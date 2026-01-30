@@ -328,17 +328,72 @@ async fn forward_request(req: Request) -> Result<Response> {
 }
 ```
 
-### Commit Messages
+### Git Workflow for AI Assistants
 
-Follow conventional commits:
+When working on this project, create commits after completing each logical unit of work. **Each commit should include all related changes: code, tests, documentation, and design updates.**
 
+#### When to Commit
+- After implementing a complete feature
+- After fixing a bug
+- After adding/updating documentation
+- After refactoring that maintains functionality
+- Do NOT commit: work-in-progress, broken code, or experimental changes
+
+#### What to Include in Each Commit
+A complete commit includes:
+1. **Code changes** (src/, examples/, tests/)
+2. **Test updates** if behavior changed
+3. **Documentation updates**:
+   - README.md if user-facing changes
+   - CLAUDE.md if AI assistant context changed
+   - docs/ARCHITECTURE.md if design changed
+   - Code comments/docstrings for new public APIs
+4. **Design document updates** if implementation differs from spec
+5. **Examples** if new functionality added
+
+#### Commit Message Format
+Use conventional commits with high-level descriptions:
+- **feat**: new functionality (e.g., "feat: add threshold-based router for immediate learning")
+- **fix**: bug fixes (e.g., "fix: handle empty tokenizer vocabulary with character fallback")
+- **docs**: documentation only (e.g., "docs: update architecture with Phase 2 design")
+- **test**: adding/updating tests (e.g., "test: add training verification tests")
+- **refactor**: code changes without behavior change (e.g., "refactor: extract routing logic into hybrid module")
+
+#### Message Content
+- **Subject**: what was done (imperative mood, <70 chars)
+- **Body** (optional): why it was done, what problem it solves, what docs updated
+- Keep it high-level - avoid implementation details
+
+#### Example Complete Commit
+```bash
+# After implementing threshold router:
+git add \
+  src/models/threshold_router.rs \
+  src/models/threshold_validator.rs \
+  src/models/mod.rs \
+  examples/threshold_demo.rs \
+  docs/ARCHITECTURE.md \
+  CLAUDE.md
+
+git commit -m "feat: add threshold-based router and validator
+
+Implements statistics-driven routing that learns from query 1, providing
+immediate value during cold start period before neural networks trained.
+
+Changes:
+- New threshold_router.rs: query categorization + success tracking
+- New threshold_validator.rs: heuristic quality validation
+- Updated ARCHITECTURE.md: added Phase 2a (threshold approach)
+- Updated CLAUDE.md: documented hybrid strategy
+- Added threshold_demo.rs: demonstrates immediate learning"
 ```
-feat: add routing logic for local vs forwarded requests
-fix: handle timeout errors in Claude API client
-docs: update architecture documentation
-test: add integration tests for learning engine
-refactor: simplify configuration loading
-```
+
+#### Verification Before Commit
+- Run `cargo test` - all tests pass
+- Run `cargo fmt` - code formatted
+- Run `cargo clippy` - no warnings
+- Verify documentation reflects current implementation
+- Check that examples still work
 
 ### No Code in CLAUDE.md
 
