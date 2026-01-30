@@ -3,10 +3,12 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Module, Tensor};
-use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Optimizer, VarBuilder, VarMap, SGD};
+use candle_nn::{
+    embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Optimizer, VarBuilder, VarMap, SGD,
+};
 use std::path::Path;
 
-use super::common::{get_device, ModelConfig, Saveable};
+use super::common::{get_device_with_preference, ModelConfig, Saveable};
 
 /// Generator model - autoregressive text generation
 pub struct GeneratorModel {
@@ -21,16 +23,12 @@ pub struct GeneratorModel {
 impl GeneratorModel {
     /// Create new generator with random initialization
     pub fn new(config: &ModelConfig) -> Result<Self> {
-        let device = get_device()?;
+        let device = get_device_with_preference(config.device_preference)?;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
         // Embedding layer
-        let embedding = embedding(
-            config.vocab_size,
-            config.hidden_dim,
-            vb.pp("embedding"),
-        )?;
+        let embedding = embedding(config.vocab_size, config.hidden_dim, vb.pp("embedding"))?;
 
         // Transformer decoder
         let decoder = TransformerDecoder::new(config, vb.pp("decoder"))?;
@@ -94,7 +92,12 @@ impl GeneratorModel {
     }
 
     /// Train on a single example (online learning)
-    pub fn update(&mut self, input_ids: &Tensor, target_ids: &[u32], learning_rate: f64) -> Result<()> {
+    pub fn update(
+        &mut self,
+        input_ids: &Tensor,
+        target_ids: &[u32],
+        learning_rate: f64,
+    ) -> Result<()> {
         // Forward pass
         let logits = self.forward(input_ids)?;
 

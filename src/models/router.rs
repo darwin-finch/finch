@@ -3,10 +3,12 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Optimizer, VarBuilder, VarMap, SGD};
+use candle_nn::{
+    embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Optimizer, VarBuilder, VarMap, SGD,
+};
 use std::path::Path;
 
-use super::common::{get_device, ModelConfig, Saveable};
+use super::common::{get_device_with_preference, ModelConfig, Saveable};
 
 /// Router model - binary classification
 pub struct RouterModel {
@@ -20,16 +22,12 @@ pub struct RouterModel {
 impl RouterModel {
     /// Create new router with random initialization
     pub fn new(config: &ModelConfig) -> Result<Self> {
-        let device = get_device()?;
+        let device = get_device_with_preference(config.device_preference)?;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
         // Embedding layer
-        let embedding = embedding(
-            config.vocab_size,
-            config.hidden_dim,
-            vb.pp("embedding"),
-        )?;
+        let embedding = embedding(config.vocab_size, config.hidden_dim, vb.pp("embedding"))?;
 
         // Transformer encoder
         let encoder = TransformerEncoder::new(config, vb.pp("encoder"))?;
@@ -92,6 +90,18 @@ impl RouterModel {
 
         Ok(())
     }
+
+    /// Predict from raw token IDs (convenience method for benchmarking)
+    pub fn predict_from_ids(&self, ids: &[u32]) -> Result<bool> {
+        let len = ids.len();
+        let tensor = Tensor::from_vec(ids.to_vec(), (1, len), &self.device)?;
+        self.predict(&tensor)
+    }
+
+    /// Get reference to the device (for benchmarking and debugging)
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
 }
 
 /// Simple transformer encoder (for Router and Validator)
@@ -103,7 +113,10 @@ impl TransformerEncoder {
     fn new(config: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let mut layers = Vec::new();
         for i in 0..config.num_layers {
-            layers.push(TransformerLayer::new(config, vb.pp(&format!("layer_{}", i)))?);
+            layers.push(TransformerLayer::new(
+                config,
+                vb.pp(&format!("layer_{}", i)),
+            )?);
         }
         Ok(Self { layers })
     }

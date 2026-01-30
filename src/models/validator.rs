@@ -3,10 +3,12 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Optimizer, VarBuilder, VarMap, SGD};
+use candle_nn::{
+    embedding, layer_norm, linear, Embedding, LayerNorm, Linear, Optimizer, VarBuilder, VarMap, SGD,
+};
 use std::path::Path;
 
-use super::common::{get_device, ModelConfig, Saveable};
+use super::common::{get_device_with_preference, ModelConfig, Saveable};
 
 /// Validator model - binary quality classifier
 pub struct ValidatorModel {
@@ -20,16 +22,12 @@ pub struct ValidatorModel {
 impl ValidatorModel {
     /// Create new validator with random initialization
     pub fn new(config: &ModelConfig) -> Result<Self> {
-        let device = get_device()?;
+        let device = get_device_with_preference(config.device_preference)?;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
         // Embedding layer
-        let embedding = embedding(
-            config.vocab_size,
-            config.hidden_dim,
-            vb.pp("embedding"),
-        )?;
+        let embedding = embedding(config.vocab_size, config.hidden_dim, vb.pp("embedding"))?;
 
         // Transformer encoder
         let encoder = TransformerEncoder::new(config, vb.pp("encoder"))?;
@@ -79,7 +77,13 @@ impl ValidatorModel {
     }
 
     /// Update weights based on actual quality (online learning)
-    pub fn update(&mut self, query_ids: &Tensor, response_ids: &Tensor, is_good: bool, learning_rate: f64) -> Result<()> {
+    pub fn update(
+        &mut self,
+        query_ids: &Tensor,
+        response_ids: &Tensor,
+        is_good: bool,
+        learning_rate: f64,
+    ) -> Result<()> {
         // Concatenate query and response
         let combined = Tensor::cat(&[query_ids, response_ids], 1)?;
 
@@ -109,7 +113,10 @@ impl TransformerEncoder {
     fn new(config: &ModelConfig, vb: VarBuilder) -> Result<Self> {
         let mut layers = Vec::new();
         for i in 0..config.num_layers {
-            layers.push(TransformerLayer::new(config, vb.pp(&format!("layer_{}", i)))?);
+            layers.push(TransformerLayer::new(
+                config,
+                vb.pp(&format!("layer_{}", i)),
+            )?);
         }
         Ok(Self { layers })
     }

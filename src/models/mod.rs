@@ -10,7 +10,10 @@ pub mod threshold_validator;
 pub mod tokenizer;
 pub mod validator;
 
-pub use common::{get_device, ModelConfig, Saveable};
+pub use common::{
+    device_info, get_device, get_device_with_preference, is_metal_available, DevicePreference,
+    ModelConfig, Saveable,
+};
 pub use ensemble::{EnsembleStats, ModelEnsemble, Quality, RouteDecision};
 pub use generator::GeneratorModel;
 pub use router::RouterModel;
