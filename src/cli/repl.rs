@@ -312,7 +312,14 @@ impl Repl {
 
             // Important: Add Claude's tool-use response to conversation first
             // This maintains the user/assistant alternation required by the API
-            self.conversation.add_assistant_message(current_response.text());
+            // If the response has no text (only tool uses), add a placeholder message
+            let assistant_text = current_response.text();
+            let assistant_message = if assistant_text.is_empty() {
+                "[Using tools]".to_string()
+            } else {
+                assistant_text
+            };
+            self.conversation.add_assistant_message(assistant_message);
 
             // Then add tool results as a user message
             self.conversation.add_user_message(tool_result_text);
