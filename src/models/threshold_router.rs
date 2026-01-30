@@ -400,9 +400,9 @@ mod tests {
         for i in 0..100 {
             // Only try local on every 10th query (90% forward rate)
             if i % 10 == 0 {
-                router.learn("test", true);  // Local attempt succeeded
+                router.learn("test", true); // Local attempt succeeded
             }
-            router.total_queries += 1;  // Count all queries
+            router.total_queries += 1; // Count all queries
         }
 
         // With 90% forward rate (way above 5% target), threshold should decrease

@@ -1,7 +1,6 @@
 // Routing decision logic
 
 use crate::crisis::CrisisDetector;
-use crate::patterns::{Pattern, PatternMatcher};
 
 #[derive(Debug, Clone)]
 pub enum ForwardReason {
@@ -22,19 +21,18 @@ impl ForwardReason {
 
 #[derive(Debug, Clone)]
 pub enum RouteDecision {
-    Local { pattern: Pattern, confidence: f64 },
+    // Keep Local variant for backward compatibility, but it's no longer used
+    Local { pattern_id: String, confidence: f64 },
     Forward { reason: ForwardReason },
 }
 
 pub struct Router {
-    pattern_matcher: PatternMatcher,
     crisis_detector: CrisisDetector,
 }
 
 impl Router {
-    pub fn new(pattern_matcher: PatternMatcher, crisis_detector: CrisisDetector) -> Self {
+    pub fn new(crisis_detector: CrisisDetector) -> Self {
         Self {
-            pattern_matcher,
             crisis_detector,
         }
     }
@@ -49,21 +47,9 @@ impl Router {
             };
         }
 
-        // Step 2: Check for pattern match
-        if let Some((pattern, confidence)) = self.pattern_matcher.find_match(query) {
-            tracing::info!(
-                "Routing decision: LOCAL (pattern: {}, confidence: {:.2})",
-                pattern.id,
-                confidence
-            );
-            return RouteDecision::Local {
-                pattern,
-                confidence,
-            };
-        }
-
-        // Step 3: Default to forward
-        tracing::info!("Routing decision: FORWARD (no pattern match)");
+        // Step 2: No pattern matching - always forward for now
+        // (In future commits, this becomes tool-based routing)
+        tracing::info!("Routing decision: FORWARD (no local processing)");
         RouteDecision::Forward {
             reason: ForwardReason::NoMatch,
         }
@@ -73,8 +59,6 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crisis::CrisisDetector;
-    use crate::patterns::{PatternLibrary, PatternMatcher};
 
     #[test]
     fn test_forward_reason_as_str() {

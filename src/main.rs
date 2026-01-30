@@ -8,7 +8,6 @@ use shammah::cli::Repl;
 use shammah::config::load_config;
 use shammah::crisis::CrisisDetector;
 use shammah::metrics::MetricsLogger;
-use shammah::patterns::{PatternLibrary, PatternMatcher};
 use shammah::router::Router;
 
 #[tokio::main]
@@ -19,17 +18,11 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = load_config()?;
 
-    // Load pattern library
-    let pattern_library = PatternLibrary::load_from_file(&config.patterns_path)?;
-
-    // Create pattern matcher
-    let pattern_matcher = PatternMatcher::new(pattern_library.clone(), config.similarity_threshold);
-
     // Load crisis detector
     let crisis_detector = CrisisDetector::load_from_file(&config.crisis_keywords_path)?;
 
     // Create router
-    let router = Router::new(pattern_matcher, crisis_detector);
+    let router = Router::new(crisis_detector);
 
     // Create Claude client
     let claude_client = ClaudeClient::new(config.api_key.clone())?;
@@ -43,7 +36,6 @@ async fn main() -> Result<()> {
         claude_client,
         router,
         metrics_logger,
-        pattern_library,
     );
 
     repl.run().await?;

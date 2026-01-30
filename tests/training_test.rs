@@ -15,6 +15,7 @@ fn test_router_training_reduces_loss() -> Result<()> {
         num_heads: 4,
         max_seq_len: 32,
         dropout: 0.0,
+        device_preference: shammah::models::DevicePreference::Cpu,
     };
 
     let mut router = RouterModel::new(&config)?;
@@ -27,8 +28,7 @@ fn test_router_training_reduces_loss() -> Result<()> {
     // Measure initial loss
     let pred_before = router.forward(&input)?;
     let target_tensor = Tensor::from_vec(vec![1.0f32], (1, 1), &device)?;
-    let loss_before = binary_cross_entropy(&pred_before, &target_tensor)?
-        .to_scalar::<f32>()?;
+    let loss_before = binary_cross_entropy(&pred_before, &target_tensor)?.to_scalar::<f32>()?;
 
     println!("Initial loss: {}", loss_before);
 
@@ -39,16 +39,14 @@ fn test_router_training_reduces_loss() -> Result<()> {
 
         if step % 3 == 0 {
             let pred = router.forward(&input)?;
-            let loss = binary_cross_entropy(&pred, &target_tensor)?
-                .to_scalar::<f32>()?;
+            let loss = binary_cross_entropy(&pred, &target_tensor)?.to_scalar::<f32>()?;
             println!("Step {}: loss = {}", step, loss);
         }
     }
 
     // Measure final loss
     let pred_after = router.forward(&input)?;
-    let loss_after = binary_cross_entropy(&pred_after, &target_tensor)?
-        .to_scalar::<f32>()?;
+    let loss_after = binary_cross_entropy(&pred_after, &target_tensor)?.to_scalar::<f32>()?;
 
     println!("Final loss: {}", loss_after);
 
@@ -74,6 +72,7 @@ fn test_validator_training_reduces_loss() -> Result<()> {
         num_heads: 4,
         max_seq_len: 32,
         dropout: 0.0,
+        device_preference: shammah::models::DevicePreference::Cpu,
     };
 
     let mut validator = ValidatorModel::new(&config)?;
@@ -88,8 +87,7 @@ fn test_validator_training_reduces_loss() -> Result<()> {
     let combined = Tensor::cat(&[&query, &response], 1)?;
     let pred_before = validator.forward(&combined)?;
     let target_tensor = Tensor::from_vec(vec![1.0f32], (1, 1), &device)?;
-    let loss_before = binary_cross_entropy(&pred_before, &target_tensor)?
-        .to_scalar::<f32>()?;
+    let loss_before = binary_cross_entropy(&pred_before, &target_tensor)?.to_scalar::<f32>()?;
 
     println!("Initial loss: {}", loss_before);
 
@@ -100,16 +98,14 @@ fn test_validator_training_reduces_loss() -> Result<()> {
 
         if step % 3 == 0 {
             let pred = validator.forward(&combined)?;
-            let loss = binary_cross_entropy(&pred, &target_tensor)?
-                .to_scalar::<f32>()?;
+            let loss = binary_cross_entropy(&pred, &target_tensor)?.to_scalar::<f32>()?;
             println!("Step {}: loss = {}", step, loss);
         }
     }
 
     // Measure final loss
     let pred_after = validator.forward(&combined)?;
-    let loss_after = binary_cross_entropy(&pred_after, &target_tensor)?
-        .to_scalar::<f32>()?;
+    let loss_after = binary_cross_entropy(&pred_after, &target_tensor)?.to_scalar::<f32>()?;
 
     println!("Final loss: {}", loss_after);
 

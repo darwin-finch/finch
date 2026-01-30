@@ -33,7 +33,11 @@ fn test_simple_forward_pass() -> Result<()> {
     println!("Output value: {:?}", prob);
 
     // Just make sure we get a probability between 0 and 1
-    assert!(prob >= 0.0 && prob <= 1.0, "Probability out of range: {}", prob);
+    assert!(
+        prob >= 0.0 && prob <= 1.0,
+        "Probability out of range: {}",
+        prob
+    );
 
     println!("Forward pass successful!");
     Ok(())

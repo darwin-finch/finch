@@ -47,8 +47,7 @@ fn try_load_from_shammah_config() -> Result<Option<String>> {
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
     // Parse TOML
-    let config: toml::Value = toml::from_str(&contents)
-        .context("Failed to parse config.toml")?;
+    let config: toml::Value = toml::from_str(&contents).context("Failed to parse config.toml")?;
 
     // Extract api_key
     let api_key = config
@@ -67,6 +66,6 @@ mod tests {
     fn test_config_creation() {
         let config = Config::new("test-key".to_string());
         assert_eq!(config.api_key, "test-key");
-        assert_eq!(config.similarity_threshold, 0.2);
+        // similarity_threshold removed (pattern system removed)
     }
 }

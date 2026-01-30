@@ -1,9 +1,9 @@
 // Phase 2: Model-based routing with online learning
 // Uses the ModelEnsemble (Router, Generator, Validator) for intelligent routing
 
-use anyhow::{Context, Result};
-use crate::models::{ModelConfig, ModelEnsemble, Quality, RouteDecision as ModelRouteDecision};
 use super::{ForwardReason, RouteDecision};
+use crate::models::{ModelConfig, ModelEnsemble, Quality, RouteDecision as ModelRouteDecision};
+use anyhow::{Context, Result};
 
 /// Model-based router using neural networks
 pub struct ModelRouter {
@@ -14,16 +14,14 @@ impl ModelRouter {
     /// Create a new model router with default configuration
     pub fn new() -> Result<Self> {
         let config = ModelConfig::default();
-        let ensemble = ModelEnsemble::new(config)
-            .context("Failed to create model ensemble")?;
+        let ensemble = ModelEnsemble::new(config).context("Failed to create model ensemble")?;
 
         Ok(Self { ensemble })
     }
 
     /// Create a model router with custom configuration
     pub fn with_config(config: ModelConfig) -> Result<Self> {
-        let ensemble = ModelEnsemble::new(config)
-            .context("Failed to create model ensemble")?;
+        let ensemble = ModelEnsemble::new(config).context("Failed to create model ensemble")?;
 
         Ok(Self { ensemble })
     }
@@ -31,7 +29,9 @@ impl ModelRouter {
     /// Make a routing decision using the neural network ensemble
     pub fn route(&self, query: &str) -> Result<RouteDecision> {
         // Get decision from model ensemble
-        let decision = self.ensemble.route(query)
+        let decision = self
+            .ensemble
+            .route(query)
             .context("Failed to get routing decision from models")?;
 
         // Convert to Phase 1 RouteDecision format
@@ -43,23 +43,24 @@ impl ModelRouter {
                     reason: ForwardReason::NoMatch, // Placeholder
                 })
             }
-            ModelRouteDecision::Forward => {
-                Ok(RouteDecision::Forward {
-                    reason: ForwardReason::NoMatch,
-                })
-            }
+            ModelRouteDecision::Forward => Ok(RouteDecision::Forward {
+                reason: ForwardReason::NoMatch,
+            }),
         }
     }
 
     /// Generate a response locally using the generator model
     pub fn generate_local(&self, query: &str) -> Result<String> {
-        self.ensemble.generate_local(query)
+        self.ensemble
+            .generate_local(query)
             .context("Failed to generate local response")
     }
 
     /// Validate a generated response
     pub fn validate(&self, query: &str, response: &str) -> Result<bool> {
-        let quality = self.ensemble.validate(query, response)
+        let quality = self
+            .ensemble
+            .validate(query, response)
             .context("Failed to validate response")?;
 
         Ok(matches!(quality, Quality::Good))
@@ -74,7 +75,8 @@ impl ModelRouter {
         claude_response: &str,
         was_forwarded_because_router: bool,
     ) -> Result<()> {
-        self.ensemble.learn_from_claude(query, claude_response, was_forwarded_because_router)
+        self.ensemble
+            .learn_from_claude(query, claude_response, was_forwarded_because_router)
             .context("Failed to learn from Claude response")
     }
 
@@ -88,20 +90,21 @@ impl ModelRouter {
         was_good: bool,
         claude_response_if_bad: Option<&str>,
     ) -> Result<()> {
-        let quality = if was_good { Quality::Good } else { Quality::Bad };
+        let quality = if was_good {
+            Quality::Good
+        } else {
+            Quality::Bad
+        };
 
-        self.ensemble.learn_from_local_attempt(
-            query,
-            local_response,
-            quality,
-            claude_response_if_bad,
-        )
-        .context("Failed to learn from local attempt")
+        self.ensemble
+            .learn_from_local_attempt(query, local_response, quality, claude_response_if_bad)
+            .context("Failed to learn from local attempt")
     }
 
     /// Save the models to disk
     pub fn save_models(&self, models_dir: &str) -> Result<()> {
-        self.ensemble.save(models_dir)
+        self.ensemble
+            .save(models_dir)
             .context("Failed to save models")
     }
 

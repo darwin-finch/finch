@@ -26,9 +26,9 @@ impl TextTokenizer {
         Ok(Self {
             tokenizer,
             vocab_size,
-            pad_token_id: 0,  // Standard PAD token
-            bos_token_id: 1,  // Standard BOS (beginning of sequence)
-            eos_token_id: 2,  // Standard EOS (end of sequence)
+            pad_token_id: 0, // Standard PAD token
+            bos_token_id: 1, // Standard BOS (beginning of sequence)
+            eos_token_id: 2, // Standard EOS (end of sequence)
         })
     }
 
@@ -76,7 +76,8 @@ impl TextTokenizer {
         }
 
         // Convert each character to an ID (simple: char as u32 % vocab_size)
-        for ch in text.chars().take(self.vocab_size - 10) {  // Leave room for special tokens
+        for ch in text.chars().take(self.vocab_size - 10) {
+            // Leave room for special tokens
             let id = ((ch as u32) % (self.vocab_size as u32 - 10)) + 10; // Start from 10 to avoid special tokens
             ids.push(id);
         }
@@ -94,17 +95,11 @@ impl TextTokenizer {
         let len = ids.len();
 
         // Create tensor with shape (1, seq_len) for batch processing
-        Tensor::from_vec(ids, (1, len), device)
-            .context("Failed to create tensor from token IDs")
+        Tensor::from_vec(ids, (1, len), device).context("Failed to create tensor from token IDs")
     }
 
     /// Encode with padding to fixed length
-    pub fn encode_padded(
-        &self,
-        text: &str,
-        max_length: usize,
-        device: &Device,
-    ) -> Result<Tensor> {
+    pub fn encode_padded(&self, text: &str, max_length: usize, device: &Device) -> Result<Tensor> {
         let mut ids = self.encode(text, true)?;
 
         // Truncate if too long
@@ -121,8 +116,7 @@ impl TextTokenizer {
             ids.push(self.pad_token_id);
         }
 
-        Tensor::from_vec(ids, (1, max_length), device)
-            .context("Failed to create padded tensor")
+        Tensor::from_vec(ids, (1, max_length), device).context("Failed to create padded tensor")
     }
 
     /// Decode token IDs back to text
@@ -143,7 +137,9 @@ impl TextTokenizer {
 
         for &id in ids {
             // Skip special tokens if requested
-            if skip_special_tokens && (id == self.pad_token_id || id == self.bos_token_id || id == self.eos_token_id) {
+            if skip_special_tokens
+                && (id == self.pad_token_id || id == self.bos_token_id || id == self.eos_token_id)
+            {
                 continue;
             }
 

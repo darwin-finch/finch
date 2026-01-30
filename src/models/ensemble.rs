@@ -43,17 +43,13 @@ pub struct ModelEnsemble {
 impl ModelEnsemble {
     /// Create new ensemble with random initialization
     pub fn new(config: ModelConfig) -> Result<Self> {
-        let router = RouterModel::new(&config)
-            .context("Failed to create router model")?;
+        let router = RouterModel::new(&config).context("Failed to create router model")?;
 
-        let generator = GeneratorModel::new(&config)
-            .context("Failed to create generator model")?;
+        let generator = GeneratorModel::new(&config).context("Failed to create generator model")?;
 
-        let validator = ValidatorModel::new(&config)
-            .context("Failed to create validator model")?;
+        let validator = ValidatorModel::new(&config).context("Failed to create validator model")?;
 
-        let tokenizer = TextTokenizer::default()
-            .context("Failed to create tokenizer")?;
+        let tokenizer = TextTokenizer::default().context("Failed to create tokenizer")?;
 
         Ok(Self {
             router,
@@ -75,19 +71,22 @@ impl ModelEnsemble {
     /// Save ensemble to disk
     pub fn save<P: AsRef<Path>>(&self, models_dir: P) -> Result<()> {
         let models_dir = models_dir.as_ref();
-        std::fs::create_dir_all(models_dir)
-            .context("Failed to create models directory")?;
+        std::fs::create_dir_all(models_dir).context("Failed to create models directory")?;
 
-        self.router.save(&models_dir.join("router.safetensors"))
+        self.router
+            .save(&models_dir.join("router.safetensors"))
             .context("Failed to save router model")?;
 
-        self.generator.save(&models_dir.join("generator.safetensors"))
+        self.generator
+            .save(&models_dir.join("generator.safetensors"))
             .context("Failed to save generator model")?;
 
-        self.validator.save(&models_dir.join("validator.safetensors"))
+        self.validator
+            .save(&models_dir.join("validator.safetensors"))
             .context("Failed to save validator model")?;
 
-        self.tokenizer.save(&models_dir.join("tokenizer.json"), true)
+        self.tokenizer
+            .save(&models_dir.join("tokenizer.json"), true)
             .context("Failed to save tokenizer")?;
 
         Ok(())
@@ -177,13 +176,15 @@ impl ModelEnsemble {
 
         // Always train the generator (distillation from Claude)
         let claude_response_ids = self.tokenizer.encode(claude_response, true)?;
-        self.generator.update(&query_tokens, &claude_response_ids, self.learning_rate)?;
+        self.generator
+            .update(&query_tokens, &claude_response_ids, self.learning_rate)?;
 
         // Train router based on whether this was a good decision
         if was_forwarded_because_router {
             // Router said "forward" - this is correct if we got here
             // Target: 0 (forward was correct)
-            self.router.update(&query_tokens, false, self.learning_rate)?;
+            self.router
+                .update(&query_tokens, false, self.learning_rate)?;
         }
 
         // Strategic sampling: occasionally try local generation too
@@ -199,11 +200,13 @@ impl ModelEnsemble {
             if divergence < threshold {
                 // Local response was good enough - router should have tried local
                 // Target: 1 (should try local)
-                self.router.update(&query_tokens, true, self.learning_rate)?;
+                self.router
+                    .update(&query_tokens, true, self.learning_rate)?;
             } else {
                 // Local response was not good - router was right to forward
                 // Target: 0 (forward was correct)
-                self.router.update(&query_tokens, false, self.learning_rate)?;
+                self.router
+                    .update(&query_tokens, false, self.learning_rate)?;
             }
         }
 
@@ -228,23 +231,32 @@ impl ModelEnsemble {
             Quality::Good => {
                 // Validator said good - this is a success!
                 // Router was correct to try local: target = 1
-                self.router.update(&query_tokens, true, self.learning_rate)?;
+                self.router
+                    .update(&query_tokens, true, self.learning_rate)?;
 
                 // Validator was correct: target = 1 (good)
-                self.validator.update(&query_tokens, &response_tokens, true, self.learning_rate)?;
+                self.validator
+                    .update(&query_tokens, &response_tokens, true, self.learning_rate)?;
             }
             Quality::Bad => {
                 // Validator rejected - this is a failure
                 // Router should have forwarded: target = 0
-                self.router.update(&query_tokens, false, self.learning_rate)?;
+                self.router
+                    .update(&query_tokens, false, self.learning_rate)?;
 
                 // Validator was correct: target = 0 (bad)
-                self.validator.update(&query_tokens, &response_tokens, false, self.learning_rate)?;
+                self.validator.update(
+                    &query_tokens,
+                    &response_tokens,
+                    false,
+                    self.learning_rate,
+                )?;
 
                 // If we have Claude's response, train generator on it
                 if let Some(claude_resp) = claude_response_if_bad {
                     let claude_ids = self.tokenizer.encode(claude_resp, true)?;
-                    self.generator.update(&query_tokens, &claude_ids, self.learning_rate)?;
+                    self.generator
+                        .update(&query_tokens, &claude_ids, self.learning_rate)?;
                 }
             }
         }

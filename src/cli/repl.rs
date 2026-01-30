@@ -17,7 +17,6 @@ use crate::claude::{ClaudeClient, MessageRequest};
 use crate::config::Config;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
 use crate::models::{ThresholdRouter, ThresholdValidator};
-use crate::patterns::PatternLibrary;
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::types::{ToolDefinition, ToolInputSchema};
 
@@ -87,7 +86,6 @@ pub struct Repl {
     claude_client: ClaudeClient,
     router: Router,
     metrics_logger: MetricsLogger,
-    pattern_library: PatternLibrary,
     // Online learning models
     threshold_router: ThresholdRouter,
     threshold_validator: ThresholdValidator,
@@ -109,7 +107,6 @@ impl Repl {
         claude_client: ClaudeClient,
         router: Router,
         metrics_logger: MetricsLogger,
-        pattern_library: PatternLibrary,
     ) -> Self {
         // Detect if we're in interactive mode (stdout is a TTY)
         let is_interactive = io::stdout().is_terminal();
@@ -140,7 +137,6 @@ impl Repl {
             claude_client,
             router,
             metrics_logger,
-            pattern_library,
             threshold_router,
             threshold_validator,
             training_trends: TrainingTrends::new(20), // Track last 20 queries
@@ -240,10 +236,6 @@ impl Repl {
             // Fancy startup for interactive mode
             println!("Shammah v0.1.0 - Constitutional AI Proxy");
             println!("Using API key from: ~/.shammah/config.toml ✓");
-            println!(
-                "Loaded {} constitutional patterns ✓",
-                self.pattern_library.patterns.len()
-            );
             println!("Loaded crisis detection keywords ✓");
             println!("Online learning: ENABLED (threshold models) ✓");
             println!();
@@ -356,7 +348,6 @@ impl Repl {
                         let output = handle_command(
                             command,
                             &self.metrics_logger,
-                            &self.pattern_library,
                             Some(&self.threshold_router),
                             Some(&self.threshold_validator),
                         )?;
@@ -497,61 +488,40 @@ impl Repl {
 
         match decision {
             RouteDecision::Local {
-                pattern,
+                pattern_id: local_pattern_id,
                 confidence,
             } => {
+                // This branch is now dead code (router never returns Local)
+                // Keep it for backward compatibility, but log a warning
                 if self.is_interactive {
-                    println!("✓ Crisis check: PASS");
-                    println!("✓ Pattern match: {} ({:.2})", pattern.id, confidence);
-                    println!("→ Routing: LOCAL ({}ms)", start_time.elapsed().as_millis());
+                    println!("⚠️  Warning: Unexpected local routing (pattern system removed)");
+                    println!("→ Forwarding to Claude instead");
                 }
 
-                let local_resp = pattern.template_response.clone();
+                // Always forward to Claude
+                let request = MessageRequest::with_context(self.conversation.get_messages())
+                    .with_tools(create_tool_definitions());
+                let response = self.claude_client.send_message(&request).await?;
 
-                // Validate the local response
-                let quality_score = self.threshold_validator.quality_score(query, &local_resp);
-                let is_valid = self.threshold_validator.validate(query, &local_resp);
-
-                if is_valid && quality_score >= 0.7 {
-                    // Use local response
-                    claude_response = local_resp.clone();
-                    local_response = Some(local_resp);
-                    routing_decision_str = "local".to_string();
-                    pattern_id = Some(pattern.id.clone());
-                    routing_confidence = Some(confidence);
-                } else {
-                    // Quality too low, fall back to Claude
+                // Check for tool uses
+                if response.has_tool_uses() {
+                    let tool_uses = response.tool_uses();
                     if self.is_interactive {
-                        println!(
-                            "  Quality score too low ({:.2}), forwarding to Claude",
-                            quality_score
-                        );
-                    }
-
-                    local_response = Some(local_resp);
-                    // Use full conversation context with tool definitions
-                    let request = MessageRequest::with_context(self.conversation.get_messages())
-                        .with_tools(create_tool_definitions());
-                    let response = self.claude_client.send_message(&request).await?;
-
-                    // Check for tool uses
-                    if response.has_tool_uses() {
-                        let tool_uses = response.tool_uses();
-                        if self.is_interactive {
-                            println!("🔧 Tool uses detected:");
-                            for tool_use in &tool_uses {
-                                println!("  → {}: {}", tool_use.name, serde_json::to_string(&tool_use.input)?);
-                            }
-                            println!("⚠️  Note: Tool execution not yet implemented. Results will be empty.");
+                        println!("🔧 Tool uses detected:");
+                        for tool_use in &tool_uses {
+                            println!("  → {}: {}", tool_use.name, serde_json::to_string(&tool_use.input)?);
                         }
-                        claude_response = response.text();
-                    } else {
-                        claude_response = response.text();
+                        println!("⚠️  Note: Tool execution not yet implemented. Results will be empty.");
                     }
-
-                    routing_decision_str = "forward_validation_failed".to_string();
-                    forward_reason = Some("quality_too_low".to_string());
+                    claude_response = response.text();
+                } else {
+                    claude_response = response.text();
                 }
+
+                routing_decision_str = "forward".to_string();
+                forward_reason = Some("pattern_system_removed".to_string());
+                pattern_id = Some(local_pattern_id);
+                routing_confidence = Some(confidence);
             }
             RouteDecision::Forward { reason } => {
                 if self.is_interactive {

@@ -4,13 +4,11 @@ use anyhow::Result;
 
 use crate::metrics::MetricsLogger;
 use crate::models::{ThresholdRouter, ThresholdValidator};
-use crate::patterns::PatternLibrary;
 
 pub enum Command {
     Help,
     Quit,
     Metrics,
-    Patterns,
     Debug,
     Training,
     Clear,
@@ -22,7 +20,6 @@ impl Command {
             "/help" => Some(Command::Help),
             "/quit" | "/exit" => Some(Command::Quit),
             "/metrics" => Some(Command::Metrics),
-            "/patterns" => Some(Command::Patterns),
             "/debug" => Some(Command::Debug),
             "/training" => Some(Command::Training),
             "/clear" | "/reset" => Some(Command::Clear),
@@ -34,7 +31,6 @@ impl Command {
 pub fn handle_command(
     command: Command,
     metrics_logger: &MetricsLogger,
-    pattern_library: &PatternLibrary,
     router: Option<&ThresholdRouter>,
     validator: Option<&ThresholdValidator>,
 ) -> Result<String> {
@@ -42,7 +38,6 @@ pub fn handle_command(
         Command::Help => Ok(format_help()),
         Command::Quit => Ok("Goodbye!".to_string()),
         Command::Metrics => format_metrics(metrics_logger),
-        Command::Patterns => Ok(format_patterns(pattern_library)),
         Command::Debug => Ok("Debug mode toggled".to_string()),
         Command::Training => format_training(router, validator),
         Command::Clear => Ok("".to_string()), // Handled in REPL directly
@@ -54,7 +49,6 @@ fn format_help() -> String {
   /help      - Show this help message
   /quit      - Exit the REPL
   /metrics   - Display statistics
-  /patterns  - List all patterns
   /training  - Show detailed training statistics
   /clear     - Clear conversation history (start fresh)
   /debug     - Toggle debug output
@@ -90,7 +84,7 @@ fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
         0.0
     };
 
-    let mut output = format!(
+    Ok(format!(
         "Metrics (last 24 hours):\n\
         Total requests: {}\n\
         Local: {} ({:.1}%)\n\
@@ -110,31 +104,7 @@ fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
         no_match_pct,
         summary.avg_local_time,
         summary.avg_forward_time
-    );
-
-    if !summary.top_patterns.is_empty() {
-        output.push_str("\nTop patterns:\n");
-        for (i, (pattern_id, count)) in summary.top_patterns.iter().enumerate() {
-            output.push_str(&format!(
-                "  {}. {} ({} matches)\n",
-                i + 1,
-                pattern_id,
-                count
-            ));
-        }
-    }
-
-    Ok(output)
-}
-
-fn format_patterns(pattern_library: &PatternLibrary) -> String {
-    let mut output = String::from("Constitutional Patterns:\n");
-
-    for (i, pattern) in pattern_library.patterns.iter().enumerate() {
-        output.push_str(&format!("  {}. {} ({})\n", i + 1, pattern.name, pattern.id));
-    }
-
-    output
+    ))
 }
 
 fn format_training(

@@ -116,19 +116,6 @@ impl MetricsLogger {
             0
         };
 
-        // Count top patterns
-        let mut pattern_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for metric in &metrics {
-            if let Some(pattern_id) = &metric.pattern_id {
-                *pattern_counts.entry(pattern_id.clone()).or_insert(0) += 1;
-            }
-        }
-
-        let mut top_patterns: Vec<(String, usize)> = pattern_counts.into_iter().collect();
-        top_patterns.sort_by(|a, b| b.1.cmp(&a.1));
-        top_patterns.truncate(3);
-
         Ok(MetricsSummary {
             total,
             local_count,
@@ -137,7 +124,6 @@ impl MetricsLogger {
             no_match_count,
             avg_local_time,
             avg_forward_time,
-            top_patterns,
         })
     }
 }
@@ -151,7 +137,6 @@ pub struct MetricsSummary {
     pub no_match_count: usize,
     pub avg_local_time: u64,
     pub avg_forward_time: u64,
-    pub top_patterns: Vec<(String, usize)>,
 }
 
 #[cfg(test)]

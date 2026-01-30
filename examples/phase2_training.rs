@@ -22,12 +22,13 @@ async fn main() -> Result<()> {
 
     // Create model router with smaller config for faster demo
     let config = ModelConfig {
-        vocab_size: 5000,    // Smaller vocab
-        hidden_dim: 128,     // Smaller model
-        num_layers: 2,       // Fewer layers
+        vocab_size: 5000, // Smaller vocab
+        hidden_dim: 128,  // Smaller model
+        num_layers: 2,    // Fewer layers
         num_heads: 4,
         max_seq_len: 256,
         dropout: 0.0,
+        device_preference: shammah::models::DevicePreference::Auto,
     };
 
     let mut router = ModelRouter::with_config(config)?;
