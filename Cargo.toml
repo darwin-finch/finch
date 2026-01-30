@@ -23,6 +23,7 @@ serde_json = "1.0"
 
 # Configuration
 config = "0.14"
+dirs = "5.0"
 
 # Error handling
 anyhow = "1.0"
@@ -31,6 +32,13 @@ thiserror = "1.0"
 # Logging
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# Time and hashing
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+
+# Text processing for TF-IDF
+rust-stemmers = "1.2"
 
 # For web tools (Phase 3)
 scraper = "0.18"

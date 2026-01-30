@@ -1,9 +1,11 @@
 // Shammah - Local-first Constitutional AI Proxy
 // Library exports
 
-// Core modules (to be implemented)
-pub mod config;
+// Core modules
 pub mod claude;
+pub mod cli;
+pub mod config;
+pub mod crisis;
+pub mod metrics;
+pub mod patterns;
 pub mod router;
-
-// Re-exports will go here as modules are implemented
