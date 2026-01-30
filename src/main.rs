@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
     let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
 
     // Create and run REPL
-    let repl = Repl::new(
+    let mut repl = Repl::new(
         config,
         claude_client,
         router,
