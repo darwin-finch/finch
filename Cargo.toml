@@ -41,6 +41,12 @@ sha2 = "0.10"
 # Text processing for TF-IDF
 rust-stemmers = "1.2"
 
+# Machine Learning (Candle)
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+tokenizers = "0.21"
+
 # For web tools (Phase 3)
 scraper = "0.18"
 
