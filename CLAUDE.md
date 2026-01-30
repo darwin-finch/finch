@@ -135,6 +135,10 @@ Confidence > threshold?
 5. **Tool Execution System** (`src/tools/`)
    - 6 implemented tools: Read, Glob, Grep, WebFetch, Bash, Restart
    - Multi-turn execution loop for complex tasks
+   - Real-time tool output visibility (user sees results as they execute)
+   - Infinite loop detection (prevents repeated identical tool calls)
+   - Conversation state validation (prevents API errors)
+   - XML-structured tool results for better Claude parsing
    - Permission system (currently allows all)
    - Enables Claude to inspect code and make modifications
 
@@ -486,8 +490,25 @@ The threshold models provide **immediate value** from query 1, unlike neural net
   - **Bash:** Execute shell commands (5K output limit)
   - **Restart:** Self-improvement tool to restart into new binary
 - ✅ **Multi-Turn Loop:** Execute tools → send results to Claude → repeat (max 5 iterations)
+- ✅ **Real-Time Output Visibility:** User sees tool results as they execute (interactive mode)
+  - Success/error status with ✓/✗ icons
+  - Preview of results (first 500 chars with truncation indicator)
+  - Indented, readable formatting
+  - Black-box problem solved - users understand what tools are doing
+- ✅ **Infinite Loop Detection:** Prevents Claude from calling same tool repeatedly
+  - Tracks tool call signatures (name + input hash)
+  - Breaks after 3 identical calls with warning
+  - Saves time by not hitting max iterations on stuck queries
+- ✅ **Conversation State Management:** Robust handling prevents API errors
+  - Proper empty message handling with "[Tool request]" placeholder
+  - Always adds final response, even at max iterations
+  - Validation checks prevent conversation corruption
+  - Fixes "messages.N: all messages must have non-empty content" errors
+- ✅ **XML-Structured Results:** Tool results formatted for better Claude parsing
+  - Uses `<tool_result>`, `<tool_name>`, `<status>`, `<content>` tags
+  - Format Claude API is trained to understand
+  - Clearer than previous plain text format
 - ✅ **Tool Definitions:** Sent to Claude API with every request
-- ✅ **Conversation Management:** Maintains proper user/assistant alternation
 - ✅ **Error Handling:** Graceful failures with user feedback
 
 **Key Design Decisions:**
@@ -495,6 +516,8 @@ The threshold models provide **immediate value** from query 1, unlike neural net
 - Multi-turn loop allows Claude to use multiple tools in sequence
 - Restart tool enables self-improvement workflow (modify code → build → restart)
 - Security design for restart tool deferred to Phase 2 (currently unrestricted)
+- Tool visibility critical for user trust and debugging
+- Loop detection prevents frustration from stuck queries
 
 ### Streaming Responses ✅ (Partial)
 

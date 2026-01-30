@@ -273,6 +273,9 @@ impl Repl {
         let mut iteration = 0;
         const MAX_ITERATIONS: u32 = 5; // Prevent infinite loops
 
+        // Track tool calls to detect infinite loops
+        let mut tool_call_history: Vec<(String, String)> = Vec::new();
+
         while current_response.has_tool_uses() && iteration < MAX_ITERATIONS {
             iteration += 1;
 
@@ -282,44 +285,125 @@ impl Repl {
                 println!("🔧 Executing {} tool(s)...", tool_uses.len());
             }
 
+            // Check for repeated tool calls (infinite loop detection)
+            for tool_use in &tool_uses {
+                let input_hash = format!("{:?}", tool_use.input);
+                let signature = (tool_use.name.clone(), input_hash.clone());
+
+                // Count how many times we've seen this exact tool call
+                let repeat_count = tool_call_history.iter()
+                    .filter(|sig| *sig == &signature)
+                    .count();
+
+                if repeat_count >= 2 {
+                    if self.is_interactive {
+                        eprintln!(
+                            "⚠️  Warning: Tool '{}' called {} times with same input",
+                            tool_use.name, repeat_count + 1
+                        );
+                        eprintln!("⚠️  Possible infinite loop detected. Breaking...");
+                    }
+
+                    // Add error message to conversation explaining the issue
+                    let error_msg = format!(
+                        "Tool execution stopped: Detected infinite loop. \
+                         Tool '{}' was called {} times with the same input.",
+                        tool_use.name, repeat_count + 1
+                    );
+
+                    return Ok(error_msg);
+                }
+
+                tool_call_history.push(signature);
+            }
+
             // Execute all tool uses
             let mut tool_results = Vec::new();
-            for tool_use in tool_uses {
+            for tool_use in &tool_uses {
                 if self.is_interactive {
                     println!("  → {}", tool_use.name);
                 }
 
-                let result = self.tool_executor.execute_tool(&tool_use).await?;
+                let result = self.tool_executor.execute_tool(tool_use).await?;
+
+                // Display tool result to user (Phase 1: Visibility)
+                if self.is_interactive {
+                    if result.is_error {
+                        println!("    ✗ Error: {}", result.content);
+                    } else {
+                        println!("    ✓ Success");
+
+                        // Show preview of result (first 500 chars)
+                        let preview = if result.content.len() > 500 {
+                            format!(
+                                "{}... [truncated, {} chars total]",
+                                &result.content[..500],
+                                result.content.len()
+                            )
+                        } else {
+                            result.content.clone()
+                        };
+
+                        // Indent output for readability
+                        for line in preview.lines() {
+                            println!("      {}", line);
+                        }
+                    }
+                    println!(); // Blank line after each tool
+                }
+
                 tool_results.push(result);
             }
 
-            // Build tool result message for Claude
-            // Format tool results as a user message with structured content
-            let mut tool_result_text = String::from("Tool execution results:\n\n");
-            for result in &tool_results {
-                tool_result_text.push_str(&format!(
-                    "Tool: {} (ID: {})\n",
-                    result.tool_use_id,
-                    result.tool_use_id
-                ));
+            // Build tool result message for Claude using XML-like structure
+            // This format is easier for Claude to parse
+            let mut tool_result_text = String::new();
+            for (idx, result) in tool_results.iter().enumerate() {
+                let tool_name = tool_uses[idx].name.as_str();
+
                 if result.is_error {
-                    tool_result_text.push_str("Status: ERROR\n");
+                    tool_result_text.push_str(&format!(
+                        "<tool_result>\n\
+                         <tool_name>{}</tool_name>\n\
+                         <status>error</status>\n\
+                         <content>{}</content>\n\
+                         </tool_result>\n\n",
+                        tool_name,
+                        result.content
+                    ));
                 } else {
-                    tool_result_text.push_str("Status: SUCCESS\n");
+                    tool_result_text.push_str(&format!(
+                        "<tool_result>\n\
+                         <tool_name>{}</tool_name>\n\
+                         <status>success</status>\n\
+                         <content>{}</content>\n\
+                         </tool_result>\n\n",
+                        tool_name,
+                        result.content
+                    ));
                 }
-                tool_result_text.push_str(&format!("Result:\n{}\n\n", result.content));
             }
 
             // Important: Add Claude's tool-use response to conversation first
             // This maintains the user/assistant alternation required by the API
-            // If the response has no text (only tool uses), add a placeholder message
             let assistant_text = current_response.text();
-            let assistant_message = if assistant_text.is_empty() {
-                "[Using tools]".to_string()
+
+            if assistant_text.is_empty() {
+                // Response contains ONLY tool_use blocks, no text
+                // We MUST add something to maintain conversation alternation
+                self.conversation.add_assistant_message("[Tool request]".to_string());
+
+                if self.is_interactive {
+                    println!("    (Claude requesting tool execution)");
+                }
             } else {
-                assistant_text
-            };
-            self.conversation.add_assistant_message(assistant_message);
+                // Response has both text and tool_use blocks
+                self.conversation.add_assistant_message(assistant_text.clone());
+
+                if self.is_interactive && !assistant_text.trim().is_empty() {
+                    println!("    Claude: {}", assistant_text);
+                }
+            }
 
             // Then add tool results as a user message
             self.conversation.add_user_message(tool_result_text);
@@ -331,12 +415,35 @@ impl Repl {
             current_response = self.claude_client.send_message(&request).await?;
         }
 
+        // Handle max iterations or completion
         if iteration >= MAX_ITERATIONS {
             if self.is_interactive {
                 eprintln!(
                     "⚠️  Warning: Max tool iterations reached ({})",
                     MAX_ITERATIONS
                 );
+                eprintln!("⚠️  Claude may be stuck in a loop. Returning last response.");
+            }
+
+            // IMPORTANT: Still add final response to conversation
+            // Even if we hit max iterations, we need to maintain conversation state
+            let final_text = current_response.text();
+            if !final_text.is_empty() {
+                self.conversation.add_assistant_message(final_text.clone());
+            }
+        }
+
+        // Validate conversation state (debug check)
+        let messages = self.conversation.get_messages();
+        if messages.is_empty() {
+            eprintln!("⚠️  ERROR: Conversation became empty after tool loop!");
+            eprintln!("⚠️  This is a bug - please report to developers");
+        }
+
+        // Check for empty messages
+        for (i, msg) in messages.iter().enumerate() {
+            if msg.content.is_empty() {
+                eprintln!("⚠️  WARNING: Message {} has empty content", i);
             }
         }
 
