@@ -3,12 +3,14 @@
 // Executes tools with permission checks and multi-turn support
 
 use crate::cli::ConversationHistory;
+use crate::tools::patterns::{ExactApproval, MatchType, PersistentPatternStore, ToolPattern};
 use crate::tools::permissions::{PermissionCheck, PermissionManager};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::types::{ToolContext, ToolResult, ToolUse};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use tracing::{debug, error, info, instrument};
+use std::path::PathBuf;
+use tracing::{debug, error, info, instrument, warn};
 
 /// Signature for a tool execution, used for caching approval decisions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -17,28 +19,159 @@ pub struct ToolSignature {
     pub context_key: String,
 }
 
-/// Session-level cache for tool execution approvals
+/// Source of approval for a tool execution
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApprovalSource {
+    NotApproved,
+    SessionExact,
+    SessionPattern(String), // Pattern ID
+    PersistentExact,
+    PersistentPattern(String), // Pattern ID
+}
+
+/// Enhanced cache for tool execution approvals with pattern matching and persistence
 pub struct ToolConfirmationCache {
-    approved: HashSet<ToolSignature>,
+    // Session-only approvals (cleared on restart)
+    session_exact: HashSet<ToolSignature>,
+    session_patterns: Vec<ToolPattern>,
+
+    // Persistent approvals (saved to disk)
+    persistent: PersistentPatternStore,
+    persistent_path: PathBuf,
+    dirty: bool, // Track if save needed
 }
 
 impl ToolConfirmationCache {
-    pub fn new() -> Self {
-        Self {
-            approved: HashSet::new(),
+    /// Create new cache with persistent storage path
+    pub fn new(persistent_path: PathBuf) -> Result<Self> {
+        let persistent = if persistent_path.exists() {
+            match PersistentPatternStore::load(&persistent_path) {
+                Ok(store) => {
+                    info!(
+                        "Loaded {} patterns and {} exact approvals from disk",
+                        store.patterns.len(),
+                        store.exact_approvals.len()
+                    );
+                    store
+                }
+                Err(e) => {
+                    warn!("Failed to load patterns, starting fresh: {}", e);
+                    PersistentPatternStore::default()
+                }
+            }
+        } else {
+            debug!("No existing patterns file, starting fresh");
+            PersistentPatternStore::default()
+        };
+
+        Ok(Self {
+            session_exact: HashSet::new(),
+            session_patterns: Vec::new(),
+            persistent,
+            persistent_path,
+            dirty: false,
+        })
+    }
+
+    /// Check if a signature is approved, returning the approval source
+    pub fn is_approved(&mut self, sig: &ToolSignature) -> ApprovalSource {
+        // 1. Check persistent exact (highest priority)
+        if self.persistent.has_exact(sig) {
+            // Increment match count (this makes it dirty)
+            if let Some(MatchType::Exact(_)) = self.persistent.matches(sig) {
+                self.dirty = true;
+                return ApprovalSource::PersistentExact;
+            }
         }
+
+        // 2. Check session exact
+        if self.session_exact.contains(sig) {
+            return ApprovalSource::SessionExact;
+        }
+
+        // 3. Check persistent patterns
+        if let Some(MatchType::Pattern(id)) = self.persistent.matches(sig) {
+            self.dirty = true; // Match count was incremented
+            return ApprovalSource::PersistentPattern(id);
+        }
+
+        // 4. Check session patterns
+        for pattern in &mut self.session_patterns {
+            if pattern.matches(sig) {
+                pattern.increment_match();
+                return ApprovalSource::SessionPattern(pattern.id.clone());
+            }
+        }
+
+        ApprovalSource::NotApproved
     }
 
-    pub fn is_approved(&self, sig: &ToolSignature) -> bool {
-        self.approved.contains(sig)
+    /// Approve exact command for session only
+    pub fn approve_exact_session(&mut self, sig: ToolSignature) {
+        self.session_exact.insert(sig);
     }
 
-    pub fn approve(&mut self, sig: ToolSignature) {
-        self.approved.insert(sig);
+    /// Approve pattern for session only
+    pub fn approve_pattern_session(&mut self, pattern: ToolPattern) {
+        self.session_patterns.push(pattern);
     }
 
+    /// Approve exact command persistently
+    pub fn approve_exact_persistent(&mut self, sig: ToolSignature) {
+        self.persistent.add_exact(ExactApproval::new(sig));
+        self.dirty = true;
+    }
+
+    /// Approve pattern persistently
+    pub fn approve_pattern_persistent(&mut self, pattern: ToolPattern) {
+        self.persistent.add_pattern(pattern);
+        self.dirty = true;
+    }
+
+    /// Save persistent patterns if modified
+    pub fn save_if_dirty(&mut self) -> Result<()> {
+        if self.dirty {
+            info!(
+                "Saving {} patterns and {} exact approvals to disk",
+                self.persistent.patterns.len(),
+                self.persistent.exact_approvals.len()
+            );
+            self.persistent.save(&self.persistent_path)?;
+            self.dirty = false;
+        }
+        Ok(())
+    }
+
+    /// Clear session approvals (keep persistent)
     pub fn clear(&mut self) {
-        self.approved.clear();
+        self.session_exact.clear();
+        self.session_patterns.clear();
+    }
+
+    /// Get reference to persistent store (for management commands)
+    pub fn persistent_store(&self) -> &PersistentPatternStore {
+        &self.persistent
+    }
+
+    /// Get mutable reference to persistent store (for management commands)
+    pub fn persistent_store_mut(&mut self) -> &mut PersistentPatternStore {
+        self.dirty = true; // Assume any mutation makes it dirty
+        &mut self.persistent
+    }
+
+    /// Remove a pattern or approval by ID
+    pub fn remove_by_id(&mut self, id: &str) -> bool {
+        let removed = self.persistent.remove(id);
+        if removed {
+            self.dirty = true;
+        }
+        removed
+    }
+
+    /// Clear all persistent patterns and approvals
+    pub fn clear_persistent(&mut self) {
+        self.persistent = PersistentPatternStore::default();
+        self.dirty = true;
     }
 }
 
@@ -50,28 +183,67 @@ pub struct ToolExecutor {
 }
 
 impl ToolExecutor {
-    /// Create new tool executor
-    pub fn new(registry: ToolRegistry, permissions: PermissionManager) -> Self {
-        Self {
+    /// Create new tool executor with persistent patterns path
+    pub fn new(
+        registry: ToolRegistry,
+        permissions: PermissionManager,
+        patterns_path: PathBuf,
+    ) -> Result<Self> {
+        Ok(Self {
             registry,
             permissions,
-            confirmation_cache: ToolConfirmationCache::new(),
-        }
+            confirmation_cache: ToolConfirmationCache::new(patterns_path)?,
+        })
     }
 
-    /// Check if a tool signature is pre-approved
-    pub fn is_pre_approved(&self, sig: &ToolSignature) -> bool {
+    /// Check if a tool signature is pre-approved (returns approval source)
+    pub fn is_approved(&mut self, sig: &ToolSignature) -> ApprovalSource {
         self.confirmation_cache.is_approved(sig)
     }
 
-    /// Add a tool signature to the approval cache
-    pub fn add_approval(&mut self, sig: ToolSignature) {
-        self.confirmation_cache.approve(sig);
+    /// Approve exact command for session only
+    pub fn approve_exact_session(&mut self, sig: ToolSignature) {
+        self.confirmation_cache.approve_exact_session(sig);
     }
 
-    /// Clear the approval cache (called on session end)
-    pub fn clear_approvals(&mut self) {
+    /// Approve pattern for session only
+    pub fn approve_pattern_session(&mut self, pattern: ToolPattern) {
+        self.confirmation_cache.approve_pattern_session(pattern);
+    }
+
+    /// Approve exact command persistently
+    pub fn approve_exact_persistent(&mut self, sig: ToolSignature) {
+        self.confirmation_cache.approve_exact_persistent(sig);
+    }
+
+    /// Approve pattern persistently
+    pub fn approve_pattern_persistent(&mut self, pattern: ToolPattern) {
+        self.confirmation_cache.approve_pattern_persistent(pattern);
+    }
+
+    /// Save patterns to disk if modified
+    pub fn save_patterns(&mut self) -> Result<()> {
+        self.confirmation_cache.save_if_dirty()
+    }
+
+    /// Clear session approvals (keep persistent)
+    pub fn clear_session_approvals(&mut self) {
         self.confirmation_cache.clear();
+    }
+
+    /// Get reference to persistent store (for management commands)
+    pub fn persistent_store(&self) -> &PersistentPatternStore {
+        self.confirmation_cache.persistent_store()
+    }
+
+    /// Remove a pattern or approval by ID
+    pub fn remove_pattern(&mut self, id: &str) -> bool {
+        self.confirmation_cache.remove_by_id(id)
+    }
+
+    /// Clear all persistent patterns and approvals
+    pub fn clear_persistent_patterns(&mut self) {
+        self.confirmation_cache.clear_persistent();
     }
 
     /// Execute a single tool use
@@ -285,7 +457,9 @@ mod tests {
                 .with_default_rule(crate::tools::permissions::PermissionRule::Deny)
         };
 
-        ToolExecutor::new(registry, permissions)
+        // Use temp path for tests
+        let temp_path = std::env::temp_dir().join("shammah_test_patterns.json");
+        ToolExecutor::new(registry, permissions, temp_path).expect("Failed to create test executor")
     }
 
     #[tokio::test]
@@ -368,7 +542,8 @@ mod tests {
 
     #[test]
     fn test_confirmation_cache() {
-        let mut cache = ToolConfirmationCache::new();
+        let temp_path = std::env::temp_dir().join("test_cache_patterns.json");
+        let mut cache = ToolConfirmationCache::new(temp_path).expect("Failed to create cache");
 
         let sig1 = ToolSignature {
             tool_name: "bash".to_string(),
@@ -381,23 +556,23 @@ mod tests {
         };
 
         // Initially, nothing is approved
-        assert!(!cache.is_approved(&sig1));
-        assert!(!cache.is_approved(&sig2));
+        assert_eq!(cache.is_approved(&sig1), ApprovalSource::NotApproved);
+        assert_eq!(cache.is_approved(&sig2), ApprovalSource::NotApproved);
 
-        // Approve sig1
-        cache.approve(sig1.clone());
-        assert!(cache.is_approved(&sig1));
-        assert!(!cache.is_approved(&sig2));
+        // Approve sig1 for session
+        cache.approve_exact_session(sig1.clone());
+        assert_eq!(cache.is_approved(&sig1), ApprovalSource::SessionExact);
+        assert_eq!(cache.is_approved(&sig2), ApprovalSource::NotApproved);
 
-        // Approve sig2
-        cache.approve(sig2.clone());
-        assert!(cache.is_approved(&sig1));
-        assert!(cache.is_approved(&sig2));
+        // Approve sig2 for session
+        cache.approve_exact_session(sig2.clone());
+        assert_eq!(cache.is_approved(&sig1), ApprovalSource::SessionExact);
+        assert_eq!(cache.is_approved(&sig2), ApprovalSource::SessionExact);
 
-        // Clear cache
+        // Clear session cache
         cache.clear();
-        assert!(!cache.is_approved(&sig1));
-        assert!(!cache.is_approved(&sig2));
+        assert_eq!(cache.is_approved(&sig1), ApprovalSource::NotApproved);
+        assert_eq!(cache.is_approved(&sig2), ApprovalSource::NotApproved);
     }
 
     #[test]
@@ -410,15 +585,15 @@ mod tests {
         };
 
         // Initially not approved
-        assert!(!executor.is_pre_approved(&sig));
+        assert_eq!(executor.is_approved(&sig), ApprovalSource::NotApproved);
 
-        // Add approval
-        executor.add_approval(sig.clone());
-        assert!(executor.is_pre_approved(&sig));
+        // Add session approval
+        executor.approve_exact_session(sig.clone());
+        assert_eq!(executor.is_approved(&sig), ApprovalSource::SessionExact);
 
-        // Clear approvals
-        executor.clear_approvals();
-        assert!(!executor.is_pre_approved(&sig));
+        // Clear session approvals
+        executor.clear_session_approvals();
+        assert_eq!(executor.is_approved(&sig), ApprovalSource::NotApproved);
     }
 
     #[test]

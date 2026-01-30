@@ -1,6 +1,6 @@
 // Interactive REPL with Claude Code-style interface
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     cursor,
     style::Stylize,
@@ -19,10 +19,11 @@ use crate::config::Config;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
 use crate::models::{ThresholdRouter, ThresholdValidator};
 use crate::router::{ForwardReason, RouteDecision, Router};
-use crate::tools::executor::{generate_tool_signature, ToolSignature};
+use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
     BashTool, GlobTool, GrepTool, ReadTool, SaveAndExecTool, WebFetchTool,
 };
+use crate::tools::patterns::ToolPattern;
 use crate::tools::types::{ToolDefinition, ToolInputSchema, ToolUse};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
@@ -33,7 +34,10 @@ use super::input::InputHandler;
 /// Result of a tool execution confirmation prompt
 pub enum ConfirmationResult {
     ApproveOnce,
-    ApproveAndRemember(ToolSignature),
+    ApproveExactSession(ToolSignature),
+    ApprovePatternSession(ToolPattern),
+    ApproveExactPersistent(ToolSignature),
+    ApprovePatternPersistent(ToolPattern),
     Deny,
 }
 
@@ -174,8 +178,31 @@ impl Repl {
         // Create permission manager (allow all for now)
         let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
 
+        // Determine patterns path
+        let patterns_path = dirs::home_dir()
+            .map(|home| home.join(".shammah").join("tool_patterns.json"))
+            .unwrap_or_else(|| PathBuf::from(".shammah/tool_patterns.json"));
+
         // Create tool executor
-        let tool_executor = ToolExecutor::new(tool_registry, permissions);
+        let tool_executor = ToolExecutor::new(tool_registry, permissions, patterns_path)
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: Failed to initialize tool executor: {}", e);
+                eprintln!("Tool pattern persistence may not work correctly");
+                // Create fresh registry and try with temp path
+                let mut fallback_registry = ToolRegistry::new();
+                fallback_registry.register(Box::new(ReadTool));
+                fallback_registry.register(Box::new(GlobTool));
+                fallback_registry.register(Box::new(GrepTool));
+                fallback_registry.register(Box::new(WebFetchTool::new()));
+                fallback_registry.register(Box::new(BashTool));
+                fallback_registry.register(Box::new(SaveAndExecTool::new()));
+                ToolExecutor::new(
+                    fallback_registry,
+                    PermissionManager::new().with_default_rule(PermissionRule::Allow),
+                    std::env::temp_dir().join("shammah_patterns_fallback.json"),
+                )
+                .expect("Failed to create fallback tool executor")
+            });
 
         if is_interactive {
             eprintln!(
@@ -234,15 +261,17 @@ impl Repl {
     }
 
     /// Save models to disk
-    fn save_models(&self) -> Result<()> {
+    fn save_models(&mut self) -> Result<()> {
         let Some(ref models_dir) = self.models_dir else {
+            // Still save patterns even if no models directory
+            self.tool_executor.save_patterns()?;
             return Ok(());
         };
 
         std::fs::create_dir_all(models_dir)?;
 
         if self.is_interactive {
-            print!("{}", "Saving models... ".dark_grey());
+            print!("{}", "Saving models and patterns... ".dark_grey());
             io::stdout().flush()?;
         }
 
@@ -252,6 +281,9 @@ impl Repl {
         // Save validator separately
         self.threshold_validator
             .save(models_dir.join("threshold_validator.json"))?;
+
+        // Save tool patterns
+        self.tool_executor.save_patterns()?;
 
         if self.is_interactive {
             println!("✓");
@@ -328,35 +360,64 @@ impl Repl {
                 let signature = generate_tool_signature(tool_use, &working_dir);
 
                 // Check if pre-approved in cache
-                if !self.tool_executor.is_pre_approved(&signature) && self.is_interactive {
-                    // Prompt for confirmation
-                    match self.confirm_tool_execution(tool_use, &signature)? {
-                        ConfirmationResult::ApproveOnce => {
-                            // Continue with execution
-                            if self.is_interactive {
-                                println!("  ✓ Approved");
-                            }
-                        }
-                        ConfirmationResult::ApproveAndRemember(sig) => {
-                            // Add to cache and continue
-                            self.tool_executor.add_approval(sig);
-                            if self.is_interactive {
-                                println!("  ✓ Approved (won't ask again this session)");
-                            }
-                        }
-                        ConfirmationResult::Deny => {
-                            // Skip this tool
-                            use crate::tools::types::ToolResult;
-                            let error_result = ToolResult::error(
-                                tool_use.id.clone(),
-                                "Tool execution denied by user".to_string(),
-                            );
-                            tool_results.push(error_result);
+                let approval_source = self.tool_executor.is_approved(&signature);
 
-                            if self.is_interactive {
-                                println!("    ✗ Denied by user");
+                match approval_source {
+                    ApprovalSource::NotApproved => {
+                        // Show prompt if interactive
+                        if self.is_interactive {
+                            match self.confirm_tool_execution(tool_use, &signature)? {
+                                ConfirmationResult::ApproveOnce => {
+                                    println!("  ✓ Approved");
+                                }
+                                ConfirmationResult::ApproveExactSession(sig) => {
+                                    self.tool_executor.approve_exact_session(sig);
+                                    println!("  ✓ Approved (remembered for session)");
+                                }
+                                ConfirmationResult::ApprovePatternSession(pattern) => {
+                                    println!("  ✓ Approved pattern: {} (session)", pattern.pattern);
+                                    self.tool_executor.approve_pattern_session(pattern);
+                                }
+                                ConfirmationResult::ApproveExactPersistent(sig) => {
+                                    self.tool_executor.approve_exact_persistent(sig);
+                                    println!("  ✓ Approved (saved permanently)");
+                                }
+                                ConfirmationResult::ApprovePatternPersistent(pattern) => {
+                                    println!(
+                                        "  ✓ Approved pattern: {} (saved permanently)",
+                                        pattern.pattern
+                                    );
+                                    self.tool_executor.approve_pattern_persistent(pattern);
+                                }
+                                ConfirmationResult::Deny => {
+                                    use crate::tools::types::ToolResult;
+                                    let error_result = ToolResult::error(
+                                        tool_use.id.clone(),
+                                        "Tool execution denied by user".to_string(),
+                                    );
+                                    tool_results.push(error_result);
+                                    println!("    ✗ Denied by user");
+                                    continue;
+                                }
                             }
-                            continue; // Skip to next tool
+                        }
+                    }
+                    ApprovalSource::SessionExact => {
+                        // Already approved, execute silently
+                    }
+                    ApprovalSource::SessionPattern(ref id) => {
+                        if self.is_interactive {
+                            println!("  ✓ Matched session pattern ({})", &id[..8]);
+                        }
+                    }
+                    ApprovalSource::PersistentExact => {
+                        if self.is_interactive {
+                            println!("  ✓ Matched saved approval");
+                        }
+                    }
+                    ApprovalSource::PersistentPattern(ref id) => {
+                        if self.is_interactive {
+                            println!("  ✓ Matched saved pattern ({})", &id[..8]);
                         }
                     }
                 }
@@ -734,35 +795,39 @@ impl Repl {
 
         println!();
         println!("  Do you want to proceed?");
-        println!("  ❯ 1. Yes");
-        println!(
-            "    2. Yes, and don't ask again for {}",
-            signature.context_key
-        );
-        println!("    3. No");
+        println!("  ❯ 1. Yes (once only)");
+        println!("    2. Yes, and remember exact command for this session");
+        println!("    3. Yes, and remember pattern for this session");
+        println!("    4. Yes, and ALWAYS allow this exact command");
+        println!("    5. Yes, and ALWAYS allow this pattern");
+        println!("    6. No (deny)");
         println!();
 
         // Get user input
         loop {
-            let input = if let Some(ref mut handler) = self.input_handler {
-                handler.read_line("  Choice [1-3]: ")?
-            } else {
-                // Fallback for non-interactive
-                print!("  Choice [1-3]: ");
-                io::stdout().flush()?;
-                let mut line = String::new();
-                io::stdin().read_line(&mut line)?;
-                Some(line.trim().to_string())
-            };
+            let input = self.read_choice("  Choice [1-6]: ")?;
 
             match input.as_deref() {
                 Some("1") | Some("y") | Some("yes") => {
                     return Ok(ConfirmationResult::ApproveOnce);
                 }
                 Some("2") => {
-                    return Ok(ConfirmationResult::ApproveAndRemember(signature.clone()));
+                    return Ok(ConfirmationResult::ApproveExactSession(signature.clone()));
                 }
-                Some("3") | Some("n") | Some("no") => {
+                Some("3") => {
+                    let pattern = self.build_pattern_from_signature(signature)?;
+                    return Ok(ConfirmationResult::ApprovePatternSession(pattern));
+                }
+                Some("4") => {
+                    return Ok(ConfirmationResult::ApproveExactPersistent(
+                        signature.clone(),
+                    ));
+                }
+                Some("5") => {
+                    let pattern = self.build_pattern_from_signature(signature)?;
+                    return Ok(ConfirmationResult::ApprovePatternPersistent(pattern));
+                }
+                Some("6") | Some("n") | Some("no") => {
                     return Ok(ConfirmationResult::Deny);
                 }
                 Some("") | None => {
@@ -770,11 +835,135 @@ impl Repl {
                     return Ok(ConfirmationResult::Deny);
                 }
                 _ => {
-                    println!("  Invalid choice. Please enter 1, 2, or 3.");
+                    println!("  Invalid choice. Please enter 1-6.");
                     continue;
                 }
             }
         }
+    }
+
+    /// Helper to read a single line choice
+    fn read_choice(&mut self, prompt: &str) -> Result<Option<String>> {
+        if let Some(ref mut handler) = self.input_handler {
+            handler.read_line(prompt)
+        } else {
+            print!("{}", prompt);
+            io::stdout().flush()?;
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            Ok(Some(line.trim().to_string()))
+        }
+    }
+
+    /// Build a pattern from a signature by prompting user for wildcard choices
+    fn build_pattern_from_signature(&mut self, signature: &ToolSignature) -> Result<ToolPattern> {
+        // Parse signature to extract components
+        let (command_part, dir_part) = self.parse_signature_components(signature);
+
+        println!();
+        println!("  What should the pattern match?");
+
+        // Generate options based on tool type
+        let options = if let (Some(ref cmd), Some(ref dir)) = (&command_part, &dir_part) {
+            let base_cmd = cmd.split_whitespace().next().unwrap_or(cmd);
+            vec![
+                format!("{} * in {}", base_cmd, dir),
+                format!("{} in *", cmd),
+                format!("{} * in *", base_cmd),
+            ]
+        } else if signature.tool_name == "read" {
+            // For read tool, offer path-based patterns
+            vec![
+                signature.context_key.clone(), // Exact file
+                format!("{}/**", Self::get_dir_from_context(&signature.context_key)),
+                format!("reading *"),
+            ]
+        } else {
+            // Generic patterns
+            vec![
+                signature.context_key.clone(),
+                format!("{} *", signature.tool_name),
+            ]
+        };
+
+        // Display options
+        for (i, opt) in options.iter().enumerate() {
+            if i == 0 {
+                println!("  ❯ {}. {}", i + 1, opt);
+            } else {
+                println!("    {}. {}", i + 1, opt);
+            }
+        }
+        println!();
+
+        loop {
+            let input = self.read_choice(&format!("  Choice [1-{}]: ", options.len()))?;
+
+            if let Some(choice) = input {
+                if let Ok(idx) = choice.parse::<usize>() {
+                    if idx > 0 && idx <= options.len() {
+                        let pattern_str = options[idx - 1].clone();
+                        return Ok(ToolPattern::new(
+                            pattern_str.clone(),
+                            signature.tool_name.clone(),
+                            format!("Auto-generated pattern: {}", pattern_str),
+                        ));
+                    }
+                }
+            }
+
+            println!("  Invalid choice. Please enter 1-{}.", options.len());
+        }
+    }
+
+    /// Parse signature context_key into command and directory components
+    fn parse_signature_components(
+        &self,
+        signature: &ToolSignature,
+    ) -> (Option<String>, Option<String>) {
+        match signature.tool_name.as_str() {
+            "bash" | "save_and_exec" => {
+                // Format: "command args in /dir"
+                if let Some(pos) = signature.context_key.rfind(" in ") {
+                    let command = signature.context_key[..pos].to_string();
+                    let dir = signature.context_key[pos + 4..].to_string();
+                    (Some(command), Some(dir))
+                } else {
+                    (Some(signature.context_key.clone()), None)
+                }
+            }
+            "read" => {
+                // Format: "reading /path/to/file"
+                if let Some(pos) = signature.context_key.find(' ') {
+                    let path = signature.context_key[pos + 1..].to_string();
+                    (None, Some(path))
+                } else {
+                    (None, Some(signature.context_key.clone()))
+                }
+            }
+            "grep" => {
+                // Format: "pattern 'text' in /dir"
+                if let Some(pos) = signature.context_key.rfind(" in ") {
+                    let pattern = signature.context_key[..pos].to_string();
+                    let dir = signature.context_key[pos + 4..].to_string();
+                    (Some(pattern), Some(dir))
+                } else {
+                    (Some(signature.context_key.clone()), None)
+                }
+            }
+            _ => (None, None),
+        }
+    }
+
+    /// Extract directory from a context string
+    fn get_dir_from_context(context: &str) -> String {
+        // For "reading /path/to/file.txt", return "/path/to"
+        if let Some(last_slash) = context.rfind('/') {
+            if last_slash > 0 {
+                return context[..last_slash].to_string();
+            }
+        }
+        ".".to_string()
     }
 
     /// Display tool parameters in user-friendly format
