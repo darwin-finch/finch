@@ -19,6 +19,7 @@ use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingT
 use crate::models::{ThresholdRouter, ThresholdValidator};
 use crate::patterns::PatternLibrary;
 use crate::router::{ForwardReason, RouteDecision, Router};
+use crate::tools::types::{ToolDefinition, ToolInputSchema};
 
 use super::commands::{handle_command, Command};
 use super::conversation::ConversationHistory;
@@ -27,6 +28,58 @@ use super::input::InputHandler;
 /// Get current terminal width, or default to 80 if not a TTY
 fn terminal_width() -> usize {
     terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+}
+
+/// Create tool definitions for Claude API
+///
+/// These are placeholder definitions until actual tool implementations are ready.
+/// Claude will know these tools exist and can invoke them, but execution is not yet implemented.
+fn create_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        // Bash command execution
+        ToolDefinition {
+            name: "bash".to_string(),
+            description: "Execute bash commands. Use this for terminal operations like git, npm, docker, file operations, etc.".to_string(),
+            input_schema: ToolInputSchema::simple(vec![
+                ("command", "The bash command to execute"),
+                ("description", "A brief description of what this command does"),
+            ]),
+        },
+        // Read file contents
+        ToolDefinition {
+            name: "read".to_string(),
+            description: "Read the contents of a file from the filesystem.".to_string(),
+            input_schema: ToolInputSchema::simple(vec![
+                ("file_path", "Absolute path to the file to read"),
+            ]),
+        },
+        // Web fetch
+        ToolDefinition {
+            name: "web_fetch".to_string(),
+            description: "Fetch content from a URL. Use this to retrieve information from websites or APIs.".to_string(),
+            input_schema: ToolInputSchema::simple(vec![
+                ("url", "The URL to fetch"),
+                ("prompt", "What information to extract from the fetched content"),
+            ]),
+        },
+        // Grep/search
+        ToolDefinition {
+            name: "grep".to_string(),
+            description: "Search for patterns in files using ripgrep. Returns matching lines.".to_string(),
+            input_schema: ToolInputSchema::simple(vec![
+                ("pattern", "The regex pattern to search for"),
+                ("path", "Directory or file to search in (optional, defaults to current directory)"),
+            ]),
+        },
+        // Glob/find files
+        ToolDefinition {
+            name: "glob".to_string(),
+            description: "Find files matching a glob pattern (e.g., \"**/*.rs\", \"src/**/*.ts\").".to_string(),
+            input_schema: ToolInputSchema::simple(vec![
+                ("pattern", "The glob pattern to match files against"),
+            ]),
+        },
+    ]
 }
 
 pub struct Repl {
@@ -476,9 +529,26 @@ impl Repl {
                     }
 
                     local_response = Some(local_resp);
-                    // Use full conversation context
-                    let request = MessageRequest::with_context(self.conversation.get_messages());
-                    claude_response = self.claude_client.send_message(&request).await?.text();
+                    // Use full conversation context with tool definitions
+                    let request = MessageRequest::with_context(self.conversation.get_messages())
+                        .with_tools(create_tool_definitions());
+                    let response = self.claude_client.send_message(&request).await?;
+
+                    // Check for tool uses
+                    if response.has_tool_uses() {
+                        let tool_uses = response.tool_uses();
+                        if self.is_interactive {
+                            println!("🔧 Tool uses detected:");
+                            for tool_use in &tool_uses {
+                                println!("  → {}: {}", tool_use.name, serde_json::to_string(&tool_use.input)?);
+                            }
+                            println!("⚠️  Note: Tool execution not yet implemented. Results will be empty.");
+                        }
+                        claude_response = response.text();
+                    } else {
+                        claude_response = response.text();
+                    }
+
                     routing_decision_str = "forward_validation_failed".to_string();
                     forward_reason = Some("quality_too_low".to_string());
                 }
@@ -503,16 +573,31 @@ impl Repl {
                     }
                 }
 
-                // Use full conversation context
-                let request = MessageRequest::with_context(self.conversation.get_messages());
-                claude_response = self.claude_client.send_message(&request).await?.text();
-                routing_decision_str = "forward".to_string();
-                forward_reason = Some(reason.as_str().to_string());
+                // Use full conversation context with tool definitions
+                let request = MessageRequest::with_context(self.conversation.get_messages())
+                    .with_tools(create_tool_definitions());
+                let response = self.claude_client.send_message(&request).await?;
 
                 let elapsed = start_time.elapsed().as_millis();
                 if self.is_interactive {
                     println!("✓ Received response ({}ms)", elapsed);
                 }
+
+                // Check for tool uses
+                if response.has_tool_uses() {
+                    let tool_uses = response.tool_uses();
+                    if self.is_interactive {
+                        println!("🔧 Tool uses detected:");
+                        for tool_use in &tool_uses {
+                            println!("  → {}: {}", tool_use.name, serde_json::to_string(&tool_use.input)?);
+                        }
+                        println!("⚠️  Note: Tool execution not yet implemented. Results will be empty.");
+                    }
+                }
+
+                claude_response = response.text();
+                routing_decision_str = "forward".to_string();
+                forward_reason = Some(reason.as_str().to_string());
             }
         };
 
