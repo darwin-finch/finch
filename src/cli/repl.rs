@@ -20,7 +20,7 @@ use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingT
 use crate::models::{ThresholdRouter, ThresholdValidator};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::implementations::{
-    BashTool, GlobTool, GrepTool, ReadTool, RestartTool, WebFetchTool,
+    BashTool, GlobTool, GrepTool, ReadTool, SaveAndExecTool, WebFetchTool,
 };
 use crate::tools::types::{ToolDefinition, ToolInputSchema};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
@@ -83,6 +83,21 @@ fn create_tool_definitions() -> Vec<ToolDefinition> {
                 ("pattern", "The glob pattern to match files against"),
             ]),
         },
+        // Save and exec - general-purpose session preservation + command execution
+        ToolDefinition {
+            name: "save_and_exec".to_string(),
+            description: "Save conversation and model state, then execute any shell command. \
+                         Session is saved to ~/.shammah/restart_state.json (also in $SHAMMAH_SESSION_FILE). \
+                         Common examples:\n\
+                         - Simple restart: './target/release/shammah --restore-session ~/.shammah/restart_state.json'\n\
+                         - With prompt: './target/release/shammah --restore-session ~/.shammah/restart_state.json --initial-prompt \"test\"'\n\
+                         - Build first: 'cargo build --release && ./target/release/shammah --restore-session ~/.shammah/restart_state.json'\n\
+                         - Any command: 'python my_script.py'".to_string(),
+            input_schema: ToolInputSchema::simple(vec![
+                ("reason", "Why you're executing this command"),
+                ("command", "Shell command to execute (supports &&, ||, pipes, etc.)"),
+            ]),
+        },
     ]
 }
 
@@ -102,6 +117,7 @@ pub struct Repl {
     // UI state
     is_interactive: bool,
     streaming_enabled: bool,
+    debug_enabled: bool,
     // Readline input handler
     input_handler: Option<InputHandler>,
     // Conversation history
@@ -145,7 +161,7 @@ impl Repl {
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
-        tool_registry.register(Box::new(RestartTool::new()));
+        tool_registry.register(Box::new(SaveAndExecTool::new()));
 
         // Create permission manager (allow all for now)
         let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
@@ -173,6 +189,7 @@ impl Repl {
             tool_executor,
             is_interactive,
             streaming_enabled,
+            debug_enabled: false,
             input_handler,
             conversation: ConversationHistory::new(),
         }
@@ -298,7 +315,23 @@ impl Repl {
                     println!("  → {}", tool_use.name);
                 }
 
-                let result = self.tool_executor.execute_tool(tool_use).await?;
+                // Create save function that captures necessary state
+                let models_dir = self.models_dir.clone();
+                let router_ref = &self.router;
+                let validator_ref = &self.threshold_validator;
+                let save_fn = || -> Result<()> {
+                    if let Some(ref dir) = models_dir {
+                        std::fs::create_dir_all(dir)?;
+                        router_ref.save(dir.join("threshold_router.json"))?;
+                        validator_ref.save(dir.join("threshold_validator.json"))?;
+                    }
+                    Ok(())
+                };
+
+                let result = self
+                    .tool_executor
+                    .execute_tool(tool_use, Some(&self.conversation), Some(save_fn))
+                    .await?;
 
                 // Display tool result to user (Phase 1: Visibility)
                 if self.is_interactive {
@@ -460,6 +493,29 @@ impl Repl {
         Ok(full_response)
     }
 
+    /// Restore conversation from a saved state
+    pub fn restore_conversation(&mut self, history: ConversationHistory) {
+        self.conversation = history;
+    }
+
+    /// Run REPL with an optional initial prompt
+    pub async fn run_with_initial_prompt(&mut self, initial_prompt: Option<String>) -> Result<()> {
+        if let Some(prompt) = initial_prompt {
+            // Process initial prompt before starting interactive loop
+            if self.is_interactive {
+                println!("\nProcessing initial prompt: \"{}\"", prompt);
+                println!();
+            }
+            let response = self.process_query(&prompt).await?;
+            if self.is_interactive {
+                println!("{}", response);
+            }
+        }
+
+        // Continue with normal REPL loop
+        self.run().await
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         if self.is_interactive {
             // Fancy startup for interactive mode
@@ -579,6 +635,7 @@ impl Repl {
                             &self.metrics_logger,
                             Some(&self.router), // CHANGED: pass router instead of threshold_router
                             Some(&self.threshold_validator),
+                            &mut self.debug_enabled,
                         )?;
                         println!("{}", output);
                         continue;

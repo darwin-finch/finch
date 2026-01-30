@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Response comparison data for training effectiveness
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResponseComparison {
     /// Local response if a local attempt was made
     pub local_response: Option<String>,
@@ -28,6 +28,7 @@ pub struct RequestMetric {
     pub forward_reason: Option<String>,
     pub response_time_ms: u64,
     /// Response comparison data
+    #[serde(default)]
     pub comparison: ResponseComparison,
     /// Router confidence scores
     pub router_confidence: Option<f64>,

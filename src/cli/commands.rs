@@ -34,12 +34,19 @@ pub fn handle_command(
     metrics_logger: &MetricsLogger,
     router: Option<&Router>, // CHANGED: Router instead of ThresholdRouter
     validator: Option<&ThresholdValidator>,
+    debug_enabled: &mut bool,
 ) -> Result<String> {
     match command {
         Command::Help => Ok(format_help()),
         Command::Quit => Ok("Goodbye!".to_string()),
         Command::Metrics => format_metrics(metrics_logger),
-        Command::Debug => Ok("Debug mode toggled".to_string()),
+        Command::Debug => {
+            *debug_enabled = !*debug_enabled;
+            Ok(format!(
+                "Debug mode: {}",
+                if *debug_enabled { "ON" } else { "OFF" }
+            ))
+        }
         Command::Training => format_training(router, validator),
         Command::Clear => Ok("".to_string()), // Handled in REPL directly
     }
