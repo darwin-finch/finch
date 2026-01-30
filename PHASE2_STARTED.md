@@ -38,31 +38,29 @@ Phase 2 implementation has begun. We're building the 3-model ensemble with onlin
 
 **Done:**
 - ✅ Decided on Candle (Rust ML framework)
-- ✅ Added Candle dependencies
+- ✅ Added Candle dependencies (candle-core, candle-nn, candle-transformers, tokenizers)
 - ✅ Created models module structure
-- ✅ Started Router model implementation
+- ✅ Implemented Router model (binary classifier, compiles successfully)
+- ✅ Implemented Generator model (autoregressive decoder, compiles successfully)
+- ✅ Implemented Validator model (binary classifier, compiles successfully)
+- ✅ Fixed all Candle API compilation errors
+- ✅ Created training framework design (docs/TRAINING_FRAMEWORK.md)
+- ✅ All three models include:
+  - Forward pass implementations
+  - Binary decision/generation methods
+  - Online learning update methods (placeholders)
+  - Model persistence (save/load) interfaces
+  - Unit tests
 
 **Next Steps:**
 
-1. **Fix Router Implementation**
-   - Correct Candle API usage
-   - Test forward pass
-   - Test backward pass (online learning)
-   - Model persistence (save/load)
+1. **Implement Proper Autograd/Backward Pass**
+   - Candle doesn't have built-in autograd like PyTorch
+   - Need to implement gradient computation manually or use alternative approach
+   - Consider using Candle's VarMap tracking for parameter updates
+   - Implement SGD/Adam optimizer integration
 
-2. **Implement Generator Model**
-   - Transformer decoder architecture
-   - Text generation (autoregressive)
-   - Online learning from Claude responses
-   - Model persistence
-
-3. **Implement Validator Model**
-   - Similar to Router (binary classifier)
-   - Takes query + response as input
-   - Online learning from quality assessments
-   - Model persistence
-
-4. **Tokenization**
+2. **Tokenization**
    - Use `tokenizers` crate
    - BPE or WordPiece tokenizer
    - Vocab size: 50k tokens
@@ -137,19 +135,20 @@ src/models/
 
 ## Current Blockers
 
-1. **Candle API:** Need to learn correct API usage (compilation errors)
-2. **Testing:** Need example data to test models
-3. **Integration:** Need to wire up models to existing Phase 1 code
+1. **Gradient Computation:** Candle doesn't have PyTorch-style autograd - need to implement backward passes manually or find alternative approach
+2. **Tokenization:** Need to integrate the `tokenizers` crate for BPE tokenization
+3. **Testing:** Need real data to test models and verify training works
+4. **Integration:** Need to wire up models to existing Phase 1 code
 
 ## Next Immediate Steps
 
-1. Fix Candle API usage in Router model
-2. Write unit tests for Router
-3. Test forward pass with dummy data
-4. Test online learning (backward pass + weight update)
-5. Model save/load functionality
+1. Implement tokenization system using `tokenizers` crate
+2. Implement proper gradient computation or find Candle-compatible training approach
+3. Test forward passes with real tokenized data
+4. Implement complete training loop as specified in docs/TRAINING_FRAMEWORK.md
+5. Wire up models to Phase 1 router infrastructure
 
 ---
 
-**Status:** Phase 2 implementation in progress
-**Last Updated:** 2026-01-30
+**Status:** Phase 2 models implemented and compiling successfully. Next: tokenization and training loop.
+**Last Updated:** 2026-01-29

@@ -1,7 +1,7 @@
 // Common model utilities and types
 
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 use std::path::Path;
 
 /// Common model configuration

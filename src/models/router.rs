@@ -2,8 +2,8 @@
 // Decides: forward to Claude (0) or try local (1)
 
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor, Var};
-use candle_nn::{embedding, linear, ops, Embedding, Linear, Optimizer, VarBuilder, VarMap};
+use candle_core::{DType, Device, Module, Tensor};
+use candle_nn::{embedding, linear, Embedding, Linear, Optimizer, VarBuilder, VarMap};
 use std::path::Path;
 
 use super::common::{get_device, ModelConfig, Saveable};
@@ -61,7 +61,7 @@ impl RouterModel {
         let logit = self.classifier.forward(&pooled)?;
 
         // Sigmoid → probability
-        ops::sigmoid(&logit)
+        sigmoid(&logit)
     }
 
     /// Predict binary decision: 0 (forward) or 1 (try local)
@@ -182,11 +182,11 @@ impl MultiHeadAttention {
         let scores = q.matmul(&k.t()?)?;
         let scale = (self.head_dim as f64).sqrt();
         let scores = (scores / scale)?;
-        let attn_weights = ops::softmax(&scores, 1)?;
+        let attn_weights = candle_nn::ops::softmax(&scores, 1)?;
 
         // Apply attention to values
         let attn_out = attn_weights.matmul(&v)?;
-        self.o_proj.forward(&attn_out)
+        Ok(self.o_proj.forward(&attn_out)?)
     }
 }
 
@@ -207,15 +207,15 @@ impl FeedForward {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.linear1.forward(x)?;
-        let x = ops::gelu(&x)?;
-        self.linear2.forward(&x)
+        let x = gelu(&x)?;
+        Ok(self.linear2.forward(&x)?)
     }
 }
 
 /// Layer normalization
 struct LayerNorm {
-    weight: Var,
-    bias: Var,
+    weight: Tensor,
+    bias: Tensor,
     eps: f64,
 }
 
@@ -234,8 +234,8 @@ impl LayerNorm {
         let mean = x.mean_keepdim(x.dims().len() - 1)?;
         let var = x.var_keepdim(x.dims().len() - 1)?;
         let x_norm = ((x - mean)? / (var + self.eps)?.sqrt()?)?;
-        let x_norm = (x_norm * self.weight.as_tensor())?;
-        x_norm + self.bias.as_tensor()
+        let x_norm = (x_norm * &self.weight)?;
+        Ok((x_norm + &self.bias)?)
     }
 }
 
@@ -246,9 +246,33 @@ fn binary_cross_entropy(pred: &Tensor, target: &Tensor) -> Result<Tensor> {
 
     let term1 = (target * pred_clamped.log()?)?;
     let term2 = ((&one - target)? * (&one - &pred_clamped)?.log()?)?;
-    let loss = -((term1 + term2)?.mean_all()?);
+    let loss_sum = (term1 + term2)?.mean_all()?;
+
+    // Negate by multiplying by -1
+    let neg_one = Tensor::new(&[-1.0f32], pred.device())?;
+    let loss = (loss_sum * neg_one)?;
 
     Ok(loss)
+}
+
+/// Sigmoid activation
+fn sigmoid(x: &Tensor) -> Result<Tensor> {
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    let one = Tensor::new(&[1.0f32], x.device())?;
+    let neg_x = (x * Tensor::new(&[-1.0f32], x.device())?)?;
+    let exp_neg_x = neg_x.exp()?;
+    let denominator = (&one + exp_neg_x)?;
+    Ok(one.broadcast_div(&denominator)?)
+}
+
+/// GELU activation (Gaussian Error Linear Unit)
+fn gelu(x: &Tensor) -> Result<Tensor> {
+    // gelu(x) = x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+    // Simplified approximation: x * sigmoid(1.702 * x)
+    let coef = Tensor::new(&[1.702f32], x.device())?;
+    let sig_input = (x * coef)?;
+    let sig = sigmoid(&sig_input)?;
+    Ok((x * sig)?)
 }
 
 impl Saveable for RouterModel {
@@ -257,7 +281,7 @@ impl Saveable for RouterModel {
         Ok(())
     }
 
-    fn load(path: &Path) -> Result<Self> {
+    fn load(_path: &Path) -> Result<Self> {
         // TODO: Implement proper loading
         unimplemented!("Router model loading not yet implemented")
     }
