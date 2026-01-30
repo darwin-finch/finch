@@ -403,9 +403,12 @@ This document is for helping AI assistants understand the project - it's a "map"
 
 ## Current Project Phase
 
-**Phase**: Phase 1 MVP Complete ✅
-**Status**: Infrastructure working, collecting training data
-**Next Steps**: Collect 1000+ queries, then begin Phase 2 (train actual models)
+**Phase**: Phase 2a - Threshold Models ✅
+**Status**: Threshold-based router and validator implemented, learning from query 1
+**Next Steps**:
+- Deploy threshold models in production to collect data
+- Train neural networks once sufficient data collected (500+ queries)
+- Transition to hybrid approach (threshold + neural)
 
 ### What's Done (Phase 1)
 
@@ -422,22 +425,36 @@ This document is for helping AI assistants understand the project - it's a "map"
 - 100% crisis detection
 - Ready to collect real training data
 
-### Understanding Phase 1 Templates
+### What's Done (Phase 2a - Threshold Models)
 
-The current pattern matching and template responses are **placeholders** demonstrating the 3-model architecture:
+- ✅ **ThresholdRouter:** Statistics-based routing using query categorization
+  - Tracks success rates per category (Greeting, Definition, HowTo, etc.)
+  - Adaptive confidence thresholds (starts 0.95, adjusts based on performance)
+  - Learns from query 1 (no cold start period)
+  - Fully interpretable decisions
+- ✅ **ThresholdValidator:** Rule-based quality validation using heuristics
+  - 8 quality signals (TooShort, Repetitive, AnswersQuestion, etc.)
+  - Learns signal correlations over time
+  - Conservative at start (forces Claude learning for first 10 queries)
+- ✅ **HybridRouter:** Smooth transition from threshold to neural
+  - Phase 1 (queries 1-50): Pure threshold-based
+  - Phase 2 (queries 51-200): Hybrid with gradually increasing neural weight
+  - Phase 3 (queries 201+): Primarily neural with threshold safety checks
+- ✅ **Neural Network Models:** Basic implementations (Router, Generator, Validator)
+  - Candle-based training with SGD optimizer
+  - Online learning after each query
+  - Tests verify loss reduction and pattern learning
+- ✅ **Examples:** threshold_demo.rs, hybrid_demo.rs demonstrate immediate learning
 
-- **Pattern matching** → Will become Router Model (neural network)
-- **Template responses** → Will become Generator Model (custom LLM)
-- **Crisis detection** → Will become Validator Model (quality gate)
+**Key Innovation:**
+The threshold models provide **immediate value** from query 1, unlike neural networks that need 200+ queries for cold start. This hybrid approach combines interpretability and instant learning (threshold) with adaptive power (neural).
 
-They prove the infrastructure works while collecting training data for real models in Phase 2.
+### What's NOT Done Yet (Phase 2b+)
 
-### What's NOT Done Yet (Phase 2+)
-
-- ❌ No actual neural networks (using templates)
-- ❌ No model training (need to collect data first)
+- ❌ No production deployment yet
+- ❌ Neural networks not trained on real data (random weights)
+- ❌ Generator model needs actual LLM (currently placeholder)
 - ❌ No uncertainty estimation
-- ❌ No learning engine
 - ❌ No Apple Neural Engine optimization
 
 ## Working with This Project
