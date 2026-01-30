@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
 use crate::models::{ThresholdRouter, ThresholdValidator};
 use crate::router::{ForwardReason, RouteDecision, Router};
-use crate::tools::implementations::{BashTool, GlobTool, GrepTool, ReadTool, WebFetchTool};
+use crate::tools::implementations::{BashTool, GlobTool, GrepTool, ReadTool, RestartTool, WebFetchTool};
 use crate::tools::types::{ToolDefinition, ToolInputSchema};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
@@ -145,6 +145,7 @@ impl Repl {
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
+        tool_registry.register(Box::new(RestartTool::new()));
 
         // Create permission manager (allow all for now)
         let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
@@ -309,7 +310,11 @@ impl Repl {
                 tool_result_text.push_str(&format!("Result:\n{}\n\n", result.content));
             }
 
-            // Add tool results to conversation as a user message
+            // Important: Add Claude's tool-use response to conversation first
+            // This maintains the user/assistant alternation required by the API
+            self.conversation.add_assistant_message(current_response.text());
+
+            // Then add tool results as a user message
             self.conversation.add_user_message(tool_result_text);
 
             // Re-invoke Claude with tool results
@@ -675,18 +680,16 @@ impl Repl {
                 let request = MessageRequest::with_context(self.conversation.get_messages())
                     .with_tools(create_tool_definitions());
 
-                // Use streaming if enabled and in interactive mode
-                // (For first version, disable streaming when tools might be used)
-                if self.streaming_enabled && self.is_interactive {
-                    // Try streaming first
+                // Disable streaming for now - it doesn't properly handle tool uses
+                // TODO: Parse SSE stream for tool_use blocks to enable streaming with tools
+                let use_streaming = false; // self.streaming_enabled && self.is_interactive;
+
+                if use_streaming {
+                    // Streaming path (disabled until tool detection added)
                     let rx = self.claude_client.send_message_stream(&request).await?;
                     claude_response = self.display_streaming_response(rx).await?;
-
-                    // Note: Streaming doesn't detect tool uses yet
-                    // If Claude returns tool use in stream, we'd need to re-parse
-                    // For now, streaming is best for simple queries without tools
                 } else {
-                    // Use non-streaming (supports tool use detection)
+                    // Non-streaming path (supports tool use detection)
                     let response = self.claude_client.send_message(&request).await?;
 
                     let elapsed = start_time.elapsed().as_millis();

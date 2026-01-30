@@ -2,8 +2,10 @@
 // Shows immediate improvement without neural network training overhead
 
 use anyhow::Result;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 /// Query category for pattern matching
@@ -269,10 +271,86 @@ impl ThresholdRouter {
     }
 
     /// Save router state to disk
+    /// Save router state with concurrent-safe merging
+    /// Acquires exclusive lock, merges with existing state, writes atomically
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        let path = path.as_ref();
+
+        // Create lock file
+        let lock_path = path.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)?;
+
+        // Acquire exclusive lock (blocks until available)
+        lock_file.lock_exclusive()?;
+
+        // Merge with existing state if file exists
+        let to_save = if path.exists() {
+            match Self::load(path) {
+                Ok(existing) => self.merge_with(&existing),
+                Err(_) => {
+                    // If load fails, just save current state
+                    // Create a copy by serializing and deserializing
+                    let json = serde_json::to_string(self)?;
+                    serde_json::from_str(&json)?
+                }
+            }
+        } else {
+            // No existing file, serialize/deserialize to get a copy
+            let json = serde_json::to_string(self)?;
+            serde_json::from_str(&json)?
+        };
+
+        // Write atomically (write to temp, then rename)
+        let temp_path = path.with_extension("tmp");
+        let json = serde_json::to_string_pretty(&to_save)?;
+        std::fs::write(&temp_path, json)?;
+        std::fs::rename(temp_path, path)?;
+
+        // Lock automatically released when lock_file drops
         Ok(())
+    }
+
+    /// Merge this router's statistics with another router
+    fn merge_with(&self, other: &Self) -> Self {
+        let mut merged = Self::new();
+
+        // Merge category statistics
+        for (category, my_stats) in &self.category_stats {
+            let other_stats = other.category_stats.get(category);
+            let merged_stats = if let Some(other_stats) = other_stats {
+                CategoryStats {
+                    local_attempts: my_stats.local_attempts + other_stats.local_attempts,
+                    successes: my_stats.successes + other_stats.successes,
+                    failures: my_stats.failures + other_stats.failures,
+                    // Average the confidence scores
+                    avg_confidence: (my_stats.avg_confidence + other_stats.avg_confidence) / 2.0,
+                }
+            } else {
+                my_stats.clone()
+            };
+            merged.category_stats.insert(*category, merged_stats);
+        }
+
+        // Add categories that only exist in other
+        for (category, other_stats) in &other.category_stats {
+            if !merged.category_stats.contains_key(category) {
+                merged.category_stats.insert(*category, other_stats.clone());
+            }
+        }
+
+        // Merge global statistics
+        merged.total_queries = self.total_queries + other.total_queries;
+        merged.total_local_attempts = self.total_local_attempts + other.total_local_attempts;
+        merged.total_successes = self.total_successes + other.total_successes;
+
+        // Average the confidence threshold
+        merged.confidence_threshold =
+            (self.confidence_threshold + other.confidence_threshold) / 2.0;
+
+        merged
     }
 
     /// Load router state from disk

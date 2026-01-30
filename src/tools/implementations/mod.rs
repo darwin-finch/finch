@@ -13,9 +13,13 @@ pub mod web_fetch;
 // Command execution
 pub mod bash;
 
+// Self-improvement
+pub mod restart;
+
 // Re-exports for convenience
 pub use bash::BashTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
+pub use restart::RestartTool;
 pub use web_fetch::WebFetchTool;
