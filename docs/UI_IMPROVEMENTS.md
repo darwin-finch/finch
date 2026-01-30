@@ -61,12 +61,12 @@ Training: 2 queries | Local: 50% | Forward: 50% | Success: 50% | Confidence: 0.9
 ## Key Features
 
 ### Claude Code-Style Prompt
-- **Separator lines** above and below each query (70 chars)
+- **Dynamic separator lines** above and below each query (adapts to terminal width)
 - **"> " prompt** instead of "You: "
 - **Clean visual separation** between queries
 
 ### Real-Time Training Status
-Displayed below the prompt after each interaction:
+**Single line** status displayed below prompt after each interaction (truncates to fit terminal width):
 
 | Metric | Description | Example |
 |--------|-------------|---------|
