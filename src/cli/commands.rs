@@ -13,6 +13,7 @@ pub enum Command {
     Patterns,
     Debug,
     Training,
+    Clear,
 }
 
 impl Command {
@@ -24,6 +25,7 @@ impl Command {
             "/patterns" => Some(Command::Patterns),
             "/debug" => Some(Command::Debug),
             "/training" => Some(Command::Training),
+            "/clear" | "/reset" => Some(Command::Clear),
             _ => None,
         }
     }
@@ -43,6 +45,7 @@ pub fn handle_command(
         Command::Patterns => Ok(format_patterns(pattern_library)),
         Command::Debug => Ok("Debug mode toggled".to_string()),
         Command::Training => format_training(router, validator),
+        Command::Clear => Ok("".to_string()), // Handled in REPL directly
     }
 }
 
@@ -53,6 +56,7 @@ fn format_help() -> String {
   /metrics   - Display statistics
   /patterns  - List all patterns
   /training  - Show detailed training statistics
+  /clear     - Clear conversation history (start fresh)
   /debug     - Toggle debug output
 
 Type any question to get started!"#

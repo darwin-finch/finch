@@ -21,6 +21,7 @@ use crate::patterns::PatternLibrary;
 use crate::router::{ForwardReason, RouteDecision, Router};
 
 use super::commands::{handle_command, Command};
+use super::conversation::ConversationHistory;
 use super::input::InputHandler;
 
 /// Get current terminal width, or default to 80 if not a TTY
@@ -45,6 +46,8 @@ pub struct Repl {
     is_interactive: bool,
     // Readline input handler
     input_handler: Option<InputHandler>,
+    // Conversation history
+    conversation: ConversationHistory,
 }
 
 impl Repl {
@@ -91,6 +94,7 @@ impl Repl {
             models_dir,
             is_interactive,
             input_handler,
+            conversation: ConversationHistory::new(),
         }
     }
 
@@ -286,6 +290,15 @@ impl Repl {
                         }
                         break;
                     }
+                    Command::Clear => {
+                        self.conversation.clear();
+                        println!("Conversation history cleared. Starting fresh.");
+                        if self.is_interactive {
+                            println!();
+                            self.print_status_line();
+                        }
+                        continue;
+                    }
                     _ => {
                         let output = handle_command(
                             command,
@@ -354,26 +367,35 @@ impl Repl {
         let quality_avg = self.training_trends.avg_quality();
         let similarity_avg = self.training_trends.avg_similarity();
 
-        // Build single-line status string with training effectiveness
+        // Build single-line status string with training effectiveness and conversation context
+        let turn_count = self.conversation.turn_count();
+        let context_indicator = if turn_count > 0 {
+            format!(" | Context: {} turns", turn_count)
+        } else {
+            String::new()
+        };
+
         let status = if self.training_trends.measurement_count() > 0 {
             format!(
-                "Training: {} queries | Local: {:.0}% | Success: {:.0}% | Quality: {:.2} | Similarity: {:.2} | Confidence: {:.2}",
+                "Training: {} queries | Local: {:.0}% | Success: {:.0}% | Quality: {:.2} | Similarity: {:.2} | Confidence: {:.2}{}",
                 router_stats.total_queries,
                 local_pct,
                 success_pct,
                 quality_avg,
                 similarity_avg,
-                router_stats.confidence_threshold
+                router_stats.confidence_threshold,
+                context_indicator
             )
         } else {
             // Fallback if no training data yet
             format!(
-                "Training: {} queries | Local: {:.0}% | Success: {:.0}% | Confidence: {:.2} | Approval: {:.0}%",
+                "Training: {} queries | Local: {:.0}% | Success: {:.0}% | Confidence: {:.2} | Approval: {:.0}%{}",
                 router_stats.total_queries,
                 local_pct,
                 success_pct,
                 router_stats.confidence_threshold,
-                validator_stats.approval_rate * 100.0
+                validator_stats.approval_rate * 100.0,
+                context_indicator
             )
         };
 
@@ -391,6 +413,9 @@ impl Repl {
 
     async fn process_query(&mut self, query: &str) -> Result<String> {
         let start_time = Instant::now();
+
+        // Add user message to conversation history
+        self.conversation.add_user_message(query.to_string());
 
         if self.is_interactive {
             print!("{}", "Analyzing...".dark_grey());
@@ -451,7 +476,8 @@ impl Repl {
                     }
 
                     local_response = Some(local_resp);
-                    let request = MessageRequest::new(query);
+                    // Use full conversation context
+                    let request = MessageRequest::with_context(self.conversation.get_messages());
                     claude_response = self.claude_client.send_message(&request).await?.text();
                     routing_decision_str = "forward_validation_failed".to_string();
                     forward_reason = Some("quality_too_low".to_string());
@@ -477,7 +503,8 @@ impl Repl {
                     }
                 }
 
-                let request = MessageRequest::new(query);
+                // Use full conversation context
+                let request = MessageRequest::with_context(self.conversation.get_messages());
                 claude_response = self.claude_client.send_message(&request).await?.text();
                 routing_decision_str = "forward".to_string();
                 forward_reason = Some(reason.as_str().to_string());
@@ -559,6 +586,9 @@ impl Repl {
         );
 
         self.metrics_logger.log(&metric)?;
+
+        // Add assistant response to conversation history
+        self.conversation.add_assistant_message(claude_response.clone());
 
         Ok(claude_response)
     }

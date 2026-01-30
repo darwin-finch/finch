@@ -34,6 +34,25 @@ impl MessageRequest {
         }
     }
 
+    /// Create request with full conversation context
+    pub fn with_context(messages: Vec<Message>) -> Self {
+        Self {
+            model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 4096,
+            messages,
+            tools: None,
+        }
+    }
+
+    /// Append a user message to existing conversation
+    pub fn append_user_message(mut self, content: String) -> Self {
+        self.messages.push(Message {
+            role: "user".to_string(),
+            content,
+        });
+        self
+    }
+
     /// Add tools to the request
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = Some(tools);
