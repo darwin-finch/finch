@@ -3,7 +3,8 @@
 use anyhow::Result;
 
 use crate::metrics::MetricsLogger;
-use crate::models::{ThresholdRouter, ThresholdValidator};
+use crate::models::ThresholdValidator;
+use crate::router::Router;
 
 pub enum Command {
     Help,
@@ -31,7 +32,7 @@ impl Command {
 pub fn handle_command(
     command: Command,
     metrics_logger: &MetricsLogger,
-    router: Option<&ThresholdRouter>,
+    router: Option<&Router>, // CHANGED: Router instead of ThresholdRouter
     validator: Option<&ThresholdValidator>,
 ) -> Result<String> {
     match command {
@@ -108,7 +109,7 @@ fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
 }
 
 fn format_training(
-    router: Option<&ThresholdRouter>,
+    router: Option<&Router>, // CHANGED: Router instead of ThresholdRouter
     validator: Option<&ThresholdValidator>,
 ) -> Result<String> {
     let mut output = String::new();

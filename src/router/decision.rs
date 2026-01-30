@@ -1,6 +1,9 @@
 // Routing decision logic
 
 use crate::crisis::CrisisDetector;
+use crate::models::{ThresholdRouter, ThresholdRouterStats};
+use anyhow::Result;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub enum ForwardReason {
@@ -28,18 +31,20 @@ pub enum RouteDecision {
 
 pub struct Router {
     crisis_detector: CrisisDetector,
+    threshold_router: ThresholdRouter,
 }
 
 impl Router {
-    pub fn new(crisis_detector: CrisisDetector) -> Self {
+    pub fn new(crisis_detector: CrisisDetector, threshold_router: ThresholdRouter) -> Self {
         Self {
             crisis_detector,
+            threshold_router,
         }
     }
 
     /// Make a routing decision for a query
     pub fn route(&self, query: &str) -> RouteDecision {
-        // Step 1: Check for crisis
+        // Layer 1: Safety gate - check for crisis
         if self.crisis_detector.detect_crisis(query) {
             tracing::info!("Routing decision: FORWARD (crisis detected)");
             return RouteDecision::Forward {
@@ -47,12 +52,44 @@ impl Router {
             };
         }
 
-        // Step 2: No pattern matching - always forward for now
-        // (In future commits, this becomes tool-based routing)
-        tracing::info!("Routing decision: FORWARD (no local processing)");
+        // Layer 2: Data-driven routing - use threshold model
+        if self.threshold_router.should_try_local(query) {
+            let stats = self.threshold_router.stats();
+            tracing::info!(
+                "Routing decision: LOCAL (threshold confidence: {:.2})",
+                stats.confidence_threshold
+            );
+            return RouteDecision::Local {
+                pattern_id: "threshold_based".to_string(),
+                confidence: stats.confidence_threshold,
+            };
+        }
+
+        // Layer 3: Default fallback - forward when uncertain
+        tracing::info!("Routing decision: FORWARD (threshold too low)");
         RouteDecision::Forward {
             reason: ForwardReason::NoMatch,
         }
+    }
+
+    /// Learn from routing result (forward to threshold router)
+    pub fn learn(&mut self, query: &str, was_successful: bool) {
+        self.threshold_router.learn(query, was_successful);
+    }
+
+    /// Get threshold router statistics
+    pub fn stats(&self) -> ThresholdRouterStats {
+        self.threshold_router.stats()
+    }
+
+    /// Save threshold router state to disk
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.threshold_router.save(path)
+    }
+
+    /// Load threshold router state from disk
+    pub fn load_threshold<P: AsRef<Path>>(path: P) -> Result<ThresholdRouter> {
+        ThresholdRouter::load(path)
     }
 }
 

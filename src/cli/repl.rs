@@ -19,7 +19,9 @@ use crate::config::Config;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
 use crate::models::{ThresholdRouter, ThresholdValidator};
 use crate::router::{ForwardReason, RouteDecision, Router};
-use crate::tools::implementations::{BashTool, GlobTool, GrepTool, ReadTool, RestartTool, WebFetchTool};
+use crate::tools::implementations::{
+    BashTool, GlobTool, GrepTool, ReadTool, RestartTool, WebFetchTool,
+};
 use crate::tools::types::{ToolDefinition, ToolInputSchema};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
@@ -87,11 +89,10 @@ fn create_tool_definitions() -> Vec<ToolDefinition> {
 pub struct Repl {
     _config: Config,
     claude_client: ClaudeClient,
-    router: Router,
+    router: Router, // Now contains ThresholdRouter
     metrics_logger: MetricsLogger,
     // Online learning models
-    threshold_router: ThresholdRouter,
-    threshold_validator: ThresholdValidator,
+    threshold_validator: ThresholdValidator, // Keep validator separate
     // Training metrics
     training_trends: TrainingTrends,
     // Model persistence
@@ -120,9 +121,8 @@ impl Repl {
         // Set up models directory
         let models_dir = dirs::home_dir().map(|home| home.join(".shammah").join("models"));
 
-        // Try to load existing models, fall back to new
-        let (threshold_router, threshold_validator) =
-            Self::load_or_create_models(models_dir.as_ref(), is_interactive);
+        // Load validator only (router is now in Router)
+        let threshold_validator = Self::load_validator(models_dir.as_ref(), is_interactive);
 
         // Initialize input handler for interactive mode
         let input_handler = if is_interactive {
@@ -165,9 +165,8 @@ impl Repl {
         Self {
             _config: config,
             claude_client,
-            router,
+            router, // Contains ThresholdRouter now
             metrics_logger,
-            threshold_router,
             threshold_validator,
             training_trends: TrainingTrends::new(20), // Track last 20 queries
             models_dir,
@@ -179,41 +178,14 @@ impl Repl {
         }
     }
 
-    /// Load models from disk or create new ones
-    fn load_or_create_models(
-        models_dir: Option<&PathBuf>,
-        is_interactive: bool,
-    ) -> (ThresholdRouter, ThresholdValidator) {
+    /// Load validator from disk or create new one
+    fn load_validator(models_dir: Option<&PathBuf>, is_interactive: bool) -> ThresholdValidator {
         let Some(models_dir) = models_dir else {
-            return (ThresholdRouter::new(), ThresholdValidator::new());
+            return ThresholdValidator::new();
         };
 
-        let router_path = models_dir.join("threshold_router.json");
         let validator_path = models_dir.join("threshold_validator.json");
-
-        let router = if router_path.exists() {
-            match ThresholdRouter::load(&router_path) {
-                Ok(router) => {
-                    if is_interactive {
-                        eprintln!(
-                            "✓ Loaded router with {} training queries",
-                            router.stats().total_queries
-                        );
-                    }
-                    router
-                }
-                Err(e) => {
-                    if is_interactive {
-                        eprintln!("Warning: Failed to load router: {}", e);
-                    }
-                    ThresholdRouter::new()
-                }
-            }
-        } else {
-            ThresholdRouter::new()
-        };
-
-        let validator = if validator_path.exists() {
+        if validator_path.exists() {
             match ThresholdValidator::load(&validator_path) {
                 Ok(validator) => {
                     if is_interactive {
@@ -233,9 +205,7 @@ impl Repl {
             }
         } else {
             ThresholdValidator::new()
-        };
-
-        (router, validator)
+        }
     }
 
     /// Save models to disk
@@ -251,8 +221,10 @@ impl Repl {
             io::stdout().flush()?;
         }
 
-        self.threshold_router
-            .save(models_dir.join("threshold_router.json"))?;
+        // Save router (includes threshold router)
+        self.router.save(models_dir.join("threshold_router.json"))?;
+
+        // Save validator separately
         self.threshold_validator
             .save(models_dir.join("threshold_validator.json"))?;
 
@@ -268,7 +240,6 @@ impl Repl {
         &mut self,
         initial_response: crate::claude::MessageResponse,
     ) -> Result<String> {
-
         let mut current_response = initial_response;
         let mut iteration = 0;
         const MAX_ITERATIONS: u32 = 5; // Prevent infinite loops
@@ -291,7 +262,8 @@ impl Repl {
                 let signature = (tool_use.name.clone(), input_hash.clone());
 
                 // Count how many times we've seen this exact tool call
-                let repeat_count = tool_call_history.iter()
+                let repeat_count = tool_call_history
+                    .iter()
                     .filter(|sig| *sig == &signature)
                     .count();
 
@@ -299,7 +271,8 @@ impl Repl {
                     if self.is_interactive {
                         eprintln!(
                             "⚠️  Warning: Tool '{}' called {} times with same input",
-                            tool_use.name, repeat_count + 1
+                            tool_use.name,
+                            repeat_count + 1
                         );
                         eprintln!("⚠️  Possible infinite loop detected. Breaking...");
                     }
@@ -308,7 +281,8 @@ impl Repl {
                     let error_msg = format!(
                         "Tool execution stopped: Detected infinite loop. \
                          Tool '{}' was called {} times with the same input.",
-                        tool_use.name, repeat_count + 1
+                        tool_use.name,
+                        repeat_count + 1
                     );
 
                     return Ok(error_msg);
@@ -368,8 +342,7 @@ impl Repl {
                          <status>error</status>\n\
                          <content>{}</content>\n\
                          </tool_result>\n\n",
-                        tool_name,
-                        result.content
+                        tool_name, result.content
                     ));
                 } else {
                     tool_result_text.push_str(&format!(
@@ -378,8 +351,7 @@ impl Repl {
                          <status>success</status>\n\
                          <content>{}</content>\n\
                          </tool_result>\n\n",
-                        tool_name,
-                        result.content
+                        tool_name, result.content
                     ));
                 }
             }
@@ -391,14 +363,16 @@ impl Repl {
             if assistant_text.is_empty() {
                 // Response contains ONLY tool_use blocks, no text
                 // We MUST add something to maintain conversation alternation
-                self.conversation.add_assistant_message("[Tool request]".to_string());
+                self.conversation
+                    .add_assistant_message("[Tool request]".to_string());
 
                 if self.is_interactive {
                     println!("    (Claude requesting tool execution)");
                 }
             } else {
                 // Response has both text and tool_use blocks
-                self.conversation.add_assistant_message(assistant_text.clone());
+                self.conversation
+                    .add_assistant_message(assistant_text.clone());
 
                 if self.is_interactive && !assistant_text.trim().is_empty() {
                     println!("    Claude: {}", assistant_text);
@@ -603,7 +577,7 @@ impl Repl {
                         let output = handle_command(
                             command,
                             &self.metrics_logger,
-                            Some(&self.threshold_router),
+                            Some(&self.router), // CHANGED: pass router instead of threshold_router
                             Some(&self.threshold_validator),
                         )?;
                         println!("{}", output);
@@ -646,7 +620,7 @@ impl Repl {
             return;
         }
 
-        let router_stats = self.threshold_router.stats();
+        let router_stats = self.router.stats(); // CHANGED: use router.stats()
         let validator_stats = self.threshold_validator.stats();
 
         // Calculate percentages
@@ -721,10 +695,7 @@ impl Repl {
             io::stdout().flush()?;
         }
 
-        // Check if threshold router suggests trying local
-        let should_try_local = self.threshold_router.should_try_local(query);
-
-        // Make routing decision (still using pattern matching for now)
+        // Make routing decision (uses threshold router internally)
         let decision = self.router.route(query);
 
         if self.is_interactive {
@@ -746,17 +717,28 @@ impl Repl {
                 pattern_id: local_pattern_id,
                 confidence,
             } => {
-                // This branch is now dead code (router never returns Local)
-                // Keep it for backward compatibility, but log a warning
                 if self.is_interactive {
-                    println!("⚠️  Warning: Unexpected local routing (pattern system removed)");
-                    println!("→ Forwarding to Claude instead");
+                    println!("✓ Crisis check: PASS");
+                    println!("✓ Threshold check: PASS (confidence: {:.2})", confidence);
+                    println!("→ Routing: LOCAL GENERATION");
                 }
 
-                // Always forward to Claude
+                // FUTURE: This is where local generation will happen
+                // For now, fall back to forwarding with a notice
+                if self.is_interactive {
+                    println!("⚠️  Note: Local generation not yet trained");
+                    println!("→ Forwarding to Claude for now");
+                }
+
+                // Forward to Claude (temporary until generator is trained)
                 let request = MessageRequest::with_context(self.conversation.get_messages())
                     .with_tools(create_tool_definitions());
                 let response = self.claude_client.send_message(&request).await?;
+
+                let elapsed = start_time.elapsed().as_millis();
+                if self.is_interactive {
+                    println!("✓ Received response ({}ms)", elapsed);
+                }
 
                 // Check for tool uses and execute them
                 if response.has_tool_uses() {
@@ -765,10 +747,10 @@ impl Repl {
                     claude_response = response.text();
                 }
 
-                routing_decision_str = "forward".to_string();
-                forward_reason = Some("pattern_system_removed".to_string());
+                routing_decision_str = "local_attempted".to_string();
                 pattern_id = Some(local_pattern_id);
                 routing_confidence = Some(confidence);
+                forward_reason = Some("untrained_generator".to_string());
             }
             RouteDecision::Forward { reason } => {
                 if self.is_interactive {
@@ -779,12 +761,7 @@ impl Repl {
                         }
                         _ => {
                             println!("✓ Crisis check: PASS");
-                            println!("✗ Pattern match: NONE");
-                            if should_try_local {
-                                println!(
-                                    "  (Threshold model suggested local, but no pattern match)"
-                                );
-                            }
+                            println!("✗ Threshold check: FAIL (confidence too low)");
                             println!("→ Routing: FORWARDING TO CLAUDE");
                         }
                     }
@@ -847,7 +824,7 @@ impl Repl {
         let was_successful = routing_decision_str == "local" && quality_score >= 0.7;
 
         // Learn from this interaction
-        self.threshold_router.learn(query, was_successful);
+        self.router.learn(query, was_successful); // CHANGED: use router.learn()
         self.threshold_validator
             .learn(query, &claude_response, quality_score >= 0.7);
 
@@ -856,7 +833,7 @@ impl Repl {
             .add_measurement(quality_score, similarity_score);
 
         // Checkpoint every 10 queries
-        let router_stats = self.threshold_router.stats();
+        let router_stats = self.router.stats(); // CHANGED: use router.stats()
         if router_stats.total_queries % 10 == 0 && router_stats.total_queries > 0 {
             let _ = self.save_models(); // Ignore errors during checkpoint
         }
@@ -895,7 +872,8 @@ impl Repl {
         self.metrics_logger.log(&metric)?;
 
         // Add assistant response to conversation history
-        self.conversation.add_assistant_message(claude_response.clone());
+        self.conversation
+            .add_assistant_message(claude_response.clone());
 
         Ok(claude_response)
     }
