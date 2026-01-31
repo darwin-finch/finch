@@ -17,6 +17,11 @@ pub enum Command {
     PatternsRemove(String),
     PatternsClear,
     PatternsAdd,
+    // Plan mode commands
+    Plan(String),
+    Approve,
+    Reject,
+    ShowPlan,
 }
 
 impl Command {
@@ -31,7 +36,18 @@ impl Command {
             "/debug" => return Some(Command::Debug),
             "/training" => return Some(Command::Training),
             "/clear" | "/reset" => return Some(Command::Clear),
+            "/approve" | "/execute" => return Some(Command::Approve),
+            "/reject" | "/cancel" => return Some(Command::Reject),
+            "/show-plan" => return Some(Command::ShowPlan),
             _ => {}
+        }
+
+        // Handle /plan command with task description
+        if let Some(rest) = trimmed.strip_prefix("/plan ") {
+            let task = rest.trim();
+            if !task.is_empty() {
+                return Some(Command::Plan(task.to_string()));
+            }
         }
 
         // Handle /patterns commands with subcommands
@@ -93,6 +109,10 @@ pub fn handle_command(
         | Command::PatternsAdd => {
             Ok("Pattern management commands should be handled in REPL.".to_string())
         }
+        // Plan mode commands are handled directly in REPL
+        Command::Plan(_) | Command::Approve | Command::Reject | Command::ShowPlan => {
+            Ok("Plan mode commands should be handled in REPL.".to_string())
+        }
     }
 }
 
@@ -108,6 +128,12 @@ fn format_help() -> String {
   /patterns add     - Add a new confirmation pattern (interactive)
   /patterns rm <id> - Remove a pattern by ID
   /patterns clear   - Remove all patterns
+
+Plan Mode Commands:
+  /plan <task>      - Enter planning mode for a task
+  /show-plan        - Display the current plan
+  /approve          - Approve plan (prompts to clear context) and start execution
+  /reject           - Reject the plan and return to normal mode
 
 Type any question to get started!"#
         .to_string()

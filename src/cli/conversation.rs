@@ -1,11 +1,18 @@
 // Conversation history manager for multi-turn interactions
 
 use crate::claude::Message;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 
 /// Manages conversation history for multi-turn interactions with context window management
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationHistory {
     messages: Vec<Message>,
+    #[serde(skip)]
     max_messages: usize,
+    #[serde(skip)]
     max_tokens_estimate: usize,
 }
 
@@ -14,7 +21,7 @@ impl ConversationHistory {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
-            max_messages: 20,           // Keep last 20 messages (10 user + 10 assistant turns)
+            max_messages: 20, // Keep last 20 messages (10 user + 10 assistant turns)
             max_tokens_estimate: 32_000, // ~8K tokens * 4 chars/token
         }
     }
@@ -98,6 +105,46 @@ impl ConversationHistory {
     pub fn estimated_tokens(&self) -> usize {
         let total_chars: usize = self.messages.iter().map(|m| m.content.len()).sum();
         total_chars / 4 // Rough estimate: 1 token ≈ 4 characters
+    }
+
+    /// Save conversation to JSON file
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let json =
+            serde_json::to_string_pretty(self).context("Failed to serialize conversation")?;
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.as_ref().parent() {
+            fs::create_dir_all(parent)
+                .context("Failed to create directory for conversation state")?;
+        }
+
+        fs::write(path.as_ref(), json).with_context(|| {
+            format!(
+                "Failed to write conversation to {}",
+                path.as_ref().display()
+            )
+        })?;
+
+        Ok(())
+    }
+
+    /// Load conversation from JSON file
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let json = fs::read_to_string(path.as_ref()).with_context(|| {
+            format!(
+                "Failed to read conversation from {}",
+                path.as_ref().display()
+            )
+        })?;
+
+        let mut history: ConversationHistory =
+            serde_json::from_str(&json).context("Failed to parse conversation JSON")?;
+
+        // Restore default config values (these are skipped during serialization)
+        history.max_messages = 20;
+        history.max_tokens_estimate = 32_000;
+
+        Ok(history)
     }
 }
 
@@ -202,5 +249,27 @@ mod tests {
         // Should trim oldest messages
         assert!(conv.message_count() < 3);
         assert!(conv.estimated_tokens() <= 5);
+    }
+
+    #[test]
+    fn test_conversation_persistence() {
+        let mut conv = ConversationHistory::new();
+        conv.add_user_message("Test message".to_string());
+        conv.add_assistant_message("Test response".to_string());
+
+        let temp_path = "/tmp/test_conv_shammah.json";
+        conv.save(temp_path).expect("Failed to save conversation");
+
+        let loaded = ConversationHistory::load(temp_path).expect("Failed to load conversation");
+
+        assert_eq!(loaded.message_count(), 2);
+        let messages = loaded.get_messages();
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Test message");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "Test response");
+
+        // Clean up
+        let _ = std::fs::remove_file(temp_path);
     }
 }

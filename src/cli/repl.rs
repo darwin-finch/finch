@@ -30,6 +30,18 @@ use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry
 use super::commands::{handle_command, Command};
 use super::conversation::ConversationHistory;
 use super::input::InputHandler;
+use super::menu::{Menu, MenuOption};
+
+/// User's menu choice for tool confirmation
+#[derive(Debug, Clone)]
+enum ConfirmationChoice {
+    ApproveOnce,
+    ApproveExactSession,
+    ApprovePatternSession,
+    ApproveExactPersistent,
+    ApprovePatternPersistent,
+    Deny,
+}
 
 /// Result of a tool execution confirmation prompt
 pub enum ConfirmationResult {
@@ -113,6 +125,25 @@ fn create_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// REPL operating mode
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplMode {
+    /// Normal mode - all tools require confirmation
+    Normal,
+    /// Planning mode - only inspection tools allowed (read, glob, grep, web_fetch)
+    Planning {
+        task: String,
+        plan_path: PathBuf,
+        created_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Executing mode - all tools enabled after plan approval
+    Executing {
+        task: String,
+        plan_path: PathBuf,
+        approved_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
 pub struct Repl {
     _config: Config,
     claude_client: ClaudeClient,
@@ -134,6 +165,8 @@ pub struct Repl {
     input_handler: Option<InputHandler>,
     // Conversation history
     conversation: ConversationHistory,
+    // REPL mode (normal, planning, executing)
+    mode: ReplMode,
 }
 
 impl Repl {
@@ -227,6 +260,7 @@ impl Repl {
             debug_enabled: false,
             input_handler,
             conversation: ConversationHistory::new(),
+            mode: ReplMode::Normal,
         }
     }
 
@@ -353,6 +387,26 @@ impl Repl {
             for tool_use in &tool_uses {
                 if self.is_interactive {
                     println!("  → {}", tool_use.name);
+                }
+
+                // Check mode-based permissions first
+                if !Self::is_tool_allowed_in_mode(&tool_use.name, &self.mode) {
+                    use crate::tools::types::ToolResult;
+                    let error_result = ToolResult::error(
+                        tool_use.id.clone(),
+                        format!(
+                            "Tool '{}' is not allowed in planning mode.\n\
+                             Reason: This tool can modify system state.\n\
+                             Available tools: read, glob, grep, web_fetch\n\
+                             Type /approve to execute your plan with all tools enabled.",
+                            tool_use.name
+                        ),
+                    );
+                    tool_results.push(error_result);
+                    if self.is_interactive {
+                        println!("    ✗ Blocked by plan mode");
+                    }
+                    continue;
                 }
 
                 // Generate tool signature for approval checking
@@ -666,8 +720,9 @@ impl Repl {
                 self.print_separator();
 
                 let line = {
+                    let prompt = self.get_prompt();
                     let handler = self.input_handler.as_mut().unwrap();
-                    handler.read_line("> ")?
+                    handler.read_line(&prompt)?
                 };
 
                 match line {
@@ -690,7 +745,13 @@ impl Repl {
                 if self.is_interactive {
                     println!();
                     self.print_separator();
-                    print!("> ");
+                    // Note: Can't use colored prompts in basic mode, so use plain text
+                    let prompt = match &self.mode {
+                        ReplMode::Normal => "> ",
+                        ReplMode::Planning { .. } => "plan> ",
+                        ReplMode::Executing { .. } => "exec> ",
+                    };
+                    print!("{}", prompt);
                 } else {
                     print!("Query: ");
                 }
@@ -756,6 +817,22 @@ impl Repl {
                         println!("{}", output);
                         continue;
                     }
+                    Command::Plan(ref task) => {
+                        self.handle_plan_command(task.clone()).await?;
+                        continue;
+                    }
+                    Command::Approve => {
+                        self.handle_approve_command().await?;
+                        continue;
+                    }
+                    Command::Reject => {
+                        self.handle_reject_command().await?;
+                        continue;
+                    }
+                    Command::ShowPlan => {
+                        self.handle_show_plan_command().await?;
+                        continue;
+                    }
                     _ => {
                         let output = handle_command(
                             command,
@@ -806,59 +883,74 @@ impl Repl {
     ) -> Result<ConfirmationResult> {
         // Display tool information
         println!();
-        println!("  Tool Execution Request:");
-        println!("  ─────────────────────────");
-        println!("  Tool: {}", tool_use.name);
+        println!("Tool Execution Request:");
+        println!("─────────────────────────");
+        println!("Tool: {}", tool_use.name);
 
         // Show relevant parameters
         self.display_tool_params(tool_use);
 
         println!();
-        println!("  Do you want to proceed?");
-        println!("  ❯ 1. Yes (once only)");
-        println!("    2. Yes, and remember exact command for this session");
-        println!("    3. Yes, and remember pattern for this session");
-        println!("    4. Yes, and ALWAYS allow this exact command");
-        println!("    5. Yes, and ALWAYS allow this pattern");
-        println!("    6. No (deny)");
-        println!();
 
-        // Get user input
-        loop {
-            let input = self.read_choice("  Choice [1-6]: ")?;
+        // Build menu options
+        let options = vec![
+            MenuOption::with_description(
+                "Yes (once only)",
+                "Execute this time, ask again next time",
+                ConfirmationChoice::ApproveOnce,
+            ),
+            MenuOption::with_description(
+                "Yes, and remember exact command for this session",
+                "Won't ask again for this exact command in this session",
+                ConfirmationChoice::ApproveExactSession,
+            ),
+            MenuOption::with_description(
+                "Yes, and remember pattern for this session",
+                "Won't ask again for similar commands in this session",
+                ConfirmationChoice::ApprovePatternSession,
+            ),
+            MenuOption::with_description(
+                "Yes, and ALWAYS allow this exact command",
+                "Save permanently - never ask again for this exact command",
+                ConfirmationChoice::ApproveExactPersistent,
+            ),
+            MenuOption::with_description(
+                "Yes, and ALWAYS allow this pattern",
+                "Save permanently - never ask again for similar commands",
+                ConfirmationChoice::ApprovePatternPersistent,
+            ),
+            MenuOption::with_description(
+                "No (deny)",
+                "Block this tool execution",
+                ConfirmationChoice::Deny,
+            ),
+        ];
 
-            match input.as_deref() {
-                Some("1") | Some("y") | Some("yes") => {
-                    return Ok(ConfirmationResult::ApproveOnce);
-                }
-                Some("2") => {
-                    return Ok(ConfirmationResult::ApproveExactSession(signature.clone()));
-                }
-                Some("3") => {
-                    let pattern = self.build_pattern_from_signature(signature)?;
-                    return Ok(ConfirmationResult::ApprovePatternSession(pattern));
-                }
-                Some("4") => {
-                    return Ok(ConfirmationResult::ApproveExactPersistent(
-                        signature.clone(),
-                    ));
-                }
-                Some("5") => {
-                    let pattern = self.build_pattern_from_signature(signature)?;
-                    return Ok(ConfirmationResult::ApprovePatternPersistent(pattern));
-                }
-                Some("6") | Some("n") | Some("no") => {
-                    return Ok(ConfirmationResult::Deny);
-                }
-                Some("") | None => {
-                    // Ctrl+C or Ctrl+D - treat as deny
-                    return Ok(ConfirmationResult::Deny);
-                }
-                _ => {
-                    println!("  Invalid choice. Please enter 1-6.");
-                    continue;
-                }
+        // Show menu
+        let choice = Menu::select(
+            "Do you want to proceed?",
+            options,
+            Some("[↑↓ or j/k to move, Enter to select, or type 1-6]"),
+        )?;
+
+        // Convert choice to ConfirmationResult
+        match choice {
+            ConfirmationChoice::ApproveOnce => Ok(ConfirmationResult::ApproveOnce),
+            ConfirmationChoice::ApproveExactSession => {
+                Ok(ConfirmationResult::ApproveExactSession(signature.clone()))
             }
+            ConfirmationChoice::ApprovePatternSession => {
+                let pattern = self.build_pattern_from_signature(signature)?;
+                Ok(ConfirmationResult::ApprovePatternSession(pattern))
+            }
+            ConfirmationChoice::ApproveExactPersistent => {
+                Ok(ConfirmationResult::ApproveExactPersistent(signature.clone()))
+            }
+            ConfirmationChoice::ApprovePatternPersistent => {
+                let pattern = self.build_pattern_from_signature(signature)?;
+                Ok(ConfirmationResult::ApprovePatternPersistent(pattern))
+            }
+            ConfirmationChoice::Deny => Ok(ConfirmationResult::Deny),
         }
     }
 
@@ -881,10 +973,9 @@ impl Repl {
         let (command_part, dir_part) = self.parse_signature_components(signature);
 
         println!();
-        println!("  What should the pattern match?");
 
         // Generate options based on tool type
-        let options = if let (Some(ref cmd), Some(ref dir)) = (&command_part, &dir_part) {
+        let pattern_options = if let (Some(ref cmd), Some(ref dir)) = (&command_part, &dir_part) {
             let base_cmd = cmd.split_whitespace().next().unwrap_or(cmd);
             vec![
                 format!("{} * in {}", base_cmd, dir),
@@ -906,34 +997,42 @@ impl Repl {
             ]
         };
 
-        // Display options
-        for (i, opt) in options.iter().enumerate() {
-            if i == 0 {
-                println!("  ❯ {}. {}", i + 1, opt);
-            } else {
-                println!("    {}. {}", i + 1, opt);
+        // Build menu options with None for "Other" choice
+        let mut menu_options: Vec<MenuOption<Option<String>>> = pattern_options
+            .into_iter()
+            .map(|p| MenuOption::new(p.clone(), Some(p)))
+            .collect();
+
+        // Add "Other" option for custom pattern
+        menu_options.push(MenuOption::with_description(
+            "✏️  Other (type custom pattern)",
+            "Enter your own pattern",
+            None,
+        ));
+
+        let selection = Menu::select(
+            "What should the pattern match?",
+            menu_options,
+            Some("Choose a pattern or select Other to type your own"),
+        )?;
+
+        let pattern_str = match selection {
+            Some(pattern) => pattern,
+            None => {
+                // User selected "Other" - prompt for custom pattern
+                Menu::text_input(
+                    "Enter custom pattern:",
+                    None,
+                    Some("Use * for wildcards, ** for recursive"),
+                )?
             }
-        }
-        println!();
+        };
 
-        loop {
-            let input = self.read_choice(&format!("  Choice [1-{}]: ", options.len()))?;
-
-            if let Some(choice) = input {
-                if let Ok(idx) = choice.parse::<usize>() {
-                    if idx > 0 && idx <= options.len() {
-                        let pattern_str = options[idx - 1].clone();
-                        return Ok(ToolPattern::new(
-                            pattern_str.clone(),
-                            signature.tool_name.clone(),
-                            format!("Auto-generated pattern: {}", pattern_str),
-                        ));
-                    }
-                }
-            }
-
-            println!("  Invalid choice. Please enter 1-{}.", options.len());
-        }
+        Ok(ToolPattern::new(
+            pattern_str.clone(),
+            signature.tool_name.clone(),
+            format!("Pattern: {}", pattern_str),
+        ))
     }
 
     /// Parse signature context_key into command and directory components
@@ -976,6 +1075,20 @@ impl Repl {
     }
 
     /// Extract directory from a context string
+    /// Check if tool is allowed in current mode
+    fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool {
+        match mode {
+            ReplMode::Normal | ReplMode::Executing { .. } => {
+                // All tools allowed (subject to normal confirmation)
+                true
+            }
+            ReplMode::Planning { .. } => {
+                // Only inspection tools allowed
+                matches!(tool_name, "read" | "glob" | "grep" | "web_fetch")
+            }
+        }
+    }
+
     fn get_dir_from_context(context: &str) -> String {
         // For "reading /path/to/file.txt", return "/path/to"
         if let Some(last_slash) = context.rfind('/') {
@@ -1234,13 +1347,8 @@ impl Repl {
             store.patterns.len(),
             store.exact_approvals.len()
         );
-        print!("Are you sure? [y/N]: ");
-        io::stdout().flush()?;
 
-        let mut confirm = String::new();
-        io::stdin().read_line(&mut confirm)?;
-
-        if !confirm.trim().eq_ignore_ascii_case("y") {
+        if !Menu::confirm("Are you sure?", false)? {
             return Ok("Clear cancelled.".to_string());
         }
 
@@ -1259,29 +1367,31 @@ impl Repl {
         println!("========================\n");
 
         // 1. Pattern type
-        println!("Pattern type:");
-        println!("  1. Wildcard (*, **)");
-        println!("  2. Regex");
-        print!("Choice [1]: ");
-        io::stdout().flush()?;
+        let pattern_type_options = vec![
+            MenuOption::with_description(
+                "Wildcard (*, **)",
+                "Use * for wildcards, ** for recursive paths",
+                PatternType::Wildcard,
+            ),
+            MenuOption::with_description(
+                "Regex",
+                "Use regular expression syntax",
+                PatternType::Regex,
+            ),
+        ];
 
-        let mut type_choice = String::new();
-        io::stdin().read_line(&mut type_choice)?;
-        let type_choice = type_choice.trim();
-
-        let pattern_type = if type_choice == "2" {
-            PatternType::Regex
-        } else {
-            PatternType::Wildcard
-        };
+        let pattern_type = Menu::select(
+            "Pattern type:",
+            pattern_type_options,
+            Some("[↑↓ or j/k to move, Enter to select, or type 1-2]"),
+        )?;
 
         // 2. Tool name
-        print!("Tool name (bash, read, grep, glob, web_fetch, save_and_exec): ");
-        io::stdout().flush()?;
-
-        let mut tool_name = String::new();
-        io::stdin().read_line(&mut tool_name)?;
-        let tool_name = tool_name.trim().to_string();
+        let tool_name = Menu::text_input(
+            "Tool name:",
+            None,
+            Some("bash, read, grep, glob, web_fetch, save_and_exec"),
+        )?;
 
         if tool_name.is_empty() {
             return Ok("Pattern creation cancelled (no tool name).".to_string());
@@ -1306,24 +1416,22 @@ impl Repl {
             }
         }
 
-        print!("\nPattern: ");
-        io::stdout().flush()?;
-
-        let mut pattern_str = String::new();
-        io::stdin().read_line(&mut pattern_str)?;
-        let pattern_str = pattern_str.trim().to_string();
+        let pattern_str = Menu::text_input(
+            "Pattern:",
+            None,
+            Some("Enter the pattern string"),
+        )?;
 
         if pattern_str.is_empty() {
             return Ok("Pattern creation cancelled (no pattern).".to_string());
         }
 
         // 4. Description
-        print!("Description: ");
-        io::stdout().flush()?;
-
-        let mut description = String::new();
-        io::stdin().read_line(&mut description)?;
-        let description = description.trim().to_string();
+        let description = Menu::text_input(
+            "Description:",
+            None,
+            Some("Brief description of what this pattern allows"),
+        )?;
 
         // 5. Create pattern and validate
         let pattern = ToolPattern::new_with_type(
@@ -1343,23 +1451,16 @@ impl Repl {
         println!("  Pattern: {}", pattern.pattern);
         println!("  Type: {:?}", pattern.pattern_type);
 
-        print!("\nTest pattern? [y/N]: ");
-        io::stdout().flush()?;
-
-        let mut test_choice = String::new();
-        io::stdin().read_line(&mut test_choice)?;
-
-        if test_choice.trim().eq_ignore_ascii_case("y") {
-            print!("Enter test string: ");
-            io::stdout().flush()?;
-
-            let mut test_str = String::new();
-            io::stdin().read_line(&mut test_str)?;
-            let test_str = test_str.trim();
+        if Menu::confirm("\nTest pattern?", false)? {
+            let test_str = Menu::text_input(
+                "Enter test string:",
+                None,
+                Some("String to test against the pattern"),
+            )?;
 
             let test_sig = ToolSignature {
                 tool_name: pattern.tool_name.clone(),
-                context_key: test_str.to_string(),
+                context_key: test_str,
             };
 
             if pattern.matches(&test_sig) {
@@ -1393,6 +1494,15 @@ impl Repl {
         ))
     }
 
+    /// Get mode-specific prompt string
+    fn get_prompt(&self) -> String {
+        match &self.mode {
+            ReplMode::Normal => "> ".to_string(),
+            ReplMode::Planning { .. } => format!("{} ", "plan>".blue()),
+            ReplMode::Executing { .. } => format!("{} ", "exec>".green()),
+        }
+    }
+
     /// Print training status below the prompt (only in interactive mode)
     fn print_status_line(&self) {
         if !self.is_interactive {
@@ -1419,6 +1529,13 @@ impl Repl {
         let quality_avg = self.training_trends.avg_quality();
         let similarity_avg = self.training_trends.avg_similarity();
 
+        // Build mode indicator
+        let mode_indicator = match &self.mode {
+            ReplMode::Normal => String::new(),
+            ReplMode::Planning { .. } => format!(" {}", "[PLANNING MODE - Inspection Only]".blue().bold()),
+            ReplMode::Executing { .. } => format!(" {}", "[EXECUTING PLAN]".green().bold()),
+        };
+
         // Build single-line status string with training effectiveness and conversation context
         let turn_count = self.conversation.turn_count();
         let context_indicator = if turn_count > 0 {
@@ -1429,7 +1546,8 @@ impl Repl {
 
         let status = if self.training_trends.measurement_count() > 0 {
             format!(
-                "Training: {} queries | Local: {:.0}% | Success: {:.0}% | Quality: {:.2} | Similarity: {:.2} | Confidence: {:.2}{}",
+                "{}Training: {} queries | Local: {:.0}% | Success: {:.0}% | Quality: {:.2} | Similarity: {:.2} | Confidence: {:.2}{}",
+                mode_indicator,
                 router_stats.total_queries,
                 local_pct,
                 success_pct,
@@ -1441,7 +1559,8 @@ impl Repl {
         } else {
             // Fallback if no training data yet
             format!(
-                "Training: {} queries | Local: {:.0}% | Success: {:.0}% | Confidence: {:.2} | Approval: {:.0}%{}",
+                "{}Training: {} queries | Local: {:.0}% | Success: {:.0}% | Confidence: {:.2} | Approval: {:.0}%{}",
+                mode_indicator,
                 router_stats.total_queries,
                 local_pct,
                 success_pct,
@@ -1650,10 +1769,239 @@ impl Repl {
 
         self.metrics_logger.log(&metric)?;
 
+        // Auto-save plan if in planning mode
+        if let ReplMode::Planning { plan_path, .. } = &self.mode {
+            // Detect if response contains a plan
+            if claude_response.contains("# Plan:") || claude_response.contains("## Analysis") {
+                if let Err(e) = std::fs::write(plan_path, &claude_response) {
+                    eprintln!("Warning: Failed to save plan: {}", e);
+                } else if self.is_interactive {
+                    println!("\n✓ Plan saved to: {}", plan_path.display());
+                    println!("Type /show-plan to review, /approve to execute, /reject to cancel.");
+                }
+            }
+        }
+
         // Add assistant response to conversation history
         self.conversation
             .add_assistant_message(claude_response.clone());
 
         Ok(claude_response)
+    }
+
+    /// Handle /plan command - enter planning mode
+    async fn handle_plan_command(&mut self, task: String) -> Result<()> {
+        use chrono::Utc;
+
+        // Check if already in plan mode
+        if matches!(self.mode, ReplMode::Planning { .. } | ReplMode::Executing { .. }) {
+            println!(
+                "⚠️  Already in {} mode. Finish current task first.",
+                match self.mode {
+                    ReplMode::Planning { .. } => "planning",
+                    ReplMode::Executing { .. } => "executing",
+                    _ => unreachable!(),
+                }
+            );
+            return Ok(());
+        }
+
+        // Create plans directory
+        let plans_dir = dirs::home_dir()
+            .context("Home directory not found")?
+            .join(".shammah")
+            .join("plans");
+        std::fs::create_dir_all(&plans_dir)?;
+
+        // Generate plan filename
+        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+        let plan_path = plans_dir.join(format!("plan_{}.md", timestamp));
+
+        // Transition to planning mode
+        self.mode = ReplMode::Planning {
+            task: task.clone(),
+            plan_path: plan_path.clone(),
+            created_at: Utc::now(),
+        };
+
+        println!("{}", "✓ Entered planning mode".blue().bold());
+        println!("📋 Task: {}", task);
+        println!("📁 Plan will be saved to: {}", plan_path.display());
+        println!();
+        println!("{}", "Available tools:".green());
+        println!("  read, glob, grep, web_fetch");
+        println!("{}", "Blocked tools:".red());
+        println!("  bash, save_and_exec");
+        println!();
+        println!("Ask me to explore the codebase and generate a plan.");
+        println!(
+            "{}",
+            "Type /show-plan to view, /approve to execute, /reject to cancel."
+                .dark_grey()
+        );
+
+        // Add mode change notification to conversation
+        self.conversation.add_user_message(format!(
+            "[System: Entered planning mode for task: {}]\n\
+             Available tools: read, glob, grep, web_fetch\n\
+             Blocked tools: bash, save_and_exec\n\
+             Please explore the codebase and generate a detailed plan.",
+            task
+        ));
+
+        if self.is_interactive {
+            println!();
+            self.print_status_line();
+        }
+
+        Ok(())
+    }
+
+    /// Handle /approve command - approve plan and start execution
+    async fn handle_approve_command(&mut self) -> Result<()> {
+        use chrono::Utc;
+        use crate::cli::menu::{Menu, MenuOption};
+
+        match &self.mode {
+            ReplMode::Planning {
+                task, plan_path, ..
+            } => {
+                // Clone values we need before mutating self.mode
+                let task_clone = task.clone();
+                let plan_path_clone = plan_path.clone();
+
+                println!("{}", "✓ Plan approved!".green().bold());
+                println!();
+
+                // Show context clearing options
+                println!("The plan has been saved to: {}", plan_path_clone.display());
+                println!();
+                println!("Would you like to:");
+                println!("  1. Clear conversation and execute plan (recommended)");
+                println!("  2. Keep conversation history and execute");
+                println!();
+
+                let options = vec![
+                    MenuOption::with_description(
+                        "Clear context (recommended)",
+                        "Reduces token usage and focuses execution on the plan",
+                        true,
+                    ),
+                    MenuOption::with_description(
+                        "Keep context",
+                        "Preserves exploration history in conversation",
+                        false,
+                    ),
+                ];
+
+                let clear_context = Menu::select(
+                    "Choose execution mode:",
+                    options,
+                    Some("[↑↓ or j/k to move, Enter to select, or type 1-2]"),
+                )?;
+
+                // Transition to executing mode
+                self.mode = ReplMode::Executing {
+                    task: task_clone,
+                    plan_path: plan_path_clone.clone(),
+                    approved_at: Utc::now(),
+                };
+
+                if clear_context {
+                    // Clear conversation and add plan as context
+                    println!();
+                    println!("{}", "Clearing conversation context...".blue());
+                    self.conversation.clear();
+
+                    // Read plan file and add as initial context
+                    if plan_path_clone.exists() {
+                        let plan_content = std::fs::read_to_string(&plan_path_clone)
+                            .context("Failed to read plan file")?;
+                        self.conversation.add_user_message(format!(
+                            "Please execute this plan:\n\n{}",
+                            plan_content
+                        ));
+                        println!("{}", "✓ Context cleared. Plan loaded as primary reference.".green());
+                    } else {
+                        println!("{}", "⚠️  Plan file not found. Adding approval message only.".yellow());
+                        self.conversation.add_user_message(
+                            "[System: Plan approved! All tools are now enabled. \
+                             You may execute bash commands and modify files.]"
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    // Keep history, just add approval message
+                    println!();
+                    println!("{}", "Keeping conversation context...".blue());
+                    self.conversation.add_user_message(
+                        "[System: Plan approved! All tools are now enabled. \
+                         You may execute bash commands and modify files.]"
+                            .to_string(),
+                    );
+                }
+
+                println!();
+                println!(
+                    "{}",
+                    "All tools enabled. Please proceed with implementation.".green()
+                );
+
+                if self.is_interactive {
+                    println!();
+                    self.print_status_line();
+                }
+            }
+            ReplMode::Normal => {
+                println!("⚠️  No plan to approve. Use /plan first.");
+            }
+            ReplMode::Executing { .. } => {
+                println!("⚠️  Already executing plan.");
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle /reject command - reject plan and return to normal mode
+    async fn handle_reject_command(&mut self) -> Result<()> {
+        match &self.mode {
+            ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
+                println!("{}", "✗ Plan rejected. Returning to normal mode.".yellow());
+                self.mode = ReplMode::Normal;
+                self.conversation
+                    .add_user_message("[System: Plan rejected by user.]".to_string());
+
+                if self.is_interactive {
+                    println!();
+                    self.print_status_line();
+                }
+            }
+            ReplMode::Normal => {
+                println!("⚠️  No active plan to reject.");
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle /show-plan command - display current plan
+    async fn handle_show_plan_command(&mut self) -> Result<()> {
+        match &self.mode {
+            ReplMode::Planning { plan_path, .. } | ReplMode::Executing { plan_path, .. } => {
+                if plan_path.exists() {
+                    let content = std::fs::read_to_string(plan_path)?;
+                    println!("\n{}", "=".repeat(60));
+                    println!("PLAN:");
+                    println!("{}", "=".repeat(60));
+                    println!("{}", content);
+                    println!("{}", "=".repeat(60));
+                } else {
+                    println!("⚠️  Plan file not yet created.");
+                }
+            }
+            ReplMode::Normal => {
+                println!("⚠️  No active plan. Use /plan to start.");
+            }
+        }
+        Ok(())
     }
 }

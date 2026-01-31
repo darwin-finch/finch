@@ -4,6 +4,7 @@
 mod commands;
 mod conversation;
 mod input;
+pub mod menu;
 mod repl;
 
 pub use commands::handle_command;
