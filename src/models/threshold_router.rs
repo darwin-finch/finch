@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use uuid::Uuid;
 
 /// Query category for pattern matching
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -68,6 +70,25 @@ pub struct ThresholdRouter {
 
     /// Target forward rate (5% eventually)
     target_forward_rate: f64,
+
+    /// Session ID to prevent double-counting on save/load cycles
+    /// Runtime-only field (not saved to disk)
+    /// Each program run gets a unique ID. When saving:
+    /// - Same ID = same process saving again (replace)
+    /// - Different ID = concurrent process (merge)
+    session_id: String,
+
+    /// Track if this session has saved to disk
+    /// First save after load: Check for concurrent changes (merge if needed)
+    /// Subsequent saves: This session owns the file (replace)
+    /// Uses AtomicBool for interior mutability (allows mutation through &self, thread-safe)
+    /// Runtime-only field (not saved to disk via manual Serialize/Deserialize)
+    has_saved_this_session: AtomicBool,
+
+    /// Track if this router was loaded from disk (vs created new)
+    /// If loaded from disk, don't merge on first save (we already have that data!)
+    /// Runtime-only field
+    loaded_from_disk: bool,
 }
 
 impl ThresholdRouter {
@@ -81,6 +102,9 @@ impl ThresholdRouter {
             confidence_threshold: 0.95, // Very conservative at start
             min_samples: 3,             // Need 3 examples before trying
             target_forward_rate: 0.05,  // Target: 5% forward
+            session_id: Uuid::new_v4().to_string(),
+            has_saved_this_session: AtomicBool::new(false),
+            loaded_from_disk: false,
         }
     }
 
@@ -272,7 +296,11 @@ impl ThresholdRouter {
 
     /// Save router state to disk
     /// Save router state with concurrent-safe merging
-    /// Acquires exclusive lock, merges with existing state, writes atomically
+    /// Acquires exclusive lock, merges with existing state if from different session, writes atomically
+    ///
+    /// Prevents double-counting:
+    /// - First save after load: Check for concurrent changes
+    /// - Subsequent saves: This session owns the file (replace)
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
 
@@ -286,19 +314,32 @@ impl ThresholdRouter {
         // Acquire exclusive lock (blocks until available)
         lock_file.lock_exclusive()?;
 
-        // Merge with existing state if file exists
-        let to_save = if path.exists() {
+        // Decide: merge or replace?
+        let to_save = if self.has_saved_this_session.load(Ordering::Relaxed) {
+            // We already saved once - we own this file, just replace
+            let json = serde_json::to_string(self)?;
+            serde_json::from_str(&json)?
+        } else if self.loaded_from_disk {
+            // First save after loading from disk
+            // We already have all the data from disk, just replace (don't merge!)
+            let json = serde_json::to_string(self)?;
+            serde_json::from_str(&json)?
+        } else if path.exists() {
+            // First save of new session, file exists
+            // Check for concurrent changes and merge if needed
             match Self::load(path) {
-                Ok(existing) => self.merge_with(&existing),
+                Ok(existing) => {
+                    // Different session wrote this file, merge
+                    self.merge_with(&existing)
+                }
                 Err(_) => {
-                    // If load fails, just save current state
-                    // Create a copy by serializing and deserializing
+                    // Load failed, just save current state
                     let json = serde_json::to_string(self)?;
                     serde_json::from_str(&json)?
                 }
             }
         } else {
-            // No existing file, serialize/deserialize to get a copy
+            // No existing file
             let json = serde_json::to_string(self)?;
             serde_json::from_str(&json)?
         };
@@ -309,11 +350,15 @@ impl ThresholdRouter {
         std::fs::write(&temp_path, json)?;
         std::fs::rename(temp_path, path)?;
 
+        // Mark that we've saved (using atomic bool for thread safety)
+        self.has_saved_this_session.store(true, Ordering::Relaxed);
+
         // Lock automatically released when lock_file drops
         Ok(())
     }
 
-    /// Merge this router's statistics with another router
+    /// Merge this router's statistics with another router (for concurrent sessions)
+    /// Preserves the current session's session_id
     fn merge_with(&self, other: &Self) -> Self {
         let mut merged = Self::new();
 
@@ -350,13 +395,23 @@ impl ThresholdRouter {
         merged.confidence_threshold =
             (self.confidence_threshold + other.confidence_threshold) / 2.0;
 
+        // Keep the current session's ID (not the merged one's)
+        merged.session_id = self.session_id.clone();
+
         merged
     }
 
     /// Load router state from disk
+    /// Generates a new session ID to represent this program run
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let json = std::fs::read_to_string(path)?;
-        let router = serde_json::from_str(&json)?;
+        let mut router: ThresholdRouter = serde_json::from_str(&json)?;
+        // Generate NEW session ID for this program run
+        router.session_id = Uuid::new_v4().to_string();
+        // Mark as not yet saved in this session
+        router.has_saved_this_session.store(false, Ordering::Relaxed);
+        // Mark as loaded from disk (already have this data, don't merge on first save)
+        router.loaded_from_disk = true;
         Ok(router)
     }
 }
@@ -375,6 +430,7 @@ impl Serialize for ThresholdRouter {
         state.serialize_field("confidence_threshold", &self.confidence_threshold)?;
         state.serialize_field("min_samples", &self.min_samples)?;
         state.serialize_field("target_forward_rate", &self.target_forward_rate)?;
+        // session_id is runtime-only (#[serde(skip)])
         state.end()
     }
 }
@@ -404,6 +460,10 @@ impl<'de> Deserialize<'de> for ThresholdRouter {
             confidence_threshold: data.confidence_threshold,
             min_samples: data.min_samples,
             target_forward_rate: data.target_forward_rate,
+            // Runtime-only fields, will be set by load() or new()
+            session_id: String::new(),
+            has_saved_this_session: AtomicBool::new(false),
+            loaded_from_disk: false, // Will be set to true by load() if needed
         })
     }
 }
