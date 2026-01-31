@@ -6,7 +6,7 @@ use crate::cli::ConversationHistory;
 use crate::tools::patterns::{ExactApproval, MatchType, PersistentPatternStore, ToolPattern};
 use crate::tools::permissions::{PermissionCheck, PermissionManager};
 use crate::tools::registry::ToolRegistry;
-use crate::tools::types::{ToolContext, ToolResult, ToolUse};
+use crate::tools::types::{ToolResult, ToolUse};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -288,15 +288,12 @@ impl ToolExecutor {
             }
         }
 
-        // 3. Create context
-        let context = ToolContext {
-            conversation,
-            save_models: save_models_fn
-                .map(|f| Box::new(f) as Box<dyn Fn() -> Result<()> + Send + Sync>),
-        };
+        // 3. Execute tool
+        // Note: conversation and save_models_fn parameters are currently unused
+        // They were intended for save_and_exec tool which is deferred to future work
+        let _ = (conversation, save_models_fn); // Suppress unused variable warning
 
-        // 4. Execute tool
-        match tool.execute(tool_use.input.clone(), &context).await {
+        match tool.execute(tool_use.input.clone()).await {
             Ok(output) => {
                 info!("Tool executed successfully");
                 Ok(ToolResult::success(tool_use.id.clone(), output))
@@ -435,7 +432,7 @@ mod tests {
             ToolInputSchema::simple(vec![("param", "Test parameter")])
         }
 
-        async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+        async fn execute(&self, input: Value) -> Result<String> {
             if self.should_fail {
                 anyhow::bail!("Mock failure");
             }

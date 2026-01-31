@@ -21,7 +21,7 @@ use crate::models::{ThresholdRouter, ThresholdValidator};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
-    BashTool, GlobTool, GrepTool, ReadTool, SaveAndExecTool, WebFetchTool,
+    BashTool, GlobTool, GrepTool, ReadTool, WebFetchTool,
 };
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::{ToolDefinition, ToolInputSchema, ToolUse};
@@ -206,7 +206,6 @@ impl Repl {
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
-        tool_registry.register(Box::new(SaveAndExecTool::new()));
 
         // Create permission manager (allow all for now)
         let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
@@ -228,7 +227,6 @@ impl Repl {
                 fallback_registry.register(Box::new(GrepTool));
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
-                fallback_registry.register(Box::new(SaveAndExecTool::new()));
                 ToolExecutor::new(
                     fallback_registry,
                     PermissionManager::new().with_default_rule(PermissionRule::Allow),
