@@ -20,16 +20,15 @@ use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingT
 use crate::models::tokenizer::TextTokenizer;
 use crate::models::{ThresholdRouter, ThresholdValidator};
 use crate::router::{ForwardReason, RouteDecision, Router};
-use crate::training::batch_trainer::BatchTrainer;
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
-    AnalyzeModelTool, BashTool, CompareResponsesTool, GenerateTrainingDataTool, GlobTool,
-    GrepTool, QueryLocalModelTool, ReadTool, RestartTool, SaveAndExecTool, TrainTool,
-    WebFetchTool,
+    AnalyzeModelTool, BashTool, CompareResponsesTool, GenerateTrainingDataTool, GlobTool, GrepTool,
+    QueryLocalModelTool, ReadTool, RestartTool, SaveAndExecTool, TrainTool, WebFetchTool,
 };
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::{ToolDefinition, ToolInputSchema, ToolUse};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
+use crate::training::batch_trainer::BatchTrainer;
 
 use super::commands::{handle_command, Command};
 use super::conversation::ConversationHistory;
@@ -185,7 +184,8 @@ impl Repl {
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
                 fallback_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
-                fallback_registry.register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
+                fallback_registry
+                    .register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
                 fallback_registry.register(Box::new(QueryLocalModelTool));
                 fallback_registry.register(Box::new(CompareResponsesTool));
                 fallback_registry.register(Box::new(GenerateTrainingDataTool));
@@ -217,37 +217,35 @@ impl Repl {
             .collect();
 
         // Initialize tokenizer for active learning
-        let tokenizer = Arc::new(
-            TextTokenizer::default()
-                .unwrap_or_else(|e| {
-                    eprintln!("Warning: Failed to create tokenizer: {}", e);
-                    eprintln!("Active learning tools may not work correctly");
-                    panic!("Cannot create tokenizer")
-                })
-        );
+        let tokenizer = Arc::new(TextTokenizer::default().unwrap_or_else(|e| {
+            eprintln!("Warning: Failed to create tokenizer: {}", e);
+            eprintln!("Active learning tools may not work correctly");
+            panic!("Cannot create tokenizer")
+        }));
 
         // Initialize batch trainer for active learning
         use crate::models::{DevicePreference, ModelConfig};
         let model_config = ModelConfig {
             vocab_size: tokenizer.vocab_size(),
-            hidden_dim: 128,         // Small model for fast training
+            hidden_dim: 128, // Small model for fast training
             num_layers: 2,
             num_heads: 4,
             max_seq_len: 512,
-            dropout: 0.1,            // Standard dropout rate
+            dropout: 0.1,                              // Standard dropout rate
             device_preference: DevicePreference::Auto, // Use Metal if available
         };
 
         let batch_trainer = Arc::new(RwLock::new(
             BatchTrainer::new(
-                32,             // batch_size
-                1e-4,           // learning_rate
+                32,   // batch_size
+                1e-4, // learning_rate
                 &model_config,
-            ).unwrap_or_else(|e| {
+            )
+            .unwrap_or_else(|e| {
                 eprintln!("Warning: Failed to create batch trainer: {}", e);
                 eprintln!("Active learning tools may not work correctly");
                 panic!("Cannot create batch trainer")
-            })
+            }),
         ));
 
         // NOW load or create local generator with neural models
@@ -257,7 +255,8 @@ impl Repl {
                 is_interactive,
                 Arc::clone(&batch_trainer),
                 Arc::clone(&tokenizer),
-            ).await
+            )
+            .await,
         ));
 
         Self {
@@ -304,7 +303,10 @@ impl Repl {
                 match LocalGenerator::load(&generator_path) {
                     Ok(_generator) => {
                         if is_interactive {
-                            eprintln!("✓ Loaded local generator from: {}", generator_path.display());
+                            eprintln!(
+                                "✓ Loaded local generator from: {}",
+                                generator_path.display()
+                            );
                         }
                         // Note: loaded generator won't have neural models yet
                         // We'd need to refactor LocalGenerator to support injecting them
@@ -501,14 +503,30 @@ impl Repl {
                                 }
                                 ConfirmationResult::ApproveExactPersistent(sig) => {
                                     self.tool_executor.approve_exact_persistent(sig);
-                                    println!("  ✓ Approved (saved permanently)");
+                                    // IMMEDIATE SAVE: Don't wait for checkpoint
+                                    if let Err(e) = self.tool_executor.save_patterns() {
+                                        eprintln!("  ⚠️  Warning: Failed to save pattern: {}", e);
+                                        println!("  ✓ Approved (this session only - save failed)");
+                                    } else {
+                                        println!("  ✓ Approved (saved permanently)");
+                                    }
                                 }
                                 ConfirmationResult::ApprovePatternPersistent(pattern) => {
-                                    println!(
-                                        "  ✓ Approved pattern: {} (saved permanently)",
-                                        pattern.pattern
-                                    );
+                                    let pattern_str = pattern.pattern.clone();
                                     self.tool_executor.approve_pattern_persistent(pattern);
+                                    // IMMEDIATE SAVE: Don't wait for checkpoint
+                                    if let Err(e) = self.tool_executor.save_patterns() {
+                                        eprintln!("  ⚠️  Warning: Failed to save pattern: {}", e);
+                                        println!(
+                                            "  ✓ Approved pattern: {} (this session only - save failed)",
+                                            pattern_str
+                                        );
+                                    } else {
+                                        println!(
+                                            "  ✓ Approved pattern: {} (saved permanently)",
+                                            pattern_str
+                                        );
+                                    }
                                 }
                                 ConfirmationResult::Deny => {
                                     use crate::tools::types::ToolResult;
@@ -948,6 +966,11 @@ impl Repl {
             }
         }
 
+        // Before exiting REPL, save any pending patterns
+        if let Err(e) = self.save_models().await {
+            eprintln!("Warning: Failed to save on exit: {}", e);
+        }
+
         Ok(())
     }
 
@@ -1025,9 +1048,9 @@ impl Repl {
                 let pattern = self.build_pattern_from_signature(signature)?;
                 Ok(ConfirmationResult::ApprovePatternSession(pattern))
             }
-            ConfirmationChoice::ApproveExactPersistent => {
-                Ok(ConfirmationResult::ApproveExactPersistent(signature.clone()))
-            }
+            ConfirmationChoice::ApproveExactPersistent => Ok(
+                ConfirmationResult::ApproveExactPersistent(signature.clone()),
+            ),
             ConfirmationChoice::ApprovePatternPersistent => {
                 let pattern = self.build_pattern_from_signature(signature)?;
                 Ok(ConfirmationResult::ApprovePatternPersistent(pattern))
@@ -1498,11 +1521,7 @@ impl Repl {
             }
         }
 
-        let pattern_str = Menu::text_input(
-            "Pattern:",
-            None,
-            Some("Enter the pattern string"),
-        )?;
+        let pattern_str = Menu::text_input("Pattern:", None, Some("Enter the pattern string"))?;
 
         if pattern_str.is_empty() {
             return Ok("Pattern creation cancelled (no pattern).".to_string());
@@ -1614,7 +1633,9 @@ impl Repl {
         // Build mode indicator
         let mode_indicator = match &self.mode {
             ReplMode::Normal => String::new(),
-            ReplMode::Planning { .. } => format!(" {}", "[PLANNING MODE - Inspection Only]".blue().bold()),
+            ReplMode::Planning { .. } => {
+                format!(" {}", "[PLANNING MODE - Inspection Only]".blue().bold())
+            }
             ReplMode::Executing { .. } => format!(" {}", "[EXECUTING PLAN]".green().bold()),
         };
 
@@ -1727,8 +1748,9 @@ impl Repl {
                         }
 
                         // Forward to Claude
-                        let request = MessageRequest::with_context(self.conversation.get_messages())
-                            .with_tools(self.tool_definitions.clone());
+                        let request =
+                            MessageRequest::with_context(self.conversation.get_messages())
+                                .with_tools(self.tool_definitions.clone());
 
                         // Try streaming first, fallback to buffered if tools detected
                         let use_streaming = self.streaming_enabled && self.is_interactive;
@@ -1741,9 +1763,12 @@ impl Repl {
                                 }
                                 Err(e) if e.to_string().contains("TOOLS_DETECTED") => {
                                     if self.is_interactive {
-                                        println!("\n🔧 Tools needed - switching to buffered mode...");
+                                        println!(
+                                            "\n🔧 Tools needed - switching to buffered mode..."
+                                        );
                                     }
-                                    let response = self.claude_client.send_message(&request).await?;
+                                    let response =
+                                        self.claude_client.send_message(&request).await?;
                                     let elapsed = start_time.elapsed().as_millis();
                                     if self.is_interactive {
                                         println!("✓ Received response ({}ms)", elapsed);
@@ -1955,7 +1980,10 @@ impl Repl {
         use chrono::Utc;
 
         // Check if already in plan mode
-        if matches!(self.mode, ReplMode::Planning { .. } | ReplMode::Executing { .. }) {
+        if matches!(
+            self.mode,
+            ReplMode::Planning { .. } | ReplMode::Executing { .. }
+        ) {
             println!(
                 "⚠️  Already in {} mode. Finish current task first.",
                 match self.mode {
@@ -1997,8 +2025,7 @@ impl Repl {
         println!("Ask me to explore the codebase and generate a plan.");
         println!(
             "{}",
-            "Type /show-plan to view, /approve to execute, /reject to cancel."
-                .dark_grey()
+            "Type /show-plan to view, /approve to execute, /reject to cancel.".dark_grey()
         );
 
         // Add mode change notification to conversation
@@ -2020,8 +2047,8 @@ impl Repl {
 
     /// Handle /approve command - approve plan and start execution
     async fn handle_approve_command(&mut self) -> Result<()> {
-        use chrono::Utc;
         use crate::cli::menu::{Menu, MenuOption};
+        use chrono::Utc;
 
         match &self.mode {
             ReplMode::Planning {
@@ -2082,9 +2109,15 @@ impl Repl {
                             "Please execute this plan:\n\n{}",
                             plan_content
                         ));
-                        println!("{}", "✓ Context cleared. Plan loaded as primary reference.".green());
+                        println!(
+                            "{}",
+                            "✓ Context cleared. Plan loaded as primary reference.".green()
+                        );
                     } else {
-                        println!("{}", "⚠️  Plan file not found. Adding approval message only.".yellow());
+                        println!(
+                            "{}",
+                            "⚠️  Plan file not found. Adding approval message only.".yellow()
+                        );
                         self.conversation.add_user_message(
                             "[System: Plan approved! All tools are now enabled. \
                              You may execute bash commands and modify files.]"
@@ -2196,7 +2229,9 @@ impl Repl {
                 }
             }
         } else {
-            println!("⚠️  No assistant response to save. Please ask Claude to generate a plan first.");
+            println!(
+                "⚠️  No assistant response to save. Please ask Claude to generate a plan first."
+            );
         }
         Ok(())
     }
@@ -2209,7 +2244,9 @@ impl Repl {
                 self.mode = ReplMode::Normal;
             }
             ReplMode::Planning { .. } => {
-                println!("⚠️  Currently in planning mode. Use /approve to execute or /reject to cancel.");
+                println!(
+                    "⚠️  Currently in planning mode. Use /approve to execute or /reject to cancel."
+                );
             }
             ReplMode::Normal => {
                 println!("⚠️  Not in execution mode.");
