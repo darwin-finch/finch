@@ -10,6 +10,18 @@ pub struct StreamEvent {
     #[serde(default)]
     pub index: Option<usize>,
     pub delta: Option<StreamDelta>,
+    pub content_block: Option<ContentBlock>,
+}
+
+/// Content block metadata from content_block_start events
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContentBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Delta within a streaming event
@@ -28,6 +40,16 @@ impl StreamEvent {
                 .delta
                 .as_ref()
                 .map(|d| d.delta_type == "text_delta")
+                .unwrap_or(false)
+    }
+
+    /// Check if this event signals a tool_use block starting
+    pub fn is_tool_use_start(&self) -> bool {
+        self.event_type == "content_block_start"
+            && self
+                .content_block
+                .as_ref()
+                .map(|cb| cb.block_type == "tool_use")
                 .unwrap_or(false)
     }
 
@@ -67,5 +89,37 @@ mod tests {
         let event: StreamEvent = serde_json::from_str(json).unwrap();
         assert!(!event.is_text_delta());
         assert_eq!(event.text(), None);
+    }
+
+    #[test]
+    fn test_parse_tool_use_start() {
+        let json = r#"{
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_123",
+                "name": "read"
+            }
+        }"#;
+
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        assert!(event.is_tool_use_start());
+        assert!(!event.is_text_delta());
+    }
+
+    #[test]
+    fn test_parse_text_block_start() {
+        let json = r#"{
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "text"
+            }
+        }"#;
+
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        assert!(!event.is_tool_use_start());
+        assert!(!event.is_text_delta());
     }
 }

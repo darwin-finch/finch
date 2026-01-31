@@ -1667,14 +1667,37 @@ impl Repl {
                 let request = MessageRequest::with_context(self.conversation.get_messages())
                     .with_tools(create_tool_definitions());
 
-                // Disable streaming for now - it doesn't properly handle tool uses
-                // TODO: Parse SSE stream for tool_use blocks to enable streaming with tools
-                let use_streaming = false; // self.streaming_enabled && self.is_interactive;
+                // Try streaming first, fallback to buffered if tools detected
+                let use_streaming = self.streaming_enabled && self.is_interactive;
 
                 if use_streaming {
-                    // Streaming path (disabled until tool detection added)
+                    // Streaming path - will abort if tools detected
                     let rx = self.claude_client.send_message_stream(&request).await?;
-                    claude_response = self.display_streaming_response(rx).await?;
+                    match self.display_streaming_response(rx).await {
+                        Ok(text) => {
+                            // Streaming succeeded (no tools)
+                            claude_response = text;
+                        }
+                        Err(e) if e.to_string().contains("TOOLS_DETECTED") => {
+                            // Tools detected in stream - fallback to buffered mode
+                            if self.is_interactive {
+                                println!("\n🔧 Tools needed - switching to buffered mode...");
+                            }
+                            let response = self.claude_client.send_message(&request).await?;
+
+                            let elapsed = start_time.elapsed().as_millis();
+                            if self.is_interactive {
+                                println!("✓ Received response ({}ms)", elapsed);
+                            }
+
+                            // Execute tool loop
+                            claude_response = self.execute_tool_loop(response).await?;
+                        }
+                        Err(e) => {
+                            // Real error - propagate
+                            return Err(e);
+                        }
+                    }
                 } else {
                     // Non-streaming path (supports tool use detection)
                     let response = self.claude_client.send_message(&request).await?;

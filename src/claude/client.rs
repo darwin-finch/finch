@@ -132,6 +132,13 @@ impl ClaudeClient {
 
                                 // Parse event and extract text
                                 if let Ok(event) = serde_json::from_str::<StreamEvent>(json_str) {
+                                    // Check for tool_use blocks - signal error to abort streaming
+                                    if event.is_tool_use_start() {
+                                        tracing::debug!("Tool use detected in stream, aborting");
+                                        let _ = tx.send(Err(anyhow::anyhow!("TOOLS_DETECTED"))).await;
+                                        break;
+                                    }
+
                                     if event.is_text_delta() {
                                         if let Some(text) = event.text() {
                                             if tx.send(Ok(text.to_string())).await.is_err() {
