@@ -22,7 +22,8 @@ use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
     AnalyzeModelTool, BashTool, CompareResponsesTool, GenerateTrainingDataTool, GlobTool,
-    GrepTool, QueryLocalModelTool, ReadTool, RestartTool, SaveAndExecTool, WebFetchTool,
+    GrepTool, QueryLocalModelTool, ReadTool, RestartTool, SaveAndExecTool, TrainTool,
+    WebFetchTool,
 };
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::{ToolDefinition, ToolInputSchema, ToolUse};
@@ -159,6 +160,7 @@ impl Repl {
         tool_registry.register(Box::new(CompareResponsesTool));
         tool_registry.register(Box::new(GenerateTrainingDataTool));
         tool_registry.register(Box::new(AnalyzeModelTool));
+        tool_registry.register(Box::new(TrainTool));
 
         // Create permission manager (allow all for now)
         let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
@@ -186,6 +188,7 @@ impl Repl {
                 fallback_registry.register(Box::new(CompareResponsesTool));
                 fallback_registry.register(Box::new(GenerateTrainingDataTool));
                 fallback_registry.register(Box::new(AnalyzeModelTool));
+                fallback_registry.register(Box::new(TrainTool));
                 ToolExecutor::new(
                     fallback_registry,
                     PermissionManager::new().with_default_rule(PermissionRule::Allow),

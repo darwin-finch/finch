@@ -22,6 +22,7 @@ pub mod analyze_model;
 pub mod compare_responses;
 pub mod generate_training;
 pub mod query_local;
+pub mod train;
 
 // Re-exports for convenience
 pub use bash::BashTool;
@@ -37,3 +38,4 @@ pub use analyze_model::AnalyzeModelTool;
 pub use compare_responses::CompareResponsesTool;
 pub use generate_training::GenerateTrainingDataTool;
 pub use query_local::QueryLocalModelTool;
+pub use train::TrainTool;
