@@ -12,13 +12,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 
 use crate::claude::{ClaudeClient, MessageRequest};
 use crate::config::Config;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
+use crate::models::tokenizer::TextTokenizer;
 use crate::models::{ThresholdRouter, ThresholdValidator};
 use crate::router::{ForwardReason, RouteDecision, Router};
+use crate::training::batch_trainer::BatchTrainer;
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
     AnalyzeModelTool, BashTool, CompareResponsesTool, GenerateTrainingDataTool, GlobTool,
@@ -86,11 +88,14 @@ pub struct Repl {
     metrics_logger: MetricsLogger,
     // Online learning models
     threshold_validator: ThresholdValidator, // Keep validator separate
-    local_generator: crate::local::LocalGenerator, // NEW: Local generation
+    local_generator: Arc<RwLock<crate::local::LocalGenerator>>, // NEW: Local generation
     // Training metrics
     training_trends: TrainingTrends,
     // Model persistence
     models_dir: Option<PathBuf>,
+    // Active learning (Phase 2)
+    batch_trainer: Arc<RwLock<crate::training::batch_trainer::BatchTrainer>>,
+    tokenizer: Arc<crate::models::tokenizer::TextTokenizer>,
     // Tool execution
     tool_executor: ToolExecutor,
     tool_definitions: Vec<ToolDefinition>, // Cached tool definitions for Claude API
@@ -107,7 +112,7 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub fn new(
+    pub async fn new(
         config: Config,
         claude_client: ClaudeClient,
         router: Router,
@@ -121,9 +126,6 @@ impl Repl {
 
         // Load validator only (router is now in Router)
         let threshold_validator = Self::load_validator(models_dir.as_ref(), is_interactive);
-
-        // Load or create local generator
-        let local_generator = Self::load_local_generator(models_dir.as_ref(), is_interactive);
 
         // Initialize input handler for interactive mode
         let input_handler = if is_interactive {
@@ -214,6 +216,50 @@ impl Repl {
             .map(|tool| tool.definition())
             .collect();
 
+        // Initialize tokenizer for active learning
+        let tokenizer = Arc::new(
+            TextTokenizer::default()
+                .unwrap_or_else(|e| {
+                    eprintln!("Warning: Failed to create tokenizer: {}", e);
+                    eprintln!("Active learning tools may not work correctly");
+                    panic!("Cannot create tokenizer")
+                })
+        );
+
+        // Initialize batch trainer for active learning
+        use crate::models::{DevicePreference, ModelConfig};
+        let model_config = ModelConfig {
+            vocab_size: tokenizer.vocab_size(),
+            hidden_dim: 128,         // Small model for fast training
+            num_layers: 2,
+            num_heads: 4,
+            max_seq_len: 512,
+            dropout: 0.1,            // Standard dropout rate
+            device_preference: DevicePreference::Auto, // Use Metal if available
+        };
+
+        let batch_trainer = Arc::new(RwLock::new(
+            BatchTrainer::new(
+                32,             // batch_size
+                1e-4,           // learning_rate
+                &model_config,
+            ).unwrap_or_else(|e| {
+                eprintln!("Warning: Failed to create batch trainer: {}", e);
+                eprintln!("Active learning tools may not work correctly");
+                panic!("Cannot create batch trainer")
+            })
+        ));
+
+        // NOW load or create local generator with neural models
+        let local_generator = Arc::new(RwLock::new(
+            Self::load_local_generator_with_models(
+                models_dir.as_ref(),
+                is_interactive,
+                Arc::clone(&batch_trainer),
+                Arc::clone(&tokenizer),
+            ).await
+        ));
+
         Self {
             _config: config,
             claude_client,
@@ -223,6 +269,8 @@ impl Repl {
             local_generator,
             training_trends: TrainingTrends::new(20), // Track last 20 queries
             models_dir,
+            batch_trainer,
+            tokenizer,
             tool_executor,
             tool_definitions,
             is_interactive,
@@ -234,34 +282,47 @@ impl Repl {
         }
     }
 
-    /// Load local generator from disk or create new one
-    fn load_local_generator(models_dir: Option<&PathBuf>, is_interactive: bool) -> crate::local::LocalGenerator {
+    /// Load local generator from disk or create new one WITH neural models
+    async fn load_local_generator_with_models(
+        models_dir: Option<&PathBuf>,
+        is_interactive: bool,
+        batch_trainer: Arc<RwLock<BatchTrainer>>,
+        tokenizer: Arc<TextTokenizer>,
+    ) -> crate::local::LocalGenerator {
         use crate::local::LocalGenerator;
 
-        let Some(models_dir) = models_dir else {
-            return LocalGenerator::new();
+        // Get neural models from batch trainer
+        let neural_generator = {
+            let trainer = batch_trainer.read().await;
+            Some(trainer.generator())
         };
 
-        let generator_path = models_dir.join("local_generator.json");
-        if generator_path.exists() {
-            match LocalGenerator::load(&generator_path) {
-                Ok(generator) => {
-                    if is_interactive {
-                        eprintln!("✓ Loaded local generator from: {}", generator_path.display());
+        // Try to load existing local generator state
+        if let Some(models_dir) = models_dir {
+            let generator_path = models_dir.join("local_generator.json");
+            if generator_path.exists() {
+                match LocalGenerator::load(&generator_path) {
+                    Ok(_generator) => {
+                        if is_interactive {
+                            eprintln!("✓ Loaded local generator from: {}", generator_path.display());
+                        }
+                        // Note: loaded generator won't have neural models yet
+                        // We'd need to refactor LocalGenerator to support injecting them
+                        // For now, create fresh with models
+                        return LocalGenerator::with_models(neural_generator, Some(tokenizer));
                     }
-                    generator
-                }
-                Err(e) => {
-                    if is_interactive {
-                        eprintln!("⚠️  Failed to load local generator: {}", e);
-                        eprintln!("   Starting with new generator");
+                    Err(e) => {
+                        if is_interactive {
+                            eprintln!("⚠️  Failed to load local generator: {}", e);
+                            eprintln!("   Starting with new generator");
+                        }
                     }
-                    LocalGenerator::new()
                 }
             }
-        } else {
-            LocalGenerator::new()
         }
+
+        // Create new with neural models
+        LocalGenerator::with_models(neural_generator, Some(tokenizer))
     }
 
     /// Load validator from disk or create new one
@@ -295,7 +356,7 @@ impl Repl {
     }
 
     /// Save models to disk
-    fn save_models(&mut self) -> Result<()> {
+    async fn save_models(&mut self) -> Result<()> {
         let Some(ref models_dir) = self.models_dir else {
             // Still save patterns even if no models directory
             self.tool_executor.save_patterns()?;
@@ -317,8 +378,10 @@ impl Repl {
             .save(models_dir.join("threshold_validator.json"))?;
 
         // Save local generator
-        self.local_generator
-            .save(models_dir.join("local_generator.json"))?;
+        {
+            let gen = self.local_generator.read().await;
+            gen.save(models_dir.join("local_generator.json"))?;
+        }
 
         // Save tool patterns
         self.tool_executor.save_patterns()?;
@@ -495,7 +558,14 @@ impl Repl {
 
                 let result = self
                     .tool_executor
-                    .execute_tool(tool_use, Some(&self.conversation), Some(save_fn))
+                    .execute_tool(
+                        tool_use,
+                        Some(&self.conversation),
+                        Some(save_fn),
+                        Some(Arc::clone(&self.batch_trainer)),
+                        Some(Arc::clone(&self.local_generator)),
+                        Some(Arc::clone(&self.tokenizer)),
+                    )
                     .await?;
 
                 // Display tool result to user (Phase 1: Visibility)
@@ -710,7 +780,7 @@ impl Repl {
                 if self.is_interactive {
                     println!();
                 }
-                self.save_models()?;
+                self.save_models().await?;
                 if self.is_interactive {
                     println!("Models saved. Goodbye!");
                 }
@@ -734,7 +804,7 @@ impl Repl {
                     None => {
                         // Ctrl+C or Ctrl+D - graceful exit
                         println!();
-                        self.save_models()?;
+                        self.save_models().await?;
                         if let Some(ref mut handler) = self.input_handler {
                             if let Err(e) = handler.save_history() {
                                 eprintln!("Warning: Failed to save history: {}", e);
@@ -781,7 +851,7 @@ impl Repl {
             if let Some(command) = Command::parse(&input) {
                 match command {
                     Command::Quit => {
-                        self.save_models()?;
+                        self.save_models().await?;
                         if let Some(ref mut handler) = self.input_handler {
                             if let Err(e) = handler.save_history() {
                                 eprintln!("Warning: Failed to save history: {}", e);
@@ -1634,7 +1704,8 @@ impl Repl {
                 }
 
                 // Try local generation
-                match self.local_generator.try_generate(query) {
+                let mut gen = self.local_generator.write().await;
+                match gen.try_generate(query) {
                     Ok(Some(response_text)) => {
                         // Successfully generated locally
                         if self.is_interactive {
@@ -1648,6 +1719,8 @@ impl Repl {
                     }
                     Ok(None) | Err(_) => {
                         // Local generation insufficient or failed - forward to Claude
+                        drop(gen); // Drop the read lock before forwarding to Claude
+
                         if self.is_interactive {
                             println!("⚠️  Local generation insufficient confidence");
                             println!("→ Forwarding to Claude");
@@ -1798,9 +1871,16 @@ impl Repl {
         self.threshold_validator
             .learn(query, &claude_response, quality_score >= 0.7);
 
-        // Learn from Claude response (for local generation)
-        self.local_generator
-            .learn_from_claude(query, &claude_response, quality_score);
+        // Learn from Claude response (for local generation and neural training)
+        {
+            let mut gen = self.local_generator.write().await;
+            gen.learn_from_claude(
+                query,
+                &claude_response,
+                quality_score,
+                Some(&self.batch_trainer), // Pass BatchTrainer for neural training
+            );
+        }
 
         // Update training trends
         self.training_trends
@@ -1809,7 +1889,7 @@ impl Repl {
         // Checkpoint every 10 queries
         let router_stats = self.router.stats(); // CHANGED: use router.stats()
         if router_stats.total_queries % 10 == 0 && router_stats.total_queries > 0 {
-            let _ = self.save_models(); // Ignore errors during checkpoint
+            let _ = self.save_models().await; // Ignore errors during checkpoint
         }
 
         if self.is_interactive {

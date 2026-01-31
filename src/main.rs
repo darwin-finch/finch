@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
         let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
 
         // Create REPL (will detect non-interactive mode automatically)
-        let mut repl = Repl::new(config, claude_client, router, metrics_logger);
+        let mut repl = Repl::new(config, claude_client, router, metrics_logger).await;
 
         // Process the piped query and exit
         let response = repl.process_query(input.trim()).await?;
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
     let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
 
     // Create and run REPL
-    let mut repl = Repl::new(config, claude_client, router, metrics_logger);
+    let mut repl = Repl::new(config, claude_client, router, metrics_logger).await;
 
     // Restore session if requested
     if let Some(session_path) = args.restore_session {
@@ -266,7 +266,7 @@ async fn run_query(query: &str) -> Result<()> {
     let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
 
     // Create REPL in non-interactive mode
-    let mut repl = Repl::new(config, claude_client, router, metrics_logger);
+    let mut repl = Repl::new(config, claude_client, router, metrics_logger).await;
 
     // Process query and print result
     let response = repl.process_query(query).await?;
