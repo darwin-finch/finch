@@ -7,6 +7,7 @@ use crossterm::{
     terminal::{self, Clear, ClearType},
     ExecutableCommand,
 };
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -402,10 +403,14 @@ impl Repl {
     ) -> Result<String> {
         let mut current_response = initial_response;
         let mut iteration = 0;
-        const MAX_ITERATIONS: u32 = 5; // Prevent infinite loops
+        const MAX_ITERATIONS: u32 = 25; // Higher safety limit (prevents truly infinite loops)
+        const MAX_CONSECUTIVE_SAME_TOOL: usize = 3; // Limit per tool
 
-        // Track tool calls to detect infinite loops
+        // Track tool calls to detect infinite loops (signature-based)
         let mut tool_call_history: Vec<(String, String)> = Vec::new();
+
+        // Track consecutive usage per tool
+        let mut consecutive_tool_usage: HashMap<String, usize> = HashMap::new();
 
         while current_response.has_tool_uses() && iteration < MAX_ITERATIONS {
             iteration += 1;
@@ -416,7 +421,35 @@ impl Repl {
                 println!("🔧 Executing {} tool(s)...", tool_uses.len());
             }
 
-            // Check for repeated tool calls (infinite loop detection)
+            // Check for excessive use of same tool (per-tool limit)
+            for tool_use in &tool_uses {
+                let count = consecutive_tool_usage
+                    .get(&tool_use.name)
+                    .unwrap_or(&0);
+
+                if *count >= MAX_CONSECUTIVE_SAME_TOOL {
+                    let error_msg = format!(
+                        "⚠️  Tool '{}' called {} times consecutively. Possible infinite loop detected.",
+                        tool_use.name, count
+                    );
+
+                    if self.is_interactive {
+                        eprintln!("{}", error_msg);
+                        eprintln!("⚠️  Breaking to prevent infinite loop...");
+                    }
+
+                    // Add explanation to conversation
+                    let explanation = format!(
+                        "Tool execution stopped: Detected possible infinite loop. \
+                         Tool '{}' was called {} times consecutively without switching to different tools.",
+                        tool_use.name, count
+                    );
+
+                    return Ok(explanation);
+                }
+            }
+
+            // Check for repeated tool calls (signature-based infinite loop detection)
             for tool_use in &tool_uses {
                 let input_hash = format!("{:?}", tool_use.input);
                 let signature = (tool_use.name.clone(), input_hash.clone());
@@ -615,6 +648,20 @@ impl Repl {
                 tool_results.push(result);
             }
 
+            // Update consecutive tool usage counters
+            let current_tool_names: HashSet<_> = tool_uses.iter()
+                .map(|t| t.name.clone())
+                .collect();
+
+            // Increment counters for tools used in this iteration
+            for tool_use in &tool_uses {
+                *consecutive_tool_usage.entry(tool_use.name.clone())
+                    .or_insert(0) += 1;
+            }
+
+            // Reset counters for tools NOT in current execution (user switched tools)
+            consecutive_tool_usage.retain(|name, _| current_tool_names.contains(name));
+
             // Build tool result message for Claude using XML-like structure
             // This format is easier for Claude to parse
             let mut tool_result_text = String::new();
@@ -702,7 +749,7 @@ impl Repl {
 
         // Check for empty messages
         for (i, msg) in messages.iter().enumerate() {
-            if msg.content.is_empty() {
+            if msg.is_empty_text() {
                 eprintln!("⚠️  WARNING: Message {} has empty content", i);
             }
         }
@@ -2207,7 +2254,7 @@ impl Repl {
             .iter()
             .rev()
             .find(|msg| msg.role == "assistant")
-            .map(|msg| msg.content.clone());
+            .map(|msg| msg.text());
 
         if let Some(content) = last_assistant_msg {
             match &self.mode {
