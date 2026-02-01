@@ -5,7 +5,7 @@ use anyhow::Result;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
@@ -131,9 +131,10 @@ impl ThresholdRouter {
         false
     }
 
-    /// Learn from a routing attempt
-    pub fn learn(&mut self, query: &str, was_successful: bool) {
+    /// Learn from a local generation attempt (called only when we tried local)
+    pub fn learn_local_attempt(&mut self, query: &str, was_successful: bool) {
         self.total_queries += 1;
+        self.total_local_attempts += 1;
 
         let category = Self::categorize_query(query);
         let stats = self
@@ -142,7 +143,6 @@ impl ThresholdRouter {
             .or_insert_with(CategoryStats::default);
 
         stats.local_attempts += 1;
-        self.total_local_attempts += 1;
 
         if was_successful {
             stats.successes += 1;
@@ -153,6 +153,32 @@ impl ThresholdRouter {
 
         // Update confidence threshold adaptively
         self.update_threshold();
+    }
+
+    /// Learn from a forwarded query (called when we forwarded to Claude)
+    pub fn learn_forwarded(&mut self, _query: &str) {
+        self.total_queries += 1;
+        // Don't increment total_local_attempts - we didn't try local generation
+
+        // Optionally: track which categories get forwarded for future analysis
+        // For now, just count the query
+
+        // Update confidence threshold adaptively
+        self.update_threshold();
+    }
+
+    /// Deprecated: Use learn_local_attempt() or learn_forwarded() instead
+    /// This method is kept for backward compatibility but logs a warning
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use learn_local_attempt() or learn_forwarded() instead"
+    )]
+    pub fn learn(&mut self, query: &str, was_successful: bool) {
+        tracing::warn!(
+            "learn() is deprecated - use learn_local_attempt() or learn_forwarded() instead"
+        );
+        // For backward compatibility, assume all calls are local attempts
+        self.learn_local_attempt(query, was_successful);
     }
 
     /// Update threshold based on current performance
@@ -409,7 +435,9 @@ impl ThresholdRouter {
         // Generate NEW session ID for this program run
         router.session_id = Uuid::new_v4().to_string();
         // Mark as not yet saved in this session
-        router.has_saved_this_session.store(false, Ordering::Relaxed);
+        router
+            .has_saved_this_session
+            .store(false, Ordering::Relaxed);
         // Mark as loaded from disk (already have this data, don't merge on first save)
         router.loaded_from_disk = true;
         Ok(router)
@@ -514,15 +542,24 @@ mod tests {
         let mut router = ThresholdRouter::new();
 
         // First 10 queries: always forward
-        for i in 0..10 {
+        for _ in 0..10 {
             assert!(!router.should_try_local("test query"));
-            router.learn("test query", false);
+            router.learn_forwarded("test query");
         }
 
-        // Learn that greetings work
+        // Verify: 10 queries, 0 local attempts
+        assert_eq!(router.total_queries, 10);
+        assert_eq!(router.total_local_attempts, 0);
+
+        // Learn that greetings work (local attempts)
         for _ in 0..5 {
-            router.learn("Hello", true);
+            router.learn_local_attempt("Hello", true);
         }
+
+        // Verify: 15 queries total, 5 local attempts, 5 successes
+        assert_eq!(router.total_queries, 15);
+        assert_eq!(router.total_local_attempts, 5);
+        assert_eq!(router.total_successes, 5);
 
         // After 3 successes, should try greetings
         assert!(router.should_try_local("Hi there"));
@@ -538,10 +575,15 @@ mod tests {
         for i in 0..100 {
             // Only try local on every 10th query (90% forward rate)
             if i % 10 == 0 {
-                router.learn("test", true); // Local attempt succeeded
+                router.learn_local_attempt("test", true); // Local attempt succeeded
+            } else {
+                router.learn_forwarded("test"); // Forwarded to Claude
             }
-            router.total_queries += 1; // Count all queries
         }
+
+        // Verify correct counts: 100 total, 10 local attempts
+        assert_eq!(router.total_queries, 100);
+        assert_eq!(router.total_local_attempts, 10);
 
         // With 90% forward rate (way above 5% target), threshold should decrease
         assert!(router.confidence_threshold < initial_threshold);

@@ -72,7 +72,23 @@ impl Router {
         }
     }
 
-    /// Learn from routing result (forward to threshold router)
+    /// Learn from a local generation attempt
+    pub fn learn_local_attempt(&mut self, query: &str, was_successful: bool) {
+        self.threshold_router
+            .learn_local_attempt(query, was_successful);
+    }
+
+    /// Learn from a forwarded query
+    pub fn learn_forwarded(&mut self, query: &str) {
+        self.threshold_router.learn_forwarded(query);
+    }
+
+    /// Deprecated: Use learn_local_attempt() or learn_forwarded() instead
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use learn_local_attempt() or learn_forwarded() instead"
+    )]
+    #[allow(deprecated)]
     pub fn learn(&mut self, query: &str, was_successful: bool) {
         self.threshold_router.learn(query, was_successful);
     }

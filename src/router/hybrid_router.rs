@@ -271,7 +271,13 @@ impl HybridRouter {
         self.query_count += 1;
 
         // Always learn with threshold models
-        self.threshold_router.learn(query, true);
+        if was_forwarded {
+            // We forwarded directly to Claude (no local attempt)
+            self.threshold_router.learn_forwarded(query);
+        } else {
+            // We tried local generation (regardless of success)
+            self.threshold_router.learn_local_attempt(query, true);
+        }
         self.threshold_validator.learn(query, response, true);
 
         // Learn with neural models if available

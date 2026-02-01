@@ -1935,11 +1935,26 @@ impl Repl {
             io::stdout().flush()?;
         }
 
-        // Determine if this was a success (for router learning)
-        let was_successful = routing_decision_str == "local" && quality_score >= 0.7;
-
         // Learn from this interaction
-        self.router.learn(query, was_successful); // CHANGED: use router.learn()
+        match routing_decision_str.as_str() {
+            "local" => {
+                // We successfully generated locally
+                let was_successful = quality_score >= 0.7;
+                self.router.learn_local_attempt(query, was_successful);
+            }
+            "local_attempted" => {
+                // We tried local but fell back to Claude (always counts as failure)
+                self.router.learn_local_attempt(query, false);
+            }
+            "forward" => {
+                // We forwarded directly to Claude (no local attempt)
+                self.router.learn_forwarded(query);
+            }
+            _ => {
+                tracing::warn!("Unknown routing decision: {}", routing_decision_str);
+            }
+        }
+
         self.threshold_validator
             .learn(query, &claude_response, quality_score >= 0.7);
 

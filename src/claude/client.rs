@@ -70,9 +70,18 @@ impl ClaudeClient {
         Ok(message_response)
     }
 
-    /// Send a message with streaming response
+    /// Send a message with streaming response (with retry logic)
     /// Returns a channel that receives text chunks as they arrive
     pub async fn send_message_stream(
+        &self,
+        request: &MessageRequest,
+    ) -> Result<mpsc::Receiver<Result<String>>> {
+        with_retry(|| self.send_message_stream_once(request)).await
+    }
+
+    /// Send a message with streaming response (no retry)
+    /// Returns a channel that receives text chunks as they arrive
+    async fn send_message_stream_once(
         &self,
         request: &MessageRequest,
     ) -> Result<mpsc::Receiver<Result<String>>> {
@@ -135,7 +144,8 @@ impl ClaudeClient {
                                     // Check for tool_use blocks - signal error to abort streaming
                                     if event.is_tool_use_start() {
                                         tracing::debug!("Tool use detected in stream, aborting");
-                                        let _ = tx.send(Err(anyhow::anyhow!("TOOLS_DETECTED"))).await;
+                                        let _ =
+                                            tx.send(Err(anyhow::anyhow!("TOOLS_DETECTED"))).await;
                                         break;
                                     }
 
@@ -178,6 +188,6 @@ mod tests {
         let request = MessageRequest::new("Hello");
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.messages[0].role, "user");
-        assert_eq!(request.messages[0].content, "Hello");
+        assert_eq!(request.messages[0].text(), "Hello");
     }
 }
