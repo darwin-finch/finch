@@ -8,6 +8,7 @@ pub mod ensemble;
 pub mod generator; // Legacy custom transformer
 pub mod generator_new; // New unified generator
 pub mod learning;
+pub mod lora; // LoRA fine-tuning (placeholder)
 pub mod manager;
 pub mod model_selector;
 pub mod persistence;
@@ -29,6 +30,7 @@ pub use ensemble::{EnsembleStats, ModelEnsemble, Quality, RouteDecision};
 pub use generator::GeneratorModel as LegacyGeneratorModel;
 pub use generator_new::{GeneratorModel, TextGeneration};
 pub use learning::{LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData};
+pub use lora::{LoRAAdapter, LoRAConfig};
 pub use manager::{ModelManager, OverallStats, TrainingReport};
 pub use model_selector::{ModelSelector, QwenSize};
 pub use persistence::{load_model_metadata, model_exists, save_model_with_metadata, ModelMetadata};

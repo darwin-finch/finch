@@ -138,6 +138,61 @@ impl GeneratorModel {
     pub fn config(&self) -> &GeneratorConfig {
         &self.config
     }
+
+    /// Fine-tune model with LoRA adapter (placeholder for future functionality)
+    ///
+    /// # Arguments
+    /// * `examples` - Training data as (query, response) pairs
+    /// * `lora_config` - LoRA configuration (rank, alpha, target modules)
+    /// * `epochs` - Number of training epochs
+    /// * `learning_rate` - Learning rate for optimization
+    ///
+    /// # Example (Future Usage)
+    /// ```rust,ignore
+    /// use shammah::models::{GeneratorModel, LoRAConfig};
+    ///
+    /// let mut generator = GeneratorModel::new(config)?;
+    ///
+    /// let examples = vec![
+    ///     ("What is Rust?".into(), "Rust is a systems programming language...".into()),
+    ///     ("Explain ownership".into(), "Ownership is Rust's most unique feature...".into()),
+    /// ];
+    ///
+    /// let lora_config = LoRAConfig::default();
+    /// generator.fine_tune(&examples, lora_config, 3, 1e-4)?;
+    /// ```
+    ///
+    /// # Returns
+    /// Error with message "Not yet implemented"
+    pub fn fine_tune(
+        &mut self,
+        _examples: &[(String, String)],
+        _lora_config: crate::models::lora::LoRAConfig,
+        _epochs: usize,
+        _learning_rate: f64,
+    ) -> Result<()> {
+        anyhow::bail!(
+            "LoRA fine-tuning not yet implemented. This is a placeholder for future functionality.\n\
+             \n\
+             To use fine-tuning in the future:\n\
+             1. Prepare training examples (query, response pairs)\n\
+             2. Configure LoRA parameters (rank, alpha, target modules)\n\
+             3. Call fine_tune() with your data\n\
+             4. Save adapted model with save_lora()\n\
+             \n\
+             See src/models/lora.rs for detailed documentation."
+        )
+    }
+
+    /// Save LoRA adapter weights (placeholder)
+    pub fn save_lora(&self, _path: &Path) -> Result<()> {
+        anyhow::bail!("LoRA adapter saving not yet implemented")
+    }
+
+    /// Load LoRA adapter weights (placeholder)
+    pub fn load_lora(&mut self, _path: &Path) -> Result<()> {
+        anyhow::bail!("LoRA adapter loading not yet implemented")
+    }
 }
 
 impl Saveable for GeneratorModel {
