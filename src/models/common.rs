@@ -5,7 +5,7 @@ use candle_core::Device;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Common model configuration
+/// Common model configuration (for custom transformers)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub vocab_size: usize,
@@ -15,6 +15,19 @@ pub struct ModelConfig {
     pub max_seq_len: usize,
     pub dropout: f64,
     pub device_preference: DevicePreference,
+}
+
+/// Generator configuration - supports both custom and pre-trained models
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GeneratorConfig {
+    /// Random initialization (existing behavior)
+    RandomInit(ModelConfig),
+    /// Pre-trained Qwen model
+    Qwen {
+        model_size: crate::models::model_selector::QwenSize,
+        cache_dir: std::path::PathBuf,
+        device_preference: DevicePreference,
+    },
 }
 
 impl Default for ModelConfig {
