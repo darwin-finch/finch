@@ -100,7 +100,9 @@ impl ConversationHistory {
 
         if total_chars > self.max_tokens_estimate {
             // Remove oldest messages until under limit
-            while !self.messages.is_empty()
+            // BUT: Always keep at least 2 messages (1 user + 1 assistant minimum)
+            // This prevents conversation from becoming empty during tool execution
+            while self.messages.len() > 2
                 && self.messages.iter()
                     .map(|m| m.text().len())
                     .sum::<usize>() > self.max_tokens_estimate

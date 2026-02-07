@@ -6,7 +6,7 @@ use candle_core::Tensor;
 use std::path::Path;
 
 use super::common::{get_device, ModelConfig, Saveable};
-use super::generator::GeneratorModel;
+use super::generator::GeneratorModel as LegacyGeneratorModel; // Legacy custom transformer
 use super::router::RouterModel;
 use super::tokenizer::TextTokenizer;
 use super::validator::ValidatorModel;
@@ -30,9 +30,11 @@ pub enum Quality {
 }
 
 /// The full 3-model ensemble with online learning
+/// NOTE: This uses the legacy custom transformer. For production, use BootstrapLoader with Qwen models.
+#[deprecated(note = "Use BootstrapLoader with Qwen models instead")]
 pub struct ModelEnsemble {
     router: RouterModel,
-    generator: GeneratorModel,
+    generator: LegacyGeneratorModel,
     validator: ValidatorModel,
     tokenizer: TextTokenizer,
     config: ModelConfig,
@@ -42,10 +44,12 @@ pub struct ModelEnsemble {
 
 impl ModelEnsemble {
     /// Create new ensemble with random initialization
+    /// NOTE: This uses the legacy custom transformer. For production, use BootstrapLoader with Qwen.
+    #[deprecated(note = "Use BootstrapLoader with Qwen models instead")]
     pub fn new(config: ModelConfig) -> Result<Self> {
         let router = RouterModel::new(&config).context("Failed to create router model")?;
 
-        let generator = GeneratorModel::new(&config).context("Failed to create generator model")?;
+        let generator = LegacyGeneratorModel::new(&config).context("Failed to create generator model")?;
 
         let validator = ValidatorModel::new(&config).context("Failed to create validator model")?;
 

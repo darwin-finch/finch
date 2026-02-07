@@ -23,7 +23,9 @@ pub struct GeneratorModel {
 impl GeneratorModel {
     /// Create new generator with random initialization
     pub fn new(config: &ModelConfig) -> Result<Self> {
-        let device = get_device_with_preference(config.device_preference)?;
+        // Force CPU for custom transformer - Metal doesn't support all ops (layer_norm)
+        let device = Device::Cpu;
+        tracing::info!("Using CPU for custom transformer (Metal layer-norm not implemented)");
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
