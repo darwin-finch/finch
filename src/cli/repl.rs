@@ -19,7 +19,8 @@ use crate::claude::{ClaudeClient, MessageRequest};
 use crate::config::Config;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
 use crate::models::tokenizer::TextTokenizer;
-use crate::models::{ThresholdRouter, ThresholdValidator};
+use crate::models::ThresholdValidator;
+use crate::models::{Sampler, SamplingConfig, TrainingCoordinator, WeightedExample};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
@@ -27,7 +28,7 @@ use crate::tools::implementations::{
     QueryLocalModelTool, ReadTool, RestartTool, SaveAndExecTool, TrainTool, WebFetchTool,
 };
 use crate::tools::patterns::ToolPattern;
-use crate::tools::types::{ToolDefinition, ToolInputSchema, ToolUse};
+use crate::tools::types::{ToolDefinition, ToolUse};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 use crate::training::batch_trainer::BatchTrainer;
 
@@ -109,6 +110,20 @@ pub struct Repl {
     conversation: ConversationHistory,
     // REPL mode (normal, planning, executing)
     mode: ReplMode,
+    // LoRA fine-tuning (NEW)
+    training_coordinator: Arc<TrainingCoordinator>,
+    sampler: Arc<RwLock<Sampler>>,
+    // Track last exchange for feedback
+    last_query: Option<String>,
+    last_response: Option<String>,
+    last_was_sampled: bool,
+}
+
+/// Background training statistics
+struct BackgroundTrainingStats {
+    examples_trained: usize,
+    final_loss: f64,
+    adapter_path: String,
 }
 
 impl Repl {
@@ -260,6 +275,20 @@ impl Repl {
             .await,
         ));
 
+        // Initialize LoRA fine-tuning system
+        let training_coordinator = Arc::new(TrainingCoordinator::new(
+            100, // buffer_size: keep last 100 examples
+            10,  // threshold: train after 10 examples
+            true, // auto_train: enabled
+        ));
+
+        let sampling_config = SamplingConfig::default(); // 5% baseline, 3x arch, 5x security
+        let sampler = Arc::new(RwLock::new(Sampler::new(sampling_config)));
+
+        if is_interactive {
+            eprintln!("✓ LoRA fine-tuning enabled (weighted training)");
+        }
+
         Self {
             _config: config,
             claude_client,
@@ -279,6 +308,12 @@ impl Repl {
             input_handler,
             conversation: ConversationHistory::new(),
             mode: ReplMode::Normal,
+            // LoRA fine-tuning
+            training_coordinator,
+            sampler,
+            last_query: None,
+            last_response: None,
+            last_was_sampled: false,
         }
     }
 
@@ -978,6 +1013,19 @@ impl Repl {
                     }
                     Command::Done => {
                         self.handle_done_command().await?;
+                        continue;
+                    }
+                    // Feedback commands for weighted LoRA training
+                    Command::FeedbackCritical(ref note) => {
+                        self.handle_feedback(10.0, note.clone()).await?;
+                        continue;
+                    }
+                    Command::FeedbackMedium(ref note) => {
+                        self.handle_feedback(3.0, note.clone()).await?;
+                        continue;
+                    }
+                    Command::FeedbackGood(ref note) => {
+                        self.handle_feedback(1.0, note.clone()).await?;
                         continue;
                     }
                     _ => {
@@ -2034,7 +2082,220 @@ impl Repl {
         self.conversation
             .add_assistant_message(claude_response.clone());
 
+        // Store last query/response for feedback commands
+        self.last_query = Some(query.to_string());
+        self.last_response = Some(claude_response.clone());
+        self.last_was_sampled = false; // TODO: Set based on sampling decision
+
         Ok(claude_response)
+    }
+
+    /// Handle feedback commands - add weighted training example
+    async fn handle_feedback(&mut self, weight: f64, note: Option<String>) -> Result<()> {
+        // Check if we have a last query/response to provide feedback on
+        let query = match &self.last_query {
+            Some(q) => q.clone(),
+            None => {
+                println!("⚠️  No previous query to provide feedback on.");
+                println!("    Use feedback commands after receiving a response.");
+                return Ok(());
+            }
+        };
+
+        let response = match &self.last_response {
+            Some(r) => r.clone(),
+            None => {
+                println!("⚠️  No previous response to provide feedback on.");
+                return Ok(());
+            }
+        };
+
+        // Create feedback message
+        let feedback = note.as_ref().map(|s| s.clone()).unwrap_or_else(|| {
+            match weight as i32 {
+                10 => "Critical issue that needs correction".to_string(),
+                3 => "Could be improved".to_string(),
+                1 => "Good example to remember".to_string(),
+                _ => "User feedback".to_string(),
+            }
+        });
+
+        // Create weighted example
+        let example = match weight as i32 {
+            10 => WeightedExample::critical(query.clone(), response.clone(), feedback.clone()),
+            3 => WeightedExample::improvement(query.clone(), response.clone(), feedback.clone()),
+            1 => WeightedExample::normal(query.clone(), response.clone(), feedback.clone()),
+            _ => WeightedExample::with_weight(
+                query.clone(),
+                response.clone(),
+                feedback.clone(),
+                weight,
+            ),
+        };
+
+        // Add to training coordinator
+        let should_train = self
+            .training_coordinator
+            .add_example(example)
+            .await
+            .context("Failed to add training example")?;
+
+        // Display confirmation
+        let weight_emoji = match weight as i32 {
+            10 => "🔴",
+            3 => "🟡",
+            1 => "🟢",
+            _ => "⚪",
+        };
+
+        println!(
+            "{} Feedback recorded (weight: {}x)",
+            weight_emoji, weight
+        );
+        if let Some(note_text) = note {
+            println!("   Note: {}", note_text);
+        }
+
+        // Get buffer stats
+        let buffer = self.training_coordinator.buffer().await;
+        let example_count = buffer.examples().len();
+        let total_weight = buffer.total_weight();
+        drop(buffer); // Release lock
+
+        println!(
+            "   Training buffer: {} examples ({:.1} weighted)",
+            example_count, total_weight
+        );
+
+        // Trigger training if threshold reached
+        if should_train {
+            println!("\n🔄 Training threshold reached, starting background training...");
+            println!("   (Training runs in background, you can continue querying)");
+
+            // Spawn background training task
+            let coordinator = Arc::clone(&self.training_coordinator);
+            let models_dir = self.models_dir.clone();
+
+            tokio::spawn(async move {
+                match Self::run_background_training(coordinator, models_dir).await {
+                    Ok(stats) => {
+                        println!("\n✓ Background training completed!");
+                        println!("   Trained on {} examples", stats.examples_trained);
+                        println!("   Final loss: {:.4}", stats.final_loss);
+                        println!("   Adapter saved to: {}", stats.adapter_path);
+                    }
+                    Err(e) => {
+                        eprintln!("\n⚠️  Background training failed: {}", e);
+                    }
+                }
+            });
+
+            println!("   Training started in background...");
+        }
+
+        Ok(())
+    }
+
+    /// Run LoRA training in background
+    async fn run_background_training(
+        coordinator: Arc<TrainingCoordinator>,
+        models_dir: Option<PathBuf>,
+    ) -> Result<BackgroundTrainingStats> {
+        use crate::models::{LoRAAdapter, LoRAConfig, LoRATrainer};
+        use std::sync::Arc as StdArc;
+
+        tracing::info!("Starting background LoRA training");
+
+        // Get training examples from buffer
+        let examples = {
+            let buffer = coordinator.buffer().await;
+            buffer.examples().to_vec()
+        };
+
+        if examples.is_empty() {
+            anyhow::bail!("No training examples in buffer");
+        }
+
+        let num_examples = examples.len();
+        tracing::info!("Training on {} examples", num_examples);
+
+        // Create LoRA configuration
+        let lora_config = LoRAConfig {
+            rank: 16,
+            alpha: 32.0,
+            dropout: 0.1,
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        };
+
+        // Determine device
+        use crate::models::{get_device_with_preference, DevicePreference};
+        let device = get_device_with_preference(DevicePreference::Auto)?;
+
+        // Create LoRA adapter
+        let adapter = LoRAAdapter::new(lora_config.clone(), device.clone())?;
+
+        // Create tokenizer
+        // TODO: Get tokenizer from actual Qwen model for production
+        // For now, use a simple GPT-2 tokenizer as placeholder
+        let tokenizer = StdArc::new({
+            use tokenizers::models::bpe::BPE;
+            let bpe = BPE::default();
+            tokenizers::Tokenizer::new(bpe)
+        });
+
+        // Create trainer
+        let mut trainer = LoRATrainer::new(
+            adapter,
+            tokenizer,
+            1e-4, // learning_rate
+            4,    // batch_size
+            3,    // epochs
+        );
+
+        // Convert WeightedExample to ExampleBuffer
+        use crate::models::ExampleBuffer;
+        let mut buffer = ExampleBuffer::new(examples.len());
+        for example in examples {
+            buffer.add(example);
+        }
+
+        // Train the adapter
+        tracing::info!("Starting LoRA training...");
+        let training_stats = trainer.train(&buffer)?;
+
+        let final_loss = training_stats
+            .last()
+            .map(|s| s.loss)
+            .unwrap_or(0.0);
+
+        // Save adapter weights
+        let adapters_dir = if let Some(ref dir) = models_dir {
+            dir.parent().unwrap().join("adapters")
+        } else {
+            dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+                .join(".shammah")
+                .join("adapters")
+        };
+
+        std::fs::create_dir_all(&adapters_dir)?;
+
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let adapter_filename = format!("lora_adapter_{}.safetensors", timestamp);
+        let adapter_path = adapters_dir.join(&adapter_filename);
+
+        trainer.adapter().save(&adapter_path)?;
+
+        tracing::info!(
+            "LoRA training completed. Adapter saved to: {}",
+            adapter_path.display()
+        );
+
+        Ok(BackgroundTrainingStats {
+            examples_trained: num_examples,
+            final_loss,
+            adapter_path: adapter_path.display().to_string(),
+        })
     }
 
     /// Handle /plan command - enter planning mode

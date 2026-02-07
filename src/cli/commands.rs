@@ -24,6 +24,10 @@ pub enum Command {
     ShowPlan,
     SavePlan,
     Done,
+    // Feedback commands for weighted LoRA training
+    FeedbackCritical(Option<String>), // High-weight (10x) - critical strategy errors
+    FeedbackMedium(Option<String>),   // Medium-weight (3x) - improvements
+    FeedbackGood(Option<String>),     // Normal-weight (1x) - good examples
 }
 
 impl Command {
@@ -43,6 +47,10 @@ impl Command {
             "/show-plan" => return Some(Command::ShowPlan),
             "/save-plan" => return Some(Command::SavePlan),
             "/done" | "/complete" => return Some(Command::Done),
+            // Feedback commands (simple form)
+            "/critical" => return Some(Command::FeedbackCritical(None)),
+            "/medium" => return Some(Command::FeedbackMedium(None)),
+            "/good" => return Some(Command::FeedbackGood(None)),
             _ => {}
         }
 
@@ -52,6 +60,57 @@ impl Command {
             if !task.is_empty() {
                 return Some(Command::Plan(task.to_string()));
             }
+        }
+
+        // Handle /feedback commands with optional explanation
+        if let Some(rest) = trimmed.strip_prefix("/feedback critical ")
+            .or_else(|| trimmed.strip_prefix("/feedback high "))
+        {
+            let explanation = rest.trim();
+            return Some(Command::FeedbackCritical(
+                if explanation.is_empty() {
+                    None
+                } else {
+                    Some(explanation.to_string())
+                },
+            ));
+        }
+
+        if trimmed == "/feedback critical" || trimmed == "/feedback high" {
+            return Some(Command::FeedbackCritical(None));
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("/feedback medium ") {
+            let explanation = rest.trim();
+            return Some(Command::FeedbackMedium(
+                if explanation.is_empty() {
+                    None
+                } else {
+                    Some(explanation.to_string())
+                },
+            ));
+        }
+
+        if trimmed == "/feedback medium" {
+            return Some(Command::FeedbackMedium(None));
+        }
+
+        if let Some(rest) = trimmed
+            .strip_prefix("/feedback good ")
+            .or_else(|| trimmed.strip_prefix("/feedback normal "))
+        {
+            let explanation = rest.trim();
+            return Some(Command::FeedbackGood(
+                if explanation.is_empty() {
+                    None
+                } else {
+                    Some(explanation.to_string())
+                },
+            ));
+        }
+
+        if trimmed == "/feedback good" || trimmed == "/feedback normal" {
+            return Some(Command::FeedbackGood(None));
         }
 
         // Handle /patterns commands with subcommands
@@ -114,9 +173,15 @@ pub fn handle_command(
             Ok("Pattern management commands should be handled in REPL.".to_string())
         }
         // Plan mode commands are handled directly in REPL
-        Command::Plan(_) | Command::Approve | Command::Reject | Command::ShowPlan
-        | Command::SavePlan | Command::Done => {
-            Ok("Plan mode commands should be handled in REPL.".to_string())
+        Command::Plan(_)
+        | Command::Approve
+        | Command::Reject
+        | Command::ShowPlan
+        | Command::SavePlan
+        | Command::Done => Ok("Plan mode commands should be handled in REPL.".to_string()),
+        // Feedback commands are handled directly in REPL
+        Command::FeedbackCritical(_) | Command::FeedbackMedium(_) | Command::FeedbackGood(_) => {
+            Ok("Feedback commands should be handled in REPL.".to_string())
         }
     }
 }
@@ -141,6 +206,19 @@ Plan Mode Commands:
   /approve          - Approve plan (prompts to clear context) and start execution
   /reject           - Reject the plan and return to normal mode
   /done             - Exit execution mode and return to normal mode
+
+Weighted Feedback Commands (LoRA Fine-Tuning):
+  /critical [note]  - Mark last response as critical error (10x weight)
+  /medium [note]    - Mark last response needs improvement (3x weight)
+  /good [note]      - Mark last response as good example (1x weight)
+
+  Aliases:
+  /feedback critical|high|medium|good [note]
+
+  Examples:
+  /critical Never use .unwrap() in production code
+  /medium Prefer iterator chains over manual loops
+  /good This is exactly the right approach
 
 Type any question to get started!"#
         .to_string()
