@@ -17,10 +17,13 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::claude::{ClaudeClient, MessageRequest};
 use crate::config::Config;
+use crate::local::LocalGenerator;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
 use crate::models::tokenizer::TextTokenizer;
 use crate::models::ThresholdValidator;
-use crate::models::{Sampler, SamplingConfig, TrainingCoordinator, WeightedExample};
+use crate::models::{
+    BootstrapLoader, GeneratorState, Sampler, SamplingConfig, TrainingCoordinator, WeightedExample,
+};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
@@ -89,13 +92,13 @@ pub struct Repl {
     metrics_logger: MetricsLogger,
     // Online learning models
     threshold_validator: ThresholdValidator, // Keep validator separate
-    local_generator: Arc<RwLock<crate::local::LocalGenerator>>, // NEW: Local generation
+    local_generator: Arc<RwLock<crate::local::LocalGenerator>>, // Local generation
     // Training metrics
     training_trends: TrainingTrends,
     // Model persistence
     models_dir: Option<PathBuf>,
-    // Active learning (Phase 2)
-    batch_trainer: Arc<RwLock<crate::training::batch_trainer::BatchTrainer>>,
+    // Qwen model bootstrap (progressive loading)
+    bootstrap_loader: Arc<BootstrapLoader>,
     tokenizer: Arc<crate::models::tokenizer::TextTokenizer>,
     // Tool execution
     tool_executor: ToolExecutor,
@@ -232,48 +235,63 @@ impl Repl {
             .map(|tool| tool.definition())
             .collect();
 
-        // Initialize tokenizer for active learning
+        // Initialize tokenizer
         let tokenizer = Arc::new(TextTokenizer::default().unwrap_or_else(|e| {
             eprintln!("Warning: Failed to create tokenizer: {}", e);
             eprintln!("Active learning tools may not work correctly");
             panic!("Cannot create tokenizer")
         }));
 
-        // Initialize batch trainer for active learning
-        use crate::models::{DevicePreference, ModelConfig};
-        let model_config = ModelConfig {
-            vocab_size: tokenizer.vocab_size(),
-            hidden_dim: 128, // Small model for fast training
-            num_layers: 2,
-            num_heads: 4,
-            max_seq_len: 512,
-            dropout: 0.1,                              // Standard dropout rate
-            device_preference: DevicePreference::Auto, // Use Metal if available
-        };
+        // Initialize BootstrapLoader for progressive Qwen model loading
+        let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
+        let bootstrap_loader = Arc::new(BootstrapLoader::new(Arc::clone(&generator_state)));
 
-        let batch_trainer = Arc::new(RwLock::new(
-            BatchTrainer::new(
-                32,   // batch_size
-                1e-4, // learning_rate
-                &model_config,
-            )
-            .unwrap_or_else(|e| {
-                eprintln!("Warning: Failed to create batch trainer: {}", e);
-                eprintln!("Active learning tools may not work correctly");
-                panic!("Cannot create batch trainer")
-            }),
-        ));
+        if is_interactive {
+            eprintln!("⏳ Initializing Qwen model (background)...");
+        }
 
-        // NOW load or create local generator with neural models
-        let local_generator = Arc::new(RwLock::new(
-            Self::load_local_generator_with_models(
-                models_dir.as_ref(),
-                is_interactive,
-                Arc::clone(&batch_trainer),
-                Arc::clone(&tokenizer),
-            )
-            .await,
-        ));
+        // Start background model loading
+        let loader_clone = Arc::clone(&bootstrap_loader);
+        let state_clone = Arc::clone(&generator_state);
+        use crate::models::DevicePreference;
+        tokio::spawn(async move {
+            if let Err(e) = loader_clone
+                .load_generator_async(None, DevicePreference::Auto)
+                .await
+            {
+                eprintln!("⚠️  Model loading failed: {}", e);
+                eprintln!("    Will forward all queries to Claude");
+                let mut state = state_clone.write().await;
+                *state = GeneratorState::Failed {
+                    error: format!("{}", e),
+                };
+            }
+        });
+
+        // Create local generator (will receive model when ready)
+        let local_generator = Arc::new(RwLock::new(LocalGenerator::new()));
+
+        // Monitor generator state and inject model when ready
+        let gen_clone = Arc::clone(&local_generator);
+        let state_monitor = Arc::clone(&generator_state);
+        let tok_clone = Arc::clone(&tokenizer);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                let state = state_monitor.read().await;
+                if let GeneratorState::Ready { model, .. } = &*state {
+                    // Inject Qwen model into LocalGenerator
+                    let mut gen = gen_clone.write().await;
+                    *gen = LocalGenerator::with_models(Some(Arc::clone(model)), Some(Arc::clone(&tok_clone)));
+
+                    eprintln!("✓ Qwen model ready - local generation enabled");
+                    break; // Stop monitoring once injected
+                } else if matches!(*state, GeneratorState::Failed { .. } | GeneratorState::NotAvailable) {
+                    break; // Stop monitoring on failure
+                }
+            }
+        });
 
         // Initialize LoRA fine-tuning system
         let training_coordinator = Arc::new(TrainingCoordinator::new(
@@ -298,7 +316,7 @@ impl Repl {
             local_generator,
             training_trends: TrainingTrends::new(20), // Track last 20 queries
             models_dir,
-            batch_trainer,
+            bootstrap_loader,
             tokenizer,
             tool_executor,
             tool_definitions,
@@ -648,7 +666,7 @@ impl Repl {
                         tool_use,
                         Some(&self.conversation),
                         Some(save_fn),
-                        Some(Arc::clone(&self.batch_trainer)),
+                        None, // TODO: Add training via BootstrapLoader's generator
                         Some(Arc::clone(&self.local_generator)),
                         Some(Arc::clone(&self.tokenizer)),
                     )
@@ -2013,7 +2031,7 @@ impl Repl {
                 query,
                 &claude_response,
                 quality_score,
-                Some(&self.batch_trainer), // Pass BatchTrainer for neural training
+                None, // TODO: Add training via BootstrapLoader's Qwen generator
             );
         }
 

@@ -28,7 +28,7 @@ pub enum GeneratorState {
 
     /// Model ready for use
     Ready {
-        model: Arc<GeneratorModel>,
+        model: Arc<RwLock<GeneratorModel>>,
         model_size: QwenSize,
     },
 
@@ -208,9 +208,9 @@ impl BootstrapLoader {
         // Load in blocking task (model loading is CPU-intensive)
         let generator = tokio::task::spawn_blocking(move || GeneratorModel::new(config)).await??;
 
-        // Step 6: Ready!
+        // Step 6: Ready! (wrap in Arc<RwLock> for shared mutable access)
         *self.state.write().await = GeneratorState::Ready {
-            model: Arc::new(generator),
+            model: Arc::new(RwLock::new(generator)),
             model_size,
         };
 
