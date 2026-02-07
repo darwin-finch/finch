@@ -39,6 +39,8 @@ use super::commands::{handle_command, Command};
 use super::conversation::ConversationHistory;
 use super::input::InputHandler;
 use super::menu::{Menu, MenuOption};
+use super::output_manager::OutputManager;
+use super::status_bar::StatusBar;
 
 /// User's menu choice for tool confirmation
 #[derive(Debug, Clone)]
@@ -120,6 +122,9 @@ pub struct Repl {
     last_query: Option<String>,
     last_response: Option<String>,
     last_was_sampled: bool,
+    // Output management (Phase 1: Terminal UI refactor)
+    output_manager: OutputManager,
+    status_bar: StatusBar,
 }
 
 /// Background training statistics
@@ -283,11 +288,17 @@ impl Repl {
                 if let GeneratorState::Ready { model, .. } = &*state {
                     // Inject Qwen model into LocalGenerator
                     let mut gen = gen_clone.write().await;
-                    *gen = LocalGenerator::with_models(Some(Arc::clone(model)), Some(Arc::clone(&tok_clone)));
+                    *gen = LocalGenerator::with_models(
+                        Some(Arc::clone(model)),
+                        Some(Arc::clone(&tok_clone)),
+                    );
 
                     eprintln!("✓ Qwen model ready - local generation enabled");
                     break; // Stop monitoring once injected
-                } else if matches!(*state, GeneratorState::Failed { .. } | GeneratorState::NotAvailable) {
+                } else if matches!(
+                    *state,
+                    GeneratorState::Failed { .. } | GeneratorState::NotAvailable
+                ) {
                     break; // Stop monitoring on failure
                 }
             }
@@ -295,8 +306,8 @@ impl Repl {
 
         // Initialize LoRA fine-tuning system
         let training_coordinator = Arc::new(TrainingCoordinator::new(
-            100, // buffer_size: keep last 100 examples
-            10,  // threshold: train after 10 examples
+            100,  // buffer_size: keep last 100 examples
+            10,   // threshold: train after 10 examples
             true, // auto_train: enabled
         ));
 
@@ -306,6 +317,10 @@ impl Repl {
         if is_interactive {
             eprintln!("✓ LoRA fine-tuning enabled (weighted training)");
         }
+
+        // Initialize output management (Phase 1: Terminal UI refactor)
+        let output_manager = OutputManager::new();
+        let status_bar = StatusBar::new();
 
         Self {
             _config: config,
@@ -332,6 +347,9 @@ impl Repl {
             last_query: None,
             last_response: None,
             last_was_sampled: false,
+            // Output management (Phase 1: Terminal UI refactor)
+            output_manager,
+            status_bar,
         }
     }
 
@@ -411,6 +429,101 @@ impl Repl {
         }
     }
 
+    // ========================================================================
+    // Output Management Methods (Phase 1: Terminal UI refactor)
+    // These methods provide a unified interface for output, allowing us to
+    // buffer messages for eventual TUI rendering while keeping dual output
+    // to stdout during the transition.
+    // ========================================================================
+
+    /// Output a user message (dual: buffer + stdout)
+    fn output_user(&self, content: impl Into<String> + Clone) {
+        let content_str = content.clone().into();
+        self.output_manager.write_user(content_str.clone());
+        if self.is_interactive {
+            println!("> {}", content_str);
+        }
+    }
+
+    /// Output a Claude response (dual: buffer + stdout)
+    fn output_claude(&self, content: impl Into<String> + Clone) {
+        let content_str = content.clone().into();
+        self.output_manager.write_claude(content_str.clone());
+        if self.is_interactive {
+            println!("{}", content_str);
+        }
+    }
+
+    /// Append to the last Claude response (for streaming)
+    fn output_claude_append(&self, content: impl AsRef<str>) {
+        let content_str = content.as_ref();
+        self.output_manager.append_claude(content_str);
+        if self.is_interactive {
+            print!("{}", content_str);
+            let _ = io::stdout().flush();
+        }
+    }
+
+    /// Output tool execution result (dual: buffer + stdout)
+    fn output_tool(&self, tool_name: impl Into<String>, content: impl Into<String> + Clone) {
+        let content_str = content.clone().into();
+        self.output_manager
+            .write_tool(tool_name, content_str.clone());
+        if self.is_interactive {
+            println!("{}", content_str);
+        }
+    }
+
+    /// Output status information (dual: buffer + stdout)
+    fn output_status(&self, content: impl Into<String> + Clone) {
+        let content_str = content.clone().into();
+        self.output_manager.write_status(content_str.clone());
+        if self.is_interactive {
+            eprintln!("{}", content_str);
+        }
+    }
+
+    /// Output error message (dual: buffer + stdout)
+    fn output_error(&self, content: impl Into<String> + Clone) {
+        let content_str = content.clone().into();
+        self.output_manager.write_error(content_str.clone());
+        if self.is_interactive {
+            eprintln!("{}", content_str);
+        }
+    }
+
+    /// Update training statistics in status bar
+    fn update_training_stats(&self, total_queries: usize, local_percentage: f64, quality: f64) {
+        self.status_bar
+            .update_training_stats(total_queries, local_percentage, quality);
+    }
+
+    /// Update download progress in status bar
+    fn update_download_progress(
+        &self,
+        model_name: impl Into<String>,
+        percentage: f64,
+        downloaded: u64,
+        total: u64,
+    ) {
+        self.status_bar
+            .update_download_progress(model_name, percentage, downloaded, total);
+    }
+
+    /// Update operation status in status bar
+    fn update_operation_status(&self, operation: impl Into<String>) {
+        self.status_bar.update_operation(operation);
+    }
+
+    /// Clear operation status from status bar
+    fn clear_operation_status(&self) {
+        self.status_bar.clear_operation();
+    }
+
+    // ========================================================================
+    // End Output Management Methods
+    // ========================================================================
+
     /// Save models to disk
     async fn save_models(&mut self) -> Result<()> {
         let Some(ref models_dir) = self.models_dir else {
@@ -476,9 +589,7 @@ impl Repl {
 
             // Check for excessive use of same tool (per-tool limit)
             for tool_use in &tool_uses {
-                let count = consecutive_tool_usage
-                    .get(&tool_use.name)
-                    .unwrap_or(&0);
+                let count = consecutive_tool_usage.get(&tool_use.name).unwrap_or(&0);
 
                 if *count >= MAX_CONSECUTIVE_SAME_TOOL {
                     let error_msg = format!(
@@ -702,13 +813,12 @@ impl Repl {
             }
 
             // Update consecutive tool usage counters
-            let current_tool_names: HashSet<_> = tool_uses.iter()
-                .map(|t| t.name.clone())
-                .collect();
+            let current_tool_names: HashSet<_> = tool_uses.iter().map(|t| t.name.clone()).collect();
 
             // Increment counters for tools used in this iteration
             for tool_use in &tool_uses {
-                *consecutive_tool_usage.entry(tool_use.name.clone())
+                *consecutive_tool_usage
+                    .entry(tool_use.name.clone())
                     .or_insert(0) += 1;
             }
 
@@ -2129,14 +2239,15 @@ impl Repl {
         };
 
         // Create feedback message
-        let feedback = note.as_ref().map(|s| s.clone()).unwrap_or_else(|| {
-            match weight as i32 {
+        let feedback = note
+            .as_ref()
+            .map(|s| s.clone())
+            .unwrap_or_else(|| match weight as i32 {
                 10 => "Critical issue that needs correction".to_string(),
                 3 => "Could be improved".to_string(),
                 1 => "Good example to remember".to_string(),
                 _ => "User feedback".to_string(),
-            }
-        });
+            });
 
         // Create weighted example
         let example = match weight as i32 {
@@ -2166,10 +2277,7 @@ impl Repl {
             _ => "⚪",
         };
 
-        println!(
-            "{} Feedback recorded (weight: {}x)",
-            weight_emoji, weight
-        );
+        println!("{} Feedback recorded (weight: {}x)", weight_emoji, weight);
         if let Some(note_text) = note {
             println!("   Note: {}", note_text);
         }
@@ -2263,9 +2371,7 @@ impl Repl {
 
         // Create trainer
         let mut trainer = LoRATrainer::new(
-            adapter,
-            tokenizer,
-            1e-4, // learning_rate
+            adapter, tokenizer, 1e-4, // learning_rate
             4,    // batch_size
             3,    // epochs
         );
@@ -2281,10 +2387,7 @@ impl Repl {
         tracing::info!("Starting LoRA training...");
         let training_stats = trainer.train(&buffer)?;
 
-        let final_loss = training_stats
-            .last()
-            .map(|s| s.loss)
-            .unwrap_or(0.0);
+        let final_loss = training_stats.last().map(|s| s.loss).unwrap_or(0.0);
 
         // Save adapter weights
         let adapters_dir = if let Some(ref dir) = models_dir {
