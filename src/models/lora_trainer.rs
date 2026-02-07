@@ -143,8 +143,7 @@ impl LoRATrainer {
             let target_ids = target_tokens.get_ids();
 
             // Create tensors
-            let input_tensor =
-                Tensor::new(input_ids, &device)?.unsqueeze(0)?; // [1, seq_len]
+            let input_tensor = Tensor::new(input_ids, &device)?.unsqueeze(0)?; // [1, seq_len]
             let target_tensor = Tensor::new(target_ids, &device)?; // [seq_len]
 
             // Forward pass (simplified - in real implementation, integrate with Qwen model)
@@ -262,7 +261,10 @@ impl TrainingCoordinator {
             return Ok(());
         }
 
-        tracing::info!("Triggering background training on {} examples", examples.len());
+        tracing::info!(
+            "Triggering background training on {} examples",
+            examples.len()
+        );
 
         // Call training function
         train_fn(examples).await?;
@@ -311,22 +313,16 @@ mod tests {
 
         // Add examples
         for i in 0..5 {
-            let ex = WeightedExample::normal(
-                format!("q{}", i),
-                format!("r{}", i),
-                "good".to_string(),
-            );
+            let ex =
+                WeightedExample::normal(format!("q{}", i), format!("r{}", i), "good".to_string());
             let should_train = coordinator.add_example(ex).await.unwrap();
             assert!(!should_train); // < threshold
         }
 
         // Add more to reach threshold
         for i in 5..10 {
-            let ex = WeightedExample::normal(
-                format!("q{}", i),
-                format!("r{}", i),
-                "good".to_string(),
-            );
+            let ex =
+                WeightedExample::normal(format!("q{}", i), format!("r{}", i), "good".to_string());
             let should_train = coordinator.add_example(ex).await.unwrap();
 
             if i == 9 {

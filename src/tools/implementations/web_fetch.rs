@@ -47,11 +47,10 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
-        let url = input["url"]
-            .as_str()
-            .context("Missing url parameter")?;
+        let url = input["url"].as_str().context("Missing url parameter")?;
 
-        let response = self.client
+        let response = self
+            .client
             .get(url)
             .send()
             .await

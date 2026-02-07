@@ -6,9 +6,9 @@
 //
 // Run: cargo run --example tool_confirmation_demo
 
+use serde_json::json;
 use shammah::tools::executor::generate_tool_signature;
 use shammah::tools::types::ToolUse;
-use serde_json::json;
 use std::path::Path;
 
 fn main() {
@@ -90,14 +90,8 @@ fn main() {
     println!("=== Signature Uniqueness Test ===\n");
 
     // Test that similar commands generate different signatures
-    let cmd1 = ToolUse::new(
-        "bash".to_string(),
-        json!({"command": "cargo test"}),
-    );
-    let cmd2 = ToolUse::new(
-        "bash".to_string(),
-        json!({"command": "cargo test --all"}),
-    );
+    let cmd1 = ToolUse::new("bash".to_string(), json!({"command": "cargo test"}));
+    let cmd2 = ToolUse::new("bash".to_string(), json!({"command": "cargo test --all"}));
 
     let sig1 = generate_tool_signature(&cmd1, working_dir);
     let sig2 = generate_tool_signature(&cmd2, working_dir);
@@ -107,10 +101,7 @@ fn main() {
     println!("Are they different? {}\n", sig1 != sig2);
 
     // Test that same command generates same signature (idempotent)
-    let cmd3 = ToolUse::new(
-        "bash".to_string(),
-        json!({"command": "cargo test"}),
-    );
+    let cmd3 = ToolUse::new("bash".to_string(), json!({"command": "cargo test"}));
     let sig3 = generate_tool_signature(&cmd3, working_dir);
 
     println!("Command 1: {}", sig1.context_key);

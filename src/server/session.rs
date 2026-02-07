@@ -235,7 +235,10 @@ mod tests {
         // Third session should fail
         let result = manager.get_or_create(None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Maximum session limit"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Maximum session limit"));
     }
 
     #[tokio::test]

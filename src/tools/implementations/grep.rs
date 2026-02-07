@@ -24,7 +24,10 @@ impl Tool for GrepTool {
     fn input_schema(&self) -> ToolInputSchema {
         ToolInputSchema::simple(vec![
             ("pattern", "The regex pattern to search for"),
-            ("path", "Directory or file to search (default: current directory)"),
+            (
+                "path",
+                "Directory or file to search (default: current directory)",
+            ),
         ])
     }
 
@@ -33,12 +36,10 @@ impl Tool for GrepTool {
             .as_str()
             .context("Missing pattern parameter")?;
 
-        let path = input["path"]
-            .as_str()
-            .unwrap_or(".");
+        let path = input["path"].as_str().unwrap_or(".");
 
-        let regex = Regex::new(pattern)
-            .with_context(|| format!("Invalid regex pattern: {}", pattern))?;
+        let regex =
+            Regex::new(pattern).with_context(|| format!("Invalid regex pattern: {}", pattern))?;
 
         let mut results = Vec::new();
         let mut file_count = 0;

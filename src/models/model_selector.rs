@@ -128,8 +128,8 @@ impl ModelSelector {
             .output()
             .context("Failed to execute sysctl to get RAM size")?;
 
-        let memsize_str = String::from_utf8(output.stdout)
-            .context("Failed to parse sysctl output")?;
+        let memsize_str =
+            String::from_utf8(output.stdout).context("Failed to parse sysctl output")?;
 
         let memsize_bytes: u64 = memsize_str
             .trim()

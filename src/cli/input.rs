@@ -13,8 +13,7 @@ pub struct InputHandler {
 impl InputHandler {
     /// Create new input handler with history support
     pub fn new() -> Result<Self> {
-        let mut editor = DefaultEditor::new()
-            .context("Failed to initialize readline editor")?;
+        let mut editor = DefaultEditor::new().context("Failed to initialize readline editor")?;
 
         // History path: ~/.shammah/history.txt
         let history_path = dirs::home_dir()
@@ -45,7 +44,8 @@ impl InputHandler {
                 let line = line.trim().to_string();
                 if !line.is_empty() {
                     // Add to history (in-memory)
-                    self.editor.add_history_entry(&line)
+                    self.editor
+                        .add_history_entry(&line)
                         .context("Failed to add history entry")?;
                 }
                 Ok(Some(line))
@@ -76,7 +76,9 @@ impl InputHandler {
         // Save history
         self.editor
             .save_history(&self.history_path)
-            .with_context(|| format!("Failed to save history to {}", self.history_path.display()))?;
+            .with_context(|| {
+                format!("Failed to save history to {}", self.history_path.display())
+            })?;
 
         Ok(())
     }

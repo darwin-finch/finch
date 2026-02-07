@@ -1,13 +1,13 @@
 // Shammah - Agent Server Module
 // HTTP daemon mode for multi-tenant agent serving
 
-mod session;
 mod handlers;
 mod middleware;
+mod session;
 
-pub use session::{SessionManager, SessionState};
 pub use handlers::{create_router, health_check, metrics_endpoint};
 pub use middleware::auth_middleware;
+pub use session::{SessionManager, SessionState};
 
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -92,8 +92,7 @@ impl AgentServer {
         let app_state = Arc::new(self);
 
         // Build router
-        let app = create_router(app_state)
-            .layer(TraceLayer::new_for_http());
+        let app = create_router(app_state).layer(TraceLayer::new_for_http());
 
         tracing::info!("Starting Shammah agent server on {}", addr);
 

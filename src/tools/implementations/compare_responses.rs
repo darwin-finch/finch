@@ -49,36 +49,54 @@ Returns: Side-by-side comparison with similarity score and verdict"
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<String> {
         let query = input["query"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'query' field"))?;
 
-        // TODO: Implement actual comparison
-        // For now, return a placeholder response
+        // Get local generator
+        let local_gen = ctx
+            .local_generator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Local generator not available"))?;
 
-        // In the real implementation, this would:
-        // 1. Generate Shammah's response
-        // 2. Forward same query to Claude
-        // 3. Compute semantic similarity
-        // 4. Analyze differences
-        // 5. Return formatted comparison
+        // Generate Shammah's response
+        let mut gen = local_gen.write().await;
+        let shammah_response = match gen.response_generator().generate(query) {
+            Ok(generated) => generated.text,
+            Err(e) => format!("[Error: {}]", e),
+        };
+
+        // Simple quality heuristic
+        let length_score = (shammah_response.len() as f64 / 100.0).min(1.0);
+        let has_content = shammah_response.len() > 10 && !shammah_response.starts_with("[Error:");
+        let quality_score = if has_content { length_score } else { 0.0 };
 
         let response = format!(
-            "=== Query ===\n\
-             {}\n\n\
+            "=== Comparison Request ===\n\
+             Query: {}\n\n\
              === Shammah's Response (Local) ===\n\
-             [Local generator not yet fully implemented]\n\
-             Quality: 0.00/1.0\n\n\
-             === Claude's Response (API) ===\n\
-             [Would forward to Claude API here]\n\n\
-             === Comparison ===\n\
-             - Similarity: N/A (Shammah not trained)\n\
-             - Divergence: N/A\n\
-             - Verdict: ✗ Shammah needs training before comparisons are meaningful\n\n\
-             Recommendation: Use GenerateTrainingDataTool to create training examples,\n\
-             then train Shammah before comparing responses.",
-            query
+             {}\n\n\
+             Quality Score: {:.2}/1.0\n\
+             Response Length: {} chars\n\
+             Status: {}\n\n\
+             === Next Step ===\n\
+             Now provide YOUR (Claude's) response to the same query,\n\
+             and I'll help you compare them to identify differences.\n\n\
+             You can analyze:\n\
+             - Accuracy: Is Shammah's answer correct?\n\
+             - Completeness: Does it cover all important points?\n\
+             - Style: Does it match your tone and formatting?\n\
+             - Quality: Is it helpful and clear?",
+            query,
+            shammah_response,
+            quality_score,
+            shammah_response.len(),
+            if has_content {
+                "✓ Generated"
+            } else {
+                "✗ Failed or insufficient"
+            }
         );
 
         Ok(response)
@@ -95,8 +113,11 @@ mod tests {
         let input = serde_json::json!({"query": "Explain photosynthesis"});
 
         let ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            allow_all: true,
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
         };
 
         let result = tool.execute(input, &ctx).await;

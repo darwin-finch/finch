@@ -276,7 +276,8 @@ When TUI was enabled for testing, output was completely broken because:
 
 ## Phase 3.5: Fix Output Routing (CRITICAL)
 
-**Status:** 🟡 In Progress (Part 1-2/6 Complete)
+**Status:** ⏸️ Paused (Part 1-2/6 Complete, Part 3 33/228 calls)
+**Priority:** Agent Server work takes precedence (see AGENT_SERVER_PLAN.md)
 
 **Goal:** Route ALL output through OutputManager so TUI works properly
 
@@ -376,7 +377,7 @@ When TUI was enabled for testing, output was completely broken because:
   - [x] Test SHAMMAH_LOG=1 to see captured logs
   - [x] Committed: Phase 3.5 Part 2 (commit e6790a5)
 
-- [ ] **Part 3: Replace Direct Output in cli/**
+- [ ] **Part 3: Replace Direct Output in cli/** ⏸️ PAUSED (33/228 calls replaced)
   - [ ] Strategy: Use instance methods where possible (testable), macros where necessary
   - [ ] Update `Repl` to keep using instance methods
     - [ ] `self.output_manager.write_user()` (testable)

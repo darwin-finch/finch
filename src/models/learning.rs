@@ -22,7 +22,10 @@ pub enum PredictionData {
     /// Router: should try local?
     Route { try_local: bool, reason: String },
     /// Pattern classifier: query type
-    Pattern { category: String, features: Vec<String> },
+    Pattern {
+        category: String,
+        features: Vec<String>,
+    },
     /// Generator: generated response
     Response { text: String, method: String },
     /// Validator: quality assessment
@@ -33,13 +36,22 @@ pub enum PredictionData {
 #[derive(Debug, Clone)]
 pub enum ModelExpectation {
     /// Router should have routed this way
-    RouteDecision { correct_choice: bool, actual_outcome: String },
+    RouteDecision {
+        correct_choice: bool,
+        actual_outcome: String,
+    },
     /// Pattern should have been this category
-    PatternLabel { category: String, features: Vec<String> },
+    PatternLabel {
+        category: String,
+        features: Vec<String>,
+    },
     /// Response should match this text
     ResponseTarget { text: String, quality_score: f64 },
     /// Validation should have caught this
-    QualityTarget { is_acceptable: bool, issues: Vec<String> },
+    QualityTarget {
+        is_acceptable: bool,
+        issues: Vec<String>,
+    },
 }
 
 /// Core trait for all learning models

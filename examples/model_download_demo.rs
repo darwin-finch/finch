@@ -15,8 +15,14 @@ fn main() -> anyhow::Result<()> {
     let selected_model = ModelSelector::select_model_for_system()?;
     println!("Selected model: {}", selected_model.description());
     println!("  Model ID: {}", selected_model.model_id());
-    println!("  RAM requirement: {}GB", selected_model.ram_requirement_gb());
-    println!("  Download size: {:.1}GB\n", selected_model.download_size_gb());
+    println!(
+        "  RAM requirement: {}GB",
+        selected_model.ram_requirement_gb()
+    );
+    println!(
+        "  Download size: {:.1}GB\n",
+        selected_model.download_size_gb()
+    );
 
     // Step 2: Create downloader
     println!("Step 2: Download Infrastructure");
@@ -33,7 +39,10 @@ fn main() -> anyhow::Result<()> {
         println!("  No download needed - ready to use!\n");
     } else {
         println!("✗ Model not cached");
-        println!("  First run will download ~{:.1}GB", selected_model.download_size_gb());
+        println!(
+            "  First run will download ~{:.1}GB",
+            selected_model.download_size_gb()
+        );
         println!("  Subsequent runs will load from cache\n");
     }
 
@@ -43,8 +52,7 @@ fn main() -> anyhow::Result<()> {
     let override_model = QwenSize::Qwen1_5B; // Force smallest model
     println!("Overriding to: {}", override_model.description());
 
-    let selected_with_override =
-        ModelSelector::select_model_with_override(Some(override_model))?;
+    let selected_with_override = ModelSelector::select_model_with_override(Some(override_model))?;
     println!("Selected: {}", selected_with_override.description());
     println!(
         "Is cached: {}\n",

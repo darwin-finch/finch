@@ -20,9 +20,7 @@ impl Tool for GlobTool {
     }
 
     fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema::simple(vec![
-            ("pattern", "The glob pattern to match files against"),
-        ])
+        ToolInputSchema::simple(vec![("pattern", "The glob pattern to match files against")])
     }
 
     async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
@@ -32,9 +30,7 @@ impl Tool for GlobTool {
 
         let mut paths = Vec::new();
 
-        for entry in glob(pattern)
-            .with_context(|| format!("Invalid glob pattern: {}", pattern))?
-        {
+        for entry in glob(pattern).with_context(|| format!("Invalid glob pattern: {}", pattern))? {
             match entry {
                 Ok(path) => paths.push(path.display().to_string()),
                 Err(e) => eprintln!("Error reading path: {}", e),

@@ -13,10 +13,7 @@ use super::model_selector::QwenSize;
 #[derive(Debug, Clone)]
 pub enum DownloadProgress {
     /// Download starting
-    Starting {
-        model_id: String,
-        size_gb: f64,
-    },
+    Starting { model_id: String, size_gb: f64 },
     /// Download in progress
     Downloading {
         model_id: String,
@@ -30,10 +27,7 @@ pub enum DownloadProgress {
         cache_path: PathBuf,
     },
     /// Download error
-    Error {
-        model_id: String,
-        error: String,
-    },
+    Error { model_id: String, error: String },
 }
 
 /// Model downloader with HuggingFace Hub integration
@@ -119,20 +113,27 @@ impl ModelDownloader {
                     let mut found_this_shard = false;
 
                     // Try different total counts (models can have 2, 3, 4, ... shards)
-                    for total in shard_idx..=20 {  // Try up to 20 total shards
-                        let shard_file = format!("model-{:05}-of-{:05}.safetensors", shard_idx, total);
+                    for total in shard_idx..=20 {
+                        // Try up to 20 total shards
+                        let shard_file =
+                            format!("model-{:05}-of-{:05}.safetensors", shard_idx, total);
                         match repo.get(&shard_file) {
                             Ok(path) => {
-                                tracing::info!("Downloaded shard {}/{}: {}", shard_idx, total, shard_file);
+                                tracing::info!(
+                                    "Downloaded shard {}/{}: {}",
+                                    shard_idx,
+                                    total,
+                                    shard_file
+                                );
                                 downloaded_files.push(path);
                                 found_this_shard = true;
 
                                 // If we found shard N of N, we're done
                                 if shard_idx == total {
                                     tracing::info!("✓ Downloaded all {} shards", total);
-                                    shard_idx = total + 1;  // Exit outer loop
+                                    shard_idx = total + 1; // Exit outer loop
                                 }
-                                break;  // Move to next shard
+                                break; // Move to next shard
                             }
                             Err(_) => continue,
                         }

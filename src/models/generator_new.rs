@@ -28,8 +28,11 @@ struct LegacyGenerator {
 
 impl TextGeneration for LegacyGenerator {
     fn generate(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
-        let input_tensor =
-            Tensor::from_vec(input_ids.to_vec(), (1, input_ids.len()), self.inner.device())?;
+        let input_tensor = Tensor::from_vec(
+            input_ids.to_vec(),
+            (1, input_ids.len()),
+            self.inner.device(),
+        )?;
         self.inner.generate(&input_tensor, max_new_tokens)
     }
 
@@ -108,7 +111,10 @@ impl GeneratorModel {
                 cache_dir,
                 device_preference,
             } => {
-                tracing::info!("Loading pre-trained Qwen model: {}", model_size.description());
+                tracing::info!(
+                    "Loading pre-trained Qwen model: {}",
+                    model_size.description()
+                );
 
                 let device = get_device_with_preference(*device_preference)?;
 
@@ -224,7 +230,9 @@ impl Saveable for GeneratorModel {
     where
         Self: Sized,
     {
-        anyhow::bail!("Loading generators from file not yet implemented - use GeneratorModel::new() instead")
+        anyhow::bail!(
+            "Loading generators from file not yet implemented - use GeneratorModel::new() instead"
+        )
     }
 }
 

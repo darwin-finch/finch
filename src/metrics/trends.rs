@@ -49,8 +49,7 @@ impl TrainingTrends {
         if self.recent_quality_scores.is_empty() {
             return 0.0;
         }
-        self.recent_quality_scores.iter().sum::<f64>()
-            / self.recent_quality_scores.len() as f64
+        self.recent_quality_scores.iter().sum::<f64>() / self.recent_quality_scores.len() as f64
     }
 
     /// Get average similarity score over the window

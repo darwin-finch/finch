@@ -37,7 +37,8 @@ impl LoRALayer {
         let lora_a = candle_nn::linear(input_dim, rank, vb.pp(&format!("{}_lora_a", name)))?;
 
         // B: Zero initialization (starts with no effect)
-        let lora_b = candle_nn::linear_no_bias(rank, output_dim, vb.pp(&format!("{}_lora_b", name)))?;
+        let lora_b =
+            candle_nn::linear_no_bias(rank, output_dim, vb.pp(&format!("{}_lora_b", name)))?;
 
         // Scaling: alpha / rank
         let scaling = alpha / rank as f64;
@@ -296,12 +297,7 @@ impl WeightedExample {
     }
 
     /// Create with custom weight
-    pub fn with_weight(
-        query: String,
-        response: String,
-        feedback: String,
-        weight: f64,
-    ) -> Self {
+    pub fn with_weight(query: String, response: String, feedback: String, weight: f64) -> Self {
         Self {
             query,
             response,
@@ -355,7 +351,11 @@ impl ExampleBuffer {
     }
 
     /// Sample batch with weighted random sampling
-    pub fn sample_batch(&self, batch_size: usize, rng: &mut impl rand::Rng) -> Vec<WeightedExample> {
+    pub fn sample_batch(
+        &self,
+        batch_size: usize,
+        rng: &mut impl rand::Rng,
+    ) -> Vec<WeightedExample> {
         use rand::seq::SliceRandom;
 
         if self.examples.is_empty() {
@@ -397,10 +397,7 @@ impl ExampleBuffer {
             .with_context(|| format!("Failed to read example buffer from {:?}", path))?;
         let examples: Vec<WeightedExample> = serde_json::from_str(&json)?;
 
-        Ok(Self {
-            examples,
-            max_size,
-        })
+        Ok(Self { examples, max_size })
     }
 }
 
@@ -442,7 +439,11 @@ mod tests {
             "r1".into(),
             "bad".into(),
         ));
-        buffer.add(WeightedExample::normal("q2".into(), "r2".into(), "good".into()));
+        buffer.add(WeightedExample::normal(
+            "q2".into(),
+            "r2".into(),
+            "good".into(),
+        ));
 
         assert_eq!(buffer.examples().len(), 2);
         assert_eq!(buffer.total_weight(), 11.0); // 10 + 1

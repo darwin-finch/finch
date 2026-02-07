@@ -14,8 +14,7 @@ use std::sync::Arc;
 #[tokio::test]
 async fn test_server_creation() {
     // Create test configuration
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .unwrap_or_else(|_| "test_key".to_string());
+    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "test_key".to_string());
 
     let config = Config::new(api_key.clone());
 
@@ -24,9 +23,8 @@ async fn test_server_creation() {
     let threshold_router = ThresholdRouter::new();
     let router = Router::new(crisis_detector, threshold_router);
     let claude_client = ClaudeClient::new(api_key).expect("Failed to create Claude client");
-    let metrics_logger = MetricsLogger::new(
-        std::env::temp_dir().join("shammah_test_metrics")
-    ).expect("Failed to create metrics logger");
+    let metrics_logger = MetricsLogger::new(std::env::temp_dir().join("shammah_test_metrics"))
+        .expect("Failed to create metrics logger");
 
     // Create server config
     let server_config = ServerConfig {
@@ -38,13 +36,7 @@ async fn test_server_creation() {
     };
 
     // Create server
-    let server = AgentServer::new(
-        config,
-        server_config,
-        claude_client,
-        router,
-        metrics_logger,
-    );
+    let server = AgentServer::new(config, server_config, claude_client, router, metrics_logger);
 
     assert!(server.is_ok(), "Server should be created successfully");
 }

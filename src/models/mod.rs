@@ -42,7 +42,9 @@ pub use persistence::{load_model_metadata, model_exists, save_model_with_metadat
 pub use qwen_loader::{LoadedQwenModel, QwenConfig, QwenLoader};
 pub use router::RouterModel;
 pub use sampling::{ComparisonResult, QueryCategory, Sampler, SamplingConfig, SamplingDecision};
-pub use threshold_router::{QueryCategory as ThresholdQueryCategory, ThresholdRouter, ThresholdRouterStats};
+pub use threshold_router::{
+    QueryCategory as ThresholdQueryCategory, ThresholdRouter, ThresholdRouterStats,
+};
 pub use threshold_validator::{QualitySignal, ThresholdValidator, ValidatorStats};
 pub use tokenizer::TextTokenizer;
 pub use validator::ValidatorModel;

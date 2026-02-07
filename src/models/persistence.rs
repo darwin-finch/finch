@@ -52,8 +52,8 @@ pub fn save_model_with_metadata(
 
     // Save metadata
     let metadata_path = weights_path.with_extension("json");
-    let metadata_json = serde_json::to_string_pretty(metadata)
-        .context("Failed to serialize model metadata")?;
+    let metadata_json =
+        serde_json::to_string_pretty(metadata).context("Failed to serialize model metadata")?;
     fs::write(&metadata_path, metadata_json)
         .with_context(|| format!("Failed to write metadata to {:?}", metadata_path))?;
 
@@ -80,8 +80,8 @@ pub fn load_model_metadata(weights_path: &Path) -> Result<ModelMetadata> {
     let metadata_json = fs::read_to_string(&metadata_path)
         .with_context(|| format!("Failed to read metadata from {:?}", metadata_path))?;
 
-    let metadata: ModelMetadata = serde_json::from_str(&metadata_json)
-        .context("Failed to parse model metadata JSON")?;
+    let metadata: ModelMetadata =
+        serde_json::from_str(&metadata_json).context("Failed to parse model metadata JSON")?;
 
     Ok(metadata)
 }

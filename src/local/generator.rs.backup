@@ -182,11 +182,18 @@ impl ResponseGenerator {
         // Tokenize query
         let tokens = tokenizer.encode(query, true)?;
 
+        // Convert to tensor
+        let input_tensor = candle_core::Tensor::new(
+            tokens.as_slice(),
+            &candle_core::Device::Cpu, // Will use model's device
+        )?
+        .unsqueeze(0)?; // Add batch dimension
+
         // Generate with neural model (try non-blocking lock)
-        let mut gen = generator
-            .try_write()
+        let gen = generator
+            .try_read()
             .map_err(|_| anyhow::anyhow!("Generator model is locked"))?;
-        let output_tokens = gen.generate(&tokens, 100)?; // max 100 new tokens
+        let output_tokens = gen.generate(&input_tensor, 100)?; // max 100 new tokens
 
         // Decode back to text
         let response = tokenizer.decode(&output_tokens, true)?;
@@ -292,50 +299,62 @@ impl LearningModel for ResponseGenerator {
                     .partial_cmp(&b.quality_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             }) {
-                PredictionData::Response {
+                PredictionData::ResponsePrediction {
                     text: best.response_text.clone(),
-                    method: "learned".to_string(),
+                    quality_score: best.quality_score,
                 }
             } else {
-                PredictionData::Response {
+                PredictionData::ResponsePrediction {
                     text: "No learned response available".to_string(),
-                    method: "fallback".to_string(),
+                    quality_score: 0.1,
                 }
             }
         } else {
-            PredictionData::Response {
+            PredictionData::ResponsePrediction {
                 text: "No learned response available".to_string(),
-                method: "fallback".to_string(),
+                quality_score: 0.1,
             }
         };
 
-        Ok(ModelPrediction { confidence, data })
+        Ok(ModelPrediction {
+            confidence,
+            data,
+            model_name: "ResponseGenerator".to_string(),
+        })
     }
 
-    fn save(&self, path: &Path) -> Result<()> {
+    fn get_stats(&self) -> &ModelStats {
+        &self.stats
+    }
+
+    fn save_to_file(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(path, json).context("Failed to save response generator")
     }
 
-    fn load(path: &Path) -> Result<Self>
-    where
-        Self: Sized,
-    {
+    fn load_from_file(&mut self, path: &Path) -> Result<()> {
         if !path.exists() {
-            anyhow::bail!("File not found: {}", path.display());
+            return Ok(()); // No existing data
         }
 
         let json = std::fs::read_to_string(path)?;
         let loaded: ResponseGenerator = serde_json::from_str(&json)?;
-        Ok(loaded)
-    }
 
-    fn name(&self) -> &str {
-        "ResponseGenerator"
-    }
+        // Merge learned responses
+        for (pattern, responses) in loaded.learned_responses {
+            self.learned_responses
+                .entry(pattern)
+                .or_default()
+                .extend(responses);
+        }
 
-    fn stats(&self) -> ModelStats {
-        self.stats.clone()
+        // Merge stats
+        self.stats.total_updates += loaded.stats.total_updates;
+        if loaded.stats.last_update.is_some() {
+            self.stats.last_update = loaded.stats.last_update;
+        }
+
+        Ok(())
     }
 }
 

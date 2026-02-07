@@ -78,9 +78,7 @@ impl GeneratorState {
             GeneratorState::Failed { error } => {
                 format!("✗ Failed: {}", error)
             }
-            GeneratorState::NotAvailable => {
-                "⚠ Offline mode - forwarding to Claude".to_string()
-            }
+            GeneratorState::NotAvailable => "⚠ Offline mode - forwarding to Claude".to_string(),
         }
     }
 }
@@ -111,12 +109,10 @@ impl BootstrapLoader {
                 tracing::info!("Using manual override: {}", size.description());
                 size
             }
-            None => {
-                ModelSelector::select_model_for_system().map_err(|e| {
-                    tracing::error!("Failed to select model: {}", e);
-                    e
-                })?
-            }
+            None => ModelSelector::select_model_for_system().map_err(|e| {
+                tracing::error!("Failed to select model: {}", e);
+                e
+            })?,
         };
 
         tracing::info!("Selected model: {}", model_size.description());
@@ -276,11 +272,7 @@ mod tests {
         assert!(!state.read().await.is_ready());
 
         // Status messages
-        assert!(state
-            .read()
-            .await
-            .status_message()
-            .contains("Loading"));
+        assert!(state.read().await.status_message().contains("Loading"));
     }
 
     #[test]
@@ -312,10 +304,6 @@ mod tests {
         loader.set_not_available().await;
 
         assert!(!state.read().await.is_ready());
-        assert!(state
-            .read()
-            .await
-            .status_message()
-            .contains("Offline"));
+        assert!(state.read().await.status_message().contains("Offline"));
     }
 }

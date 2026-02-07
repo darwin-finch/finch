@@ -20,9 +20,7 @@ impl Tool for ReadTool {
     }
 
     fn input_schema(&self) -> ToolInputSchema {
-        ToolInputSchema::simple(vec![
-            ("file_path", "Absolute path to the file to read"),
-        ])
+        ToolInputSchema::simple(vec![("file_path", "Absolute path to the file to read")])
     }
 
     async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {

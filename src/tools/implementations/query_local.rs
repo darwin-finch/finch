@@ -49,32 +49,57 @@ Returns: Shammah's raw response plus quality metrics including:
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<String> {
         let query = input["query"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'query' field"))?;
 
-        // TODO: Implement actual local generation
-        // For now, return a placeholder response
+        // Check if local generator is available
+        let local_gen = ctx
+            .local_generator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Local generator not available"))?;
 
-        // In the real implementation, this would:
-        // 1. Tokenize the query
-        // 2. Run through generator model
-        // 3. Run validator to get quality metrics
-        // 4. Return formatted results
+        // Generate response using local generator
+        let mut gen = local_gen.write().await;
+        let generated = gen.response_generator().generate(query)?;
+        let local_response = generated.text;
 
+        // Check if we have validator available (through batch trainer)
+        let quality_score = if let Some(batch_trainer) = ctx.batch_trainer.as_ref() {
+            // For now, use a simple quality heuristic
+            // TODO: Use validator model for actual quality assessment
+            let trainer = batch_trainer.read().await;
+            // Simple heuristic: longer responses are "better" (placeholder)
+            let length_score = (local_response.len() as f64 / 100.0).min(1.0);
+            length_score
+        } else {
+            0.0
+        };
+
+        // Format response with metrics
         let response = format!(
             "=== Shammah's Response ===\n\
-             [Local generator not yet fully implemented]\n\
              Query: {}\n\n\
+             Response:\n\
+             {}\n\n\
              === Quality Metrics ===\n\
-             - Quality Score: 0.00/1.0 (not yet trained)\n\
-             - Uncertainty: 1.00 (very uncertain)\n\
-             - Status: Shammah needs training data to produce responses\n\n\
-             To train Shammah, use the GenerateTrainingDataTool to create \
-             targeted training examples, then use the TrainTool to train \
-             on those examples.",
-            query
+             - Quality Score: {:.2}/1.0\n\
+             - Response Length: {} chars\n\
+             - Status: {}\n\n\
+             Note: Quality assessment is based on simple heuristics. \
+             For more accurate quality scores, train the validator model.",
+            query,
+            local_response,
+            quality_score,
+            local_response.len(),
+            if quality_score > 0.7 {
+                "Good quality"
+            } else if quality_score > 0.4 {
+                "Medium quality"
+            } else {
+                "Low quality - needs more training"
+            }
         );
 
         Ok(response)
@@ -92,8 +117,11 @@ mod tests {
 
         // Create minimal context for testing
         let ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            allow_all: true,
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
         };
 
         let result = tool.execute(input, &ctx).await;

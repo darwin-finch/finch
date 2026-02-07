@@ -8,7 +8,7 @@
 // Run: cargo run --example tool_execution_demo
 
 use shammah::tools::{
-    ToolExecutor, ToolPatternMatcher, PermissionManager, PermissionRule, ToolRegistry,
+    PermissionManager, PermissionRule, ToolExecutor, ToolPatternMatcher, ToolRegistry,
 };
 
 #[tokio::main]
@@ -20,13 +20,15 @@ async fn main() -> anyhow::Result<()> {
     println!("✓ Pattern matcher initialized with {} patterns", 5);
 
     // 2. Create permission manager (allow all for demo)
-    let permissions = PermissionManager::new()
-        .with_default_rule(PermissionRule::Allow);
+    let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
     println!("✓ Permission manager initialized (allow all for demo)");
 
     // 3. Create empty tool registry (no implementations yet)
     let registry = ToolRegistry::new();
-    println!("✓ Tool registry initialized ({} tools registered)", registry.len());
+    println!(
+        "✓ Tool registry initialized ({} tools registered)",
+        registry.len()
+    );
 
     // 4. Create executor
     let executor = ToolExecutor::new(registry, permissions);
@@ -53,7 +55,10 @@ async fn main() -> anyhow::Result<()> {
             for tool_use in tool_uses {
                 println!("      → Tool: {}", tool_use.name);
                 println!("      → ID: {}", tool_use.id);
-                println!("      → Input: {}", serde_json::to_string_pretty(&tool_use.input)?);
+                println!(
+                    "      → Input: {}",
+                    serde_json::to_string_pretty(&tool_use.input)?
+                );
             }
         }
     }

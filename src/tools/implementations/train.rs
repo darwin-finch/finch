@@ -55,48 +55,113 @@ Returns:
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<String> {
         let wait = input["wait"].as_bool().unwrap_or(false);
 
-        // TODO: Wire up to actual BatchTrainer
-        // For now, return instructions
+        // Get batch trainer from context
+        let batch_trainer = ctx
+            .batch_trainer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Batch trainer not available"))?;
 
-        // In the real implementation:
-        // 1. Get BatchTrainer reference from context
-        // 2. Check queue size
-        // 3. Call train_now() or train_async()
-        // 4. Return results
-
-        let response = if wait {
-            "=== Training Started (Synchronous) ===\n\
-             Status: Training infrastructure ready but not yet fully integrated\n\n\
-             When integrated, this will:\n\
-             1. Train on accumulated examples in queue\n\
-             2. Update router, generator, and validator models\n\
-             3. Hot-reload models (zero downtime)\n\
-             4. Return detailed results:\n\
-                - Examples trained: N\n\
-                - Router loss: X.XX -> Y.YY (improvement: Z.ZZ)\n\
-                - Generator loss: X.XX -> Y.YY (improvement: Z.ZZ)\n\
-                - Validator loss: X.XX -> Y.YY (improvement: Z.ZZ)\n\
-                - Duration: N.N seconds\n\n\
-             Current queue size: 0 examples\n\
-             Minimum batch size: 32 examples\n\n\
-             Use generate_training_data to add examples to the queue."
-                .to_string()
-        } else {
-            "=== Training Started (Asynchronous) ===\n\
-             Status: Training infrastructure ready but not yet fully integrated\n\n\
-             Training will run in background. Check status with:\n\
-             - /status command in REPL\n\
-             - analyze_model tool to test improvement\n\n\
-             Current queue size: 0 examples\n\
-             Minimum batch size: 32 examples\n\n\
-             Use generate_training_data to add examples to the queue."
-                .to_string()
+        // Check queue size
+        let queue_size = {
+            let trainer = batch_trainer.read().await;
+            trainer.queue_size().await
         };
 
-        Ok(response)
+        if queue_size == 0 {
+            return Ok(format!(
+                "=== Training Status ===\n\
+                 Queue Size: 0 examples\n\
+                 Status: No examples in queue\n\n\
+                 To train Shammah:\n\
+                 1. Use generate_training_data to create examples\n\
+                 2. Use Claude to provide high-quality responses\n\
+                 3. Examples will be added to training queue\n\
+                 4. Run this tool again to train\n\n\
+                 Note: Batch training requires at least 1 example."
+            ));
+        }
+
+        if wait {
+            // Synchronous training
+            let mut trainer = batch_trainer.write().await;
+            let start = std::time::Instant::now();
+
+            match trainer.train_now().await {
+                Ok(result) => {
+                    let duration = start.elapsed().as_secs_f64();
+
+                    Ok(format!(
+                        "=== Training Completed (Synchronous) ===\n\
+                         Examples trained: {}\n\
+                         Duration: {:.2} seconds\n\n\
+                         === Model Improvements ===\n\
+                         Router:\n\
+                         - Old loss: {:.4}\n\
+                         - New loss: {:.4}\n\
+                         - Improvement: {:.1}%\n\n\
+                         Generator:\n\
+                         - Old loss: {:.4}\n\
+                         - New loss: {:.4}\n\
+                         - Improvement: {:.1}%\n\n\
+                         Validator:\n\
+                         - Old loss: {:.4}\n\
+                         - New loss: {:.4}\n\
+                         - Improvement: {:.1}%\n\n\
+                         Status: Models updated successfully\n\
+                         Test with query_local_model to see improvements!",
+                        result.examples_count,
+                        duration,
+                        result.router_old_loss,
+                        result.router_new_loss,
+                        (result.router_old_loss - result.router_new_loss) / result.router_old_loss
+                            * 100.0,
+                        result.generator_old_loss,
+                        result.generator_new_loss,
+                        (result.generator_old_loss - result.generator_new_loss)
+                            / result.generator_old_loss
+                            * 100.0,
+                        result.validator_old_loss,
+                        result.validator_new_loss,
+                        (result.validator_old_loss - result.validator_new_loss)
+                            / result.validator_old_loss
+                            * 100.0,
+                    ))
+                }
+                Err(e) => Ok(format!(
+                    "=== Training Failed ===\n\
+                     Error: {}\n\n\
+                     Queue size: {} examples\n\
+                     Try again or check logs for details.",
+                    e, queue_size
+                )),
+            }
+        } else {
+            // Asynchronous training
+            let mut trainer = batch_trainer.write().await;
+
+            match trainer.train_async().await {
+                Ok(_) => Ok(format!(
+                    "=== Training Started (Asynchronous) ===\n\
+                     Queue size: {} examples\n\
+                     Status: Training running in background\n\n\
+                     Training will complete shortly. Check progress with:\n\
+                     - query_local_model tool to test responses\n\
+                     - analyze_model tool to see overall performance\n\n\
+                     Note: Models will be automatically updated when training completes.",
+                    queue_size
+                )),
+                Err(e) => Ok(format!(
+                    "=== Training Failed to Start ===\n\
+                     Error: {}\n\n\
+                     Queue size: {} examples\n\
+                     Try again or check logs for details.",
+                    e, queue_size
+                )),
+            }
+        }
     }
 }
 
@@ -110,8 +175,11 @@ mod tests {
         let input = serde_json::json!({"wait": true});
 
         let ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            allow_all: true,
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
         };
 
         let result = tool.execute(input, &ctx).await;

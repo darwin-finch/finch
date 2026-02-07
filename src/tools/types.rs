@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cli::ConversationHistory;
+use crate::local::LocalGenerator;
+use crate::models::tokenizer::TextTokenizer;
+use crate::training::batch_trainer::BatchTrainer;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// Context passed to tools during execution
 pub struct ToolContext<'a> {
@@ -15,6 +20,15 @@ pub struct ToolContext<'a> {
 
     /// Optional function to save model weights (for restart tools)
     pub save_models: Option<&'a (dyn Fn() -> Result<()> + Send + Sync)>,
+
+    /// Optional batch trainer for active learning tools
+    pub batch_trainer: Option<Arc<RwLock<BatchTrainer>>>,
+
+    /// Optional local generator for query_local tool
+    pub local_generator: Option<Arc<RwLock<LocalGenerator>>>,
+
+    /// Optional tokenizer for encoding/decoding text
+    pub tokenizer: Option<Arc<TextTokenizer>>,
 }
 
 /// Tool definition (Claude API-compatible)
@@ -62,9 +76,9 @@ impl ToolInputSchema {
 /// Tool use request (from generator or Claude API)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolUse {
-    pub id: String,        // Format: toolu_[random]
-    pub name: String,      // Tool name
-    pub input: Value,      // Tool parameters (JSON object)
+    pub id: String,   // Format: toolu_[random]
+    pub name: String, // Tool name
+    pub input: Value, // Tool parameters (JSON object)
 }
 
 impl ToolUse {

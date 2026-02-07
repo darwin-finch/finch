@@ -176,7 +176,10 @@ impl Sampler {
                 effective_rate * 100.0
             )
         } else {
-            format!("Not sampled (random: {:.3} >= {:.3})", random_value, effective_rate)
+            format!(
+                "Not sampled (random: {:.3} >= {:.3})",
+                random_value, effective_rate
+            )
         };
 
         SamplingDecision {
@@ -245,12 +248,8 @@ impl ComparisonResult {
         let a_lower = a.to_lowercase();
         let b_lower = b.to_lowercase();
 
-        let words_a: std::collections::HashSet<_> = a_lower
-            .split_whitespace()
-            .collect();
-        let words_b: std::collections::HashSet<_> = b_lower
-            .split_whitespace()
-            .collect();
+        let words_a: std::collections::HashSet<_> = a_lower.split_whitespace().collect();
+        let words_b: std::collections::HashSet<_> = b_lower.split_whitespace().collect();
 
         let intersection = words_a.intersection(&words_b).count();
         let union = words_a.union(&words_b).count();
@@ -298,10 +297,7 @@ mod tests {
             QueryCategory::Architecture.sampling_multiplier(&config),
             3.0
         );
-        assert_eq!(
-            QueryCategory::Security.sampling_multiplier(&config),
-            5.0
-        );
+        assert_eq!(QueryCategory::Security.sampling_multiplier(&config), 5.0);
         assert_eq!(QueryCategory::General.sampling_multiplier(&config), 1.0);
     }
 

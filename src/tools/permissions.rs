@@ -128,9 +128,7 @@ impl PermissionManager {
         // Use configured rule or default
         match config.map(|c| &c.rule).unwrap_or(&self.default_rule) {
             PermissionRule::Allow => PermissionCheck::Allow,
-            PermissionRule::Ask => {
-                PermissionCheck::AskUser(format!("Execute {} tool?", tool_name))
-            }
+            PermissionRule::Ask => PermissionCheck::AskUser(format!("Execute {} tool?", tool_name)),
             PermissionRule::Deny => {
                 PermissionCheck::Deny(format!("Tool '{}' is not allowed", tool_name))
             }
@@ -210,10 +208,7 @@ impl PermissionManager {
         for scheme in blocked_schemes {
             if url.to_lowercase().starts_with(scheme) {
                 warn!("Blocked dangerous URL scheme: {}", url);
-                return Some(format!(
-                    "Blocked: URL scheme '{}' is not allowed",
-                    scheme
-                ));
+                return Some(format!("Blocked: URL scheme '{}' is not allowed", scheme));
             }
         }
 
@@ -277,7 +272,10 @@ impl PermissionManager {
 
         // If allowed patterns specified, input must match one
         if !config.allowed_patterns.is_empty() {
-            let matches = config.allowed_patterns.iter().any(|p| input_str.contains(p));
+            let matches = config
+                .allowed_patterns
+                .iter()
+                .any(|p| input_str.contains(p));
             if !matches {
                 return Some(PermissionCheck::AskUser(format!(
                     "Tool {} input doesn't match allowed patterns",
@@ -315,7 +313,11 @@ mod tests {
         for cmd in dangerous_commands {
             let input = serde_json::json!({"command": cmd});
             let check = manager.check_tool_use("bash", &input);
-            assert!(matches!(check, PermissionCheck::Deny(_)), "Failed to block: {}", cmd);
+            assert!(
+                matches!(check, PermissionCheck::Deny(_)),
+                "Failed to block: {}",
+                cmd
+            );
         }
     }
 
@@ -328,7 +330,11 @@ mod tests {
         for file in system_files {
             let input = serde_json::json!({"file_path": file});
             let check = manager.check_tool_use("read", &input);
-            assert!(matches!(check, PermissionCheck::Deny(_)), "Failed to block: {}", file);
+            assert!(
+                matches!(check, PermissionCheck::Deny(_)),
+                "Failed to block: {}",
+                file
+            );
         }
     }
 
@@ -345,7 +351,11 @@ mod tests {
         for url in dangerous_urls {
             let input = serde_json::json!({"url": url});
             let check = manager.check_tool_use("web_fetch", &input);
-            assert!(matches!(check, PermissionCheck::Deny(_)), "Failed to block: {}", url);
+            assert!(
+                matches!(check, PermissionCheck::Deny(_)),
+                "Failed to block: {}",
+                url
+            );
         }
     }
 
@@ -363,7 +373,11 @@ mod tests {
         for url in private_urls {
             let input = serde_json::json!({"url": url});
             let check = manager.check_tool_use("web_fetch", &input);
-            assert!(matches!(check, PermissionCheck::Deny(_)), "Failed to block: {}", url);
+            assert!(
+                matches!(check, PermissionCheck::Deny(_)),
+                "Failed to block: {}",
+                url
+            );
         }
     }
 

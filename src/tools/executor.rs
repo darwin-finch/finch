@@ -474,12 +474,10 @@ pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path
                 context_key: format!("generate_training_data count={}", examples_count),
             }
         }
-        "compare_responses" => {
-            ToolSignature {
-                tool_name: tool_use.name.clone(),
-                context_key: "compare_responses".to_string(),
-            }
-        }
+        "compare_responses" => ToolSignature {
+            tool_name: tool_use.name.clone(),
+            context_key: "compare_responses".to_string(),
+        },
         _ => {
             // Generic signature for unknown tools
             ToolSignature {
@@ -551,7 +549,14 @@ mod tests {
         let tool_use = ToolUse::new("mock".to_string(), serde_json::json!({"param": "value"}));
 
         let result = executor
-            .execute_tool(&tool_use, None, None::<fn() -> Result<()>>, None, None, None)
+            .execute_tool(
+                &tool_use,
+                None,
+                None::<fn() -> Result<()>>,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -569,7 +574,14 @@ mod tests {
         );
 
         let result = executor
-            .execute_tool(&tool_use, None, None::<fn() -> Result<()>>, None, None, None)
+            .execute_tool(
+                &tool_use,
+                None,
+                None::<fn() -> Result<()>>,
+                None,
+                None,
+                None,
+            )
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
@@ -581,7 +593,14 @@ mod tests {
         let tool_use = ToolUse::new("mock".to_string(), serde_json::json!({"param": "value"}));
 
         let result = executor
-            .execute_tool(&tool_use, None, None::<fn() -> Result<()>>, None, None, None)
+            .execute_tool(
+                &tool_use,
+                None,
+                None::<fn() -> Result<()>>,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -596,7 +615,14 @@ mod tests {
         let tool_use = ToolUse::new("mock".to_string(), serde_json::json!({"param": "value"}));
 
         let result = executor
-            .execute_tool(&tool_use, None, None::<fn() -> Result<()>>, None, None, None)
+            .execute_tool(
+                &tool_use,
+                None,
+                None::<fn() -> Result<()>>,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -614,7 +640,14 @@ mod tests {
         ];
 
         let results = executor
-            .execute_tool_loop(tool_uses, None, None::<fn() -> Result<()>>, None, None, None)
+            .execute_tool_loop(
+                tool_uses,
+                None,
+                None::<fn() -> Result<()>>,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -816,10 +849,7 @@ mod tests {
     #[test]
     fn test_generate_tool_signature_compare_responses() {
         let working_dir = Path::new("/test/dir");
-        let tool_use = ToolUse::new(
-            "compare_responses".to_string(),
-            json!({}),
-        );
+        let tool_use = ToolUse::new("compare_responses".to_string(), json!({}));
 
         let sig = generate_tool_signature(&tool_use, working_dir);
 

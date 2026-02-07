@@ -36,17 +36,14 @@ impl LoadedQwenModel {
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
         let input_ids = tokens.get_ids();
-        let input_tensor =
-            Tensor::new(input_ids, &self.device)?.unsqueeze(0)?; // Add batch dimension
+        let input_tensor = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?; // Add batch dimension
 
         // Generate tokens autoregressively
         let mut generated_ids = input_ids.to_vec();
 
         for _ in 0..max_tokens {
             // Forward pass
-            let logits = self
-                .model
-                .forward(&input_tensor, generated_ids.len() - 1)?;
+            let logits = self.model.forward(&input_tensor, generated_ids.len() - 1)?;
 
             // Get logits for last token
             let last_logits = logits.i((0, generated_ids.len() - 1))?;
@@ -105,7 +102,8 @@ impl QwenLoader {
         )
         .context("Failed to parse Qwen2 config.json")?;
 
-        tracing::debug!("Loaded config: vocab_size={}, hidden_size={}, num_layers={}",
+        tracing::debug!(
+            "Loaded config: vocab_size={}, hidden_size={}, num_layers={}",
             qwen_config.vocab_size,
             qwen_config.hidden_size,
             qwen_config.num_hidden_layers
@@ -113,10 +111,14 @@ impl QwenLoader {
 
         // 2. Load tokenizer
         let tokenizer_path = config.cache_dir.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {:?}: {}", tokenizer_path, e))?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            anyhow::anyhow!("Failed to load tokenizer from {:?}: {}", tokenizer_path, e)
+        })?;
 
-        tracing::debug!("Loaded tokenizer with vocab size: {}", tokenizer.get_vocab_size(true));
+        tracing::debug!(
+            "Loaded tokenizer with vocab size: {}",
+            tokenizer.get_vocab_size(true)
+        );
 
         // 3. Load model weights from safetensors (single file or sharded)
         let weights_paths = Self::find_safetensors_files(&config.cache_dir)?;
@@ -161,9 +163,7 @@ impl QwenLoader {
 
         // Try sharded files - collect all shards
         let mut shards = Vec::new();
-        for entry in std::fs::read_dir(cache_dir)
-            .context("Failed to read cache directory")?
-        {
+        for entry in std::fs::read_dir(cache_dir).context("Failed to read cache directory")? {
             let entry = entry.context("Failed to read directory entry")?;
             let path = entry.path();
 
@@ -197,7 +197,6 @@ impl QwenLoader {
 
         has_config && has_tokenizer && has_weights
     }
-
 }
 
 #[cfg(test)]

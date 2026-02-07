@@ -17,31 +17,27 @@ impl Tool for GenerateTrainingDataTool {
     }
 
     fn description(&self) -> &str {
-        "Generate synthetic training examples to improve Shammah's capabilities.
+        "Add training examples to improve Shammah's capabilities.
 
-Claude (you) can create targeted training data to teach Shammah specific skills:
-- Generate diverse examples for a category (math, code, science, etc.)
-- Cover different difficulty levels
-- Include edge cases and variations
-- Provide high-quality responses for each example
+Claude (you) can create targeted training data by providing Q&A pairs:
 
 Input: {
-  \"category\": \"math\" | \"code\" | \"science\" | \"general\" | etc.,
-  \"count\": 10-100,
-  \"difficulty\": \"easy\" | \"medium\" | \"hard\",
-  \"focus\": \"optional specific focus area\"
+  \"examples\": [
+    {\"query\": \"What is 2+2?\", \"response\": \"2+2 equals 4.\"},
+    {\"query\": \"Explain photosynthesis\", \"response\": \"Photosynthesis is...\"}
+  ]
 }
 
 Process:
-1. Claude generates N diverse queries in the category
-2. Claude provides high-quality responses for each
+1. Claude generates diverse queries and high-quality responses
+2. Call this tool with the examples array
 3. Examples are added to training queue
-4. User can trigger training with TrainTool
+4. Use train tool to train immediately, or wait for automatic training
 
 This enables:
-- Rapid skill acquisition (hours vs months)
+- Rapid skill acquisition
 - Targeted weakness improvement
-- Curriculum learning (easy -> hard)
+- Curriculum learning (easy -> hard examples)
 - Active learning (Claude identifies gaps and fills them)"
     }
 
@@ -49,82 +45,96 @@ This enables:
         ToolInputSchema {
             schema_type: "object".to_string(),
             properties: serde_json::json!({
-                "category": {
-                    "type": "string",
-                    "description": "Category of training examples (math, code, science, general, etc.)",
-                    "enum": ["math", "code", "science", "history", "general", "reasoning", "creative"]
-                },
-                "count": {
-                    "type": "integer",
-                    "description": "Number of examples to generate (10-100)",
-                    "minimum": 10,
-                    "maximum": 100
-                },
-                "difficulty": {
-                    "type": "string",
-                    "description": "Difficulty level",
-                    "enum": ["easy", "medium", "hard"]
-                },
-                "focus": {
-                    "type": "string",
-                    "description": "Optional specific focus area within category"
+                "examples": {
+                    "type": "array",
+                    "description": "Array of Q&A pairs: [{\"query\": \"...\", \"response\": \"...\"}]",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The user query/question"
+                            },
+                            "response": {
+                                "type": "string",
+                                "description": "Claude's high-quality response"
+                            }
+                        },
+                        "required": ["query", "response"]
+                    }
                 }
             }),
-            required: vec!["category".to_string(), "count".to_string(), "difficulty".to_string()],
+            required: vec!["examples".to_string()],
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<String> {
-        let category = input["category"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'category' field"))?;
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<String> {
+        let examples_array = input["examples"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'examples' array"))?;
 
-        let count = input["count"]
-            .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'count' field"))?;
+        if examples_array.is_empty() {
+            return Ok("No examples provided. Please provide at least one example.".to_string());
+        }
 
-        let difficulty = input["difficulty"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing 'difficulty' field"))?;
+        let batch_trainer = ctx
+            .batch_trainer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Batch trainer not available"))?;
 
-        let focus = input["focus"].as_str();
+        let mut added = 0;
+        let mut errors = Vec::new();
 
-        // TODO: Implement actual training data generation
-        // For now, return instructions
+        for (i, example_obj) in examples_array.iter().enumerate() {
+            let query = match example_obj["query"].as_str() {
+                Some(q) => q,
+                None => {
+                    errors.push(format!("Example {}: missing 'query' field", i + 1));
+                    continue;
+                }
+            };
 
-        // In the real implementation, this would:
-        // 1. Claude generates N diverse queries
-        // 2. Claude provides high-quality responses
-        // 3. Add to training queue
-        // 4. Return summary
+            let response = match example_obj["response"].as_str() {
+                Some(r) => r,
+                None => {
+                    errors.push(format!("Example {}: missing 'response' field", i + 1));
+                    continue;
+                }
+            };
 
-        let response = format!(
-            "=== Training Data Generation Request ===\n\
-             Category: {}\n\
-             Count: {} examples\n\
-             Difficulty: {}\n\
-             {}\n\n\
-             === Instructions ===\n\
-             To generate training data:\n\n\
-             1. Create {} diverse {} queries at {} difficulty\n\
-             2. For each query, provide your (Claude's) high-quality response\n\
-             3. Format as: Query | Response pairs\n\
-             4. I will add these to Shammah's training queue\n\n\
-             Example format:\n\
-             Q: [Your generated question]\n\
-             A: [Your high-quality answer]\n\n\
-             Please generate the {} {} examples now, and I'll process them \
-             into training data.",
-            category,
-            count,
-            difficulty,
-            focus.map(|f| format!("Focus: {}", f)).unwrap_or_default(),
-            count,
-            category,
-            difficulty,
-            count,
-            category
+            use crate::training::batch_trainer::TrainingExample;
+            let training_example = TrainingExample::new(
+                query.to_string(),
+                response.to_string(),
+                false, // local_success = false (these are from Claude)
+            )
+            .with_quality(1.0); // Claude's responses are high quality
+
+            let mut trainer = batch_trainer.write().await;
+            trainer.add_example(training_example).await?;
+
+            added += 1;
+        }
+
+        let queue_size = {
+            let trainer = batch_trainer.read().await;
+            trainer.queue_size().await
+        };
+
+        let mut response = format!(
+            "=== Training Examples Added ===\n\
+             Added: {} examples\n\
+             Queue size: {} examples\n\
+             Batch size: 32 (training triggers automatically)\n\n",
+            added, queue_size
         );
+
+        if !errors.is_empty() {
+            response.push_str(&format!("=== Errors ===\n{}\n\n", errors.join("\n")));
+        }
+
+        response
+            .push_str("Use the train tool to train immediately, or wait for automatic training.");
 
         Ok(response)
     }
@@ -135,26 +145,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_generate_training_tool() {
+    async fn test_generate_training_tool_no_trainer() {
         let tool = GenerateTrainingDataTool;
         let input = serde_json::json!({
-            "category": "math",
-            "count": 20,
-            "difficulty": "medium",
-            "focus": "algebra"
+            "examples": [
+                {"query": "What is 2+2?", "response": "2+2 equals 4."}
+            ]
         });
 
         let ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            allow_all: true,
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
         };
 
         let result = tool.execute(input, &ctx).await;
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
-        assert!(response.contains("Training Data Generation"));
-        assert!(response.contains("math"));
-        assert!(response.contains("20"));
+        // Should fail because batch_trainer is None
+        assert!(result.is_err());
     }
 }

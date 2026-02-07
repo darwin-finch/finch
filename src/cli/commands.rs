@@ -63,17 +63,16 @@ impl Command {
         }
 
         // Handle /feedback commands with optional explanation
-        if let Some(rest) = trimmed.strip_prefix("/feedback critical ")
+        if let Some(rest) = trimmed
+            .strip_prefix("/feedback critical ")
             .or_else(|| trimmed.strip_prefix("/feedback high "))
         {
             let explanation = rest.trim();
-            return Some(Command::FeedbackCritical(
-                if explanation.is_empty() {
-                    None
-                } else {
-                    Some(explanation.to_string())
-                },
-            ));
+            return Some(Command::FeedbackCritical(if explanation.is_empty() {
+                None
+            } else {
+                Some(explanation.to_string())
+            }));
         }
 
         if trimmed == "/feedback critical" || trimmed == "/feedback high" {
@@ -82,13 +81,11 @@ impl Command {
 
         if let Some(rest) = trimmed.strip_prefix("/feedback medium ") {
             let explanation = rest.trim();
-            return Some(Command::FeedbackMedium(
-                if explanation.is_empty() {
-                    None
-                } else {
-                    Some(explanation.to_string())
-                },
-            ));
+            return Some(Command::FeedbackMedium(if explanation.is_empty() {
+                None
+            } else {
+                Some(explanation.to_string())
+            }));
         }
 
         if trimmed == "/feedback medium" {
@@ -100,13 +97,11 @@ impl Command {
             .or_else(|| trimmed.strip_prefix("/feedback normal "))
         {
             let explanation = rest.trim();
-            return Some(Command::FeedbackGood(
-                if explanation.is_empty() {
-                    None
-                } else {
-                    Some(explanation.to_string())
-                },
-            ));
+            return Some(Command::FeedbackGood(if explanation.is_empty() {
+                None
+            } else {
+                Some(explanation.to_string())
+            }));
         }
 
         if trimmed == "/feedback good" || trimmed == "/feedback normal" {

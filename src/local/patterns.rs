@@ -119,7 +119,10 @@ impl PatternClassifier {
             || query_lower.contains("hey")
         {
             let stats = self.patterns.get(&QueryPattern::Greeting);
-            return (QueryPattern::Greeting, stats.map(|s| s.confidence).unwrap_or(0.7));
+            return (
+                QueryPattern::Greeting,
+                stats.map(|s| s.confidence).unwrap_or(0.7),
+            );
         }
 
         // Check for definitions
@@ -140,7 +143,10 @@ impl PatternClassifier {
             || query_lower.starts_with("how can i")
         {
             let stats = self.patterns.get(&QueryPattern::HowTo);
-            return (QueryPattern::HowTo, stats.map(|s| s.confidence).unwrap_or(0.5));
+            return (
+                QueryPattern::HowTo,
+                stats.map(|s| s.confidence).unwrap_or(0.5),
+            );
         }
 
         // Check for code
@@ -150,7 +156,10 @@ impl PatternClassifier {
             || query_lower.contains("error:")
         {
             let stats = self.patterns.get(&QueryPattern::Code);
-            return (QueryPattern::Code, stats.map(|s| s.confidence).unwrap_or(0.4));
+            return (
+                QueryPattern::Code,
+                stats.map(|s| s.confidence).unwrap_or(0.4),
+            );
         }
 
         // Default to Other with low confidence
@@ -162,7 +171,16 @@ impl PatternClassifier {
         let mut features = Vec::new();
 
         // Length feature
-        features.push(format!("length:{}", if query.len() < 50 { "short" } else if query.len() < 200 { "medium" } else { "long" }));
+        features.push(format!(
+            "length:{}",
+            if query.len() < 50 {
+                "short"
+            } else if query.len() < 200 {
+                "medium"
+            } else {
+                "long"
+            }
+        ));
 
         // Question mark
         if query.contains('?') {
@@ -197,9 +215,7 @@ impl LearningModel for PatternClassifier {
     fn update(&mut self, input: &str, expected: &ModelExpectation) -> Result<()> {
         // Extract pattern from expectation
         let pattern = match expected {
-            ModelExpectation::PatternLabel { category, .. } => {
-                QueryPattern::from_str(category)
-            }
+            ModelExpectation::PatternLabel { category, .. } => QueryPattern::from_str(category),
             _ => QueryPattern::Other,
         };
 
@@ -228,17 +244,16 @@ impl LearningModel for PatternClassifier {
     }
 
     fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("Failed to serialize pattern classifier")?;
+        let json =
+            serde_json::to_string_pretty(self).context("Failed to serialize pattern classifier")?;
         std::fs::write(path, json).context("Failed to write pattern classifier")?;
         Ok(())
     }
 
     fn load(path: &Path) -> Result<Self> {
-        let json = std::fs::read_to_string(path)
-            .context("Failed to read pattern classifier")?;
-        let classifier = serde_json::from_str(&json)
-            .context("Failed to deserialize pattern classifier")?;
+        let json = std::fs::read_to_string(path).context("Failed to read pattern classifier")?;
+        let classifier =
+            serde_json::from_str(&json).context("Failed to deserialize pattern classifier")?;
         Ok(classifier)
     }
 

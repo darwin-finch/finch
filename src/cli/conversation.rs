@@ -1,6 +1,6 @@
 // Conversation history manager for multi-turn interactions
 
-use crate::claude::{Message, ContentBlock};
+use crate::claude::{ContentBlock, Message};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -94,18 +94,15 @@ impl ConversationHistory {
         }
 
         // Estimate token count (rough: 1 token ≈ 4 characters)
-        let total_chars: usize = self.messages.iter()
-            .map(|m| m.text().len())
-            .sum();
+        let total_chars: usize = self.messages.iter().map(|m| m.text().len()).sum();
 
         if total_chars > self.max_tokens_estimate {
             // Remove oldest messages until under limit
             // BUT: Always keep at least 2 messages (1 user + 1 assistant minimum)
             // This prevents conversation from becoming empty during tool execution
             while self.messages.len() > 2
-                && self.messages.iter()
-                    .map(|m| m.text().len())
-                    .sum::<usize>() > self.max_tokens_estimate
+                && self.messages.iter().map(|m| m.text().len()).sum::<usize>()
+                    > self.max_tokens_estimate
             {
                 self.messages.remove(0);
             }
@@ -114,9 +111,7 @@ impl ConversationHistory {
 
     /// Get estimated token count (rough approximation)
     pub fn estimated_tokens(&self) -> usize {
-        let total_chars: usize = self.messages.iter()
-            .map(|m| m.text().len())
-            .sum();
+        let total_chars: usize = self.messages.iter().map(|m| m.text().len()).sum();
         total_chars / 4 // Rough estimate: 1 token ≈ 4 characters
     }
 

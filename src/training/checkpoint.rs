@@ -52,8 +52,12 @@ impl CheckpointManager {
     /// Create new checkpoint manager
     pub fn new(checkpoint_dir: PathBuf, max_checkpoints: usize) -> Result<Self> {
         // Create directory if it doesn't exist
-        fs::create_dir_all(&checkpoint_dir)
-            .with_context(|| format!("Failed to create checkpoint directory: {:?}", checkpoint_dir))?;
+        fs::create_dir_all(&checkpoint_dir).with_context(|| {
+            format!(
+                "Failed to create checkpoint directory: {:?}",
+                checkpoint_dir
+            )
+        })?;
 
         Ok(Self {
             checkpoint_dir,
@@ -76,19 +80,26 @@ impl CheckpointManager {
 
         // Create checkpoint subdirectory
         let checkpoint_subdir = self.checkpoint_dir.join(&id);
-        fs::create_dir_all(&checkpoint_subdir)
-            .with_context(|| format!("Failed to create checkpoint subdirectory: {:?}", checkpoint_subdir))?;
+        fs::create_dir_all(&checkpoint_subdir).with_context(|| {
+            format!(
+                "Failed to create checkpoint subdirectory: {:?}",
+                checkpoint_subdir
+            )
+        })?;
 
         // Save models
         let router_path = checkpoint_subdir.join("router.safetensors");
         let generator_path = checkpoint_subdir.join("generator.safetensors");
         let validator_path = checkpoint_subdir.join("validator.safetensors");
 
-        router.save(&router_path)
+        router
+            .save(&router_path)
             .context("Failed to save router model")?;
-        generator.save(&generator_path)
+        generator
+            .save(&generator_path)
             .context("Failed to save generator model")?;
-        validator.save(&validator_path)
+        validator
+            .save(&validator_path)
             .context("Failed to save validator model")?;
 
         // Create checkpoint metadata
@@ -131,9 +142,12 @@ impl CheckpointManager {
         }
 
         // Read all checkpoint directories
-        for entry in fs::read_dir(&self.checkpoint_dir)
-            .with_context(|| format!("Failed to read checkpoint directory: {:?}", self.checkpoint_dir))?
-        {
+        for entry in fs::read_dir(&self.checkpoint_dir).with_context(|| {
+            format!(
+                "Failed to read checkpoint directory: {:?}",
+                self.checkpoint_dir
+            )
+        })? {
             let entry = entry?;
             let path = entry.path();
 
@@ -178,7 +192,10 @@ impl CheckpointManager {
     }
 
     /// Restore from a checkpoint
-    pub fn restore_checkpoint(&self, checkpoint_id: &str) -> Result<(RouterModel, GeneratorModel, ValidatorModel)> {
+    pub fn restore_checkpoint(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<(RouterModel, GeneratorModel, ValidatorModel)> {
         // Find checkpoint
         let checkpoints = self.list_checkpoints()?;
         let checkpoint = checkpoints
@@ -208,8 +225,12 @@ impl CheckpointManager {
         let checkpoint_dir = self.checkpoint_dir.join(checkpoint_id);
 
         if checkpoint_dir.exists() {
-            fs::remove_dir_all(&checkpoint_dir)
-                .with_context(|| format!("Failed to delete checkpoint directory: {:?}", checkpoint_dir))?;
+            fs::remove_dir_all(&checkpoint_dir).with_context(|| {
+                format!(
+                    "Failed to delete checkpoint directory: {:?}",
+                    checkpoint_dir
+                )
+            })?;
 
             tracing::info!(checkpoint_id = %checkpoint_id, "Deleted checkpoint");
         }

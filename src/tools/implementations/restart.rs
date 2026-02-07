@@ -42,8 +42,14 @@ impl Tool for RestartTool {
 
     fn input_schema(&self) -> ToolInputSchema {
         ToolInputSchema::simple(vec![
-            ("reason", "Why you're restarting (e.g., 'optimized router', 'added new tool')"),
-            ("binary_path", "Path to new binary (default: ./target/release/shammah)"),
+            (
+                "reason",
+                "Why you're restarting (e.g., 'optimized router', 'added new tool')",
+            ),
+            (
+                "binary_path",
+                "Path to new binary (default: ./target/release/shammah)",
+            ),
         ])
     }
 
@@ -120,8 +126,7 @@ impl Tool for RestartTool {
         {
             println!("\n→ Starting new binary...\n");
 
-            cmd.spawn()
-                .context("Failed to spawn new binary")?;
+            cmd.spawn().context("Failed to spawn new binary")?;
 
             std::process::exit(0);
         }

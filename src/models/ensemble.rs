@@ -49,7 +49,8 @@ impl ModelEnsemble {
     pub fn new(config: ModelConfig) -> Result<Self> {
         let router = RouterModel::new(&config).context("Failed to create router model")?;
 
-        let generator = LegacyGeneratorModel::new(&config).context("Failed to create generator model")?;
+        let generator =
+            LegacyGeneratorModel::new(&config).context("Failed to create generator model")?;
 
         let validator = ValidatorModel::new(&config).context("Failed to create validator model")?;
 

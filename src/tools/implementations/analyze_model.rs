@@ -67,8 +67,8 @@ Use this to:
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<String> {
-        let test_count = input["test_count"].as_i64().unwrap_or(100);
+    async fn execute(&self, input: Value, ctx: &ToolContext<'_>) -> Result<String> {
+        let test_count = input["test_count"].as_i64().unwrap_or(20) as usize;
 
         let categories = if let Some(cats) = input["categories"].as_array() {
             cats.iter()
@@ -79,46 +79,132 @@ Use this to:
             vec![
                 "greetings".to_string(),
                 "math".to_string(),
-                "code".to_string(),
-                "science".to_string(),
-                "history".to_string(),
-                "reasoning".to_string(),
-                "creative".to_string(),
+                "general".to_string(),
             ]
         };
 
-        // TODO: Implement actual model analysis
-        // For now, return a template analysis
+        // Get local generator
+        let local_gen = ctx
+            .local_generator
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Local generator not available"))?;
 
-        // In the real implementation, this would:
-        // 1. Generate test queries across categories
-        // 2. Get Shammah's responses
-        // 3. Get Claude's responses (ground truth)
-        // 4. Compare and score
-        // 5. Aggregate by category
-        // 6. Identify patterns
-        // 7. Return recommendations
+        // Predefined test queries per category
+        let test_queries = vec![
+            ("greetings", "Hello, how are you?"),
+            ("greetings", "Good morning!"),
+            ("greetings", "Hi there"),
+            ("greetings", "Hey, what's up?"),
+            ("math", "What is 2+2?"),
+            ("math", "What is 5*7?"),
+            ("math", "What is 10-3?"),
+            ("math", "What is 100/4?"),
+            ("general", "What is your name?"),
+            ("general", "What is the capital of France?"),
+            ("general", "Who invented the telephone?"),
+            ("general", "What is water made of?"),
+            ("code", "How do I print in Python?"),
+            ("code", "What is a function?"),
+            ("science", "What is gravity?"),
+            ("science", "What causes rain?"),
+            ("reasoning", "If it's raining, should I take an umbrella?"),
+            ("reasoning", "What comes after 2, 4, 6, 8?"),
+            ("creative", "Write a short poem"),
+            ("creative", "Give me a fun fact"),
+        ];
+
+        let mut results = Vec::new();
+        let mut total_score = 0.0;
+        let mut category_scores: std::collections::HashMap<String, (usize, f64)> =
+            std::collections::HashMap::new();
+
+        let mut gen = local_gen.write().await;
+
+        for (category, query) in test_queries.iter().take(test_count) {
+            match gen.response_generator().generate(query) {
+                Ok(generated) => {
+                    let response = generated.text;
+                    // Simple quality: response length > 10 chars and not an error = success
+                    let score = if response.len() > 10 && !response.contains("[Error:") {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    total_score += score;
+
+                    let entry = category_scores
+                        .entry(category.to_string())
+                        .or_insert((0, 0.0));
+                    entry.0 += 1;
+                    entry.1 += score;
+
+                    results.push(format!(
+                        "  {} [{}]: {} chars ({})",
+                        query,
+                        category,
+                        response.len(),
+                        if score > 0.0 { "✓" } else { "✗" }
+                    ));
+                }
+                Err(e) => {
+                    results.push(format!("  {} [{}]: ERROR - {}", query, category, e));
+                    let entry = category_scores
+                        .entry(category.to_string())
+                        .or_insert((0, 0.0));
+                    entry.0 += 1;
+                }
+            }
+        }
+
+        let avg_score = if results.is_empty() {
+            0.0
+        } else {
+            total_score / results.len() as f64
+        };
+        let percentage = (avg_score * 100.0) as u32;
+
+        // Format category breakdown
+        let mut category_breakdown = String::new();
+        for (cat, (count, score)) in category_scores.iter() {
+            let cat_percentage = if *count > 0 {
+                (score / *count as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            category_breakdown.push_str(&format!(
+                "  {}: {}/{}  ({}%)\n",
+                cat, *score as u32, count, cat_percentage
+            ));
+        }
 
         let response = format!(
-            "=== Shammah Capability Analysis ===\n\
-             Test queries: {}\n\
-             Categories tested: {}\n\n\
-             === Current Status ===\n\
-             Overall: Shammah is not yet trained (0% local success rate)\n\n\
+            "=== Model Capability Analysis ===\n\
+             Test Queries: {}\n\
+             Categories: {}\n\n\
+             === Results ===\n\
+             {}\n\n\
+             === Category Breakdown ===\n\
+             {}\n\
+             === Overall Performance ===\n\
+             Success Rate: {}%\n\
+             Average Score: {:.2}/1.0\n\n\
              === Recommendations ===\n\
-             Shammah needs initial training before meaningful analysis.\n\n\
-             Suggested bootstrap training:\n\
-             1. Greetings & simple queries: 50 examples (easy)\n\
-             2. General knowledge: 100 examples (easy-medium)\n\
-             3. Math basics: 50 examples (easy-medium)\n\
-             4. Code snippets: 50 examples (medium)\n\
-             5. Reasoning: 50 examples (medium)\n\n\
-             Total: 300 examples to establish baseline capability\n\n\
-             Use GenerateTrainingDataTool to create these examples,\n\
-             then TrainTool to train Shammah.\n\n\
-             After initial training, run this analysis again to measure progress.",
-            test_count,
-            categories.join(", ")
+             {}\n\n\
+             Use generate_training_data to create targeted examples,\n\
+             then use train to improve Shammah's performance.",
+            results.len(),
+            categories.join(", "),
+            results.join("\n"),
+            category_breakdown,
+            percentage,
+            avg_score,
+            if percentage < 30 {
+                "🔴 Critical: Shammah needs extensive training (50-100 examples)"
+            } else if percentage < 60 {
+                "🟡 Warning: Shammah needs moderate training (20-50 examples)"
+            } else {
+                "🟢 Good: Shammah performing reasonably well"
+            }
         );
 
         Ok(response)
@@ -138,8 +224,11 @@ mod tests {
         });
 
         let ctx = ToolContext {
-            cwd: std::path::PathBuf::from("."),
-            allow_all: true,
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
         };
 
         let result = tool.execute(input, &ctx).await;

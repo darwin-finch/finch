@@ -14,6 +14,7 @@ fn test_simple_forward_pass() -> Result<()> {
         num_heads: 2,
         max_seq_len: 16,
         dropout: 0.0,
+        device_preference: shammah::models::DevicePreference::Cpu,
     };
 
     let router = RouterModel::new(&config)?;
@@ -52,6 +53,7 @@ fn test_predict() -> Result<()> {
         num_heads: 2,
         max_seq_len: 16,
         dropout: 0.0,
+        device_preference: shammah::models::DevicePreference::Cpu,
     };
 
     let router = RouterModel::new(&config)?;

@@ -1,9 +1,7 @@
 // Qwen Integration Demo
 // Demonstrates the complete Qwen integration: selection, download, and loading
 
-use shammah::models::{
-    GeneratorConfig, GeneratorModel, ModelDownloader, ModelSelector, QwenSize,
-};
+use shammah::models::{GeneratorConfig, GeneratorModel, ModelDownloader, ModelSelector, QwenSize};
 
 fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -16,8 +14,14 @@ fn main() -> anyhow::Result<()> {
     println!("----------------------------------");
     let selected_model = ModelSelector::select_model_for_system()?;
     println!("✓ Selected: {}", selected_model.description());
-    println!("  RAM requirement: {}GB", selected_model.ram_requirement_gb());
-    println!("  Download size: {:.1}GB\n", selected_model.download_size_gb());
+    println!(
+        "  RAM requirement: {}GB",
+        selected_model.ram_requirement_gb()
+    );
+    println!(
+        "  Download size: {:.1}GB\n",
+        selected_model.download_size_gb()
+    );
 
     // Step 2: Check cache status
     println!("Step 2: Check Cache Status");
@@ -41,7 +45,9 @@ fn main() -> anyhow::Result<()> {
 
     // Option A: Use pre-trained Qwen (if downloaded)
     println!("Option A: Pre-trained Qwen");
-    let cache_dir = downloader.cache_dir().join("hub/models--Qwen--Qwen2.5-1.5B-Instruct");
+    let cache_dir = downloader
+        .cache_dir()
+        .join("hub/models--Qwen--Qwen2.5-1.5B-Instruct");
 
     // Find snapshot directory
     let mut qwen_available = false;
