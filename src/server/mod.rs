@@ -17,7 +17,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::claude::ClaudeClient;
 use crate::config::Config;
+use crate::local::LocalGenerator;
 use crate::metrics::MetricsLogger;
+use crate::models::{BootstrapLoader, GeneratorState, TrainingCoordinator};
 use crate::router::Router;
 
 /// Configuration for the HTTP server
@@ -59,6 +61,14 @@ pub struct AgentServer {
     session_manager: Arc<SessionManager>,
     /// Server configuration
     config: ServerConfig,
+    /// Local generator (Qwen model with LoRA)
+    local_generator: Arc<RwLock<LocalGenerator>>,
+    /// Bootstrap loader for progressive model loading
+    bootstrap_loader: Arc<BootstrapLoader>,
+    /// Generator state (tracks model loading progress)
+    generator_state: Arc<RwLock<GeneratorState>>,
+    /// Training coordinator for LoRA fine-tuning
+    training_coordinator: Arc<TrainingCoordinator>,
 }
 
 impl AgentServer {
@@ -69,6 +79,10 @@ impl AgentServer {
         claude_client: ClaudeClient,
         router: Router,
         metrics_logger: MetricsLogger,
+        local_generator: Arc<RwLock<LocalGenerator>>,
+        bootstrap_loader: Arc<BootstrapLoader>,
+        generator_state: Arc<RwLock<GeneratorState>>,
+        training_coordinator: Arc<TrainingCoordinator>,
     ) -> Result<Self> {
         let session_manager = SessionManager::new(
             server_config.max_sessions,
@@ -81,6 +95,10 @@ impl AgentServer {
             metrics_logger: Arc::new(metrics_logger),
             session_manager: Arc::new(session_manager),
             config: server_config,
+            local_generator,
+            bootstrap_loader,
+            generator_state,
+            training_coordinator,
         })
     }
 
@@ -126,5 +144,25 @@ impl AgentServer {
     /// Get server configuration
     pub fn config(&self) -> &ServerConfig {
         &self.config
+    }
+
+    /// Get reference to local generator
+    pub fn local_generator(&self) -> &Arc<RwLock<LocalGenerator>> {
+        &self.local_generator
+    }
+
+    /// Get reference to bootstrap loader
+    pub fn bootstrap_loader(&self) -> &Arc<BootstrapLoader> {
+        &self.bootstrap_loader
+    }
+
+    /// Get reference to generator state
+    pub fn generator_state(&self) -> &Arc<RwLock<GeneratorState>> {
+        &self.generator_state
+    }
+
+    /// Get reference to training coordinator
+    pub fn training_coordinator(&self) -> &Arc<TrainingCoordinator> {
+        &self.training_coordinator
     }
 }

@@ -213,6 +213,11 @@ fn init_tracing() {
 /// Run HTTP daemon server
 async fn run_daemon(bind_address: String) -> Result<()> {
     use shammah::server::{AgentServer, ServerConfig};
+    use shammah::models::{BootstrapLoader, GeneratorState, DevicePreference, TrainingCoordinator};
+    use shammah::local::LocalGenerator;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use shammah::{output_progress, output_status};
 
     // Initialize tracing with custom OutputManager layer
     init_tracing();
@@ -262,6 +267,68 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Create metrics logger
     let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
 
+    // Initialize BootstrapLoader for progressive Qwen model loading
+    output_progress!("⏳ Initializing Qwen model (background)...");
+    let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
+    let bootstrap_loader = Arc::new(BootstrapLoader::new(Arc::clone(&generator_state)));
+
+    // Start background model loading
+    let loader_clone = Arc::clone(&bootstrap_loader);
+    let state_clone = Arc::clone(&generator_state);
+    tokio::spawn(async move {
+        if let Err(e) = loader_clone
+            .load_generator_async(None, DevicePreference::Auto)
+            .await
+        {
+            output_status!("⚠️  Model loading failed: {}", e);
+            output_status!("   Will forward all queries to Claude");
+            let mut state = state_clone.write().await;
+            *state = GeneratorState::Failed {
+                error: format!("{}", e),
+            };
+        }
+    });
+
+    // Create local generator (will receive model when ready)
+    let local_generator = Arc::new(RwLock::new(LocalGenerator::new()));
+
+    // Monitor generator state and inject model when ready
+    let gen_clone = Arc::clone(&local_generator);
+    let state_monitor = Arc::clone(&generator_state);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+            let state = state_monitor.read().await;
+            if let GeneratorState::Ready { model, .. } = &*state {
+                // Inject Qwen model into LocalGenerator
+                // Note: tokenizer is now embedded in GeneratorModel backend
+                let mut gen = gen_clone.write().await;
+                *gen = LocalGenerator::with_models(
+                    Some(Arc::clone(model)),
+                    None, // Tokenizer is embedded in GeneratorModel
+                );
+
+                output_status!("✓ Qwen model ready - local generation enabled");
+                break; // Stop monitoring once injected
+            } else if matches!(
+                *state,
+                GeneratorState::Failed { .. } | GeneratorState::NotAvailable
+            ) {
+                break; // Stop monitoring on failure
+            }
+        }
+    });
+
+    // Initialize LoRA fine-tuning system
+    let training_coordinator = Arc::new(TrainingCoordinator::new(
+        100,  // buffer_size: keep last 100 examples
+        10,   // threshold: train after 10 examples
+        true, // auto_train: enabled
+    ));
+
+    output_status!("✓ LoRA fine-tuning enabled (weighted training)");
+
     // Create server configuration
     let server_config = ServerConfig {
         bind_address: config.server.bind_address.clone(),
@@ -271,8 +338,18 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         api_keys: config.server.api_keys.clone(),
     };
 
-    // Create and start agent server
-    let server = AgentServer::new(config, server_config, claude_client, router, metrics_logger)?;
+    // Create and start agent server (with LocalGenerator support)
+    let server = AgentServer::new(
+        config,
+        server_config,
+        claude_client,
+        router,
+        metrics_logger,
+        local_generator,
+        bootstrap_loader,
+        generator_state,
+        training_coordinator,
+    )?;
     server.serve().await?;
 
     Ok(())

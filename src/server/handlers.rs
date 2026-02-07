@@ -18,6 +18,7 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
     Router::new()
         .route("/v1/messages", post(handle_message))
         .route("/v1/session/:id", get(get_session).delete(delete_session))
+        .route("/v1/status", get(get_status))
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
         .with_state(server)
@@ -110,14 +111,98 @@ async fn handle_message(
         RouteDecision::Local { .. } => {
             tracing::info!(session_id = %session.id, "Handling locally");
 
-            // TODO: Use actual local generator when implemented
-            // For now, fall back to Claude
-            let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
-            let response = server.claude_client().send_message(&claude_request).await?;
+            // Check if local generator is ready
+            use crate::models::GeneratorState;
+            let state = server.generator_state().read().await;
 
-            let text = response.text();
+            match &*state {
+                GeneratorState::Ready { .. } => {
+                    drop(state); // Release lock before generating
 
-            (text, "local_fallback".to_string())
+                    tracing::info!(session_id = %session.id, "Using local Qwen model");
+
+                    // Use local generator (need write lock for try_generate)
+                    let mut generator = server.local_generator().write().await;
+
+                    match generator.try_generate(&user_text) {
+                        Ok(Some(response_text)) => {
+                            (response_text, "local".to_string())
+                        }
+                        Ok(None) => {
+                            // Confidence too low, fall back to Claude
+                            tracing::info!(
+                                session_id = %session.id,
+                                "Local confidence too low, falling back to Claude"
+                            );
+                            drop(generator); // Release lock
+
+                            let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+                            let response = server.claude_client().send_message(&claude_request).await?;
+                            let text = response.text();
+
+                            (text, "confidence_fallback".to_string())
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "Local generation failed, falling back to Claude"
+                            );
+                            drop(generator); // Release lock
+
+                            // Fall back to Claude on error
+                            let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+                            let response = server.claude_client().send_message(&claude_request).await?;
+                            let text = response.text();
+
+                            (text, "local_error_fallback".to_string())
+                        }
+                    }
+                }
+                GeneratorState::Initializing | GeneratorState::Downloading { .. } | GeneratorState::Loading { .. } => {
+                    tracing::info!(
+                        session_id = %session.id,
+                        "Model still loading, forwarding to Claude"
+                    );
+                    drop(state); // Release lock
+
+                    // Model not ready yet, forward to Claude
+                    let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+                    let response = server.claude_client().send_message(&claude_request).await?;
+                    let text = response.text();
+
+                    (text, "loading_fallback".to_string())
+                }
+                GeneratorState::Failed { error } => {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        error = %error,
+                        "Model failed to load, forwarding to Claude"
+                    );
+                    drop(state); // Release lock
+
+                    // Model failed to load, forward to Claude
+                    let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+                    let response = server.claude_client().send_message(&claude_request).await?;
+                    let text = response.text();
+
+                    (text, "failed_fallback".to_string())
+                }
+                GeneratorState::NotAvailable => {
+                    tracing::info!(
+                        session_id = %session.id,
+                        "Model not available, forwarding to Claude"
+                    );
+                    drop(state); // Release lock
+
+                    // No model available, forward to Claude
+                    let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+                    let response = server.claude_client().send_message(&claude_request).await?;
+                    let text = response.text();
+
+                    (text, "unavailable_fallback".to_string())
+                }
+            }
         }
     };
 
@@ -206,6 +291,77 @@ async fn delete_session(
     } else {
         Err(AppError(anyhow::anyhow!("Session not found")))
     }
+}
+
+/// Generator status information
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GeneratorStatus {
+    Initializing,
+    Downloading {
+        model_size: String,
+        file_name: String,
+        current_file: usize,
+        total_files: usize,
+    },
+    Loading {
+        model_size: String,
+    },
+    Ready {
+        model_size: String,
+    },
+    Failed {
+        error: String,
+    },
+    NotAvailable,
+}
+
+/// Status response
+#[derive(Debug, Serialize)]
+pub struct StatusResponse {
+    pub generator: GeneratorStatus,
+    pub active_sessions: usize,
+    pub training_enabled: bool,
+}
+
+/// Handle GET /v1/status - Get server and model status
+async fn get_status(
+    State(server): State<Arc<AgentServer>>,
+) -> Result<Json<StatusResponse>, AppError> {
+    use crate::models::GeneratorState;
+
+    let state = server.generator_state().read().await;
+
+    let generator_status = match &*state {
+        GeneratorState::Initializing => GeneratorStatus::Initializing,
+        GeneratorState::Downloading {
+            model_size,
+            progress,
+        } => GeneratorStatus::Downloading {
+            model_size: format!("{:?}", model_size),
+            file_name: progress.file_name.clone(),
+            current_file: progress.current_file,
+            total_files: progress.total_files,
+        },
+        GeneratorState::Loading { model_size } => GeneratorStatus::Loading {
+            model_size: format!("{:?}", model_size),
+        },
+        GeneratorState::Ready { model_size, .. } => GeneratorStatus::Ready {
+            model_size: format!("{:?}", model_size),
+        },
+        GeneratorState::Failed { error } => GeneratorStatus::Failed {
+            error: error.clone(),
+        },
+        GeneratorState::NotAvailable => GeneratorStatus::NotAvailable,
+    };
+
+    let response = StatusResponse {
+        generator: generator_status,
+        active_sessions: server.session_manager().active_count(),
+        training_enabled: true, // LoRA training is always enabled
+    };
+
+    Ok(Json(response))
 }
 
 /// Health check response
