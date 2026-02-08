@@ -57,6 +57,23 @@ pub enum ReplEvent {
         message: String,
     },
 
+    /// Streaming response started
+    StreamingStarted {
+        query_id: Uuid,
+    },
+
+    /// Streaming response delta
+    StreamingDelta {
+        query_id: Uuid,
+        delta: String,
+    },
+
+    /// Streaming response completed
+    StreamingComplete {
+        query_id: Uuid,
+        full_response: String,
+    },
+
     /// Request to shut down the REPL
     Shutdown,
 }

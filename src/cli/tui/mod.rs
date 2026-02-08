@@ -93,6 +93,10 @@ pub struct TuiRenderer {
     prev_input_text: String,
     /// Previous status bar content (for change detection)
     prev_status_content: String,
+    /// Track which messages have been permanently written to terminal scrollback
+    written_message_ids: std::collections::HashSet<MessageId>,
+    /// Track how many enum messages from output_manager we've processed
+    last_enum_message_count: usize,
 }
 
 impl TuiRenderer {
@@ -252,10 +256,12 @@ impl TuiRenderer {
             viewport_height,
             needs_full_refresh: false,
             last_refresh: std::time::Instant::now(),
-            refresh_interval: Duration::from_millis(100), // 10 FPS during streaming
+            refresh_interval: Duration::from_millis(100), // 10 FPS - blit to overwrite visible area
             needs_tui_render: true, // Initial render needed
             prev_input_text: String::new(),
             prev_status_content: String::new(),
+            written_message_ids: std::collections::HashSet::new(),
+            last_enum_message_count: 0,
         })
     }
 
@@ -418,14 +424,14 @@ impl TuiRenderer {
         use crate::cli::output_manager::OutputMessage as OldMessage;
         use std::sync::Arc;
 
-        let messages = output_manager.get_messages();
-        let current_count = self.scrollback.message_count();
-
         // Track new messages to render
         let mut new_messages_to_render: Vec<MessageRef> = Vec::new();
 
+        // Handle old enum-based messages FIRST (so user input appears before streaming response)
+        let messages = output_manager.get_messages();
+
         // Add only new messages (messages added since last flush)
-        for msg in messages.iter().skip(current_count) {
+        for msg in messages.iter().skip(self.last_enum_message_count) {
             // Skip status messages - they're shown in status bar
             if matches!(msg, OldMessage::StatusInfo { .. }) {
                 continue;
@@ -469,6 +475,38 @@ impl TuiRenderer {
 
             new_messages_to_render.push(trait_msg.clone());
             self.scrollback.add_message(trait_msg);
+        }
+
+        // Update count of processed enum messages
+        self.last_enum_message_count = messages.len();
+
+        // Handle trait-based messages AFTER enum messages (so they appear after user input)
+        // Pure buffer comparison - add all messages to shadow buffer
+        let trait_messages = output_manager.get_trait_messages();
+
+        for msg in &trait_messages {
+            let msg_id = msg.id();
+
+            // Add to shadow buffer if not already there
+            if self.scrollback.get_message(msg_id).is_none() {
+                self.scrollback.add_message(msg.clone());
+                self.needs_full_refresh = true; // New message = needs refresh
+            }
+
+            // Only write Complete messages to terminal scrollback permanently (once)
+            // Status checking ONLY for permanent scrollback writes, not for rendering decisions
+            if matches!(msg.status(), crate::cli::messages::MessageStatus::Complete) {
+                if !self.written_message_ids.contains(&msg_id) {
+                    new_messages_to_render.push(msg.clone());
+                    self.written_message_ids.insert(msg_id);
+                }
+            }
+        }
+
+        // If there are any messages, trigger refresh to keep visible area updated
+        // (Messages update in place via Arc<RwLock<>>, so periodic blit keeps display current)
+        if !trait_messages.is_empty() {
+            self.needs_full_refresh = true;
         }
 
         // Render new messages to terminal scrollback using insert_before()
@@ -759,50 +797,73 @@ impl TuiRenderer {
     }
 
     /// Full refresh of viewport from shadow buffer
+    /// Uses MoveTo/Print to overwrite visible area with current state
+    /// This prevents duplicates - insert_before() writes to scrollback,
+    /// but blit overwrites visible area with latest content
     fn full_refresh_viewport(&mut self) -> Result<()> {
         use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
         use crossterm::style::Print;
 
-        let mut stdout = io::stdout();
+        // Get terminal size
+        let (term_width, term_height) = crossterm::terminal::size()?;
 
-        // Get lines to render from ring buffer
-        let viewport_lines = self.scrollback.get_viewport_lines();
+        // Calculate visible scrollback area (above inline viewport)
+        // Inline viewport is 6 lines at bottom, so visible area is rows 0 to (height - 7)
+        let visible_rows = term_height.saturating_sub(7); // -6 for inline, -1 for 0-indexing
 
-        if viewport_lines.is_empty() {
-            return Ok(()); // Nothing to render
+        if visible_rows == 0 {
+            return Ok(()); // Terminal too small
         }
 
-        // Synchronized update for tear-free rendering
+        // Get all messages from shadow buffer (no status filtering!)
+        let messages = self.scrollback.get_visible_messages();
+
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        // Format ALL messages from shadow buffer
+        let mut all_lines: Vec<String> = Vec::new();
+        for msg in &messages {
+            let formatted = msg.format();
+            for line in formatted.lines() {
+                all_lines.push(line.to_string());
+            }
+            all_lines.push(String::new()); // Blank line between messages
+        }
+
+        if all_lines.is_empty() {
+            return Ok(()); // Nothing to blit
+        }
+
+        // Calculate how many lines we can fit
+        let num_lines = all_lines.len().min(visible_rows as usize);
+        let lines_to_render = &all_lines[all_lines.len().saturating_sub(num_lines)..];
+
+        // Render bottom-aligned (just above inline viewport)
+        // Start at row (visible_rows - num_lines) so content appears at bottom
+        let start_row = visible_rows.saturating_sub(num_lines as u16);
+
+        let mut stdout = io::stdout();
         execute!(stdout, BeginSynchronizedUpdate)?;
 
-        // Render each line in viewport
-        for (line_idx, (message_id, line_offset)) in viewport_lines.iter().enumerate() {
-            let row = line_idx as u16;
+        // Clear the entire visible area first
+        for row in 0..visible_rows {
+            execute!(
+                stdout,
+                cursor::MoveTo(0, row),
+                Clear(ClearType::UntilNewLine)
+            )?;
+        }
 
-            // Get message from scrollback
-            if let Some(message) = self.scrollback.get_message(*message_id) {
-                // Extract specific line from formatted message
-                let formatted = message.format();
-                let line_content = formatted
-                    .lines()
-                    .nth(*line_offset)
-                    .unwrap_or("");
-
-                // Move cursor, clear line, write content
-                execute!(
-                    stdout,
-                    cursor::MoveTo(0, row),
-                    Clear(ClearType::UntilNewLine),
-                    Print(line_content)
-                )?;
-            } else {
-                // Message not found, clear line
-                execute!(
-                    stdout,
-                    cursor::MoveTo(0, row),
-                    Clear(ClearType::UntilNewLine)
-                )?;
-            }
+        // Render lines bottom-aligned
+        for (idx, line) in lines_to_render.iter().enumerate() {
+            let row = start_row + idx as u16;
+            execute!(
+                stdout,
+                cursor::MoveTo(0, row),
+                Print(line)
+            )?;
         }
 
         execute!(stdout, EndSynchronizedUpdate)?;
@@ -810,6 +871,59 @@ impl TuiRenderer {
 
         Ok(())
     }
+
+    // Old approach (kept for reference, commented out):
+    // fn full_refresh_viewport_old(&mut self) -> Result<()> {
+    //     use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+    //     use crossterm::style::Print;
+    //
+    //     let mut stdout = io::stdout();
+    //
+    //     // Get lines to render from ring buffer
+    //     let viewport_lines = self.scrollback.get_viewport_lines();
+    //
+    //     if viewport_lines.is_empty() {
+    //         return Ok(()); // Nothing to render
+    //     }
+    //
+    //     // Synchronized update for tear-free rendering
+    //     execute!(stdout, BeginSynchronizedUpdate)?;
+    //
+    //     // Render each line in viewport
+    //     for (line_idx, (message_id, line_offset)) in viewport_lines.iter().enumerate() {
+    //         let row = line_idx as u16;
+    //
+    //         // Get message from scrollback
+    //         if let Some(message) = self.scrollback.get_message(*message_id) {
+    //             // Extract specific line from formatted message
+    //             let formatted = message.format();
+    //             let line_content = formatted
+    //                 .lines()
+    //                 .nth(*line_offset)
+    //                 .unwrap_or("");
+    //
+    //             // Move cursor, clear line, write content
+    //             execute!(
+    //                 stdout,
+    //                 cursor::MoveTo(0, row),
+    //                 Clear(ClearType::UntilNewLine),
+    //                 Print(line_content)
+    //             )?;
+    //         } else {
+    //             // Message not found, clear line
+    //             execute!(
+    //                 stdout,
+    //                 cursor::MoveTo(0, row),
+    //                 Clear(ClearType::UntilNewLine)
+    //             )?;
+    //         }
+    //     }
+    //
+    //     execute!(stdout, EndSynchronizedUpdate)?;
+    //     stdout.flush()?;
+    //
+    //     Ok(())
+    // }
 
     /// Update a streaming message (mark for refresh)
     // NOTE: With trait-based messages, updates happen directly through Arc<RwLock<>>
@@ -827,13 +941,14 @@ impl TuiRenderer {
     }
 
     /// Check if full refresh is needed and perform it
+    /// Blit overwrites visible area with current shadow buffer state
     pub fn check_and_refresh(&mut self) -> Result<()> {
-        // NOTE: Full refresh disabled for inline viewport mode
-        // Messages are written to terminal scrollback via insert_before()
-        // The TUI viewport (separator + input + status) is rendered by Ratatui
-        // No manual viewport refresh needed
+        if self.needs_full_refresh {
+            // Render current shadow buffer to visible area (overwrites existing content)
+            self.full_refresh_viewport()?;
+            self.needs_full_refresh = false;
+        }
 
-        self.needs_full_refresh = false;
         Ok(())
     }
 

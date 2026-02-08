@@ -16,7 +16,7 @@ use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::tools::executor::{generate_tool_signature, ToolExecutor};
 use crate::tools::patterns::ToolPattern;
-use crate::tools::types::ToolDefinition;
+use crate::tools::types::{ToolDefinition, ToolUse};
 
 use super::events::ReplEvent;
 use super::query_state::{QueryState, QueryStateManager};
@@ -61,6 +61,9 @@ pub struct EventLoop {
 
     /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
     tool_results: Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>,
+
+    /// Streaming messages tracked by query_id
+    streaming_messages: Arc<RwLock<std::collections::HashMap<Uuid, Arc<crate::cli::messages::StreamingResponseMessage>>>>,
 }
 
 impl EventLoop {
@@ -108,12 +111,13 @@ impl EventLoop {
             streaming_enabled,
             tool_coordinator,
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            streaming_messages: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
     /// Run the event loop
     pub async fn run(&mut self) -> Result<()> {
-        // Render interval (100ms)
+        // Render interval (100ms) - blit overwrites visible area with shadow buffer
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
 
         // Cleanup interval (30 seconds)
@@ -295,9 +299,12 @@ impl EventLoop {
             let request = MessageRequest::with_context(messages)
                 .with_tools((*tool_definitions).clone());
 
-            // Send to Claude
-            let response = match claude_client.send_message(&request).await {
-                Ok(r) => r,
+            // Send streaming started event
+            let _ = event_tx.send(ReplEvent::StreamingStarted { query_id });
+
+            // Send to Claude with streaming
+            let mut stream_rx = match claude_client.send_message_stream(&request).await {
+                Ok(rx) => rx,
                 Err(e) => {
                     let _ = event_tx.send(ReplEvent::QueryFailed {
                         query_id,
@@ -307,8 +314,38 @@ impl EventLoop {
                 }
             };
 
-            let response_text = response.text();
-            let tool_uses = response.tool_uses();
+            // Collect full response while streaming deltas
+            let mut full_response = String::new();
+            while let Some(result) = stream_rx.recv().await {
+                match result {
+                    Ok(delta) => {
+                        full_response.push_str(&delta);
+                        let _ = event_tx.send(ReplEvent::StreamingDelta {
+                            query_id,
+                            delta,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(ReplEvent::QueryFailed {
+                            query_id,
+                            error: format!("Streaming error: {}", e),
+                        });
+                        return;
+                    }
+                }
+            }
+
+            // Send streaming complete event
+            let _ = event_tx.send(ReplEvent::StreamingComplete {
+                query_id,
+                full_response: full_response.clone(),
+            });
+
+            // Parse the full response to get tool uses
+            // TODO: We need to parse the streaming response properly
+            // For now, if there are no tool uses in the text, complete
+            let response_text = full_response;
+            let tool_uses: Vec<ToolUse> = Vec::new(); // TODO: Parse tool uses from response
 
             // Check if response has tool uses
             if tool_uses.is_empty() {
@@ -412,6 +449,52 @@ impl EventLoop {
                 self.output_manager.write_status(message);
             }
 
+            ReplEvent::StreamingStarted { query_id } => {
+                // Create streaming response message
+                use crate::cli::messages::StreamingResponseMessage;
+                use std::sync::Arc;
+
+                let msg = Arc::new(StreamingResponseMessage::new());
+                self.output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
+
+                // Store message reference for updates
+                self.streaming_messages.write().await.insert(query_id, msg);
+            }
+
+            ReplEvent::StreamingDelta { query_id, delta } => {
+                // Update the streaming message in memory
+                if let Some(msg) = self.streaming_messages.read().await.get(&query_id) {
+                    msg.append_chunk(&delta);
+                    // Content will appear in scrollback via periodic render + full_refresh_viewport()
+                }
+            }
+
+            ReplEvent::StreamingComplete { query_id, full_response } => {
+                // Mark streaming message as complete
+                if let Some(msg) = self.streaming_messages.write().await.remove(&query_id) {
+                    msg.set_complete();
+                    // Message will be written to scrollback on next flush_output_safe()
+                    // since it's now marked Complete
+                }
+
+                // Clear streaming status
+                self.status_bar.clear_operation();
+
+                // Add complete response to conversation
+                self.conversation
+                    .write()
+                    .await
+                    .add_assistant_message(full_response.clone());
+
+                // Update query state
+                self.query_states
+                    .update_state(query_id, QueryState::Completed { response: full_response.clone() })
+                    .await;
+
+                // Render TUI to write the complete message to scrollback
+                self.render_tui().await?;
+            }
+
             ReplEvent::Shutdown => {
                 // Handled in run() method - this should not be reached
                 unreachable!("Shutdown event should be handled in run() method");
@@ -425,6 +508,8 @@ impl EventLoop {
     async fn render_tui(&self) -> Result<()> {
         let mut tui = self.tui_renderer.lock().await;
         tui.flush_output_safe(&self.output_manager)?;
+        // Check if full refresh needed (for InProgress streaming messages)
+        tui.check_and_refresh()?;
         // Actually render the TUI after flushing output
         tui.render()?;
         Ok(())

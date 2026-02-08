@@ -111,10 +111,18 @@ impl Message for StreamingResponseMessage {
             MessageStatus::InProgress if thinking => {
                 format!("🤔 [thinking...]\n{}", content)
             }
+            MessageStatus::InProgress => {
+                // Regular streaming (not thinking)
+                if content.is_empty() {
+                    "⏳ [streaming...]".to_string()
+                } else {
+                    format!("{}▸", content)  // Streaming indicator at end
+                }
+            }
             MessageStatus::Failed => {
                 format!("{}❌ Response failed{}\n{}", colors::RED, colors::RESET, content)
             }
-            _ => content.clone(),
+            MessageStatus::Complete => content.clone(),
         }
     }
 
