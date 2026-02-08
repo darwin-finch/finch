@@ -457,10 +457,12 @@ impl TuiRenderer {
                     Arc::new(StaticMessage::error(content.clone()))
                 }
                 OldMessage::Progress { content } => {
-                    Arc::new(StaticMessage::info(content.clone()))
+                    // Use plain type - messages already have their own formatting/emojis
+                    Arc::new(StaticMessage::plain(content.clone()))
                 }
                 OldMessage::SystemInfo { content } => {
-                    Arc::new(StaticMessage::info(content.clone()))
+                    // Use plain type - messages already have their own formatting/emojis
+                    Arc::new(StaticMessage::plain(content.clone()))
                 }
                 OldMessage::StatusInfo { .. } => unreachable!(), // Already handled above
             };

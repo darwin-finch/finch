@@ -341,6 +341,7 @@ pub enum StaticMessageType {
     Error,
     Success,
     Warning,
+    Plain, // For messages that already have their own formatting
 }
 
 impl StaticMessage {
@@ -375,6 +376,14 @@ impl StaticMessage {
             message_type: StaticMessageType::Warning,
         }
     }
+
+    pub fn plain(content: impl Into<String>) -> Self {
+        Self {
+            id: MessageId::new(),
+            content: content.into(),
+            message_type: StaticMessageType::Plain,
+        }
+    }
 }
 
 impl Message for StaticMessage {
@@ -395,6 +404,10 @@ impl Message for StaticMessage {
             }
             StaticMessageType::Warning => {
                 format!("{}⚠️  {}{}", colors::YELLOW, self.content, colors::RESET)
+            }
+            StaticMessageType::Plain => {
+                // No prefix - content already formatted
+                self.content.clone()
             }
         }
     }
