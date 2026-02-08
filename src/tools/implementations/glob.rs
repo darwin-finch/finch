@@ -2,6 +2,7 @@
 
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::output_error;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use glob::glob;
@@ -33,7 +34,7 @@ impl Tool for GlobTool {
         for entry in glob(pattern).with_context(|| format!("Invalid glob pattern: {}", pattern))? {
             match entry {
                 Ok(path) => paths.push(path.display().to_string()),
-                Err(e) => eprintln!("Error reading path: {}", e),
+                Err(e) => output_error!("Error reading path: {}", e),
             }
         }
 

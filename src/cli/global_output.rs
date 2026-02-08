@@ -11,28 +11,42 @@
 
 use once_cell::sync::Lazy;
 use std::io::{self, IsTerminal};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::{OutputManager, StatusBar};
 use super::tui::TuiRenderer;
 
-/// Global singleton OutputManager
-pub static GLOBAL_OUTPUT: Lazy<Arc<OutputManager>> = Lazy::new(|| Arc::new(OutputManager::new()));
+/// Global singleton OutputManager (swappable - set by main())
+/// Starts with a minimal default, replaced with the real instance in main()
+pub static GLOBAL_OUTPUT: Lazy<RwLock<Arc<OutputManager>>> =
+    Lazy::new(|| RwLock::new(Arc::new(OutputManager::new())));
 
-/// Global singleton StatusBar
-pub static GLOBAL_STATUS: Lazy<Arc<StatusBar>> = Lazy::new(|| Arc::new(StatusBar::new()));
+/// Global singleton StatusBar (swappable - set by main())
+/// Starts with a minimal default, replaced with the real instance in main()
+pub static GLOBAL_STATUS: Lazy<RwLock<Arc<StatusBar>>> =
+    Lazy::new(|| RwLock::new(Arc::new(StatusBar::new())));
 
 /// Global singleton TUI renderer (optional, set when TUI mode is enabled)
 pub static GLOBAL_TUI_RENDERER: Lazy<Mutex<Option<TuiRenderer>>> = Lazy::new(|| Mutex::new(None));
 
+/// Set the global OutputManager (called from main at startup)
+pub fn set_global_output(output_manager: Arc<OutputManager>) {
+    *GLOBAL_OUTPUT.write().unwrap() = output_manager;
+}
+
+/// Set the global StatusBar (called from main at startup)
+pub fn set_global_status(status_bar: Arc<StatusBar>) {
+    *GLOBAL_STATUS.write().unwrap() = status_bar;
+}
+
 /// Get reference to global OutputManager
-pub fn global_output() -> &'static Arc<OutputManager> {
-    &GLOBAL_OUTPUT
+pub fn global_output() -> Arc<OutputManager> {
+    GLOBAL_OUTPUT.read().unwrap().clone()
 }
 
 /// Get reference to global StatusBar
-pub fn global_status() -> &'static Arc<StatusBar> {
-    &GLOBAL_STATUS
+pub fn global_status() -> Arc<StatusBar> {
+    GLOBAL_STATUS.read().unwrap().clone()
 }
 
 /// Set the global TUI renderer (called when TUI mode is enabled)
@@ -49,8 +63,6 @@ pub fn get_global_tui_renderer() -> &'static Mutex<Option<TuiRenderer>> {
 pub fn shutdown_global_tui() -> anyhow::Result<()> {
     use std::time::Duration;
 
-    eprintln!("[DEBUG] shutdown_global_tui: Starting...");
-
     // Try to acquire lock with timeout to prevent indefinite hang
     // Use a loop with try_lock to implement timeout behavior
     let start = std::time::Instant::now();
@@ -59,21 +71,14 @@ pub fn shutdown_global_tui() -> anyhow::Result<()> {
     loop {
         match GLOBAL_TUI_RENDERER.try_lock() {
             Ok(mut tui_lock) => {
-                eprintln!("[DEBUG] shutdown_global_tui: Lock acquired");
                 if let Some(tui) = tui_lock.take() {
-                    eprintln!("[DEBUG] shutdown_global_tui: Calling tui.shutdown()...");
                     tui.shutdown()?;
-                    eprintln!("[DEBUG] shutdown_global_tui: tui.shutdown() completed");
-                } else {
-                    eprintln!("[DEBUG] shutdown_global_tui: No TUI to shutdown");
                 }
                 return Ok(());
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 if start.elapsed() > timeout {
                     // Timeout - force cleanup without taking the lock
-                    eprintln!("[DEBUG] shutdown_global_tui: Lock timeout - forcing emergency cleanup");
-
                     // Emergency terminal cleanup
                     use crossterm::{cursor, execute, terminal};
                     let _ = terminal::disable_raw_mode();
@@ -90,8 +95,6 @@ pub fn shutdown_global_tui() -> anyhow::Result<()> {
             }
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 // Mutex was poisoned - do emergency cleanup
-                eprintln!("[DEBUG] shutdown_global_tui: Mutex poisoned - forcing emergency cleanup");
-
                 use crossterm::{cursor, execute, terminal};
                 let _ = terminal::disable_raw_mode();
                 let _ = execute!(
@@ -122,7 +125,8 @@ pub fn logging_enabled() -> bool {
 #[macro_export]
 macro_rules! output_user {
     ($($arg:tt)*) => {{
-        $crate::cli::global_output::global_output().write_user(format!($($arg)*));
+        let output_mgr = $crate::cli::global_output::global_output();
+        output_mgr.write_user(format!($($arg)*));
     }};
 }
 
@@ -139,7 +143,8 @@ macro_rules! output_claude {
             let _ = writeln!(std::io::stdout(), "{}", content);
         } else {
             // Interactive mode: write to buffer for TUI
-            $crate::cli::global_output::global_output().write_claude(content);
+            let output_mgr = $crate::cli::global_output::global_output();
+            output_mgr.write_claude(content);
         }
     }};
 }
@@ -148,7 +153,8 @@ macro_rules! output_claude {
 #[macro_export]
 macro_rules! output_claude_append {
     ($($arg:tt)*) => {{
-        $crate::cli::global_output::global_output().append_claude(format!($($arg)*));
+        let output_mgr = $crate::cli::global_output::global_output();
+        output_mgr.append_claude(format!($($arg)*));
     }};
 }
 
@@ -156,13 +162,14 @@ macro_rules! output_claude_append {
 #[macro_export]
 macro_rules! output_tool {
     ($tool:expr, $($arg:tt)*) => {{
-        $crate::cli::global_output::global_output().write_tool($tool, format!($($arg)*));
+        let output_mgr = $crate::cli::global_output::global_output();
+        output_mgr.write_tool($tool, format!($($arg)*));
     }};
 }
 
 /// Output status information
 /// In non-interactive mode, only prints if SHAMMAH_LOG=1
-/// In interactive mode, writes to buffer for TUI
+/// In interactive mode, redirects to StatusBar for TUI status widget
 #[macro_export]
 macro_rules! output_status {
     ($($arg:tt)*) => {{
@@ -173,8 +180,9 @@ macro_rules! output_status {
                 eprintln!("[STATUS] {}", content);
             }
         } else {
-            // Interactive mode: write to buffer for TUI
-            $crate::cli::global_output::global_output().write_status(content);
+            // Interactive mode: redirect to StatusBar for TUI status widget
+            let status_bar = $crate::cli::global_output::global_status();
+            status_bar.update_operation(content);
         }
     }};
 }
@@ -193,7 +201,8 @@ macro_rules! output_error {
             }
         } else {
             // Interactive mode: write to buffer for TUI
-            $crate::cli::global_output::global_output().write_error(content);
+            let output_mgr = $crate::cli::global_output::global_output();
+            output_mgr.write_error(content);
         }
     }};
 }
@@ -212,7 +221,8 @@ macro_rules! output_progress {
             }
         } else {
             // Interactive mode: write to buffer for TUI
-            $crate::cli::global_output::global_output().write_progress(content);
+            let output_mgr = $crate::cli::global_output::global_output();
+            output_mgr.write_progress(content);
         }
     }};
 }
@@ -232,8 +242,8 @@ macro_rules! status_training {
                 );
             }
         } else {
-            $crate::cli::global_output::global_status()
-                .update_training_stats($queries, $local_pct, $quality);
+            let status_bar = $crate::cli::global_output::global_status();
+            status_bar.update_training_stats($queries, $local_pct, $quality);
         }
     }};
 }
@@ -251,8 +261,8 @@ macro_rules! status_download {
                 );
             }
         } else {
-            $crate::cli::global_output::global_status()
-                .update_download_progress($name, $pct, $downloaded, $total);
+            let status_bar = $crate::cli::global_output::global_status();
+            status_bar.update_download_progress($name, $pct, $downloaded, $total);
         }
     }};
 }
@@ -268,7 +278,8 @@ macro_rules! status_operation {
                 eprintln!("[STATUS] {}", content);
             }
         } else {
-            $crate::cli::global_output::global_status().update_operation(content);
+            let status_bar = $crate::cli::global_output::global_status();
+            status_bar.update_operation(content);
         }
     }};
 }
@@ -277,7 +288,8 @@ macro_rules! status_operation {
 #[macro_export]
 macro_rules! status_clear_operation {
     () => {{
-        $crate::cli::global_output::global_status().clear_operation();
+        let status_bar = $crate::cli::global_output::global_status();
+        status_bar.clear_operation();
     }};
 }
 

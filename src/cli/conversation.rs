@@ -85,6 +85,16 @@ impl ConversationHistory {
         self.messages.len()
     }
 
+    /// Create a snapshot of current conversation state
+    pub fn snapshot(&self) -> Vec<Message> {
+        self.messages.clone()
+    }
+
+    /// Restore conversation from a snapshot
+    pub fn restore_snapshot(&mut self, snapshot: Vec<Message>) {
+        self.messages = snapshot;
+    }
+
     /// Trim old messages if context exceeds limits
     fn trim_if_needed(&mut self) {
         // Trim by message count

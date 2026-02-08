@@ -2,6 +2,7 @@
 
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::{output_status, output_progress};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -81,17 +82,17 @@ impl Tool for RestartTool {
             }
         }
 
-        println!("\n🔄 Restarting Shammah...");
-        println!("   Reason: {}", reason);
-        println!("   Binary: {}", binary_path);
-        println!("   Conversation will be preserved");
+        output_status!("\n🔄 Restarting Shammah...");
+        output_status!("   Reason: {}", reason);
+        output_status!("   Binary: {}", binary_path);
+        output_status!("   Conversation will be preserved");
 
         // Save conversation state
         let session_state_file = self.session_state_file.clone();
         if let Some(conversation) = context.conversation {
             std::fs::create_dir_all(session_state_file.parent().unwrap())?;
             conversation.save(&session_state_file)?;
-            println!(
+            output_status!(
                 "✓ Saved conversation state to {}",
                 session_state_file.display()
             );
@@ -100,7 +101,7 @@ impl Tool for RestartTool {
         // Save model weights before restart
         if let Some(ref save_models_fn) = context.save_models {
             save_models_fn()?;
-            println!("✓ Saved model weights");
+            output_status!("✓ Saved model weights");
         }
 
         // Prepare restart command with session restoration
@@ -112,7 +113,7 @@ impl Tool for RestartTool {
         {
             use std::os::unix::process::CommandExt;
 
-            println!("\n→ Executing new binary...\n");
+            output_status!("\n→ Executing new binary...\n");
 
             // This will replace the current process - never returns
             let err = cmd.exec();
@@ -124,7 +125,7 @@ impl Tool for RestartTool {
         // On Windows, spawn and exit
         #[cfg(not(unix))]
         {
-            println!("\n→ Starting new binary...\n");
+            output_status!("\n→ Starting new binary...\n");
 
             cmd.spawn().context("Failed to spawn new binary")?;
 

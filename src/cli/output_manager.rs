@@ -71,6 +71,10 @@ pub struct OutputManager {
     buffer: Arc<RwLock<VecDeque<OutputMessage>>>,
     /// Whether to write output to stdout immediately (for scrollback)
     write_to_stdout: Arc<RwLock<bool>>,
+    /// Buffering mode - true = accumulate for batch flush, false = immediate write
+    buffering_mode: Arc<RwLock<bool>>,
+    /// Pending lines waiting to be flushed (used when buffering_mode = true)
+    pending_flush: Arc<RwLock<Vec<String>>>,
 }
 
 impl OutputManager {
@@ -79,6 +83,8 @@ impl OutputManager {
         Self {
             buffer: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_BUFFER_SIZE))),
             write_to_stdout: Arc::new(RwLock::new(true)), // Enable by default for TUI mode
+            buffering_mode: Arc::new(RwLock::new(false)), // Default: immediate write
+            pending_flush: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -92,14 +98,47 @@ impl OutputManager {
         *self.write_to_stdout.write().unwrap() = false;
     }
 
+    /// Enable buffering mode - accumulate writes for batch flush
+    pub fn enable_buffering(&self) {
+        *self.buffering_mode.write().unwrap() = true;
+    }
+
+    /// Disable buffering mode - writes go to stdout immediately
+    pub fn disable_buffering(&self) {
+        *self.buffering_mode.write().unwrap() = false;
+    }
+
+    /// Drain all pending output lines for flushing
+    pub fn drain_pending(&self) -> Vec<String> {
+        let mut pending = self.pending_flush.write().unwrap();
+        std::mem::take(&mut *pending)
+    }
+
+    /// Check if there are pending lines to flush
+    pub fn has_pending(&self) -> bool {
+        !self.pending_flush.read().unwrap().is_empty()
+    }
+
     /// Write a message to stdout with ANSI colors (internal)
     fn write_to_terminal(&self, message: &OutputMessage) {
-        if !*self.write_to_stdout.read().unwrap() {
-            return; // Stdout writing disabled
-        }
+        let formatted = self.format_message(message);
 
-        let mut stdout = io::stdout();
-        let formatted = match message {
+        if *self.buffering_mode.read().unwrap() {
+            // Buffering mode: always accumulate for batch flush (TUI will render)
+            self.pending_flush.write().unwrap().push(formatted);
+        } else if *self.write_to_stdout.read().unwrap() {
+            // Immediate mode: write to stdout only if enabled
+            let mut stdout = io::stdout();
+            // Always use \r\n for raw mode compatibility (harmless in normal mode)
+            let _ = write!(stdout, "{}\r\n", formatted);
+            let _ = stdout.flush();
+        }
+        // If neither buffering nor stdout writing, output is discarded (testing mode)
+    }
+
+    /// Format a message with ANSI colors (internal)
+    fn format_message(&self, message: &OutputMessage) -> String {
+        match message {
             OutputMessage::UserMessage { content } => {
                 // Cyan prompt ">" with content on same line
                 format!("{}> {}{}", colors::CYAN, content, colors::RESET)
@@ -113,8 +152,8 @@ impl OutputManager {
                 format!("{}[{}] {}{}", colors::BLUE, tool_name, content, colors::RESET)
             }
             OutputMessage::StatusInfo { content } => {
-                // Yellow for status
-                format!("{}{}{}", colors::YELLOW, content, colors::RESET)
+                // Default color for status (not yellow - too bright)
+                content.to_string()
             }
             OutputMessage::Error { content } => {
                 // Red for errors
@@ -124,19 +163,30 @@ impl OutputManager {
                 // Yellow for progress
                 format!("{}{}{}", colors::YELLOW, content, colors::RESET)
             }
-        };
-
-        // Write to stdout (ignore errors - terminal might not be available)
-        let _ = writeln!(stdout, "{}", formatted);
-        let _ = stdout.flush();
+        }
     }
 
     /// Add a message to the buffer (internal)
     fn add_message(&self, message: OutputMessage) {
-        // Write to terminal immediately (for scrollback)
-        self.write_to_terminal(&message);
+        // In TUI mode, skip writing StatusInfo to terminal
+        // (StatusInfo should only appear in StatusBar widget)
+        let should_write = match message {
+            OutputMessage::StatusInfo { .. } => {
+                // Don't write status to stdout - use StatusBar widget instead
+                false
+            }
+            _ => {
+                // Write all other message types to stdout normally
+                true
+            }
+        };
 
-        // Also buffer for TUI rendering
+        if should_write {
+            // Write to terminal immediately (for scrollback)
+            self.write_to_terminal(&message);
+        }
+
+        // Always buffer for TUI rendering
         let mut buffer = self.buffer.write().unwrap();
 
         // If buffer is full, remove oldest message
@@ -246,6 +296,8 @@ impl Clone for OutputManager {
         Self {
             buffer: Arc::clone(&self.buffer),
             write_to_stdout: Arc::clone(&self.write_to_stdout),
+            buffering_mode: Arc::clone(&self.buffering_mode),
+            pending_flush: Arc::clone(&self.pending_flush),
         }
     }
 }

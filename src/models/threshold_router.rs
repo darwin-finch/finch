@@ -92,15 +92,15 @@ pub struct ThresholdRouter {
 }
 
 impl ThresholdRouter {
-    /// Create new threshold router with conservative defaults
+    /// Create new threshold router with balanced defaults
     pub fn new() -> Self {
         Self {
             category_stats: HashMap::new(),
             total_queries: 0,
             total_local_attempts: 0,
             total_successes: 0,
-            confidence_threshold: 0.95, // Very conservative at start
-            min_samples: 3,             // Need 3 examples before trying
+            confidence_threshold: 0.75, // Balanced threshold (75% success rate)
+            min_samples: 2,             // Need 2 examples before trying
             target_forward_rate: 0.05,  // Target: 5% forward
             session_id: Uuid::new_v4().to_string(),
             has_saved_this_session: AtomicBool::new(false),
@@ -110,8 +110,8 @@ impl ThresholdRouter {
 
     /// Decide whether to try local generation
     pub fn should_try_local(&self, query: &str) -> bool {
-        // During first few queries, be very conservative
-        if self.total_queries < 10 {
+        // During first few queries, establish baseline
+        if self.total_queries < 3 {
             return false;
         }
 

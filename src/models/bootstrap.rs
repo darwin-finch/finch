@@ -94,6 +94,11 @@ impl BootstrapLoader {
         Self { state }
     }
 
+    /// Get reference to the generator state
+    pub fn state(&self) -> &Arc<RwLock<GeneratorState>> {
+        &self.state
+    }
+
     /// Load generator in background (blocking operation, run in tokio::task::spawn_blocking)
     pub async fn load_generator_async(
         &self,

@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use shammah::claude::ClaudeClient;
 use shammah::cli::output_layer::OutputManagerLayer;
@@ -39,6 +40,10 @@ struct Args {
     /// Alias for --raw (for backwards compatibility)
     #[arg(long = "no-tui")]
     no_tui: bool,
+
+    /// Use new event loop mode (concurrent query execution)
+    #[arg(long = "event-loop")]
+    event_loop: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -121,6 +126,14 @@ async fn main() -> Result<()> {
     // Initialize tracing with custom OutputManager layer
     init_tracing();
 
+    // Create global OutputManager and StatusBar (single instances for entire application)
+    use shammah::cli::{OutputManager, StatusBar};
+    use shammah::cli::global_output::{set_global_output, set_global_status};
+    let output_manager = Arc::new(OutputManager::new());
+    let status_bar = Arc::new(StatusBar::new());
+    set_global_output(output_manager.clone());
+    set_global_status(status_bar.clone());
+
     // Load configuration
     let mut config = load_config()?;
 
@@ -142,20 +155,26 @@ async fn main() -> Result<()> {
     let threshold_router = if threshold_router_path.exists() {
         match ThresholdRouter::load(&threshold_router_path) {
             Ok(router) => {
-                eprintln!(
-                    "✓ Loaded threshold router with {} queries",
-                    router.stats().total_queries
-                );
+                if std::env::var("SHAMMAH_DEBUG").is_ok() {
+                    eprintln!(
+                        "✓ Loaded threshold router with {} queries",
+                        router.stats().total_queries
+                    );
+                }
                 router
             }
             Err(e) => {
-                eprintln!("Warning: Failed to load threshold router: {}", e);
-                eprintln!("  Creating new threshold router");
+                if std::env::var("SHAMMAH_DEBUG").is_ok() {
+                    eprintln!("Warning: Failed to load threshold router: {}", e);
+                    eprintln!("  Creating new threshold router");
+                }
                 ThresholdRouter::new()
             }
         }
     } else {
-        eprintln!("Creating new threshold router");
+        if std::env::var("SHAMMAH_DEBUG").is_ok() {
+            eprintln!("Creating new threshold router");
+        }
         ThresholdRouter::new()
     };
 
@@ -177,21 +196,45 @@ async fn main() -> Result<()> {
             match ConversationHistory::load(&session_path) {
                 Ok(history) => {
                     repl.restore_conversation(history);
-                    eprintln!("✓ Restored conversation from session");
+                    if std::env::var("SHAMMAH_DEBUG").is_ok() {
+                        eprintln!("✓ Restored conversation from session");
+                    }
                     std::fs::remove_file(&session_path)?;
                 }
                 Err(e) => {
-                    eprintln!("⚠️  Failed to restore session: {}", e);
+                    if std::env::var("SHAMMAH_DEBUG").is_ok() {
+                        eprintln!("⚠️  Failed to restore session: {}", e);
+                    }
                 }
             }
         }
     }
 
     // Run REPL (potentially with initial prompt)
-    eprintln!("[DEBUG] Starting REPL...");
-    repl.run_with_initial_prompt(args.initial_prompt).await?;
+    if std::env::var("SHAMMAH_DEBUG").is_ok() {
+        eprintln!("[DEBUG] Starting REPL...");
+    }
 
-    eprintln!("[DEBUG] REPL exited, returning from main");
+    // Choose event loop mode or traditional mode
+    if args.event_loop {
+        if std::env::var("SHAMMAH_DEBUG").is_ok() {
+            eprintln!("[DEBUG] Using event loop mode");
+        }
+        // TODO: Process initial prompt before event loop
+        if args.initial_prompt.is_some() {
+            eprintln!("Warning: --initial-prompt not yet supported with --event-loop");
+        }
+        repl.run_event_loop().await?;
+    } else {
+        if std::env::var("SHAMMAH_DEBUG").is_ok() {
+            eprintln!("[DEBUG] Using traditional blocking mode");
+        }
+        repl.run_with_initial_prompt(args.initial_prompt).await?;
+    }
+
+    if std::env::var("SHAMMAH_DEBUG").is_ok() {
+        eprintln!("[DEBUG] REPL exited, returning from main");
+    }
     Ok(())
 }
 

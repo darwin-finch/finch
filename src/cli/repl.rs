@@ -35,7 +35,7 @@ use crate::tools::types::{ToolDefinition, ToolUse};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 use crate::training::batch_trainer::BatchTrainer;
 
-use super::commands::{handle_command, Command};
+use super::commands::{handle_command, Command, CommandOutput};
 use super::conversation::ConversationHistory;
 use super::input::InputHandler;
 use super::menu::{Menu, MenuOption};
@@ -107,7 +107,7 @@ pub struct Repl {
     bootstrap_loader: Arc<BootstrapLoader>,
     tokenizer: Arc<crate::models::tokenizer::TextTokenizer>,
     // Tool execution
-    tool_executor: ToolExecutor,
+    tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
     tool_definitions: Vec<ToolDefinition>, // Cached tool definitions for Claude API
     // UI state
     is_interactive: bool,
@@ -116,7 +116,7 @@ pub struct Repl {
     // Readline input handler
     input_handler: Option<InputHandler>,
     // Conversation history
-    conversation: ConversationHistory,
+    conversation: Arc<RwLock<ConversationHistory>>,
     // REPL mode (normal, planning, executing)
     mode: ReplMode,
     // LoRA fine-tuning (NEW)
@@ -201,7 +201,7 @@ impl Repl {
             .unwrap_or_else(|| PathBuf::from(".shammah/tool_patterns.json"));
 
         // Create tool executor
-        let tool_executor = ToolExecutor::new(tool_registry, permissions, patterns_path)
+        let tool_executor = Arc::new(tokio::sync::Mutex::new(ToolExecutor::new(tool_registry, permissions, patterns_path)
             .unwrap_or_else(|e| {
                 output_status!("⚠️  Failed to initialize tool executor: {}", e);
                 output_status!("   Tool pattern persistence may not work correctly");
@@ -226,12 +226,13 @@ impl Repl {
                     std::env::temp_dir().join("shammah_patterns_fallback.json"),
                 )
                 .expect("Failed to create fallback tool executor")
-            });
+            })
+        ));
 
         if is_interactive {
             output_status!(
                 "✓ Tool execution enabled ({} tools)",
-                tool_executor.registry().len()
+                tool_executor.lock().await.registry().len()
             );
         }
 
@@ -239,6 +240,8 @@ impl Repl {
 
         // Generate tool definitions from registry
         let tool_definitions: Vec<ToolDefinition> = tool_executor
+            .lock()
+            .await
             .registry()
             .get_all_tools()
             .into_iter()
@@ -330,7 +333,7 @@ impl Repl {
         // Initialize TUI renderer if enabled (Phase 2: Ratatui interface)
         // Moved to global for Phase 5 native ratatui dialogs
         if config.tui_enabled && is_interactive {
-            match TuiRenderer::new(output_manager.clone(), status_bar.clone()) {
+            match TuiRenderer::new(Arc::new(output_manager.clone()), Arc::new(status_bar.clone())) {
                 Ok(renderer) => {
                     output_status!("✓ TUI mode enabled (Ratatui)");
 
@@ -362,7 +365,7 @@ impl Repl {
             streaming_enabled,
             debug_enabled: false,
             input_handler,
-            conversation: ConversationHistory::new(),
+            conversation: Arc::new(RwLock::new(ConversationHistory::new())),
             mode: ReplMode::Normal,
             // LoRA fine-tuning
             training_coordinator,
@@ -582,7 +585,7 @@ impl Repl {
     async fn save_models(&mut self) -> Result<()> {
         let Some(ref models_dir) = self.models_dir else {
             // Still save patterns even if no models directory
-            self.tool_executor.save_patterns()?;
+            self.tool_executor.lock().await.save_patterns()?;
             return Ok(());
         };
 
@@ -607,7 +610,7 @@ impl Repl {
         }
 
         // Save tool patterns
-        self.tool_executor.save_patterns()?;
+        self.tool_executor.lock().await.save_patterns()?;
 
         if self.is_interactive {
             self.output_status("✓");
@@ -734,7 +737,7 @@ impl Repl {
                 let signature = generate_tool_signature(tool_use, &working_dir);
 
                 // Check if pre-approved in cache
-                let approval_source = self.tool_executor.is_approved(&signature);
+                let approval_source = self.tool_executor.lock().await.is_approved(&signature);
 
                 match approval_source {
                     ApprovalSource::NotApproved => {
@@ -745,17 +748,17 @@ impl Repl {
                                     self.output_tool(&tool_use.name, "  ✓ Approved");
                                 }
                                 ConfirmationResult::ApproveExactSession(sig) => {
-                                    self.tool_executor.approve_exact_session(sig);
+                                    self.tool_executor.lock().await.approve_exact_session(sig);
                                     self.output_tool(&tool_use.name, "  ✓ Approved (remembered for session)");
                                 }
                                 ConfirmationResult::ApprovePatternSession(pattern) => {
                                     self.output_tool(&tool_use.name, format!("  ✓ Approved pattern: {} (session)", pattern.pattern));
-                                    self.tool_executor.approve_pattern_session(pattern);
+                                    self.tool_executor.lock().await.approve_pattern_session(pattern);
                                 }
                                 ConfirmationResult::ApproveExactPersistent(sig) => {
-                                    self.tool_executor.approve_exact_persistent(sig);
+                                    self.tool_executor.lock().await.approve_exact_persistent(sig);
                                     // IMMEDIATE SAVE: Don't wait for checkpoint
-                                    if let Err(e) = self.tool_executor.save_patterns() {
+                                    if let Err(e) = self.tool_executor.lock().await.save_patterns() {
                                         self.output_status(format!("  ⚠️  Warning: Failed to save pattern: {}", e));
                                         self.output_tool(&tool_use.name, "  ✓ Approved (this session only - save failed)");
                                     } else {
@@ -764,9 +767,9 @@ impl Repl {
                                 }
                                 ConfirmationResult::ApprovePatternPersistent(pattern) => {
                                     let pattern_str = pattern.pattern.clone();
-                                    self.tool_executor.approve_pattern_persistent(pattern);
+                                    self.tool_executor.lock().await.approve_pattern_persistent(pattern);
                                     // IMMEDIATE SAVE: Don't wait for checkpoint
-                                    if let Err(e) = self.tool_executor.save_patterns() {
+                                    if let Err(e) = self.tool_executor.lock().await.save_patterns() {
                                         self.output_status(format!("  ⚠️  Warning: Failed to save pattern: {}", e));
                                         self.output_tool(&tool_use.name, format!(
                                             "  ✓ Approved pattern: {} (this session only - save failed)",
@@ -825,11 +828,14 @@ impl Repl {
                     Ok(())
                 };
 
+                let conversation_snapshot = self.conversation.read().await.clone();
                 let result = self
                     .tool_executor
+                    .lock()
+                    .await
                     .execute_tool(
                         tool_use,
-                        Some(&self.conversation),
+                        Some(&conversation_snapshot),
                         Some(save_fn),
                         None, // TODO: Add training via BootstrapLoader's generator
                         Some(Arc::clone(&self.local_generator)),
@@ -913,16 +919,14 @@ impl Repl {
             if assistant_text.is_empty() {
                 // Response contains ONLY tool_use blocks, no text
                 // We MUST add something to maintain conversation alternation
-                self.conversation
-                    .add_assistant_message("[Tool request]".to_string());
+                self.conversation.write().await.add_assistant_message("[Tool request]".to_string());
 
                 if self.is_interactive {
                     self.output_status("    (Claude requesting tool execution)");
                 }
             } else {
                 // Response has both text and tool_use blocks
-                self.conversation
-                    .add_assistant_message(assistant_text.clone());
+                self.conversation.write().await.add_assistant_message(assistant_text.clone());
 
                 if self.is_interactive && !assistant_text.trim().is_empty() {
                     self.output_claude(format!("    Claude: {}", assistant_text));
@@ -930,10 +934,10 @@ impl Repl {
             }
 
             // Then add tool results as a user message
-            self.conversation.add_user_message(tool_result_text);
+            self.conversation.write().await.add_user_message(tool_result_text);
 
             // Re-invoke Claude with tool results
-            let request = MessageRequest::with_context(self.conversation.get_messages())
+            let request = MessageRequest::with_context(self.conversation.read().await.get_messages())
                 .with_tools(self.tool_definitions.clone());
 
             current_response = self.claude_client.send_message(&request).await?;
@@ -953,12 +957,12 @@ impl Repl {
             // Even if we hit max iterations, we need to maintain conversation state
             let final_text = current_response.text();
             if !final_text.is_empty() {
-                self.conversation.add_assistant_message(final_text.clone());
+                self.conversation.write().await.add_assistant_message(final_text.clone());
             }
         }
 
         // Validate conversation state (debug check)
-        let messages = self.conversation.get_messages();
+        let messages = self.conversation.read().await.get_messages();
         if messages.is_empty() {
             self.output_error("⚠️  ERROR: Conversation became empty after tool loop!");
             self.output_error("⚠️  This is a bug - please report to developers");
@@ -1025,7 +1029,7 @@ impl Repl {
 
     /// Restore conversation from a saved state
     pub fn restore_conversation(&mut self, history: ConversationHistory) {
-        self.conversation = history;
+        self.conversation = Arc::new(RwLock::new(history));
     }
 
     /// Run REPL with an optional initial prompt
@@ -1046,6 +1050,14 @@ impl Repl {
         self.run().await
     }
 
+    /// Run REPL in event loop mode (concurrent queries and tools)
+    pub async fn run_event_loop(&mut self) -> Result<()> {
+        // TODO: Implement full EventLoop integration
+        // For now, fall back to regular run() method
+        self.output_status("Note: Event loop mode not fully implemented yet, using regular mode");
+        self.run().await
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         if self.is_interactive {
             // Fancy startup for interactive mode
@@ -1055,7 +1067,7 @@ impl Repl {
             self.output_status("Online learning: ENABLED (threshold models) ✓");
             self.output_status("");
             self.output_status("Ready. Type /help for commands.");
-            self.print_status_line();
+            self.print_status_line().await;
         } else {
             // Minimal output for non-interactive mode (pipes, scripts)
             output_status!("# Shammah v0.1.0 - Non-interactive mode");
@@ -1233,31 +1245,31 @@ impl Repl {
                         break;
                     }
                     Command::Clear => {
-                        self.conversation.clear();
+                        self.conversation.write().await.clear();
                         self.output_status("Conversation history cleared. Starting fresh.");
                         if self.is_interactive {
                             self.output_status("");
-                            self.print_status_line();
+                            self.print_status_line().await;
                         }
                         continue;
                     }
                     Command::PatternsList => {
-                        let output = self.list_patterns()?;
+                        let output = self.list_patterns().await?;
                         self.output_status(output);
                         continue;
                     }
                     Command::PatternsRemove(ref id) => {
-                        let output = self.remove_pattern(id)?;
+                        let output = self.remove_pattern(id).await?;
                         self.output_status(output);
                         continue;
                     }
                     Command::PatternsClear => {
-                        let output = self.clear_patterns()?;
+                        let output = self.clear_patterns().await?;
                         self.output_status(output);
                         continue;
                     }
                     Command::PatternsAdd => {
-                        let output = self.add_pattern_interactive()?;
+                        let output = self.add_pattern_interactive().await?;
                         self.output_status(output);
                         continue;
                     }
@@ -1306,7 +1318,11 @@ impl Repl {
                             Some(&self.threshold_validator),
                             &mut self.debug_enabled,
                         )?;
-                        self.output_status(output);
+                        match output {
+                            CommandOutput::Status(msg) | CommandOutput::Message(msg) => {
+                                self.output_status(msg);
+                            }
+                        }
                         continue;
                     }
                 }
@@ -1318,14 +1334,14 @@ impl Repl {
                     self.output_claude(&response);
                     if self.is_interactive {
                         self.output_status("");
-                        self.print_status_line();
+                        self.print_status_line().await;
                     }
                 }
                 Err(e) => {
                     self.output_error(format!("Error: {}", e));
                     if self.is_interactive {
                         self.output_status("");
-                        self.print_status_line();
+                        self.print_status_line().await;
                     }
                 }
             }
@@ -1658,8 +1674,9 @@ impl Repl {
     }
 
     /// List all confirmation patterns
-    pub fn list_patterns(&self) -> Result<String> {
-        let store = self.tool_executor.persistent_store();
+    pub async fn list_patterns(&self) -> Result<String> {
+        let executor = self.tool_executor.lock().await;
+        let store = executor.persistent_store();
         let mut output = String::new();
 
         output.push_str("Confirmation Patterns\n");
@@ -1726,8 +1743,9 @@ impl Repl {
     }
 
     /// Remove a pattern by ID (supports partial matching with 8+ chars)
-    pub fn remove_pattern(&mut self, id: &str) -> Result<String> {
-        let store = self.tool_executor.persistent_store();
+    pub async fn remove_pattern(&mut self, id: &str) -> Result<String> {
+        let executor = self.tool_executor.lock().await;
+        let store = executor.persistent_store();
 
         // Find pattern by full or partial ID (8+ chars)
         let matching_pattern = if id.len() >= 8 {
@@ -1780,8 +1798,8 @@ impl Repl {
             }
 
             // Remove and save
-            if self.tool_executor.remove_pattern(&pattern.id) {
-                self.tool_executor.save_patterns()?;
+            if self.tool_executor.lock().await.remove_pattern(&pattern.id) {
+                self.tool_executor.lock().await.save_patterns()?;
                 Ok(format!("Removed pattern: {}", &pattern.id[..8]))
             } else {
                 Ok(format!("Failed to remove pattern: {}", id))
@@ -1811,8 +1829,8 @@ impl Repl {
             }
 
             // Remove and save
-            if self.tool_executor.remove_pattern(&approval.id) {
-                self.tool_executor.save_patterns()?;
+            if self.tool_executor.lock().await.remove_pattern(&approval.id) {
+                self.tool_executor.lock().await.save_patterns()?;
                 Ok(format!("Removed approval: {}", &approval.id[..8]))
             } else {
                 Ok(format!("Failed to remove approval: {}", id))
@@ -1823,8 +1841,9 @@ impl Repl {
     }
 
     /// Clear all patterns with confirmation
-    pub fn clear_patterns(&mut self) -> Result<String> {
-        let store = self.tool_executor.persistent_store();
+    pub async fn clear_patterns(&mut self) -> Result<String> {
+        let executor = self.tool_executor.lock().await;
+        let store = executor.persistent_store();
         let total = store.total_count();
 
         if total == 0 {
@@ -1838,14 +1857,14 @@ impl Repl {
         }
 
         // Clear and save
-        self.tool_executor.clear_persistent_patterns();
-        self.tool_executor.save_patterns()?;
+        self.tool_executor.lock().await.clear_persistent_patterns();
+        self.tool_executor.lock().await.save_patterns()?;
 
         Ok(format!("Cleared {} pattern(s) and approval(s).", total))
     }
 
     /// Add a pattern interactively
-    pub fn add_pattern_interactive(&mut self) -> Result<String> {
+    pub async fn add_pattern_interactive(&mut self) -> Result<String> {
         use crate::tools::patterns::PatternType;
 
         self.output_status("Add Confirmation Pattern");
@@ -1965,8 +1984,10 @@ impl Repl {
 
         // Add to executor and save
         self.tool_executor
+            .lock()
+            .await
             .approve_pattern_persistent(pattern.clone());
-        self.tool_executor.save_patterns()?;
+        self.tool_executor.lock().await.save_patterns()?;
 
         Ok(format!(
             "Pattern saved: {} ({})",
@@ -1985,7 +2006,7 @@ impl Repl {
     }
 
     /// Print training status below the prompt (only in interactive mode)
-    fn print_status_line(&self) {
+    async fn print_status_line(&self) {
         if !self.is_interactive {
             return;
         }
@@ -2020,7 +2041,7 @@ impl Repl {
         };
 
         // Build single-line status string with training effectiveness and conversation context
-        let turn_count = self.conversation.turn_count();
+        let turn_count = self.conversation.read().await.turn_count();
         let context_indicator = if turn_count > 0 {
             format!(" | Context: {} turns", turn_count)
         } else {
@@ -2069,7 +2090,7 @@ impl Repl {
         let start_time = Instant::now();
 
         // Add user message to conversation history
-        self.conversation.add_user_message(query.to_string());
+        self.conversation.write().await.add_user_message(query.to_string());
 
         if self.is_interactive {
             print!("{}", "Analyzing...".dark_grey());
@@ -2129,7 +2150,7 @@ impl Repl {
 
                         // Forward to Claude
                         let request =
-                            MessageRequest::with_context(self.conversation.get_messages())
+                            MessageRequest::with_context(self.conversation.read().await.get_messages())
                                 .with_tools(self.tool_definitions.clone());
 
                         // Try streaming first, fallback to buffered if tools detected
@@ -2192,7 +2213,7 @@ impl Repl {
                 }
 
                 // Use full conversation context with tool definitions
-                let request = MessageRequest::with_context(self.conversation.get_messages())
+                let request = MessageRequest::with_context(self.conversation.read().await.get_messages())
                     .with_tools(self.tool_definitions.clone());
 
                 // Try streaming first, fallback to buffered if tools detected
@@ -2363,8 +2384,7 @@ impl Repl {
         }
 
         // Add assistant response to conversation history
-        self.conversation
-            .add_assistant_message(claude_response.clone());
+        self.conversation.write().await.add_assistant_message(claude_response.clone());
 
         // Store last query/response for feedback commands
         self.last_query = Some(query.to_string());
@@ -2629,7 +2649,7 @@ impl Repl {
         ));
 
         // Add mode change notification to conversation
-        self.conversation.add_user_message(format!(
+        self.conversation.write().await.add_user_message(format!(
             "[System: Entered planning mode for task: {}]\n\
              Available tools: read, glob, grep, web_fetch\n\
              Blocked tools: bash, save_and_exec\n\
@@ -2639,7 +2659,7 @@ impl Repl {
 
         if self.is_interactive {
             self.output_status("");
-            self.print_status_line();
+            self.print_status_line().await;
         }
 
         Ok(())
@@ -2699,13 +2719,13 @@ impl Repl {
                     // Clear conversation and add plan as context
                     self.output_status("");
                     self.output_status(format!("{}", "Clearing conversation context...".blue()));
-                    self.conversation.clear();
+                    self.conversation.write().await.clear();
 
                     // Read plan file and add as initial context
                     if plan_path_clone.exists() {
                         let plan_content = std::fs::read_to_string(&plan_path_clone)
                             .context("Failed to read plan file")?;
-                        self.conversation.add_user_message(format!(
+                        self.conversation.write().await.add_user_message(format!(
                             "Please execute this plan:\n\n{}",
                             plan_content
                         ));
@@ -2718,7 +2738,7 @@ impl Repl {
                             "{}",
                             "⚠️  Plan file not found. Adding approval message only.".yellow()
                         ));
-                        self.conversation.add_user_message(
+                        self.conversation.write().await.add_user_message(
                             "[System: Plan approved! All tools are now enabled. \
                              You may execute bash commands and modify files.]"
                                 .to_string(),
@@ -2728,7 +2748,7 @@ impl Repl {
                     // Keep history, just add approval message
                     self.output_status("");
                     self.output_status(format!("{}", "Keeping conversation context...".blue()));
-                    self.conversation.add_user_message(
+                    self.conversation.write().await.add_user_message(
                         "[System: Plan approved! All tools are now enabled. \
                          You may execute bash commands and modify files.]"
                             .to_string(),
@@ -2743,7 +2763,7 @@ impl Repl {
 
                 if self.is_interactive {
                     self.output_status("");
-                    self.print_status_line();
+                    self.print_status_line().await;
                 }
             }
             ReplMode::Normal => {
@@ -2762,12 +2782,11 @@ impl Repl {
             ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
                 self.output_status(format!("{}", "✗ Plan rejected. Returning to normal mode.".yellow()));
                 self.mode = ReplMode::Normal;
-                self.conversation
-                    .add_user_message("[System: Plan rejected by user.]".to_string());
+                self.conversation.write().await.add_user_message("[System: Plan rejected by user.]".to_string());
 
                 if self.is_interactive {
                     self.output_status("");
-                    self.print_status_line();
+                    self.print_status_line().await;
                 }
             }
             ReplMode::Normal => {
@@ -2802,7 +2821,7 @@ impl Repl {
     /// Handle /save-plan command - manually save current response as plan
     async fn handle_save_plan_command(&mut self) -> Result<()> {
         // Get the last assistant message from conversation
-        let messages = self.conversation.get_messages();
+        let messages = self.conversation.read().await.get_messages();
         let last_assistant_msg = messages
             .iter()
             .rev()

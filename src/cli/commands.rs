@@ -6,6 +6,12 @@ use crate::metrics::MetricsLogger;
 use crate::models::ThresholdValidator;
 use crate::router::Router;
 
+/// Output destination for commands
+pub enum CommandOutput {
+    Status(String),    // Short messages for status bar
+    Message(String),   // Long content for scrollback area
+}
+
 pub enum Command {
     Help,
     Quit,
@@ -146,26 +152,29 @@ pub fn handle_command(
     router: Option<&Router>, // CHANGED: Router instead of ThresholdRouter
     validator: Option<&ThresholdValidator>,
     debug_enabled: &mut bool,
-) -> Result<String> {
+) -> Result<CommandOutput> {
     match command {
-        Command::Help => Ok(format_help()),
-        Command::Quit => Ok("Goodbye!".to_string()),
-        Command::Metrics => format_metrics(metrics_logger),
+        // Long-form outputs go to scrollback
+        Command::Help => Ok(CommandOutput::Message(format_help())),
+        Command::Metrics => Ok(CommandOutput::Message(format_metrics(metrics_logger)?)),
+        Command::Training => Ok(CommandOutput::Message(format_training(router, validator)?)),
+
+        // Short outputs go to status bar
         Command::Debug => {
             *debug_enabled = !*debug_enabled;
-            Ok(format!(
+            Ok(CommandOutput::Status(format!(
                 "Debug mode: {}",
                 if *debug_enabled { "ON" } else { "OFF" }
-            ))
+            )))
         }
-        Command::Training => format_training(router, validator),
-        Command::Clear => Ok("".to_string()), // Handled in REPL directly
+        Command::Quit => Ok(CommandOutput::Status("Goodbye!".to_string())),
+        Command::Clear => Ok(CommandOutput::Status("".to_string())), // Handled in REPL directly
         // Pattern commands are now handled directly in REPL
         Command::PatternsList
         | Command::PatternsRemove(_)
         | Command::PatternsClear
         | Command::PatternsAdd => {
-            Ok("Pattern management commands should be handled in REPL.".to_string())
+            Ok(CommandOutput::Status("Pattern management commands should be handled in REPL.".to_string()))
         }
         // Plan mode commands are handled directly in REPL
         Command::Plan(_)
@@ -173,10 +182,10 @@ pub fn handle_command(
         | Command::Reject
         | Command::ShowPlan
         | Command::SavePlan
-        | Command::Done => Ok("Plan mode commands should be handled in REPL.".to_string()),
+        | Command::Done => Ok(CommandOutput::Status("Plan mode commands should be handled in REPL.".to_string())),
         // Feedback commands are handled directly in REPL
         Command::FeedbackCritical(_) | Command::FeedbackMedium(_) | Command::FeedbackGood(_) => {
-            Ok("Feedback commands should be handled in REPL.".to_string())
+            Ok(CommandOutput::Status("Feedback commands should be handled in REPL.".to_string()))
         }
     }
 }

@@ -3,6 +3,7 @@
 use crate::tools::registry::Tool;
 use crate::tools::types::ToolContext;
 use crate::tools::types::ToolInputSchema;
+use crate::{output_status, output_progress};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -67,9 +68,9 @@ impl Tool for SaveAndExecTool {
             .as_str()
             .context("Missing command parameter")?;
 
-        println!("\n💾 Saving session state...");
-        println!("   Reason: {}", reason);
-        println!("   Command: {}", command);
+        output_status!("\n💾 Saving session state...");
+        output_status!("   Reason: {}", reason);
+        output_status!("   Command: {}", command);
 
         // CRITICAL: Save all state before exec
         let session_state_file = self.session_state_file.clone();
@@ -78,7 +79,7 @@ impl Tool for SaveAndExecTool {
         if let Some(conversation) = context.conversation {
             std::fs::create_dir_all(session_state_file.parent().unwrap())?;
             conversation.save(&session_state_file)?;
-            println!(
+            output_status!(
                 "✓ Saved conversation state to {}",
                 session_state_file.display()
             );
@@ -89,7 +90,7 @@ impl Tool for SaveAndExecTool {
         // These MUST be saved or all learning is lost on restart
         if let Some(ref save_models_fn) = context.save_models {
             save_models_fn()?;
-            println!("✓ Saved model weights");
+            output_status!("✓ Saved model weights");
         }
 
         // Prepare command execution through shell
@@ -104,7 +105,7 @@ impl Tool for SaveAndExecTool {
         {
             use std::os::unix::process::CommandExt;
 
-            println!("\n→ Executing command...\n");
+            output_status!("\n→ Executing command...\n");
 
             // This will replace the current process - never returns
             let err = cmd.exec();
@@ -116,7 +117,7 @@ impl Tool for SaveAndExecTool {
         // On Windows, spawn and exit
         #[cfg(not(unix))]
         {
-            println!("\n→ Starting command...\n");
+            output_status!("\n→ Starting command...\n");
 
             cmd.spawn().context("Failed to spawn command")?;
 

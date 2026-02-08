@@ -26,12 +26,14 @@ use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar};
 
+mod async_input;
 mod dialog;
 mod dialog_widget;
 mod input_widget;
 mod output_widget;
 mod status_widget;
 
+pub use async_input::spawn_input_task;
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use input_widget::render_input_widget;

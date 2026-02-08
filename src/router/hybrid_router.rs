@@ -106,12 +106,13 @@ impl HybridRouter {
                 // Pure threshold-based
                 let should_try = self.threshold_router.should_try_local(query);
                 if should_try {
-                    Ok(RouteDecision::Forward {
-                        reason: ForwardReason::NoMatch,
+                    Ok(RouteDecision::Local {
+                        pattern_id: "threshold".to_string(),
+                        confidence: 0.8,
                     })
                 } else {
                     Ok(RouteDecision::Forward {
-                        reason: ForwardReason::NoMatch,
+                        reason: ForwardReason::LowConfidence,
                     })
                 }
             }
@@ -130,23 +131,25 @@ impl HybridRouter {
                         + (neural_says_local as u8 as f64 * neural_weight);
 
                     if combined_score > 0.5 {
-                        Ok(RouteDecision::Forward {
-                            reason: ForwardReason::NoMatch,
+                        Ok(RouteDecision::Local {
+                            pattern_id: "hybrid".to_string(),
+                            confidence: combined_score,
                         })
                     } else {
                         Ok(RouteDecision::Forward {
-                            reason: ForwardReason::NoMatch,
+                            reason: ForwardReason::LowConfidence,
                         })
                     }
                 } else {
                     // No neural model yet, fall back to threshold
                     if threshold_decision {
-                        Ok(RouteDecision::Forward {
-                            reason: ForwardReason::NoMatch,
+                        Ok(RouteDecision::Local {
+                            pattern_id: "threshold".to_string(),
+                            confidence: 0.8,
                         })
                     } else {
                         Ok(RouteDecision::Forward {
-                            reason: ForwardReason::NoMatch,
+                            reason: ForwardReason::LowConfidence,
                         })
                     }
                 }
@@ -164,18 +167,20 @@ impl HybridRouter {
                                 let threshold_agrees =
                                     self.threshold_router.should_try_local(query);
                                 if threshold_agrees {
-                                    Ok(RouteDecision::Forward {
-                                        reason: ForwardReason::NoMatch,
+                                    Ok(RouteDecision::Local {
+                                        pattern_id: "neural".to_string(),
+                                        confidence: 0.9,
                                     })
                                 } else {
                                     // Threshold disagrees, play it safe and forward
                                     Ok(RouteDecision::Forward {
-                                        reason: ForwardReason::NoMatch,
+                                        reason: ForwardReason::LowConfidence,
                                     })
                                 }
                             } else {
-                                Ok(RouteDecision::Forward {
-                                    reason: ForwardReason::NoMatch,
+                                Ok(RouteDecision::Local {
+                                    pattern_id: "neural".to_string(),
+                                    confidence: 0.9,
                                 })
                             }
                         }
@@ -187,12 +192,13 @@ impl HybridRouter {
                     // No neural model, fall back to threshold
                     let should_try = self.threshold_router.should_try_local(query);
                     if should_try {
-                        Ok(RouteDecision::Forward {
-                            reason: ForwardReason::NoMatch,
+                        Ok(RouteDecision::Local {
+                            pattern_id: "threshold".to_string(),
+                            confidence: 0.8,
                         })
                     } else {
                         Ok(RouteDecision::Forward {
-                            reason: ForwardReason::NoMatch,
+                            reason: ForwardReason::LowConfidence,
                         })
                     }
                 }

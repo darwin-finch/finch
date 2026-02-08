@@ -14,6 +14,7 @@ const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 
+#[derive(Clone)]
 pub struct ClaudeClient {
     client: Client,
     api_key: String,
