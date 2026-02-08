@@ -241,6 +241,20 @@ impl Repl {
             .map(|tool| tool.definition())
             .collect();
 
+        // Initialize output management EARLY (before bootstrap, so messages go through proper channels)
+        let output_manager = OutputManager::new();
+        let status_bar = StatusBar::new();
+
+        // Set as global instances so macros (output_progress!, etc.) use them
+        use crate::cli::global_output::{set_global_output, set_global_status};
+        set_global_output(Arc::new(output_manager.clone()));
+        set_global_status(Arc::new(status_bar.clone()));
+
+        // If TUI will be enabled, disable stdout now so bootstrap messages go through proper channels
+        if config.tui_enabled && is_interactive {
+            output_manager.disable_stdout();
+        }
+
         // Initialize tokenizer
         let tokenizer = Arc::new(TextTokenizer::default().unwrap_or_else(|e| {
             output_status!("⚠️  Failed to create tokenizer: {}", e);
@@ -318,10 +332,6 @@ impl Repl {
         if is_interactive {
             output_status!("✓ LoRA fine-tuning enabled (weighted training)");
         }
-
-        // Initialize output management (Phase 1: Terminal UI refactor)
-        let output_manager = OutputManager::new();
-        let status_bar = StatusBar::new();
 
         // Initialize TUI renderer if enabled (Phase 2: Ratatui interface)
         // Moved to global for Phase 5 native ratatui dialogs
@@ -1064,9 +1074,10 @@ impl Repl {
             }
         };
 
-        if self.is_interactive {
-            self.output_status("✓ Event loop mode enabled (concurrent execution)");
-        }
+        // Event loop is always enabled in interactive mode - no need to announce
+        // if self.is_interactive {
+        //     self.output_status("✓ Event loop mode enabled (concurrent execution)");
+        // }
 
         // Create EventLoop with all dependencies
         let mut event_loop = EventLoop::new(

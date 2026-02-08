@@ -169,7 +169,7 @@ macro_rules! output_tool {
 
 /// Output status information
 /// In non-interactive mode, only prints if SHAMMAH_LOG=1
-/// In interactive mode, redirects to StatusBar for TUI status widget
+/// In interactive mode, writes to scrollback buffer (not status bar)
 #[macro_export]
 macro_rules! output_status {
     ($($arg:tt)*) => {{
@@ -180,9 +180,9 @@ macro_rules! output_status {
                 eprintln!("[STATUS] {}", content);
             }
         } else {
-            // Interactive mode: redirect to StatusBar for TUI status widget
-            let status_bar = $crate::cli::global_output::global_status();
-            status_bar.update_operation(content);
+            // Interactive mode: write to scrollback buffer for visibility
+            let output_mgr = $crate::cli::global_output::global_output();
+            output_mgr.write_progress(content);
         }
     }};
 }
