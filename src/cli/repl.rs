@@ -24,6 +24,7 @@ use crate::models::ThresholdValidator;
 use crate::models::{
     BootstrapLoader, GeneratorState, Sampler, SamplingConfig, TrainingCoordinator, WeightedExample,
 };
+use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
@@ -87,6 +88,8 @@ pub enum ReplMode {
 pub struct Repl {
     _config: Config,
     claude_client: ClaudeClient,
+    // Teacher session with context optimization
+    teacher_session: Arc<RwLock<TeacherSession>>,
     router: Router, // Now contains ThresholdRouter
     metrics_logger: MetricsLogger,
     // Online learning models
@@ -374,9 +377,37 @@ impl Repl {
             }
         }
 
+        // Initialize TeacherSession with context optimization
+        let teacher_config = TeacherContextConfig {
+            max_context_turns: 15,           // Keep last 15 turns
+            tool_result_retention_turns: 5,  // Keep last 5 turns of tool results
+            prompt_caching_enabled: true,
+        };
+
+        let teacher_provider = match crate::providers::create_provider(&config.teacher) {
+            Ok(provider) => provider,
+            Err(e) => {
+                output_status!("⚠️  Failed to create teacher provider: {}", e);
+                output_status!("   Using default Claude fallback");
+                // This shouldn't happen since claude_client already works,
+                // but we need to handle the error case
+                panic!("Cannot create teacher provider")
+            }
+        };
+
+        let teacher_session = Arc::new(RwLock::new(TeacherSession::with_config(
+            teacher_provider,
+            teacher_config,
+        )));
+
+        if is_interactive {
+            output_status!("✓ Teacher context optimization enabled (Level 3)");
+        }
+
         Self {
             _config: config,
             claude_client,
+            teacher_session,
             router, // Contains ThresholdRouter now
             metrics_logger,
             threshold_validator,
@@ -404,6 +435,47 @@ impl Repl {
             status_bar,
             // TUI renderer moved to global (Phase 5: Native ratatui dialogs)
         }
+    }
+
+    /// Call teacher with context optimization (helper for MessageRequest → ProviderRequest conversion)
+    async fn call_teacher(&self, request: &MessageRequest) -> Result<crate::claude::types::MessageResponse> {
+        use crate::providers::ProviderRequest;
+
+        // Convert MessageRequest to ProviderRequest
+        let provider_request = ProviderRequest {
+            messages: request.messages.clone(),
+            model: request.model.clone(),
+            max_tokens: request.max_tokens,
+            temperature: None,
+            tools: request.tools.clone(),
+            stream: false,
+        };
+
+        // Send with Level 3 optimization (smart strategies)
+        let mut session = self.teacher_session.write().await;
+        let response = session.send_message_with_optimization(&provider_request).await?;
+
+        // Convert ProviderResponse back to MessageResponse
+        Ok(response.into())
+    }
+
+    /// Call teacher with streaming and context optimization
+    async fn call_teacher_stream(&self, request: &MessageRequest) -> Result<tokio::sync::mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
+        use crate::providers::ProviderRequest;
+
+        // Convert MessageRequest to ProviderRequest
+        let provider_request = ProviderRequest {
+            messages: request.messages.clone(),
+            model: request.model.clone(),
+            max_tokens: request.max_tokens,
+            temperature: None,
+            tools: request.tools.clone(),
+            stream: true,
+        };
+
+        // Send with streaming (Level 1 tracking only, no truncation for streaming)
+        let mut session = self.teacher_session.write().await;
+        session.send_message_stream(&provider_request).await
     }
 
     /// Load local generator from disk or create new one WITH neural models
@@ -962,11 +1034,11 @@ impl Repl {
             // Then add tool results as a user message
             self.conversation.write().await.add_user_message(tool_result_text);
 
-            // Re-invoke Claude with tool results
+            // Re-invoke teacher with tool results (using optimized context)
             let request = MessageRequest::with_context(self.conversation.read().await.get_messages())
                 .with_tools(self.tool_definitions.clone());
 
-            current_response = self.claude_client.send_message(&request).await?;
+            current_response = self.call_teacher(&request).await?;
         }
 
         // Handle max iterations or completion
@@ -2229,7 +2301,7 @@ impl Repl {
                     let use_streaming = self.streaming_enabled && self.is_interactive;
 
                     if use_streaming {
-                        let rx = self.claude_client.send_message_stream(&request).await?;
+                        let rx = self.call_teacher_stream(&request).await?;
                         match self.display_streaming_response(rx).await {
                             Ok(text) => {
                                 claude_response = text;
@@ -2238,7 +2310,7 @@ impl Repl {
                                 if self.is_interactive {
                                     self.output_status("\n🔧 Tools needed - switching to buffered mode...");
                                 }
-                                let response = self.claude_client.send_message(&request).await?;
+                                let response = self.call_teacher(&request).await?;
                                 let elapsed = start_time.elapsed().as_millis();
                                 if self.is_interactive {
                                     self.output_status(format!("✓ Received response ({}ms)", elapsed));
@@ -2248,7 +2320,7 @@ impl Repl {
                             Err(e) => return Err(e),
                         }
                     } else {
-                        let response = self.claude_client.send_message(&request).await?;
+                        let response = self.call_teacher(&request).await?;
                         let elapsed = start_time.elapsed().as_millis();
                         if self.is_interactive {
                             self.output_status(format!("✓ Received response ({}ms)", elapsed));
@@ -2296,7 +2368,7 @@ impl Repl {
                         let use_streaming = self.streaming_enabled && self.is_interactive;
 
                         if use_streaming {
-                            let rx = self.claude_client.send_message_stream(&request).await?;
+                            let rx = self.call_teacher_stream(&request).await?;
                             match self.display_streaming_response(rx).await {
                                 Ok(text) => {
                                     claude_response = text;
@@ -2307,7 +2379,7 @@ impl Repl {
 🔧 Tools needed - switching to buffered mode...");
                                     }
                                     let response =
-                                        self.claude_client.send_message(&request).await?;
+                                        self.call_teacher(&request).await?;
                                     let elapsed = start_time.elapsed().as_millis();
                                     if self.is_interactive {
                                         self.output_status(format!("✓ Received response ({}ms)", elapsed));
@@ -2317,7 +2389,7 @@ impl Repl {
                                 Err(e) => return Err(e),
                             }
                         } else {
-                            let response = self.claude_client.send_message(&request).await?;
+                            let response = self.call_teacher(&request).await?;
                             let elapsed = start_time.elapsed().as_millis();
                             if self.is_interactive {
                                 self.output_status(format!("✓ Received response ({}ms)", elapsed));
@@ -2370,7 +2442,7 @@ impl Repl {
 
                 if use_streaming {
                     // Streaming path - will abort if tools detected
-                    let rx = self.claude_client.send_message_stream(&request).await?;
+                    let rx = self.call_teacher_stream(&request).await?;
                     match self.display_streaming_response(rx).await {
                         Ok(text) => {
                             // Streaming succeeded (no tools)
@@ -2381,7 +2453,7 @@ impl Repl {
                             if self.is_interactive {
                                 self.output_status("\n🔧 Tools needed - switching to buffered mode...");
                             }
-                            let response = self.claude_client.send_message(&request).await?;
+                            let response = self.call_teacher(&request).await?;
 
                             let elapsed = start_time.elapsed().as_millis();
                             if self.is_interactive {
@@ -2398,7 +2470,7 @@ impl Repl {
                     }
                 } else {
                     // Non-streaming path (supports tool use detection)
-                    let response = self.claude_client.send_message(&request).await?;
+                    let response = self.call_teacher(&request).await?;
 
                     let elapsed = start_time.elapsed().as_millis();
                     if self.is_interactive {
