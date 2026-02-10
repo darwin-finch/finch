@@ -357,8 +357,9 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     let loader_clone = Arc::clone(&bootstrap_loader);
     let state_clone = Arc::clone(&generator_state);
     tokio::spawn(async move {
+        // TODO: Read from config instead of hardcoded defaults
         if let Err(e) = loader_clone
-            .load_generator_async(None, DevicePreference::Auto)
+            .load_generator_async("Qwen2", "Medium", DevicePreference::Auto)
             .await
         {
             output_status!("⚠️  Model loading failed: {}", e);

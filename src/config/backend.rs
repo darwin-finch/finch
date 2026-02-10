@@ -119,6 +119,14 @@ pub struct BackendConfig {
     /// Selected device for inference
     pub device: BackendDevice,
 
+    /// Model family to use (Qwen2, Gemma2, etc.)
+    #[serde(default = "default_model_family")]
+    pub model_family: String,
+
+    /// Model size variant (Small, Medium, Large, XLarge)
+    #[serde(default = "default_model_size")]
+    pub model_size: String,
+
     /// Model repository (varies by backend)
     /// - CoreML: "anemll/Qwen2.5-3B-Instruct"
     /// - Others: "Qwen/Qwen2.5-3B-Instruct"
@@ -130,6 +138,14 @@ pub struct BackendConfig {
     /// Fallback device chain
     #[serde(default = "default_fallback_chain")]
     pub fallback_chain: Vec<BackendDevice>,
+}
+
+fn default_model_family() -> String {
+    "Qwen2".to_string()
+}
+
+fn default_model_size() -> String {
+    "Medium".to_string()
 }
 
 fn default_fallback_chain() -> Vec<BackendDevice> {
@@ -154,6 +170,8 @@ impl Default for BackendConfig {
     fn default() -> Self {
         Self {
             device: BackendDevice::Auto,
+            model_family: default_model_family(),
+            model_size: default_model_size(),
             model_repo: None,
             model_path: None,
             fallback_chain: default_fallback_chain(),
@@ -166,6 +184,20 @@ impl BackendConfig {
     pub fn with_device(device: BackendDevice) -> Self {
         Self {
             device,
+            model_family: default_model_family(),
+            model_size: default_model_size(),
+            model_repo: None,
+            model_path: None,
+            fallback_chain: default_fallback_chain(),
+        }
+    }
+
+    /// Create new backend config with model family and size
+    pub fn with_model(device: BackendDevice, family: String, size: String) -> Self {
+        Self {
+            device,
+            model_family: family,
+            model_size: size,
             model_repo: None,
             model_path: None,
             fallback_chain: default_fallback_chain(),

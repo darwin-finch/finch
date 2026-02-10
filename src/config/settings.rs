@@ -159,8 +159,8 @@ impl TeacherConfig {
     }
 
     /// Get the active teacher (first in priority list)
-    pub fn active_teacher(&self) -> Option<&TeacherEntry> {
-        self.get_teachers().first()
+    pub fn active_teacher(&self) -> Option<TeacherEntry> {
+        self.get_teachers().into_iter().next()
     }
 
     /// Get the settings for a specific provider (legacy method)

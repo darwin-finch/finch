@@ -335,19 +335,19 @@ async fn get_status(
     let generator_status = match &*state {
         GeneratorState::Initializing => GeneratorStatus::Initializing,
         GeneratorState::Downloading {
-            model_size,
+            model_name,
             progress,
         } => GeneratorStatus::Downloading {
-            model_size: format!("{:?}", model_size),
+            model_size: model_name.clone(),
             file_name: progress.file_name.clone(),
             current_file: progress.current_file,
             total_files: progress.total_files,
         },
-        GeneratorState::Loading { model_size } => GeneratorStatus::Loading {
-            model_size: format!("{:?}", model_size),
+        GeneratorState::Loading { model_name } => GeneratorStatus::Loading {
+            model_size: model_name.clone(),
         },
-        GeneratorState::Ready { model_size, .. } => GeneratorStatus::Ready {
-            model_size: format!("{:?}", model_size),
+        GeneratorState::Ready { model_name, .. } => GeneratorStatus::Ready {
+            model_size: model_name.clone(),
         },
         GeneratorState::Failed { error } => GeneratorStatus::Failed {
             error: error.clone(),
