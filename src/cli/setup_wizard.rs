@@ -331,7 +331,7 @@ fn render_welcome(f: &mut Frame, area: Rect) {
          • Inference device (CoreML/Metal/CPU)\n\n\
          Press Enter or Space to continue, Esc to cancel."
     )
-    .style(Style::default().fg(Color::White))
+    .style(Style::default().fg(Color::Reset))
     .alignment(Alignment::Left)
     .wrap(Wrap { trim: false });
     f.render_widget(message, chunks[1]);
@@ -353,17 +353,19 @@ fn render_api_key_input(f: &mut Frame, area: Rect, input: &str) {
         ])
         .split(area);
 
-    let title = Paragraph::new("Step 1: Claude API Key")
+    let title = Paragraph::new("Step 1: Teacher Provider API Key")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
     let instructions = Paragraph::new(
-        "Enter your Anthropic Claude API key.\n\n\
-         Get your API key from: https://console.anthropic.com/\n\
-         (starts with sk-ant-...)"
+        "Enter your API key for the TEACHER provider (Claude by default).\n\
+         This is the AI model that will teach your local model.\n\n\
+         Get Claude API key from: https://console.anthropic.com/\n\
+         (starts with sk-ant-...)\n\n\
+         You can configure other providers (OpenAI, Gemini, etc.) later."
     )
-    .style(Style::default().fg(Color::White))
+    .style(Style::default().fg(Color::Reset))
     .wrap(Wrap { trim: false });
     f.render_widget(instructions, chunks[1]);
 
@@ -375,8 +377,8 @@ fn render_api_key_input(f: &mut Frame, area: Rect, input: &str) {
     };
 
     let input_widget = Paragraph::new(display_text)
-        .block(Block::default().borders(Borders::ALL).title("API Key"))
-        .style(Style::default().fg(Color::Yellow));
+        .block(Block::default().borders(Borders::ALL).title("Teacher API Key (Claude)"))
+        .style(Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD));
     f.render_widget(input_widget, chunks[2]);
 
     let help = Paragraph::new("Type key then press Enter  Esc: Cancel")
@@ -407,7 +409,7 @@ fn render_hf_token_input(f: &mut Frame, area: Rect, input: &str) {
          Get token from: https://huggingface.co/settings/tokens\n\
          (Press Enter to skip)"
     )
-    .style(Style::default().fg(Color::White))
+    .style(Style::default().fg(Color::Reset))
     .wrap(Wrap { trim: false });
     f.render_widget(instructions, chunks[1]);
 
@@ -421,7 +423,7 @@ fn render_hf_token_input(f: &mut Frame, area: Rect, input: &str) {
 
     let input_widget = Paragraph::new(display_text)
         .block(Block::default().borders(Borders::ALL).title("HF Token"))
-        .style(Style::default().fg(Color::Yellow));
+        .style(Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD));
     f.render_widget(input_widget, chunks[2]);
 
     let help = Paragraph::new("Type token then press Enter (or Enter to skip)  Esc: Cancel")
@@ -463,7 +465,7 @@ fn render_device_selection(f: &mut Frame, area: Rect, devices: &[BackendDevice],
             ListItem::new(Line::from(vec![
                 Span::raw(emoji),
                 Span::raw(" "),
-                Span::styled(description, Style::default().fg(Color::White)),
+                Span::styled(description, Style::default().fg(Color::Reset).add_modifier(Modifier::BOLD)),
             ]))
         })
         .collect();
@@ -510,7 +512,7 @@ fn render_model_family_selection(f: &mut Frame, area: Rect, families: &[ModelFam
             ListItem::new(Line::from(vec![
                 Span::styled(family.name(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 Span::raw(" - "),
-                Span::styled(family.description(), Style::default().fg(Color::Gray)),
+                Span::styled(family.description(), Style::default().fg(Color::DarkGray)),
             ]))
         })
         .collect();
@@ -617,7 +619,7 @@ fn render_teacher_config(f: &mut Frame, area: Rect, teachers: &[TeacherEntry], s
         "Configure teacher models for learning. The first teacher is primary.\n\
          You can add more teachers later by editing ~/.shammah/config.toml"
     )
-    .style(Style::default().fg(Color::White))
+    .style(Style::default().fg(Color::Reset))
     .wrap(Wrap { trim: false });
     f.render_widget(instructions, chunks[1]);
 
@@ -680,7 +682,7 @@ fn render_confirm(f: &mut Frame, area: Rect) {
          Press 'y' or Enter to confirm and start Shammah.\n\
          Press 'n' or Esc to cancel."
     )
-    .style(Style::default().fg(Color::White))
+    .style(Style::default().fg(Color::Reset))
     .wrap(Wrap { trim: false });
     f.render_widget(summary, chunks[1]);
 
