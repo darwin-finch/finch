@@ -49,6 +49,19 @@ api_key = "xai-..."
 model = "grok-beta"  # Optional: defaults to grok-beta
 ```
 
+### Using Gemini (Google)
+
+```toml
+streaming_enabled = true
+
+[fallback]
+provider = "gemini"
+
+[fallback.gemini]
+api_key = "AIza..."
+model = "gemini-2.0-flash-exp"  # Optional: defaults to gemini-2.0-flash-exp
+```
+
 ## Multi-Provider Configuration
 
 You can configure multiple providers and switch between them by changing the `provider` field:
@@ -57,7 +70,7 @@ You can configure multiple providers and switch between them by changing the `pr
 streaming_enabled = true
 
 [fallback]
-provider = "claude"  # Change to "openai", "grok", etc.
+provider = "claude"  # Change to "openai", "grok", "gemini", etc.
 
 # Configure all your providers
 [fallback.claude]
@@ -71,6 +84,10 @@ model = "gpt-4o"
 [fallback.grok]
 api_key = "xai-..."
 model = "grok-beta"
+
+[fallback.gemini]
+api_key = "AIza..."
+model = "gemini-2.0-flash-exp"
 ```
 
 ## Provider Details
@@ -95,6 +112,14 @@ model = "grok-beta"
 - **Default Model**: `grok-beta`
 - **Supports**: Streaming, tool calling
 - **Cost**: Check X.AI pricing
+
+### Gemini (Google)
+
+- **API Key**: Get from https://aistudio.google.com/apikey
+- **Default Model**: `gemini-2.0-flash-exp`
+- **Supports**: Streaming, tool calling (function declarations)
+- **Cost**: Free tier available, check Google AI Studio pricing
+- **Note**: Experimental models may have rate limits
 
 ## How Provider Selection Works
 
@@ -143,7 +168,7 @@ api_key = "sk-proj-..."  # Don't forget this!
 
 ### Error: "Unknown provider"
 
-Check that the `provider` field matches one of: `"claude"`, `"openai"`, `"grok"`.
+Check that the `provider` field matches one of: `"claude"`, `"openai"`, `"grok"`, `"gemini"`.
 
 ### Testing Provider Configuration
 
@@ -157,9 +182,11 @@ Check the logs to see which provider was used.
 
 ## Future Providers
 
-Coming soon:
-- **Gemini** (Google) - Phase 4 (optional)
-- Custom OpenAI-compatible endpoints
+Potential additions:
+- Custom OpenAI-compatible endpoints (e.g., local LLMs with OpenAI API)
+- Azure OpenAI
+- Anthropic Claude via AWS Bedrock
+- Cohere Command models
 
 ## Architecture
 

@@ -5,6 +5,7 @@
 use anyhow::{bail, Result};
 
 use super::claude::ClaudeProvider;
+use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
 use crate::config::FallbackConfig;
@@ -39,10 +40,14 @@ pub fn create_provider(config: &FallbackConfig) -> Result<Box<dyn LlmProvider>> 
             Ok(Box::new(provider))
         }
 
-        // "gemini" => {
-        //     // TODO: Implement Gemini provider (Phase 4)
-        //     bail!("Gemini provider not yet implemented")
-        // }
+        "gemini" => {
+            let mut provider = GeminiProvider::new(settings.api_key.clone())?;
+            if let Some(model) = &settings.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
         _ => bail!("Unknown provider: {}", provider_name),
     }
 }
@@ -117,6 +122,28 @@ mod tests {
         let provider = create_provider(&config);
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "grok");
+    }
+
+    #[test]
+    fn test_create_gemini_provider() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "gemini".to_string(),
+            ProviderSettings {
+                api_key: "test-key".to_string(),
+                model: None,
+                base_url: None,
+            },
+        );
+
+        let config = FallbackConfig {
+            provider: "gemini".to_string(),
+            settings,
+        };
+
+        let provider = create_provider(&config);
+        assert!(provider.is_ok());
+        assert_eq!(provider.unwrap().name(), "gemini");
     }
 
     #[test]

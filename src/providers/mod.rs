@@ -13,6 +13,7 @@ pub mod types;
 // Provider implementations
 pub mod claude;
 pub mod openai;
+pub mod gemini;
 
 // Provider factory
 pub mod factory;
