@@ -319,10 +319,27 @@ impl UnifiedModelLoader {
         let size_str = config.size.to_size_string(config.family);
 
         let repo = match (&config.family, &config.backend) {
-            // CoreML needs pre-converted models from anemll
+            // CoreML needs pre-converted models (macOS only)
             #[cfg(target_os = "macos")]
             (ModelFamily::Qwen2, BackendDevice::CoreML) => {
                 format!("anemll/Qwen2.5-{}-Instruct", size_str)
+            }
+
+            #[cfg(target_os = "macos")]
+            (ModelFamily::Llama3, BackendDevice::CoreML) => {
+                // Community CoreML conversions for Llama 3.2
+                match config.size {
+                    ModelSize::Small => "smpanaro/Llama-3.2-1B-Instruct-CoreML".to_string(),
+                    ModelSize::Medium => "andmev/Llama-3.2-3B-Instruct-CoreML".to_string(),
+                    // Larger sizes fall back to standard Metal/CPU
+                    _ => format!("meta-llama/Llama-3.2-{}-Instruct", size_str),
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            (ModelFamily::Mistral, BackendDevice::CoreML) => {
+                // Apple's official CoreML conversion
+                "apple/mistral-coreml".to_string()
             }
 
             // Standard Candle-compatible repos
@@ -413,6 +430,14 @@ impl UnifiedModelLoader {
                 loaders::gemma::load(model_path, config.size, Device::Cpu)
             }
 
+            // Llama on CoreML (macOS only) - uses community conversions
+            #[cfg(target_os = "macos")]
+            (ModelFamily::Llama3, BackendDevice::CoreML) => {
+                // For Small/Medium, use CoreML conversions if downloaded
+                // Otherwise fall back to Metal (handled by error)
+                loaders::coreml::load(model_path, config.size)
+            }
+
             // Llama on Metal (macOS)
             #[cfg(target_os = "macos")]
             (ModelFamily::Llama3, BackendDevice::Metal) => {
@@ -432,6 +457,12 @@ impl UnifiedModelLoader {
             // Llama on CPU (all platforms)
             (ModelFamily::Llama3, BackendDevice::Cpu) => {
                 loaders::llama::load(model_path, config.size, Device::Cpu)
+            }
+
+            // Mistral on CoreML (macOS only) - uses Apple's official conversion
+            #[cfg(target_os = "macos")]
+            (ModelFamily::Mistral, BackendDevice::CoreML) => {
+                loaders::coreml::load(model_path, config.size)
             }
 
             // Mistral on Metal (macOS)
