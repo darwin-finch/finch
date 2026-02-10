@@ -21,6 +21,7 @@ pub mod sampling; // Context-aware sampling system
 pub mod threshold_router;
 pub mod threshold_validator;
 pub mod tokenizer;
+pub mod unified_loader; // Generic loader for multiple model families/backends
 pub mod validator;
 
 pub use bootstrap::{BootstrapLoader, DownloadProgressSnapshot, GeneratorState};
@@ -50,4 +51,5 @@ pub use threshold_router::{
 };
 pub use threshold_validator::{QualitySignal, ThresholdValidator, ValidatorStats};
 pub use tokenizer::TextTokenizer;
+pub use unified_loader::{BackendDevice, ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
 pub use validator::ValidatorModel;

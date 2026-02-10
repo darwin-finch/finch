@@ -22,13 +22,22 @@ pub struct ModelConfig {
 pub enum GeneratorConfig {
     /// Random initialization (existing behavior)
     RandomInit(ModelConfig),
+
+    /// Pre-trained model using unified loader (NEW - generic across families/backends)
+    Pretrained(crate::models::unified_loader::ModelLoadConfig),
+
     /// Pre-trained Qwen model (Metal/CPU via Candle)
+    /// DEPRECATED: Use Pretrained variant instead
+    #[deprecated(note = "Use GeneratorConfig::Pretrained instead")]
     Qwen {
         model_size: crate::models::model_selector::QwenSize,
         cache_dir: std::path::PathBuf,
         device_preference: DevicePreference,
     },
+
     /// Pre-trained CoreML model (Apple Neural Engine)
+    /// DEPRECATED: Use Pretrained variant with backend=CoreML instead
+    #[deprecated(note = "Use GeneratorConfig::Pretrained with backend=CoreML instead")]
     #[cfg(target_os = "macos")]
     CoreML {
         model_size: crate::models::model_selector::QwenSize,
