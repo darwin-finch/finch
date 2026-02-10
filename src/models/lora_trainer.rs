@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use super::lora_impl::{ExampleBuffer, LoRAAdapter, WeightedExample};
-use super::qwen_loader::LoadedQwenModel;
 
 /// Training statistics
 #[derive(Debug, Clone)]

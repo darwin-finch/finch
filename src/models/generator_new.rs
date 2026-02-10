@@ -5,9 +5,8 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use std::path::Path;
 
-use super::common::{get_device_with_preference, GeneratorConfig, Saveable};
+use super::common::{GeneratorConfig, Saveable};
 use super::generator as legacy_generator;
-use super::qwen_loader::{LoadedQwenModel, QwenConfig, QwenLoader};
 use super::unified_loader::UnifiedModelLoader;
 
 /// Text generation trait - abstraction over different generator backends
@@ -46,88 +45,6 @@ impl TextGeneration for LegacyGenerator {
     }
 }
 
-/// Qwen pre-trained model implementation
-struct QwenGenerator {
-    inner: LoadedQwenModel,
-    name: String,
-}
-
-impl TextGeneration for QwenGenerator {
-    fn generate(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
-        // Decode input IDs to text
-        let input_text = self
-            .inner
-            .tokenizer
-            .decode(input_ids, true)
-            .map_err(|e| anyhow::anyhow!("Failed to decode input: {}", e))?;
-
-        // Generate response text
-        let output_text = self.inner.generate(&input_text, max_new_tokens)?;
-
-        // Encode back to token IDs
-        let output_tokens = self
-            .inner
-            .tokenizer
-            .encode(output_text, true)
-            .map_err(|e| anyhow::anyhow!("Failed to encode output: {}", e))?;
-
-        Ok(output_tokens.get_ids().to_vec())
-    }
-
-    fn device(&self) -> &Device {
-        &self.inner.device
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-/// CoreML pre-trained model implementation (Apple Neural Engine)
-#[cfg(target_os = "macos")]
-struct CoreMLGenerator {
-    inner: super::coreml_loader::LoadedCoreMLModel,
-    name: String,
-    // CoreML doesn't use Candle Device, use a placeholder
-    dummy_device: Device,
-}
-
-#[cfg(target_os = "macos")]
-impl TextGeneration for CoreMLGenerator {
-    fn generate(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
-        // CoreML models handle tokenization internally
-        // We receive token IDs but CoreML's complete_text expects text
-        // For now, convert to simple text (this is a simplification)
-
-        // TODO: Proper token ID handling
-        // For now, treat input_ids as a simple string representation
-        let input_text = format!("token_ids: {:?}", input_ids);
-
-        tracing::debug!("CoreML generation with {} input tokens", input_ids.len());
-
-        // Generate response text using CoreML/ANE
-        let output_text = self.inner.generate(&input_text, max_new_tokens)?;
-
-        // CoreML returns text, we need to return token IDs
-        // For now, return dummy token IDs (1 token per char as placeholder)
-        let output_tokens: Vec<u32> = output_text
-            .chars()
-            .map(|c| c as u32)
-            .collect();
-
-        Ok(output_tokens)
-    }
-
-    fn device(&self) -> &Device {
-        // CoreML doesn't use Candle's Device, return placeholder
-        &self.dummy_device
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
 /// Unified generator model supporting multiple backends
 pub struct GeneratorModel {
     backend: Box<dyn TextGeneration>,
@@ -162,130 +79,6 @@ impl GeneratorModel {
 
                 let loader = UnifiedModelLoader::new()?;
                 loader.load(load_config.clone())?
-            }
-            GeneratorConfig::Qwen {
-                model_size,
-                cache_dir,
-                device_preference,
-            } => {
-                tracing::info!(
-                    "Loading pre-trained Qwen model: {}",
-                    model_size.description()
-                );
-
-                // Try Metal first (10-100x faster), fall back to CPU if issues
-                tracing::info!("Attempting to load Qwen on preferred device...");
-
-                let device = match get_device_with_preference(*device_preference) {
-                    Ok(dev) => dev,
-                    Err(e) => {
-                        tracing::warn!("Failed to get preferred device: {}, using CPU", e);
-                        Device::Cpu
-                    }
-                };
-
-                let qwen_config = QwenConfig {
-                    model_size: *model_size,
-                    cache_dir: cache_dir.clone(),
-                    device: device.clone(),
-                };
-
-                // Try loading and test a simple generation
-                match QwenLoader::load(&qwen_config) {
-                    Ok(mut model) => {
-                        // Test with simple prompt (with KV cache, should be fast)
-                        tracing::info!("Testing generation on {:?}...", device);
-                        // Try with just 1 token to minimize complexity
-                        match model.generate("Hi", 1) {
-                            Ok(output) => {
-                                let name = format!("Qwen {}", model_size.description());
-                                tracing::info!("✓ Test passed, generated: {:?}", output.chars().take(20).collect::<String>());
-                                tracing::info!("✓ Loaded Qwen on {:?}", device);
-                                Box::new(QwenGenerator { inner: model, name })
-                            }
-                            Err(e) if matches!(device, Device::Metal(_)) => {
-                                // Metal test failed, fall back to CPU
-                                tracing::warn!("Metal generation test failed: {}", e);
-
-                                // Write full error to file for inspection
-                                if let Err(write_err) = std::fs::write("metal_error.txt", format!("{:#?}", e)) {
-                                    tracing::warn!("Failed to write metal_error.txt: {}", write_err);
-                                } else {
-                                    tracing::warn!("Full error details written to metal_error.txt");
-                                }
-
-                                tracing::info!("Retrying with CPU...");
-
-                                let cpu_config = QwenConfig {
-                                    model_size: *model_size,
-                                    cache_dir: cache_dir.clone(),
-                                    device: Device::Cpu,
-                                };
-
-                                let model = QwenLoader::load(&cpu_config)?;
-                                let name = format!("Qwen {}", model_size.description());
-                                tracing::info!("✓ Loaded Qwen on CPU (Metal fallback, skipping test)");
-                                // Skip test for CPU - we know it works, and test might be slow
-                                Box::new(QwenGenerator { inner: model, name })
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    Err(e) if matches!(device, Device::Metal(_)) => {
-                        // Metal loading failed, fall back to CPU
-                        tracing::warn!("Metal loading failed: {}", e);
-                        tracing::info!("Retrying with CPU...");
-
-                        let cpu_config = QwenConfig {
-                            model_size: *model_size,
-                            cache_dir: cache_dir.clone(),
-                            device: Device::Cpu,
-                        };
-
-                        let model = QwenLoader::load(&cpu_config)?;
-                        let name = format!("Qwen {}", model_size.description());
-                        tracing::info!("✓ Loaded Qwen on CPU (Metal fallback)");
-                        Box::new(QwenGenerator { inner: model, name })
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            #[cfg(target_os = "macos")]
-            GeneratorConfig::CoreML {
-                model_size,
-                cache_dir,
-            } => {
-                tracing::info!(
-                    "Loading pre-trained CoreML model for Apple Neural Engine: {}",
-                    model_size.description()
-                );
-
-                let coreml_config = super::coreml_loader::CoreMLConfig {
-                    model_size: *model_size,
-                    cache_dir: cache_dir.clone(),
-                };
-
-                // Load CoreML model
-                match super::coreml_loader::CoreMLLoader::load(&coreml_config) {
-                    Ok(model) => {
-                        let name = format!("Qwen {} (CoreML/ANE)", model_size.description());
-                        tracing::info!("✓ Loaded CoreML model");
-                        tracing::info!("✓ Model will use Apple Neural Engine if available");
-
-                        // CoreML doesn't use Candle Device, create a placeholder
-                        let dummy_device = Device::Cpu;
-
-                        Box::new(CoreMLGenerator {
-                            inner: model,
-                            name,
-                            dummy_device,
-                        })
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to load CoreML model: {}", e);
-                        return Err(e);
-                    }
-                }
             }
         };
 
@@ -381,19 +174,6 @@ impl Saveable for GeneratorModel {
                 // No need to save
                 Ok(())
             }
-            #[allow(deprecated)]
-            GeneratorConfig::Qwen { .. } => {
-                // Qwen models are already persisted in HF cache
-                // No need to save
-                Ok(())
-            }
-            #[cfg(target_os = "macos")]
-            #[allow(deprecated)]
-            GeneratorConfig::CoreML { .. } => {
-                // CoreML models are already persisted in HF cache
-                // No need to save
-                Ok(())
-            }
         }
     }
 
@@ -427,38 +207,25 @@ mod tests {
     #[test]
     #[ignore] // Requires downloaded Qwen model
     fn test_generator_qwen() {
-        use crate::models::model_selector::QwenSize;
+        use crate::models::unified_loader::{ModelLoadConfig, ModelFamily, ModelSize};
+        use crate::config::backend::BackendDevice;
 
-        let cache_dir = dirs::home_dir()
-            .unwrap()
-            .join(".cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct");
+        let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            family: ModelFamily::Qwen2,
+            size: ModelSize::Small,
+            backend: BackendDevice::Cpu,
+            repo_override: None,
+        });
 
-        // Find snapshot directory
-        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                let snapshot_dir = entry.path();
-                if snapshot_dir.is_dir() && QwenLoader::is_loadable(&snapshot_dir) {
-                    let config = GeneratorConfig::Qwen {
-                        model_size: QwenSize::Qwen1_5B,
-                        cache_dir: snapshot_dir,
-                        device_preference: DevicePreference::Auto,
-                    };
-
-                    let generator = GeneratorModel::new(config);
-                    match generator {
-                        Ok(gen) => {
-                            println!("Created generator: {}", gen.name());
-                            assert!(gen.name().contains("Qwen"));
-                        }
-                        Err(e) => {
-                            println!("Failed to create generator: {}", e);
-                        }
-                    }
-                    return;
-                }
+        let generator = GeneratorModel::new(config);
+        match generator {
+            Ok(gen) => {
+                println!("Created generator: {}", gen.name());
+                assert!(gen.name().contains("Qwen"));
+            }
+            Err(e) => {
+                println!("Failed to create generator: {}", e);
             }
         }
-
-        println!("No Qwen model found - run download test first");
     }
 }
