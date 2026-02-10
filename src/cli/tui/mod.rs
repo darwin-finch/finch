@@ -451,24 +451,33 @@ impl TuiRenderer {
 
         // Render new messages to terminal scrollback using insert_before()
         if !new_messages_to_render.is_empty() {
-            // Get terminal width for wrapping
-            let (term_width, _) = crossterm::terminal::size()?;
-            let width = term_width.saturating_sub(2) as usize;
+            // Build the complete text first to let Ratatui calculate exact height
+            let mut all_lines: Vec<Line> = Vec::new();
 
-            // Calculate total lines needed
-            let num_lines: usize = new_messages_to_render
+            for msg in &new_messages_to_render {
+                let formatted = msg.format();
+                for line in formatted.lines() {
+                    all_lines.push(Line::raw(line.to_string()));
+                }
+                // Add blank line between messages
+                all_lines.push(Line::raw(""));
+            }
+
+            // Calculate how many terminal lines this will actually take
+            let (term_width, _) = crossterm::terminal::size()?;
+            let width = term_width as usize;
+
+            let num_lines: usize = all_lines
                 .iter()
-                .map(|msg| {
-                    // Count lines in formatted message
-                    let formatted = msg.format();
-                    formatted
-                        .lines()
-                        .map(|line| {
-                            let visible_len = Self::visible_length(line);
-                            ((visible_len + width - 1) / width.max(1)).max(1)
-                        })
-                        .sum::<usize>()
-                        + 1 // Extra line for spacing
+                .map(|line| {
+                    let text = line.to_string();
+                    let visible_len = Self::visible_length(&text);
+                    if visible_len == 0 {
+                        1  // Empty line still takes 1 row
+                    } else {
+                        // Calculate wrapped lines
+                        (visible_len + width - 1) / width.max(1)
+                    }
                 })
                 .sum();
 
@@ -479,19 +488,10 @@ impl TuiRenderer {
             execute!(io::stdout(), BeginSynchronizedUpdate)?;
 
             // Use insert_before() to write to terminal scrollback
+            // Note: all_lines is moved into the closure
             self.terminal.insert_before(num_lines_u16, |buf| {
-                let mut lines: Vec<Line> = Vec::new();
-
-                for msg in &new_messages_to_render {
-                    // Add formatted message content
-                    let formatted = msg.format();
-                    for line in formatted.lines() {
-                        lines.push(Line::raw(line.to_string()));
-                    }
-                }
-
-                let text = Text::from(lines);
-                let paragraph = Paragraph::new(text);
+                let text = Text::from(all_lines.clone());
+                let paragraph = Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false });
                 paragraph.render(buf.area, buf);
             })?;
 
