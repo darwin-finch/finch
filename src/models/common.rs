@@ -22,11 +22,17 @@ pub struct ModelConfig {
 pub enum GeneratorConfig {
     /// Random initialization (existing behavior)
     RandomInit(ModelConfig),
-    /// Pre-trained Qwen model
+    /// Pre-trained Qwen model (Metal/CPU via Candle)
     Qwen {
         model_size: crate::models::model_selector::QwenSize,
         cache_dir: std::path::PathBuf,
         device_preference: DevicePreference,
+    },
+    /// Pre-trained CoreML model (Apple Neural Engine)
+    #[cfg(target_os = "macos")]
+    CoreML {
+        model_size: crate::models::model_selector::QwenSize,
+        cache_dir: std::path::PathBuf,
     },
 }
 

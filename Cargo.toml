@@ -76,6 +76,10 @@ rand = "0.8"
 hf-hub = "0.4"  # HuggingFace Hub integration for model downloads
 indicatif = "0.17"  # Progress bars for download tracking
 
+# CoreML support (macOS only)
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-coreml = "0.3"
+
 # For web tools (Phase 3)
 scraper = "0.18"
 

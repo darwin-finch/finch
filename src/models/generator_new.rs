@@ -82,6 +82,48 @@ impl TextGeneration for QwenGenerator {
     }
 }
 
+/// CoreML pre-trained model implementation (Apple Neural Engine)
+#[cfg(target_os = "macos")]
+struct CoreMLGenerator {
+    inner: super::coreml_loader::LoadedCoreMLModel,
+    name: String,
+    // CoreML doesn't use Candle Device, use a placeholder
+    dummy_device: Device,
+}
+
+#[cfg(target_os = "macos")]
+impl TextGeneration for CoreMLGenerator {
+    fn generate(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+        // Decode input IDs to text
+        let input_text = self
+            .inner
+            .tokenizer
+            .decode(input_ids, true)
+            .map_err(|e| anyhow::anyhow!("Failed to decode input: {}", e))?;
+
+        // Generate response text using CoreML/ANE
+        let output_text = self.inner.generate(&input_text, max_new_tokens)?;
+
+        // Encode back to token IDs
+        let output_tokens = self
+            .inner
+            .tokenizer
+            .encode(output_text, true)
+            .map_err(|e| anyhow::anyhow!("Failed to encode output: {}", e))?;
+
+        Ok(output_tokens.get_ids().to_vec())
+    }
+
+    fn device(&self) -> &Device {
+        // CoreML doesn't use Candle's Device, return placeholder
+        &self.dummy_device
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Unified generator model supporting multiple backends
 pub struct GeneratorModel {
     backend: Box<dyn TextGeneration>,
@@ -193,6 +235,43 @@ impl GeneratorModel {
                     Err(e) => return Err(e),
                 }
             }
+            #[cfg(target_os = "macos")]
+            GeneratorConfig::CoreML {
+                model_size,
+                cache_dir,
+            } => {
+                tracing::info!(
+                    "Loading pre-trained CoreML model for Apple Neural Engine: {}",
+                    model_size.description()
+                );
+
+                let coreml_config = super::coreml_loader::CoreMLConfig {
+                    model_size: *model_size,
+                    cache_dir: cache_dir.clone(),
+                };
+
+                // Load CoreML model
+                match super::coreml_loader::CoreMLLoader::load(&coreml_config) {
+                    Ok(model) => {
+                        let name = format!("Qwen {} (CoreML/ANE)", model_size.description());
+                        tracing::info!("✓ Loaded CoreML model");
+                        tracing::info!("✓ Model will use Apple Neural Engine if available");
+
+                        // CoreML doesn't use Candle Device, create a placeholder
+                        let dummy_device = Device::Cpu;
+
+                        Box::new(CoreMLGenerator {
+                            inner: model,
+                            name,
+                            dummy_device,
+                        })
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to load CoreML model: {}", e);
+                        return Err(e);
+                    }
+                }
+            }
         };
 
         Ok(Self { backend, config })
@@ -284,6 +363,12 @@ impl Saveable for GeneratorModel {
             }
             GeneratorConfig::Qwen { .. } => {
                 // Qwen models are already persisted in HF cache
+                // No need to save
+                Ok(())
+            }
+            #[cfg(target_os = "macos")]
+            GeneratorConfig::CoreML { .. } => {
+                // CoreML models are already persisted in HF cache
                 // No need to save
                 Ok(())
             }

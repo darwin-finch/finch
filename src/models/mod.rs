@@ -3,6 +3,7 @@
 
 pub mod bootstrap; // Progressive bootstrap for instant startup
 pub mod common;
+pub mod coreml_loader; // CoreML models for Apple Neural Engine
 pub mod download;
 pub mod ensemble;
 pub mod generator; // Legacy custom transformer
@@ -27,6 +28,8 @@ pub use common::{
     device_info, get_device, get_device_with_preference, is_metal_available, DevicePreference,
     GeneratorConfig, ModelConfig, Saveable,
 };
+#[cfg(target_os = "macos")]
+pub use coreml_loader::{CoreMLConfig, CoreMLLoader, LoadedCoreMLModel};
 pub use download::{DownloadProgress, ModelDownloader};
 pub use ensemble::{EnsembleStats, ModelEnsemble, Quality, RouteDecision};
 // Export both old and new generator APIs for compatibility
