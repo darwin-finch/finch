@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
 use super::LlmProvider;
@@ -70,11 +71,39 @@ impl GeminiProvider {
                     &msg.role
                 };
 
+                // Convert all content blocks to Gemini parts
+                let parts: Vec<GeminiPart> = msg
+                    .content
+                    .iter()
+                    .map(|block| match block {
+                        ContentBlock::Text { text } => GeminiPart::Text {
+                            text: text.clone(),
+                        },
+                        ContentBlock::ToolUse { id: _, name, input } => GeminiPart::FunctionCall {
+                            function_call: GeminiFunctionCall {
+                                name: name.clone(),
+                                args: input.clone(),
+                            },
+                        },
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => GeminiPart::FunctionResponse {
+                            function_response: GeminiFunctionResponse {
+                                name: tool_use_id.clone(),
+                                response: serde_json::json!({
+                                    "content": content,
+                                    "is_error": is_error.unwrap_or(false),
+                                }),
+                            },
+                        },
+                    })
+                    .collect();
+
                 GeminiContent {
                     role: role.to_string(),
-                    parts: vec![GeminiPart::Text {
-                        text: msg.text(),
-                    }],
+                    parts,
                 }
             })
             .collect();
@@ -86,8 +115,17 @@ impl GeminiProvider {
                     .iter()
                     .map(|tool| {
                         // Convert ToolInputSchema to parameters
-                        let parameters = serde_json::to_value(&tool.input_schema)
-                            .unwrap_or(serde_json::json!({}));
+                        let parameters = match serde_json::to_value(&tool.input_schema) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to convert tool schema for '{}': {}",
+                                    tool.name,
+                                    e
+                                );
+                                serde_json::json!({})
+                            }
+                        };
 
                         GeminiFunctionDeclaration {
                             name: tool.name.clone(),
@@ -99,7 +137,7 @@ impl GeminiProvider {
             }]
         });
 
-        let mut generation_config = GeminiGenerationConfig {
+        let generation_config = GeminiGenerationConfig {
             temperature: request.temperature,
             max_output_tokens: Some(request.max_tokens as i32),
             ..Default::default()
@@ -114,17 +152,16 @@ impl GeminiProvider {
     }
 
     /// Convert Gemini response to ProviderResponse
-    fn from_gemini_response(&self, response: GeminiResponse, model: String) -> ProviderResponse {
-        let candidate = response.candidates.into_iter().next().unwrap_or_else(|| {
-            GeminiCandidate {
-                content: GeminiContent {
-                    role: "model".to_string(),
-                    parts: vec![],
-                },
-                finish_reason: Some("ERROR".to_string()),
-                safety_ratings: None,
-            }
-        });
+    fn from_gemini_response(
+        &self,
+        response: GeminiResponse,
+        model: String,
+    ) -> Result<ProviderResponse> {
+        let candidate = response
+            .candidates
+            .into_iter()
+            .next()
+            .context("Gemini returned no candidates in response")?;
 
         // Convert parts to ContentBlock
         let mut content = Vec::new();
@@ -137,8 +174,10 @@ impl GeminiProvider {
                     }
                 }
                 GeminiPart::FunctionCall { function_call } => {
+                    // Generate unique ID since Gemini doesn't provide tool call IDs
+                    let unique_id = format!("gemini_{}_{}", function_call.name, Uuid::new_v4());
                     content.push(ContentBlock::ToolUse {
-                        id: format!("gemini_{}", function_call.name), // Gemini doesn't provide IDs
+                        id: unique_id,
                         name: function_call.name,
                         input: function_call.args,
                     });
@@ -149,14 +188,14 @@ impl GeminiProvider {
             }
         }
 
-        ProviderResponse {
+        Ok(ProviderResponse {
             id: "gemini-response".to_string(), // Gemini doesn't provide response IDs
             model,
             content,
             stop_reason: candidate.finish_reason,
             role: "assistant".to_string(), // Convert "model" back to "assistant"
             provider: "gemini".to_string(),
-        }
+        })
     }
 
     /// Send a single message request (no retry)
@@ -198,7 +237,7 @@ impl GeminiProvider {
 
         tracing::debug!("Received response: {:?}", gemini_response);
 
-        Ok(self.from_gemini_response(gemini_response, model))
+        self.from_gemini_response(gemini_response, model)
     }
 
     /// Send a message with streaming response (no retry)
