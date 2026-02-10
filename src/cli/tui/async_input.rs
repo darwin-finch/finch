@@ -95,6 +95,10 @@ pub fn spawn_input_task(
                 }
                 Ok(None) => {
                     // No input, continue polling
+                    // Check if channel is closed (event loop exited)
+                    if tx.is_closed() {
+                        break;
+                    }
                 }
                 Err(e) => {
                     // Error reading input, log and continue

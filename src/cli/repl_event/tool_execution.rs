@@ -197,6 +197,8 @@ impl ToolExecutionCoordinator {
             match result {
                 Ok(Ok(tool_result)) => {
                     // Tool executed successfully within timeout
+                    tracing::info!("[tool_exec] Tool {} succeeded, sending result ({} chars)",
+                        tool_use.name, tool_result.content.len());
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
                         tool_id: tool_use.id.clone(),
@@ -205,6 +207,7 @@ impl ToolExecutionCoordinator {
                 }
                 Ok(Err(e)) => {
                     // Tool executed but returned error
+                    tracing::warn!("[tool_exec] Tool {} returned error: {}", tool_use.name, e);
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
                         tool_id: tool_use.id.clone(),
@@ -213,6 +216,8 @@ impl ToolExecutionCoordinator {
                 }
                 Err(_) => {
                     // Timeout elapsed
+                    tracing::error!("[tool_exec] Tool {} timed out after {} seconds",
+                        tool_use.name, timeout_duration.as_secs());
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
                         tool_id: tool_use.id.clone(),

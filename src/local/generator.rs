@@ -133,10 +133,11 @@ impl ResponseGenerator {
                     });
                 }
                 Err(e) => {
-                    // Neural generation failed entirely - show the error
-                    tracing::debug!("Neural generation failed: {}", e);
+                    // Neural generation failed entirely - show the full error with context
+                    let full_error = format!("{:#}", e); // Use alternate display for full error chain
+                    tracing::error!("Neural generation failed: {}", full_error);
                     return Ok(GeneratedResponse {
-                        text: format!("[NEURAL GENERATION FAILED]: {}", e),
+                        text: format!("[NEURAL GENERATION FAILED]: {}", full_error),
                         method: "neural_error".to_string(),
                         confidence: 0.0,
                         pattern: pattern.as_str().to_string(),
@@ -179,17 +180,28 @@ impl ResponseGenerator {
         generator: &Arc<RwLock<GeneratorModel>>,
         tokenizer: &Arc<TextTokenizer>,
     ) -> Result<String> {
+        tracing::info!("[neural_gen] Starting neural generation for query: {}", query);
+
         // Tokenize query
+        tracing::debug!("[neural_gen] Tokenizing query...");
         let tokens = tokenizer.encode(query, true)?;
+        tracing::debug!("[neural_gen] Tokenized to {} tokens", tokens.len());
 
         // Generate with neural model (try non-blocking lock)
+        tracing::debug!("[neural_gen] Acquiring generator lock...");
         let mut gen = generator
             .try_write()
             .map_err(|_| anyhow::anyhow!("Generator model is locked"))?;
+
+        tracing::info!("[neural_gen] Lock acquired, starting generation (max 100 tokens)...");
         let output_tokens = gen.generate(&tokens, 100)?; // max 100 new tokens
+        tracing::info!("[neural_gen] Generation complete, output: {} tokens", output_tokens.len());
 
         // Decode back to text
+        tracing::debug!("[neural_gen] Decoding tokens to text...");
         let response = tokenizer.decode(&output_tokens, true)?;
+        tracing::info!("[neural_gen] Neural generation finished, response length: {} chars", response.len());
+
         Ok(response)
     }
 

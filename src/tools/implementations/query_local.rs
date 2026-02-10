@@ -1,8 +1,9 @@
 // QueryLocalModelTool - Let Claude see Shammah's responses directly
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
@@ -54,16 +55,41 @@ Returns: Shammah's raw response plus quality metrics including:
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'query' field"))?;
 
+        tracing::info!("[query_local_model] Starting query: {}", query);
+
         // Check if local generator is available
         let local_gen = ctx
             .local_generator
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Local generator not available"))?;
 
-        // Generate response using local generator
-        let mut gen = local_gen.write().await;
-        let generated = gen.response_generator().generate(query)?;
+        tracing::debug!("[query_local_model] Acquiring generator lock...");
+
+        // Clone what we need for the blocking task
+        let query_owned = query.to_string();
+        let local_gen_clone = Arc::clone(local_gen);
+
+        // Run generation in blocking thread pool to avoid freezing async runtime
+        tracing::debug!("[query_local_model] Spawning blocking task for CPU generation...");
+        let generated = tokio::task::spawn_blocking(move || {
+            // This runs in a separate thread, won't block the async runtime
+            let mut gen = local_gen_clone.blocking_write();
+            tracing::debug!("[query_local_model] Lock acquired in blocking task, calling generate()...");
+            gen.response_generator().generate(&query_owned)
+        })
+        .await
+        .context("Blocking task panicked or was cancelled")?
+        .context("Generation failed")?;
+
         let local_response = generated.text;
+
+        tracing::info!("[query_local_model] Generation complete, response length: {} chars", local_response.len());
+        tracing::debug!("[query_local_model] Response preview: {}",
+            if local_response.len() > 100 {
+                format!("{}...", &local_response[..100])
+            } else {
+                local_response.clone()
+            });
 
         // Check if we have validator available (through batch trainer)
         let quality_score = if let Some(batch_trainer) = ctx.batch_trainer.as_ref() {
