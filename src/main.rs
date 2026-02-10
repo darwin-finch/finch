@@ -45,6 +45,8 @@ struct Args {
 
 #[derive(Parser, Debug)]
 enum Command {
+    /// Run interactive setup wizard
+    Setup,
     /// Run HTTP daemon server
     Daemon {
         /// Bind address (default: 127.0.0.1:8000)
@@ -77,6 +79,9 @@ async fn main() -> Result<()> {
 
     // Dispatch based on command
     match args.command {
+        Some(Command::Setup) => {
+            return run_setup().await;
+        }
         Some(Command::Daemon { bind }) => {
             return run_daemon(bind).await;
         }
@@ -465,6 +470,44 @@ async fn run_query(query: &str) -> Result<()> {
     // Process query and print result
     let response = repl.process_query(query).await?;
     println!("{}", response);
+
+    Ok(())
+}
+
+/// Run interactive setup wizard
+async fn run_setup() -> Result<()> {
+    use shammah::cli::show_setup_wizard;
+    use shammah::config::{BackendConfig, Config, TeacherConfig};
+
+    println!("Starting Shammah setup wizard...\n");
+
+    // Run the wizard
+    let result = show_setup_wizard()?;
+
+    // Create config from wizard results
+    let mut config = Config::new(result.claude_api_key);
+
+    // Update backend config with selected device, model family, and size
+    config.backend = BackendConfig {
+        device: result.backend_device,
+        model_family: result.model_family.name().to_string(),
+        model_size: format!("{:?}", result.model_size),
+        ..Default::default()
+    };
+
+    // Update teacher config with configured teachers
+    config.teacher = TeacherConfig {
+        provider: Some(result.teachers[0].provider.clone()),
+        settings: std::collections::HashMap::new(),
+        teachers: result.teachers,
+    };
+
+    // Save configuration
+    config.save()?;
+
+    println!("\n✓ Configuration saved to ~/.shammah/config.toml");
+    println!("  You can now run: shammah");
+    println!("  Or start the daemon: shammah daemon\n");
 
     Ok(())
 }
