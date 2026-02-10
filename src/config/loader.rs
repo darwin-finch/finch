@@ -37,7 +37,7 @@ pub fn load_config() -> Result<Config> {
 
 fn try_load_from_shammah_config() -> Result<Option<Config>> {
     use super::backend::BackendConfig;
-    use super::settings::FallbackConfig;
+    use super::settings::TeacherConfig;
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let config_path = home.join(".shammah/config.toml");
@@ -74,10 +74,10 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
             }
         }
 
-        // Load fallback config if present
-        if let Some(fallback_value) = toml_config.get("fallback") {
-            if let Ok(fallback_config) = toml::from_str::<FallbackConfig>(&fallback_value.to_string()) {
-                config.fallback = fallback_config;
+        // Load teacher config if present (check "teacher" first, then "fallback" for backwards compat)
+        if let Some(teacher_value) = toml_config.get("teacher").or_else(|| toml_config.get("fallback")) {
+            if let Ok(teacher_config) = toml::from_str::<TeacherConfig>(&teacher_value.to_string()) {
+                config.teacher = teacher_config;
             }
         }
 

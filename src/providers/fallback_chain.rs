@@ -1,0 +1,287 @@
+// Fallback chain for automatic provider retry
+//
+// Tries providers in priority order until one succeeds
+
+use anyhow::{Context, Result};
+use tokio::sync::mpsc;
+
+use super::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
+
+/// A chain of providers to try in order
+pub struct FallbackChain {
+    providers: Vec<Box<dyn LlmProvider>>,
+}
+
+impl FallbackChain {
+    /// Create a new fallback chain with providers in priority order
+    pub fn new(providers: Vec<Box<dyn LlmProvider>>) -> Self {
+        Self { providers }
+    }
+
+    /// Get the number of providers in the chain
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Check if the chain is empty
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// Get the primary provider (first in chain)
+    pub fn primary_provider(&self) -> Option<&dyn LlmProvider> {
+        self.providers.first().map(|p| p.as_ref())
+    }
+
+    /// Try sending message with automatic fallback
+    pub async fn send_message_with_fallback(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ProviderResponse> {
+        let mut last_error = None;
+
+        for (idx, provider) in self.providers.iter().enumerate() {
+            tracing::info!(
+                "Trying provider {} ({}/{})",
+                provider.name(),
+                idx + 1,
+                self.providers.len()
+            );
+
+            match provider.send_message(request).await {
+                Ok(response) => {
+                    if idx > 0 {
+                        tracing::info!(
+                            "Provider {} succeeded after {} failed attempts",
+                            provider.name(),
+                            idx
+                        );
+                    } else {
+                        tracing::debug!("Primary provider {} succeeded", provider.name());
+                    }
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Provider {} failed (attempt {}/{}): {}",
+                        provider.name(),
+                        idx + 1,
+                        self.providers.len(),
+                        e
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("No providers available"))
+            .context("All fallback providers failed"))
+    }
+
+    /// Try streaming with automatic fallback
+    pub async fn send_message_stream_with_fallback(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+        let mut last_error = None;
+
+        for (idx, provider) in self.providers.iter().enumerate() {
+            tracing::info!(
+                "Trying streaming with provider {} ({}/{})",
+                provider.name(),
+                idx + 1,
+                self.providers.len()
+            );
+
+            match provider.send_message_stream(request).await {
+                Ok(receiver) => {
+                    if idx > 0 {
+                        tracing::info!(
+                            "Provider {} streaming succeeded after {} failed attempts",
+                            provider.name(),
+                            idx
+                        );
+                    } else {
+                        tracing::debug!("Primary provider {} streaming succeeded", provider.name());
+                    }
+                    return Ok(receiver);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Provider {} streaming failed (attempt {}/{}): {}",
+                        provider.name(),
+                        idx + 1,
+                        self.providers.len(),
+                        e
+                    );
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("No providers available for streaming"))
+            .context("All fallback providers failed for streaming"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::types::ContentBlock;
+
+    // Mock provider for testing
+    struct MockProvider {
+        name: String,
+        should_fail: bool,
+    }
+
+    impl MockProvider {
+        fn new(name: &str, should_fail: bool) -> Self {
+            Self {
+                name: name.to_string(),
+                should_fail,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MockProvider {
+        async fn send_message(&self, _request: &ProviderRequest) -> Result<ProviderResponse> {
+            if self.should_fail {
+                anyhow::bail!("Mock provider {} failed", self.name);
+            }
+
+            Ok(ProviderResponse {
+                id: "test-id".to_string(),
+                model: "test-model".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "Test response".to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                role: "assistant".to_string(),
+                provider: self.name.clone(),
+            })
+        }
+
+        async fn send_message_stream(
+            &self,
+            _request: &ProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+            if self.should_fail {
+                anyhow::bail!("Mock provider {} streaming failed", self.name);
+            }
+
+            let (tx, rx) = mpsc::channel(1);
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(StreamChunk::TextDelta("test".to_string()))).await;
+            });
+            Ok(rx)
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_tools(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_primary_provider_succeeds() {
+        let providers: Vec<Box<dyn LlmProvider>> = vec![
+            Box::new(MockProvider::new("primary", false)),
+            Box::new(MockProvider::new("fallback", false)),
+        ];
+
+        let chain = FallbackChain::new(providers);
+        let request = ProviderRequest {
+            messages: vec![],
+            model: String::new(),
+            max_tokens: 100,
+            temperature: None,
+            tools: None,
+            stream: false,
+        };
+
+        let result = chain.send_message_with_fallback(&request).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().provider, "primary");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_to_secondary() {
+        let providers: Vec<Box<dyn LlmProvider>> = vec![
+            Box::new(MockProvider::new("primary", true)),
+            Box::new(MockProvider::new("fallback", false)),
+        ];
+
+        let chain = FallbackChain::new(providers);
+        let request = ProviderRequest {
+            messages: vec![],
+            model: String::new(),
+            max_tokens: 100,
+            temperature: None,
+            tools: None,
+            stream: false,
+        };
+
+        let result = chain.send_message_with_fallback(&request).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().provider, "fallback");
+    }
+
+    #[tokio::test]
+    async fn test_all_providers_fail() {
+        let providers: Vec<Box<dyn LlmProvider>> = vec![
+            Box::new(MockProvider::new("primary", true)),
+            Box::new(MockProvider::new("fallback", true)),
+        ];
+
+        let chain = FallbackChain::new(providers);
+        let request = ProviderRequest {
+            messages: vec![],
+            model: String::new(),
+            max_tokens: 100,
+            temperature: None,
+            tools: None,
+            stream: false,
+        };
+
+        let result = chain.send_message_with_fallback(&request).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_fallback() {
+        let providers: Vec<Box<dyn LlmProvider>> = vec![
+            Box::new(MockProvider::new("primary", true)),
+            Box::new(MockProvider::new("fallback", false)),
+        ];
+
+        let chain = FallbackChain::new(providers);
+        let request = ProviderRequest {
+            messages: vec![],
+            model: String::new(),
+            max_tokens: 100,
+            temperature: None,
+            tools: None,
+            stream: true,
+        };
+
+        let result = chain.send_message_stream_with_fallback(&request).await;
+        assert!(result.is_ok());
+    }
+}

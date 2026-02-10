@@ -32,8 +32,8 @@ pub struct Config {
     /// Server configuration (daemon mode)
     pub server: ServerConfig,
 
-    /// Fallback LLM provider configuration
-    pub fallback: FallbackConfig,
+    /// Teacher LLM provider configuration
+    pub teacher: TeacherConfig,
 }
 
 /// Server configuration for daemon mode
@@ -66,18 +66,49 @@ impl Default for ServerConfig {
     }
 }
 
-/// Fallback LLM provider configuration
+/// Teacher LLM provider configuration
+///
+/// The local model (student) learns from teacher providers.
+/// Configure multiple teachers, priority = first in array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FallbackConfig {
-    /// Provider name: "claude", "openai", "grok", "gemini"
-    pub provider: String,
+pub struct TeacherConfig {
+    /// Legacy single provider (deprecated, use teachers array)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 
-    /// Provider-specific settings (API keys, models, etc.)
-    #[serde(flatten)]
+    /// Legacy provider settings (deprecated, use teachers array)
+    #[serde(flatten, skip_serializing_if = "HashMap::is_empty", default)]
     pub settings: HashMap<String, ProviderSettings>,
+
+    /// Array of teacher configurations in priority order
+    /// The first teacher in the array is the active one.
+    #[serde(default)]
+    pub teachers: Vec<TeacherEntry>,
 }
 
-/// Provider-specific settings
+/// A single teacher entry with provider and settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeacherEntry {
+    /// Provider name: "claude", "openai", "grok", "gemini", "mistral", "groq"
+    pub provider: String,
+
+    /// API key for this provider
+    pub api_key: String,
+
+    /// Optional model override (uses provider default if not specified)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Optional base URL (for custom endpoints)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// Optional name/label for this teacher (for UI/logging)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Provider-specific settings (legacy)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSettings {
     /// API key for this provider
@@ -92,26 +123,64 @@ pub struct ProviderSettings {
     pub base_url: Option<String>,
 }
 
-impl Default for FallbackConfig {
+impl Default for TeacherConfig {
     fn default() -> Self {
         Self {
-            provider: "claude".to_string(),
+            provider: Some("claude".to_string()),
             settings: HashMap::new(),
+            teachers: vec![],
         }
     }
 }
 
-impl FallbackConfig {
-    /// Get the settings for a specific provider
+impl TeacherConfig {
+    /// Get teacher entries in priority order
+    /// Supports both legacy (single provider) and new (array) formats
+    pub fn get_teachers(&self) -> Vec<TeacherEntry> {
+        if !self.teachers.is_empty() {
+            // Use new format
+            self.teachers.clone()
+        } else if let Some(provider) = &self.provider {
+            // Convert legacy format to single entry
+            if let Some(settings) = self.settings.get(provider) {
+                vec![TeacherEntry {
+                    provider: provider.clone(),
+                    api_key: settings.api_key.clone(),
+                    model: settings.model.clone(),
+                    base_url: settings.base_url.clone(),
+                    name: None,
+                }]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        }
+    }
+
+    /// Get the active teacher (first in priority list)
+    pub fn active_teacher(&self) -> Option<&TeacherEntry> {
+        self.get_teachers().first()
+    }
+
+    /// Get the settings for a specific provider (legacy method)
     pub fn get_provider_settings(&self, provider: &str) -> Option<&ProviderSettings> {
         self.settings.get(provider)
     }
 
-    /// Get the settings for the currently selected provider
+    /// Get the settings for the currently selected provider (legacy method)
     pub fn get_current_settings(&self) -> Option<&ProviderSettings> {
-        self.get_provider_settings(&self.provider)
+        if let Some(provider) = &self.provider {
+            self.get_provider_settings(provider)
+        } else {
+            None
+        }
     }
 }
+
+// Backwards compatibility alias
+pub type FallbackConfig = TeacherConfig;
+pub type FallbackEntry = TeacherEntry;
 
 impl Config {
     pub fn new(api_key: String) -> Self {
@@ -126,9 +195,10 @@ impl Config {
             None
         };
 
-        // Create default fallback config with Claude
-        let mut fallback = FallbackConfig::default();
-        fallback.settings.insert(
+        // Create default teacher config with Claude (legacy format)
+        let mut teacher = TeacherConfig::default();
+        teacher.provider = Some("claude".to_string());
+        teacher.settings.insert(
             "claude".to_string(),
             ProviderSettings {
                 api_key: api_key.clone(),
@@ -146,7 +216,7 @@ impl Config {
             constitution_path,
             backend: BackendConfig::default(),
             server: ServerConfig::default(),
-            fallback,
+            teacher,
         }
     }
 
@@ -166,7 +236,7 @@ impl Config {
             api_key: self.api_key.clone(),
             streaming_enabled: self.streaming_enabled,
             backend: self.backend.clone(),
-            fallback: self.fallback.clone(),
+            teacher: self.teacher.clone(),
         };
 
         let toml_string = toml::to_string_pretty(&toml_config)?;
@@ -183,5 +253,5 @@ struct TomlConfig {
     api_key: String,
     streaming_enabled: bool,
     backend: BackendConfig,
-    fallback: FallbackConfig,
+    teacher: TeacherConfig,
 }

@@ -60,10 +60,10 @@ enum Command {
 
 /// Create a ClaudeClient with the configured provider
 ///
-/// This function creates a provider based on the fallback configuration
+/// This function creates a provider based on the teacher configuration
 /// and wraps it in a ClaudeClient for backwards compatibility.
 fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
-    let provider = create_provider(&config.fallback)?;
+    let provider = create_provider(&config.teacher)?;
     Ok(ClaudeClient::with_provider(provider))
 }
 

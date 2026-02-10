@@ -18,8 +18,12 @@ pub mod gemini;
 // Provider factory
 pub mod factory;
 
+// Fallback chain
+pub mod fallback_chain;
+
 // Re-export commonly used types
-pub use factory::create_provider;
+pub use factory::{create_provider, create_providers};
+pub use fallback_chain::FallbackChain;
 pub use types::{ProviderRequest, ProviderResponse, StreamChunk};
 
 /// Trait for LLM providers

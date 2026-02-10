@@ -1,25 +1,112 @@
 // Provider factory
 //
-// Creates LLM providers based on configuration
+// Creates LLM providers based on teacher configuration
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use super::claude::ClaudeProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
-use crate::config::FallbackConfig;
+use crate::config::{TeacherConfig, TeacherEntry};
 
-/// Create a provider based on the fallback configuration
-pub fn create_provider(config: &FallbackConfig) -> Result<Box<dyn LlmProvider>> {
-    let provider_name = config.provider.as_str();
+/// Create providers from teacher configuration in priority order
+///
+/// The first provider in the returned list is the active teacher.
+/// Additional providers are available for easy switching via config reordering.
+pub fn create_providers(config: &TeacherConfig) -> Result<Vec<Box<dyn LlmProvider>>> {
+    let entries = config.get_teachers();
+
+    if entries.is_empty() {
+        bail!("No teacher providers configured");
+    }
+
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            create_provider_from_entry(&entry)
+                .with_context(|| format!("Failed to create teacher provider #{}", idx + 1))
+        })
+        .collect()
+}
+
+/// Create a single provider from a teacher entry
+fn create_provider_from_entry(entry: &TeacherEntry) -> Result<Box<dyn LlmProvider>> {
+    match entry.provider.as_str() {
+        "claude" => {
+            let mut provider = ClaudeProvider::new(entry.api_key.clone())?;
+            if let Some(model) = &entry.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
+        "openai" => {
+            let mut provider = OpenAIProvider::new_openai(entry.api_key.clone())?;
+            if let Some(model) = &entry.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
+        "grok" => {
+            let mut provider = OpenAIProvider::new_grok(entry.api_key.clone())?;
+            if let Some(model) = &entry.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
+        "gemini" => {
+            let mut provider = GeminiProvider::new(entry.api_key.clone())?;
+            if let Some(model) = &entry.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
+        "mistral" => {
+            let mut provider = OpenAIProvider::new_mistral(entry.api_key.clone())?;
+            if let Some(model) = &entry.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
+        "groq" => {
+            let mut provider = OpenAIProvider::new_groq(entry.api_key.clone())?;
+            if let Some(model) = &entry.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
+        _ => bail!("Unknown provider: {}", entry.provider),
+    }
+}
+
+/// Create the active teacher provider (first in config list)
+///
+/// This is the primary teacher that the local model will learn from.
+pub fn create_provider(config: &TeacherConfig) -> Result<Box<dyn LlmProvider>> {
+    let providers = create_providers(config)?;
+    providers
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("No teacher providers configured"))
+}
+
+/// Legacy implementation kept for compatibility
+fn _create_provider_legacy(config: &TeacherConfig) -> Result<Box<dyn LlmProvider>> {
+    let provider_name = config.provider.as_ref().ok_or_else(|| anyhow!("No provider specified"))?;
 
     // Get settings for the selected provider
     let settings = config
         .get_current_settings()
-        .ok_or_else(|| anyhow::anyhow!("No settings found for provider: {}", provider_name))?;
+        .ok_or_else(|| anyhow!("No settings found for provider: {}", provider_name))?;
 
-    match provider_name {
+    match provider_name.as_str() {
         "claude" => {
             let mut provider = ClaudeProvider::new(settings.api_key.clone())?;
             if let Some(model) = &settings.model {
@@ -29,14 +116,34 @@ pub fn create_provider(config: &FallbackConfig) -> Result<Box<dyn LlmProvider>> 
         }
 
         "openai" => {
-            let provider = OpenAIProvider::new_openai(settings.api_key.clone())?;
-            // TODO: Support custom model override
+            let mut provider = OpenAIProvider::new_openai(settings.api_key.clone())?;
+            if let Some(model) = &settings.model {
+                provider = provider.with_model(model.clone());
+            }
             Ok(Box::new(provider))
         }
 
         "grok" => {
-            let provider = OpenAIProvider::new_grok(settings.api_key.clone())?;
-            // TODO: Support custom model override
+            let mut provider = OpenAIProvider::new_grok(settings.api_key.clone())?;
+            if let Some(model) = &settings.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
+        "mistral" => {
+            let mut provider = OpenAIProvider::new_mistral(settings.api_key.clone())?;
+            if let Some(model) = &settings.model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+
+        "groq" => {
+            let mut provider = OpenAIProvider::new_groq(settings.api_key.clone())?;
+            if let Some(model) = &settings.model {
+                provider = provider.with_model(model.clone());
+            }
             Ok(Box::new(provider))
         }
 
@@ -55,7 +162,7 @@ pub fn create_provider(config: &FallbackConfig) -> Result<Box<dyn LlmProvider>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProviderSettings;
+    use crate::config::{ProviderSettings, TeacherEntry};
     use std::collections::HashMap;
 
     #[test]
@@ -70,9 +177,10 @@ mod tests {
             },
         );
 
-        let config = FallbackConfig {
-            provider: "claude".to_string(),
+        let config = TeacherConfig {
+            provider: Some("claude".to_string()),
             settings,
+            teachers: vec![],
         };
 
         let provider = create_provider(&config);
@@ -92,9 +200,10 @@ mod tests {
             },
         );
 
-        let config = FallbackConfig {
-            provider: "openai".to_string(),
+        let config = TeacherConfig {
+            provider: Some("openai".to_string()),
             settings,
+            teachers: vec![],
         };
 
         let provider = create_provider(&config);
@@ -114,9 +223,10 @@ mod tests {
             },
         );
 
-        let config = FallbackConfig {
-            provider: "grok".to_string(),
+        let config = TeacherConfig {
+            provider: Some("grok".to_string()),
             settings,
+            teachers: vec![],
         };
 
         let provider = create_provider(&config);
@@ -136,9 +246,10 @@ mod tests {
             },
         );
 
-        let config = FallbackConfig {
-            provider: "gemini".to_string(),
+        let config = TeacherConfig {
+            provider: Some("gemini".to_string()),
             settings,
+            teachers: vec![],
         };
 
         let provider = create_provider(&config);
@@ -148,12 +259,127 @@ mod tests {
 
     #[test]
     fn test_unknown_provider() {
-        let config = FallbackConfig {
-            provider: "unknown".to_string(),
+        let config = TeacherConfig {
+            provider: Some("unknown".to_string()),
             settings: HashMap::new(),
+            teachers: vec![],
         };
 
         let provider = create_provider(&config);
         assert!(provider.is_err());
+    }
+
+    #[test]
+    fn test_multiple_teachers() {
+        let config = TeacherConfig {
+            provider: None,
+            settings: HashMap::new(),
+            teachers: vec![
+                TeacherEntry {
+                    provider: "openai".to_string(),
+                    api_key: "test-key-1".to_string(),
+                    model: Some("gpt-4o".to_string()),
+                    base_url: None,
+                    name: Some("GPT-4o".to_string()),
+                },
+                TeacherEntry {
+                    provider: "claude".to_string(),
+                    api_key: "test-key-2".to_string(),
+                    model: None,
+                    base_url: None,
+                    name: Some("Claude Sonnet".to_string()),
+                },
+            ],
+        };
+
+        let providers = create_providers(&config).unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].name(), "openai");
+        assert_eq!(providers[1].name(), "claude");
+    }
+
+    #[test]
+    fn test_active_teacher() {
+        let config = TeacherConfig {
+            provider: None,
+            settings: HashMap::new(),
+            teachers: vec![
+                TeacherEntry {
+                    provider: "openai".to_string(),
+                    api_key: "test-key-1".to_string(),
+                    model: Some("gpt-4o".to_string()),
+                    base_url: None,
+                    name: Some("GPT-4o (active)".to_string()),
+                },
+                TeacherEntry {
+                    provider: "claude".to_string(),
+                    api_key: "test-key-2".to_string(),
+                    model: None,
+                    base_url: None,
+                    name: Some("Claude (backup)".to_string()),
+                },
+            ],
+        };
+
+        // create_provider should return the FIRST teacher (active one)
+        let provider = create_provider(&config).unwrap();
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.default_model(), "gpt-4o");
+    }
+
+    #[test]
+    fn test_legacy_config_compatibility() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "claude".to_string(),
+            ProviderSettings {
+                api_key: "test-key".to_string(),
+                model: Some("claude-opus-4-6".to_string()),
+                base_url: None,
+            },
+        );
+
+        let config = TeacherConfig {
+            provider: Some("claude".to_string()),
+            settings,
+            teachers: vec![],
+        };
+
+        let entries = config.get_teachers();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provider, "claude");
+        assert_eq!(entries[0].model, Some("claude-opus-4-6".to_string()));
+    }
+
+    #[test]
+    fn test_same_provider_different_models() {
+        let config = TeacherConfig {
+            provider: None,
+            settings: HashMap::new(),
+            teachers: vec![
+                TeacherEntry {
+                    provider: "openai".to_string(),
+                    api_key: "test-key".to_string(),
+                    model: Some("gpt-4o".to_string()),
+                    base_url: None,
+                    name: Some("GPT-4o (best)".to_string()),
+                },
+                TeacherEntry {
+                    provider: "openai".to_string(),
+                    api_key: "test-key".to_string(),
+                    model: Some("gpt-4o-mini".to_string()),
+                    base_url: None,
+                    name: Some("GPT-4o-mini (cheaper)".to_string()),
+                },
+            ],
+        };
+
+        let providers = create_providers(&config).unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].name(), "openai");
+        assert_eq!(providers[1].name(), "openai");
+        // Both are OpenAI but with different models
+        assert_eq!(providers[0].default_model(), "gpt-4o");
+        assert_eq!(providers[1].default_model(), "gpt-4o-mini");
     }
 }

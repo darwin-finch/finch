@@ -51,6 +51,33 @@ impl OpenAIProvider {
         )
     }
 
+    /// Create a new Mistral provider (uses OpenAI-compatible API)
+    pub fn new_mistral(api_key: String) -> Result<Self> {
+        Self::new(
+            api_key,
+            "https://api.mistral.ai".to_string(),
+            "mistral-large-latest".to_string(),
+            "mistral".to_string(),
+        )
+    }
+
+    /// Create a new Groq provider (fast inference, uses OpenAI-compatible API)
+    /// Note: This is Groq (by Groq Inc), not Grok (by X.AI)
+    pub fn new_groq(api_key: String) -> Result<Self> {
+        Self::new(
+            api_key,
+            "https://api.groq.com".to_string(),
+            "llama-3.1-70b-versatile".to_string(),
+            "groq".to_string(),
+        )
+    }
+
+    /// Set custom model for this provider
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.default_model = model.into();
+        self
+    }
+
     /// Create a provider with custom settings
     fn new(api_key: String, base_url: String, default_model: String, provider_name: String) -> Result<Self> {
         let client = Client::builder()
