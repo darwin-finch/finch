@@ -305,9 +305,7 @@ impl UnifiedModelLoader {
             // Qwen on CoreML (macOS only)
             #[cfg(target_os = "macos")]
             (ModelFamily::Qwen2, BackendDevice::CoreML) => {
-                tracing::info!("Loading Qwen on CoreML/ANE");
-                // TODO: Implement in Phase 3
-                anyhow::bail!("CoreML loading not yet implemented")
+                loaders::coreml::load(model_path, config.size)
             }
 
             // Qwen on Metal (macOS only)

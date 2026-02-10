@@ -3,9 +3,10 @@
 
 pub mod qwen;
 
-// Future loaders (Phase 3-5)
-// #[cfg(target_os = "macos")]
-// pub mod coreml;
+#[cfg(target_os = "macos")]
+pub mod coreml;
+
+// Future loaders (Phase 4-5)
 // pub mod gemma;
 // pub mod llama;
 // pub mod mistral;
