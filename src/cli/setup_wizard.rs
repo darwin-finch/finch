@@ -11,13 +11,17 @@ use ratatui::{
 };
 use std::io;
 
-use crate::config::BackendDevice;
+use crate::config::{BackendDevice, TeacherEntry};
+use crate::models::unified_loader::{ModelFamily, ModelSize};
 
 /// Setup wizard result containing all collected configuration
 pub struct SetupResult {
     pub claude_api_key: String,
     pub hf_token: Option<String>,
     pub backend_device: BackendDevice,
+    pub model_family: ModelFamily,
+    pub model_size: ModelSize,
+    pub teachers: Vec<TeacherEntry>,
 }
 
 enum WizardStep {
@@ -25,6 +29,9 @@ enum WizardStep {
     ClaudeApiKey(String),
     HfToken(String),
     DeviceSelection(usize),
+    ModelFamilySelection(usize),
+    ModelSizeSelection(usize),
+    TeacherConfig(Vec<TeacherEntry>, usize), // (teachers list, selected index)
     Confirm,
 }
 
@@ -49,9 +56,34 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
     let devices = BackendDevice::available_devices();
     let mut selected_device_idx = 0;
 
+    let model_families = vec![
+        ModelFamily::Qwen2,
+        ModelFamily::Gemma2,
+        ModelFamily::Llama3,
+        ModelFamily::Mistral,
+    ];
+    let mut selected_family_idx = 0;
+
+    let model_sizes = vec![
+        ModelSize::Small,
+        ModelSize::Medium,
+        ModelSize::Large,
+        ModelSize::XLarge,
+    ];
+    let mut selected_size_idx = 1; // Default to Medium
+
+    let mut teachers: Vec<TeacherEntry> = vec![TeacherEntry {
+        provider: "claude".to_string(),
+        api_key: String::new(), // Will be filled from claude_key
+        model: None,
+        base_url: None,
+        name: Some("Claude (Primary)".to_string()),
+    }];
+    let mut selected_teacher_idx = 0;
+
     let result = loop {
         terminal.draw(|f| {
-            render_wizard_step(f, &step, &devices);
+            render_wizard_step(f, &step, &devices, &model_families, &model_sizes);
         })?;
 
         // Handle input
@@ -123,6 +155,86 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
                             }
                         }
                         KeyCode::Enter => {
+                            step = WizardStep::ModelFamilySelection(selected_family_idx);
+                        }
+                        KeyCode::Esc => {
+                            anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::ModelFamilySelection(selected) => {
+                    match key.code {
+                        KeyCode::Up => {
+                            if *selected > 0 {
+                                *selected -= 1;
+                                selected_family_idx = *selected;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if *selected < model_families.len() - 1 {
+                                *selected += 1;
+                                selected_family_idx = *selected;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            step = WizardStep::ModelSizeSelection(selected_size_idx);
+                        }
+                        KeyCode::Esc => {
+                            anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::ModelSizeSelection(selected) => {
+                    match key.code {
+                        KeyCode::Up => {
+                            if *selected > 0 {
+                                *selected -= 1;
+                                selected_size_idx = *selected;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if *selected < model_sizes.len() - 1 {
+                                *selected += 1;
+                                selected_size_idx = *selected;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            // Fill teacher's API key from claude_key
+                            teachers[0].api_key = claude_key.clone();
+                            step = WizardStep::TeacherConfig(teachers.clone(), selected_teacher_idx);
+                        }
+                        KeyCode::Esc => {
+                            anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::TeacherConfig(teacher_list, selected) => {
+                    match key.code {
+                        KeyCode::Up => {
+                            if *selected > 0 {
+                                *selected -= 1;
+                                selected_teacher_idx = *selected;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if *selected < teacher_list.len() - 1 {
+                                *selected += 1;
+                                selected_teacher_idx = *selected;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            teachers = teacher_list.clone();
+                            step = WizardStep::Confirm;
+                        }
+                        KeyCode::Char('a') => {
+                            // Add new teacher (simplified - just show we can skip for now)
+                            teachers = teacher_list.clone();
                             step = WizardStep::Confirm;
                         }
                         KeyCode::Esc => {
@@ -139,6 +251,9 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
                                 claude_api_key: claude_key.clone(),
                                 hf_token: if hf_token.is_empty() { None } else { Some(hf_token.clone()) },
                                 backend_device: devices[selected_device_idx],
+                                model_family: model_families[selected_family_idx],
+                                model_size: model_sizes[selected_size_idx],
+                                teachers: teachers.clone(),
                             });
                         }
                         KeyCode::Char('n') | KeyCode::Esc => {
@@ -162,7 +277,13 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
     result
 }
 
-fn render_wizard_step(f: &mut Frame, step: &WizardStep, devices: &[BackendDevice]) {
+fn render_wizard_step(
+    f: &mut Frame,
+    step: &WizardStep,
+    devices: &[BackendDevice],
+    model_families: &[ModelFamily],
+    model_sizes: &[ModelSize],
+) {
     let size = f.area();
     let dialog_area = centered_rect(70, 70, size);
 
@@ -180,6 +301,9 @@ fn render_wizard_step(f: &mut Frame, step: &WizardStep, devices: &[BackendDevice
         WizardStep::ClaudeApiKey(input) => render_api_key_input(f, inner, input),
         WizardStep::HfToken(input) => render_hf_token_input(f, inner, input),
         WizardStep::DeviceSelection(selected) => render_device_selection(f, inner, devices, *selected),
+        WizardStep::ModelFamilySelection(selected) => render_model_family_selection(f, inner, model_families, *selected),
+        WizardStep::ModelSizeSelection(selected) => render_model_size_selection(f, inner, model_sizes, *selected),
+        WizardStep::TeacherConfig(teachers, selected) => render_teacher_config(f, inner, teachers, *selected),
         WizardStep::Confirm => render_confirm(f, inner),
     }
 }
@@ -365,6 +489,172 @@ fn render_device_selection(f: &mut Frame, area: Rect, devices: &[BackendDevice],
     f.render_widget(help, chunks[2]);
 }
 
+fn render_model_family_selection(f: &mut Frame, area: Rect, families: &[ModelFamily], selected: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(8),     // Family list
+            Constraint::Length(2),  // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Step 4: Select Model Family")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let items: Vec<ListItem> = families
+        .iter()
+        .map(|family| {
+            ListItem::new(Line::from(vec![
+                Span::styled(family.name(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::raw(" - "),
+                Span::styled(family.description(), Style::default().fg(Color::Gray)),
+            ]))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected));
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ");
+
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
+
+    let help = Paragraph::new("↑/↓: Navigate  Enter: Select  Esc: Cancel")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[2]);
+}
+
+fn render_model_size_selection(f: &mut Frame, area: Rect, sizes: &[ModelSize], selected: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(8),     // Size list
+            Constraint::Length(2),  // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Step 5: Select Model Size")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let items: Vec<ListItem> = sizes
+        .iter()
+        .enumerate()
+        .map(|(idx, size)| {
+            let (desc, ram) = match size {
+                ModelSize::Small => ("Small (~1-3B params)", "8-16GB RAM"),
+                ModelSize::Medium => ("Medium (~3-9B params)", "16-32GB RAM (Recommended)"),
+                ModelSize::Large => ("Large (~7-14B params)", "32-64GB RAM"),
+                ModelSize::XLarge => ("XLarge (~14B+ params)", "64GB+ RAM"),
+            };
+            let is_recommended = idx == 1; // Medium
+            let style = if is_recommended {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(desc, style.add_modifier(Modifier::BOLD)),
+                Span::raw(" - "),
+                Span::styled(ram, Style::default().fg(Color::Gray)),
+            ]))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected));
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ");
+
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
+
+    let help = Paragraph::new("↑/↓: Navigate  Enter: Select  Esc: Cancel")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[2]);
+}
+
+fn render_teacher_config(f: &mut Frame, area: Rect, teachers: &[TeacherEntry], selected: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Length(5),  // Instructions
+            Constraint::Min(6),     // Teacher list
+            Constraint::Length(2),  // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Step 6: Teacher Configuration")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let instructions = Paragraph::new(
+        "Configure teacher models for learning. The first teacher is primary.\n\
+         You can add more teachers later by editing ~/.shammah/config.toml"
+    )
+    .style(Style::default().fg(Color::White))
+    .wrap(Wrap { trim: false });
+    f.render_widget(instructions, chunks[1]);
+
+    let items: Vec<ListItem> = teachers
+        .iter()
+        .map(|teacher| {
+            let name = teacher.name.as_deref().unwrap_or(&teacher.provider);
+            ListItem::new(Line::from(vec![
+                Span::styled(name, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw(" ("),
+                Span::styled(&teacher.provider, Style::default().fg(Color::Gray)),
+                Span::raw(")"),
+            ]))
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected));
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ");
+
+    f.render_stateful_widget(list, chunks[2], &mut list_state);
+
+    let help = Paragraph::new("Enter: Continue  Esc: Cancel")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[3]);
+}
+
 fn render_confirm(f: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -384,7 +674,9 @@ fn render_confirm(f: &mut Frame, area: Rect) {
         "Configuration will be saved to: ~/.shammah/config.toml\n\n\
          ✓ Claude API key configured\n\
          ✓ HuggingFace token configured (or skipped)\n\
-         ✓ Inference device selected\n\n\
+         ✓ Inference device selected\n\
+         ✓ Model family and size selected\n\
+         ✓ Teacher configuration set\n\n\
          Press 'y' or Enter to confirm and start Shammah.\n\
          Press 'n' or Esc to cancel."
     )
