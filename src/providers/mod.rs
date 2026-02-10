@@ -18,12 +18,18 @@ pub mod gemini;
 // Provider factory
 pub mod factory;
 
-// Fallback chain
+// Fallback chain (not used in student-teacher architecture)
 pub mod fallback_chain;
+
+// Teacher session management with context optimization
+pub mod teacher_session;
 
 // Re-export commonly used types
 pub use factory::{create_provider, create_providers};
 pub use fallback_chain::FallbackChain;
+pub use teacher_session::{
+    ConversationState, OptimizationStats, TeacherContextConfig, TeacherSession,
+};
 pub use types::{ProviderRequest, ProviderResponse, StreamChunk};
 
 /// Trait for LLM providers
