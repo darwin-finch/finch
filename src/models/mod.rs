@@ -1,6 +1,7 @@
 // Machine learning models
 // All models support online learning (update after each forward to Claude)
 
+pub mod adapters;  // Local model adapters (chat templates, token IDs)
 pub mod bootstrap; // Progressive bootstrap for instant startup
 pub mod common;
 pub mod download;
@@ -21,6 +22,7 @@ pub mod tokenizer; // Phase 4: Stub for compatibility
 pub mod unified_loader; // Generic loader for ONNX models
 // pub mod validator; // Phase 4: Commented out (Candle-based)
 
+pub use adapters::{AdapterRegistry, LocalModelAdapter, GenerationConfig as AdapterGenerationConfig};
 pub use bootstrap::{BootstrapLoader, DownloadProgressSnapshot, GeneratorState};
 #[allow(deprecated)]
 pub use common::{

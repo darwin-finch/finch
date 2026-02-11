@@ -5,6 +5,7 @@
 // Phase 3: Style transfer and quality matching
 
 use crate::local::patterns::PatternClassifier;
+use crate::models::adapters::{AdapterRegistry, LocalModelAdapter};
 use crate::models::learning::{
     LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData,
 };
@@ -36,6 +37,8 @@ pub struct ResponseGenerator {
     neural_generator: Option<Arc<RwLock<GeneratorModel>>>,
     /// System prompt / constitution for guiding responses
     system_prompt: String,
+    /// Model adapter for formatting prompts and cleaning output
+    model_adapter: Box<dyn LocalModelAdapter>,
 }
 
 /// A response learned from Claude
@@ -50,16 +53,21 @@ struct LearnedResponse {
 impl ResponseGenerator {
     /// Create new response generator without neural models
     pub fn new(pattern_classifier: PatternClassifier) -> Self {
-        Self::with_models(pattern_classifier, None)
+        Self::with_models(pattern_classifier, None, "Qwen") // Default to Qwen
     }
 
     /// Create response generator with optional neural models
     pub fn with_models(
         pattern_classifier: PatternClassifier,
         neural_generator: Option<Arc<RwLock<GeneratorModel>>>,
+        model_name: &str,
     ) -> Self {
         // Load system prompt from constitution file
         let system_prompt = Self::load_constitution();
+
+        // Get appropriate model adapter
+        let model_adapter = AdapterRegistry::get_adapter(model_name);
+        tracing::info!("Using {} adapter for model: {}", model_adapter.family_name(), model_name);
 
         let mut templates = HashMap::new();
 
@@ -97,6 +105,7 @@ impl ResponseGenerator {
             stats: ModelStats::default(),
             neural_generator,
             system_prompt,
+            model_adapter,
         }
     }
 
@@ -202,15 +211,9 @@ impl ResponseGenerator {
         "You are Shammah, a helpful coding assistant. Be concise and accurate.".to_string()
     }
 
-    /// Format user query with chat template
-    /// Uses a flexible format that works across model families (Qwen, Llama, Mistral, etc.)
+    /// Format user query with chat template using model-specific adapter
     fn format_chat_prompt(&self, user_query: &str) -> String {
-        // Use ChatML format (works with Qwen, many others)
-        // For other models, we can detect and switch format in the future
-        format!(
-            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            self.system_prompt, user_query
-        )
+        self.model_adapter.format_chat_prompt(&self.system_prompt, user_query)
     }
 
     /// Try to generate response using neural model
@@ -234,11 +237,16 @@ impl ResponseGenerator {
         tracing::info!("[neural_gen] Lock acquired, starting generation (max 100 tokens)...");
 
         // Use generate_text() which handles tokenization internally
-        let response = gen.generate_text(&formatted_prompt, 100)?; // max 100 new tokens
+        let raw_response = gen.generate_text(&formatted_prompt, 100)?; // max 100 new tokens
 
-        tracing::info!("[neural_gen] Neural generation finished, response length: {} chars", response.len());
+        tracing::info!("[neural_gen] Raw response length: {} chars", raw_response.len());
 
-        Ok(response)
+        // Clean output using model adapter
+        let clean_response = self.model_adapter.clean_output(&raw_response);
+
+        tracing::info!("[neural_gen] Cleaned response length: {} chars", clean_response.len());
+
+        Ok(clean_response)
     }
 
     /// Learn from a Claude response
@@ -422,6 +430,7 @@ impl<'de> serde::Deserialize<'de> for ResponseGenerator {
             stats: data.stats,
             neural_generator: None,
             system_prompt: Self::load_constitution(),
+            model_adapter: AdapterRegistry::get_adapter("Qwen"), // Default to Qwen
         })
     }
 }
