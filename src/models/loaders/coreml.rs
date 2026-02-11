@@ -149,18 +149,20 @@ pub fn load(model_path: &Path, family: ModelFamily, size: ModelSize) -> Result<B
     tracing::info!("Loading CoreML model components...");
     tracing::debug!("Model path: {:?}", model_path);
 
-    // List directory contents for debugging
-    if let Ok(entries) = std::fs::read_dir(model_path) {
-        tracing::debug!("Directory contents:");
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            tracing::debug!("  - {:?} (is_dir: {})", name, path.is_dir());
-        }
-    }
+    // Load ModelConfig from meta.yaml
+    let meta_path = model_path.join("meta.yaml");
+    tracing::debug!("Loading config from: {:?}", meta_path);
 
-    // QwenModel::load_from_directory handles all the CoreML component loading
-    let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, None)
+    let model_config = candle_coreml::config::ModelConfig::load_from_file(&meta_path)
+        .context("Failed to load meta.yaml")?;
+
+    tracing::debug!("Model config loaded with {} components", model_config.components.len());
+
+    // Create QwenConfig from ModelConfig
+    let qwen_config = candle_coreml::qwen::QwenConfig::from_model_config(model_config);
+
+    // QwenModel::load_from_directory with config
+    let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, Some(qwen_config))
         .map_err(|e| {
             tracing::error!("CoreML load error: {:?}", e);
             e
