@@ -252,11 +252,14 @@ impl Repl {
         let status_bar_arc = global_status();
         let status_bar = (*status_bar_arc).clone();
 
-        // CRITICAL: If TUI will be enabled, disable stdout NOW (before bootstrap spawns)
-        // This prevents tracing logs from download.rs from writing directly to stdout
-        // and overlapping with TUI content.
+        // CRITICAL: If TUI will be enabled, disable stdout NOW (before ANY output)
+        // This must happen before tokenizer init, bootstrap spawn, or any other code
+        // that might emit tracing logs.
         if config.tui_enabled && is_interactive {
-            output_manager_arc.disable_stdout();
+            // Disable stdout on the global OutputManager
+            // All output will go to buffer; TUI will render via insert_before()
+            (*output_manager_arc).disable_stdout();
+            eprintln!("[DEBUG] Stdout disabled for TUI mode");
         }
 
         // Initialize tokenizer
