@@ -223,22 +223,96 @@ impl UnifiedModelLoader {
         })
     }
 
-    /// Load model with automatic download and backend selection
-    ///
-    /// DEPRECATED: Use load_onnx() instead (Phase 4: Candle removed)
-    pub fn load(&self, _config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
-        anyhow::bail!(
-            "Candle-based loading removed in Phase 4.\n\
-             Use load_onnx() instead:\n\
-             \n\
-             let loader = UnifiedModelLoader::new()?;\n\
-             let model = loader.load_onnx(Some(16))?;  // 16GB RAM\n\
-             \n\
-             ONNX Runtime provides:\n\
-             - Working CoreML support (Apple Neural Engine)\n\
-             - Cross-platform (CoreML/TensorRT/DirectML)\n\
-             - LoRA adapter loading (Phase 5)"
-        )
+    /// Load model with configuration (Phase 5: ONNX implementation)
+    pub fn load(&self, config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
+        tracing::info!("Loading model: {:?} {:?} on {:?}", config.family, config.size, config.backend);
+
+        // Phase 5: Currently only Qwen2 is supported via ONNX
+        // Other families will be added as ONNX models become available
+        if config.family != ModelFamily::Qwen2 {
+            anyhow::bail!(
+                "Only Qwen2 models are currently supported via ONNX.\n\
+                 Other families (Gemma2, Llama3, Mistral) will be added soon."
+            );
+        }
+
+        // Convert unified ModelLoadConfig to OnnxLoadConfig
+        let onnx_config = self.to_onnx_config(&config)?;
+
+        // Load via ONNX
+        let onnx_loader = OnnxLoader::new(onnx_config.cache_dir.clone());
+        let model = onnx_loader.load_model_sync(&onnx_config)
+            .context("Failed to load ONNX model")?;
+
+        tracing::info!("Successfully loaded model: {}", model.model_name());
+
+        // Box and return as TextGeneration trait object
+        Ok(Box::new(model))
+    }
+
+    /// Convert ModelLoadConfig to OnnxLoadConfig (Phase 5 helper)
+    fn to_onnx_config(&self, config: &ModelLoadConfig) -> Result<OnnxLoadConfig> {
+        // Get cache directory
+        let cache_dir = dirs::home_dir()
+            .context("Failed to determine home directory")?
+            .join(".cache/huggingface/hub");
+
+        // Map unified ModelSize to ONNX ModelSize
+        let onnx_size = match config.size {
+            ModelSize::Small => OnnxModelSize::Medium,   // 1.5B
+            ModelSize::Medium => OnnxModelSize::Large,   // 3B
+            ModelSize::Large => OnnxModelSize::XLarge,   // 7B
+            ModelSize::XLarge => OnnxModelSize::XLarge,  // 7B (max for ONNX currently)
+        };
+
+        // Build model name based on family and size
+        let model_name = if let Some(ref repo) = config.repo_override {
+            // Extract model name from custom repo (e.g., "user/model-name" → "model-name")
+            repo.split('/').last().unwrap_or(repo).to_string()
+        } else {
+            // Standard naming for Qwen2
+            format!("Qwen2.5-{}-Instruct", onnx_size.to_string())
+        };
+
+        // Map BackendDevice to execution providers
+        use super::loaders::onnx_config::ExecutionProvider;
+
+        let execution_providers = match config.backend {
+            #[cfg(target_os = "macos")]
+            BackendDevice::CoreML => {
+                Some(vec![
+                    ExecutionProvider::CoreML,
+                    ExecutionProvider::CPU,
+                ])
+            }
+            #[cfg(feature = "cuda")]
+            BackendDevice::Cuda => {
+                Some(vec![
+                    ExecutionProvider::CUDA,
+                    ExecutionProvider::CPU,
+                ])
+            }
+            #[cfg(target_os = "macos")]
+            BackendDevice::Metal => {
+                // Metal not directly supported by ONNX, use CoreML (which uses ANE/GPU)
+                tracing::warn!("Metal not directly supported by ONNX, using CoreML instead");
+                Some(vec![
+                    ExecutionProvider::CoreML,
+                    ExecutionProvider::CPU,
+                ])
+            }
+            BackendDevice::Cpu => {
+                Some(vec![ExecutionProvider::CPU])
+            }
+            BackendDevice::Auto => None, // Let ONNX loader decide
+        };
+
+        Ok(OnnxLoadConfig {
+            model_name,
+            size: onnx_size,
+            cache_dir,
+            execution_providers,
+        })
     }
 
     /// DEPRECATED: Candle-based loading removed

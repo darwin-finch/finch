@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, bail};
+use ndarray;
 use ort::{
     ep,
-    session::{Session, builder::GraphOptimizationLevel},
+    memory::MemoryInfo,
+    session::{Session, builder::GraphOptimizationLevel, output::SessionOutputs},
+    value::{Value, DynValue},
 };
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
@@ -10,6 +13,7 @@ use tracing::{debug, info, warn};
 
 use super::onnx_config::{ExecutionProvider as ConfigExecutionProvider, ModelSize, OnnxLoadConfig};
 use crate::models::download::{DownloadProgress, ModelDownloader};
+use crate::models::generator_new::TextGeneration;
 
 /// ONNX model loader - downloads and loads models from HuggingFace
 pub struct OnnxLoader {
@@ -126,12 +130,26 @@ impl OnnxLoader {
         let (model_dir, _progress_rx) = self.download_model_files(config)?;
 
         // Step 2: Find model.onnx file
-        let model_path = model_dir.join("model.onnx");
-        if !model_path.exists() {
-            bail!("ONNX model file not found: {:?}", model_path);
-        }
+        // onnx-community repos store models in onnx/ subdirectory
+        let onnx_subdir_path = model_dir.join("onnx").join("model.onnx");
+        let root_path = model_dir.join("model.onnx");
 
-        info!("Found ONNX model at: {:?}", model_path);
+        let model_path = if onnx_subdir_path.exists() {
+            info!("Found ONNX model at: {:?}", onnx_subdir_path);
+            onnx_subdir_path
+        } else if root_path.exists() {
+            info!("Found ONNX model at: {:?}", root_path);
+            root_path
+        } else {
+            bail!(
+                "ONNX model file not found.\n\
+                 Tried:\n\
+                 - {:?}\n\
+                 - {:?}",
+                onnx_subdir_path,
+                root_path
+            );
+        };
 
         // Step 3: Load tokenizer
         let tokenizer = self.load_tokenizer(&model_dir)?;
@@ -257,6 +275,253 @@ impl LoadedOnnxModel {
     /// Get model path
     pub fn model_path(&self) -> &Path {
         &self.model_path
+    }
+
+    /// Autoregressive text generation with KV cache (Phase 5.1)
+    fn generate_autoregressive(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+        info!("ONNX autoregressive generation: {} input tokens, max {} new tokens",
+              input_ids.len(), max_new_tokens);
+
+        let mut output_ids = input_ids.to_vec();
+        let eos_token_id = self.get_eos_token_id();
+
+        // Model architecture (from config.json)
+        const NUM_LAYERS: usize = 28;
+        const NUM_KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 128; // hidden_size / num_attention_heads = 1536 / 12
+
+        // Initialize empty KV cache for first step
+        let mut past_key_values: Vec<(DynValue, DynValue)> = Vec::new();
+
+        // Generation loop
+        for step in 0..max_new_tokens {
+            debug!("Generation step {}/{}", step + 1, max_new_tokens);
+
+            // 1. Prepare input tensor - only the new token(s) after first step
+            let input_for_step = if step == 0 {
+                &output_ids[..] // First step: all input tokens
+            } else {
+                &output_ids[output_ids.len()-1..] // Subsequent: only last generated token
+            };
+
+            // 2. Run inference with KV cache using IoBinding
+            let (logits, new_kv_cache) = self.run_with_kv_cache(
+                input_for_step,
+                &past_key_values,
+                step == 0,
+                NUM_LAYERS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+            )?;
+
+            // Update KV cache for next iteration
+            past_key_values = new_kv_cache;
+
+            // 3. Sample next token
+            let next_token = Self::sample_token_static(&logits)?;
+            debug!("Generated token: {}", next_token);
+
+            // 4. Check for EOS
+            if next_token == eos_token_id {
+                info!("EOS token generated, stopping");
+                break;
+            }
+
+            // 5. Append to output
+            output_ids.push(next_token);
+        }
+
+        info!("Generated {} new tokens", output_ids.len() - input_ids.len());
+        Ok(output_ids)
+    }
+
+    /// Run inference with KV cache using IoBinding for dynamic inputs
+    fn run_with_kv_cache(
+        &mut self,
+        input_tokens: &[u32],
+        past_kv: &[(DynValue, DynValue)],
+        is_first_step: bool,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(Vec<f32>, Vec<(DynValue, DynValue)>)> {
+        // Prepare input_ids tensor
+        let input_tensor = self.prepare_input(input_tokens)?;
+
+        // For first step, create empty KV cache tensors
+        let kv_cache = if is_first_step {
+            // Empty cache: shape [1, num_kv_heads, 0, head_dim]
+            let mut cache = Vec::new();
+            for _ in 0..num_layers {
+                let empty_key = ndarray::Array4::<f32>::zeros((1, num_kv_heads, 0, head_dim));
+                let empty_value = ndarray::Array4::<f32>::zeros((1, num_kv_heads, 0, head_dim));
+
+                let key_val = Value::from_array(empty_key)?.into_dyn();
+                let value_val = Value::from_array(empty_value)?.into_dyn();
+
+                cache.push((key_val, value_val));
+            }
+            cache
+        } else {
+            // Reuse existing cache from previous step (already owned Values)
+            Vec::new() // Will bind past_kv directly below
+        };
+
+        // Create IoBinding for dynamic inputs
+        let mut binding = self.session.create_binding()?;
+
+        // Bind input_ids
+        binding.bind_input("input_ids", &input_tensor)?;
+
+        // Bind past_key_values for each layer
+        let cache_to_bind = if is_first_step { &kv_cache } else { past_kv };
+        for (layer_idx, (key, value)) in cache_to_bind.iter().enumerate() {
+            let key_name = format!("past_key_values.{}.key", layer_idx);
+            let value_name = format!("past_key_values.{}.value", layer_idx);
+
+            binding.bind_input(&key_name, key)?;
+            binding.bind_input(&value_name, value)?;
+        }
+
+        // Bind outputs to device memory (shape unknown, use bind_output_to_device)
+        let mem_info = MemoryInfo::default(); // CPU memory
+        binding.bind_output_to_device("logits", &mem_info)?;
+        for layer_idx in 0..num_layers {
+            let key_name = format!("present.{}.key", layer_idx);
+            let value_name = format!("present.{}.value", layer_idx);
+
+            binding.bind_output_to_device(&key_name, &mem_info)?;
+            binding.bind_output_to_device(&value_name, &mem_info)?;
+        }
+
+        // Run inference (correct API: run_binding returns SessionOutputs)
+        let mut outputs = self.session.run_binding(&binding)?;
+
+        // Extract logits
+        let logits = Self::extract_logits_static(&outputs, input_tokens.len())?;
+
+        // Extract new KV cache by consuming outputs to get owned DynValues
+        let mut new_cache = Vec::new();
+        for layer_idx in 0..num_layers {
+            let key_name = format!("present.{}.key", layer_idx);
+            let value_name = format!("present.{}.value", layer_idx);
+
+            // Get owned DynValue by removing from outputs
+            let key_output = outputs.remove(&key_name)
+                .ok_or_else(|| anyhow::anyhow!("Missing output: {}", key_name))?;
+            let value_output = outputs.remove(&value_name)
+                .ok_or_else(|| anyhow::anyhow!("Missing output: {}", value_name))?;
+
+            new_cache.push((key_output, value_output));
+        }
+
+        Ok((logits, new_cache))
+    }
+
+    /// Prepare input tensor for ONNX Runtime
+    fn prepare_input(&self, tokens: &[u32]) -> Result<DynValue> {
+        debug!("Preparing input tensor: {} tokens", tokens.len());
+
+        // Convert u32 tokens to i64 (ONNX typically expects int64)
+        let input_data: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
+
+        // Create tensor with shape [batch_size=1, seq_len]
+        let array = ndarray::Array2::from_shape_vec(
+            (1, tokens.len()),
+            input_data
+        ).context("Failed to create ndarray for input")?;
+
+        // Convert to ort::Value (ndarray feature enabled)
+        // Use into_dyn() to erase the specific type to DynValueTypeMarker
+        let value = Value::from_array(array)
+            .context("Failed to create ONNX Value from array")?;
+        Ok(value.into_dyn())
+    }
+
+    /// Extract logits from ONNX session output (static to avoid borrowing issues)
+    fn extract_logits_static(outputs: &SessionOutputs, seq_len: usize) -> Result<Vec<f32>> {
+        debug!("Extracting logits from output");
+
+        // Get the first output by name (typically "logits" or similar)
+        // Try common output names first
+        let output_tensor = outputs.get("logits")
+            .or_else(|| outputs.get("output"))
+            .or_else(|| outputs.get("last_hidden_state"))
+            .ok_or_else(|| anyhow::anyhow!("No output tensor found with expected names"))?;
+
+        // Extract tensor data as f32
+        // try_extract_tensor returns Result<(shape, data_slice)>
+        let (shape, data) = output_tensor.try_extract_tensor::<f32>()
+            .context("Failed to extract f32 tensor from output")?;
+
+        debug!("Output tensor shape: {:?}", shape);
+
+        // Shape is typically [batch_size, seq_len, vocab_size]
+        if shape.len() != 3 {
+            bail!("Expected 3D output tensor, got shape: {:?}", shape);
+        }
+
+        let vocab_size = shape[2] as usize;
+        let last_token_offset = (seq_len - 1) * vocab_size;
+
+        // Extract the last token's logits
+        let logits: Vec<f32> = data
+            .iter()
+            .skip(last_token_offset)
+            .take(vocab_size)
+            .copied()
+            .collect();
+
+        debug!("Extracted {} logits for last token", logits.len());
+        Ok(logits)
+    }
+
+    /// Sample next token from logits (greedy sampling) - static to avoid borrowing issues
+    fn sample_token_static(logits: &[f32]) -> Result<u32> {
+        if logits.is_empty() {
+            bail!("Cannot sample from empty logits");
+        }
+
+        // Find token with maximum logit (greedy sampling)
+        let (max_idx, max_val) = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .ok_or_else(|| anyhow::anyhow!("Failed to find max logit"))?;
+
+        debug!("Sampled token {} (logit: {:.4})", max_idx, max_val);
+        Ok(max_idx as u32)
+    }
+
+    /// Get EOS token ID from tokenizer
+    fn get_eos_token_id(&self) -> u32 {
+        // Try to get from tokenizer's special tokens
+        // For Qwen models, EOS is typically 151643
+        // Fallback to common value if not available
+        let vocab = self.tokenizer.get_vocab(true);
+
+        vocab.get("<|endoftext|>")
+            .or_else(|| vocab.get("<|im_end|>"))
+            .or_else(|| vocab.get("</s>"))
+            .copied()
+            .unwrap_or(151643)
+    }
+}
+
+// Implement TextGeneration trait
+impl TextGeneration for LoadedOnnxModel {
+    fn generate(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+        self.generate_autoregressive(input_ids, max_new_tokens)
+    }
+
+    fn name(&self) -> &str {
+        &self.model_name
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

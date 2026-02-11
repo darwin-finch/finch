@@ -428,8 +428,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 // Note: tokenizer is now embedded in GeneratorModel backend
                 let mut gen = gen_clone.write().await;
                 *gen = LocalGenerator::with_models(
-                    Some(Arc::clone(model)),
-                    None, // Tokenizer is embedded in GeneratorModel
+                    Some(Arc::clone(model)), // Tokenizer is embedded in GeneratorModel
                 );
 
                 output_status!("✓ Qwen model ready - local generation enabled");

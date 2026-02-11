@@ -14,6 +14,9 @@ pub trait TextGeneration: Send + Sync {
 
     /// Get model name/description
     fn name(&self) -> &str;
+
+    /// Downcast to Any for accessing concrete type methods
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 // Phase 4: LegacyGenerator removed (depends on Candle-based generator module)
@@ -65,6 +68,51 @@ impl GeneratorModel {
     /// Generate response from input tokens
     pub fn generate(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
         self.backend.generate(input_ids, max_new_tokens)
+    }
+
+    /// Generate text response from text input (handles tokenization internally)
+    ///
+    /// This is a convenience method that:
+    /// 1. Tokenizes the input text
+    /// 2. Calls generate() on the backend
+    /// 3. Detokenizes the output
+    ///
+    /// For ONNX models, this uses the model's built-in tokenizer.
+    pub fn generate_text(&mut self, prompt: &str, max_new_tokens: usize) -> Result<String> {
+        // Downcast to LoadedOnnxModel to access tokenizer
+        // This is safe because we only support ONNX models in Phase 5
+        use super::loaders::onnx::LoadedOnnxModel;
+
+        // Tokenize input (scope the borrow)
+        let input_ids: Vec<u32> = {
+            let onnx_model = self.backend
+                .as_any()
+                .downcast_ref::<LoadedOnnxModel>()
+                .ok_or_else(|| anyhow::anyhow!("Backend is not an ONNX model"))?;
+
+            let encoding = onnx_model.tokenizer()
+                .encode(prompt, true)
+                .map_err(|e| anyhow::anyhow!("Failed to encode prompt: {}", e))?;
+
+            encoding.get_ids().to_vec()
+        }; // onnx_model borrow ends here
+
+        // Generate tokens (requires mutable borrow of self)
+        let output_ids = self.generate(&input_ids, max_new_tokens)?;
+
+        // Decode output (scope the borrow again)
+        let response = {
+            let onnx_model = self.backend
+                .as_any()
+                .downcast_ref::<LoadedOnnxModel>()
+                .ok_or_else(|| anyhow::anyhow!("Backend is not an ONNX model"))?;
+
+            onnx_model.tokenizer()
+                .decode(&output_ids, true)
+                .map_err(|e| anyhow::anyhow!("Failed to decode output: {}", e))?
+        }; // onnx_model borrow ends here
+
+        Ok(response)
     }
 
     /// Get generator backend name

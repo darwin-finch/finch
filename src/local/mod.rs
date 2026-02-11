@@ -25,17 +25,16 @@ pub struct LocalGenerator {
 impl LocalGenerator {
     /// Create new local generator without neural models
     pub fn new() -> Self {
-        Self::with_models(None, None)
+        Self::with_models(None)
     }
 
     /// Create local generator with optional neural models
     pub fn with_models(
         neural_generator: Option<Arc<RwLock<GeneratorModel>>>,
-        tokenizer: Option<Arc<TextTokenizer>>,
     ) -> Self {
         let pattern_classifier = PatternClassifier::new();
         let response_generator =
-            ResponseGenerator::with_models(pattern_classifier.clone(), neural_generator, tokenizer);
+            ResponseGenerator::with_models(pattern_classifier.clone(), neural_generator);
 
         Self {
             pattern_classifier,

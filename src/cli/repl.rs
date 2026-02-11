@@ -333,7 +333,6 @@ impl Repl {
                     let mut gen = gen_clone.write().await;
                     *gen = LocalGenerator::with_models(
                         Some(Arc::clone(model)),
-                        Some(Arc::clone(&tok_clone)),
                     );
 
                     output_status!("✓ Qwen model ready - local generation enabled");
@@ -513,7 +512,7 @@ impl Repl {
                         // Note: loaded generator won't have neural models yet
                         // We'd need to refactor LocalGenerator to support injecting them
                         // For now, create fresh with models
-                        return LocalGenerator::with_models(neural_generator, Some(tokenizer));
+                        return LocalGenerator::with_models(neural_generator);
                     }
                     Err(e) => {
                         if is_interactive {
@@ -526,7 +525,7 @@ impl Repl {
         }
 
         // Create new with neural models
-        LocalGenerator::with_models(neural_generator, Some(tokenizer))
+        LocalGenerator::with_models(neural_generator)
     }
 
     /// Load validator from disk or create new one

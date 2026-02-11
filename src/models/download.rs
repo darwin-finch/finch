@@ -177,11 +177,39 @@ impl ModelDownloader {
         if found_coreml {
             tracing::info!("✓ CoreML model components downloaded");
         } else {
-            tracing::debug!("No CoreML bundles detected, trying standard safetensors...");
+            tracing::debug!("No CoreML bundles detected, trying ONNX or safetensors...");
         }
 
+        // Try ONNX files (onnx-community repos)
+        let mut found_onnx = false;
         if !found_coreml {
-            // Not CoreML, try standard safetensors files
+            tracing::debug!("Checking for ONNX model files in onnx/ subdirectory...");
+
+            let onnx_files = vec![
+                "onnx/model.onnx",       // Main model file
+                "onnx/model.onnx_data",  // Optional: external data for large models
+            ];
+
+            for file in &onnx_files {
+                match repo.get(file) {
+                    Ok(path) => {
+                        tracing::info!("Downloaded {}", file);
+                        downloaded_files.push(path);
+                        found_onnx = true;
+                    }
+                    Err(_) => {
+                        tracing::debug!("  {} not found (may be optional)", file);
+                    }
+                }
+            }
+
+            if found_onnx {
+                tracing::info!("✓ ONNX model files downloaded");
+            }
+        }
+
+        if !found_coreml && !found_onnx {
+            // Not CoreML or ONNX, try standard safetensors files
             match repo.get("model.safetensors") {
                 Ok(path) => {
                     tracing::info!("Downloaded single model file");

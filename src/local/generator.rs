@@ -8,7 +8,7 @@ use crate::local::patterns::PatternClassifier;
 use crate::models::learning::{
     LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData,
 };
-use crate::models::{GeneratorModel, TextTokenizer};
+use crate::models::GeneratorModel;
 use crate::training::batch_trainer::BatchTrainer;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,6 @@ pub struct ResponseGenerator {
     stats: ModelStats,
     /// Optional neural generator for trained model generation
     neural_generator: Option<Arc<RwLock<GeneratorModel>>>,
-    /// Optional tokenizer for encoding/decoding text
-    tokenizer: Option<Arc<TextTokenizer>>,
 }
 
 /// A response learned from Claude
@@ -50,14 +48,13 @@ struct LearnedResponse {
 impl ResponseGenerator {
     /// Create new response generator without neural models
     pub fn new(pattern_classifier: PatternClassifier) -> Self {
-        Self::with_models(pattern_classifier, None, None)
+        Self::with_models(pattern_classifier, None)
     }
 
     /// Create response generator with optional neural models
     pub fn with_models(
         pattern_classifier: PatternClassifier,
         neural_generator: Option<Arc<RwLock<GeneratorModel>>>,
-        tokenizer: Option<Arc<TextTokenizer>>,
     ) -> Self {
         let mut templates = HashMap::new();
 
@@ -94,7 +91,6 @@ impl ResponseGenerator {
             learned_responses: HashMap::new(),
             stats: ModelStats::default(),
             neural_generator,
-            tokenizer,
         }
     }
 
@@ -104,8 +100,8 @@ impl ResponseGenerator {
         let (pattern, confidence) = self.pattern_classifier.classify(query);
 
         // 1. Try neural generator FIRST - ALWAYS show the output if generation succeeds
-        if let (Some(generator), Some(tokenizer)) = (&self.neural_generator, &self.tokenizer) {
-            match self.try_neural_generate(query, generator, tokenizer) {
+        if let Some(generator) = &self.neural_generator {
+            match self.try_neural_generate(query, generator) {
                 Ok(neural_response) => {
                     // ALWAYS return neural response if generation succeeded
                     // Even if it's short or contains errors - let user see what model produces
@@ -178,14 +174,8 @@ impl ResponseGenerator {
         &self,
         query: &str,
         generator: &Arc<RwLock<GeneratorModel>>,
-        tokenizer: &Arc<TextTokenizer>,
     ) -> Result<String> {
         tracing::info!("[neural_gen] Starting neural generation for query: {}", query);
-
-        // Tokenize query
-        tracing::debug!("[neural_gen] Tokenizing query...");
-        let tokens = tokenizer.encode(query, true)?;
-        tracing::debug!("[neural_gen] Tokenized to {} tokens", tokens.len());
 
         // Generate with neural model (try non-blocking lock)
         tracing::debug!("[neural_gen] Acquiring generator lock...");
@@ -194,12 +184,10 @@ impl ResponseGenerator {
             .map_err(|_| anyhow::anyhow!("Generator model is locked"))?;
 
         tracing::info!("[neural_gen] Lock acquired, starting generation (max 100 tokens)...");
-        let output_tokens = gen.generate(&tokens, 100)?; // max 100 new tokens
-        tracing::info!("[neural_gen] Generation complete, output: {} tokens", output_tokens.len());
 
-        // Decode back to text
-        tracing::debug!("[neural_gen] Decoding tokens to text...");
-        let response = tokenizer.decode(&output_tokens, true)?;
+        // Use generate_text() which handles tokenization internally
+        let response = gen.generate_text(query, 100)?; // max 100 new tokens
+
         tracing::info!("[neural_gen] Neural generation finished, response length: {} chars", response.len());
 
         Ok(response)
@@ -385,7 +373,6 @@ impl<'de> serde::Deserialize<'de> for ResponseGenerator {
             learned_responses: data.learned_responses,
             stats: data.stats,
             neural_generator: None,
-            tokenizer: None,
         })
     }
 }
