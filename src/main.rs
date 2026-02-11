@@ -145,6 +145,11 @@ async fn main() -> Result<()> {
     set_global_output(output_manager.clone());
     set_global_status(status_bar.clone());
 
+    // CRITICAL: Disable stdout immediately before any logs can be emitted
+    // TUI will render all output via insert_before() instead
+    // This prevents tracing logs from appearing on stdout and overlapping
+    output_manager.disable_stdout();
+
     // Load configuration (or run setup if missing)
     let mut config = match load_config() {
         Ok(cfg) => cfg,
@@ -175,6 +180,8 @@ async fn main() -> Result<()> {
     // Override TUI setting if --raw or --no-tui flag is provided
     if args.raw_mode || args.no_tui {
         config.tui_enabled = false;
+        // Re-enable stdout for non-TUI modes
+        output_manager.enable_stdout();
     }
 
     // Load crisis detector
