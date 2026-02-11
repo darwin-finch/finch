@@ -32,7 +32,8 @@ impl LocalModelAdapter for QwenAdapter {
         // The model might echo the system prompt - we need to extract ONLY the actual answer
         let mut cleaned = raw_output;
 
-        // If the model echoed the template, find the last "assistant" section
+        // Step 1: Handle special tokens (ChatML format with markers)
+        // If the model echoed the template, find the last "assistant" section with markers
         if let Some(last_assistant_start) = cleaned.rfind("<|im_start|>assistant") {
             cleaned = &cleaned[last_assistant_start + 22..]; // Skip "<|im_start|>assistant\n"
         }
@@ -47,7 +48,26 @@ impl LocalModelAdapter for QwenAdapter {
             .unwrap_or(cleaned)
             .trim();
 
-        // Remove ChatML role markers if they leaked through
+        // Step 2: Handle role names as plain text (when tokenizer treats them as regular tokens)
+        // Find the LAST occurrence of "assistant\n" or "assistant " (without special tokens)
+        // This handles cases like: "user\nWhat is 2+2?\nassistant\n4"
+        if let Some(last_assistant_pos) = cleaned.rfind("assistant\n") {
+            // Take everything after "assistant\n"
+            cleaned = &cleaned[last_assistant_pos + 10..]; // "assistant\n".len() = 10
+        } else if let Some(last_assistant_pos) = cleaned.rfind("assistant ") {
+            // Handle "assistant " (space instead of newline)
+            cleaned = &cleaned[last_assistant_pos + 10..]; // "assistant ".len() = 10
+        }
+
+        // Step 3: Remove embedded role patterns that might appear in the middle
+        // Replace patterns like "\nuser\n", "\nsystem\n", "\nassistant\n" with just "\n"
+        let mut temp = cleaned.to_string();
+        temp = temp.replace("\nuser\n", "\n");
+        temp = temp.replace("\nsystem\n", "\n");
+        temp = temp.replace("\nassistant\n", "\n");
+        cleaned = &temp;
+
+        // Step 4: Remove leading role names (if any remain after above steps)
         cleaned = cleaned
             .trim_start_matches("system")
             .trim_start_matches("user")
@@ -55,7 +75,22 @@ impl LocalModelAdapter for QwenAdapter {
             .trim_start_matches('\n')
             .trim();
 
-        // AGGRESSIVE: If the output starts with constitution text, skip to the actual answer
+        // Step 5: Detect question/answer pattern and extract just the answer
+        // Pattern: "What is X?\nAnswer" → extract "Answer"
+        let lines: Vec<&str> = cleaned.lines().collect();
+        if lines.len() > 1 {
+            // If first line ends with '?', it's likely the echoed question
+            // Answer is in the last non-empty line
+            if let Some(first_line) = lines.first() {
+                if first_line.trim().ends_with('?') {
+                    if let Some(last_line) = lines.iter().rev().find(|l| !l.trim().is_empty()) {
+                        cleaned = last_line.trim();
+                    }
+                }
+            }
+        }
+
+        // Step 6: AGGRESSIVE: If the output starts with constitution text, skip to the actual answer
         // Constitution typically starts with "You are Shammah" or "# Shammah Constitution"
         if cleaned.starts_with("You are Shammah") || cleaned.starts_with("# Shammah Constitution") {
             // The actual answer is usually at the end after all the instructions
@@ -81,7 +116,7 @@ impl LocalModelAdapter for QwenAdapter {
             }
         }
 
-        // If still too long (>500 chars), something went wrong - take last line as fallback
+        // Step 7: If still too long (>500 chars), something went wrong - take last line as fallback
         if cleaned.len() > 500 {
             if let Some(last_line) = cleaned.lines().last() {
                 if !last_line.trim().is_empty() && last_line.len() < 200 {
@@ -153,5 +188,70 @@ mod tests {
         let adapter = QwenAdapter;
         assert_eq!(adapter.eos_token_id(), 151643);
         assert_eq!(adapter.bos_token_id(), None);
+    }
+
+    #[test]
+    fn test_clean_echo_with_answer() {
+        let adapter = QwenAdapter;
+
+        // Test case 1: Echo with embedded role (THE MAIN PROBLEM CASE)
+        // This is what the ONNX model currently generates
+        let raw = "user\nWhat is 2+2?\nassistant\n4";
+        let cleaned = adapter.clean_output(raw);
+        assert_eq!(cleaned, "4");
+
+        // Test case 2: Echo with role names and spaces
+        let raw2 = "user What is Rust?\nassistant Rust is a systems programming language";
+        let cleaned2 = adapter.clean_output(raw2);
+        assert_eq!(cleaned2, "Rust is a systems programming language");
+
+        // Test case 3: Multiple role patterns
+        let raw3 = "system\nYou are helpful\nuser\nTest\nassistant\nResponse";
+        let cleaned3 = adapter.clean_output(raw3);
+        assert_eq!(cleaned3, "Response");
+    }
+
+    #[test]
+    fn test_clean_question_answer_pattern() {
+        let adapter = QwenAdapter;
+
+        // Test case 1: Question with answer on next line
+        let raw = "What is Rust?\nRust is a systems programming language";
+        let cleaned = adapter.clean_output(raw);
+        assert_eq!(cleaned, "Rust is a systems programming language");
+
+        // Test case 2: Question with multi-line answer
+        let raw2 = "How do I print in Rust?\nYou can use println! macro\nExample: println!(\"Hello\");";
+        let cleaned2 = adapter.clean_output(raw2);
+        // Should extract the answer (not the question)
+        assert!(cleaned2.contains("println!"));
+        assert!(!cleaned2.starts_with("How do I"));
+    }
+
+    #[test]
+    fn test_clean_embedded_role_patterns() {
+        let adapter = QwenAdapter;
+
+        // Test removing embedded role patterns in the middle of text
+        let raw = "Here is\nuser\nsome text\nassistant\nwith roles";
+        let cleaned = adapter.clean_output(raw);
+        // Role patterns should be removed or collapsed
+        assert!(!cleaned.contains("user\n"));
+        assert!(!cleaned.contains("assistant\n"));
+    }
+
+    #[test]
+    fn test_clean_preserves_good_output() {
+        let adapter = QwenAdapter;
+
+        // Test that clean output without artifacts is preserved
+        let raw = "The answer is 42";
+        let cleaned = adapter.clean_output(raw);
+        assert_eq!(cleaned, "The answer is 42");
+
+        // Test multi-line clean output
+        let raw2 = "Here is the code:\nfn main() {\n    println!(\"Hello\");\n}";
+        let cleaned2 = adapter.clean_output(raw2);
+        assert_eq!(cleaned2, raw2);
     }
 }
