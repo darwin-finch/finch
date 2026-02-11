@@ -10,13 +10,13 @@ use crossterm::{
     cursor,
     event::{self, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    text::{Line, Text},
-    widgets::{Clear as ClearWidget, Paragraph, Widget},
+    text::Line,
+    widgets::{Paragraph, Widget},
     Terminal, TerminalOptions, Viewport,
 };
 use std::io::{self, Write};
@@ -25,13 +25,14 @@ use std::time::Duration;
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar};
-use crate::cli::messages::{MessageId, MessageRef, MessageStatus, UserQueryMessage, StreamingResponseMessage, StaticMessage};
+use crate::cli::messages::{MessageId, MessageRef};
 
 mod async_input;
 mod dialog;
 mod dialog_widget;
 mod input_widget;
 mod scrollback;
+mod shadow_buffer;
 mod status_widget;
 
 pub use async_input::spawn_input_task;
@@ -39,6 +40,7 @@ pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use input_widget::render_input_widget;
 pub use scrollback::ScrollbackBuffer;
+pub use shadow_buffer::{ShadowBuffer, diff_buffers};
 pub use status_widget::StatusWidget;
 
 // Import DialogType for internal use
@@ -79,6 +81,10 @@ pub struct TuiRenderer {
     scrollback: ScrollbackBuffer,
     /// Dynamic viewport height (updated on resize)
     viewport_height: usize,
+    /// Shadow buffer for rendering (2D character array)
+    shadow_buffer: ShadowBuffer,
+    /// Previous frame buffer (for diff-based updates)
+    prev_frame_buffer: ShadowBuffer,
     /// Whether full refresh is needed
     needs_full_refresh: bool,
     /// Last refresh timestamp
@@ -158,52 +164,6 @@ impl TuiRenderer {
             .split(popup_layout[1])[1]
     }
 
-    /// Calculate visible length of string (excluding ANSI escape codes)
-    fn visible_length(s: &str) -> usize {
-        let mut len = 0;
-        let mut chars = s.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            match c {
-                '\x1b' => {
-                    // Handle escape sequences
-                    if chars.peek() == Some(&'[') {
-                        // CSI sequence: \x1b[...m (color codes, cursor movement)
-                        chars.next(); // consume '['
-                        while let Some(ch) = chars.next() {
-                            if ch.is_ascii_alphabetic() {
-                                break;  // Sequence terminator
-                            }
-                        }
-                    } else if chars.peek() == Some(&']') {
-                        // OSC sequence: \x1b]...\x07 or \x1b]...\x1b\\
-                        chars.next(); // consume ']'
-                        while let Some(ch) = chars.next() {
-                            if ch == '\x07' || (ch == '\x1b' && chars.peek() == Some(&'\\')) {
-                                if ch == '\x1b' {
-                                    chars.next(); // consume '\\'
-                                }
-                                break;
-                            }
-                        }
-                    } else {
-                        // Other escape sequences, skip 1 char
-                        chars.next();
-                    }
-                }
-                '\r' | '\x08' | '\x7f' => {
-                    // Control characters that don't add visible length
-                    // \r = carriage return, \x08 = backspace, \x7f = delete
-                }
-                _ => {
-                    len += 1;  // Regular visible character
-                }
-            }
-        }
-
-        len
-    }
-
     /// Create a new TUI renderer with inline viewport
     pub fn new(output_manager: Arc<OutputManager>, status_bar: Arc<StatusBar>) -> Result<Self> {
         // Setup terminal with inline viewport - preserves terminal scrollback
@@ -236,6 +196,14 @@ impl TuiRenderer {
         // We'll use insert_before() to write to terminal scrollback
         let scrollback = ScrollbackBuffer::new(viewport_height, term_width as usize);
 
+        // Calculate visible scrollback area (above inline viewport)
+        // Inline viewport is 6 lines at bottom, so visible area is (term_height - 6)
+        let visible_scrollback_rows = _term_height.saturating_sub(6) as usize;
+
+        // Initialize shadow buffers for diff-based rendering
+        let shadow_buffer = ShadowBuffer::new(term_width as usize, visible_scrollback_rows);
+        let prev_frame_buffer = ShadowBuffer::new(term_width as usize, visible_scrollback_rows);
+
         // Ensure stdout is disabled - we'll write via insert_before() instead
         // (Already disabled in main.rs, but double-check for safety)
         output_manager.disable_stdout();
@@ -251,6 +219,8 @@ impl TuiRenderer {
             history_index: None,
             scrollback,
             viewport_height,
+            shadow_buffer,
+            prev_frame_buffer,
             needs_full_refresh: false,
             last_refresh: std::time::Instant::now(),
             refresh_interval: Duration::from_millis(100), // 10 FPS - blit to overwrite visible area
@@ -414,13 +384,11 @@ impl TuiRenderer {
         self.is_active
     }
 
-    /// Flush pending output to terminal scrollback via insert_before()
-    /// Syncs OutputManager messages to ScrollbackBuffer, then renders new ones
+    /// Flush pending output to terminal scrollback using shadow buffer with diff-based updates
+    /// Syncs OutputManager messages to ScrollbackBuffer, then renders using shadow buffer
     pub fn flush_output_safe(&mut self, output_manager: &OutputManager) -> Result<()> {
-        use std::sync::Arc;
-
-        // Track new messages to render
-        let mut new_messages_to_render: Vec<MessageRef> = Vec::new();
+        // Track if any messages changed
+        let mut messages_changed = false;
 
         // Get all trait-based messages from OutputManager
         let messages = output_manager.get_messages();
@@ -428,89 +396,65 @@ impl TuiRenderer {
         for msg in &messages {
             let msg_id = msg.id();
 
-            // Add to shadow buffer if not already there
+            // Add to scrollback if not already there
             if self.scrollback.get_message(msg_id).is_none() {
                 self.scrollback.add_message(msg.clone());
-                self.needs_full_refresh = true; // New message = needs refresh
-            }
-
-            // Only write Complete messages to terminal scrollback permanently (once)
-            // Status checking ONLY for permanent scrollback writes, not for rendering decisions
-            if matches!(msg.status(), crate::cli::messages::MessageStatus::Complete) {
-                if !self.written_message_ids.contains(&msg_id) {
-                    new_messages_to_render.push(msg.clone());
-                    self.written_message_ids.insert(msg_id);
-                }
+                messages_changed = true;
             }
         }
 
         // If there are any messages, trigger refresh to keep visible area updated
-        // (Messages update in place via Arc<RwLock<>>, so periodic blit keeps display current)
+        // (Messages update in place via Arc<RwLock<>>, so we need to re-render)
         if !messages.is_empty() {
-            self.needs_full_refresh = true;
+            messages_changed = true;
         }
 
-        // Render new messages to terminal scrollback using insert_before()
-        if !new_messages_to_render.is_empty() {
-            // Build the complete text first to let Ratatui calculate exact height
-            let mut all_lines: Vec<Line> = Vec::new();
-
-            for msg in &new_messages_to_render {
-                let formatted = msg.format();
-                for line in formatted.lines() {
-                    all_lines.push(Line::raw(line.to_string()));
-                }
-                // Add blank line between messages
-                all_lines.push(Line::raw(""));
-            }
-
-            // Calculate height with generous padding to avoid truncation
-            // Long paths can wrap unpredictably, so we over-allocate rather than under-allocate
-            let (term_width, _) = crossterm::terminal::size()?;
-            let width = term_width as usize;
-
-            let mut estimated_lines: usize = 0;
-            for line in &all_lines {
-                let text = line.to_string();
-                let visible_len = Self::visible_length(&text);
-                if visible_len == 0 {
-                    estimated_lines += 1;  // Empty line = 1 row
-                } else {
-                    // Calculate wrapped lines, then add 50% padding for safety
-                    // This accounts for word breaks, ANSI codes, and rendering quirks
-                    let wrapped = (visible_len + width - 1) / width.max(1);
-                    estimated_lines += wrapped + (wrapped / 2).max(1);
-                }
-            }
-
-            let num_lines_u16 = estimated_lines.min(u16::MAX as usize) as u16;
-
-            // Use synchronized update to prevent flickering
-            use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-            execute!(io::stdout(), BeginSynchronizedUpdate)?;
-
-            // Use insert_before() to write to terminal scrollback
-            // Note: all_lines is moved into the closure
-            self.terminal.insert_before(num_lines_u16, |buf| {
-                let text = Text::from(all_lines.clone());
-                let paragraph = Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false });
-                paragraph.render(buf.area, buf);
-            })?;
-
-            execute!(io::stdout(), EndSynchronizedUpdate)?;
-
-            // Update ring buffer to track rendered lines
-            for msg in &new_messages_to_render {
-                let formatted = msg.format();
-                let num_content_lines = formatted.lines().count();
-                for line_offset in 0..num_content_lines {
-                    self.scrollback.push_line(msg.id(), line_offset);
-                }
-            }
-
-            // Mark TUI for render (separator might need to move up)
-            self.needs_tui_render = true;
+        // Only update if messages changed
+        if !messages_changed {
+            return Ok(());
         }
+
+        // Render messages to shadow buffer (with proper wrapping)
+        let all_messages = self.scrollback.get_visible_messages();
+        self.shadow_buffer.render_messages(&all_messages);
+
+        // Diff with previous frame to get changes
+        let changes = diff_buffers(&self.shadow_buffer, &self.prev_frame_buffer);
+
+        if changes.is_empty() {
+            return Ok(()); // No visual changes
+        }
+
+        // Get terminal size
+        let (term_width, term_height) = crossterm::terminal::size()?;
+        let visible_rows = term_height.saturating_sub(6); // -6 for inline viewport
+
+        // Apply changes to terminal
+        use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+        use crossterm::style::Print;
+
+        let mut stdout = io::stdout();
+        execute!(stdout, BeginSynchronizedUpdate)?;
+
+        for (x, y, cell) in changes {
+            // Only update cells within visible area
+            if (y as u16) < visible_rows {
+                execute!(
+                    stdout,
+                    cursor::MoveTo(x as u16, y as u16),
+                    Print(cell.ch)
+                )?;
+            }
+        }
+
+        execute!(stdout, EndSynchronizedUpdate)?;
+        stdout.flush()?;
+
+        // Update previous frame buffer
+        self.prev_frame_buffer = self.shadow_buffer.clone_buffer();
+
+        // Mark TUI for render (input/status area might need update)
+        self.needs_tui_render = true;
 
         Ok(())
     }
@@ -734,57 +678,31 @@ impl TuiRenderer {
         Ok(())
     }
 
-    /// Full refresh of viewport from shadow buffer
-    /// Uses MoveTo/Print to overwrite visible area with current state
-    /// This prevents duplicates - insert_before() writes to scrollback,
-    /// but blit overwrites visible area with latest content
+    /// Full refresh of viewport using shadow buffer
+    /// Renders all messages to shadow buffer, then updates terminal
     fn full_refresh_viewport(&mut self) -> Result<()> {
         use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
         use crossterm::style::Print;
 
         // Get terminal size
-        let (term_width, term_height) = crossterm::terminal::size()?;
+        let (_term_width, term_height) = crossterm::terminal::size()?;
 
         // Calculate visible scrollback area (above inline viewport)
-        // Inline viewport is 6 lines at bottom, so visible area is rows 0 to (height - 7)
-        let visible_rows = term_height.saturating_sub(7); // -6 for inline, -1 for 0-indexing
+        let visible_rows = term_height.saturating_sub(6); // -6 for inline viewport
 
         if visible_rows == 0 {
             return Ok(()); // Terminal too small
         }
 
-        // Get all messages from shadow buffer (no status filtering!)
-        let messages = self.scrollback.get_visible_messages();
+        // Render all messages to shadow buffer (with proper wrapping)
+        let all_messages = self.scrollback.get_visible_messages();
+        self.shadow_buffer.render_messages(&all_messages);
 
-        if messages.is_empty() {
-            return Ok(());
-        }
-
-        // Format ALL messages from shadow buffer
-        let mut all_lines: Vec<String> = Vec::new();
-        for msg in &messages {
-            let formatted = msg.format();
-            for line in formatted.lines() {
-                all_lines.push(line.to_string());
-            }
-        }
-
-        if all_lines.is_empty() {
-            return Ok(()); // Nothing to blit
-        }
-
-        // Calculate how many lines we can fit
-        let num_lines = all_lines.len().min(visible_rows as usize);
-        let lines_to_render = &all_lines[all_lines.len().saturating_sub(num_lines)..];
-
-        // Render bottom-aligned (just above inline viewport)
-        // Start at row (visible_rows - num_lines) so content appears at bottom
-        let start_row = visible_rows.saturating_sub(num_lines as u16);
-
+        // Clear terminal and render entire shadow buffer
         let mut stdout = io::stdout();
         execute!(stdout, BeginSynchronizedUpdate)?;
 
-        // Clear the entire visible area first
+        // Clear the entire visible area
         for row in 0..visible_rows {
             execute!(
                 stdout,
@@ -793,18 +711,26 @@ impl TuiRenderer {
             )?;
         }
 
-        // Render lines bottom-aligned
-        for (idx, line) in lines_to_render.iter().enumerate() {
-            let row = start_row + idx as u16;
-            execute!(
-                stdout,
-                cursor::MoveTo(0, row),
-                Print(line)
-            )?;
+        // Render shadow buffer to terminal
+        for y in 0..self.shadow_buffer.height {
+            for x in 0..self.shadow_buffer.width {
+                if let Some(cell) = self.shadow_buffer.get(x, y) {
+                    if cell.ch != ' ' { // Skip empty cells for efficiency
+                        execute!(
+                            stdout,
+                            cursor::MoveTo(x as u16, y as u16),
+                            Print(cell.ch)
+                        )?;
+                    }
+                }
+            }
         }
 
         execute!(stdout, EndSynchronizedUpdate)?;
         stdout.flush()?;
+
+        // Update previous frame buffer
+        self.prev_frame_buffer = self.shadow_buffer.clone_buffer();
 
         Ok(())
     }
@@ -896,12 +822,16 @@ impl TuiRenderer {
         self.viewport_height = new_viewport_height;
         self.scrollback.update_viewport(new_viewport_height, width as usize);
 
+        // Resize shadow buffers
+        let visible_rows = height.saturating_sub(6) as usize; // -6 for inline viewport
+        self.shadow_buffer.resize(width as usize, visible_rows);
+        self.prev_frame_buffer.resize(width as usize, visible_rows);
+
         // Rebuild ring buffer with new line counts
         self.scrollback.rebuild_ring_buffer();
 
-        // NOTE: No full refresh needed with inline viewport
-        // Terminal scrollback content is already there
-        // Just need to re-render TUI components (which happens on next render())
+        // Force full refresh after resize
+        self.needs_full_refresh = true;
         self.needs_tui_render = true;
 
         Ok(())
