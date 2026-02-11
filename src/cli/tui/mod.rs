@@ -91,14 +91,16 @@ pub struct TuiRenderer {
     last_refresh: std::time::Instant,
     /// Refresh interval during streaming
     refresh_interval: Duration,
+    /// Last blit timestamp (for rate limiting)
+    last_blit: std::time::Instant,
+    /// Blit rate limit (min interval between blits)
+    blit_interval: Duration,
     /// Whether TUI needs to be redrawn (double buffering)
     needs_tui_render: bool,
     /// Previous input text (for change detection)
     prev_input_text: String,
     /// Previous status bar content (for change detection)
     prev_status_content: String,
-    /// Track which messages have been permanently written to terminal scrollback
-    written_message_ids: std::collections::HashSet<MessageId>,
 }
 
 impl TuiRenderer {
@@ -238,10 +240,11 @@ impl TuiRenderer {
             needs_full_refresh: false,
             last_refresh: std::time::Instant::now(),
             refresh_interval: Duration::from_millis(100), // 10 FPS - blit to overwrite visible area
+            last_blit: std::time::Instant::now(),
+            blit_interval: Duration::from_millis(50), // 20 FPS max for blitting
             needs_tui_render: true, // Initial render needed
             prev_input_text: String::new(),
             prev_status_content: String::new(),
-            written_message_ids: std::collections::HashSet::new(),
         })
     }
 
@@ -401,8 +404,8 @@ impl TuiRenderer {
     /// Flush pending output to terminal scrollback using insert_before() for complete messages
     /// and shadow buffer for visible area updates
     pub fn flush_output_safe(&mut self, output_manager: &OutputManager) -> Result<()> {
-        // Track new messages to render permanently to scrollback
-        let mut new_complete_messages: Vec<MessageRef> = Vec::new();
+        // Track new messages to write to terminal scrollback
+        let mut new_messages: Vec<MessageRef> = Vec::new();
 
         // Get all trait-based messages from OutputManager
         let messages = output_manager.get_messages();
@@ -410,19 +413,14 @@ impl TuiRenderer {
         for msg in &messages {
             let msg_id = msg.id();
 
-            // Add to scrollback buffer if not already there
+            // If message not in scrollback yet, it's NEW - add and write to terminal
             if self.scrollback.get_message(msg_id).is_none() {
                 self.scrollback.add_message(msg.clone());
+                new_messages.push(msg.clone());
                 self.needs_full_refresh = true;
             }
-
-            // Only write Complete messages to terminal scrollback permanently (once)
-            if matches!(msg.status(), crate::cli::messages::MessageStatus::Complete) {
-                if !self.written_message_ids.contains(&msg_id) {
-                    new_complete_messages.push(msg.clone());
-                    self.written_message_ids.insert(msg_id);
-                }
-            }
+            // Otherwise it's an UPDATE - message already in scrollback
+            // Updates happen via Arc<RwLock<>>, shadow buffer sees them automatically
         }
 
         // If there are any messages, trigger refresh to keep visible area updated
@@ -430,14 +428,14 @@ impl TuiRenderer {
             self.needs_full_refresh = true;
         }
 
-        // Write complete messages to terminal scrollback using insert_before()
+        // Write new messages to terminal scrollback using insert_before()
         // This pushes content up above the inline viewport (permanent, scrollable)
-        if !new_complete_messages.is_empty() {
+        if !new_messages.is_empty() {
             let (term_width, _) = crossterm::terminal::size()?;
 
             // Format messages with proper wrapping using shadow buffer
             let mut wrapped_lines = Vec::new();
-            for msg in &new_complete_messages {
+            for msg in &new_messages {
                 let formatted = msg.format();
                 for line in formatted.lines() {
                     // Use shadow buffer's wrapping logic
@@ -479,6 +477,13 @@ impl TuiRenderer {
 
             // Mark TUI for render (separator might need to move)
             self.needs_tui_render = true;
+        }
+
+        // Blit updates to visible area with rate limiting
+        // diff_buffers() will return empty if nothing changed (fast early return)
+        if !messages.is_empty() && self.last_blit.elapsed() >= self.blit_interval {
+            self.blit_visible_area()?;
+            self.last_blit = std::time::Instant::now();
         }
 
         Ok(())
@@ -752,6 +757,72 @@ impl TuiRenderer {
                     cursor::MoveTo(0, y as u16),
                     Print(line_content)
                 )?;
+            }
+        }
+
+        execute!(stdout, EndSynchronizedUpdate)?;
+        stdout.flush()?;
+
+        // Update previous frame buffer
+        self.prev_frame_buffer = self.shadow_buffer.clone_buffer();
+
+        Ok(())
+    }
+
+    /// Blit only changed cells to visible area using diff-based updates
+    /// More efficient than full_refresh_viewport() for streaming updates
+    fn blit_visible_area(&mut self) -> Result<()> {
+        use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+        use crossterm::style::Print;
+        use std::collections::HashMap;
+
+        // Get terminal size
+        let (_term_width, term_height) = crossterm::terminal::size()?;
+        let visible_rows = term_height.saturating_sub(6); // -6 for inline viewport
+
+        if visible_rows == 0 {
+            return Ok(()); // Terminal too small
+        }
+
+        // Render all visible messages to shadow buffer
+        let all_messages = self.scrollback.get_visible_messages();
+        self.shadow_buffer.render_messages(&all_messages);
+
+        // Diff with previous frame to find changes
+        let changes = diff_buffers(&self.shadow_buffer, &self.prev_frame_buffer);
+
+        if changes.is_empty() {
+            return Ok(()); // No changes to apply
+        }
+
+        // Group changes by row for efficient line-based clearing
+        let mut changes_by_row: HashMap<usize, Vec<(usize, char)>> = HashMap::new();
+
+        for (x, y, cell) in changes {
+            if (y as u16) < visible_rows {
+                changes_by_row.entry(y).or_insert_with(Vec::new).push((x, cell.ch));
+            }
+        }
+
+        // Apply changes to terminal
+        let mut stdout = io::stdout();
+        execute!(stdout, BeginSynchronizedUpdate)?;
+
+        for (row, _cells) in changes_by_row {
+            // Clear line and write entire row (more efficient than per-cell updates)
+            execute!(stdout, cursor::MoveTo(0, row as u16), Clear(ClearType::UntilNewLine))?;
+
+            // Build full line content from shadow buffer
+            let mut line_content = String::new();
+            for x in 0..self.shadow_buffer.width {
+                if let Some(cell) = self.shadow_buffer.get(x, row) {
+                    line_content.push(cell.ch);
+                }
+            }
+
+            // Write entire line at once
+            if !line_content.is_empty() {
+                execute!(stdout, cursor::MoveTo(0, row as u16), Print(line_content))?;
             }
         }
 
