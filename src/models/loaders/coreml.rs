@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use candle_core::Device;
+use std::collections::HashMap;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
@@ -50,10 +51,15 @@ impl TextGeneration for CoreMLGenerator {
 
         // Call CoreML model's complete_text method
         // Note: Uses fixed temperature (0.7) and top_k (50) internally
+        tracing::debug!("Calling model.complete_text with input_len={}, max_tokens={}", input_text.len(), max_new_tokens);
+
         let output_text = self
             .model
             .complete_text(&input_text, max_new_tokens)
-            .map_err(|e| anyhow::anyhow!("CoreML generation failed: {}", e))?;
+            .map_err(|e| {
+                tracing::error!("CoreML complete_text error: {:?}", e);
+                anyhow::anyhow!("CoreML generation failed: {}", e)
+            })?;
 
         tracing::debug!(
             "CoreML generated {} chars from {} input chars",
@@ -78,6 +84,85 @@ impl TextGeneration for CoreMLGenerator {
     fn name(&self) -> &str {
         &self.name
     }
+}
+
+/// Read tensor specs from .mlmodelc metadata.json
+#[cfg(target_os = "macos")]
+fn read_mlmodelc_metadata(mlmodelc_path: &Path) -> Result<(HashMap<String, candle_coreml::config::TensorConfig>, HashMap<String, candle_coreml::config::TensorConfig>)> {
+    use serde_json::Value;
+    use std::fs;
+
+    let metadata_path = mlmodelc_path.join("metadata.json");
+    if !metadata_path.exists() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
+
+    let metadata_str = fs::read_to_string(&metadata_path)
+        .context("Failed to read metadata.json")?;
+
+    let metadata: Value = serde_json::from_str(&metadata_str)
+        .context("Failed to parse metadata.json")?;
+
+    let mut inputs = HashMap::new();
+    let mut outputs = HashMap::new();
+
+    // Metadata is an array with one object
+    if let Some(model_info) = metadata.as_array().and_then(|arr| arr.first()) {
+        // Parse input schema
+        if let Some(input_schema) = model_info.get("inputSchema").and_then(|v| v.as_array()) {
+            for input in input_schema {
+                if let (Some(name), Some(shape_str), Some(data_type)) = (
+                    input.get("name").and_then(|v| v.as_str()),
+                    input.get("shape").and_then(|v| v.as_str()),
+                    input.get("dataType").and_then(|v| v.as_str()),
+                ) {
+                    // Parse shape string like "[1, 64]" into Vec<usize>
+                    let shape: Vec<usize> = shape_str
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+
+                    inputs.insert(
+                        name.to_string(),
+                        candle_coreml::config::TensorConfig {
+                            name: name.to_string(),
+                            shape,
+                            data_type: data_type.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Parse output schema
+        if let Some(output_schema) = model_info.get("outputSchema").and_then(|v| v.as_array()) {
+            for output in output_schema {
+                if let (Some(name), Some(shape_str), Some(data_type)) = (
+                    output.get("name").and_then(|v| v.as_str()),
+                    output.get("shape").and_then(|v| v.as_str()),
+                    output.get("dataType").and_then(|v| v.as_str()),
+                ) {
+                    let shape: Vec<usize> = shape_str
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+
+                    outputs.insert(
+                        name.to_string(),
+                        candle_coreml::config::TensorConfig {
+                            name: name.to_string(),
+                            shape,
+                            data_type: data_type.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Ok((inputs, outputs))
 }
 
 /// Parse meta.yaml file into candle-coreml ModelConfig
@@ -114,16 +199,21 @@ fn parse_meta_yaml(meta_path: &Path) -> Result<candle_coreml::config::ModelConfi
         .ok_or_else(|| anyhow::anyhow!("Missing context_length in meta.yaml"))?
         as usize;
 
-    let batch_size = params
-        .get("batch_size")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1) as usize;
+    // Note: meta.yaml may list batch_size=64, but CoreML models often expect batch_size=1
+    // for single-query inference. Override to 1 to match CoreML expectations.
+    let batch_size = 1;
 
     let architecture = model_info_yaml
         .get("architecture")
         .and_then(|v| v.as_str())
         .unwrap_or("qwen")
         .to_string();
+
+    // Get model prefix from parameters (e.g., "qwen")
+    let model_prefix = params
+        .get("model_prefix")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // Create ModelInfo
     let model_info = candle_coreml::config::ModelInfo {
@@ -144,40 +234,73 @@ fn parse_meta_yaml(meta_path: &Path) -> Result<candle_coreml::config::ModelConfi
         vocab_size: 151_936, // Standard Qwen vocab size
     };
 
-    // Discover .mlmodelc components in the directory
+    // Read component paths from meta.yaml with flexible pattern matching
     let model_dir = meta_path.parent().unwrap();
     let mut components: HashMap<String, candle_coreml::config::ComponentConfig> = HashMap::new();
 
-    // Scan directory for .mlmodelc files
-    if let Ok(entries) = std::fs::read_dir(model_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && path.extension().and_then(|s| s.to_str()) == Some("mlmodelc") {
-                let filename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                let path_str = path.to_string_lossy().to_string();
+    // Extract component file patterns from meta.yaml
+    if let Some(params) = yaml.get("model_info").and_then(|m| m.get("parameters")) {
+        // Read component filename patterns from meta.yaml
+        let component_mappings = [
+            ("embeddings", params.get("embeddings")),
+            ("lm_head", params.get("lm_head")),
+            ("ffn_prefill", params.get("ffn")), // FFN PF = ffn_prefill
+            ("ffn_infer", params.get("ffn")), // Use same FFN for inference (unified mode)
+        ];
 
-                // Map filenames to component names
-                let component_name = if filename.contains("embedding") {
-                    Some("embeddings")
-                } else if filename.contains("lm_head") {
-                    Some("lm_head")
-                } else if filename.contains("FFN") || filename.contains("ffn") {
-                    Some("ffn")
-                } else {
-                    None
-                };
+        for (component_name, filename_value) in component_mappings {
+            if let Some(filename_pattern) = filename_value.and_then(|v| v.as_str()) {
+                // Remove .mlmodelc extension to get base pattern
+                let base_pattern = filename_pattern.trim_end_matches(".mlmodelc");
 
-                if let Some(name) = component_name {
-                    tracing::debug!("Discovered CoreML component: {} -> {}", name, filename);
-                    components.insert(
-                        name.to_string(),
-                        candle_coreml::config::ComponentConfig {
-                            file_path: Some(path_str),
-                            inputs: HashMap::new(),
-                            outputs: HashMap::new(),
-                            functions: vec![],
-                            input_order: None,
-                        },
+                // Scan directory for files matching this pattern (handle chunk suffixes)
+                let mut found = false;
+                if let Ok(entries) = std::fs::read_dir(model_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() && path.extension().and_then(|s| s.to_str()) == Some("mlmodelc") {
+                            let filename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                            // Match if filename starts with base pattern
+                            if filename.starts_with(base_pattern) {
+                                let path_str = path.to_string_lossy().to_string();
+
+                                // Read tensor specs from metadata.json
+                                let (inputs, outputs) = read_mlmodelc_metadata(&path)
+                                    .unwrap_or_else(|e| {
+                                        tracing::warn!("Failed to read metadata for {}: {}", filename, e);
+                                        (HashMap::new(), HashMap::new())
+                                    });
+
+                                tracing::debug!(
+                                    "Found CoreML component '{}': {} ({} inputs, {} outputs)",
+                                    component_name,
+                                    filename,
+                                    inputs.len(),
+                                    outputs.len()
+                                );
+
+                                components.insert(
+                                    component_name.to_string(),
+                                    candle_coreml::config::ComponentConfig {
+                                        file_path: Some(path_str),
+                                        inputs,
+                                        outputs,
+                                        functions: vec![],
+                                        input_order: None,
+                                    },
+                                );
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if !found {
+                    tracing::warn!(
+                        "Component {} pattern '{}' not found in directory",
+                        component_name,
+                        base_pattern
                     );
                 }
             }
@@ -186,12 +309,14 @@ fn parse_meta_yaml(meta_path: &Path) -> Result<candle_coreml::config::ModelConfi
 
     if components.is_empty() {
         return Err(anyhow::anyhow!(
-            "No .mlmodelc components found in {:?}. Expected files like qwen_embeddings.mlmodelc",
-            model_dir
+            "No .mlmodelc components found in meta.yaml. Expected parameters.embeddings, parameters.lm_head, parameters.ffn"
         ));
     }
 
-    tracing::debug!("Discovered {} CoreML components", components.len());
+    tracing::debug!(
+        "Loaded {} CoreML components from meta.yaml",
+        components.len()
+    );
 
     // Create NamingConfig (using empty patterns - file paths are explicit)
     let naming = candle_coreml::config::NamingConfig {
@@ -317,6 +442,13 @@ pub fn load(model_path: &Path, family: ModelFamily, size: ModelSize) -> Result<B
 
     // Create QwenConfig from ModelConfig
     let qwen_config = candle_coreml::qwen::QwenConfig::from_model_config(model_config);
+
+    tracing::debug!(
+        "Loaded {} components, batch_size={}, context_length={}",
+        qwen_config.model_config.components.len(),
+        qwen_config.model_config.shapes.batch_size,
+        qwen_config.model_config.shapes.context_length
+    );
 
     // Pass the config with discovered components to QwenModel
     let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, Some(qwen_config))
