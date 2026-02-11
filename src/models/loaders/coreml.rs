@@ -264,15 +264,16 @@ pub fn load(model_path: &Path, family: ModelFamily, size: ModelSize) -> Result<B
         })
         .context("Failed to load meta.yaml - check file format")?;
 
-    tracing::debug!("Model config loaded with {} components", model_config.components.len());
+    tracing::debug!("Model config parsed (auto-discovery mode)");
 
-    // Create QwenConfig from ModelConfig
-    let qwen_config = candle_coreml::qwen::QwenConfig::from_model_config(model_config);
-
-    // QwenModel::load_from_directory with config
-    let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, Some(qwen_config))
+    // Use None for config to let QwenModel auto-discover components
+    // The meta.yaml provides context but QwenModel will discover the actual
+    // component files (.mlmodelc) in the directory automatically
+    let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, None)
         .map_err(|e| {
             tracing::error!("CoreML load error: {:?}", e);
+            tracing::error!("Note: CoreML models must have .mlmodelc files in the directory");
+            tracing::error!("Expected files: qwen_embeddings.mlmodelc, qwen_lm_head.mlmodelc, qwen_FFN_*.mlmodelc");
             e
         })
         .context("Failed to load CoreML model components")?;
