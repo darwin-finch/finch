@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use super::lifecycle::DaemonLifecycle;
 
 /// Default daemon bind address
-const DEFAULT_BIND: &str = "127.0.0.1:11434";
+const DEFAULT_BIND: &str = "127.0.0.1:11435";
 
 /// Ensure daemon is running, spawning if necessary
 ///

@@ -30,7 +30,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1:11434".to_string(),
+            bind_address: "127.0.0.1:11435".to_string(), // Port 11435 (11434 is used by Ollama)
             auto_spawn: true,
             timeout_seconds: 120,
         }

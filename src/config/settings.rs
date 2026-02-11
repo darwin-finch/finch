@@ -83,7 +83,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             use_daemon: true, // Enabled by default (daemon-only mode)
-            daemon_address: "127.0.0.1:11434".to_string(),
+            daemon_address: "127.0.0.1:11435".to_string(), // Port 11435 (11434 is used by Ollama)
             auto_spawn: true,
             timeout_seconds: 120,
         }
