@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use ort::session::Session;
+use ort::{
+    ep,
+    session::{Session, builder::GraphOptimizationLevel},
+};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use tokenizers::Tokenizer;
@@ -27,13 +30,19 @@ impl OnnxLoader {
     ) -> Result<Session> {
         info!("Creating ONNX session from: {:?}", model_path);
 
-        // Get execution providers based on config
-        let _execution_providers = self.get_execution_providers(config);
-
-        // Create session with providers
-        let session = Session::builder()?
+        // Build execution provider list
+        let mut builder = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?  // Parallel ops within layer
+            .with_intra_threads(4)?;  // Parallel ops within layer
+
+        // Add execution providers based on config
+        let providers = self.get_execution_providers(config);
+        if !providers.is_empty() {
+            builder = builder.with_execution_providers(providers)?;
+        }
+
+        // Create session
+        let session = builder
             .commit_from_file(model_path)
             .context("Failed to create ONNX session")?;
 
@@ -43,30 +52,44 @@ impl OnnxLoader {
     }
 
     /// Get execution providers based on backend configuration
-    fn get_execution_providers(&self, config: &OnnxLoadConfig) -> Vec<ExecutionProvider> {
+    fn get_execution_providers(&self, config: &OnnxLoadConfig) -> Vec<ort::ep::ExecutionProviderDispatch> {
         let mut providers = vec![];
 
         // Add execution providers based on config
         if let Some(exec_providers) = &config.execution_providers {
             for provider in exec_providers {
                 match provider {
-                    super::onnx_config::ExecutionProvider::CoreML => {
+                    ConfigExecutionProvider::CoreML => {
                         #[cfg(target_os = "macos")]
                         {
                             info!("Requesting CoreML execution provider");
-                            providers.push(ExecutionProvider::CoreML(Default::default()));
+                            providers.push(ep::CoreML::default().build());
                         }
                     }
-                    super::onnx_config::ExecutionProvider::CUDA => {
+                    ConfigExecutionProvider::CUDA => {
                         #[cfg(feature = "cuda")]
                         {
                             info!("Requesting CUDA execution provider");
-                            providers.push(ExecutionProvider::CUDA(Default::default()));
+                            providers.push(ep::CUDA::default().build());
                         }
                     }
-                    super::onnx_config::ExecutionProvider::CPU => {
+                    ConfigExecutionProvider::CPU => {
                         info!("Requesting CPU execution provider");
-                        providers.push(ExecutionProvider::CPU(Default::default()));
+                        providers.push(ep::CPU::default().build());
+                    }
+                    ConfigExecutionProvider::TensorRT => {
+                        #[cfg(feature = "cuda")]
+                        {
+                            info!("Requesting TensorRT execution provider");
+                            providers.push(ep::TensorRT::default().build());
+                        }
+                    }
+                    ConfigExecutionProvider::DirectML => {
+                        #[cfg(target_os = "windows")]
+                        {
+                            info!("Requesting DirectML execution provider");
+                            providers.push(ep::DirectML::default().build());
+                        }
                     }
                 }
             }
@@ -75,19 +98,19 @@ impl OnnxLoader {
             #[cfg(target_os = "macos")]
             {
                 info!("Auto-selecting: Trying CoreML");
-                providers.push(ExecutionProvider::CoreML(Default::default()));
+                providers.push(ep::CoreML::default().build());
             }
 
             #[cfg(feature = "cuda")]
             {
                 info!("Auto-selecting: Trying CUDA");
-                providers.push(ExecutionProvider::CUDA(Default::default()));
+                providers.push(ep::CUDA::default().build());
             }
         }
 
         // Always add CPU as fallback
         info!("Adding CPU as fallback provider");
-        providers.push(ExecutionProvider::CPU(Default::default()));
+        providers.push(ep::CPU::default().build());
 
         providers
     }
