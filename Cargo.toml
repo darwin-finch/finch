@@ -67,23 +67,17 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 # Text processing for TF-IDF
 rust-stemmers = "1.2"
 
-# Machine Learning (Candle - to be removed in Phase 4)
-candle-core = { version = "0.9", features = ["metal"] }
-candle-nn = "0.9"
-candle-transformers = "0.9"
-tokenizers = "0.21"
-rand = "0.8"
-hf-hub = "0.4"  # HuggingFace Hub integration for model downloads
-indicatif = "0.17"  # Progress bars for download tracking
-
-# ONNX Runtime (Phase 1: New inference backend)
+# Machine Learning (ONNX Runtime - Phase 4: Candle removed)
 ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
 sysinfo = "0.32"  # System RAM detection for model selection
+tokenizers = "0.21"  # Tokenization (kept, used by ONNX loader)
+hf-hub = "0.4"  # HuggingFace Hub integration for model downloads
+indicatif = "0.17"  # Progress bars for download tracking
+rand = "0.8"  # Random number generation for sampling
 
-# CoreML support (macOS only)
+# CoreML support via ONNX Runtime execution provider (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-coreml = "0.3"
-serde_yaml = "0.9"  # For parsing meta.yaml files
+# candle-coreml removed - using ort's CoreML EP instead
 
 # For web tools (Phase 3)
 scraper = "0.18"

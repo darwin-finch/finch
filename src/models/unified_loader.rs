@@ -2,18 +2,14 @@
 // Enables users to run Qwen, Gemma, Llama, or Mistral on CoreML, Metal, CUDA, or CPU
 
 use anyhow::{Context, Result};
-use candle_core::Device;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::config::BackendDevice;
-use super::common::DevicePreference;
-use super::download::ModelDownloader;
-use super::loaders;
 use super::loaders::onnx::{OnnxLoader, LoadedOnnxModel};
 use super::loaders::onnx_config::{OnnxLoadConfig, ModelSize as OnnxModelSize};
-use super::model_selector::QwenSize;
-use super::TextGeneration;
+
+// Phase 4: Candle removed, ONNX only
+// Legacy types kept for compatibility (will be removed after migration complete)
 
 /// Configuration for loading any model on any backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,7 +220,26 @@ impl UnifiedModelLoader {
     }
 
     /// Load model with automatic download and backend selection
-    pub fn load(&self, config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
+    ///
+    /// DEPRECATED: Use load_onnx() instead (Phase 4: Candle removed)
+    pub fn load(&self, _config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
+        anyhow::bail!(
+            "Candle-based loading removed in Phase 4.\n\
+             Use load_onnx() instead:\n\
+             \n\
+             let loader = UnifiedModelLoader::new()?;\n\
+             let model = loader.load_onnx(Some(16))?;  // 16GB RAM\n\
+             \n\
+             ONNX Runtime provides:\n\
+             - Working CoreML support (Apple Neural Engine)\n\
+             - Cross-platform (CoreML/TensorRT/DirectML)\n\
+             - LoRA adapter loading (Phase 5)"
+        )
+    }
+
+    /// DEPRECATED: Candle-based loading removed
+    #[allow(dead_code)]
+    fn load_legacy(&self, config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
         // 1. Resolve repository ID
         let repo_id = self.resolve_repository(&config)?;
 
@@ -367,11 +382,25 @@ impl UnifiedModelLoader {
     }
 
     /// Load model variant based on family + backend combination
+    ///
+    /// DEPRECATED: References deleted Candle loaders (Phase 4)
+    #[allow(dead_code, unused_variables)]
     fn load_model_variant(
         &self,
         config: &ModelLoadConfig,
-        model_path: &Path,
+        model_path: &std::path::Path,
     ) -> Result<Box<dyn TextGeneration>> {
+        anyhow::bail!("Candle loaders removed - use load_onnx() instead")
+    }
+
+    /// DEPRECATED: Old Candle-based implementation
+    #[allow(dead_code, unused_variables)]
+    fn load_model_variant_legacy(
+        &self,
+        config: &ModelLoadConfig,
+        model_path: &std::path::Path,
+    ) -> Result<Box<dyn TextGeneration>> {
+        /*
         match (&config.family, &config.backend) {
             // Qwen on CoreML (macOS only)
             #[cfg(target_os = "macos")]
@@ -486,9 +515,12 @@ impl UnifiedModelLoader {
                 )
             }
         }
+        */
+        // Commented out - Candle loaders removed in Phase 4
+        anyhow::bail!("Legacy Candle loading removed")
     }
 
-    /// Load ONNX model (Phase 3: New unified inference path)
+    /// Load ONNX model (Phase 4: Primary loading method)
     ///
     /// This will replace the Candle-based loaders in Phase 4.
     /// For now, it coexists with the old loaders for testing.

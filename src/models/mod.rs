@@ -4,48 +4,42 @@
 pub mod bootstrap; // Progressive bootstrap for instant startup
 pub mod common;
 pub mod download;
-pub mod ensemble;
-pub mod generator; // Legacy custom transformer
-pub mod generator_new; // New unified generator
+// pub mod ensemble; // Phase 4: Commented out (Candle-based)
+// pub mod generator; // Phase 4: Commented out (Legacy Candle transformer)
+pub mod generator_new; // New unified generator (ONNX-based)
 pub mod learning;
-pub mod loaders; // Family-specific model loaders (qwen, gemma, etc.)
-pub mod lora; // LoRA fine-tuning configuration
-pub mod lora_impl; // LoRA implementation (matrices, weighted examples)
-pub mod lora_trainer; // LoRA training loop
+pub mod loaders; // ONNX model loader
+pub mod lora; // LoRA fine-tuning configuration (Python training, Phase 5)
 pub mod manager;
 pub mod model_selector;
 pub mod persistence;
-pub mod router;
+// pub mod router; // Phase 4: Commented out (Candle-based)
 pub mod sampling; // Context-aware sampling system
 pub mod threshold_router;
 pub mod threshold_validator;
-pub mod tokenizer;
-pub mod unified_loader; // Generic loader for multiple model families/backends
-pub mod validator;
+// pub mod tokenizer; // Phase 4: Commented out (Candle-based)
+pub mod unified_loader; // Generic loader for ONNX models
+// pub mod validator; // Phase 4: Commented out (Candle-based)
 
 pub use bootstrap::{BootstrapLoader, DownloadProgressSnapshot, GeneratorState};
-pub use common::{
-    device_info, get_device, get_device_with_preference, is_metal_available, DevicePreference,
-    GeneratorConfig, ModelConfig, Saveable,
-};
+pub use common::{GeneratorConfig, ModelConfig};
 pub use download::{DownloadProgress, ModelDownloader};
-pub use ensemble::{EnsembleStats, ModelEnsemble, Quality, RouteDecision};
-// Export both old and new generator APIs for compatibility
-pub use generator::GeneratorModel as LegacyGeneratorModel;
+// pub use ensemble::{EnsembleStats, ModelEnsemble, Quality, RouteDecision}; // Phase 4: Candle-based
 pub use generator_new::{GeneratorModel, TextGeneration};
 pub use learning::{LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData};
-pub use lora::LoRAConfig;
-pub use lora_impl::{ExampleBuffer, LoRAAdapter, LoRALayer, WeightedExample};
-pub use lora_trainer::{LoRATrainer, TrainingCoordinator, TrainingStats};
+pub use lora::{
+    LoRAAdapter, LoRAConfig, LoRATrainer, TrainingCoordinator, TrainingStats, WeightedExample,
+    ExampleBuffer,
+};
 pub use manager::{ModelManager, OverallStats, TrainingReport};
 pub use model_selector::{ModelSelector, QwenSize};
 pub use persistence::{load_model_metadata, model_exists, save_model_with_metadata, ModelMetadata};
-pub use router::RouterModel;
+// pub use router::RouterModel; // Phase 4: Candle-based
 pub use sampling::{ComparisonResult, QueryCategory, Sampler, SamplingConfig, SamplingDecision};
 pub use threshold_router::{
     QueryCategory as ThresholdQueryCategory, ThresholdRouter, ThresholdRouterStats,
 };
 pub use threshold_validator::{QualitySignal, ThresholdValidator, ValidatorStats};
-pub use tokenizer::TextTokenizer;
+// pub use tokenizer::TextTokenizer; // Phase 4: Candle-based
 pub use unified_loader::{ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
-pub use validator::ValidatorModel;
+// pub use validator::ValidatorModel; // Phase 4: Candle-based

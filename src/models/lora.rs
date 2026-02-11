@@ -258,3 +258,98 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+// Phase 4: Stub types for removed Candle-based LoRA implementation
+// These will be replaced with Python/ONNX-based implementation in Phase 5
+
+/// Weighted training example (stub for Phase 5)
+#[derive(Debug, Clone)]
+pub struct WeightedExample {
+    pub query: String,
+    pub response: String,
+    pub weight: f64,
+}
+
+/// Example buffer for batching (stub for Phase 5)
+#[derive(Debug)]
+pub struct ExampleBuffer {
+    examples: Vec<WeightedExample>,
+}
+
+impl ExampleBuffer {
+    pub fn new() -> Self {
+        Self {
+            examples: Vec::new(),
+        }
+    }
+
+    pub fn add(&mut self, example: WeightedExample) {
+        self.examples.push(example);
+    }
+
+    pub fn len(&self) -> usize {
+        self.examples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.examples.is_empty()
+    }
+}
+
+/// LoRA trainer (stub for Phase 5)
+#[derive(Debug)]
+pub struct LoRATrainer {
+    config: LoRAConfig,
+}
+
+impl LoRATrainer {
+    pub fn new(config: LoRAConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn train(&mut self, _examples: &[WeightedExample]) -> Result<()> {
+        anyhow::bail!("LoRA training moved to Python (Phase 5)")
+    }
+}
+
+/// Training coordinator (stub for Phase 5)
+#[derive(Debug)]
+pub struct TrainingCoordinator {
+    buffer: ExampleBuffer,
+}
+
+impl TrainingCoordinator {
+    pub fn new() -> Self {
+        Self {
+            buffer: ExampleBuffer::new(),
+        }
+    }
+
+    pub fn add_example(&mut self, example: WeightedExample) {
+        self.buffer.add(example);
+    }
+
+    pub fn should_train(&self) -> bool {
+        false // Training will be external in Phase 5
+    }
+
+    pub fn train(&mut self) -> Result<()> {
+        anyhow::bail!("Training moved to external Python scripts (Phase 5)")
+    }
+}
+
+/// Training stats (stub for Phase 5)
+#[derive(Debug, Clone)]
+pub struct TrainingStats {
+    pub total_examples: usize,
+    pub loss: f64,
+}
+
+impl TrainingStats {
+    pub fn new() -> Self {
+        Self {
+            total_examples: 0,
+            loss: 0.0,
+        }
+    }
+}
