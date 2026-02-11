@@ -147,9 +147,24 @@ pub fn load(model_path: &Path, family: ModelFamily, size: ModelSize) -> Result<B
 
     // Load CoreML model using candle-coreml's Qwen API
     tracing::info!("Loading CoreML model components...");
+    tracing::debug!("Model path: {:?}", model_path);
+
+    // List directory contents for debugging
+    if let Ok(entries) = std::fs::read_dir(model_path) {
+        tracing::debug!("Directory contents:");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            tracing::debug!("  - {:?} (is_dir: {})", name, path.is_dir());
+        }
+    }
 
     // QwenModel::load_from_directory handles all the CoreML component loading
     let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, None)
+        .map_err(|e| {
+            tracing::error!("CoreML load error: {:?}", e);
+            e
+        })
         .context("Failed to load CoreML model components")?;
 
     tracing::info!("✓ Loaded {} {} on CoreML/ANE", family.name(), size_str);
