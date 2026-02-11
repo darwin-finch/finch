@@ -34,6 +34,10 @@ impl OnnxLoader {
     ) -> Result<Session> {
         info!("Creating ONNX session from: {:?}", model_path);
 
+        // Suppress ONNX Runtime logs (set before session creation)
+        // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
+        std::env::set_var("ORT_LOGGING_LEVEL", "2");  // Warning and above only
+
         // Build execution provider list
         let mut builder = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
