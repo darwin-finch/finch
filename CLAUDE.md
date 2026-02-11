@@ -236,7 +236,258 @@ fn route_with_generator_check(
 - `src/router/decision.rs` - Router, RouteDecision, route_with_generator_check()
 - `src/router/hybrid_router.rs` - Hybrid threshold + neural routing
 
-#### 5. **Tool Execution System** (`src/tools/`)
+#### 5. **TUI Renderer System** (`src/cli/tui/`)
+
+**Purpose:** Professional terminal UI with scrollback, streaming, and efficient updates
+
+**Architecture:**
+
+The TUI uses a dual-layer rendering system:
+1. **Terminal Scrollback** (permanent, scrollable with Shift+PgUp)
+   - Written via `insert_before()` for new messages
+   - Pushes content above the inline viewport
+   - Preserves full history (scrollable by user)
+
+2. **Inline Viewport** (6 lines at bottom, double-buffered)
+   - Separator line (visual boundary)
+   - Input area (4 lines, tui-textarea)
+   - Status bar (1 line, model/token info)
+
+**Key Innovation: Immediate Scrollback with Efficient Updates**
+
+Traditional approach (wrong):
+```
+New message → Wait for "Complete" status → Write to scrollback
+Problem: Streaming messages never appear in scrollback
+```
+
+Shammah's approach (correct):
+```
+New message → Write to scrollback immediately via insert_before()
+Message updates → Diff-based blitting to visible area only
+```
+
+**Flow Diagram:**
+
+```
+User Query / Response Update
+    ↓
+OutputManager has messages
+    ↓
+┌─────────────────────────────────────┐
+│ flush_output_safe()                  │
+└─────────────────────────────────────┘
+    ↓
+Check: msg in scrollback?
+    │
+    ├─ NO (NEW MESSAGE)
+    │   ↓
+    │   Add to ScrollbackBuffer
+    │   ↓
+    │   insert_before() writes to terminal scrollback
+    │   (pushes content above viewport)
+    │   (permanent, scrollable with Shift+PgUp)
+    │   ↓
+    │   Wraps long lines at terminal width
+    │   Preserves ANSI color codes
+    │
+    └─ YES (UPDATE MESSAGE)
+        ↓
+        Message already in scrollback
+        Updates via Arc<RwLock<>>
+        (shadow buffer sees changes automatically)
+    │
+    └───┬───┘
+        ↓
+┌─────────────────────────────────────┐
+│ blit_visible_area()                  │
+│ (diff-based updates to visible area) │
+└─────────────────────────────────────┘
+    ↓
+Render messages to shadow_buffer
+(2D char array with proper wrapping)
+    ↓
+diff_buffers(current, prev_frame)
+(find changed cells)
+    ↓
+Group changes by row
+    ↓
+Clear and rewrite changed rows only
+(BeginSynchronizedUpdate for tear-free)
+    ↓
+Update prev_frame_buffer
+```
+
+**Shadow Buffer System:**
+
+The shadow buffer is a 2D character array that handles:
+- Proper text wrapping at terminal width
+- ANSI escape code preservation (zero-width)
+- Diff-based rendering (only changed cells)
+- Bottom-aligned content (recent messages visible)
+
+```rust
+// Shadow buffer structure
+pub struct ShadowBuffer {
+    cells: Vec<Vec<Cell>>,  // [y][x]
+    width: usize,           // Terminal width
+    height: usize,          // Visible scrollback rows
+}
+
+pub struct Cell {
+    ch: char,               // Visible character
+    style: Style,           // Ratatui style (colors, etc.)
+}
+```
+
+**Key Methods:**
+
+1. **flush_output_safe()** - Main entry point
+   ```rust
+   // Check if message is NEW or UPDATE
+   if self.scrollback.get_message(msg_id).is_none() {
+       // NEW: Write to scrollback via insert_before()
+       self.scrollback.add_message(msg.clone());
+       new_messages.push(msg.clone());
+   }
+   // UPDATE: Already in scrollback, Arc<RwLock<>> propagates changes
+
+   // Write new messages to terminal scrollback
+   if !new_messages.is_empty() {
+       self.terminal.insert_before(num_lines, |buf| {
+           // Write wrapped lines above viewport
+       })?;
+   }
+
+   // Blit updates to visible area
+   if !messages.is_empty() {
+       self.blit_visible_area()?;
+   }
+   ```
+
+2. **blit_visible_area()** - Diff-based updates
+   ```rust
+   // Render all messages to shadow buffer
+   self.shadow_buffer.render_messages(&all_messages);
+
+   // Find changes since last frame
+   let changes = diff_buffers(&self.shadow_buffer, &self.prev_frame_buffer);
+
+   if changes.is_empty() {
+       return Ok(()); // No changes
+   }
+
+   // Group by row for efficient clearing
+   let mut changes_by_row: HashMap<usize, Vec<(usize, char)>> = HashMap::new();
+
+   // Apply changes (clear + rewrite changed rows)
+   for (row, _cells) in changes_by_row {
+       execute!(stdout, cursor::MoveTo(0, row), Clear(ClearType::UntilNewLine))?;
+       execute!(stdout, cursor::MoveTo(0, row), Print(line_content))?;
+   }
+
+   // Update previous frame buffer
+   self.prev_frame_buffer = self.shadow_buffer.clone_buffer();
+   ```
+
+3. **render_messages()** (shadow_buffer.rs) - Message → 2D array
+   ```rust
+   // Format all messages
+   let mut all_lines: Vec<String> = Vec::new();
+   for msg in messages {
+       let formatted = msg.format();
+       for line in formatted.lines() {
+           all_lines.push(line.to_string());
+       }
+   }
+
+   // Calculate wrapping (visible length excludes ANSI codes)
+   for line in &all_lines {
+       let visible_len = visible_length(line);
+       let rows = (visible_len + width - 1) / width.max(1);
+       // ...
+   }
+
+   // Bottom-align (recent messages visible)
+   let start_row = height.saturating_sub(accumulated_rows);
+
+   // Write wrapped chunks to 2D buffer
+   for line in lines_to_render {
+       let rows_consumed = self.write_line(current_y, line);
+       current_y += rows_consumed;
+   }
+   ```
+
+4. **visible_length() / extract_visible_chars()** - ANSI handling
+   ```rust
+   // Strip ANSI escape codes for accurate width calculation
+   pub fn visible_length(s: &str) -> usize {
+       let mut len = 0;
+       let mut chars = s.chars().peekable();
+
+       while let Some(c) = chars.next() {
+           match c {
+               '\x1b' => {
+                   // Skip CSI sequences (\x1b[...m)
+                   // Skip OSC sequences (\x1b]...\x07)
+               }
+               _ => len += 1,
+           }
+       }
+       len
+   }
+   ```
+
+**Architecture Principles:**
+
+1. ✅ **insert_before() = New messages only**
+   - Called once per message when added to ScrollbackBuffer
+   - Writes to terminal scrollback (permanent, scrollable)
+   - Check: `scrollback.get_message(msg_id).is_none()`
+
+2. ✅ **Shadow buffer + blitting = Updates only**
+   - Handles changes to existing messages efficiently
+   - Diff-based updates (only changed cells)
+   - Messages update via Arc<RwLock<>>, shadow buffer sees changes automatically
+
+3. ✅ **No "complete vs incomplete" distinction**
+   - ALL messages go to scrollback immediately
+   - Status doesn't affect scrollback writing
+   - Users can scroll up during streaming responses
+
+4. ✅ **ScrollbackBuffer prevents duplicates**
+   - Each message written exactly once via `get_message()` check
+   - No need for separate tracking (e.g., `written_message_ids`)
+
+5. ✅ **Proper wrapping and ANSI handling**
+   - Long lines wrap cleanly at terminal width
+   - ANSI color codes preserved (zero-width)
+   - No truncation or text bleeding
+
+**Benefits:**
+
+- **Immediate scrollback**: ALL messages appear in scrollback immediately (not after completion)
+- **Efficient updates**: Diff-based blitting (only changed cells updated)
+- **Full history**: Users can scroll up during streaming (Shift+PgUp)
+- **Clean architecture**: Simple separation (insert_before = new, blitting = updates)
+- **Professional UX**: No text ghosting, proper wrapping, synchronized updates
+
+**Key Files:**
+- `src/cli/tui/mod.rs` - TuiRenderer, flush_output_safe(), blit_visible_area()
+- `src/cli/tui/shadow_buffer.rs` - ShadowBuffer, diff_buffers(), visible_length()
+- `src/cli/tui/scrollback.rs` - ScrollbackBuffer (message tracking)
+- `src/cli/tui/input_widget.rs` - Input area rendering (tui-textarea)
+- `src/cli/tui/status_widget.rs` - Status bar rendering
+
+**Implementation Details:**
+
+See `TUI_SCROLLBACK_FIX_COMPLETE.md` for:
+- Full implementation details
+- Flow diagrams
+- Testing procedures
+- Architecture verification
+
+#### 6. **Tool Execution System** (`src/tools/`)
 
 **Purpose:** Enable Claude to inspect and modify code
 
@@ -261,7 +512,7 @@ fn route_with_generator_check(
 - `src/tools/implementations/` - Individual tool implementations
 - `src/tools/permissions.rs` - PermissionManager, approval patterns
 
-#### 6. **Claude Client** (`src/claude/`)
+#### 7. **Claude Client** (`src/claude/`)
 
 **Purpose:** Forward queries to Claude API, collect training data
 
@@ -276,7 +527,7 @@ fn route_with_generator_check(
 - `src/claude/client.rs` - ClaudeClient, send_message(), send_message_stream()
 - `src/claude/types.rs` - API request/response types
 
-#### 7. **Configuration** (`src/config/`)
+#### 8. **Configuration** (`src/config/`)
 
 **Purpose:** User preferences and API key management
 
