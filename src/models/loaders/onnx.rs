@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
+use ort::session::Session;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
-use super::onnx_config::{ExecutionProvider, ModelSize, OnnxLoadConfig};
+use super::onnx_config::{ExecutionProvider as ConfigExecutionProvider, ModelSize, OnnxLoadConfig};
 use crate::models::download::{DownloadProgress, ModelDownloader};
 
 /// ONNX model loader - downloads and loads models from HuggingFace
@@ -16,6 +17,79 @@ impl OnnxLoader {
     /// Create new ONNX loader with cache directory
     pub fn new(cache_dir: PathBuf) -> Self {
         Self { cache_dir }
+    }
+
+    /// Create ONNX Runtime session with execution providers
+    fn create_session(
+        &self,
+        model_path: &Path,
+        config: &OnnxLoadConfig,
+    ) -> Result<Session> {
+        info!("Creating ONNX session from: {:?}", model_path);
+
+        // Get execution providers based on config
+        let _execution_providers = self.get_execution_providers(config);
+
+        // Create session with providers
+        let session = Session::builder()?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(4)?  // Parallel ops within layer
+            .commit_from_file(model_path)
+            .context("Failed to create ONNX session")?;
+
+        info!("ONNX session created successfully");
+
+        Ok(session)
+    }
+
+    /// Get execution providers based on backend configuration
+    fn get_execution_providers(&self, config: &OnnxLoadConfig) -> Vec<ExecutionProvider> {
+        let mut providers = vec![];
+
+        // Add execution providers based on config
+        if let Some(exec_providers) = &config.execution_providers {
+            for provider in exec_providers {
+                match provider {
+                    super::onnx_config::ExecutionProvider::CoreML => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            info!("Requesting CoreML execution provider");
+                            providers.push(ExecutionProvider::CoreML(Default::default()));
+                        }
+                    }
+                    super::onnx_config::ExecutionProvider::CUDA => {
+                        #[cfg(feature = "cuda")]
+                        {
+                            info!("Requesting CUDA execution provider");
+                            providers.push(ExecutionProvider::CUDA(Default::default()));
+                        }
+                    }
+                    super::onnx_config::ExecutionProvider::CPU => {
+                        info!("Requesting CPU execution provider");
+                        providers.push(ExecutionProvider::CPU(Default::default()));
+                    }
+                }
+            }
+        } else {
+            // Default: Try platform-specific providers first, then CPU
+            #[cfg(target_os = "macos")]
+            {
+                info!("Auto-selecting: Trying CoreML");
+                providers.push(ExecutionProvider::CoreML(Default::default()));
+            }
+
+            #[cfg(feature = "cuda")]
+            {
+                info!("Auto-selecting: Trying CUDA");
+                providers.push(ExecutionProvider::CUDA(Default::default()));
+            }
+        }
+
+        // Always add CPU as fallback
+        info!("Adding CPU as fallback provider");
+        providers.push(ExecutionProvider::CPU(Default::default()));
+
+        providers
     }
 
     /// Load ONNX model with progress tracking
@@ -36,16 +110,16 @@ impl OnnxLoader {
 
         info!("Found ONNX model at: {:?}", model_path);
 
-        // Step 3: Create ONNX Runtime session (placeholder for Phase 2)
-        // TODO: Implement actual session creation once ort API is confirmed
-        info!("ONNX session creation placeholder (Phase 2)");
-
-        // Step 4: Load tokenizer
+        // Step 3: Load tokenizer
         let tokenizer = self.load_tokenizer(&model_dir)?;
+
+        // Step 4: Create ONNX Runtime session
+        let session = self.create_session(&model_path, config)?;
 
         info!("Successfully loaded ONNX model: {}", config.model_name);
 
         Ok(LoadedOnnxModel {
+            session,
             tokenizer,
             model_name: config.model_name.clone(),
             model_size: config.size,
@@ -103,6 +177,7 @@ impl OnnxLoader {
 
 /// Loaded ONNX model with tokenizer
 pub struct LoadedOnnxModel {
+    session: Session,
     tokenizer: Tokenizer,
     model_name: String,
     model_size: ModelSize,
