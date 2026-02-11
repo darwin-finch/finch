@@ -153,8 +153,21 @@ pub fn load(model_path: &Path, family: ModelFamily, size: ModelSize) -> Result<B
     let meta_path = model_path.join("meta.yaml");
     tracing::debug!("Loading config from: {:?}", meta_path);
 
+    // Check if file exists
+    if !meta_path.exists() {
+        return Err(anyhow::anyhow!(
+            "meta.yaml not found at {:?}. Downloaded files may be in wrong location.",
+            meta_path
+        ));
+    }
+
     let model_config = candle_coreml::config::ModelConfig::load_from_file(&meta_path)
-        .context("Failed to load meta.yaml")?;
+        .map_err(|e| {
+            tracing::error!("Failed to parse meta.yaml: {:?}", e);
+            tracing::error!("File path: {:?}", meta_path);
+            e
+        })
+        .context("Failed to load meta.yaml - check file format")?;
 
     tracing::debug!("Model config loaded with {} components", model_config.components.len());
 
