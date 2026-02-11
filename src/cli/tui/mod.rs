@@ -464,45 +464,26 @@ impl TuiRenderer {
                 all_lines.push(Line::raw(""));
             }
 
-            // Calculate exact height by pre-rendering with Ratatui
-            // This ensures insert_before() reserves the EXACT space needed
+            // Calculate height with generous padding to avoid truncation
+            // Long paths can wrap unpredictably, so we over-allocate rather than under-allocate
             let (term_width, _) = crossterm::terminal::size()?;
+            let width = term_width as usize;
 
-            // Use reasonable max height (messages rarely exceed 500 lines)
-            const MAX_TEST_HEIGHT: u16 = 500;
-            let test_area = ratatui::layout::Rect {
-                x: 0,
-                y: 0,
-                width: term_width,
-                height: MAX_TEST_HEIGHT,
-            };
-            let mut test_buffer = ratatui::buffer::Buffer::empty(test_area);
-
-            // Pre-render the paragraph to measure exact height
-            let text = Text::from(all_lines.clone());
-            let paragraph = Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false });
-            paragraph.render(test_area, &mut test_buffer);
-
-            // Find the last non-empty row to get actual height
-            let mut actual_height: u16 = 0;
-            for y in 0..MAX_TEST_HEIGHT {
-                let row_start = (y as usize) * (term_width as usize);
-                let row_end = row_start + (term_width as usize);
-                if row_end <= test_buffer.content.len() {
-                    let row = &test_buffer.content[row_start..row_end];
-                    if row.iter().any(|cell| cell.symbol() != " ") {
-                        actual_height = y + 1;
-                    }
+            let mut estimated_lines: usize = 0;
+            for line in &all_lines {
+                let text = line.to_string();
+                let visible_len = Self::visible_length(&text);
+                if visible_len == 0 {
+                    estimated_lines += 1;  // Empty line = 1 row
+                } else {
+                    // Calculate wrapped lines, then add 50% padding for safety
+                    // This accounts for word breaks, ANSI codes, and rendering quirks
+                    let wrapped = (visible_len + width - 1) / width.max(1);
+                    estimated_lines += wrapped + (wrapped / 2).max(1);
                 }
             }
 
-            // Use actual height, or fall back to estimated if content is too large
-            let num_lines_u16 = if actual_height >= MAX_TEST_HEIGHT {
-                // Content exceeded test buffer, use conservative estimate
-                MAX_TEST_HEIGHT
-            } else {
-                actual_height
-            };
+            let num_lines_u16 = estimated_lines.min(u16::MAX as usize) as u16;
 
             // Use synchronized update to prevent flickering
             use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
