@@ -9,7 +9,10 @@ pub mod patterns;
 pub use generator::{GeneratedResponse, ResponseGenerator};
 pub use patterns::{PatternClassifier, QueryPattern};
 
+use crate::claude::Message;
+use crate::generators::{GeneratorResponse, Generator};
 use crate::models::{GeneratorModel, TextTokenizer};
+use crate::tools::types::ToolDefinition;
 use crate::training::batch_trainer::BatchTrainer;
 use anyhow::Result;
 use std::sync::Arc;
@@ -72,6 +75,22 @@ impl LocalGenerator {
             }
             Err(_) => Ok(None),
         }
+    }
+
+    /// Try to generate a response with tools
+    ///
+    /// This method is used by the daemon to support tool execution.
+    /// For now, it returns None (indicating local generation doesn't support tools yet).
+    /// In the future, this will delegate to QwenGenerator's tool support.
+    pub fn try_generate_with_tools(
+        &mut self,
+        messages: &[Message],
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<Option<GeneratorResponse>> {
+        // For now, local generator doesn't support tools
+        // This will be implemented when we integrate QwenGenerator properly
+        // Return None to fall back to Claude
+        Ok(None)
     }
 
     /// Learn from a Claude response

@@ -1,0 +1,428 @@
+// Daemon client implementation
+//
+// HTTP client that communicates with the Shammah daemon.
+// Automatically spawns daemon if not running.
+
+use anyhow::{Context, Result};
+use reqwest::Client;
+use std::time::Duration;
+use tracing::{debug, info};
+
+use crate::claude::{ContentBlock, Message};
+use crate::daemon::ensure_daemon_running;
+use crate::server::openai_types::{
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Tool, FunctionDefinition,
+};
+use crate::tools::types::{ToolDefinition, ToolUse};
+use crate::tools::executor::ToolExecutor;
+
+/// Configuration for daemon connection
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    /// Daemon bind address (e.g., "127.0.0.1:11434")
+    pub bind_address: String,
+    /// Whether to auto-spawn daemon if not running
+    pub auto_spawn: bool,
+    /// Request timeout in seconds
+    pub timeout_seconds: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: "127.0.0.1:11434".to_string(),
+            auto_spawn: true,
+            timeout_seconds: 120,
+        }
+    }
+}
+
+impl DaemonConfig {
+    /// Create DaemonConfig from ClientConfig settings
+    pub fn from_client_config(client_config: &crate::config::ClientConfig) -> Self {
+        Self {
+            bind_address: client_config.daemon_address.clone(),
+            auto_spawn: client_config.auto_spawn,
+            timeout_seconds: client_config.timeout_seconds,
+        }
+    }
+}
+
+/// HTTP client for communicating with Shammah daemon
+pub struct DaemonClient {
+    base_url: String,
+    client: Client,
+    config: DaemonConfig,
+}
+
+impl DaemonClient {
+    /// Create a new daemon client and ensure daemon is running
+    pub async fn connect(config: DaemonConfig) -> Result<Self> {
+        let base_url = format!("http://{}", config.bind_address);
+
+        // Ensure daemon is running (auto-spawn if enabled)
+        if config.auto_spawn {
+            ensure_daemon_running(Some(&config.bind_address))
+                .await
+                .context("Failed to ensure daemon is running")?;
+        } else {
+            // Just check if daemon is reachable
+            Self::check_health(&base_url).await?;
+        }
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(config.timeout_seconds))
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        info!(base_url = %base_url, "Connected to daemon");
+
+        Ok(Self {
+            base_url,
+            client,
+            config,
+        })
+    }
+
+    /// Create a client with default configuration
+    pub async fn connect_default() -> Result<Self> {
+        Self::connect(DaemonConfig::default()).await
+    }
+
+    /// Create config from ClientConfig settings (convenience method)
+    pub fn config_from_settings(client_config: &crate::config::ClientConfig) -> DaemonConfig {
+        DaemonConfig::from_client_config(client_config)
+    }
+
+    /// Send a query to the daemon using OpenAI-compatible API
+    ///
+    /// This is the main method for CLI to send queries.
+    pub async fn query(&self, messages: Vec<Message>) -> Result<String> {
+        // Convert internal messages to OpenAI format
+        let openai_messages: Vec<ChatMessage> = messages
+            .into_iter()
+            .map(|m| {
+                let content = m
+                    .content
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                ChatMessage {
+                    role: m.role,
+                    content: Some(content),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                }
+            })
+            .collect();
+
+        // Build request
+        let request = ChatCompletionRequest {
+            model: "qwen-local".to_string(),
+            messages: openai_messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: false,
+            stop: None,
+            tools: None,
+        };
+
+        // Send to daemon
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        debug!(url = %url, "Sending chat completion request");
+
+        let response: ChatCompletionResponse = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to send request to daemon")?
+            .json()
+            .await
+            .context("Failed to parse response from daemon")?;
+
+        // Extract response text
+        let response_text = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_else(|| "No response from model".to_string());
+
+        Ok(response_text)
+    }
+
+    /// Send a simple text query (convenience method)
+    pub async fn query_text(&self, query: &str) -> Result<String> {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: query.to_string(),
+            }],
+        }];
+
+        self.query(messages).await
+    }
+
+    /// Query with tool execution loop
+    ///
+    /// Handles the full tool execution flow:
+    /// 1. Send query with tools
+    /// 2. If response has tool_calls, execute them locally
+    /// 3. Send tool results back
+    /// 4. Repeat until final answer
+    pub async fn query_with_tools(
+        &self,
+        initial_query: &str,
+        tools: Vec<ToolDefinition>,
+        tool_executor: &ToolExecutor,
+    ) -> Result<String> {
+        let mut messages = vec![Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: initial_query.to_string(),
+            }],
+        }];
+
+        const MAX_TURNS: usize = 10;
+        let mut turn = 0;
+
+        loop {
+            if turn >= MAX_TURNS {
+                anyhow::bail!("Max tool execution turns reached ({})", MAX_TURNS);
+            }
+            turn += 1;
+
+            // Convert to OpenAI format
+            let openai_messages = Self::convert_to_openai_messages(&messages);
+            let openai_tools = Self::convert_to_openai_tools(&tools);
+
+            // Send request
+            let request = ChatCompletionRequest {
+                model: "qwen-local".to_string(),
+                messages: openai_messages,
+                tools: Some(openai_tools),
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                n: None,
+                stream: false,
+                stop: None,
+            };
+
+            let url = format!("{}/v1/chat/completions", self.base_url);
+            debug!(url = %url, turn, "Sending chat completion request with tools");
+
+            let response: ChatCompletionResponse = self
+                .client
+                .post(&url)
+                .json(&request)
+                .send()
+                .await
+                .context("Failed to send request to daemon")?
+                .json()
+                .await
+                .context("Failed to parse response from daemon")?;
+
+            let choice = response
+                .choices
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("No choices in response"))?;
+
+            // Check if tools were called
+            if let Some(tool_calls) = &choice.message.tool_calls {
+                info!("Received {} tool call(s) from daemon", tool_calls.len());
+
+                // Add assistant message with tool calls
+                let mut tool_use_blocks = Vec::new();
+                for tc in tool_calls {
+                    let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)?;
+                    tool_use_blocks.push(ContentBlock::ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        input,
+                    });
+                }
+
+                messages.push(Message {
+                    role: "assistant".to_string(),
+                    content: tool_use_blocks.clone(),
+                });
+
+                // Execute tools locally
+                let mut tool_result_blocks = Vec::new();
+                for block in tool_use_blocks {
+                    if let ContentBlock::ToolUse { id, name, input } = block {
+                        info!("Executing tool locally: {} ({})", name, id);
+
+                        // Execute tool
+                        let tool_use = ToolUse { id: id.clone(), name, input };
+
+                        let result = tool_executor
+                            .execute_tool::<fn() -> Result<()>>(&tool_use, None, None, None, None, None)
+                            .await?;
+
+                        tool_result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: id,
+                            content: result.content,
+                            is_error: Some(result.is_error),
+                        });
+                    }
+                }
+
+                // Add tool results to conversation
+                messages.push(Message {
+                    role: "user".to_string(),
+                    content: tool_result_blocks,
+                });
+
+                // Continue loop with updated conversation
+                continue;
+            }
+
+            // No tool calls, return final answer
+            if let Some(content) = &choice.message.content {
+                return Ok(content.clone());
+            }
+
+            anyhow::bail!("Response has no content and no tool calls");
+        }
+    }
+
+    /// Convert internal messages to OpenAI format
+    fn convert_to_openai_messages(messages: &[Message]) -> Vec<ChatMessage> {
+        messages
+            .iter()
+            .map(|m| {
+                let mut openai_msg = ChatMessage {
+                    role: m.role.clone(),
+                    content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                };
+
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+
+                for block in &m.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            text_parts.push(text.clone());
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            tool_calls.push(crate::server::openai_types::ToolCall {
+                                id: id.clone(),
+                                tool_type: "function".to_string(),
+                                function: crate::server::openai_types::FunctionCall {
+                                    name: name.clone(),
+                                    arguments: serde_json::to_string(input).unwrap_or_default(),
+                                },
+                            });
+                        }
+                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                            // For tool results, create a separate message with role "tool"
+                            // But for simplicity in batching, we'll encode it as text for now
+                            // This is a limitation - proper implementation would split messages
+                            text_parts.push(format!("[Tool Result for {}]: {}", tool_use_id, content));
+                        }
+                    }
+                }
+
+                if !text_parts.is_empty() {
+                    openai_msg.content = Some(text_parts.join("\n"));
+                }
+
+                if !tool_calls.is_empty() {
+                    openai_msg.tool_calls = Some(tool_calls);
+                }
+
+                openai_msg
+            })
+            .collect()
+    }
+
+    /// Convert internal tools to OpenAI format
+    fn convert_to_openai_tools(tools: &[ToolDefinition]) -> Vec<Tool> {
+        tools
+            .iter()
+            .map(|t| Tool {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: t.name.clone(),
+                    description: Some(t.description.clone()),
+                    parameters: t.input_schema.properties.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// Check daemon health
+    pub async fn check_health_status(&self) -> Result<serde_json::Value> {
+        let url = format!("{}/health", self.base_url);
+        let response = self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .context("Failed to check daemon health")?
+            .json()
+            .await
+            .context("Failed to parse health response")?;
+
+        Ok(response)
+    }
+
+    /// Internal health check (used during connection)
+    async fn check_health(base_url: &str) -> Result<()> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        let url = format!("{}/health", base_url);
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .context("Daemon is not reachable")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Daemon health check failed: {}", response.status());
+        }
+
+        Ok(())
+    }
+
+    /// Get base URL
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Get configuration
+    pub fn config(&self) -> &DaemonConfig {
+        &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_daemon_config_default() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.bind_address, "127.0.0.1:11434");
+        assert!(config.auto_spawn);
+        assert_eq!(config.timeout_seconds, 120);
+    }
+}
