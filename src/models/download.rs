@@ -91,6 +91,7 @@ impl ModelDownloader {
             ("config.json", true),           // Required
             ("tokenizer.json", true),         // Required
             ("tokenizer_config.json", false), // Optional
+            ("meta.yaml", false),             // Optional - CoreML component mapping
         ];
 
         let mut required_failed = Vec::new();
