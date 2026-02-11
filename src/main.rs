@@ -515,7 +515,7 @@ async fn run_repl_via_daemon(
     ));
 
     // Create simplified REPL
-    let mut repl = SimplifiedRepl::new(config, daemon_client, tool_executor)?;
+    let mut repl = SimplifiedRepl::new(config, daemon_client, tool_executor).await?;
 
     // Restore session if provided
     if let Some(session_path) = restore_session {

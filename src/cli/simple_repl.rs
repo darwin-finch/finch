@@ -31,7 +31,7 @@ pub struct SimplifiedRepl {
 
 impl SimplifiedRepl {
     /// Create a new simplified REPL
-    pub fn new(
+    pub async fn new(
         config: Config,
         daemon_client: DaemonClient,
         tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
@@ -39,26 +39,14 @@ impl SimplifiedRepl {
         // Initialize conversation history
         let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
 
-        // Get tool definitions (we need to use a runtime for this)
+        // Get tool definitions (async)
         let tool_definitions = {
-            let rt = tokio::runtime::Handle::try_current();
-            if let Ok(handle) = rt {
-                let executor = handle.block_on(tool_executor.lock());
-                executor.registry()
-                    .get_all_tools()
-                    .into_iter()
-                    .map(|tool| tool.definition())
-                    .collect()
-            } else {
-                // Fallback: create a minimal runtime
-                let rt = tokio::runtime::Runtime::new()?;
-                let executor = rt.block_on(tool_executor.lock());
-                executor.registry()
-                    .get_all_tools()
-                    .into_iter()
-                    .map(|tool| tool.definition())
-                    .collect()
-            }
+            let executor = tool_executor.lock().await;
+            executor.registry()
+                .get_all_tools()
+                .into_iter()
+                .map(|tool| tool.definition())
+                .collect()
         };
 
         // Initialize input handler if interactive
