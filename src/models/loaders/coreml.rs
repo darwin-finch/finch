@@ -144,8 +144,54 @@ fn parse_meta_yaml(meta_path: &Path) -> Result<candle_coreml::config::ModelConfi
         vocab_size: 151_936, // Standard Qwen vocab size
     };
 
-    // Create components HashMap (empty for now - will be populated by auto-discovery)
-    let components: HashMap<String, candle_coreml::config::ComponentConfig> = HashMap::new();
+    // Discover .mlmodelc components in the directory
+    let model_dir = meta_path.parent().unwrap();
+    let mut components: HashMap<String, candle_coreml::config::ComponentConfig> = HashMap::new();
+
+    // Scan directory for .mlmodelc files
+    if let Ok(entries) = std::fs::read_dir(model_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.extension().and_then(|s| s.to_str()) == Some("mlmodelc") {
+                let filename = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let path_str = path.to_string_lossy().to_string();
+
+                // Map filenames to component names
+                let component_name = if filename.contains("embedding") {
+                    Some("embeddings")
+                } else if filename.contains("lm_head") {
+                    Some("lm_head")
+                } else if filename.contains("FFN") || filename.contains("ffn") {
+                    Some("ffn")
+                } else {
+                    None
+                };
+
+                if let Some(name) = component_name {
+                    tracing::debug!("Discovered CoreML component: {} -> {}", name, filename);
+                    components.insert(
+                        name.to_string(),
+                        candle_coreml::config::ComponentConfig {
+                            file_path: Some(path_str),
+                            inputs: HashMap::new(),
+                            outputs: HashMap::new(),
+                            functions: vec![],
+                            input_order: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    if components.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No .mlmodelc components found in {:?}. Expected files like qwen_embeddings.mlmodelc",
+            model_dir
+        ));
+    }
+
+    tracing::debug!("Discovered {} CoreML components", components.len());
 
     // Create NamingConfig (using empty patterns - file paths are explicit)
     let naming = candle_coreml::config::NamingConfig {
@@ -264,12 +310,16 @@ pub fn load(model_path: &Path, family: ModelFamily, size: ModelSize) -> Result<B
         })
         .context("Failed to load meta.yaml - check file format")?;
 
-    tracing::debug!("Model config parsed (auto-discovery mode)");
+    tracing::debug!(
+        "Model config loaded with {} components",
+        model_config.components.len()
+    );
 
-    // Use None for config to let QwenModel auto-discover components
-    // The meta.yaml provides context but QwenModel will discover the actual
-    // component files (.mlmodelc) in the directory automatically
-    let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, None)
+    // Create QwenConfig from ModelConfig
+    let qwen_config = candle_coreml::qwen::QwenConfig::from_model_config(model_config);
+
+    // Pass the config with discovered components to QwenModel
+    let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, Some(qwen_config))
         .map_err(|e| {
             tracing::error!("CoreML load error: {:?}", e);
             tracing::error!("Note: CoreML models must have .mlmodelc files in the directory");
