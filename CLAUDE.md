@@ -6,7 +6,9 @@ This document provides context for AI assistants (like Claude Code) working on t
 
 **Project Name**: Shammah (שָׁמָה - "watchman/guardian")
 **Purpose**: Local-first AI coding assistant with continuous improvement
-**Core Innovation**: Pre-trained Qwen models + weighted LoRA fine-tuning for domain adaptation
+**Core Innovation**: Pre-trained local models + weighted LoRA fine-tuning for domain adaptation
+**Supported Models**: Qwen, Llama, Mistral, Phi (via ONNX)
+**Teacher Backends**: Claude (Anthropic), GPT-4 (OpenAI), Gemini (Google), Grok (xAI)
 
 ### The Problem
 
@@ -20,26 +22,27 @@ Traditional AI coding assistants require:
 ### The Solution
 
 Shammah provides **immediate quality** with **continuous improvement**:
-1. Uses pre-trained Qwen models (works well from day 1)
+1. Uses pre-trained local models (works well from day 1)
 2. Loads instantly with progressive bootstrap (<100ms startup)
 3. Learns from weighted feedback via LoRA fine-tuning
 4. Adapts to your coding style, frameworks, and patterns
 5. Works offline after initial model download
 6. Preserves privacy (code stays on your machine)
+7. Falls back to teacher models (Claude/GPT-4/etc.) when needed
 
 ### Key Metrics
 
 - **Startup Time**: <100ms (instant REPL)
 - **First-Run Experience**: 0ms blocked (background download)
-- **Quality Day 1**: High (pre-trained Qwen)
+- **Quality Day 1**: High (pre-trained models)
 - **Quality Month 1**: Specialized (LoRA adapted to your domain)
-- **RAM Support**: 8GB to 64GB+ Macs (adaptive model selection)
+- **System Support**: 8GB to 64GB+ RAM (adaptive model selection)
 
 ## Architecture Overview
 
-### New Design: Pre-trained Qwen + LoRA Adaptation
+### Design: Pre-trained Local Models + LoRA Adaptation
 
-Shammah uses **pre-trained Qwen models** with **weighted LoRA fine-tuning** instead of training from scratch:
+Shammah uses **pre-trained local models** with **weighted LoRA fine-tuning** instead of training from scratch:
 
 ```
 User Request
@@ -47,18 +50,19 @@ User Request
 ┌─────────────────────────────────────┐
 │ Router with Model Check              │
 │ - Crisis detection (safety)          │
-│ - Model ready? Use local             │
-│ - Model loading? Forward to Claude   │
+│ - Local model ready? Use local      │
+│ - Model loading? Forward to teacher │
 └──────────┬──────────────────────────┘
            │
     Model Ready?
            │
-    ├─ NO  → Forward to Claude API
+    ├─ NO  → Forward to Teacher API (Claude/GPT-4/Gemini/Grok)
     └─ YES → Continue
            │
            v
     ┌──────────────────────────────────┐
-    │ Pre-trained Qwen Model           │
+    │ Pre-trained Local Model          │
+    │ (Qwen/Llama/Mistral/Phi)        │
     │ (1.5B / 3B / 7B / 14B)          │
     │ + LoRA Adapters                  │
     │   (your learned patterns)        │

@@ -2,25 +2,26 @@
 
 > **שָׁמָה** (Shammah) - Hebrew: "watchman" or "guardian"
 
-A local-first AI coding assistant powered by pre-trained Qwen models that continuously improves through weighted LoRA fine-tuning. Works offline, starts instantly, and gets better at coding with every interaction.
+A local-first AI coding assistant that runs entirely on your machine with optional cloud fallback. Works offline, starts instantly, and continuously improves through weighted LoRA fine-tuning to match your coding patterns.
 
 ## What is Shammah?
 
-Shammah provides **immediate, high-quality AI assistance** using pre-trained Qwen models, then continuously improves based on your feedback. Unlike traditional approaches requiring months of training, Shammah works well from day 1 and gets better at your specific coding patterns over time.
+Shammah provides **immediate, high-quality AI assistance** using your choice of local models (Qwen, Llama, Mistral, etc.) or cloud providers (Claude, GPT-4, Gemini, Grok), then continuously improves based on your feedback. Unlike traditional approaches requiring months of training, Shammah works well from day 1 and gets better at your specific coding patterns over time.
 
 **Key Innovation:** Weighted LoRA fine-tuning lets you flag critical feedback (like strategy mistakes) to have more impact on future responses.
 
 ## Key Features
 
-### 🚀 **Instant Quality** - Pre-trained Qwen Models
+### 🚀 **Instant Quality** - Pre-trained Local Models
 - **Works from day 1** - No training period required
-- **Adaptive sizing** - Automatically selects model based on your Mac's RAM
-  - 8GB Mac → Qwen-1.5B (fast, efficient)
-  - 16GB Mac → Qwen-3B (balanced)
-  - 32GB Mac → Qwen-7B (powerful)
-  - 64GB+ Mac → Qwen-14B (maximum capability)
+- **Multiple model support** - Qwen, Llama, Mistral, Phi, and more via ONNX
+- **Adaptive sizing** - Automatically selects model based on your system's RAM
+  - 8GB system → 1.5B parameter models (fast, efficient)
+  - 16GB system → 3B parameter models (balanced)
+  - 32GB system → 7B parameter models (powerful)
+  - 64GB+ system → 14B+ parameter models (maximum capability)
 - **Instant startup** - REPL appears in <100ms with background model loading
-- **Metal acceleration** - Uses Apple Silicon GPU automatically
+- **Hardware acceleration** - Uses Metal (Apple Silicon), CUDA, or CPU automatically
 - **Offline capable** - Works without internet after first download
 
 ### 📈 **Continuous Improvement** - Weighted LoRA Fine-Tuning
@@ -33,12 +34,13 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained Qwe
 - **No degradation** - Base model quality preserved, only adds specialized knowledge
 - **Efficient** - Trains only 0.1-1% of parameters, takes minutes not hours
 
-### 🛠️ **Tool Execution** - Claude Can Inspect and Modify Code
+### 🛠️ **Tool Execution** - AI Can Inspect and Modify Code
 - **Read files** - Inspect code, configs, documentation
 - **Search codebase** - Glob patterns (`**/*.rs`) and regex (`TODO.*`)
 - **Run commands** - Execute tests, build, run scripts
 - **Web research** - Fetch documentation and examples
 - **Self-improvement** - Modify own code and restart
+- **Works with all models** - Local and cloud backends support full tool use
 
 ### ✅ **Interactive Tool Confirmation** - Full Control
 - **Approve once or remember** - Session or persistent approvals
@@ -47,7 +49,8 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained Qwe
 - **Safe by default** - Requires approval for new patterns
 
 ### 📊 **HTTP Daemon Mode** - Multi-Client Server
-- **Claude-compatible** - Drop-in replacement for Claude API
+- **OpenAI-compatible API** - Drop-in replacement for GPT/Claude APIs
+- **Tool pass-through** - Tools execute on client side (proper context/security)
 - **Session management** - Automatic cleanup, concurrent clients
 - **Prometheus metrics** - Monitor usage and performance
 - **Production-ready** - Run as service or in containers
@@ -59,7 +62,7 @@ User runs shammah
     ↓
 REPL appears instantly (<100ms)
     ↓
-Background: Download/load Qwen model
+Background: Download/load local model
     ↓
 ┌─────────────────────────────────────┐
 │   User Query                        │
@@ -69,18 +72,18 @@ Background: Download/load Qwen model
 ┌──────────────────────────────────────┐
 │  Router with Model Check             │
 │  - Crisis detection (safety)         │
-│  - Model ready? Use local            │
-│  - Model loading? Forward to Claude  │
+│  - Local model ready? Use local      │
+│  - Model loading? Forward to teacher │
 └──────────┬───────────────────────────┘
            │
     Model Ready?
            │
-    ├─ NO  → Forward to Claude API
+    ├─ NO  → Forward to Teacher API (Claude/GPT-4/Gemini/Grok)
     └─ YES → Continue
            │
            v
     ┌──────────────────────────┐
-    │  Qwen Model              │
+    │  Local Model             │
     │  + LoRA Adapters         │
     │  (your customizations)   │
     └──────────┬───────────────┘
