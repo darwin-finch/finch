@@ -1,22 +1,27 @@
-// CoreML Loader - Qwen models optimized for Apple Neural Engine
-// Uses .mlpackage format from anemll organization
+// CoreML Loader - Models optimized for Apple Neural Engine
+// Uses .mlpackage/.mlmodelc format from HuggingFace
+// Currently supports: Qwen (full support via candle-coreml)
+// Future: Mistral, Llama, Gemma (requires custom generation implementation)
 
 use anyhow::{Context, Result};
 use candle_core::Device;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-use crate::models::unified_loader::ModelSize;
+use crate::models::unified_loader::{ModelFamily, ModelSize};
 use crate::models::TextGeneration;
 
 /// CoreML generator with tokenizer bridge
 ///
-/// CoreML uses text-based API (complete_text), but we need token-based API
+/// CoreML uses text-based API, but we need token-based API
 /// for consistency with other generators. This struct bridges the two.
 pub struct CoreMLGenerator {
+    // Using QwenModel which has high-level complete_text() API
+    // For other architectures, we'd need to implement autoregressive generation
     model: candle_coreml::qwen::QwenModel,
     tokenizer: Tokenizer,
     name: String,
+    family: ModelFamily,
     // CoreML doesn't use Candle Device, use placeholder
     dummy_device: Device,
 }
@@ -41,18 +46,20 @@ impl TextGeneration for CoreMLGenerator {
         );
 
         // 2. Use CoreML's text-based generation (runs on ANE)
-        // Note: CoreML provides its own generation implementation
-        const DEFAULT_TEMPERATURE: f64 = 0.8;
+        tracing::debug!("Starting CoreML generation with {} tokens", input_ids.len());
 
-        // For now, we'll use a simple stub. The actual implementation would call
-        // the CoreML model's generation method when it's properly wired up.
-        // TODO: Wire up actual CoreML generation once candle_coreml::qwen::QwenModel
-        // provides a high-level generation API.
+        // Call CoreML model's complete_text method
+        // Note: Uses fixed temperature (0.7) and top_k (50) internally
+        let output_text = self
+            .model
+            .complete_text(&input_text, max_new_tokens)
+            .map_err(|e| anyhow::anyhow!("CoreML generation failed: {}", e))?;
 
-        tracing::warn!("CoreML generation stub - using tokenizer round-trip");
-
-        // Stub: Just echo the input for now
-        let output_text = format!("{} [CoreML response]", input_text);
+        tracing::debug!(
+            "CoreML generated {} chars from {} input chars",
+            output_text.len(),
+            input_text.len()
+        );
 
         // 3. Encode output text back to token IDs
         let output_tokens = self
@@ -73,35 +80,57 @@ impl TextGeneration for CoreMLGenerator {
     }
 }
 
-/// Load Qwen CoreML model from cache directory
+/// Load CoreML model from cache directory
 ///
 /// # Arguments
-/// * `model_path` - Directory containing model.mlpackage, config.json, tokenizer.json
-/// * `size` - Model size variant (Small=1.5B, Medium=3B, Large=7B, XLarge=14B)
+/// * `model_path` - Directory containing model components and tokenizer
+/// * `family` - Model architecture family
+/// * `size` - Model size variant
 ///
 /// # Returns
 /// Boxed TextGeneration implementation that uses Apple Neural Engine
-pub fn load(model_path: &Path, size: ModelSize) -> Result<Box<dyn TextGeneration>> {
-    let size_str = size.to_size_string(crate::models::unified_loader::ModelFamily::Qwen2);
+///
+/// # Supported Families
+/// - **Qwen**: Full support with anemll models
+/// - **Mistral, Llama, Gemma**: Not yet implemented (need custom generation loop)
+pub fn load(model_path: &Path, family: ModelFamily, size: ModelSize) -> Result<Box<dyn TextGeneration>> {
+    let size_str = size.to_size_string(family);
     tracing::info!(
-        "Loading Qwen {} CoreML model from {:?}",
+        "Loading {} {} CoreML model from {:?}",
+        family.name(),
         size_str,
         model_path
     );
 
-    // 1. Check for required files
-    let mlpackage_path = model_path.join("model.mlpackage");
-    if !mlpackage_path.exists() {
-        return Err(anyhow::anyhow!(
-            "model.mlpackage not found in {:?}\n\
-             \n\
-             CoreML models require pre-converted .mlpackage format.\n\
-             Expected from anemll organization (e.g., anemll/Qwen2.5-3B-Instruct).",
-            model_path
-        ));
+    // Check family support
+    match family {
+        ModelFamily::Qwen2 => {
+            // Supported - continue
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "CoreML {} models not yet supported.\n\
+                 \n\
+                 Currently only Qwen models work with CoreML because candle-coreml\n\
+                 only provides high-level API for Qwen.\n\
+                 \n\
+                 To add {} support, you'd need to:\n\
+                 1. Implement autoregressive generation loop with candle_coreml::CoreMLModel\n\
+                 2. Handle tokenization and sampling manually\n\
+                 3. Test with Apple's {} CoreML model\n\
+                 \n\
+                 For now, try:\n\
+                 - Use Qwen with CoreML (works great!)\n\
+                 - Use {} with Metal/CPU backends (if rms-norm is supported)",
+                family.name(),
+                family.name(),
+                family.name(),
+                family.name()
+            ));
+        }
     }
 
-    // 2. Load tokenizer (needed for token ↔ text conversion)
+    // Load tokenizer (needed for token ↔ text conversion)
     let tokenizer_path = model_path.join("tokenizer.json");
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
         anyhow::anyhow!(
@@ -116,33 +145,47 @@ pub fn load(model_path: &Path, size: ModelSize) -> Result<Box<dyn TextGeneration
         tokenizer.get_vocab_size(true)
     );
 
-    // 3. Load CoreML model using candle-coreml's API
-    tracing::info!("Loading CoreML model from {:?}", mlpackage_path);
+    // Load CoreML model using candle-coreml's Qwen API
+    tracing::info!("Loading CoreML model components...");
 
-    // Use candle_coreml::qwen::QwenModel::load_from_directory
-    // Pass None to use default config
+    // QwenModel::load_from_directory handles all the CoreML component loading
     let model = candle_coreml::qwen::QwenModel::load_from_directory(model_path, None)
-        .context("Failed to load CoreML model")?;
+        .context("Failed to load CoreML model components")?;
 
-    tracing::info!("✓ Loaded Qwen {} on CoreML/ANE", size_str);
+    tracing::info!("✓ Loaded {} {} on CoreML/ANE", family.name(), size_str);
     tracing::info!("✓ Model will use Apple Neural Engine if available");
 
-    let name = format!("Qwen 2.5 {} (CoreML/ANE)", size_str);
+    let name = format!("{} {} (CoreML/ANE)", family.name(), size_str);
     let dummy_device = Device::Cpu; // Placeholder
 
     Ok(Box::new(CoreMLGenerator {
         model,
         tokenizer,
         name,
+        family,
         dummy_device,
     }))
 }
 
 /// Check if CoreML model is loadable from cache directory
 pub fn is_loadable(cache_dir: &Path) -> bool {
-    let has_mlpackage = cache_dir.join("model.mlpackage").exists();
+    // Check for tokenizer (required)
     let has_tokenizer = cache_dir.join("tokenizer.json").exists();
-    has_mlpackage && has_tokenizer
+
+    // Check for CoreML model components (.mlmodelc directories)
+    let has_coreml = std::fs::read_dir(cache_dir)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    e.path().is_dir()
+                        && e.file_name().to_string_lossy().ends_with(".mlmodelc")
+                })
+        })
+        .unwrap_or(false);
+
+    has_tokenizer && has_coreml
 }
 
 #[cfg(test)]
@@ -166,14 +209,14 @@ mod tests {
     fn test_load_coreml_model() {
         let cache_dir = dirs::home_dir()
             .unwrap()
-            .join(".cache/huggingface/hub/models--anemll--Qwen2.5-1.5B-Instruct/snapshots");
+            .join(".cache/huggingface/hub/models--anemll--anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4/snapshots");
 
         // Find the latest snapshot
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
                 let snapshot_dir = entry.path();
                 if snapshot_dir.is_dir() && is_loadable(&snapshot_dir) {
-                    let result = load(&snapshot_dir, ModelSize::Small);
+                    let result = load(&snapshot_dir, ModelFamily::Qwen2, ModelSize::Small);
                     match result {
                         Ok(mut generator) => {
                             println!("Successfully loaded CoreML model from {:?}", snapshot_dir);
@@ -195,6 +238,6 @@ mod tests {
             }
         }
 
-        println!("No CoreML model found in cache - download anemll/Qwen2.5-1.5B-Instruct first");
+        println!("No CoreML model found in cache - download anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4 first");
     }
 }

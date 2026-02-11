@@ -1,0 +1,4 @@
+Error {
+    context: "Forward pass failed at step 0 on Metal (Apple Silicon GPU) device (seqlen_offset=0). Input shape: [1, 1]",
+    source: Metal error no metal implementation for rms-norm,
+}

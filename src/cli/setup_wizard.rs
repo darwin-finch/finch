@@ -21,6 +21,7 @@ pub struct SetupResult {
     pub backend_device: BackendDevice,
     pub model_family: ModelFamily,
     pub model_size: ModelSize,
+    pub custom_model_repo: Option<String>,
     pub teachers: Vec<TeacherEntry>,
 }
 
@@ -31,12 +32,16 @@ enum WizardStep {
     DeviceSelection(usize),
     ModelFamilySelection(usize),
     ModelSizeSelection(usize),
+    CustomModelRepo(String, BackendDevice), // (repo input, selected device)
     TeacherConfig(Vec<TeacherEntry>, usize), // (teachers list, selected index)
     Confirm,
 }
 
 /// Show first-run setup wizard and return configuration
 pub fn show_setup_wizard() -> Result<SetupResult> {
+    // Try to load existing config to pre-fill values
+    let existing_config = crate::config::load_config().ok();
+
     // Set up terminal
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -49,12 +54,39 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    // Wizard state
-    let mut step = WizardStep::Welcome;
-    let mut claude_key = String::new();
-    let mut hf_token = String::new();
+    // Run the wizard logic and ensure cleanup happens regardless of outcome
+    let result = run_wizard_loop(&mut terminal, existing_config.as_ref());
+
+    // ALWAYS restore terminal, even if wizard was cancelled or errored
+    // Prioritize cleanup to ensure terminal is always restored
+    cleanup_terminal(&mut terminal)?;
+
+    // Return the wizard result after cleanup is guaranteed
+    result
+}
+
+/// Run the wizard interaction loop
+fn run_wizard_loop(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    existing_config: Option<&crate::config::Config>,
+) -> Result<SetupResult> {
+    // Pre-fill from existing config if available
+    let mut claude_key = existing_config
+        .and_then(|c| c.active_teacher())
+        .map(|t| t.api_key.clone())
+        .unwrap_or_default();
+
+    let mut hf_token = String::new(); // TODO: Add HF token to config
+
     let devices = BackendDevice::available_devices();
-    let mut selected_device_idx = 0;
+    let mut selected_device_idx = existing_config
+        .map(|c| {
+            devices
+                .iter()
+                .position(|d| d == &c.backend.device)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
 
     let model_families = vec![
         ModelFamily::Qwen2,
@@ -62,7 +94,14 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
         ModelFamily::Llama3,
         ModelFamily::Mistral,
     ];
-    let mut selected_family_idx = 0;
+    let mut selected_family_idx = existing_config
+        .map(|c| {
+            model_families
+                .iter()
+                .position(|f| *f == c.backend.model_family)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
 
     let model_sizes = vec![
         ModelSize::Small,
@@ -70,20 +109,40 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
         ModelSize::Large,
         ModelSize::XLarge,
     ];
-    let mut selected_size_idx = 1; // Default to Medium
+    let mut selected_size_idx = existing_config
+        .map(|c| {
+            model_sizes
+                .iter()
+                .position(|s| *s == c.backend.model_size)
+                .unwrap_or(1)
+        })
+        .unwrap_or(1); // Default to Medium
 
-    let mut teachers: Vec<TeacherEntry> = vec![TeacherEntry {
-        provider: "claude".to_string(),
-        api_key: String::new(), // Will be filled from claude_key
-        model: None,
-        base_url: None,
-        name: Some("Claude (Primary)".to_string()),
-    }];
+    let mut teachers: Vec<TeacherEntry> = existing_config
+        .map(|c| c.teachers.clone())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| {
+            vec![TeacherEntry {
+                provider: "claude".to_string(),
+                api_key: String::new(), // Will be filled from claude_key
+                model: None,
+                base_url: None,
+                name: Some("Claude (Primary)".to_string()),
+            }]
+        });
+
     let mut selected_teacher_idx = 0;
 
-    let result = loop {
+    let mut custom_model_repo = existing_config
+        .and_then(|c| c.backend.model_repo.clone())
+        .unwrap_or_default();
+
+    // Wizard state - start at Welcome
+    let mut step = WizardStep::Welcome;
+
+    loop {
         terminal.draw(|f| {
-            render_wizard_step(f, &step, &devices, &model_families, &model_sizes);
+            render_wizard_step(f, &step, &devices, &model_families, &model_sizes, &custom_model_repo);
         })?;
 
         // Handle input
@@ -203,6 +262,30 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
                             }
                         }
                         KeyCode::Enter => {
+                            step = WizardStep::CustomModelRepo(
+                                custom_model_repo.clone(),
+                                devices[selected_device_idx]
+                            );
+                        }
+                        KeyCode::Esc => {
+                            anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::CustomModelRepo(input, selected_device) => {
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            input.push(c);
+                            custom_model_repo = input.clone();
+                        }
+                        KeyCode::Backspace => {
+                            input.pop();
+                            custom_model_repo = input.clone();
+                        }
+                        KeyCode::Enter => {
+                            // Continue even if empty (optional)
                             // Fill teacher's API key from claude_key
                             teachers[0].api_key = claude_key.clone();
                             step = WizardStep::TeacherConfig(teachers.clone(), selected_teacher_idx);
@@ -247,12 +330,17 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
                 WizardStep::Confirm => {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => {
-                            break Ok(SetupResult {
+                            return Ok(SetupResult {
                                 claude_api_key: claude_key.clone(),
                                 hf_token: if hf_token.is_empty() { None } else { Some(hf_token.clone()) },
                                 backend_device: devices[selected_device_idx],
                                 model_family: model_families[selected_family_idx],
                                 model_size: model_sizes[selected_size_idx],
+                                custom_model_repo: if custom_model_repo.is_empty() {
+                                    None
+                                } else {
+                                    Some(custom_model_repo.clone())
+                                },
                                 teachers: teachers.clone(),
                             });
                         }
@@ -264,17 +352,18 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
                 }
             }
         }
-    };
+    }
+}
 
-    // Restore terminal
+/// Clean up terminal state
+fn cleanup_terminal(terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>) -> Result<()> {
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut(),
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture
     )?;
-
-    result
+    Ok(())
 }
 
 fn render_wizard_step(
@@ -283,6 +372,7 @@ fn render_wizard_step(
     devices: &[BackendDevice],
     model_families: &[ModelFamily],
     model_sizes: &[ModelSize],
+    _custom_repo: &str,
 ) {
     let size = f.area();
     let dialog_area = centered_rect(70, 70, size);
@@ -303,6 +393,7 @@ fn render_wizard_step(
         WizardStep::DeviceSelection(selected) => render_device_selection(f, inner, devices, *selected),
         WizardStep::ModelFamilySelection(selected) => render_model_family_selection(f, inner, model_families, *selected),
         WizardStep::ModelSizeSelection(selected) => render_model_size_selection(f, inner, model_sizes, *selected),
+        WizardStep::CustomModelRepo(input, device) => render_custom_model_repo(f, inner, input, *device),
         WizardStep::TeacherConfig(teachers, selected) => render_teacher_config(f, inner, teachers, *selected),
         WizardStep::Confirm => render_confirm(f, inner),
     }
@@ -337,7 +428,7 @@ fn render_welcome(f: &mut Frame, area: Rect) {
     f.render_widget(message, chunks[1]);
 
     let help = Paragraph::new("Enter/Space: Continue  Esc: Cancel")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
@@ -353,36 +444,29 @@ fn render_api_key_input(f: &mut Frame, area: Rect, input: &str) {
         ])
         .split(area);
 
-    let title = Paragraph::new("Step 1: Teacher Provider API Key")
+    let title = Paragraph::new("Step 1: Claude API Key")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
     let instructions = Paragraph::new(
-        "Enter your API key for the TEACHER provider (Claude by default).\n\
-         This is the AI model that will teach your local model.\n\n\
-         Get Claude API key from: https://console.anthropic.com/\n\
-         (starts with sk-ant-...)\n\n\
-         You can configure other providers (OpenAI, Gemini, etc.) later."
+        "Enter your Claude API key (required).\n\n\
+         Get your key from: https://console.anthropic.com/\n\
+         (starts with sk-ant-...)"
     )
     .style(Style::default().fg(Color::Reset))
     .wrap(Wrap { trim: false });
     f.render_widget(instructions, chunks[1]);
 
-    // Mask the key for display (show only last 4 chars)
-    let display_text = if input.len() > 8 {
-        format!("{}...{}", &input[..7], &input[input.len()-4..])
-    } else {
-        input.to_string()
-    };
-
-    let input_widget = Paragraph::new(display_text)
-        .block(Block::default().borders(Borders::ALL).title("Teacher API Key (Claude)"))
-        .style(Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD));
+    let input_widget = Paragraph::new(input.clone())
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("API Key"))
+        .style(Style::default().fg(Color::Reset));
     f.render_widget(input_widget, chunks[2]);
 
     let help = Paragraph::new("Type key then press Enter  Esc: Cancel")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[3]);
 }
@@ -415,19 +499,17 @@ fn render_hf_token_input(f: &mut Frame, area: Rect, input: &str) {
 
     let display_text = if input.is_empty() {
         "[Optional - press Enter to skip]".to_string()
-    } else if input.len() > 8 {
-        format!("{}...{}", &input[..7], &input[input.len()-4..])
     } else {
         input.to_string()
     };
 
     let input_widget = Paragraph::new(display_text)
         .block(Block::default().borders(Borders::ALL).title("HF Token"))
-        .style(Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD));
+        .style(Style::default().fg(Color::Reset));
     f.render_widget(input_widget, chunks[2]);
 
     let help = Paragraph::new("Type token then press Enter (or Enter to skip)  Esc: Cancel")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[3]);
 }
@@ -486,7 +568,7 @@ fn render_device_selection(f: &mut Frame, area: Rect, devices: &[BackendDevice],
     f.render_stateful_widget(list, chunks[1], &mut list_state);
 
     let help = Paragraph::new("↑/↓: Navigate  Enter: Select  Esc: Cancel")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
@@ -533,7 +615,7 @@ fn render_model_family_selection(f: &mut Frame, area: Rect, families: &[ModelFam
     f.render_stateful_widget(list, chunks[1], &mut list_state);
 
     let help = Paragraph::new("↑/↓: Navigate  Enter: Select  Esc: Cancel")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
@@ -594,9 +676,73 @@ fn render_model_size_selection(f: &mut Frame, area: Rect, sizes: &[ModelSize], s
     f.render_stateful_widget(list, chunks[1], &mut list_state);
 
     let help = Paragraph::new("↑/↓: Navigate  Enter: Select  Esc: Cancel")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
+}
+
+fn render_custom_model_repo(f: &mut Frame, area: Rect, input: &str, device: BackendDevice) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Length(8),  // Instructions (device-specific)
+            Constraint::Length(3),  // Input
+            Constraint::Length(2),  // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Step 6: Custom Model Repository (Optional)")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    // Device-specific instructions
+    let instructions_text = match device {
+        #[cfg(target_os = "macos")]
+        BackendDevice::CoreML => {
+            "⚠️  CoreML requires .mlpackage/.mlmodelc format models!\n\n\
+             Compatible repos (with config.json + tokenizer.json):\n\
+             • anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4 (Qwen 0.6B, recommended)\n\
+             • andmev/Llama-3.2-3B-Instruct-CoreML (Llama 3B)\n\
+             • anemll/anemll-google-gemma-3-270m-it-M1-ctx512-monolithic_0.3.5 (Gemma 270M)\n\n\
+             ⚠️ Most CoreML repos lack standard HF structure!\n\
+             Standard safetensors repos will NOT work.\n\
+             Press Enter to skip and use defaults."
+        }
+        _ => {
+            "Specify a custom HuggingFace model repository (optional).\n\n\
+             Examples:\n\
+             • Qwen/Qwen2.5-3B-Instruct (default for Qwen)\n\
+             • google/gemma-2-9b-it (Gemma)\n\
+             • meta-llama/Llama-3.2-8B-Instruct (Llama)\n\n\
+             Leave empty to use recommended defaults.\n\
+             Press Enter to continue."
+        }
+    };
+
+    let instructions = Paragraph::new(instructions_text)
+        .style(Style::default().fg(Color::Reset))
+        .wrap(Wrap { trim: false });
+    f.render_widget(instructions, chunks[1]);
+
+    let display_text = if input.is_empty() {
+        "[Optional - press Enter to skip]".to_string()
+    } else {
+        input.to_string()
+    };
+
+    let input_widget = Paragraph::new(display_text)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title("HuggingFace Repo"))
+        .style(Style::default().fg(Color::Reset));
+    f.render_widget(input_widget, chunks[2]);
+
+    let help = Paragraph::new("Type repo then press Enter (or Enter to skip)  Esc: Cancel")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[3]);
 }
 
 fn render_teacher_config(f: &mut Frame, area: Rect, teachers: &[TeacherEntry], selected: usize) {
@@ -652,7 +798,7 @@ fn render_teacher_config(f: &mut Frame, area: Rect, teachers: &[TeacherEntry], s
     f.render_stateful_widget(list, chunks[2], &mut list_state);
 
     let help = Paragraph::new("Enter: Continue  Esc: Cancel")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[3]);
 }
@@ -687,7 +833,7 @@ fn render_confirm(f: &mut Frame, area: Rect) {
     f.render_widget(summary, chunks[1]);
 
     let help = Paragraph::new("y/Enter: Confirm  n/Esc: Cancel")
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }

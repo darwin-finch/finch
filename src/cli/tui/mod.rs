@@ -236,7 +236,8 @@ impl TuiRenderer {
         // We'll use insert_before() to write to terminal scrollback
         let scrollback = ScrollbackBuffer::new(viewport_height, term_width as usize);
 
-        // Keep stdout disabled - we'll write via insert_before() instead
+        // Ensure stdout is disabled - we'll write via insert_before() instead
+        // (Already disabled in main.rs, but double-check for safety)
         output_manager.disable_stdout();
 
         Ok(Self {

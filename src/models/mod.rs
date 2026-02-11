@@ -47,5 +47,5 @@ pub use threshold_router::{
 };
 pub use threshold_validator::{QualitySignal, ThresholdValidator, ValidatorStats};
 pub use tokenizer::TextTokenizer;
-pub use unified_loader::{BackendDevice, ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
+pub use unified_loader::{ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
 pub use validator::ValidatorModel;

@@ -122,60 +122,121 @@ impl ModelDownloader {
             ));
         }
 
-        // Try to download model weights (single file or sharded)
-        // First, try single model.safetensors file
-        match repo.get("model.safetensors") {
-            Ok(path) => {
-                tracing::info!("Downloaded single model file");
-                downloaded_files.push(path);
+        // Try to download model weights
+        // First, check if this is a CoreML model (has .mlmodelc directories)
+        let coreml_dirs = vec![
+            "qwen_embeddings.mlmodelc",
+            "qwen_FFN_PF_lut6_chunk_01of01.mlmodelc",
+            "qwen_lm_head.mlmodelc",
+            "qwen_lm_head_lut6.mlmodelc",
+            // Add more patterns as needed
+        ];
+
+        tracing::debug!("Checking for CoreML model format...");
+        let mut found_coreml = false;
+        for dir_name in &coreml_dirs {
+            // Try to download a file from this directory to check if it exists
+            let test_file = format!("{}/metadata.json", dir_name);
+            tracing::debug!("Testing for CoreML component: {}", test_file);
+            match repo.get(&test_file) {
+                Ok(_) => {
+                    found_coreml = true;
+                    tracing::info!("✓ Detected CoreML model format (found {})", dir_name);
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!("Not found: {} ({})", test_file, e);
+                }
             }
-            Err(_) => {
-                // Single file doesn't exist, try sharded files
-                tracing::info!("Single model file not found, looking for sharded files...");
+        }
 
-                let mut shard_idx = 1;
-                loop {
-                    // Try downloading shards sequentially: model-00001-of-00002.safetensors, etc.
-                    let mut found_this_shard = false;
+        if !found_coreml {
+            tracing::debug!("No CoreML components detected, trying standard safetensors...");
+        }
 
-                    // Try different total counts (models can have 2, 3, 4, ... shards)
-                    for total in shard_idx..=20 {
-                        // Try up to 20 total shards
-                        let shard_file =
-                            format!("model-{:05}-of-{:05}.safetensors", shard_idx, total);
-                        match repo.get(&shard_file) {
-                            Ok(path) => {
-                                tracing::info!(
-                                    "Downloaded shard {}/{}: {}",
-                                    shard_idx,
-                                    total,
-                                    shard_file
-                                );
-                                downloaded_files.push(path);
-                                found_this_shard = true;
+        if found_coreml {
+            // Download all .mlmodelc directories
+            tracing::info!("Downloading CoreML model components...");
+            for dir_name in &coreml_dirs {
+                // Download common files in each .mlmodelc directory
+                let coreml_files = vec![
+                    "metadata.json",
+                    "model.mil",
+                    "coremldata.bin",
+                    "weights/weight.bin",
+                    "analytics/coremldata.bin",
+                ];
 
-                                // If we found shard N of N, we're done
-                                if shard_idx == total {
-                                    tracing::info!("✓ Downloaded all {} shards", total);
-                                    shard_idx = total + 1; // Exit outer loop
+                for file in &coreml_files {
+                    let full_path = format!("{}/{}", dir_name, file);
+                    match repo.get(&full_path) {
+                        Ok(path) => {
+                            tracing::debug!("Downloaded {}", full_path);
+                            downloaded_files.push(path);
+                        }
+                        Err(_) => {
+                            // File might not exist in this component, that's ok
+                            tracing::debug!("Skipped {} (not found)", full_path);
+                        }
+                    }
+                }
+            }
+            tracing::info!("✓ Downloaded CoreML model components");
+        } else {
+            // Not CoreML, try standard safetensors files
+            match repo.get("model.safetensors") {
+                Ok(path) => {
+                    tracing::info!("Downloaded single model file");
+                    downloaded_files.push(path);
+                }
+                Err(_) => {
+                    // Single file doesn't exist, try sharded files
+                    tracing::info!("Single model file not found, looking for sharded files...");
+
+                    let mut shard_idx = 1;
+                    loop {
+                        // Try downloading shards sequentially: model-00001-of-00002.safetensors, etc.
+                        let mut found_this_shard = false;
+
+                        // Try different total counts (models can have 2, 3, 4, ... shards)
+                        for total in shard_idx..=20 {
+                            // Try up to 20 total shards
+                            let shard_file =
+                                format!("model-{:05}-of-{:05}.safetensors", shard_idx, total);
+                            match repo.get(&shard_file) {
+                                Ok(path) => {
+                                    tracing::info!(
+                                        "Downloaded shard {}/{}: {}",
+                                        shard_idx,
+                                        total,
+                                        shard_file
+                                    );
+                                    downloaded_files.push(path);
+                                    found_this_shard = true;
+
+                                    // If we found shard N of N, we're done
+                                    if shard_idx == total {
+                                        tracing::info!("✓ Downloaded all {} shards", total);
+                                        shard_idx = total + 1; // Exit outer loop
+                                    }
+                                    break; // Move to next shard
                                 }
-                                break; // Move to next shard
+                                Err(_) => continue,
                             }
-                            Err(_) => continue,
                         }
-                    }
 
-                    if !found_this_shard {
-                        // No more shards found
-                        if shard_idx == 1 {
-                            tracing::error!("No model files found (neither single nor sharded)");
-                        } else {
-                            tracing::info!("✓ Found {} total shards", shard_idx - 1);
+                        if !found_this_shard {
+                            // No more shards found
+                            if shard_idx == 1 {
+                                tracing::error!("No model files found (neither single nor sharded)");
+                            } else {
+                                tracing::info!("✓ Found {} total shards", shard_idx - 1);
+                            }
+                            break;
                         }
-                        break;
-                    }
 
-                    shard_idx += 1;
+                        shard_idx += 1;
+                    }
                 }
             }
         }

@@ -1,5 +1,6 @@
 // Backend Configuration - Device selection and model management
 
+use crate::models::unified_loader::{ModelFamily, ModelSize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -27,6 +28,20 @@ pub enum BackendDevice {
 }
 
 impl BackendDevice {
+    /// Get short name for logging
+    pub fn name(&self) -> &'static str {
+        match self {
+            #[cfg(target_os = "macos")]
+            BackendDevice::CoreML => "CoreML (ANE)",
+            #[cfg(target_os = "macos")]
+            BackendDevice::Metal => "Metal (GPU)",
+            #[cfg(feature = "cuda")]
+            BackendDevice::Cuda => "CUDA (GPU)",
+            BackendDevice::Cpu => "CPU",
+            BackendDevice::Auto => "Auto",
+        }
+    }
+
     /// Get human-readable description
     pub fn description(&self) -> &'static str {
         match self {
@@ -121,11 +136,11 @@ pub struct BackendConfig {
 
     /// Model family to use (Qwen2, Gemma2, etc.)
     #[serde(default = "default_model_family")]
-    pub model_family: String,
+    pub model_family: ModelFamily,
 
     /// Model size variant (Small, Medium, Large, XLarge)
     #[serde(default = "default_model_size")]
-    pub model_size: String,
+    pub model_size: ModelSize,
 
     /// Model repository (varies by backend)
     /// - CoreML: "anemll/Qwen2.5-3B-Instruct"
@@ -140,12 +155,12 @@ pub struct BackendConfig {
     pub fallback_chain: Vec<BackendDevice>,
 }
 
-fn default_model_family() -> String {
-    "Qwen2".to_string()
+fn default_model_family() -> ModelFamily {
+    ModelFamily::Qwen2
 }
 
-fn default_model_size() -> String {
-    "Medium".to_string()
+fn default_model_size() -> ModelSize {
+    ModelSize::Medium
 }
 
 fn default_fallback_chain() -> Vec<BackendDevice> {
@@ -193,7 +208,7 @@ impl BackendConfig {
     }
 
     /// Create new backend config with model family and size
-    pub fn with_model(device: BackendDevice, family: String, size: String) -> Self {
+    pub fn with_model(device: BackendDevice, family: ModelFamily, size: ModelSize) -> Self {
         Self {
             device,
             model_family: family,

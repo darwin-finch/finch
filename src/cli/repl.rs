@@ -244,18 +244,19 @@ impl Repl {
             .map(|tool| tool.definition())
             .collect();
 
-        // Initialize output management EARLY (before bootstrap, so messages go through proper channels)
-        let output_manager = OutputManager::new();
-        let status_bar = StatusBar::new();
+        // Get global OutputManager and StatusBar (created in main.rs)
+        // DO NOT create new instances - that would break stdout control!
+        use crate::cli::global_output::{global_output, global_status};
+        let output_manager_arc = global_output();
+        let output_manager = (*output_manager_arc).clone(); // Clone for local reference
+        let status_bar_arc = global_status();
+        let status_bar = (*status_bar_arc).clone();
 
-        // Set as global instances so macros (output_progress!, etc.) use them
-        use crate::cli::global_output::{set_global_output, set_global_status};
-        set_global_output(Arc::new(output_manager.clone()));
-        set_global_status(Arc::new(status_bar.clone()));
-
-        // If TUI will be enabled, disable stdout now so bootstrap messages go through proper channels
+        // CRITICAL: If TUI will be enabled, disable stdout NOW (before bootstrap spawns)
+        // This prevents tracing logs from download.rs from writing directly to stdout
+        // and overlapping with TUI content.
         if config.tui_enabled && is_interactive {
-            output_manager.disable_stdout();
+            output_manager_arc.disable_stdout();
         }
 
         // Initialize tokenizer
@@ -295,11 +296,13 @@ impl Repl {
         // Start background model loading
         let loader_clone = Arc::clone(&bootstrap_loader);
         let state_clone = Arc::clone(&generator_state);
-        use crate::models::DevicePreference;
+        let model_family = config.backend.model_family;
+        let model_size = config.backend.model_size;
+        let device = config.backend.device;
+        let model_repo = config.backend.model_repo.clone();
         tokio::spawn(async move {
-            // TODO: Read from config instead of hardcoded defaults
             if let Err(e) = loader_clone
-                .load_generator_async("Qwen2", "Medium", DevicePreference::Auto)
+                .load_generator_async(model_family, model_size, device, model_repo)
                 .await
             {
                 output_status!("⚠️  Model loading failed: {}", e);
@@ -384,7 +387,7 @@ impl Repl {
             prompt_caching_enabled: true,
         };
 
-        let teacher_provider = match crate::providers::create_provider(&config.teacher) {
+        let teacher_provider = match crate::providers::create_provider(&config.teachers) {
             Ok(provider) => provider,
             Err(e) => {
                 output_status!("⚠️  Failed to create teacher provider: {}", e);

@@ -65,7 +65,7 @@ enum Command {
 /// This function creates a provider based on the teacher configuration
 /// and wraps it in a ClaudeClient for backwards compatibility.
 fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
-    let provider = create_provider(&config.teacher)?;
+    let provider = create_provider(&config.teachers)?;
     Ok(ClaudeClient::with_provider(provider))
 }
 
@@ -157,17 +157,13 @@ async fn main() -> Result<()> {
             let result = show_setup_wizard()?;
 
             // Create and save config
-            let mut new_config = Config::new(result.claude_api_key);
+            let mut new_config = Config::new(result.teachers);
             new_config.backend = shammah::config::BackendConfig {
                 device: result.backend_device,
-                model_family: result.model_family.name().to_string(),
-                model_size: format!("{:?}", result.model_size),
+                model_family: result.model_family,
+                model_size: result.model_size,
+                model_repo: result.custom_model_repo,
                 ..Default::default()
-            };
-            new_config.teacher = shammah::config::TeacherConfig {
-                provider: Some(result.teachers[0].provider.clone()),
-                settings: std::collections::HashMap::new(),
-                teachers: result.teachers,
             };
             new_config.save()?;
 
@@ -389,10 +385,13 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Start background model loading
     let loader_clone = Arc::clone(&bootstrap_loader);
     let state_clone = Arc::clone(&generator_state);
+    let model_family = config.backend.model_family;
+    let model_size = config.backend.model_size;
+    let device = config.backend.device;
+    let model_repo = config.backend.model_repo.clone();
     tokio::spawn(async move {
-        // TODO: Read from config instead of hardcoded defaults
         if let Err(e) = loader_clone
-            .load_generator_async("Qwen2", "Medium", DevicePreference::Auto)
+            .load_generator_async(model_family, model_size, device, model_repo)
             .await
         {
             output_status!("⚠️  Model loading failed: {}", e);
@@ -505,7 +504,7 @@ async fn run_query(query: &str) -> Result<()> {
 /// Run interactive setup wizard
 async fn run_setup() -> Result<()> {
     use shammah::cli::show_setup_wizard;
-    use shammah::config::{BackendConfig, Config, TeacherConfig};
+    use shammah::config::{BackendConfig, Config};
 
     println!("Starting Shammah setup wizard...\n");
 
@@ -513,21 +512,15 @@ async fn run_setup() -> Result<()> {
     let result = show_setup_wizard()?;
 
     // Create config from wizard results
-    let mut config = Config::new(result.claude_api_key);
+    let mut config = Config::new(result.teachers);
 
     // Update backend config with selected device, model family, and size
     config.backend = BackendConfig {
         device: result.backend_device,
-        model_family: result.model_family.name().to_string(),
-        model_size: format!("{:?}", result.model_size),
+        model_family: result.model_family,
+        model_size: result.model_size,
+        model_repo: result.custom_model_repo,
         ..Default::default()
-    };
-
-    // Update teacher config with configured teachers
-    config.teacher = TeacherConfig {
-        provider: Some(result.teachers[0].provider.clone()),
-        settings: std::collections::HashMap::new(),
-        teachers: result.teachers,
     };
 
     // Save configuration

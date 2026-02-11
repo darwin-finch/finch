@@ -6,6 +6,7 @@ use candle_core::Device;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::config::BackendDevice;
 use super::common::DevicePreference;
 use super::download::ModelDownloader;
 use super::loaders;
@@ -121,55 +122,6 @@ impl ModelSize {
             16..=31 => Ok(Self::Medium), // 3-9B models (~6-12GB RAM)
             32..=63 => Ok(Self::Large),  // 7-14B models (~14-28GB RAM)
             _ => Ok(Self::XLarge),       // 14B+ models (~28GB+ RAM)
-        }
-    }
-}
-
-/// Backend device for model execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BackendDevice {
-    /// CPU (all platforms) - slowest but universal
-    Cpu,
-    /// Metal (macOS) - Apple Silicon GPU
-    Metal,
-    /// CoreML (macOS) - Apple Neural Engine (fastest on Mac)
-    #[cfg(target_os = "macos")]
-    CoreML,
-    /// CUDA (Linux/Windows) - NVIDIA GPU
-    #[cfg(feature = "cuda")]
-    Cuda,
-}
-
-impl BackendDevice {
-    /// Convert from legacy DevicePreference
-    pub fn from_preference(pref: DevicePreference) -> Self {
-        match pref {
-            DevicePreference::Cpu => Self::Cpu,
-            DevicePreference::Metal => Self::Metal,
-            DevicePreference::Auto => {
-                // Auto-select best backend for platform
-                #[cfg(target_os = "macos")]
-                {
-                    // Prefer Metal over CoreML for now (CoreML requires pre-converted models)
-                    Self::Metal
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    Self::Cpu
-                }
-            }
-        }
-    }
-
-    /// Get human-readable name
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Cpu => "CPU",
-            Self::Metal => "Metal (GPU)",
-            #[cfg(target_os = "macos")]
-            Self::CoreML => "CoreML (ANE)",
-            #[cfg(feature = "cuda")]
-            Self::Cuda => "CUDA (GPU)",
         }
     }
 }
@@ -319,26 +271,63 @@ impl UnifiedModelLoader {
         let size_str = config.size.to_size_string(config.family);
 
         let repo = match (&config.family, &config.backend) {
-            // CoreML needs pre-converted models (macOS only)
+            // CoreML needs pre-converted .mlpackage models (macOS only)
+            // Community and official conversions from HuggingFace
             #[cfg(target_os = "macos")]
             (ModelFamily::Qwen2, BackendDevice::CoreML) => {
-                format!("anemll/Qwen2.5-{}-Instruct", size_str)
+                // Only Small (0.6B) has proper CoreML structure with config.json + tokenizer.json
+                match config.size {
+                    ModelSize::Small => "anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4".to_string(),
+                    _ => {
+                        anyhow::bail!(
+                            "CoreML Qwen only available for Small (0.6B).\n\
+                             \n\
+                             Repository: anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4\n\
+                             \n\
+                             For larger models, use CPU backend (Metal has rms-norm bug).\n\
+                             \n\
+                             To fix: Change config.toml:\n\
+                             [backend]\n\
+                             device = \"coreml\"\n\
+                             model_size = \"Small\"  # <-- Change this"
+                        )
+                    }
+                }
             }
 
             #[cfg(target_os = "macos")]
             (ModelFamily::Llama3, BackendDevice::CoreML) => {
-                // Community CoreML conversions for Llama 3.2
+                // Community CoreML conversions (andmev, smpanaro)
                 match config.size {
                     ModelSize::Small => "smpanaro/Llama-3.2-1B-Instruct-CoreML".to_string(),
                     ModelSize::Medium => "andmev/Llama-3.2-3B-Instruct-CoreML".to_string(),
-                    // Larger sizes fall back to standard Metal/CPU
-                    _ => format!("meta-llama/Llama-3.2-{}-Instruct", size_str),
+                    ModelSize::Large => "andmev/Llama-3.1-8B-Instruct-CoreML".to_string(),
+                    _ => {
+                        anyhow::bail!(
+                            "CoreML Llama only available up to 8B. \
+                             For larger models, use Metal or CPU."
+                        )
+                    }
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            (ModelFamily::Gemma2, BackendDevice::CoreML) => {
+                // anemll has Gemma 3 270M
+                match config.size {
+                    ModelSize::Small => "anemll/anemll-google-gemma-3-270m-it-M1-ctx512-monolithic_0.3.5".to_string(),
+                    _ => {
+                        anyhow::bail!(
+                            "CoreML Gemma only available for Small (270M). \
+                             For larger models, use Metal or CPU."
+                        )
+                    }
                 }
             }
 
             #[cfg(target_os = "macos")]
             (ModelFamily::Mistral, BackendDevice::CoreML) => {
-                // Apple's official CoreML conversion
+                // Apple's official CoreML conversion (7B)
                 "apple/mistral-coreml".to_string()
             }
 
@@ -385,7 +374,7 @@ impl UnifiedModelLoader {
             // Qwen on CoreML (macOS only)
             #[cfg(target_os = "macos")]
             (ModelFamily::Qwen2, BackendDevice::CoreML) => {
-                loaders::coreml::load(model_path, config.size)
+                loaders::coreml::load(model_path, config.family, config.size)
             }
 
             // Qwen on Metal (macOS only)
@@ -435,7 +424,7 @@ impl UnifiedModelLoader {
             (ModelFamily::Llama3, BackendDevice::CoreML) => {
                 // For Small/Medium, use CoreML conversions if downloaded
                 // Otherwise fall back to Metal (handled by error)
-                loaders::coreml::load(model_path, config.size)
+                loaders::coreml::load(model_path, config.family, config.size)
             }
 
             // Llama on Metal (macOS)
@@ -462,7 +451,7 @@ impl UnifiedModelLoader {
             // Mistral on CoreML (macOS only) - uses Apple's official conversion
             #[cfg(target_os = "macos")]
             (ModelFamily::Mistral, BackendDevice::CoreML) => {
-                loaders::coreml::load(model_path, config.size)
+                loaders::coreml::load(model_path, config.family, config.size)
             }
 
             // Mistral on Metal (macOS)

@@ -43,7 +43,7 @@ impl OutputManager {
     /// Create a new OutputManager
     pub fn new() -> Self {
         Self {
-            write_to_stdout: Arc::new(RwLock::new(true)), // Enable by default for TUI mode
+            write_to_stdout: Arc::new(RwLock::new(true)), // Enabled by default, but main.rs disables immediately for TUI
             buffering_mode: Arc::new(RwLock::new(false)), // Default: immediate write
             pending_flush: Arc::new(RwLock::new(Vec::new())),
             messages: Arc::new(RwLock::new(Vec::new())),

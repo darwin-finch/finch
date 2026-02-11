@@ -9,18 +9,25 @@ use super::settings::Config;
 /// Load configuration from Shammah config file or environment
 pub fn load_config() -> Result<Config> {
     // Try loading from ~/.shammah/config.toml first
-    if let Some(mut config) = try_load_from_shammah_config()? {
+    if let Some(config) = try_load_from_shammah_config()? {
         return Ok(config);
     }
 
     // Fall back to environment variable
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         if !api_key.is_empty() {
-            return Ok(Config::new(api_key));
+            let teachers = vec![super::TeacherEntry {
+                provider: "claude".to_string(),
+                api_key,
+                model: None,
+                base_url: None,
+                name: Some("Claude (Environment)".to_string()),
+            }];
+            return Ok(Config::new(teachers));
         }
     }
 
-    // No API key found - prompt user to run setup
+    // No config found - prompt user to run setup
     bail!(
         "No configuration found. Please run the setup wizard:\n\n\
         \x1b[1;36mshammah setup\x1b[0m\n\n\
@@ -36,7 +43,7 @@ pub fn load_config() -> Result<Config> {
 
 fn try_load_from_shammah_config() -> Result<Option<Config>> {
     use super::backend::BackendConfig;
-    use super::settings::TeacherConfig;
+    use super::TeacherEntry;
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let config_path = home.join(".shammah/config.toml");
@@ -48,42 +55,36 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
     let contents = fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
-    // Parse TOML
-    let toml_config: toml::Value =
-        toml::from_str(&contents).context("Failed to parse config.toml")?;
-
-    // Extract api_key (for backwards compatibility)
-    let api_key = toml_config
-        .get("api_key")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    if let Some(api_key) = api_key {
-        let mut config = Config::new(api_key);
-
-        // Override tui_enabled if specified in config
-        if let Some(tui_enabled) = toml_config.get("tui_enabled").and_then(|v| v.as_bool()) {
-            config.tui_enabled = tui_enabled;
-        }
-
-        // Load backend config if present
-        if let Some(backend_value) = toml_config.get("backend") {
-            if let Ok(backend_config) = toml::from_str::<BackendConfig>(&backend_value.to_string()) {
-                config.backend = backend_config;
-            }
-        }
-
-        // Load teacher config if present (check "teacher" first, then "fallback" for backwards compat)
-        if let Some(teacher_value) = toml_config.get("teacher").or_else(|| toml_config.get("fallback")) {
-            if let Ok(teacher_config) = toml::from_str::<TeacherConfig>(&teacher_value.to_string()) {
-                config.teacher = teacher_config;
-            }
-        }
-
-        Ok(Some(config))
-    } else {
-        Ok(None)
+    // Parse TOML directly into a temp struct
+    #[derive(serde::Deserialize)]
+    struct TomlConfig {
+        #[serde(default)]
+        streaming_enabled: bool,
+        #[serde(default = "default_tui_enabled")]
+        tui_enabled: bool,
+        #[serde(default)]
+        backend: BackendConfig,
+        #[serde(default)]
+        teachers: Vec<TeacherEntry>,
     }
+
+    fn default_tui_enabled() -> bool {
+        true
+    }
+
+    let toml_config: TomlConfig = toml::from_str(&contents)
+        .context("Failed to parse config.toml")?;
+
+    if toml_config.teachers.is_empty() {
+        bail!("Config is missing teachers array. Please run 'shammah setup' to configure.");
+    }
+
+    let mut config = Config::new(toml_config.teachers);
+    config.streaming_enabled = toml_config.streaming_enabled;
+    config.tui_enabled = toml_config.tui_enabled;
+    config.backend = toml_config.backend;
+
+    Ok(Some(config))
 }
 
 #[cfg(test)]

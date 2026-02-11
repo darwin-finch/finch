@@ -9,7 +9,8 @@ use tokio::sync::RwLock;
 use super::download::{DownloadProgress, ModelDownloader};
 use super::generator_new::GeneratorModel;
 use super::model_selector::{ModelSelector, QwenSize};
-use super::unified_loader::{BackendDevice, ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
+use crate::config::BackendDevice;
+use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
 use super::{DevicePreference, GeneratorConfig};
 use crate::cli::OutputManager;
 
@@ -145,42 +146,13 @@ impl BootstrapLoader {
     /// Load generator in background using UnifiedModelLoader
     pub async fn load_generator_async(
         &self,
-        model_family_str: &str,
-        model_size_str: &str,
-        device_preference: DevicePreference,
+        model_family: ModelFamily,
+        model_size: ModelSize,
+        backend: BackendDevice,
+        model_repo: Option<String>,
     ) -> Result<()> {
         // Step 1: Initializing
         *self.state.write().await = GeneratorState::Initializing;
-
-        // Step 2: Parse model family and size
-        let model_family = match model_family_str {
-            "Qwen2" => ModelFamily::Qwen2,
-            "Gemma2" => ModelFamily::Gemma2,
-            "Llama3" => ModelFamily::Llama3,
-            "Mistral" => ModelFamily::Mistral,
-            _ => {
-                let error = format!("Unknown model family: {}", model_family_str);
-                tracing::error!("{}", error);
-                *self.state.write().await = GeneratorState::Failed { error: error.clone() };
-                return Err(anyhow!("{}", error));
-            }
-        };
-
-        let model_size = match model_size_str {
-            "Small" => ModelSize::Small,
-            "Medium" => ModelSize::Medium,
-            "Large" => ModelSize::Large,
-            "XLarge" => ModelSize::XLarge,
-            _ => {
-                let error = format!("Unknown model size: {}", model_size_str);
-                tracing::error!("{}", error);
-                *self.state.write().await = GeneratorState::Failed { error: error.clone() };
-                return Err(anyhow!("{}", error));
-            }
-        };
-
-        // Convert DevicePreference to BackendDevice
-        let backend = BackendDevice::from_preference(device_preference);
 
         let model_name = format!(
             "{} {}",
@@ -189,13 +161,16 @@ impl BootstrapLoader {
         );
 
         tracing::info!("Loading model: {} on {:?}", model_name, backend);
+        if let Some(ref repo) = model_repo {
+            tracing::info!("Using custom repository: {}", repo);
+        }
 
         // Step 3: Create model load config
         let load_config = ModelLoadConfig {
             family: model_family,
             size: model_size,
             backend,
-            repo_override: None,
+            repo_override: model_repo.clone(),
         };
 
         // Step 4: Load using UnifiedModelLoader (handles download + loading)
@@ -234,7 +209,7 @@ impl BootstrapLoader {
                 family: model_family,
                 size: model_size,
                 backend,
-                repo_override: None,
+                repo_override: model_repo.clone(),
             });
 
             // Actually, UnifiedModelLoader.load() returns Box<dyn TextGeneration>

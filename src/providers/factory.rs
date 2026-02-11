@@ -8,24 +8,22 @@ use super::claude::ClaudeProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
-use crate::config::{TeacherConfig, TeacherEntry};
+use crate::config::TeacherEntry;
 
-/// Create providers from teacher configuration in priority order
+/// Create providers from teacher entries in priority order
 ///
 /// The first provider in the returned list is the active teacher.
 /// Additional providers are available for easy switching via config reordering.
-pub fn create_providers(config: &TeacherConfig) -> Result<Vec<Box<dyn LlmProvider>>> {
-    let entries = config.get_teachers();
-
-    if entries.is_empty() {
+pub fn create_providers(teachers: &[TeacherEntry]) -> Result<Vec<Box<dyn LlmProvider>>> {
+    if teachers.is_empty() {
         bail!("No teacher providers configured");
     }
 
-    entries
-        .into_iter()
+    teachers
+        .iter()
         .enumerate()
         .map(|(idx, entry)| {
-            create_provider_from_entry(&entry)
+            create_provider_from_entry(entry)
                 .with_context(|| format!("Failed to create teacher provider #{}", idx + 1))
         })
         .collect()
@@ -86,77 +84,14 @@ fn create_provider_from_entry(entry: &TeacherEntry) -> Result<Box<dyn LlmProvide
     }
 }
 
-/// Create the active teacher provider (first in config list)
+/// Create the active teacher provider (first in teacher list)
 ///
 /// This is the primary teacher that the local model will learn from.
-pub fn create_provider(config: &TeacherConfig) -> Result<Box<dyn LlmProvider>> {
-    let providers = create_providers(config)?;
-    providers
-        .into_iter()
-        .next()
+pub fn create_provider(teachers: &[TeacherEntry]) -> Result<Box<dyn LlmProvider>> {
+    teachers
+        .first()
         .ok_or_else(|| anyhow!("No teacher providers configured"))
-}
-
-/// Legacy implementation kept for compatibility
-fn _create_provider_legacy(config: &TeacherConfig) -> Result<Box<dyn LlmProvider>> {
-    let provider_name = config.provider.as_ref().ok_or_else(|| anyhow!("No provider specified"))?;
-
-    // Get settings for the selected provider
-    let settings = config
-        .get_current_settings()
-        .ok_or_else(|| anyhow!("No settings found for provider: {}", provider_name))?;
-
-    match provider_name.as_str() {
-        "claude" => {
-            let mut provider = ClaudeProvider::new(settings.api_key.clone())?;
-            if let Some(model) = &settings.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "openai" => {
-            let mut provider = OpenAIProvider::new_openai(settings.api_key.clone())?;
-            if let Some(model) = &settings.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "grok" => {
-            let mut provider = OpenAIProvider::new_grok(settings.api_key.clone())?;
-            if let Some(model) = &settings.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "mistral" => {
-            let mut provider = OpenAIProvider::new_mistral(settings.api_key.clone())?;
-            if let Some(model) = &settings.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "groq" => {
-            let mut provider = OpenAIProvider::new_groq(settings.api_key.clone())?;
-            if let Some(model) = &settings.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        "gemini" => {
-            let mut provider = GeminiProvider::new(settings.api_key.clone())?;
-            if let Some(model) = &settings.model {
-                provider = provider.with_model(model.clone());
-            }
-            Ok(Box::new(provider))
-        }
-
-        _ => bail!("Unknown provider: {}", provider_name),
-    }
+        .and_then(|entry| create_provider_from_entry(entry))
 }
 
 #[cfg(test)]
