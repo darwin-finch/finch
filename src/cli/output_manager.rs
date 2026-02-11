@@ -113,14 +113,6 @@ impl OutputManager {
         let buffering = *self.buffering_mode.read().unwrap();
         let write_stdout = *self.write_to_stdout.read().unwrap();
 
-        // DEBUG: Log state on first few calls
-        static DEBUG_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let count = DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count < 3 {
-            eprintln!("[OUTPUT_MGR] #{} buffering={} write_stdout={} msg={}",
-                count, buffering, write_stdout, formatted.chars().take(50).collect::<String>());
-        }
-
         if buffering {
             // Buffering mode: accumulate for batch flush
             self.pending_flush.write().unwrap().push(formatted);

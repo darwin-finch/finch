@@ -255,15 +255,10 @@ impl Repl {
         // CRITICAL: If TUI will be enabled, disable stdout NOW (before ANY output)
         // This must happen before tokenizer init, bootstrap spawn, or any other code
         // that might emit tracing logs.
-        eprintln!("\n[DEBUG REPL] config.tui_enabled = {}", config.tui_enabled);
-        eprintln!("[DEBUG REPL] is_interactive = {}", is_interactive);
         if config.tui_enabled && is_interactive {
             // Disable stdout on the global OutputManager
             // All output will go to buffer; TUI will render via insert_before()
             (*output_manager_arc).disable_stdout();
-            eprintln!("[DEBUG REPL] Stdout disabled for TUI mode\n");
-        } else {
-            eprintln!("[DEBUG REPL] Stdout NOT disabled (condition failed)\n");
         }
 
         // Initialize tokenizer

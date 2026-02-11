@@ -71,12 +71,6 @@ fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // UNMISSABLE MARKER - This should ALWAYS appear at startup
-    eprintln!("\n\n========================================");
-    eprintln!("SHAMMAH STARTING - NEW BINARY");
-    eprintln!("Build: {}", env!("CARGO_PKG_VERSION"));
-    eprintln!("========================================\n");
-
     // Install panic handler to cleanup terminal on panic
     install_panic_handler();
 
@@ -149,14 +143,11 @@ async fn main() -> Result<()> {
     let status_bar = Arc::new(StatusBar::new());
 
     // Disable stdout immediately for TUI mode (will re-enable for --raw/--no-tui later)
-    eprintln!("=== BEFORE DISABLE: write_to_stdout = true ===");
     output_manager.disable_stdout();
-    eprintln!("=== AFTER DISABLE: write_to_stdout should be false ===");
 
     // Set as global BEFORE init_tracing() to prevent lazy initialization
     set_global_output(output_manager.clone());
     set_global_status(status_bar.clone());
-    eprintln!("=== GLOBAL OUTPUT SET ===");
 
     // NOW initialize tracing (will use the global OutputManager we just configured)
     init_tracing();
