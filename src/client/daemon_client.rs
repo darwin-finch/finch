@@ -484,6 +484,115 @@ impl DaemonClient {
             }
         }
     }
+
+    /// Query with automatic crash recovery
+    ///
+    /// Attempts to send query, and if connection fails (daemon crashed),
+    /// automatically restarts the daemon and retries once.
+    ///
+    /// # Arguments
+    /// * `messages` - Conversation messages to send
+    ///
+    /// # Returns
+    /// * `Ok(String)` - Response text from model
+    /// * `Err` - Error if both attempts fail
+    pub async fn query_with_recovery(&self, messages: Vec<Message>) -> Result<String> {
+        // First attempt
+        match self.query(messages.clone()).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                // Check if error is connection-related (daemon crash)
+                let error_str = e.to_string().to_lowercase();
+                let is_connection_error = error_str.contains("connection refused")
+                    || error_str.contains("connection reset")
+                    || error_str.contains("broken pipe")
+                    || error_str.contains("failed to send request");
+
+                if is_connection_error && self.config.auto_spawn {
+                    info!("Daemon connection failed, attempting auto-restart...");
+
+                    // Try to restart daemon
+                    match ensure_daemon_running(Some(&self.config.bind_address)).await {
+                        Ok(_) => {
+                            info!("Daemon restarted successfully, retrying query...");
+
+                            // Wait a moment for daemon to fully initialize
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+
+                            // Retry query once
+                            self.query(messages).await.context(
+                                "Query failed after daemon restart. Original error: {}",
+                            )
+                        }
+                        Err(restart_err) => {
+                            anyhow::bail!(
+                                "Failed to restart daemon: {}. Original query error: {}",
+                                restart_err,
+                                e
+                            )
+                        }
+                    }
+                } else {
+                    // Not a connection error, or auto-spawn disabled
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Query local model only with automatic crash recovery
+    ///
+    /// Same as query_local_only but with automatic daemon restart on connection failure.
+    ///
+    /// # Arguments
+    /// * `query` - Text query to send
+    ///
+    /// # Returns
+    /// * `Ok(String)` - Response text from local model
+    /// * `Err` - Error if both attempts fail or model not ready
+    pub async fn query_local_only_with_recovery(&self, query: &str) -> Result<String> {
+        // First attempt
+        match self.query_local_only(query).await {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                // Check if error is connection-related (daemon crash)
+                let error_str = e.to_string().to_lowercase();
+                let is_connection_error = error_str.contains("connection refused")
+                    || error_str.contains("connection reset")
+                    || error_str.contains("broken pipe")
+                    || error_str.contains("failed to send request");
+
+                if is_connection_error && self.config.auto_spawn {
+                    info!("Daemon connection failed, attempting auto-restart...");
+
+                    // Try to restart daemon
+                    match ensure_daemon_running(Some(&self.config.bind_address)).await {
+                        Ok(_) => {
+                            info!("Daemon restarted successfully, retrying query...");
+
+                            // Wait a moment for daemon to fully initialize
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+
+                            // Retry query once
+                            self.query_local_only(query).await.context(
+                                "Query failed after daemon restart",
+                            )
+                        }
+                        Err(restart_err) => {
+                            anyhow::bail!(
+                                "Failed to restart daemon: {}. Original query error: {}",
+                                restart_err,
+                                e
+                            )
+                        }
+                    }
+                } else {
+                    // Not a connection error, or auto-spawn disabled
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

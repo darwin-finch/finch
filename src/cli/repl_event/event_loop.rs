@@ -320,8 +320,8 @@ impl EventLoop {
 
         // Check if daemon client exists
         if let Some(daemon_client) = &self.daemon_client {
-            // Daemon mode: use HTTP to query with local_only flag
-            match daemon_client.query_local_only(&query).await {
+            // Daemon mode: use HTTP to query with local_only flag (with auto-recovery)
+            match daemon_client.query_local_only_with_recovery(&query).await {
                 Ok(response_text) => {
                     // Output the response
                     self.output_manager.write_response(response_text);
