@@ -82,12 +82,12 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 **Organization:** Items sorted easiest → hardest for efficient progress and quick wins.
 
 **Summary:**
-- 23 total items (14 original + 9 new suggestions)
+- 24 total items (14 original + 10 new suggestions)
 - Phase 1: Quick wins (3 items, 1-2h each) ⚡
 - Phase 2: Medium difficulty (6 items, 2-4h each)
 - Phase 3: Moderate complexity (4 items, 3-6h each)
 - Phase 4: Challenging (6 items, 4-8h each)
-- Phase 5: Complex (3 items, 8-20h each)
+- Phase 5: Complex (4 items, 4-20h each)
 - Phase 6: Very complex (1 item, 20-40h)
 
 **New Items Added:**
@@ -100,6 +100,7 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 7. Python deps helper
 8. Memory monitoring
 9. Color customization
+10. Flexible tool approval patterns
 
 See `docs/ROADMAP.md` for detailed implementation plans.
 
@@ -237,17 +238,27 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 ### Phase 5: Complex (8-20 hours each)
 
-20. **[ ] Additional model adapters** (Phi, DeepSeek, etc.)
+20. **[ ] Flexible tool approval patterns** (NEW) 🔴 HIGH PRIORITY
+    - Allow patterns to match command, args, and directory separately
+    - Current: Pattern matches whole string like "cargo test in /Users/foo"
+    - Desired: Match components independently (e.g., any cargo command in specific dir)
+    - Structured pattern format: {tool: "bash", command: "cargo *", dir: "/home/*/projects"}
+    - Support wildcards for each component
+    - Backward compatible with existing patterns
+    - Files: `src/tools/patterns.rs`, `src/tools/executor.rs`
+    - Effort: 4-6 hours
+
+21. **[ ] Additional model adapters** (Phi, DeepSeek, etc.)
     - Create adapters for other model families
     - Files: `src/models/adapters/`
     - Effort: 4-8 hours per model
 
-21. **[ ] Adapter loading in runtime**
+22. **[ ] Adapter loading in runtime**
     - Load trained LoRA adapters in ONNX runtime
     - Files: `src/models/lora.rs`, `src/generators/qwen.rs`
     - Effort: 8-16 hours
 
-22. **[ ] Color scheme customization** (NEW)
+23. **[ ] Color scheme customization** (NEW)
     - Let users customize TUI colors via config
     - Accessibility improvement
     - Files: `src/cli/tui/`, `src/config/mod.rs`
@@ -255,7 +266,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 ### Phase 6: Very Complex (20+ hours)
 
-23. **[ ] Plan mode redesign**
+24. **[ ] Plan mode redesign**
     - Match Claude Code's plan mode quality
     - Multi-step planning, approval workflow
     - Files: `src/cli/plan_mode.rs` (major refactor)
@@ -265,7 +276,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 - [x] Clean up obsolete docs (moved to docs/archive/)
 - [x] Update STATUS.md with current capabilities
-- [ ] Update CLAUDE.md with accurate ONNX architecture
+- [x] Update CLAUDE.md with accurate ONNX architecture and recent progress
 - [ ] Create user guide (docs/USER_GUIDE.md)
 - [ ] Update ARCHITECTURE.md with daemon mode
 
