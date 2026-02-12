@@ -111,7 +111,7 @@ pub struct TuiRenderer {
 
 impl TuiRenderer {
     /// Helper method to create a clean text area with no default styling
-    fn create_clean_textarea() -> TextArea<'static> {
+    pub(super) fn create_clean_textarea() -> TextArea<'static> {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text("Type your message...");
 
@@ -131,7 +131,7 @@ impl TuiRenderer {
     }
 
     /// Helper to create a clean text area with initial text
-    fn create_clean_textarea_with_text(text: &str) -> TextArea<'static> {
+    pub(super) fn create_clean_textarea_with_text(text: &str) -> TextArea<'static> {
         let mut textarea = TextArea::from([text]);
 
         use ratatui::style::{Modifier, Style};
@@ -239,7 +239,7 @@ impl TuiRenderer {
             is_active: true,
             active_dialog: None,
             input_textarea: Self::create_clean_textarea(),
-            command_history: Vec::new(),
+            command_history: Self::load_history(), // Load history from disk
             history_index: None,
             scrollback,
             viewport_height,
@@ -298,6 +298,67 @@ impl TuiRenderer {
             } else {
                 self.output_manager.write_info("\n⚠ No recent interaction to provide feedback on\n");
             }
+        }
+
+        Ok(())
+    }
+
+    /// Load command history from disk
+    fn load_history() -> Vec<String> {
+        use std::io::BufRead;
+
+        let history_file = match dirs::home_dir() {
+            Some(home) => home.join(".shammah").join("history.txt"),
+            None => return Vec::new(),
+        };
+
+        if !history_file.exists() {
+            return Vec::new();
+        }
+
+        match std::fs::File::open(&history_file) {
+            Ok(file) => {
+                let reader = std::io::BufReader::new(file);
+                reader
+                    .lines()
+                    .filter_map(|line| line.ok())
+                    .filter(|line| !line.trim().is_empty())
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Save command history to disk
+    pub fn save_history(&self) -> Result<()> {
+        use std::io::Write;
+
+        let history_file = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
+            .join(".shammah")
+            .join("history.txt");
+
+        // Ensure parent directory exists
+        if let Some(parent) = history_file.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+        }
+
+        // Write history (limit to last 1000 commands)
+        let history_to_save: Vec<&String> = self
+            .command_history
+            .iter()
+            .rev()
+            .take(1000)
+            .rev()
+            .collect();
+
+        let mut file = std::fs::File::create(&history_file)
+            .with_context(|| format!("Failed to create history file: {}", history_file.display()))?;
+
+        for cmd in history_to_save {
+            writeln!(file, "{}", cmd)
+                .context("Failed to write to history file")?;
         }
 
         Ok(())
@@ -758,6 +819,11 @@ impl TuiRenderer {
 
             stdout.flush().context("Failed to flush stdout")?;
 
+            // Save command history to disk
+            if let Err(e) = self.save_history() {
+                eprintln!("Warning: Failed to save command history: {}", e);
+            }
+
             // Disable raw mode
             disable_raw_mode().context("Failed to disable raw mode")?;
 
@@ -1074,6 +1140,9 @@ impl Drop for TuiRenderer {
         // Ensure terminal is restored on drop
         if self.is_active {
             let mut stdout = io::stdout();
+
+            // Save command history (best effort)
+            let _ = self.save_history();
 
             // Show cursor
             let _ = execute!(stdout, cursor::Show);

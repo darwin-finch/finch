@@ -42,8 +42,12 @@ pub fn spawn_input_task(
                                 // Enter without Shift: Submit input
                                 let input = tui.input_textarea.lines().join("\n");
                                 if !input.trim().is_empty() {
+                                    // Add to command history
+                                    tui.command_history.push(input.clone());
+                                    tui.history_index = None;
+
                                     // Clear textarea for next input
-                                    tui.input_textarea = create_clean_textarea();
+                                    tui.input_textarea = TuiRenderer::create_clean_textarea();
                                     Ok(Some(input))
                                 } else {
                                     Ok(None) // Empty input, ignore
@@ -54,7 +58,7 @@ pub fn spawn_input_task(
                             // Check for feedback shortcuts when input is empty
                             let input_empty = tui.input_textarea.lines().join("").trim().is_empty();
 
-                            // Check for special shortcuts (Ctrl+C, Ctrl+G, Ctrl+B)
+                            // Check for special shortcuts and navigation (Ctrl+C, Ctrl+G, Ctrl+B, Up/Down)
                             match (key.code, key.modifiers) {
                                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                                     // Ctrl+C: Cancel query
@@ -69,6 +73,36 @@ pub fn spawn_input_task(
                                 (KeyCode::Char('b'), m) if m.contains(KeyModifiers::CONTROL) => {
                                     // Ctrl+B: Bad feedback
                                     tui.pending_feedback = Some(crate::feedback::FeedbackRating::Bad);
+                                    Ok(None)
+                                }
+                                (KeyCode::Up, KeyModifiers::NONE) => {
+                                    // Navigate history backwards (older commands)
+                                    if let Some(idx) = tui.history_index {
+                                        if idx > 0 {
+                                            tui.history_index = Some(idx - 1);
+                                            let cmd = &tui.command_history[idx - 1];
+                                            tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
+                                        }
+                                    } else if !tui.command_history.is_empty() {
+                                        tui.history_index = Some(tui.command_history.len() - 1);
+                                        let cmd = &tui.command_history[tui.command_history.len() - 1];
+                                        tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
+                                    }
+                                    Ok(None)
+                                }
+                                (KeyCode::Down, KeyModifiers::NONE) => {
+                                    // Navigate history forwards (newer commands)
+                                    if let Some(idx) = tui.history_index {
+                                        if idx < tui.command_history.len() - 1 {
+                                            tui.history_index = Some(idx + 1);
+                                            let cmd = &tui.command_history[idx + 1];
+                                            tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
+                                        } else {
+                                            // At newest entry, down arrow clears input
+                                            tui.history_index = None;
+                                            tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                        }
+                                    }
                                     Ok(None)
                                 }
                                 _ => {

@@ -205,6 +205,10 @@ pub fn handle_command(
         Command::Local { .. } => {
             Ok(CommandOutput::Status("Local command should be handled in REPL.".to_string()))
         }
+        // Memory command is handled directly in REPL
+        Command::Memory => {
+            Ok(CommandOutput::Status("Memory command should be handled in REPL.".to_string()))
+        }
     }
 }
 
