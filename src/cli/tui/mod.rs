@@ -70,7 +70,7 @@ pub struct TuiRenderer {
     /// Whether TUI is currently active (for suspend/resume)
     is_active: bool,
     /// Active dialog being displayed (if any)
-    active_dialog: Option<Dialog>,
+    pub active_dialog: Option<Dialog>,
     /// Text input area for integrated TUI input
     input_textarea: TextArea<'static>,
     /// Command history for up/down arrow navigation
@@ -91,6 +91,8 @@ pub struct TuiRenderer {
     pub pending_feedback: Option<crate::feedback::FeedbackRating>,
     /// Pending cancellation request (Ctrl+C pressed)
     pub pending_cancellation: bool,
+    /// Pending dialog result (completed but not yet processed)
+    pub pending_dialog_result: Option<crate::cli::tui::DialogResult>,
     /// Last query-response pair for feedback
     last_interaction: Option<(String, String)>,
     /// Last refresh timestamp
@@ -255,6 +257,7 @@ impl TuiRenderer {
             prev_status_content: String::new(),
             pending_feedback: None,
             pending_cancellation: false,
+            pending_dialog_result: None,
             last_interaction: None,
         })
     }

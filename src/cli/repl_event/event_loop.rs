@@ -80,6 +80,9 @@ pub struct EventLoop {
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
 
+    /// Pending tool approval requests (query_id -> (tool_use, response_tx))
+    pending_approvals: Arc<RwLock<std::collections::HashMap<Uuid, (crate::tools::types::ToolUse, tokio::sync::oneshot::Sender<super::events::ConfirmationResult>)>>>,
+
     /// Daemon client (for /local command)
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
 }
@@ -139,6 +142,7 @@ impl EventLoop {
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             streaming_messages: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
+            pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             daemon_client,
         }
     }
@@ -200,6 +204,31 @@ impl EventLoop {
                             tui.pending_cancellation = false; // Clear flag
                             drop(tui); // Release lock before sending event
                             let _ = self.event_tx.send(ReplEvent::CancelQuery);
+                        }
+                    }
+
+                    // Check for pending dialog result (tool approval)
+                    {
+                        let mut tui = self.tui_renderer.lock().await;
+                        if let Some(dialog_result) = tui.pending_dialog_result.take() {
+                            drop(tui); // Release lock before async operations
+
+                            // Find which query this dialog was for
+                            let mut approvals = self.pending_approvals.write().await;
+
+                            // Get the first pending approval (there should only be one active dialog at a time)
+                            if let Some((query_id, (tool_use, response_tx))) = approvals.iter().next() {
+                                let query_id = *query_id;
+                                let (tool_use, response_tx) = approvals.remove(&query_id).unwrap();
+
+                                // Convert dialog result to ConfirmationResult
+                                let confirmation = self.dialog_result_to_confirmation(dialog_result, &tool_use);
+
+                                // Send confirmation back to tool execution task
+                                let _ = response_tx.send(confirmation);
+
+                                tracing::debug!("[EVENT_LOOP] Tool approval processed for query {}", query_id);
+                            }
                         }
                     }
 
@@ -942,21 +971,14 @@ impl EventLoop {
     /// Handle tool approval request (show dialog, get user response)
     async fn handle_tool_approval_request(
         &mut self,
-        _query_id: Uuid,
+        query_id: Uuid,
         tool_use: crate::tools::types::ToolUse,
         response_tx: tokio::sync::oneshot::Sender<super::events::ConfirmationResult>,
     ) -> Result<()> {
-        use super::events::ConfirmationResult;
+        use crate::cli::tui::{Dialog, DialogOption};
 
-        // TEMPORARY: Auto-approve all tools to avoid deadlock
-        // TODO: Implement non-blocking dialog system (see TOOL_APPROVAL_DEADLOCK_FIX.md)
-        tracing::debug!("[EVENT_LOOP] Auto-approving tool: {}", tool_use.name);
-        let _ = response_tx.send(ConfirmationResult::ApproveOnce);
-        return Ok(());
+        tracing::debug!("[EVENT_LOOP] Requesting tool approval: {}", tool_use.name);
 
-        // BLOCKED CODE: This causes deadlock because show_dialog() blocks the event loop
-        // which prevents input_rx from being processed
-        /*
         // Create approval dialog
         let tool_name = &tool_use.name;
         let tool_input = serde_json::to_string_pretty(&tool_use.input)
@@ -976,17 +998,40 @@ impl EventLoop {
             options,
         );
 
-        // Show dialog and get result
+        // Set dialog in TUI (non-blocking - will be handled by async_input task)
         let mut tui = self.tui_renderer.lock().await;
-        let dialog_result = tui.show_dialog(dialog)?;
-        drop(tui); // Release lock
+        tui.active_dialog = Some(dialog);
 
-        // Convert dialog result to ConfirmationResult
-        let confirmation = match dialog_result {
+        // Force render to show dialog immediately
+        if let Err(e) = tui.render() {
+            tracing::error!("[EVENT_LOOP] Failed to render dialog: {}", e);
+        }
+        drop(tui);
+
+        // Store the response channel and tool_use for when dialog completes
+        // We'll check pending_dialog_result in the event loop and send the response then
+        self.pending_approvals.write().await.insert(query_id, (tool_use, response_tx));
+
+        tracing::debug!("[EVENT_LOOP] Tool approval dialog shown, waiting for user response");
+
+        Ok(())
+    }
+
+    /// Convert dialog result to confirmation result
+    fn dialog_result_to_confirmation(
+        &self,
+        dialog_result: crate::cli::tui::DialogResult,
+        tool_use: &crate::tools::types::ToolUse,
+    ) -> super::events::ConfirmationResult {
+        use super::events::ConfirmationResult;
+        use crate::tools::executor::generate_tool_signature;
+        use crate::tools::patterns::ToolPattern;
+
+        match dialog_result {
             crate::cli::tui::DialogResult::Selected(index) => match index {
                 0 => ConfirmationResult::ApproveOnce,
                 1 => {
-                    let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
+                    let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
                     ConfirmationResult::ApproveExactSession(signature)
                 }
                 2 => {
@@ -999,7 +1044,7 @@ impl EventLoop {
                     ConfirmationResult::ApprovePatternSession(pattern)
                 }
                 3 => {
-                    let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
+                    let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
                     ConfirmationResult::ApproveExactPersistent(signature)
                 }
                 4 => {
@@ -1011,15 +1056,9 @@ impl EventLoop {
                     );
                     ConfirmationResult::ApprovePatternPersistent(pattern)
                 }
-                _ => ConfirmationResult::Deny,
+                _ => ConfirmationResult::Deny, // Index 5 or cancelled
             },
             _ => ConfirmationResult::Deny,
-        };
-
-        // Send confirmation back to tool execution task
-        let _ = response_tx.send(confirmation);
-
-        Ok(())
-        */
+        }
     }
 }

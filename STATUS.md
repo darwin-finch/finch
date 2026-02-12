@@ -216,10 +216,14 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/cli/setup_wizard.rs`
     - Effort: 4 hours (actual)
 
-17. **[ ] Tool confirmation system fix** 🔴 CRITICAL SECURITY
-    - Debug why confirmations not working
-    - Files: `src/tools/permissions.rs`, `src/tools/executor.rs`
-    - Effort: 4-8 hours
+17. **[x] Tool confirmation system fix** 🔴 CRITICAL SECURITY - ✅ COMPLETE
+    - Fixed deadlock issue by integrating dialogs with async input system
+    - Dialog key events handled in async_input task (non-blocking)
+    - Tool approval dialog shows 6 options (once, session exact/pattern, persistent exact/pattern, deny)
+    - Approval responses sent through oneshot channels
+    - No more auto-approving of tools
+    - Files: `src/cli/tui/mod.rs`, `src/cli/tui/async_input.rs`, `src/cli/repl_event/event_loop.rs`
+    - Effort: 5 hours (actual)
 
 18. **[ ] Multi-model setup wizard**
     - Let users choose models in wizard

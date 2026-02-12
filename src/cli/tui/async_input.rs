@@ -32,7 +32,22 @@ pub fn spawn_input_task(
                 {
                     // Process first event
                     let first_event_result = match crossterm::event::read() {
-                        Ok(Event::Key(key)) if key.code == KeyCode::Enter => {
+                        Ok(Event::Key(key)) => {
+                            // Priority 1: Handle active dialog (if any)
+                            if tui.active_dialog.is_some() {
+                                let dialog_result = if let Some(dialog) = tui.active_dialog.as_mut() {
+                                    dialog.handle_key_event(key)
+                                } else {
+                                    None
+                                };
+
+                                if let Some(result) = dialog_result {
+                                    // Dialog completed, clear it and store result
+                                    tui.active_dialog = None;
+                                    tui.pending_dialog_result = Some(result);
+                                }
+                                Ok(None) // Don't submit input while dialog is active
+                            } else if key.code == KeyCode::Enter {
                             // Check if Shift is held (Shift+Enter inserts newline, Enter submits)
                             if key.modifiers.contains(KeyModifiers::SHIFT) {
                                 // Shift+Enter: Insert newline (pass to textarea)
@@ -53,8 +68,8 @@ pub fn spawn_input_task(
                                     Ok(None) // Empty input, ignore
                                 }
                             }
-                        }
-                        Ok(Event::Key(key)) => {
+                            } else {
+                            // Priority 3: Handle other keys (feedback shortcuts, history, input)
                             // Check for feedback shortcuts when input is empty
                             let input_empty = tui.input_textarea.lines().join("").trim().is_empty();
 
@@ -110,6 +125,7 @@ pub fn spawn_input_task(
                                     tui.input_textarea.input(Event::Key(key));
                                     Ok(None)
                                 }
+                            }
                             }
                         }
                         Ok(_) => Ok(None), // Ignore other events (mouse, resize, etc.)
