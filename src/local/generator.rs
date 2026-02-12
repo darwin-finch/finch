@@ -118,26 +118,17 @@ impl TemplateGenerator {
         if let Some(generator) = &self.neural_generator {
             match self.try_neural_generate(query, generator) {
                 Ok(neural_response) => {
-                    // ALWAYS return neural response if generation succeeded
-                    // Even if it's short or contains errors - let user see what model produces
+                    // Return neural response (quality score used internally for routing)
                     let quality_score = if neural_response.len() < 10 {
-                        0.1 // Very low confidence for short responses
+                        0.5 // Lower confidence for very short responses
                     } else if neural_response.starts_with("[Error:") {
-                        0.2 // Low confidence for error responses
+                        0.3 // Low confidence for error responses
                     } else {
-                        0.8 // High confidence for normal responses
-                    };
-
-                    let display_text = if neural_response.len() < 10 {
-                        format!("[NEURAL - LOW QUALITY]: {}", neural_response)
-                    } else if neural_response.starts_with("[Error:") {
-                        format!("[NEURAL - ERROR]: {}", neural_response)
-                    } else {
-                        neural_response
+                        0.9 // High confidence for normal responses
                     };
 
                     return Ok(GeneratedResponse {
-                        text: display_text,
+                        text: neural_response, // Clean output without debug prefixes
                         method: "neural".to_string(),
                         confidence: quality_score,
                         pattern: pattern.as_str().to_string(),
