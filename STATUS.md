@@ -81,6 +81,14 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 
 ### Phase 1: Polish & UX (High Priority)
 
+**Tool Confirmation Fix:**
+- [ ] Debug and fix tool confirmation system
+  - Current: Tool confirmations not working properly
+  - Security: HIGH PRIORITY - affects user control over tool execution
+  - Need: Investigate why permission prompts not appearing
+  - Files: `src/tools/permissions.rs`, `src/tools/executor.rs`
+  - Impact: Critical for safety and user trust
+
 **Textarea Improvements:**
 - [ ] Add shift-return support for multi-line input expansion
 - [ ] Add history navigation (up/down arrows for previous queries)
@@ -93,6 +101,14 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
   - Current: Status bar exists but doesn't show live stats
   - Need: Real-time token count, generation speed, current model
   - Files: `src/cli/tui/status_widget.rs`
+
+**Query Control:**
+- [ ] Add Control-C query termination
+  - Current: Control-C cannot stop in-progress queries
+  - Need: Terminate current query, return to prompt
+  - Daemon: Pass cancellation through to teacher model API
+  - Files: `src/cli/tui/mod.rs`, `src/daemon/client.rs`
+  - Impact: Essential UX for long-running queries
 
 **Daemon Management:**
 - [ ] Add `shammah daemon stop` subcommand
@@ -166,22 +182,33 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 
 ## Known Issues
 
-### 1. Plan Mode Needs Redesign
+### 1. Tool Confirmations Not Working
+**Issue:** Tool confirmation system is broken/non-functional
+**Impact:** Tools may execute without proper user approval
+**Security:** High priority - affects user control and safety
+**Fix:** Phase 1 - Debug and fix permission system
+
+### 2. Control-C Cannot Stop Queries
+**Issue:** No way to cancel in-progress queries
+**Impact:** Users stuck waiting for long-running queries to complete
+**Fix:** Phase 1 - Implement query cancellation with Control-C
+
+### 3. Plan Mode Needs Redesign
 **Issue:** Current plan mode is basic and not user-friendly
 **Impact:** Users find it "nearly useless" compared to Claude Code
 **Fix:** Phase 3 - Study Claude Code's plan mode and redesign
 
-### 2. Status Bar Empty
+### 3. Status Bar Empty
 **Issue:** Status bar exists but doesn't show live stats
 **Impact:** Users don't see token counts, speed, model info
 **Fix:** Phase 1 - Wire up OutputManager stats to status bar
 
-### 3. Setup Wizard Limited
+### 4. Setup Wizard Limited
 **Issue:** Only supports Claude setup during first run
 **Impact:** Users manually edit config to add other providers
 **Fix:** Phase 2 - Add interactive prompts for all providers
 
-### 4. LoRA Training Not Active
+### 5. LoRA Training Not Active
 **Issue:** Infrastructure complete but Python deps not installed
 **Impact:** Weighted training not functional yet
 **Fix:** Phase 3 - Install dependencies, test end-to-end

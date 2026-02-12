@@ -9,6 +9,55 @@ This document provides detailed plans for future Shammah development, organized 
 
 ## Phase 1: Polish & UX (High Priority)
 
+### 1.0 Tool Confirmation System Fix
+
+**Problem:** Tool confirmation prompts not appearing/working properly
+**Security Impact:** HIGH - Tools may execute without user approval
+**User Impact:** Critical - Affects trust and control over system actions
+
+**Investigation Steps:**
+1. Test tool execution in REPL mode
+   - Try: `> Can you read my Cargo.toml?`
+   - Expected: Confirmation prompt appears
+   - Actual: ?
+2. Check if permission system is bypassed
+3. Verify prompt rendering in TUI
+4. Test daemon mode vs REPL mode
+
+**Implementation Details:**
+- Files:
+  - `src/tools/permissions.rs` - PermissionManager
+  - `src/tools/executor.rs` - ToolExecutor
+  - `src/cli/tui/mod.rs` - TUI rendering
+- Behavior:
+  1. When tool requested, check if pattern approved
+  2. If not approved, show prompt with options:
+     - Approve once
+     - Approve for session
+     - Approve pattern (persistent)
+     - Deny
+  3. Wait for user input
+  4. Execute or deny based on response
+
+**Debugging Questions:**
+- Are prompts being generated?
+- Are they being sent to TUI?
+- Is TUI rendering them?
+- Is input being captured?
+- Are patterns being saved/loaded correctly?
+
+**Test Cases:**
+1. First tool use (no patterns) → Should prompt
+2. Approved pattern → Should execute without prompt
+3. Session pattern → Should work in session only
+4. Persistent pattern → Should work across restarts
+
+**Complexity:** Medium-High (requires debugging existing system)
+**Estimated Effort:** 4-8 hours
+**Priority:** CRITICAL - Security and user trust
+
+---
+
 ### 1.1 Textarea Improvements
 
 #### 1.1.1 Shift-Return Multi-Line Input Support
@@ -59,6 +108,59 @@ This document provides detailed plans for future Shammah development, organized 
 **Dependencies:** None
 
 **Reference Implementation:** Check `reedline` crate for history handling patterns
+
+---
+
+### 1.1.3 Control-C Query Termination
+
+**Problem:** No way to cancel in-progress queries
+**Expected Behavior:** Control-C stops current query and returns to prompt
+**Impact:** High - Essential for long-running queries
+
+**Implementation Details:**
+- Files:
+  - `src/cli/tui/mod.rs` - Capture Control-C signal
+  - `src/daemon/client.rs` - Send cancellation to daemon
+  - `src/daemon/session.rs` - Cancel ongoing generation
+  - `src/providers/*.rs` - Cancel API requests
+
+**Behavior:**
+1. User presses Control-C during query
+2. TUI captures SIGINT signal
+3. If query in progress:
+   - Send cancel request to daemon
+   - Daemon cancels API request (HTTP abort)
+   - Return partial response (if any)
+   - Display "Query cancelled by user"
+   - Return to prompt
+4. If no query in progress:
+   - Ignore (already at prompt)
+
+**API Cancellation:**
+- For streaming requests: Close SSE connection
+- For non-streaming: Abort HTTP request
+- Teacher APIs (Claude/GPT-4): Use cancellation endpoints if available
+- Local model: Interrupt generation loop
+
+**Edge Cases:**
+- Query just completed → Show full response
+- Multi-turn tool execution → Cancel current turn only
+- Background tasks → Don't cancel (e.g., model loading)
+
+**Signal Handling:**
+```rust
+use tokio::signal;
+
+async fn handle_sigint() {
+    signal::ctrl_c().await.unwrap();
+    // Send cancellation
+}
+```
+
+**Complexity:** Medium
+**Estimated Effort:** 3-6 hours
+**Dependencies:** None
+**Priority:** HIGH - Basic UX expectation
 
 ---
 
@@ -494,6 +596,8 @@ api_key = "..."
 
 ### This Week (Feb 12-18)
 - [x] Documentation cleanup (STATUS.md, archive)
+- [ ] **Fix tool confirmation system (1.0) - CRITICAL**
+- [ ] **Control-C query termination (1.1.3) - HIGH PRIORITY**
 - [ ] Textarea shift-return support (1.1.1)
 - [ ] Status bar live stats (1.2)
 - [ ] Daemon management commands (1.3)
