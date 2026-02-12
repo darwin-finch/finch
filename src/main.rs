@@ -178,6 +178,10 @@ async fn main() -> Result<()> {
         anyhow::bail!("--no-daemon mode requires --initial-prompt");
     }
 
+    // For daemon mode, force raw mode (TUI not fully integrated yet)
+    config.tui_enabled = false;
+    output_manager.enable_stdout();
+
     // Run REPL via daemon (daemon-only mode)
     run_repl_via_daemon(args.initial_prompt, args.restore_session, config).await
 }

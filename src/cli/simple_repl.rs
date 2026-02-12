@@ -63,9 +63,23 @@ impl SimplifiedRepl {
         };
 
         // TUI initialization (if enabled in config)
-        // Note: For daemon mode, TUI is simplified
-        // Full TUI rendering happens in the daemon
-        let tui_renderer: Option<Arc<RwLock<TuiRenderer>>> = None;
+        let tui_renderer = if config.tui_enabled {
+            // Get global OutputManager and StatusBar (created in main.rs)
+            use crate::cli::global_output::{global_output, global_status};
+
+            match TuiRenderer::new(global_output(), global_status()) {
+                Ok(renderer) => {
+                    output_status!("✓ TUI mode enabled");
+                    Some(Arc::new(RwLock::new(renderer)))
+                }
+                Err(e) => {
+                    output_error!("Failed to initialize TUI: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
