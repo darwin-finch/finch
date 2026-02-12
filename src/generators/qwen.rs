@@ -129,6 +129,9 @@ impl QwenGenerator {
                 model: "Qwen2.5-3B".to_string(),
                 confidence: Some(generated.confidence),
                 stop_reason: None,
+                input_tokens: None,  // TODO: Track ONNX tokenizer input length
+                output_tokens: Some(generated.text.split_whitespace().count() as u32), // Rough estimate
+                latency_ms: None,    // TODO: Track generation timing
             },
         })
     }
@@ -169,6 +172,9 @@ impl QwenGenerator {
                         model: "Qwen2.5-3B".to_string(),
                         confidence: Some(0.8),
                         stop_reason: Some("end_turn".to_string()),
+                        input_tokens: None,
+                        output_tokens: Some(text.split_whitespace().count() as u32),
+                        latency_ms: None,
                     },
                 });
             }

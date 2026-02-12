@@ -70,6 +70,9 @@ impl ClaudeGenerator {
                 model: response.model,
                 confidence: None,
                 stop_reason: response.stop_reason,
+                input_tokens: None,  // TODO: Extract from response.usage when available
+                output_tokens: None, // TODO: Extract from response.usage when available
+                latency_ms: None,    // TODO: Track request timing
             },
         }
     }

@@ -123,6 +123,9 @@ impl LocalGenerator {
                         model: "Qwen2.5-1.5B-Instruct".to_string(), // TODO: Get from config
                         confidence: Some(generated.confidence),
                         stop_reason: None,
+                        input_tokens: None,
+                        output_tokens: Some(generated.text.split_whitespace().count() as u32),
+                        latency_ms: None,
                     },
                 };
 

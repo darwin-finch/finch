@@ -74,6 +74,14 @@ pub enum ReplEvent {
         full_response: String,
     },
 
+    /// Query statistics update (for status bar)
+    StatsUpdate {
+        model: String,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        latency_ms: Option<u64>,
+    },
+
     /// Request to shut down the REPL
     Shutdown,
 }

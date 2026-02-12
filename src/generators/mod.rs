@@ -67,6 +67,9 @@ pub struct ResponseMetadata {
     pub model: String,          // specific model name
     pub confidence: Option<f64>, // for Qwen
     pub stop_reason: Option<String>, // for Claude
+    pub input_tokens: Option<u32>,   // Input token count (if available)
+    pub output_tokens: Option<u32>,  // Output token count (if available)
+    pub latency_ms: Option<u64>,     // Response latency in milliseconds
 }
 
 /// Streaming chunk (text delta or complete block)

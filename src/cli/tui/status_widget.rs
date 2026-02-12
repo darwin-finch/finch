@@ -26,6 +26,12 @@ impl<'a> StatusWidget<'a> {
     /// Get the style for a status line based on its type
     fn get_line_style(line_type: &StatusLineType) -> Style {
         match line_type {
+            StatusLineType::LiveStats => {
+                // Live stats: bright green
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            }
             StatusLineType::TrainingStats => {
                 // Training stats: gray
                 Style::default().fg(Color::DarkGray)

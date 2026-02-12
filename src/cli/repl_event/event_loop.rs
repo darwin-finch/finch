@@ -172,6 +172,7 @@ impl EventLoop {
                         ReplEvent::ToolApprovalNeeded { .. } => "ToolApprovalNeeded",
                         ReplEvent::OutputReady { .. } => "OutputReady",
                         ReplEvent::UserInput { .. } => "UserInput",
+                        ReplEvent::StatsUpdate { .. } => "StatsUpdate",
                         ReplEvent::Shutdown => "Shutdown",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
@@ -537,6 +538,14 @@ impl EventLoop {
                 .await
             {
                 Ok(response) => {
+                    // Send stats update
+                    let _ = event_tx.send(ReplEvent::StatsUpdate {
+                        model: response.metadata.model.clone(),
+                        input_tokens: response.metadata.input_tokens,
+                        output_tokens: response.metadata.output_tokens,
+                        latency_ms: response.metadata.latency_ms,
+                    });
+
                     // Send response (StreamingComplete works for non-streaming too)
                     let _ = event_tx.send(ReplEvent::StreamingComplete {
                         query_id,
@@ -712,6 +721,23 @@ impl EventLoop {
                 // Render TUI to write the complete message to scrollback
                 self.render_tui().await?;
                 tracing::debug!("[EVENT_LOOP] StreamingComplete handled, TUI rendered");
+            }
+
+            ReplEvent::StatsUpdate {
+                model,
+                input_tokens,
+                output_tokens,
+                latency_ms,
+            } => {
+                // Update status bar with live stats
+                self.status_bar.update_live_stats(
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    latency_ms,
+                );
+                // Render to display updated stats
+                self.render_tui().await?;
             }
 
             ReplEvent::Shutdown => {

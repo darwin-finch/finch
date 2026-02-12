@@ -13,6 +13,8 @@ use std::sync::{Arc, RwLock};
 /// Types of status lines
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StatusLineType {
+    /// Live query statistics (tokens, latency, model)
+    LiveStats,
     /// Training statistics (queries, local%, quality)
     TrainingStats,
     /// Model download progress
@@ -68,10 +70,17 @@ impl StatusBar {
     pub fn get_lines(&self) -> Vec<StatusLine> {
         let lines = self.lines.read().unwrap();
 
-        // Order: TrainingStats, DownloadProgress, OperationStatus, then Custom
+        // Order: LiveStats, TrainingStats, DownloadProgress, OperationStatus, then Custom
         let mut result = Vec::new();
 
         // Add in preferred order
+        if let Some(content) = lines.get(&StatusLineType::LiveStats) {
+            result.push(StatusLine {
+                line_type: StatusLineType::LiveStats,
+                content: content.clone(),
+            });
+        }
+
         if let Some(content) = lines.get(&StatusLineType::TrainingStats) {
             result.push(StatusLine {
                 line_type: StatusLineType::TrainingStats,
@@ -203,6 +212,48 @@ impl StatusBar {
     /// Clear operation status (shorthand)
     pub fn clear_operation(&self) {
         self.remove_line(&StatusLineType::OperationStatus);
+    }
+
+    /// Update live query statistics
+    pub fn update_live_stats(
+        &self,
+        model: impl Into<String>,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        latency_ms: Option<u64>,
+    ) {
+        let model_name = model.into();
+
+        let mut parts = vec![format!("Model: {}", model_name)];
+
+        if let Some(input) = input_tokens {
+            if let Some(output) = output_tokens {
+                parts.push(format!("Tokens: {}→{}", input, output));
+            } else {
+                parts.push(format!("Input: {} tokens", input));
+            }
+        } else if let Some(output) = output_tokens {
+            parts.push(format!("Output: {} tokens", output));
+        }
+
+        if let Some(latency) = latency_ms {
+            let latency_sec = latency as f64 / 1000.0;
+            parts.push(format!("Latency: {:.2}s", latency_sec));
+
+            // Calculate tokens/sec if we have output tokens
+            if let Some(output) = output_tokens {
+                let tokens_per_sec = output as f64 / latency_sec;
+                parts.push(format!("Speed: {:.1} tok/s", tokens_per_sec));
+            }
+        }
+
+        let content = parts.join(" | ");
+        self.update_line(StatusLineType::LiveStats, content);
+    }
+
+    /// Clear live stats (shorthand)
+    pub fn clear_live_stats(&self) {
+        self.remove_line(&StatusLineType::LiveStats);
     }
 }
 
