@@ -207,42 +207,73 @@ pub fn handle_command(
 }
 
 pub fn format_help() -> String {
-    r#"Available commands:
-  /help             - Show this help message
-  /quit             - Exit the REPL
-  /metrics          - Display statistics
-  /training         - Show detailed training statistics
-  /clear            - Clear conversation history (start fresh)
-  /debug            - Toggle debug output
-  /local <query>    - Query local model directly (bypass routing)
-  /patterns         - List confirmation patterns
-  /patterns add     - Add a new confirmation pattern (interactive)
-  /patterns rm <id> - Remove a pattern by ID
-  /patterns clear   - Remove all patterns
-
-Plan Mode Commands:
-  /plan <task>      - Enter planning mode for a task
-  /show-plan        - Display the current plan
-  /save-plan        - Manually save current response as plan
-  /approve          - Approve plan (prompts to clear context) and start execution
-  /reject           - Reject the plan and return to normal mode
-  /done             - Exit execution mode and return to normal mode
-
-Weighted Feedback Commands (LoRA Fine-Tuning):
-  /critical [note]  - Mark last response as critical error (10x weight)
-  /medium [note]    - Mark last response needs improvement (3x weight)
-  /good [note]      - Mark last response as good example (1x weight)
-
-  Aliases:
-  /feedback critical|high|medium|good [note]
-
-  Examples:
-  /critical Never use .unwrap() in production code
-  /medium Prefer iterator chains over manual loops
-  /good This is exactly the right approach
-
-Type any question to get started!"#
-        .to_string()
+    format!(
+        "\x1b[1;36m╔═══════════════════════════════════════════════════════════════════════╗\x1b[0m\n\
+         \x1b[1;36m║\x1b[0m                  \x1b[1;32mShammah Help - Commands & Shortcuts\x1b[0m                  \x1b[1;36m║\x1b[0m\n\
+         \x1b[1;36m╚═══════════════════════════════════════════════════════════════════════╝\x1b[0m\n\n\
+         \x1b[1;33m📋 Basic Commands:\x1b[0m\n\
+         \x1b[36m  /help\x1b[0m              Show this help message\n\
+         \x1b[36m  /quit\x1b[0m              Exit the REPL (also: Ctrl+D)\n\
+         \x1b[36m  /clear\x1b[0m             Clear conversation history (start fresh)\n\
+         \x1b[36m  /debug\x1b[0m             Toggle debug output\n\
+         \x1b[36m  /metrics\x1b[0m           Display usage statistics\n\
+         \x1b[36m  /training\x1b[0m          Show detailed training statistics\n\n\
+         \x1b[1;33m🤖 Model Commands:\x1b[0m\n\
+         \x1b[36m  /local <query>\x1b[0m     Query local model directly (bypass routing)\n\
+         \x1b[0m                     Example: /local What is 2+2?\n\n\
+         \x1b[1;33m🔒 Tool Confirmation Patterns:\x1b[0m\n\
+         \x1b[36m  /patterns\x1b[0m          List all saved confirmation patterns\n\
+         \x1b[36m  /patterns add\x1b[0m      Add a new pattern (interactive wizard)\n\
+         \x1b[36m  /patterns rm <id>\x1b[0m  Remove a specific pattern by ID\n\
+         \x1b[36m  /patterns clear\x1b[0m    Remove all patterns (requires confirmation)\n\
+         \x1b[0m\n\
+         \x1b[90m  What are patterns?\x1b[0m Saved rules for auto-approving tool executions.\n\
+         \x1b[90m  Example:\x1b[0m \"Always allow reading *.rs files\" or \"Allow git status\"\n\n\
+         \x1b[1;33m📝 Plan Mode Commands:\x1b[0m\n\
+         \x1b[36m  /plan <task>\x1b[0m       Enter planning mode for a complex task\n\
+         \x1b[36m  /show-plan\x1b[0m         Display the current plan\n\
+         \x1b[36m  /save-plan\x1b[0m         Manually save current response as plan\n\
+         \x1b[36m  /approve\x1b[0m           Approve plan and start execution\n\
+         \x1b[36m  /reject\x1b[0m            Reject the plan and return to normal mode\n\
+         \x1b[36m  /done\x1b[0m              Exit execution mode\n\n\
+         \x1b[1;33m🎓 Weighted Feedback (LoRA Fine-Tuning):\x1b[0m\n\
+         \x1b[36m  /critical [note]\x1b[0m   Mark response as \x1b[31mcritical error\x1b[0m (10x training weight)\n\
+         \x1b[36m  /medium [note]\x1b[0m     Mark response \x1b[33mneeds improvement\x1b[0m (3x weight)\n\
+         \x1b[36m  /good [note]\x1b[0m       Mark response as \x1b[32mgood example\x1b[0m (1x weight)\n\
+         \x1b[0m\n\
+         \x1b[90m  Aliases:\x1b[0m /feedback critical|high|medium|good [note]\n\
+         \x1b[0m\n\
+         \x1b[90m  Examples:\x1b[0m\n\
+         \x1b[90m    /critical\x1b[0m Never use .unwrap() in production code\n\
+         \x1b[90m    /medium\x1b[0m Prefer iterator chains over manual loops\n\
+         \x1b[90m    /good\x1b[0m This is exactly the right approach\n\n\
+         \x1b[1;33m⌨️  Keyboard Shortcuts:\x1b[0m\n\
+         \x1b[36m  Ctrl+C\x1b[0m             Cancel current query (interrupts generation)\n\
+         \x1b[36m  Ctrl+D\x1b[0m             Exit REPL (same as /quit)\n\
+         \x1b[36m  Shift+PgUp\x1b[0m         Scroll up in history\n\
+         \x1b[36m  Shift+PgDown\x1b[0m       Scroll down in history\n\
+         \x1b[90m  ↑ / ↓ arrows\x1b[0m       Navigate command history (coming soon)\n\
+         \x1b[90m  Shift+Enter\x1b[0m        Multi-line input (coming soon)\n\n\
+         \x1b[1;33m🛠️  Tool Execution:\x1b[0m\n\
+         When Claude needs to use tools (read files, run commands, etc.), you'll\n\
+         be asked to approve each action. You can:\n\
+         \x1b[32m  • Approve once\x1b[0m              Execute this time only\n\
+         \x1b[32m  • Approve for session\x1b[0m      Allow during this session\n\
+         \x1b[32m  • Remember pattern\x1b[0m         Always allow (saves to /patterns)\n\
+         \x1b[31m  • Deny\x1b[0m                     Reject the action\n\n\
+         Available tools: Read, Glob, Grep, WebFetch, Bash, Restart\n\n\
+         \x1b[1;33m📚 Learn More:\x1b[0m\n\
+         \x1b[36m  GitHub:\x1b[0m   https://github.com/schancel/shammah\n\
+         \x1b[36m  Issues:\x1b[0m   https://github.com/schancel/shammah/issues\n\
+         \x1b[36m  Docs:\x1b[0m     See README.md and docs/ folder\n\n\
+         \x1b[1;33m💡 Quick Start:\x1b[0m\n\
+         Just type your question! Examples:\n\
+         \x1b[90m  • How do I implement a binary search in Rust?\x1b[0m\n\
+         \x1b[90m  • Can you read my Cargo.toml and explain the dependencies?\x1b[0m\n\
+         \x1b[90m  • Find all TODO comments in my code\x1b[0m\n\n\
+         \x1b[1;36m─────────────────────────────────────────────────────────────────────────\x1b[0m\n\
+         \x1b[90mTip: Use Ctrl+C to cancel long-running queries\x1b[0m"
+    )
 }
 
 fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {

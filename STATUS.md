@@ -150,11 +150,11 @@ See `docs/ROADMAP.md` for detailed implementation plans.
    - Files: `src/models/download.rs`, `src/cli/tui/status_widget.rs`
    - Effort: 2-4 hours
 
-9. **[ ] /help command improvements** (NEW)
+9. **[x] /help command improvements** (NEW) - ✅ COMPLETE
    - Document all slash commands, keyboard shortcuts
    - Show tool confirmation system usage
    - Files: `src/cli/commands.rs`
-   - Effort: 2-4 hours
+   - Effort: 30 minutes (actual)
 
 ### Phase 3: Moderate Complexity (3-6 hours each)
 
