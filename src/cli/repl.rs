@@ -88,6 +88,8 @@ pub enum ReplMode {
 pub struct Repl {
     _config: Config,
     claude_client: ClaudeClient,
+    // Daemon client (optional - for daemon-only mode)
+    daemon_client: Option<Arc<crate::client::DaemonClient>>,
     // Teacher session with context optimization
     teacher_session: Arc<RwLock<TeacherSession>>,
     router: Router, // Now contains ThresholdRouter
@@ -408,9 +410,18 @@ impl Repl {
             output_status!("✓ Teacher context optimization enabled (Level 3)");
         }
 
+        // Try to connect to daemon (non-blocking, best effort)
+        let daemon_client = Self::try_connect_daemon(&config).await;
+        if daemon_client.is_some() {
+            output_status!("✓ Connected to daemon");
+        } else if is_interactive {
+            output_status!("⚠️  Daemon not available, using teacher API directly");
+        }
+
         Self {
             _config: config,
             claude_client,
+            daemon_client,
             teacher_session,
             router, // Contains ThresholdRouter now
             metrics_logger,
@@ -438,6 +449,31 @@ impl Repl {
             output_manager,
             status_bar,
             // TUI renderer moved to global (Phase 5: Native ratatui dialogs)
+        }
+    }
+
+    /// Try to connect to daemon (non-blocking, returns None if not available)
+    async fn try_connect_daemon(config: &Config) -> Option<Arc<crate::client::DaemonClient>> {
+        use crate::client::{DaemonClient, DaemonConfig};
+
+        // Only try if daemon is enabled in config
+        if !config.client.use_daemon {
+            return None;
+        }
+
+        // Try to connect with short timeout
+        let daemon_config = DaemonConfig {
+            bind_address: config.client.daemon_address.clone(),
+            auto_spawn: config.client.auto_spawn,
+            timeout_seconds: 5, // Short timeout for non-blocking check
+        };
+
+        match DaemonClient::connect(daemon_config).await {
+            Ok(client) => Some(Arc::new(client)),
+            Err(e) => {
+                tracing::debug!("Failed to connect to daemon: {}", e);
+                None
+            }
         }
     }
 
@@ -2251,6 +2287,39 @@ impl Repl {
             io::stdout().flush()?;
         }
 
+        // DAEMON MODE: If daemon client is available, use it
+        if let Some(daemon_client) = &self.daemon_client {
+            if self.is_interactive {
+                io::stdout()
+                    .execute(cursor::MoveToColumn(0))?
+                    .execute(Clear(ClearType::CurrentLine))?;
+                self.output_status("→ Using daemon for query");
+            }
+
+            match daemon_client.query_text(query).await {
+                Ok(response) => {
+                    // Add assistant response to conversation
+                    self.conversation.write().await.add_assistant_message(response.clone());
+
+                    if self.is_interactive {
+                        let elapsed = start_time.elapsed();
+                        self.output_status(format!("✓ Query completed in {:.2}s (via daemon)", elapsed.as_secs_f64()));
+                    }
+
+                    return Ok(response);
+                }
+                Err(e) => {
+                    tracing::warn!("Daemon query failed: {}, falling back to teacher", e);
+                    if self.is_interactive {
+                        self.output_status(format!("⚠️  Daemon failed: {}", e));
+                        self.output_status("→ Falling back to teacher API");
+                    }
+                    // Fall through to normal routing below
+                }
+            }
+        }
+
+        // FALLBACK: Normal routing (local model or teacher API)
         // Make routing decision (uses threshold router internally)
         // Check if local generator is ready before routing (progressive bootstrap support)
         let generator_ready = matches!(
