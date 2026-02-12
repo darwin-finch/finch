@@ -105,10 +105,10 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 ### Phase 1: Quick Wins ⚡ (Easy - 1-2 hours each)
 
-1. **[ ] Daemon stop command** - EASIEST FIRST
-   - Add `shammah daemon stop` subcommand
-   - Files: `src/cli/commands.rs`, `src/daemon/lifecycle.rs`
-   - Effort: 1-2 hours
+1. **[x] Daemon stop command** - ✅ COMPLETE
+   - Add `shammah daemon-stop` subcommand
+   - Files: `src/main.rs`, `src/daemon/lifecycle.rs`
+   - Effort: 1 hour (actual)
 
 2. **[ ] Daemon start command**
    - Add `shammah daemon start` subcommand

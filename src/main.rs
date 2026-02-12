@@ -57,6 +57,8 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8000")]
         bind: String,
     },
+    /// Stop the running daemon
+    DaemonStop,
     /// Execute a single query
     Query {
         /// Query text
@@ -93,6 +95,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Daemon { bind }) => {
             return run_daemon(bind).await;
+        }
+        Some(Command::DaemonStop) => {
+            return run_daemon_stop();
         }
         Some(Command::Query { query }) => {
             return run_query(&query).await;
@@ -320,6 +325,29 @@ fn init_tracing() {
 }
 
 /// Run HTTP daemon server
+/// Stop the running daemon
+fn run_daemon_stop() -> Result<()> {
+    use shammah::daemon::DaemonLifecycle;
+
+    let lifecycle = DaemonLifecycle::new()?;
+
+    // Check if daemon is running
+    if !lifecycle.is_running() {
+        println!("Daemon is not running");
+        return Ok(());
+    }
+
+    // Get PID for display
+    let pid = lifecycle.read_pid()?;
+    println!("Stopping daemon (PID: {})...", pid);
+
+    // Stop daemon
+    lifecycle.stop_daemon()?;
+
+    println!("✓ Daemon stopped successfully");
+    Ok(())
+}
+
 async fn run_daemon(bind_address: String) -> Result<()> {
     use shammah::server::{AgentServer, ServerConfig};
     use shammah::models::{BootstrapLoader, GeneratorState, DevicePreference, TrainingCoordinator};

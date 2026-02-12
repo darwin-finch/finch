@@ -80,6 +80,100 @@ impl DaemonLifecycle {
     pub fn pid_file(&self) -> &PathBuf {
         &self.pid_file
     }
+
+    /// Stop the daemon gracefully
+    ///
+    /// Attempts graceful shutdown:
+    /// 1. Send SIGTERM
+    /// 2. Wait up to 5 seconds for process to exit
+    /// 3. If still running, send SIGKILL
+    /// 4. Remove PID file
+    ///
+    /// Returns Ok if daemon stopped successfully or wasn't running.
+    /// Returns Err if failed to stop process.
+    pub fn stop_daemon(&self) -> Result<()> {
+        // Check if daemon is running
+        if !self.pid_file.exists() {
+            info!("Daemon not running (PID file does not exist)");
+            return Ok(());
+        }
+
+        let pid = match self.read_pid() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Stale PID file exists but cannot read: {}. Removing...", e);
+                self.cleanup()?;
+                return Ok(());
+            }
+        };
+
+        if !process_exists(pid) {
+            info!(pid = pid, "Daemon not running (process does not exist). Removing stale PID file...");
+            self.cleanup()?;
+            return Ok(());
+        }
+
+        info!(pid = pid, "Stopping daemon with SIGTERM...");
+
+        // Send SIGTERM for graceful shutdown
+        #[cfg(target_family = "unix")]
+        {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            use std::time::{Duration, Instant};
+
+            kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
+                .context("Failed to send SIGTERM to daemon")?;
+
+            // Wait up to 5 seconds for graceful shutdown
+            let start = Instant::now();
+            let timeout = Duration::from_secs(5);
+
+            while start.elapsed() < timeout {
+                if !process_exists(pid) {
+                    info!(pid = pid, "Daemon stopped gracefully");
+                    self.cleanup()?;
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            // Still running after timeout, send SIGKILL
+            warn!(pid = pid, "Daemon did not stop gracefully, sending SIGKILL...");
+            kill(Pid::from_raw(pid as i32), Signal::SIGKILL)
+                .context("Failed to send SIGKILL to daemon")?;
+
+            // Wait a bit for SIGKILL to take effect
+            std::thread::sleep(Duration::from_millis(500));
+
+            if process_exists(pid) {
+                anyhow::bail!("Failed to stop daemon (process {} still running)", pid);
+            }
+
+            info!(pid = pid, "Daemon force-stopped with SIGKILL");
+            self.cleanup()?;
+            Ok(())
+        }
+
+        #[cfg(target_family = "windows")]
+        {
+            use std::process::Command as ProcessCommand;
+
+            // Use taskkill on Windows
+            let output = ProcessCommand::new("taskkill")
+                .args(&["/PID", &pid.to_string(), "/F"])
+                .output()
+                .context("Failed to execute taskkill")?;
+
+            if !output.status.success() {
+                anyhow::bail!("Failed to stop daemon: taskkill failed");
+            }
+
+            info!(pid = pid, "Daemon stopped");
+            self.cleanup()?;
+            Ok(())
+        }
+    }
 }
 
 impl Default for DaemonLifecycle {
