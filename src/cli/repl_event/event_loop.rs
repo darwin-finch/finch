@@ -77,6 +77,9 @@ pub struct EventLoop {
     /// Streaming messages tracked by query_id
     streaming_messages: Arc<RwLock<std::collections::HashMap<Uuid, Arc<crate::cli::messages::StreamingResponseMessage>>>>,
 
+    /// Currently active query ID (for cancellation)
+    active_query_id: Arc<RwLock<Option<Uuid>>>,
+
     /// Daemon client (for /local command)
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
 }
@@ -135,6 +138,7 @@ impl EventLoop {
             tool_coordinator,
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             streaming_messages: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            active_query_id: Arc::new(RwLock::new(None)),
             daemon_client,
         }
     }
@@ -173,6 +177,7 @@ impl EventLoop {
                         ReplEvent::OutputReady { .. } => "OutputReady",
                         ReplEvent::UserInput { .. } => "UserInput",
                         ReplEvent::StatsUpdate { .. } => "StatsUpdate",
+                        ReplEvent::CancelQuery => "CancelQuery",
                         ReplEvent::Shutdown => "Shutdown",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
@@ -188,6 +193,16 @@ impl EventLoop {
 
                 // Periodic rendering
                 _ = render_interval.tick() => {
+                    // Check for pending cancellation
+                    {
+                        let mut tui = self.tui_renderer.lock().await;
+                        if tui.pending_cancellation {
+                            tui.pending_cancellation = false; // Clear flag
+                            drop(tui); // Release lock before sending event
+                            let _ = self.event_tx.send(ReplEvent::CancelQuery);
+                        }
+                    }
+
                     // Don't spam logs, but good to know the loop is alive
                     // tracing::debug!("[EVENT_LOOP] Render tick");
                     self.render_tui().await?;
@@ -287,6 +302,9 @@ impl EventLoop {
             .write()
             .await
             .add_user_message(input.clone());
+
+        // Set as active query (for cancellation)
+        *self.active_query_id.write().await = Some(query_id);
 
         // Spawn query processing task
         self.spawn_query_task(query_id, input).await;
@@ -636,6 +654,14 @@ impl EventLoop {
 
                 // Display error
                 self.output_manager.write_error(format!("Query failed: {}", error));
+
+                // Clear active query (query failed)
+                {
+                    let mut active = self.active_query_id.write().await;
+                    if *active == Some(query_id) {
+                        *active = None;
+                    }
+                }
             }
 
             ReplEvent::ToolResult {
@@ -721,6 +747,14 @@ impl EventLoop {
                 // Render TUI to write the complete message to scrollback
                 self.render_tui().await?;
                 tracing::debug!("[EVENT_LOOP] StreamingComplete handled, TUI rendered");
+
+                // Clear active query (query completed successfully)
+                {
+                    let mut active = self.active_query_id.write().await;
+                    if *active == Some(query_id) {
+                        *active = None;
+                    }
+                }
             }
 
             ReplEvent::StatsUpdate {
@@ -738,6 +772,40 @@ impl EventLoop {
                 );
                 // Render to display updated stats
                 self.render_tui().await?;
+            }
+
+            ReplEvent::CancelQuery => {
+                // Get the active query ID
+                let query_id = {
+                    let active = self.active_query_id.read().await;
+                    *active
+                };
+
+                if let Some(qid) = query_id {
+                    // Mark streaming message as cancelled
+                    if let Some(msg) = self.streaming_messages.write().await.remove(&qid) {
+                        msg.set_complete(); // Mark complete to stop updates
+                    }
+
+                    // Update query state to cancelled
+                    self.query_states
+                        .update_state(qid, QueryState::Failed {
+                            error: "Cancelled by user".to_string(),
+                        })
+                        .await;
+
+                    // Clear active query
+                    *self.active_query_id.write().await = None;
+
+                    // Show cancellation message
+                    self.output_manager.write_info("⚠️  Query cancelled by user (Ctrl+C)");
+                    self.status_bar.clear_operation();
+                    self.render_tui().await?;
+
+                    tracing::info!("Query {} cancelled by user", qid);
+                } else {
+                    tracing::debug!("Ctrl+C pressed but no active query to cancel");
+                }
             }
 
             ReplEvent::Shutdown => {

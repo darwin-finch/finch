@@ -54,8 +54,13 @@ pub fn spawn_input_task(
                             // Check for feedback shortcuts when input is empty
                             let input_empty = tui.input_textarea.lines().join("").trim().is_empty();
 
-                            // Check for feedback shortcuts (Ctrl+G / Ctrl+B)
+                            // Check for special shortcuts (Ctrl+C, Ctrl+G, Ctrl+B)
                             match (key.code, key.modifiers) {
+                                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                    // Ctrl+C: Cancel query
+                                    tui.pending_cancellation = true;
+                                    Ok(None)
+                                }
                                 (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {
                                     // Ctrl+G: Good feedback
                                     tui.pending_feedback = Some(crate::feedback::FeedbackRating::Good);

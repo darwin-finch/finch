@@ -89,6 +89,8 @@ pub struct TuiRenderer {
     needs_full_refresh: bool,
     /// Pending feedback rating from user ('g' or 'b' key press)
     pub pending_feedback: Option<crate::feedback::FeedbackRating>,
+    /// Pending cancellation request (Ctrl+C pressed)
+    pub pending_cancellation: bool,
     /// Last query-response pair for feedback
     last_interaction: Option<(String, String)>,
     /// Last refresh timestamp
@@ -252,6 +254,7 @@ impl TuiRenderer {
             prev_input_text: String::new(),
             prev_status_content: String::new(),
             pending_feedback: None,
+            pending_cancellation: false,
             last_interaction: None,
         })
     }

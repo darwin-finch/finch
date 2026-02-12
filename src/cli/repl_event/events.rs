@@ -82,6 +82,9 @@ pub enum ReplEvent {
         latency_ms: Option<u64>,
     },
 
+    /// User requested query cancellation (Ctrl+C)
+    CancelQuery,
+
     /// Request to shut down the REPL
     Shutdown,
 }
