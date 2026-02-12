@@ -18,6 +18,7 @@ use crate::models::unified_loader::{ModelFamily, ModelSize};
 pub struct SetupResult {
     pub claude_api_key: String,
     pub hf_token: Option<String>,
+    pub backend_enabled: bool,
     pub backend_device: BackendDevice,
     pub model_family: ModelFamily,
     pub model_size: ModelSize,
@@ -29,6 +30,7 @@ enum WizardStep {
     Welcome,
     ClaudeApiKey(String),
     HfToken(String),
+    EnableLocalModel(bool), // Ask if user wants local model (true = yes, false = proxy-only)
     DeviceSelection(usize),
     ModelFamilySelection(usize),
     ModelSizeSelection(usize),
@@ -140,6 +142,11 @@ fn run_wizard_loop(
         .and_then(|c| c.backend.model_repo.clone())
         .unwrap_or_default();
 
+    // Track whether user wants local model enabled
+    let mut backend_enabled = existing_config
+        .map(|c| c.backend.enabled)
+        .unwrap_or(true); // Default to enabled
+
     // Wizard state - start at Welcome
     let mut step = WizardStep::Welcome;
 
@@ -193,7 +200,31 @@ fn run_wizard_loop(
                         }
                         KeyCode::Enter => {
                             // Continue even if empty (optional)
-                            step = WizardStep::DeviceSelection(selected_device_idx);
+                            step = WizardStep::EnableLocalModel(true); // Default to yes
+                        }
+                        KeyCode::Esc => {
+                            anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::EnableLocalModel(enable) => {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Down => {
+                            // Toggle between yes/no
+                            *enable = !*enable;
+                        }
+                        KeyCode::Enter => {
+                            backend_enabled = *enable; // Save user's choice
+                            if *enable {
+                                // User wants local model - continue to device selection
+                                step = WizardStep::DeviceSelection(selected_device_idx);
+                            } else {
+                                // User wants proxy-only - skip to teacher config
+                                teachers[0].api_key = claude_key.clone();
+                                step = WizardStep::TeacherConfig(teachers.clone(), selected_teacher_idx);
+                            }
                         }
                         KeyCode::Esc => {
                             anyhow::bail!("Setup cancelled");
@@ -431,6 +462,7 @@ fn run_wizard_loop(
                             return Ok(SetupResult {
                                 claude_api_key: claude_key.clone(),
                                 hf_token: if hf_token.is_empty() { None } else { Some(hf_token.clone()) },
+                                backend_enabled,
                                 backend_device: devices[selected_device_idx],
                                 model_family: model_families[selected_family_idx],
                                 model_size: model_sizes[selected_size_idx],
@@ -488,6 +520,7 @@ fn render_wizard_step(
         WizardStep::Welcome => render_welcome(f, inner),
         WizardStep::ClaudeApiKey(input) => render_api_key_input(f, inner, input),
         WizardStep::HfToken(input) => render_hf_token_input(f, inner, input),
+        WizardStep::EnableLocalModel(enable) => render_enable_local_model(f, inner, *enable),
         WizardStep::DeviceSelection(selected) => render_device_selection(f, inner, devices, *selected),
         WizardStep::ModelFamilySelection(selected) => render_model_family_selection(f, inner, model_families, *selected),
         WizardStep::ModelSizeSelection(selected) => render_model_size_selection(f, inner, model_sizes, *selected),
@@ -613,6 +646,71 @@ fn render_hf_token_input(f: &mut Frame, area: Rect, input: &str) {
         .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[3]);
+}
+
+fn render_enable_local_model(f: &mut Frame, area: Rect, enable: bool) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(8),     // Instructions + options
+            Constraint::Length(2),  // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Step 3: Enable Local Model?")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let instructions = Paragraph::new(
+        "Would you like to enable local model inference?\n\n\
+         ✓ Local Model: Download and run AI models on your device\n\
+         • Works offline after initial download\n\
+         • Privacy-first (code stays on your machine)\n\
+         • Requires 8-64GB RAM depending on model size\n\
+         • 5-30 minute download on first run\n\n\
+         ✗ Proxy-Only: Use Shammah like Claude Code (no local model)\n\
+         • REPL + tool execution (Read, Bash, etc.)\n\
+         • Always forwards to teacher APIs (Claude/GPT-4)\n\
+         • Faster startup, no downloads\n\
+         • Requires internet connection\n\n"
+    )
+    .style(Style::default().fg(Color::Reset))
+    .wrap(Wrap { trim: false });
+    f.render_widget(instructions, chunks[1]);
+
+    // Show selected option with visual indicator
+    let yes_style = if enable {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let no_style = if !enable {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    let options_text = vec![
+        Line::from(vec![
+            Span::styled(if enable { "▸ " } else { "  " }, yes_style),
+            Span::styled("✓ Yes - Enable local model", yes_style),
+        ]),
+        Line::from(vec![
+            Span::styled(if !enable { "▸ " } else { "  " }, no_style),
+            Span::styled("✗ No - Proxy-only mode", no_style),
+        ]),
+    ];
+
+    let options = Paragraph::new(options_text)
+        .alignment(Alignment::Center);
+    f.render_widget(options, Rect::new(chunks[1].x, chunks[1].y + chunks[1].height - 3, chunks[1].width, 3));
+
+    let help = Paragraph::new("↑/↓: Toggle  Enter: Confirm  Esc: Cancel")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[2]);
 }
 
 fn render_device_selection(f: &mut Frame, area: Rect, devices: &[BackendDevice], selected: usize) {

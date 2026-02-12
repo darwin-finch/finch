@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
             // Create and save config
             let mut new_config = Config::new(result.teachers);
             new_config.backend = shammah::config::BackendConfig {
+                enabled: result.backend_enabled,
                 device: result.backend_device,
                 model_family: result.model_family,
                 model_size: result.model_size,
@@ -685,26 +686,34 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
     let bootstrap_loader = Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None));
 
-    // Start background model loading
-    let loader_clone = Arc::clone(&bootstrap_loader);
-    let state_clone = Arc::clone(&generator_state);
-    let model_family = config.backend.model_family;
-    let model_size = config.backend.model_size;
-    let device = config.backend.device;
-    let model_repo = config.backend.model_repo.clone();
-    tokio::spawn(async move {
-        if let Err(e) = loader_clone
-            .load_generator_async(model_family, model_size, device, model_repo)
-            .await
-        {
-            output_status!("⚠️  Model loading failed: {}", e);
-            output_status!("   Will forward all queries to Claude");
-            let mut state = state_clone.write().await;
-            *state = GeneratorState::Failed {
-                error: format!("{}", e),
-            };
-        }
-    });
+    // Start background model loading (unless backend is disabled for proxy-only mode)
+    if config.backend.enabled {
+        let loader_clone = Arc::clone(&bootstrap_loader);
+        let state_clone = Arc::clone(&generator_state);
+        let model_family = config.backend.model_family;
+        let model_size = config.backend.model_size;
+        let device = config.backend.device;
+        let model_repo = config.backend.model_repo.clone();
+        tokio::spawn(async move {
+            if let Err(e) = loader_clone
+                .load_generator_async(model_family, model_size, device, model_repo)
+                .await
+            {
+                output_status!("⚠️  Model loading failed: {}", e);
+                output_status!("   Will forward all queries to teacher APIs");
+                let mut state = state_clone.write().await;
+                *state = GeneratorState::Failed {
+                    error: format!("{}", e),
+                };
+            }
+        });
+    } else {
+        // Proxy-only mode: Skip model loading
+        output_status!("🔌 Proxy-only mode enabled (no local model)");
+        output_status!("   All queries will be forwarded to teacher APIs");
+        let mut state = generator_state.write().await;
+        *state = GeneratorState::NotAvailable;
+    }
 
     // Create local generator (will receive model when ready)
     let local_generator = Arc::new(RwLock::new(LocalGenerator::new()));
@@ -883,6 +892,7 @@ async fn run_setup() -> Result<()> {
 
     // Update backend config with selected device, model family, and size
     config.backend = BackendConfig {
+        enabled: result.backend_enabled,
         device: result.backend_device,
         model_family: result.model_family,
         model_size: result.model_size,

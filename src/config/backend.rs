@@ -133,6 +133,11 @@ impl BackendDevice {
 /// Backend configuration for model inference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
+    /// Enable local model inference (default: true)
+    /// Set to false for proxy-only mode (no local model, teacher APIs only)
+    #[serde(default = "default_backend_enabled")]
+    pub enabled: bool,
+
     /// Selected device for inference
     pub device: BackendDevice,
 
@@ -155,6 +160,10 @@ pub struct BackendConfig {
     /// Fallback device chain
     #[serde(default = "default_fallback_chain")]
     pub fallback_chain: Vec<BackendDevice>,
+}
+
+fn default_backend_enabled() -> bool {
+    true
 }
 
 fn default_model_family() -> ModelFamily {
@@ -186,6 +195,7 @@ fn default_fallback_chain() -> Vec<BackendDevice> {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
+            enabled: default_backend_enabled(),
             device: BackendDevice::Auto,
             model_family: default_model_family(),
             model_size: default_model_size(),
@@ -200,6 +210,7 @@ impl BackendConfig {
     /// Create new backend config with device selection
     pub fn with_device(device: BackendDevice) -> Self {
         Self {
+            enabled: default_backend_enabled(),
             device,
             model_family: default_model_family(),
             model_size: default_model_size(),
@@ -212,6 +223,7 @@ impl BackendConfig {
     /// Create new backend config with model family and size
     pub fn with_model(device: BackendDevice, family: ModelFamily, size: ModelSize) -> Self {
         Self {
+            enabled: default_backend_enabled(),
             device,
             model_family: family,
             model_size: size,

@@ -1,7 +1,7 @@
 # Shammah - Project Status
 
-**Last Updated:** 2026-02-11
-**Version:** 0.3.0 (Local Model Generation + Daemon Architecture)
+**Last Updated:** 2026-02-12
+**Version:** 0.4.0 (Proxy-Only Mode + Multi-Provider Setup)
 
 ## Current State: Production-Ready Local AI Proxy ✅
 
@@ -58,6 +58,14 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 - Gemini (Google)
 - Grok (xAI)
 - Provider-specific adapters with capability mapping
+- Setup wizard supports adding multiple providers
+
+**Proxy-Only Mode:**
+- Use Shammah without local model (like Claude Code)
+- REPL + tool execution with teacher API fallback
+- Setup wizard asks: "Enable local model?" (yes/no)
+- Config option: `[backend] enabled = false`
+- Useful for users who want tools without model overhead
 
 **LoRA Fine-Tuning Infrastructure:**
 - WeightedExample serialization (JSONL export)
@@ -237,14 +245,20 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/models/adapters/llama.rs`, new test
     - Effort: 2-8 hours (variable)
 
-20. **[ ] Proxy-only mode** (NEW) 🟡 MEDIUM PRIORITY
+20. **[x] Proxy-only mode** (NEW) 🟡 MEDIUM PRIORITY - ✅ COMPLETE
     - Allow users to use Shammah without local model (like Claude Code)
     - Daemon still spawns but skips model loading
     - Pure proxy to teacher APIs with tool execution
     - Useful for users who want REPL + tools without model overhead
     - Config option: `[backend] enabled = false`
-    - Files: `src/daemon/server.rs`, `src/config/settings.rs`, `src/cli/setup_wizard.rs`
-    - Effort: 3-4 hours
+    - Files: `src/config/backend.rs`, `src/cli/setup_wizard.rs`, `src/main.rs`
+    - Implementation:
+      - Added `enabled: bool` field to BackendConfig (defaults to true)
+      - Added EnableLocalModel wizard step (yes/no choice)
+      - If no: skip device/model selection, jump to teacher config
+      - If enabled=false in config: skip model loading, set GeneratorState::NotAvailable
+      - All queries forwarded to teacher APIs with tool execution
+    - Status: ✅ Compiles, wizard flow implemented, integration complete
 
 ### Phase 4: Challenging (4-8 hours each) - Continued
 
