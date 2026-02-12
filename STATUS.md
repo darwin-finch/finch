@@ -110,10 +110,10 @@ See `docs/ROADMAP.md` for detailed implementation plans.
    - Files: `src/main.rs`, `src/daemon/lifecycle.rs`
    - Effort: 1 hour (actual)
 
-2. **[ ] Daemon start command**
-   - Add `shammah daemon start` subcommand
-   - Files: `src/cli/commands.rs`
-   - Effort: 1-2 hours
+2. **[x] Daemon start command** - ✅ COMPLETE
+   - Add `shammah daemon-start` subcommand
+   - Files: `src/main.rs`
+   - Effort: 30 minutes (actual)
 
 3. **[ ] Error message improvements** (NEW)
    - Make error messages user-friendly with actionable suggestions

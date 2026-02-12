@@ -57,6 +57,12 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8000")]
         bind: String,
     },
+    /// Start the daemon in background
+    DaemonStart {
+        /// Bind address (default: 127.0.0.1:11435)
+        #[arg(long, default_value = "127.0.0.1:11435")]
+        bind: String,
+    },
     /// Stop the running daemon
     DaemonStop,
     /// Execute a single query
@@ -95,6 +101,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Daemon { bind }) => {
             return run_daemon(bind).await;
+        }
+        Some(Command::DaemonStart { bind }) => {
+            return run_daemon_start(bind).await;
         }
         Some(Command::DaemonStop) => {
             return run_daemon_stop();
@@ -325,6 +334,34 @@ fn init_tracing() {
 }
 
 /// Run HTTP daemon server
+/// Start the daemon in background
+async fn run_daemon_start(bind_address: String) -> Result<()> {
+    use shammah::daemon::{DaemonLifecycle, ensure_daemon_running};
+
+    let lifecycle = DaemonLifecycle::new()?;
+
+    // Check if daemon is already running
+    if lifecycle.is_running() {
+        let pid = lifecycle.read_pid()?;
+        println!("Daemon is already running (PID: {})", pid);
+        println!("Bind address: {}", bind_address);
+        return Ok(());
+    }
+
+    println!("Starting daemon...");
+    println!("Bind address: {}", bind_address);
+    println!("Logs: ~/.shammah/daemon.log");
+
+    // Use ensure_daemon_running to spawn and wait for health check
+    ensure_daemon_running(Some(&bind_address)).await?;
+
+    // Get PID for display
+    let pid = lifecycle.read_pid()?;
+    println!("✓ Daemon started successfully (PID: {})", pid);
+
+    Ok(())
+}
+
 /// Stop the running daemon
 fn run_daemon_stop() -> Result<()> {
     use shammah::daemon::DaemonLifecycle;
