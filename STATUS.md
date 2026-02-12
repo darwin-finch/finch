@@ -179,11 +179,12 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/feedback/mod.rs`, `src/cli/tui/async_input.rs`, `src/cli/tui/mod.rs`
     - Effort: 2 hours (actual)
 
-12. **[ ] Crash recovery mechanism** (NEW)
-    - Handle daemon crashes gracefully
-    - Auto-restart daemon, preserve session state
-    - Files: `src/daemon/lifecycle.rs`, `src/daemon/client.rs`
-    - Effort: 4-6 hours
+12. **[x] Crash recovery mechanism** (NEW) - ✅ COMPLETE
+    - Handle daemon crashes gracefully with auto-restart
+    - Detects connection failures and retries queries
+    - Auto-restart daemon on connection errors
+    - Files: `src/client/daemon_client.rs`, `src/cli/repl_event/event_loop.rs`
+    - Effort: 1.5 hours (actual)
 
 13. **[x] Python deps installation helper** (NEW) - ✅ COMPLETE
     - Add `shammah train setup` command
