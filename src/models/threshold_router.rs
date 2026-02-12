@@ -129,25 +129,25 @@ impl ThresholdRouter {
 
     /// Decide whether to try local generation
     pub fn should_try_local(&self, query: &str) -> bool {
-        // During first few queries, establish baseline
-        if self.total_queries < 3 {
-            return false;
-        }
+        // CHANGED: Now that we have a real ONNX model, try local by default
+        // Only forward if we've learned this category fails consistently
 
         // Categorize the query
         let category = Self::categorize_query(query);
 
         // Look up statistics for this category
         if let Some(stats) = self.category_stats.get(&category) {
-            // Have enough samples?
+            // If we have enough samples and success rate is LOW, forward
             if stats.local_attempts >= self.min_samples {
-                // Success rate above threshold?
-                return stats.success_rate() >= self.confidence_threshold;
+                // Only forward if success rate is BELOW threshold (inverted logic)
+                if stats.success_rate() < self.confidence_threshold {
+                    return false; // Forward to Claude
+                }
             }
         }
 
-        // Default: forward (conservative)
-        false
+        // Default: try local (now that we have ONNX model)
+        true
     }
 
     /// Learn from a local generation attempt (called only when we tried local)
