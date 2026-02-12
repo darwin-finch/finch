@@ -75,6 +75,11 @@ fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Suppress ONNX Runtime verbose logs BEFORE any initialization
+    // Must be set early, before any ONNX library code runs
+    // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
+    std::env::set_var("ORT_LOGGING_LEVEL", "3");  // Error and Fatal only
+
     // Install panic handler to cleanup terminal on panic
     install_panic_handler();
 
@@ -323,6 +328,10 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use shammah::{output_progress, output_status};
+
+    // Suppress ONNX Runtime verbose logs (must be set before library initialization)
+    // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
+    std::env::set_var("ORT_LOGGING_LEVEL", "3");  // Error and Fatal only
 
     // Initialize tracing with custom OutputManager layer
     init_tracing();
