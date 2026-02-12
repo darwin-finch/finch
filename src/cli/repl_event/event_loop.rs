@@ -76,6 +76,9 @@ pub struct EventLoop {
 
     /// Streaming messages tracked by query_id
     streaming_messages: Arc<RwLock<std::collections::HashMap<Uuid, Arc<crate::cli::messages::StreamingResponseMessage>>>>,
+
+    /// Daemon client (for /local command)
+    daemon_client: Option<Arc<crate::client::DaemonClient>>,
 }
 
 impl EventLoop {
@@ -95,6 +98,7 @@ impl EventLoop {
         streaming_enabled: bool,
         local_generator: Arc<RwLock<LocalGenerator>>,
         tokenizer: Arc<TextTokenizer>,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -131,6 +135,7 @@ impl EventLoop {
             tool_coordinator,
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             streaming_messages: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            daemon_client,
         }
     }
 
@@ -284,64 +289,30 @@ impl EventLoop {
 
     /// Handle /local command - query local model directly (bypass routing)
     async fn handle_local_query(&mut self, query: String) -> Result<()> {
-        use crate::claude::Message;
-
         // Show status message
         self.output_manager.write_info("🔧 Local Model Query (bypassing routing)");
         self.render_tui().await?;
 
-        // Check generator state
-        let state = self.generator_state.read().await;
-        match &*state {
-            GeneratorState::Ready { .. } => {
-                // Model ready, proceed (state dropped at end of scope)
+        // Check if daemon client exists
+        if let Some(daemon_client) = &self.daemon_client {
+            // Daemon mode: use HTTP to query with local_only flag
+            match daemon_client.query_local_only(&query).await {
+                Ok(response_text) => {
+                    // Output the response
+                    self.output_manager.write_response(response_text);
+                    self.output_manager.write_info("✓ Local model (bypassed routing)");
+                    self.render_tui().await?;
+                }
+                Err(e) => {
+                    self.output_manager.write_error(format!("Local query failed: {}", e));
+                    self.render_tui().await?;
+                }
             }
-            GeneratorState::Initializing | GeneratorState::Downloading { .. } | GeneratorState::Loading { .. } => {
-                self.output_manager.write_error("Local model not ready (initializing/downloading/loading)");
-                self.render_tui().await?;
-                return Ok(());
-            }
-            GeneratorState::Failed { error } => {
-                self.output_manager.write_error(format!("Local model failed: {}", error));
-                self.render_tui().await?;
-                return Ok(());
-            }
-            GeneratorState::NotAvailable => {
-                self.output_manager.write_error("Local model not available");
-                self.render_tui().await?;
-                return Ok(());
-            }
-        }
-        // State dropped here automatically
-
-        // Create a message for the query
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: vec![crate::claude::ContentBlock::Text { text: query.clone() }],
-        }];
-
-        // Generate response using local model directly (no tools, bypass routing)
-        match self.qwen_gen.generate(messages, None).await {
-            Ok(response) => {
-                // Extract text from response
-                let response_text = response.content_blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                // Output the response
-                self.output_manager.write_response(response_text);
-                self.output_manager.write_info("✓ Local model (bypassed routing)");
-                self.render_tui().await?;
-            }
-            Err(e) => {
-                self.output_manager.write_error(format!("Local generation failed: {}", e));
-                self.render_tui().await?;
-            }
+        } else {
+            // No daemon mode - show error
+            self.output_manager.write_error("Error: /local requires daemon mode.");
+            self.output_manager.write_info("    Start the daemon: shammah daemon --bind 127.0.0.1:11435");
+            self.render_tui().await?;
         }
 
         Ok(())

@@ -1160,6 +1160,7 @@ impl Repl {
             self.streaming_enabled,
             Arc::clone(&self.local_generator),
             Arc::clone(&self.tokenizer),
+            self.daemon_client.clone(),
         );
 
         // Run the event loop
