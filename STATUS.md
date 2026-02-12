@@ -133,11 +133,11 @@ See `docs/ROADMAP.md` for detailed implementation plans.
    - Files: `src/cli/tui/status_widget.rs`, `src/cli/output_manager.rs`
    - Effort: 2-4 hours
 
-6. **[ ] Config validation on startup** (NEW)
+6. **[x] Config validation on startup** (NEW) - ✅ COMPLETE
    - Validate config file and show helpful errors
    - Check API keys, paths, model sizes
-   - Files: `src/config/mod.rs`
-   - Effort: 2-4 hours
+   - Files: `src/config/settings.rs`, `src/config/loader.rs`
+   - Effort: 1 hour (actual)
 
 7. **[ ] Daemon status command**
    - Add `shammah daemon status` subcommand

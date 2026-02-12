@@ -96,6 +96,10 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
         config.client = client;
     }
 
+    // Validate configuration
+    config.validate()
+        .context("Configuration validation failed")?;
+
     Ok(Some(config))
 }
 

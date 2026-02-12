@@ -115,6 +115,138 @@ pub struct TeacherEntry {
 
 
 impl Config {
+    /// Validate configuration and return helpful errors
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use crate::errors;
+
+        // Validate teachers array is not empty
+        if self.teachers.is_empty() {
+            anyhow::bail!(errors::wrap_error_with_suggestion(
+                "No teacher providers configured",
+                "Run setup wizard to configure a provider:\n  shammah setup"
+            ));
+        }
+
+        // Validate each teacher entry
+        for (idx, teacher) in self.teachers.iter().enumerate() {
+            // Validate provider name
+            let valid_providers = ["claude", "openai", "grok", "gemini", "mistral", "groq"];
+            if !valid_providers.contains(&teacher.provider.as_str()) {
+                anyhow::bail!(errors::wrap_error_with_suggestion(
+                    format!("Invalid provider '{}' in teacher[{}]", teacher.provider, idx),
+                    &format!(
+                        "Valid providers: {}\n\n\
+                         Update your config:\n  \
+                         Edit ~/.shammah/config.toml",
+                        valid_providers.join(", ")
+                    )
+                ));
+            }
+
+            // Validate API key is not empty
+            if teacher.api_key.trim().is_empty() {
+                anyhow::bail!(errors::api_key_invalid_error(&teacher.provider));
+            }
+
+            // Validate API key format based on provider
+            match teacher.provider.as_str() {
+                "claude" => {
+                    if !teacher.api_key.starts_with("sk-ant-") {
+                        anyhow::bail!(errors::wrap_error_with_suggestion(
+                            format!("Claude API key has incorrect format (teacher[{}])", idx),
+                            "Claude API keys start with 'sk-ant-'\n\n\
+                             Get a valid key from:\n  \
+                             https://console.anthropic.com/"
+                        ));
+                    }
+                    if teacher.api_key.len() < 20 {
+                        anyhow::bail!("Claude API key is too short (should be ~100+ characters)");
+                    }
+                }
+                "openai" | "groq" => {
+                    if !teacher.api_key.starts_with("sk-") {
+                        anyhow::bail!(errors::wrap_error_with_suggestion(
+                            format!("{} API key has incorrect format (teacher[{}])", teacher.provider, idx),
+                            &format!(
+                                "{} API keys start with 'sk-'\n\n\
+                                 Get a valid key from:\n  \
+                                 https://platform.openai.com/api-keys",
+                                teacher.provider.to_uppercase()
+                            )
+                        ));
+                    }
+                }
+                "gemini" => {
+                    if teacher.api_key.len() < 30 {
+                        anyhow::bail!("Gemini API key is too short");
+                    }
+                }
+                _ => {} // Other providers - basic validation passed
+            }
+        }
+
+        // Validate bind address format
+        if !self.server.bind_address.contains(':') {
+            anyhow::bail!(errors::wrap_error_with_suggestion(
+                format!("Invalid bind address: '{}'", self.server.bind_address),
+                "Bind address should be in format 'IP:PORT'\n\
+                 Examples:\n  \
+                 • 127.0.0.1:8000\n  \
+                 • 0.0.0.0:11435\n  \
+                 • localhost:8080"
+            ));
+        }
+
+        if !self.client.daemon_address.contains(':') {
+            anyhow::bail!(errors::wrap_error_with_suggestion(
+                format!("Invalid daemon address: '{}'", self.client.daemon_address),
+                "Daemon address should be in format 'IP:PORT'\n\
+                 Example: 127.0.0.1:11435"
+            ));
+        }
+
+        // Validate numeric ranges
+        if self.server.max_sessions == 0 {
+            anyhow::bail!("max_sessions must be greater than 0");
+        }
+
+        if self.server.max_sessions > 10000 {
+            anyhow::bail!(errors::wrap_error_with_suggestion(
+                format!("max_sessions ({}) is unreasonably high", self.server.max_sessions),
+                "Recommended range: 1-1000\n\
+                 High values may cause memory issues"
+            ));
+        }
+
+        if self.server.session_timeout_minutes == 0 {
+            anyhow::bail!("session_timeout_minutes must be greater than 0");
+        }
+
+        if self.client.timeout_seconds == 0 {
+            anyhow::bail!("timeout_seconds must be greater than 0");
+        }
+
+        if self.client.timeout_seconds > 3600 {
+            anyhow::bail!(errors::wrap_error_with_suggestion(
+                format!("timeout_seconds ({}) is very high", self.client.timeout_seconds),
+                "Recommended range: 30-600 seconds\n\
+                 High values may cause requests to hang"
+            ));
+        }
+
+        // Validate paths exist if specified
+        if let Some(ref path) = self.constitution_path {
+            if !path.exists() {
+                anyhow::bail!(errors::file_not_found_error(
+                    &path.display().to_string(),
+                    "Constitution file"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn new(teachers: Vec<TeacherEntry>) -> Self {
         let home = dirs::home_dir().expect("Could not determine home directory");
         let project_dir = std::env::current_dir().expect("Could not determine current directory");
