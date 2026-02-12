@@ -235,6 +235,12 @@ impl EventLoop {
                         );
                         self.render_tui().await?;
                     }
+                    Command::Memory => {
+                        use crate::monitoring::MemoryInfo;
+                        let info = MemoryInfo::current();
+                        self.output_manager.write_info(info.format_with_warning());
+                        self.render_tui().await?;
+                    }
                     Command::Local { query } => {
                         // Handle /local command - query local model directly (bypass routing)
                         self.handle_local_query(query).await?;

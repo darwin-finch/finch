@@ -13,6 +13,7 @@ pub mod feedback; // Response feedback system for LoRA training
 pub mod generators; // Unified generator interface
 pub mod local; // Local generation system
 pub mod metrics;
+pub mod monitoring; // System monitoring (memory, CPU)
 pub mod models; // Phase 2: Neural network models
 pub mod providers; // Multi-provider LLM support
 pub mod router;

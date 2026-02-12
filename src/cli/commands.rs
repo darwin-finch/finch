@@ -16,6 +16,7 @@ pub enum Command {
     Help,
     Quit,
     Metrics,
+    Memory,
     Debug,
     Training,
     Clear,
@@ -47,6 +48,7 @@ impl Command {
             "/help" => return Some(Command::Help),
             "/quit" | "/exit" => return Some(Command::Quit),
             "/metrics" => return Some(Command::Metrics),
+            "/memory" => return Some(Command::Memory),
             "/debug" => return Some(Command::Debug),
             "/training" => return Some(Command::Training),
             "/clear" | "/reset" => return Some(Command::Clear),
@@ -217,6 +219,7 @@ pub fn format_help() -> String {
          \x1b[36m  /clear\x1b[0m             Clear conversation history (start fresh)\n\
          \x1b[36m  /debug\x1b[0m             Toggle debug output\n\
          \x1b[36m  /metrics\x1b[0m           Display usage statistics\n\
+         \x1b[36m  /memory\x1b[0m            Show memory usage (system and process)\n\
          \x1b[36m  /training\x1b[0m          Show detailed training statistics\n\n\
          \x1b[1;33m🤖 Model Commands:\x1b[0m\n\
          \x1b[36m  /local <query>\x1b[0m     Query local model directly (bypass routing)\n\
