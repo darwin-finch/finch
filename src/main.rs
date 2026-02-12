@@ -329,12 +329,42 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     use tokio::sync::RwLock;
     use shammah::{output_progress, output_status};
 
+    // Set up file logging for daemon (append to ~/.shammah/daemon.log)
+    let log_path = dirs::home_dir()
+        .context("Failed to determine home directory")?
+        .join(".shammah")
+        .join("daemon.log");
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to open daemon log: {}", log_path.display()))?;
+
+    // Create a file logger layer
+    use tracing_subscriber::fmt::writer::MakeWriter;
+    let file_writer = Arc::new(log_file);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(move || file_writer.clone())
+        .with_ansi(false);  // No ANSI colors in log file
+
+    // Add file layer to tracing
+    use tracing_subscriber::prelude::*;
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(file_layer)
+        .init();
+
+    eprintln!("Daemon logs: {}", log_path.display());
+
     // Suppress ONNX Runtime verbose logs (must be set before library initialization)
     // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
     std::env::set_var("ORT_LOGGING_LEVEL", "3");  // Error and Fatal only
 
-    // Initialize tracing with custom OutputManager layer
-    init_tracing();
+    // Note: init_tracing() is NOT called in daemon mode - we set up file logging above instead
 
     tracing::info!("Starting Shammah in daemon mode");
 

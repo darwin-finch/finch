@@ -75,16 +75,36 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
 
 /// Spawn daemon as background process
 ///
-/// Detaches daemon from current process:
-/// - Unix: Standard spawn with null stdio
+/// Detaches daemon from current process and redirects logs to ~/.shammah/daemon.log
+/// - Unix: Standard spawn with log file redirection
 /// - Windows: Uses CREATE_NO_WINDOW flag to avoid console
 pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     let exe_path = std::env::current_exe()
         .context("Failed to determine current executable path")?;
 
+    // Create log file in ~/.shammah/daemon.log
+    let log_path = dirs::home_dir()
+        .context("Failed to determine home directory")?
+        .join(".shammah")
+        .join("daemon.log");
+
+    // Ensure .shammah directory exists
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
+    }
+
+    // Open log file in append mode
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to open daemon log file: {}", log_path.display()))?;
+
     info!(
         exe = %exe_path.display(),
         bind = bind_address,
+        log = %log_path.display(),
         "Spawning daemon subprocess"
     );
 
@@ -95,8 +115,8 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
             .arg("--bind")
             .arg(bind_address)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log_file.try_clone().context("Failed to clone log file handle")?))
+            .stderr(Stdio::from(log_file))
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
     }
@@ -112,13 +132,13 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
             .arg(bind_address)
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log_file.try_clone().context("Failed to clone log file handle")?))
+            .stderr(Stdio::from(log_file))
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
     }
 
-    debug!("Daemon subprocess spawned");
+    debug!(log = %log_path.display(), "Daemon subprocess spawned, logs at {}", log_path.display());
     Ok(())
 }
 
