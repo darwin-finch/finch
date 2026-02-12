@@ -144,7 +144,7 @@ async fn handle_message(
                     // Use local generator (need write lock for try_generate)
                     let mut generator = server.local_generator().write().await;
 
-                    match generator.try_generate(&user_text) {
+                    match generator.try_generate_from_pattern(&user_text) {
                         Ok(Some(response_text)) => {
                             (response_text, "local".to_string())
                         }

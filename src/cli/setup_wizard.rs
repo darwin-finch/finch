@@ -419,7 +419,7 @@ fn render_welcome(f: &mut Frame, area: Rect) {
          This wizard will help you set up:\n\
          • Claude API key (for remote assistance)\n\
          • HuggingFace token (for model downloads)\n\
-         • Inference device (CoreML/Metal/CPU)\n\n\
+         • Inference device (uses ONNX Runtime)\n\n\
          Press Enter or Space to continue, Esc to cancel."
     )
     .style(Style::default().fg(Color::Reset))

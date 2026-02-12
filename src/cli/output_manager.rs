@@ -134,19 +134,19 @@ impl OutputManager {
         self.add_trait_message(msg);
     }
 
-    /// Write a Claude response (can be called incrementally for streaming)
-    pub fn write_claude(&self, content: impl Into<String>) {
+    /// Write a provider response (can be called incrementally for streaming)
+    pub fn write_response(&self, content: impl Into<String>) {
         let msg = StreamingResponseMessage::new();
         msg.append_chunk(&content.into());
         msg.set_complete();
         self.add_trait_message(Arc::new(msg));
     }
 
-    /// Append to the last Claude response (for streaming)
-    pub fn append_claude(&self, content: impl Into<String>) {
+    /// Append to the last provider response (for streaming)
+    pub fn append_response(&self, content: impl Into<String>) {
         // For now, just create a new message
         // TODO: In future, find last StreamingResponseMessage and append
-        self.write_claude(content);
+        self.write_response(content);
     }
 
     /// Write tool execution output
@@ -234,7 +234,7 @@ mod tests {
         let manager = OutputManager::new();
 
         manager.write_user("Hello");
-        manager.write_claude("Hi there!");
+        manager.write_response("Hi there!");
         manager.write_tool("read", "File contents...");
 
         assert_eq!(manager.len(), 3);
@@ -250,9 +250,9 @@ mod tests {
     fn test_streaming_append() {
         let manager = OutputManager::new();
 
-        manager.write_claude("Hello");
-        manager.append_claude(" world");
-        manager.append_claude("!");
+        manager.write_response("Hello");
+        manager.append_response(" world");
+        manager.append_response("!");
 
         let messages = manager.get_messages();
         assert_eq!(messages.len(), 1);

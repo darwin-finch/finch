@@ -8,11 +8,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendDevice {
-    /// Apple Neural Engine via CoreML (macOS only, fastest)
+    /// Apple Neural Engine via CoreML execution provider (macOS only, ONNX Runtime)
     #[cfg(target_os = "macos")]
     CoreML,
 
-    /// Metal GPU (macOS only, fast)
+    /// Metal GPU (macOS only, deprecated - use ONNX with CoreML EP instead)
     #[cfg(target_os = "macos")]
     Metal,
 
@@ -20,7 +20,7 @@ pub enum BackendDevice {
     #[cfg(feature = "cuda")]
     Cuda,
 
-    /// CPU fallback (slow, works everywhere)
+    /// CPU execution provider (slow, not recommended for production)
     Cpu,
 
     /// Auto-detect best available device
@@ -46,12 +46,12 @@ impl BackendDevice {
     pub fn description(&self) -> &'static str {
         match self {
             #[cfg(target_os = "macos")]
-            BackendDevice::CoreML => "Apple Neural Engine (ANE) - Fastest, best battery life",
+            BackendDevice::CoreML => "ONNX Runtime with CoreML EP - Fastest, best battery life",
             #[cfg(target_os = "macos")]
-            BackendDevice::Metal => "Metal GPU - Fast, flexible",
+            BackendDevice::Metal => "Metal GPU (Deprecated - use CoreML instead)",
             #[cfg(feature = "cuda")]
             BackendDevice::Cuda => "NVIDIA CUDA GPU - Very fast",
-            BackendDevice::Cpu => "CPU - Slow, works everywhere",
+            BackendDevice::Cpu => "CPU execution provider - Slow, not recommended",
             BackendDevice::Auto => "Auto-detect best available",
         }
     }

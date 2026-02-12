@@ -6,7 +6,7 @@
 pub mod generator;
 pub mod patterns;
 
-pub use generator::{GeneratedResponse, ResponseGenerator};
+pub use generator::{GeneratedResponse, TemplateGenerator};
 pub use patterns::{PatternClassifier, QueryPattern};
 
 use crate::claude::Message;
@@ -21,7 +21,7 @@ use tokio::sync::RwLock;
 /// Local generation system that coordinates pattern classification and response generation
 pub struct LocalGenerator {
     pattern_classifier: PatternClassifier,
-    response_generator: ResponseGenerator,
+    response_generator: TemplateGenerator,
     enabled: bool,
 }
 
@@ -40,7 +40,7 @@ impl LocalGenerator {
         // For now, default to Qwen since that's what we're using
         let model_name = "Qwen2.5-1.5B-Instruct";
         let response_generator =
-            ResponseGenerator::with_models(pattern_classifier.clone(), neural_generator, model_name);
+            TemplateGenerator::with_models(pattern_classifier.clone(), neural_generator, model_name);
 
         Self {
             pattern_classifier,
@@ -49,8 +49,8 @@ impl LocalGenerator {
         }
     }
 
-    /// Try to generate a local response
-    pub fn try_generate(&mut self, query: &str) -> Result<Option<String>> {
+    /// Try to generate a local response from patterns
+    pub fn try_generate_from_pattern(&mut self, query: &str) -> Result<Option<String>> {
         if !self.enabled {
             return Ok(None);
         }
@@ -77,12 +77,12 @@ impl LocalGenerator {
         }
     }
 
-    /// Try to generate a response with tools
+    /// Try to generate a response from patterns with tools
     ///
     /// This method is used by the daemon to support tool execution.
     /// For now, it returns None (indicating local generation doesn't support tools yet).
     /// In the future, this will delegate to QwenGenerator's tool support.
-    pub fn try_generate_with_tools(
+    pub fn try_generate_from_pattern_with_tools(
         &mut self,
         messages: &[Message],
         tools: Option<Vec<ToolDefinition>>,
@@ -171,7 +171,7 @@ impl LocalGenerator {
     }
 
     /// Get response generator
-    pub fn response_generator(&mut self) -> &mut ResponseGenerator {
+    pub fn response_generator(&mut self) -> &mut TemplateGenerator {
         &mut self.response_generator
     }
 
@@ -184,8 +184,8 @@ impl LocalGenerator {
     /// Load local generator from file
     pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         use crate::models::learning::LearningModel;
-        let response_generator = ResponseGenerator::load(path.as_ref())?;
-        // ResponseGenerator contains its own pattern_classifier, so we create a fresh one
+        let response_generator = TemplateGenerator::load(path.as_ref())?;
+        // TemplateGenerator contains its own pattern_classifier, so we create a fresh one
         // for the LocalGenerator's copy (they stay in sync via learning)
         let pattern_classifier = PatternClassifier::new();
 
@@ -212,7 +212,7 @@ mod tests {
         let mut generator = LocalGenerator::new();
 
         // Try to generate response for greeting
-        let result = generator.try_generate("Hello!");
+        let result = generator.try_generate_from_pattern("Hello!");
         assert!(result.is_ok());
 
         if let Ok(Some(response)) = result {
@@ -228,7 +228,7 @@ mod tests {
         let mut generator = LocalGenerator::new();
 
         // Complex query should return None (forward to Claude)
-        let result = generator.try_generate(
+        let result = generator.try_generate_from_pattern(
             "Explain the implementation details of Rust's async/await system including how the compiler transforms async functions into state machines"
         );
 

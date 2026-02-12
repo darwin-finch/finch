@@ -5,7 +5,7 @@
 // to write to the output buffer without passing references around.
 //
 // Non-interactive Mode Behavior:
-// - output_claude!() prints to stdout (actual model output)
+// - output_response!() prints to stdout (actual model output)
 // - output_status!() is silent unless SHAMMAH_LOG=1
 // - Other macros write to buffer (for potential logging)
 
@@ -130,11 +130,11 @@ macro_rules! output_user {
     }};
 }
 
-/// Output a Claude response
+/// Output a provider response
 /// In non-interactive mode (piped output), prints directly to stdout
 /// In interactive mode (TUI), writes to buffer
 #[macro_export]
-macro_rules! output_claude {
+macro_rules! output_response {
     ($($arg:tt)*) => {{
         let content = format!($($arg)*);
         if $crate::cli::global_output::is_non_interactive() {
@@ -144,17 +144,17 @@ macro_rules! output_claude {
         } else {
             // Interactive mode: write to buffer for TUI
             let output_mgr = $crate::cli::global_output::global_output();
-            output_mgr.write_claude(content);
+            output_mgr.write_response(content);
         }
     }};
 }
 
-/// Append to the last Claude response (for streaming)
+/// Append to the last provider response (for streaming)
 #[macro_export]
-macro_rules! output_claude_append {
+macro_rules! output_response_append {
     ($($arg:tt)*) => {{
         let output_mgr = $crate::cli::global_output::global_output();
-        output_mgr.append_claude(format!($($arg)*));
+        output_mgr.append_response(format!($($arg)*));
     }};
 }
 
@@ -310,7 +310,7 @@ mod tests {
         global_output().clear();
 
         output_user!("Hello");
-        output_claude!("Response");
+        output_response!("Response");
         output_status!("Status message");
 
         assert_eq!(global_output().len(), 3);

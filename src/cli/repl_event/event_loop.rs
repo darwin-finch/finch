@@ -334,7 +334,7 @@ impl EventLoop {
                     .join("\n");
 
                 // Output the response
-                self.output_manager.write_claude(response_text);
+                self.output_manager.write_response(response_text);
                 self.output_manager.write_info("✓ Local model (bypassed routing)");
                 self.render_tui().await?;
             }
@@ -639,7 +639,7 @@ impl EventLoop {
                     .await;
 
                 // Display response
-                self.output_manager.write_claude(&response);
+                self.output_manager.write_response(&response);
             }
 
             ReplEvent::QueryFailed { query_id, error } => {

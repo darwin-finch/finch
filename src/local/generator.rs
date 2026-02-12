@@ -27,8 +27,8 @@ struct ResponseTemplate {
     success_rate: f64,
 }
 
-/// Response generator that creates local responses
-pub struct ResponseGenerator {
+/// Template-based generator that creates local responses from learned patterns
+pub struct TemplateGenerator {
     pattern_classifier: PatternClassifier,
     templates: HashMap<String, ResponseTemplate>,
     learned_responses: HashMap<String, Vec<LearnedResponse>>,
@@ -50,7 +50,7 @@ struct LearnedResponse {
     usage_count: usize,
 }
 
-impl ResponseGenerator {
+impl TemplateGenerator {
     /// Create new response generator without neural models
     pub fn new(pattern_classifier: PatternClassifier) -> Self {
         Self::with_models(pattern_classifier, None, "Qwen") // Default to Qwen
@@ -316,13 +316,13 @@ pub struct GeneratedResponse {
     pub pattern: String,
 }
 
-impl Default for ResponseGenerator {
+impl Default for TemplateGenerator {
     fn default() -> Self {
         Self::new(PatternClassifier::new())
     }
 }
 
-impl LearningModel for ResponseGenerator {
+impl LearningModel for TemplateGenerator {
     fn update(&mut self, input: &str, expected: &ModelExpectation) -> Result<()> {
         match expected {
             ModelExpectation::ResponseTarget {
@@ -382,12 +382,12 @@ impl LearningModel for ResponseGenerator {
         }
 
         let json = std::fs::read_to_string(path)?;
-        let loaded: ResponseGenerator = serde_json::from_str(&json)?;
+        let loaded: TemplateGenerator = serde_json::from_str(&json)?;
         Ok(loaded)
     }
 
     fn name(&self) -> &str {
-        "ResponseGenerator"
+        "TemplateGenerator"
     }
 
     fn stats(&self) -> ModelStats {
@@ -395,14 +395,14 @@ impl LearningModel for ResponseGenerator {
     }
 }
 
-impl serde::Serialize for ResponseGenerator {
+impl serde::Serialize for TemplateGenerator {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
 
-        let mut state = serializer.serialize_struct("ResponseGenerator", 3)?;
+        let mut state = serializer.serialize_struct("TemplateGenerator", 3)?;
         state.serialize_field("templates", &self.templates)?;
         state.serialize_field("learned_responses", &self.learned_responses)?;
         state.serialize_field("stats", &self.stats)?;
@@ -410,19 +410,19 @@ impl serde::Serialize for ResponseGenerator {
     }
 }
 
-impl<'de> serde::Deserialize<'de> for ResponseGenerator {
+impl<'de> serde::Deserialize<'de> for TemplateGenerator {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct ResponseGeneratorData {
+        struct TemplateGeneratorData {
             templates: HashMap<String, ResponseTemplate>,
             learned_responses: HashMap<String, Vec<LearnedResponse>>,
             stats: ModelStats,
         }
 
-        let data = ResponseGeneratorData::deserialize(deserializer)?;
+        let data = TemplateGeneratorData::deserialize(deserializer)?;
         Ok(Self {
             pattern_classifier: PatternClassifier::new(),
             templates: data.templates,

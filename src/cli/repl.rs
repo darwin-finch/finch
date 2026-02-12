@@ -529,20 +529,20 @@ impl Repl {
         }
     }
 
-    /// Output a Claude response (dual: buffer + stdout, or TUI only)
-    fn output_claude(&self, content: impl Into<String> + Clone) {
+    /// Output a provider response (dual: buffer + stdout, or TUI only)
+    fn output_response(&self, content: impl Into<String> + Clone) {
         let content_str = content.clone().into();
-        self.output_manager.write_claude(content_str.clone());
+        self.output_manager.write_response(content_str.clone());
         // Only print to stdout if TUI is not active
         if self.is_interactive && !self.is_tui_active() {
             println!("{}", content_str);
         }
     }
 
-    /// Append to the last Claude response (for streaming)
-    fn output_claude_append(&self, content: impl AsRef<str>) {
+    /// Append to the last provider response (for streaming)
+    fn output_response_append(&self, content: impl AsRef<str>) {
         let content_str = content.as_ref();
-        self.output_manager.append_claude(content_str);
+        self.output_manager.append_response(content_str);
         // Only print to stdout if TUI is not active
         if self.is_interactive && !self.is_tui_active() {
             print!("{}", content_str);
@@ -985,7 +985,7 @@ impl Repl {
                 self.conversation.write().await.add_assistant_message(assistant_text.clone());
 
                 if self.is_interactive && !assistant_text.trim().is_empty() {
-                    self.output_claude(format!("    Claude: {}", assistant_text));
+                    self.output_response(format!("    Claude: {}", assistant_text));
                 }
             }
 
@@ -1046,9 +1046,9 @@ impl Repl {
             self.output_status("");
         }
 
-        // Start a new Claude response in the output buffer
+        // Start a new provider response in the output buffer
         if full_response.is_empty() {
-            self.output_manager.write_claude(String::new());
+            self.output_manager.write_response(String::new());
         }
 
         while let Some(result) = rx.recv().await {
@@ -1057,7 +1057,7 @@ impl Repl {
                     full_response.push_str(&text_chunk);
 
                     // Update the output buffer with the chunk
-                    self.output_manager.append_claude(text_chunk.clone());
+                    self.output_manager.append_response(text_chunk.clone());
 
                     // Render TUI to show the update (if active)
                     if self.is_tui_active() {
@@ -1101,7 +1101,7 @@ impl Repl {
             }
             let response = self.process_query(&prompt).await?;
             if self.is_interactive {
-                self.output_claude(&response);
+                self.output_response(&response);
             }
         }
 
@@ -1444,7 +1444,7 @@ impl Repl {
             // Process query
             match self.process_query(&input).await {
                 Ok(response) => {
-                    self.output_claude(&response);
+                    self.output_response(&response);
                     if self.is_interactive {
                         self.output_status("");
                         self.print_status_line().await;
@@ -2335,7 +2335,7 @@ impl Repl {
                     // Model is ready, proceed with local generation
                     // Try local generation
                     let mut gen = self.local_generator.write().await;
-                    match gen.try_generate(query) {
+                    match gen.try_generate_from_pattern(query) {
                     Ok(Some(response_text)) => {
                         // Successfully generated locally
                         if self.is_interactive {
@@ -2737,7 +2737,7 @@ impl Repl {
 
                     // Output the response
                     if self.is_interactive {
-                        self.output_claude(&response);
+                        self.output_response(&response);
                     } else {
                         println!("{}", response);
                     }
@@ -2778,7 +2778,7 @@ impl Repl {
         coordinator: Arc<TrainingCoordinator>,
         models_dir: Option<PathBuf>,
     ) -> Result<BackgroundTrainingStats> {
-        use crate::models::{LoRAAdapter, LoRAConfig, LoRATrainer};
+        use crate::models::{LoRATrainingAdapter, LoRAConfig, LoRATrainer};
         use std::sync::Arc as StdArc;
 
         tracing::info!("Starting background LoRA training");
@@ -2809,7 +2809,7 @@ impl Repl {
         let device = get_device_with_preference(DevicePreference::Auto)?;
 
         // Create LoRA adapter
-        let adapter = LoRAAdapter::new(lora_config.clone(), device.clone())?;
+        let adapter = LoRATrainingAdapter::new(lora_config.clone(), device.clone())?;
 
         // Create tokenizer
         // TODO: Get tokenizer from actual Qwen model for production

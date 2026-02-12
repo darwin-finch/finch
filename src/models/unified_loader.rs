@@ -1,5 +1,5 @@
-// Generic model loader supporting multiple families and backends
-// Enables users to run Qwen, Gemma, Llama, or Mistral on CoreML, Metal, CUDA, or CPU
+// Generic model loader supporting multiple families via ONNX Runtime
+// Enables users to run Qwen, Gemma, Llama, or Mistral using ONNX Runtime with various execution providers
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -379,7 +379,8 @@ impl UnifiedModelLoader {
                              \n\
                              Repository: anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4\n\
                              \n\
-                             For larger models, use CPU backend (Metal has rms-norm bug).\n\
+                             For larger models, use ONNX Runtime (recommended) or wait for broader CoreML support.\n\
+                             Note: CPU backend is too slow for production use.\n\
                              \n\
                              To fix: Change config.toml:\n\
                              [backend]\n\

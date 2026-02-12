@@ -71,7 +71,7 @@ impl Default for LoRAConfig {
 ///
 /// # Example (Future Usage)
 /// ```rust,ignore
-/// use shammah::models::{GeneratorModel, LoRAAdapter, LoRAConfig};
+/// use shammah::models::{GeneratorModel, LoRATrainingAdapter, LoRAConfig};
 ///
 /// // Load pre-trained Qwen model
 /// let mut generator = GeneratorModel::new(config)?;
@@ -96,12 +96,12 @@ impl Default for LoRAConfig {
 /// generator.save_lora("~/.shammah/adapters/physics.safetensors")?;
 /// ```
 #[derive(Debug)]
-pub struct LoRAAdapter {
+pub struct LoRATrainingAdapter {
     config: LoRAConfig,
     enabled: bool,
 }
 
-impl LoRAAdapter {
+impl LoRATrainingAdapter {
     /// Create new LoRA adapter with given configuration
     /// Phase 4: device parameter removed (was Candle-based)
     pub fn new(config: LoRAConfig, _device: ()) -> Result<Self> {
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn test_lora_adapter_creation() {
         let config = LoRAConfig::default();
-        let adapter = LoRAAdapter::new(config);
+        let adapter = LoRATrainingAdapter::new(config);
 
         assert!(!adapter.is_enabled());
         assert_eq!(adapter.config().rank, 16);
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_lora_adapter_enable_disable() {
-        let mut adapter = LoRAAdapter::default_config();
+        let mut adapter = LoRATrainingAdapter::default_config();
 
         assert!(!adapter.is_enabled());
 
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_lora_train_not_implemented() {
-        let mut adapter = LoRAAdapter::default_config();
+        let mut adapter = LoRATrainingAdapter::default_config();
 
         let examples = vec![
             ("Hello".to_string(), "World".to_string()),
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_lora_save_not_implemented() {
-        let adapter = LoRAAdapter::default_config();
+        let adapter = LoRATrainingAdapter::default_config();
         let path = std::path::Path::new("/tmp/test.safetensors");
 
         let result = adapter.save(path);
@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn test_lora_load_not_implemented() {
         let path = std::path::Path::new("/tmp/test.safetensors");
-        let result = LoRAAdapter::load(path);
+        let result = LoRATrainingAdapter::load(path);
         assert!(result.is_err());
     }
 }
@@ -351,7 +351,7 @@ impl ExampleBuffer {
 /// LoRA trainer (stub for Phase 5)
 #[derive(Debug)]
 pub struct LoRATrainer {
-    _adapter: LoRAAdapter,
+    _adapter: LoRATrainingAdapter,
     _learning_rate: f64,
     _batch_size: usize,
     _epochs: usize,
@@ -359,7 +359,7 @@ pub struct LoRATrainer {
 
 impl LoRATrainer {
     pub fn new(
-        adapter: LoRAAdapter,
+        adapter: LoRATrainingAdapter,
         _tokenizer: std::sync::Arc<tokenizers::Tokenizer>,
         learning_rate: f64,
         batch_size: usize,
@@ -377,7 +377,7 @@ impl LoRATrainer {
         anyhow::bail!("LoRA training moved to Python (Phase 5)")
     }
 
-    pub fn adapter(&self) -> Result<&LoRAAdapter> {
+    pub fn adapter(&self) -> Result<&LoRATrainingAdapter> {
         // Phase 4: LoRATrainer removed
         anyhow::bail!("LoRA training moved to Python (Phase 5)")
     }

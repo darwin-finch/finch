@@ -20,7 +20,7 @@ use super::{
 
 /// Qwen local generator implementation
 pub struct QwenGenerator {
-    local_gen: Arc<RwLock<LocalGenerator>>,
+    local_generator: Arc<RwLock<LocalGenerator>>,
     tokenizer: Arc<TextTokenizer>,
     tool_executor: Option<Arc<tokio::sync::Mutex<ToolExecutor>>>,
     capabilities: GeneratorCapabilities,
@@ -28,14 +28,14 @@ pub struct QwenGenerator {
 
 impl QwenGenerator {
     pub fn new(
-        local_gen: Arc<RwLock<LocalGenerator>>,
+        local_generator: Arc<RwLock<LocalGenerator>>,
         tokenizer: Arc<TextTokenizer>,
         tool_executor: Option<Arc<tokio::sync::Mutex<ToolExecutor>>>,
     ) -> Self {
         let supports_tools = tool_executor.is_some();
 
         Self {
-            local_gen,
+            local_generator,
             tokenizer,
             tool_executor,
             capabilities: GeneratorCapabilities {
@@ -98,14 +98,14 @@ impl QwenGenerator {
             .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
 
         // Generate (blocking, so spawn_blocking)
-        let local_gen = Arc::clone(&self.local_gen);
+        let local_generator = Arc::clone(&self.local_generator);
         let query = query.to_string();
 
         let generated = tokio::task::spawn_blocking(move || -> Result<_> {
             // Get write lock synchronously
-            let mut gen = local_gen.blocking_write();
+            let mut gen = local_generator.blocking_write();
             // Use try_generate which returns Option<String>
-            match gen.try_generate(&query)? {
+            match gen.try_generate_from_pattern(&query)? {
                 Some(text) => Ok(crate::local::GeneratedResponse {
                     text,
                     method: "local".to_string(),
@@ -328,7 +328,7 @@ impl QwenGenerator {
                     None, // conversation
                     None::<fn() -> Result<()>>, // save_models_fn
                     None, // batch_trainer
-                    Some(Arc::clone(&self.local_gen)), // local_generator (for query_local tool)
+                    Some(Arc::clone(&self.local_generator)), // local_generator (for query_local tool)
                     Some(Arc::clone(&self.tokenizer)),  // tokenizer
                 )
                 .await
@@ -347,12 +347,12 @@ impl QwenGenerator {
 
     /// Low-level text generation (synchronous, blocking)
     async fn generate_text(&self, prompt: &str) -> Result<String> {
-        let local_gen = Arc::clone(&self.local_gen);
+        let local_generator = Arc::clone(&self.local_generator);
         let prompt = prompt.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<String> {
-            let mut gen = local_gen.blocking_write();
-            match gen.try_generate(&prompt)? {
+            let mut gen = local_generator.blocking_write();
+            match gen.try_generate_from_pattern(&prompt)? {
                 Some(text) => Ok(text),
                 None => Err(anyhow::anyhow!("Local generation returned None")),
             }

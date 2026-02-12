@@ -223,8 +223,7 @@ impl ToolExecutionCoordinator {
                         tool_id: tool_use.id.clone(),
                         result: Err(anyhow::anyhow!(
                             "Tool execution timed out after {} seconds. \
-                             This often happens when Qwen runs on CPU instead of Metal. \
-                             Try restarting or check Metal support.",
+                             Try restarting or check daemon logs for errors.",
                             timeout_duration.as_secs()
                         )),
                     });

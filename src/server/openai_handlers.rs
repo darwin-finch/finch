@@ -124,7 +124,7 @@ pub async fn handle_chat_completions(
 
                     // Try local generation with tools
                     let mut generator = server.local_generator().write().await;
-                    match generator.try_generate_with_tools(&internal_messages, internal_tools.clone()) {
+                    match generator.try_generate_from_pattern_with_tools(&internal_messages, internal_tools.clone()) {
                         Ok(Some(response)) => (response.content_blocks, "local"),
                         Ok(None) | Err(_) => {
                             // Fall back to Claude
@@ -261,7 +261,7 @@ async fn handle_local_only_query(
 
     // Generate response (no tools for now - direct generation only)
     let mut generator = server.local_generator().write().await;
-    let content_blocks = match generator.try_generate_with_tools(&internal_messages, None) {
+    let content_blocks = match generator.try_generate_from_pattern_with_tools(&internal_messages, None) {
         Ok(Some(response)) => response.content_blocks,
         Ok(None) => {
             return Err((
