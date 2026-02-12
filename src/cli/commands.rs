@@ -34,6 +34,8 @@ pub enum Command {
     FeedbackCritical(Option<String>), // High-weight (10x) - critical strategy errors
     FeedbackMedium(Option<String>),   // Medium-weight (3x) - improvements
     FeedbackGood(Option<String>),     // Normal-weight (1x) - good examples
+    // Local model testing
+    Local { query: String }, // Query local model directly (bypass routing)
 }
 
 impl Command {
@@ -114,6 +116,16 @@ impl Command {
             return Some(Command::FeedbackGood(None));
         }
 
+        // Handle /local command with query
+        if let Some(rest) = trimmed.strip_prefix("/local ") {
+            let query = rest.trim();
+            if !query.is_empty() {
+                return Some(Command::Local {
+                    query: query.to_string(),
+                });
+            }
+        }
+
         // Handle /patterns commands with subcommands
         if trimmed == "/patterns" || trimmed == "/patterns list" {
             return Some(Command::PatternsList);
@@ -187,6 +199,10 @@ pub fn handle_command(
         Command::FeedbackCritical(_) | Command::FeedbackMedium(_) | Command::FeedbackGood(_) => {
             Ok(CommandOutput::Status("Feedback commands should be handled in REPL.".to_string()))
         }
+        // Local command is handled directly in REPL
+        Command::Local { .. } => {
+            Ok(CommandOutput::Status("Local command should be handled in REPL.".to_string()))
+        }
     }
 }
 
@@ -198,6 +214,7 @@ pub fn format_help() -> String {
   /training         - Show detailed training statistics
   /clear            - Clear conversation history (start fresh)
   /debug            - Toggle debug output
+  /local <query>    - Query local model directly (bypass routing)
   /patterns         - List confirmation patterns
   /patterns add     - Add a new confirmation pattern (interactive)
   /patterns rm <id> - Remove a pattern by ID

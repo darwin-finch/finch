@@ -33,6 +33,9 @@ pub struct ChatCompletionRequest {
     /// Tools available for function calling
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    /// Bypass routing and query local model directly (for testing)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_only: Option<bool>,
 }
 
 /// Chat message in OpenAI format

@@ -67,6 +67,11 @@ pub async fn handle_chat_completions(
         ));
     }
 
+    // Check if local-only mode requested
+    if request.local_only.unwrap_or(false) {
+        return handle_local_only_query(server, request).await;
+    }
+
     // Convert OpenAI messages to internal format (now handles tool calls/results)
     let internal_messages = convert_messages_to_internal(&request.messages)
         .map_err(|e| error_response(&e.to_string(), "invalid_request_error"))?;
@@ -194,6 +199,95 @@ pub async fn handle_chat_completions(
     }
 
     // Convert internal response to OpenAI format (handles tool_calls)
+    let openai_response = convert_response_to_openai(content_blocks, &request.model)?;
+
+    Ok(Json(openai_response))
+}
+
+/// Handle local-only query (bypass routing, direct local model access)
+async fn handle_local_only_query(
+    server: Arc<AgentServer>,
+    request: ChatCompletionRequest,
+) -> Result<Json<ChatCompletionResponse>, Response> {
+    use crate::models::GeneratorState;
+
+    info!("Local-only query (bypassing routing)");
+
+    // Check generator state
+    let state = server.generator_state().read().await;
+
+    match &*state {
+        GeneratorState::Ready { .. } => {
+            // Model ready, proceed (state will be dropped at end of scope)
+        }
+        GeneratorState::Initializing | GeneratorState::Downloading { .. } | GeneratorState::Loading { .. } => {
+            warn!("Local model not ready: {:?}", &*state);
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::new(
+                    "Local model not ready (initializing/downloading/loading)".to_string(),
+                    "model_not_ready".to_string(),
+                )),
+            )
+                .into_response());
+        }
+        GeneratorState::Failed { ref error } => {
+            warn!("Local model failed: {}", error);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Local model failed: {}", error),
+                    "model_failed".to_string(),
+                )),
+            )
+                .into_response());
+        }
+        GeneratorState::NotAvailable => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse::new(
+                    "Local model not available".to_string(),
+                    "model_not_available".to_string(),
+                )),
+            )
+                .into_response());
+        }
+    }
+    // State dropped here automatically
+
+    // Extract query from messages
+    let internal_messages = convert_messages_to_internal(&request.messages)
+        .map_err(|e| error_response(&e.to_string(), "invalid_request_error"))?;
+
+    // Generate response (no tools for now - direct generation only)
+    let mut generator = server.local_generator().write().await;
+    let content_blocks = match generator.try_generate_with_tools(&internal_messages, None) {
+        Ok(Some(response)) => response.content_blocks,
+        Ok(None) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "Local model returned no response".to_string(),
+                    "generation_failed".to_string(),
+                )),
+            )
+                .into_response());
+        }
+        Err(e) => {
+            warn!("Local generation failed: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    format!("Local generation failed: {}", e),
+                    "generation_failed".to_string(),
+                )),
+            )
+                .into_response());
+        }
+    };
+    drop(generator);
+
+    // Convert response to OpenAI format
     let openai_response = convert_response_to_openai(content_blocks, &request.model)?;
 
     Ok(Json(openai_response))

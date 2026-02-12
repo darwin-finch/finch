@@ -133,6 +133,7 @@ impl DaemonClient {
             stream: false,
             stop: None,
             tools: None,
+            local_only: None,
         };
 
         // Send to daemon
@@ -216,6 +217,7 @@ impl DaemonClient {
                 n: None,
                 stream: false,
                 stop: None,
+                local_only: None,
             };
 
             let url = format!("{}/v1/chat/completions", self.base_url);
@@ -411,6 +413,76 @@ impl DaemonClient {
     /// Get configuration
     pub fn config(&self) -> &DaemonConfig {
         &self.config
+    }
+
+    /// Query local model directly, bypassing routing
+    ///
+    /// This sends a request with local_only=true to bypass crisis detection
+    /// and threshold routing, going directly to the local model.
+    /// Returns an error if the model is not ready or generation fails.
+    pub async fn query_local_only(&self, query: &str) -> Result<String> {
+        use reqwest::StatusCode;
+
+        let request = ChatCompletionRequest {
+            model: "qwen-local".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(query.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: false,
+            stop: None,
+            tools: None,
+            local_only: Some(true), // KEY: Bypass routing
+        };
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        debug!(url = %url, "Sending local-only query");
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to send request to daemon")?;
+
+        match response.status() {
+            StatusCode::OK => {
+                let completion: ChatCompletionResponse = response
+                    .json()
+                    .await
+                    .context("Failed to parse response from daemon")?;
+
+                let content = completion
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.message.content.clone())
+                    .unwrap_or_else(|| "No response from model".to_string());
+
+                Ok(content)
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                anyhow::bail!("Local model not ready (initializing/downloading/loading)")
+            }
+            StatusCode::NOT_IMPLEMENTED => {
+                anyhow::bail!("Local model not available")
+            }
+            StatusCode::INTERNAL_SERVER_ERROR => {
+                let error_text = response.text().await.unwrap_or_default();
+                anyhow::bail!("Local model generation failed: {}", error_text)
+            }
+            status => {
+                let error_text = response.text().await.unwrap_or_default();
+                anyhow::bail!("Daemon error ({}): {}", status, error_text)
+            }
+        }
     }
 }
 

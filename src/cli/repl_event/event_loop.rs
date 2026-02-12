@@ -230,6 +230,10 @@ impl EventLoop {
                         );
                         self.render_tui().await?;
                     }
+                    Command::Local { query } => {
+                        // Handle /local command - query local model directly (bypass routing)
+                        self.handle_local_query(query).await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -274,6 +278,71 @@ impl EventLoop {
 
         // Spawn query processing task
         self.spawn_query_task(query_id, input).await;
+
+        Ok(())
+    }
+
+    /// Handle /local command - query local model directly (bypass routing)
+    async fn handle_local_query(&mut self, query: String) -> Result<()> {
+        use crate::claude::Message;
+
+        // Show status message
+        self.output_manager.write_info("🔧 Local Model Query (bypassing routing)");
+        self.render_tui().await?;
+
+        // Check generator state
+        let state = self.generator_state.read().await;
+        match &*state {
+            GeneratorState::Ready { .. } => {
+                // Model ready, proceed (state dropped at end of scope)
+            }
+            GeneratorState::Initializing | GeneratorState::Downloading { .. } | GeneratorState::Loading { .. } => {
+                self.output_manager.write_error("Local model not ready (initializing/downloading/loading)");
+                self.render_tui().await?;
+                return Ok(());
+            }
+            GeneratorState::Failed { error } => {
+                self.output_manager.write_error(format!("Local model failed: {}", error));
+                self.render_tui().await?;
+                return Ok(());
+            }
+            GeneratorState::NotAvailable => {
+                self.output_manager.write_error("Local model not available");
+                self.render_tui().await?;
+                return Ok(());
+            }
+        }
+        // State dropped here automatically
+
+        // Create a message for the query
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: vec![crate::claude::ContentBlock::Text { text: query.clone() }],
+        }];
+
+        // Generate response using local model directly (no tools, bypass routing)
+        match self.qwen_gen.generate(messages, None).await {
+            Ok(response) => {
+                // Extract text from response
+                let response_text = response.content_blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                // Output the response
+                self.output_manager.write_claude(response_text);
+                self.output_manager.write_info("✓ Local model (bypassed routing)");
+                self.render_tui().await?;
+            }
+            Err(e) => {
+                self.output_manager.write_error(format!("Local generation failed: {}", e));
+                self.render_tui().await?;
+            }
+        }
 
         Ok(())
     }

@@ -28,8 +28,7 @@ use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
-    AnalyzeModelTool, BashTool, CompareResponsesTool, GenerateTrainingDataTool, GlobTool, GrepTool,
-    QueryLocalModelTool, ReadTool, RestartTool, SaveAndExecTool, TrainTool, WebFetchTool,
+    BashTool, GlobTool, GrepTool, ReadTool, RestartTool, SaveAndExecTool, WebFetchTool,
 };
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::{ToolDefinition, ToolUse};
@@ -183,13 +182,6 @@ impl Repl {
         tool_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
         tool_registry.register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
 
-        // Active learning tools (Phase 2)
-        tool_registry.register(Box::new(QueryLocalModelTool));
-        tool_registry.register(Box::new(CompareResponsesTool));
-        tool_registry.register(Box::new(GenerateTrainingDataTool));
-        tool_registry.register(Box::new(AnalyzeModelTool));
-        tool_registry.register(Box::new(TrainTool));
-
         // Create permission manager (allow all for now)
         let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
 
@@ -213,11 +205,6 @@ impl Repl {
                 fallback_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
                 fallback_registry
                     .register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
-                fallback_registry.register(Box::new(QueryLocalModelTool));
-                fallback_registry.register(Box::new(CompareResponsesTool));
-                fallback_registry.register(Box::new(GenerateTrainingDataTool));
-                fallback_registry.register(Box::new(AnalyzeModelTool));
-                fallback_registry.register(Box::new(TrainTool));
                 ToolExecutor::new(
                     fallback_registry,
                     PermissionManager::new().with_default_rule(PermissionRule::Allow),
@@ -1429,6 +1416,11 @@ impl Repl {
                     }
                     Command::FeedbackGood(ref note) => {
                         self.handle_feedback(1.0, note.clone()).await?;
+                        continue;
+                    }
+                    // Local model query command
+                    Command::Local { ref query } => {
+                        self.handle_local_query(query).await?;
                         continue;
                     }
                     _ => {
@@ -2718,6 +2710,64 @@ impl Repl {
             });
 
             self.output_status("   Training started in background...");
+        }
+
+        Ok(())
+    }
+
+    /// Handle /local command - query local model directly (bypass routing)
+    async fn handle_local_query(&mut self, query: &str) -> Result<()> {
+        // Show status
+        self.output_status("🔧 Local Model Query (bypassing routing)");
+
+        // Check if daemon client exists
+        if let Some(daemon_client) = &self.daemon_client {
+            // Daemon mode: use HTTP
+            if self.is_interactive {
+                self.output_user(query);
+            }
+
+            // Start response
+            let start_time = Instant::now();
+
+            // Query daemon with local_only flag
+            match daemon_client.query_local_only(query).await {
+                Ok(response) => {
+                    let elapsed = start_time.elapsed();
+
+                    // Output the response
+                    if self.is_interactive {
+                        self.output_claude(&response);
+                    } else {
+                        println!("{}", response);
+                    }
+
+                    // Show timing
+                    if self.is_interactive {
+                        self.output_status(format!("✓ Local model ({:.2}s)", elapsed.as_secs_f64()));
+                    }
+                }
+                Err(e) => {
+                    // Show error
+                    let error_msg = format!("Error: {}", e);
+                    if self.is_interactive {
+                        self.output_error(&error_msg);
+                        self.output_status("⚠️  Local model query failed");
+                    } else {
+                        eprintln!("{}", error_msg);
+                    }
+                }
+            }
+        } else {
+            // No daemon mode - show error
+            let error_msg =
+                "Error: /local requires daemon mode. The daemon provides direct model access.";
+            if self.is_interactive {
+                self.output_status("⚠️  Daemon not available");
+                self.output_status("    Start the daemon: shammah daemon --bind 127.0.0.1:11435");
+            } else {
+                eprintln!("{}", error_msg);
+            }
         }
 
         Ok(())
