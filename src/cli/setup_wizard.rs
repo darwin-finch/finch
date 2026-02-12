@@ -34,6 +34,9 @@ enum WizardStep {
     ModelSizeSelection(usize),
     CustomModelRepo(String, BackendDevice), // (repo input, selected device)
     TeacherConfig(Vec<TeacherEntry>, usize), // (teachers list, selected index)
+    AddTeacherProviderSelection(Vec<TeacherEntry>, usize), // (existing teachers, selected provider idx)
+    AddTeacherApiKey(Vec<TeacherEntry>, String, String), // (existing teachers, provider, api_key input)
+    AddTeacherModel(Vec<TeacherEntry>, String, String, String), // (existing teachers, provider, api_key, model input)
     Confirm,
 }
 
@@ -316,12 +319,107 @@ fn run_wizard_loop(
                             step = WizardStep::Confirm;
                         }
                         KeyCode::Char('a') => {
-                            // Add new teacher (simplified - just show we can skip for now)
-                            teachers = teacher_list.clone();
-                            step = WizardStep::Confirm;
+                            // Add new teacher - go to provider selection
+                            step = WizardStep::AddTeacherProviderSelection(teacher_list.clone(), 0);
+                        }
+                        KeyCode::Char('d') => {
+                            // Delete selected teacher (if not the only one)
+                            if teacher_list.len() > 1 && *selected < teacher_list.len() {
+                                let mut new_teachers = teacher_list.clone();
+                                new_teachers.remove(*selected);
+                                let new_selected = if *selected >= new_teachers.len() {
+                                    new_teachers.len().saturating_sub(1)
+                                } else {
+                                    *selected
+                                };
+                                step = WizardStep::TeacherConfig(new_teachers, new_selected);
+                            }
                         }
                         KeyCode::Esc => {
                             anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::AddTeacherProviderSelection(teacher_list, selected) => {
+                    let providers = vec!["claude", "openai", "gemini", "grok", "mistral", "groq"];
+                    match key.code {
+                        KeyCode::Up => {
+                            if *selected > 0 {
+                                *selected -= 1;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if *selected < providers.len() - 1 {
+                                *selected += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let provider = providers[*selected].to_string();
+                            step = WizardStep::AddTeacherApiKey(teacher_list.clone(), provider, String::new());
+                        }
+                        KeyCode::Esc => {
+                            // Go back to teacher config
+                            step = WizardStep::TeacherConfig(teacher_list.clone(), 0);
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::AddTeacherApiKey(teacher_list, provider, api_key_input) => {
+                    match key.code {
+                        KeyCode::Enter => {
+                            if !api_key_input.is_empty() {
+                                // Go to model name input (optional)
+                                step = WizardStep::AddTeacherModel(teacher_list.clone(), provider.clone(), api_key_input.clone(), String::new());
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            api_key_input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            api_key_input.push(c);
+                        }
+                        KeyCode::Esc => {
+                            // Go back to provider selection
+                            step = WizardStep::AddTeacherProviderSelection(teacher_list.clone(), 0);
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::AddTeacherModel(teacher_list, provider, api_key, model_input) => {
+                    match key.code {
+                        KeyCode::Enter => {
+                            // Create new teacher and add to list
+                            let mut new_teachers = teacher_list.clone();
+                            new_teachers.push(TeacherEntry {
+                                provider: provider.clone(),
+                                api_key: api_key.clone(),
+                                model: if model_input.is_empty() { None } else { Some(model_input.clone()) },
+                                base_url: None,
+                                name: None,
+                            });
+                            step = WizardStep::TeacherConfig(new_teachers, teacher_list.len());
+                        }
+                        KeyCode::Backspace => {
+                            model_input.pop();
+                        }
+                        KeyCode::Char(c) => {
+                            model_input.push(c);
+                        }
+                        KeyCode::Esc => {
+                            // Skip model input and add teacher anyway
+                            let mut new_teachers = teacher_list.clone();
+                            new_teachers.push(TeacherEntry {
+                                provider: provider.clone(),
+                                api_key: api_key.clone(),
+                                model: None,
+                                base_url: None,
+                                name: None,
+                            });
+                            step = WizardStep::TeacherConfig(new_teachers, teacher_list.len());
                         }
                         _ => {}
                     }
@@ -395,6 +493,9 @@ fn render_wizard_step(
         WizardStep::ModelSizeSelection(selected) => render_model_size_selection(f, inner, model_sizes, *selected),
         WizardStep::CustomModelRepo(input, device) => render_custom_model_repo(f, inner, input, *device),
         WizardStep::TeacherConfig(teachers, selected) => render_teacher_config(f, inner, teachers, *selected),
+        WizardStep::AddTeacherProviderSelection(_, selected) => render_provider_selection(f, inner, *selected),
+        WizardStep::AddTeacherApiKey(_, provider, input) => render_teacher_api_key_input(f, inner, provider, input),
+        WizardStep::AddTeacherModel(_, provider, _, input) => render_teacher_model_input(f, inner, provider, input),
         WizardStep::Confirm => render_confirm(f, inner),
     }
 }
@@ -797,7 +898,7 @@ fn render_teacher_config(f: &mut Frame, area: Rect, teachers: &[TeacherEntry], s
 
     f.render_stateful_widget(list, chunks[2], &mut list_state);
 
-    let help = Paragraph::new("Enter: Continue  Esc: Cancel")
+    let help = Paragraph::new("↑/↓: Select  a: Add Provider  d: Delete  Enter: Continue  Esc: Cancel")
         .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[3]);
@@ -856,4 +957,110 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn render_provider_selection(f: &mut Frame, area: Rect, selected: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Select Provider")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let providers = vec!["claude", "openai", "gemini", "grok", "mistral", "groq"];
+    let items: Vec<ListItem> = providers
+        .iter()
+        .enumerate()
+        .map(|(idx, provider)| {
+            let style = if idx == selected {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(Line::from(Span::styled(*provider, style)))
+        })
+        .collect();
+
+    let list = List::new(items);
+    f.render_widget(list, chunks[1]);
+
+    let instructions = Paragraph::new("↑/↓: Navigate | Enter: Select | Esc: Back")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(instructions, chunks[2]);
+}
+
+fn render_teacher_api_key_input(f: &mut Frame, area: Rect, provider: &str, input: &str) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let title = Paragraph::new(format!("Configure {}", provider.to_uppercase()))
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let prompt = Paragraph::new(format!("Enter API key for {}:", provider))
+        .style(Style::default().fg(Color::Yellow));
+    f.render_widget(prompt, chunks[1]);
+
+    // Mask API key for security (show asterisks)
+    let masked = "*".repeat(input.len());
+    let input_widget = Paragraph::new(masked)
+        .style(Style::default().fg(Color::Green))
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green)));
+    f.render_widget(input_widget, chunks[2]);
+
+    let instructions = Paragraph::new("Type API key | Enter: Continue | Esc: Back")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(instructions, chunks[3]);
+}
+
+fn render_teacher_model_input(f: &mut Frame, area: Rect, provider: &str, input: &str) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let title = Paragraph::new(format!("Configure {}", provider.to_uppercase()))
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let prompt = Paragraph::new(
+        format!("Enter model name for {} (optional):\nLeave empty to use default model", provider)
+    )
+        .style(Style::default().fg(Color::Yellow))
+        .wrap(Wrap { trim: true });
+    f.render_widget(prompt, chunks[1]);
+
+    let input_widget = Paragraph::new(input)
+        .style(Style::default().fg(Color::Green))
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Green)));
+    f.render_widget(input_widget, chunks[3]);
+
+    let instructions = Paragraph::new("Type model name | Enter: Add Teacher | Esc: Skip")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(instructions, chunks[4]);
 }

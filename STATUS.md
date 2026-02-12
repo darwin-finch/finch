@@ -209,10 +209,12 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/monitoring/mod.rs`, `src/cli/commands.rs`, `src/cli/repl_event/event_loop.rs`
     - Effort: 1 hour (actual)
 
-16. **[ ] Multi-provider setup wizard**
-    - Support all providers (Claude, GPT-4, Gemini, Grok) in wizard
-    - Files: `src/cli/setup.rs`
-    - Effort: 4-6 hours
+16. **[x] Multi-provider setup wizard** - ✅ COMPLETE
+    - Support all providers (Claude, GPT-4, Gemini, Grok, Mistral, Groq) in wizard
+    - Users can add multiple providers, delete providers, configure API keys
+    - Keyboard shortcuts: a (add), d (delete), ↑/↓ (select)
+    - Files: `src/cli/setup_wizard.rs`
+    - Effort: 4 hours (actual)
 
 17. **[ ] Tool confirmation system fix** 🔴 CRITICAL SECURITY
     - Debug why confirmations not working
