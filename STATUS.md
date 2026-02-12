@@ -77,106 +77,179 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 
 ---
 
-## TODO List
+## TODO List (Organized by Difficulty)
 
-### Phase 1: Polish & UX (High Priority)
+**Organization:** Items sorted easiest → hardest for efficient progress and quick wins.
 
-**Tool Confirmation Fix:**
-- [ ] Debug and fix tool confirmation system
-  - Current: Tool confirmations not working properly
-  - Security: HIGH PRIORITY - affects user control over tool execution
-  - Need: Investigate why permission prompts not appearing
-  - Files: `src/tools/permissions.rs`, `src/tools/executor.rs`
-  - Impact: Critical for safety and user trust
+**Summary:**
+- 23 total items (14 original + 9 new suggestions)
+- Phase 1: Quick wins (3 items, 1-2h each) ⚡
+- Phase 2: Medium difficulty (6 items, 2-4h each)
+- Phase 3: Moderate complexity (4 items, 3-6h each)
+- Phase 4: Challenging (6 items, 4-8h each)
+- Phase 5: Complex (3 items, 8-20h each)
+- Phase 6: Very complex (1 item, 20-40h)
 
-**Textarea Improvements:**
-- [ ] Add shift-return support for multi-line input expansion
-- [ ] Add history navigation (up/down arrows for previous queries)
-  - Rationale: Basic UX feature users expect from REPL interfaces
-  - Complexity: Medium (need to track command history, handle multi-line)
-  - Files: `src/cli/tui/input_widget.rs`
+**New Items Added:**
+1. Error message improvements
+2. Config validation
+3. Model download progress in TUI
+4. /help improvements
+5. Simple feedback system
+6. Crash recovery
+7. Python deps helper
+8. Memory monitoring
+9. Color customization
 
-**Status Bar Enhancements:**
-- [ ] Display actual stats in status bar (tokens, latency, model info)
-  - Current: Status bar exists but doesn't show live stats
-  - Need: Real-time token count, generation speed, current model
-  - Files: `src/cli/tui/status_widget.rs`
+See `docs/ROADMAP.md` for detailed implementation plans.
 
-**Query Control:**
-- [ ] Add Control-C query termination
-  - Current: Control-C cannot stop in-progress queries
-  - Need: Terminate current query, return to prompt
-  - Daemon: Pass cancellation through to teacher model API
-  - Files: `src/cli/tui/mod.rs`, `src/daemon/client.rs`
-  - Impact: Essential UX for long-running queries
+### Phase 1: Quick Wins ⚡ (Easy - 1-2 hours each)
 
-**Daemon Management:**
-- [ ] Add `shammah daemon stop` subcommand
-  - Should kill daemon gracefully and remove PID file
-  - Files: `src/cli/commands.rs`, `src/daemon/lifecycle.rs`
-- [ ] Add `shammah daemon start` subcommand
-  - Currently daemon auto-spawns, but explicit start is useful
-  - Files: `src/cli/commands.rs`
-- [ ] Add `shammah daemon status` subcommand
-  - Show daemon running/stopped, PID, uptime, active sessions
-  - Files: `src/cli/commands.rs`
+1. **[ ] Daemon stop command** - EASIEST FIRST
+   - Add `shammah daemon stop` subcommand
+   - Files: `src/cli/commands.rs`, `src/daemon/lifecycle.rs`
+   - Effort: 1-2 hours
 
-### Phase 2: Setup & Configuration (Medium Priority)
+2. **[ ] Daemon start command**
+   - Add `shammah daemon start` subcommand
+   - Files: `src/cli/commands.rs`
+   - Effort: 1-2 hours
 
-**Setup Wizard Enhancements:**
-- [ ] Support adding multiple teacher providers in wizard
-  - Current: Only Claude setup during first run
-  - Need: Interactive prompts for GPT-4, Gemini, Grok
-  - Files: `src/cli/setup.rs`
-- [ ] Support configuring multiple local models in wizard
-  - Current: Auto-selects single model based on RAM
-  - Need: Allow user to choose preferred models
-  - Files: `src/cli/setup.rs`
+3. **[ ] Error message improvements** (NEW)
+   - Make error messages user-friendly with actionable suggestions
+   - Examples: "Model not found" → "Model not downloaded. Run setup wizard..."
+   - Files: `src/errors.rs`, error handling sites
+   - Effort: 1-2 hours
 
-**Model Adapter Support:**
-- [ ] Test/verify Mistral model support with LlamaAdapter
-  - Current: Llama adapter exists, should work for Mistral
-  - Need: Integration test with Mistral ONNX models
-  - Files: `src/models/adapters/llama.rs`
-- [ ] Add adapters for other model families (Phi, DeepSeek, etc.)
-  - Create model-specific adapters
-  - Handle tokenizer differences
-  - Files: `src/models/adapters/`
+### Phase 2: Medium Difficulty (2-4 hours each)
 
-### Phase 3: Advanced Features (Lower Priority)
+4. **[ ] Shift-return multi-line support**
+   - Textarea shift-return for multi-line input
+   - Files: `src/cli/tui/input_widget.rs`
+   - Effort: 2-4 hours
 
-**Plan Mode Redesign:**
-- [ ] Redesign plan mode to match Claude Code's implementation
-  - Current: Basic plan mode exists but "nearly useless" (user feedback)
-  - Need to research Claude Code's plan mode behavior
-  - Multi-step planning with approval workflow
-  - Step-by-step execution tracking
-  - Files: `src/cli/plan_mode.rs` (may need major refactor)
+5. **[ ] Status bar live stats**
+   - Display tokens, latency, model info in status bar
+   - Files: `src/cli/tui/status_widget.rs`, `src/cli/output_manager.rs`
+   - Effort: 2-4 hours
 
-**LoRA Training Integration:**
-- [ ] Install Python dependencies for LoRA training
-  - scripts/requirements.txt exists
-  - Need: Virtual environment setup, dependency installation
-  - Files: `scripts/train_lora.py`, `scripts/requirements.txt`
-- [ ] Implement adapter loading in Rust runtime
-  - Training infrastructure complete, need to load adapters
-  - Files: `src/models/lora.rs`, `src/generators/qwen.rs`
+6. **[ ] Config validation on startup** (NEW)
+   - Validate config file and show helpful errors
+   - Check API keys, paths, model sizes
+   - Files: `src/config/mod.rs`
+   - Effort: 2-4 hours
 
-### Phase 4: Documentation & Cleanup (Ongoing)
+7. **[ ] Daemon status command**
+   - Add `shammah daemon status` subcommand
+   - Show running/stopped, PID, uptime, active sessions
+   - Files: `src/cli/commands.rs`
+   - Effort: 2-4 hours
+
+8. **[ ] Model download progress in TUI** (NEW)
+   - Show download progress in TUI status bar (not just logs)
+   - Files: `src/models/download.rs`, `src/cli/tui/status_widget.rs`
+   - Effort: 2-4 hours
+
+9. **[ ] /help command improvements** (NEW)
+   - Document all slash commands, keyboard shortcuts
+   - Show tool confirmation system usage
+   - Files: `src/cli/commands.rs`
+   - Effort: 2-4 hours
+
+### Phase 3: Moderate Complexity (3-6 hours each)
+
+10. **[ ] Control-C query termination** 🔴 HIGH PRIORITY
+    - Cancel in-progress queries with Control-C
+    - Pass cancellation through to teacher APIs
+    - Files: `src/cli/tui/mod.rs`, `src/daemon/client.rs`, provider APIs
+    - Effort: 3-6 hours
+
+11. **[ ] Simple response feedback system** (NEW)
+    - Add thumbs up/down for responses (for LoRA training data)
+    - Press 'g' for good, 'b' for bad
+    - Log to ~/.shammah/feedback.jsonl
+    - Files: `src/cli/tui/mod.rs`, new `src/feedback/`
+    - Effort: 3-6 hours
+
+12. **[ ] Crash recovery mechanism** (NEW)
+    - Handle daemon crashes gracefully
+    - Auto-restart daemon, preserve session state
+    - Files: `src/daemon/lifecycle.rs`, `src/daemon/client.rs`
+    - Effort: 4-6 hours
+
+13. **[ ] Python deps installation helper** (NEW)
+    - Add `shammah train setup` command
+    - Create venv, install requirements.txt
+    - Files: `src/cli/commands.rs`, new `src/training/setup.rs`
+    - Effort: 3-5 hours
+
+### Phase 4: Challenging (4-8 hours each)
+
+14. **[ ] Command history navigation**
+    - Up/down arrows for previous queries
+    - Handle multi-line, persist to disk
+    - Files: `src/cli/tui/input_widget.rs`
+    - Effort: 4-8 hours
+
+15. **[ ] Memory usage monitoring** (NEW)
+    - Track and display model memory usage
+    - Show available system RAM, warn if approaching limits
+    - Files: `src/models/`, `src/cli/tui/status_widget.rs`
+    - Effort: 4-6 hours
+
+16. **[ ] Multi-provider setup wizard**
+    - Support all providers (Claude, GPT-4, Gemini, Grok) in wizard
+    - Files: `src/cli/setup.rs`
+    - Effort: 4-6 hours
+
+17. **[ ] Tool confirmation system fix** 🔴 CRITICAL SECURITY
+    - Debug why confirmations not working
+    - Files: `src/tools/permissions.rs`, `src/tools/executor.rs`
+    - Effort: 4-8 hours
+
+18. **[ ] Multi-model setup wizard**
+    - Let users choose models in wizard
+    - Files: `src/cli/setup.rs`
+    - Effort: 4-6 hours
+
+19. **[ ] Mistral model testing**
+    - Test Mistral with LlamaAdapter
+    - Files: `src/models/adapters/llama.rs`, new test
+    - Effort: 2-8 hours (variable)
+
+### Phase 5: Complex (8-20 hours each)
+
+20. **[ ] Additional model adapters** (Phi, DeepSeek, etc.)
+    - Create adapters for other model families
+    - Files: `src/models/adapters/`
+    - Effort: 4-8 hours per model
+
+21. **[ ] Adapter loading in runtime**
+    - Load trained LoRA adapters in ONNX runtime
+    - Files: `src/models/lora.rs`, `src/generators/qwen.rs`
+    - Effort: 8-16 hours
+
+22. **[ ] Color scheme customization** (NEW)
+    - Let users customize TUI colors via config
+    - Accessibility improvement
+    - Files: `src/cli/tui/`, `src/config/mod.rs`
+    - Effort: 6-10 hours
+
+### Phase 6: Very Complex (20+ hours)
+
+23. **[ ] Plan mode redesign**
+    - Match Claude Code's plan mode quality
+    - Multi-step planning, approval workflow
+    - Files: `src/cli/plan_mode.rs` (major refactor)
+    - Effort: 20-40 hours
+
+### Phase 7: Documentation (Ongoing)
 
 - [x] Clean up obsolete docs (moved to docs/archive/)
 - [x] Update STATUS.md with current capabilities
 - [ ] Update CLAUDE.md with accurate ONNX architecture
-  - Replace references to Candle with ONNX Runtime
-  - Update component descriptions
-  - Fix architecture diagrams
-- [ ] Create user guide for setup and usage
-  - New file: `docs/USER_GUIDE.md`
-  - Cover setup wizard, basic usage, tool execution
+- [ ] Create user guide (docs/USER_GUIDE.md)
 - [ ] Update ARCHITECTURE.md with daemon mode
-  - Document client/daemon split
-  - Tool pass-through architecture
-  - Session management
 
 ---
 
@@ -233,31 +306,49 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 
 ---
 
-## Next Steps
+## Next Steps (Recommended Order)
 
-### Immediate Priorities (This Week)
-1. Implement textarea improvements (shift-return, history)
-2. Wire up status bar with live stats
-3. Add daemon management subcommands
-4. Test Mistral model support
+### Week 1: Quick Wins for Momentum ⚡
+1. Daemon stop command (1-2h) - EASIEST FIRST
+2. Daemon start command (1-2h)
+3. Error message improvements (1-2h)
+4. Shift-return support (2-4h)
+5. Status bar stats (2-4h)
+**Goal:** Build momentum with easy wins, improve UX
 
-### Short Term (This Month)
-5. Enhance setup wizard for multi-provider
-6. Install Python deps for LoRA training
-7. Create user guide documentation
-8. Update ARCHITECTURE.md
+### Week 2: Critical Issues 🔴
+6. Tool confirmation fix (4-8h) - CRITICAL SECURITY
+7. Control-C termination (3-6h) - HIGH PRIORITY
+8. Config validation (2-4h)
+**Goal:** Fix critical security and UX issues
 
-### Medium Term (Next Quarter)
-9. Redesign plan mode (match Claude Code)
-10. Implement adapter loading in runtime
-11. Add more model adapters (Phi, DeepSeek)
-12. Multi-model switching in REPL
+### Week 3: User Experience Polish
+9. Command history (4-8h)
+10. Model download progress in TUI (2-4h)
+11. /help improvements (2-4h)
+12. Daemon status command (2-4h)
+**Goal:** Professional REPL experience
+
+### Week 4: Reliability & Setup
+13. Crash recovery (4-6h)
+14. Simple feedback system (3-6h)
+15. Python deps helper (3-5h)
+16. Multi-provider wizard (4-6h)
+**Goal:** Robust system, easier setup
+
+### Later (As Needed)
+- Memory monitoring
+- Color customization
+- Additional model adapters
+- Mistral testing
+- Plan mode redesign (big project)
 
 ### Long Term (Future)
-13. Quantization for lower memory usage
-14. Multi-GPU support
-15. Custom domain-specific tools
-16. CoreML export for Neural Engine
+- Adapter loading in runtime
+- Quantization for lower memory usage
+- Multi-GPU support
+- Custom domain-specific tools
+- CoreML export optimization
 
 ---
 
