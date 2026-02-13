@@ -3,10 +3,9 @@
 // Enables the LLM to display interactive dialogs and collect user input during
 // task execution. Supports single-select, multi-select, and custom text input.
 
-use crate::cli::llm_dialogs::{validate_input, AskUserQuestionInput};
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -96,21 +95,13 @@ impl Tool for AskUserQuestionTool {
         }
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
-        // Parse input
-        let ask_input: AskUserQuestionInput = serde_json::from_value(input)
-            .context("Failed to parse AskUserQuestion input")?;
-
-        // Validate input
-        validate_input(&ask_input)
-            .map_err(|e| anyhow::anyhow!("Invalid question format: {}", e))?;
-
-        // Return instruction for the TUI to handle this
-        // The event loop will intercept this and show the actual dialog
-        Ok(format!(
-            "__ASK_USER_QUESTION__\n{}",
-            serde_json::to_string(&ask_input)?
-        ))
+    async fn execute(&self, _input: Value, _context: &ToolContext<'_>) -> Result<String> {
+        // This should never be called - the event loop intercepts AskUserQuestion
+        // before it reaches the tool executor via handle_ask_user_question()
+        anyhow::bail!(
+            "AskUserQuestion should be intercepted by event loop, not executed as a tool. \
+             This is a bug in the event loop implementation."
+        )
     }
 }
 
