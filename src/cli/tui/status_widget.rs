@@ -53,6 +53,10 @@ impl<'a> StatusWidget<'a> {
                 Style::default()
                     .fg(self.colors.ui.cursor.to_color())
             }
+            StatusLineType::CompactionPercent => {
+                // Compaction percentage: subtle gray
+                Style::default().fg(Color::DarkGray)
+            }
             StatusLineType::Custom(_) => {
                 // Custom status lines: readable dark gray
                 Style::default().fg(Color::DarkGray)
@@ -72,9 +76,15 @@ impl<'a> Widget for StatusWidget<'a> {
         // Get all status lines
         let status_lines = self.status_bar.get_lines();
 
-        // Convert to styled lines
+        // Check for compaction percentage line (displayed in title, not in content)
+        let compaction_line = status_lines
+            .iter()
+            .find(|sl| sl.line_type == StatusLineType::CompactionPercent);
+
+        // Convert to styled lines (excluding compaction line)
         let lines: Vec<Line> = status_lines
             .iter()
+            .filter(|sl| sl.line_type != StatusLineType::CompactionPercent)
             .map(|sl| self.status_line_to_line(&sl.line_type, &sl.content))
             .collect();
 
@@ -88,11 +98,18 @@ impl<'a> Widget for StatusWidget<'a> {
             lines
         };
 
-        // Create paragraph with top border and "Status" title
+        // Build title with optional compaction percentage
+        let title = if let Some(compaction) = compaction_line {
+            format!(" Status • {} ", compaction.content)
+        } else {
+            " Status ".to_string()
+        };
+
+        // Create paragraph with top border and title
         let paragraph = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::TOP)
-                .title(" Status ")
+                .title(title)
                 .title_alignment(Alignment::Right)
                 .border_style(Style::default().fg(self.colors.status.border.to_color())),
         );

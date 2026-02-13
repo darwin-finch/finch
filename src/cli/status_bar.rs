@@ -23,6 +23,8 @@ pub enum StatusLineType {
     OperationStatus,
     /// Contextual suggestions (like Claude Code)
     Suggestions,
+    /// Auto-compaction percentage (displayed on right side)
+    CompactionPercent,
     /// Custom status line with ID
     Custom(String),
 }

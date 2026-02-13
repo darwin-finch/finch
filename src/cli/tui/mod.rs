@@ -119,6 +119,8 @@ pub struct TuiRenderer {
     colors: crate::config::ColorScheme,
     /// Suggestion manager for contextual prompts
     suggestions: crate::cli::SuggestionManager,
+    /// Inline ghost text suggestion (shown after cursor)
+    ghost_text: Option<String>,
 }
 
 impl TuiRenderer {
@@ -182,6 +184,73 @@ impl TuiRenderer {
                 Constraint::Percentage((100 - percent_width) / 2),
             ])
             .split(popup_layout[1])[1]
+    }
+
+    /// Update ghost text suggestion based on current input
+    ///
+    /// Generates inline autocomplete suggestions for common commands and patterns.
+    /// Ghost text appears after the cursor and can be accepted with Tab.
+    pub(super) fn update_ghost_text(&mut self) {
+        let current_input = self.input_textarea.lines().join("\n");
+        let trimmed = current_input.trim();
+
+        // Only suggest on single-line inputs
+        if self.input_textarea.lines().len() > 1 {
+            self.ghost_text = None;
+            return;
+        }
+
+        // Don't suggest if input is empty
+        if trimmed.is_empty() {
+            self.ghost_text = None;
+            return;
+        }
+
+        // Command suggestions (prefix matching)
+        let commands = vec![
+            ("/help", "Show available commands"),
+            ("/local", "Check local model status"),
+            ("/clear", "Clear conversation history"),
+            ("/plan", "Toggle plan mode"),
+            ("/approve", "Approve current plan"),
+            ("/reject", "Reject current plan"),
+            ("/show-plan", "Display current plan"),
+            ("/save-plan", "Save last response to plan"),
+            ("/done", "Exit plan mode"),
+            ("/exit", "Exit shammah"),
+            ("/quit", "Exit shammah"),
+        ];
+
+        // Find matching command
+        for (cmd, _desc) in commands {
+            if cmd.starts_with(trimmed) && cmd != trimmed {
+                // Found a match - suggest the rest
+                self.ghost_text = Some(cmd[trimmed.len()..].to_string());
+                return;
+            }
+        }
+
+        // Common query patterns
+        let patterns = vec![
+            ("Can you help", " me with..."),
+            ("How do I", " ..."),
+            ("What is", " ..."),
+            ("Why does", " ..."),
+            ("Fix", " this code"),
+            ("Explain", " this code"),
+            ("Refactor", " this code"),
+            ("Write", " a function that..."),
+        ];
+
+        for (prefix, completion) in patterns {
+            if current_input.starts_with(prefix) && current_input.len() < prefix.len() + 3 {
+                self.ghost_text = Some(completion.to_string());
+                return;
+            }
+        }
+
+        // No suggestion found
+        self.ghost_text = None;
     }
 
     /// Create a new TUI renderer with inline viewport
@@ -285,6 +354,7 @@ impl TuiRenderer {
             last_interaction: None,
             colors,
             suggestions: crate::cli::SuggestionManager::new(),
+            ghost_text: None,
         };
 
         // Initialize first-run suggestions
@@ -625,8 +695,8 @@ impl TuiRenderer {
                     )));
                     frame.render_widget(separator_widget, chunks[0]);
 
-                    // Render input
-                    render_input_widget(frame, &input_textarea, chunks[1], "❯", &self.colors);
+                    // Render input with ghost text
+                    render_input_widget(frame, &input_textarea, chunks[1], "❯", &self.colors, self.ghost_text.as_deref());
 
                     // Render status
                     let status_widget = StatusWidget::new(&status_bar, &self.colors);

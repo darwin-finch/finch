@@ -95,6 +95,10 @@ pub fn spawn_input_task(
                                     tui.pending_feedback = Some(crate::feedback::FeedbackRating::Bad);
                                     Ok(None)
                                 }
+                                (KeyCode::Char('/'), m) if m.contains(KeyModifiers::CONTROL) => {
+                                    // Ctrl+/: Show help (send as command)
+                                    Ok(Some("/help".to_string()))
+                                }
                                 (KeyCode::BackTab, _) => {
                                     // Shift+Tab: Toggle plan mode (send as command)
                                     Ok(Some("/plan".to_string()))
@@ -161,6 +165,21 @@ pub fn spawn_input_task(
                                     }
                                     Ok(None)
                                 }
+                                (KeyCode::Tab, KeyModifiers::NONE) => {
+                                    // Tab: Accept ghost text suggestion if available
+                                    if let Some(ghost) = tui.ghost_text.take() {
+                                        // Append ghost text to current input
+                                        let current = tui.input_textarea.lines().join("\n");
+                                        let completed = format!("{}{}", current, ghost);
+                                        tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&completed);
+                                        first_event_modified_input = true;
+                                    } else {
+                                        // No ghost text - pass Tab to textarea (insert tab char)
+                                        tui.input_textarea.input(Event::Key(key));
+                                        first_event_modified_input = true;
+                                    }
+                                    Ok(None)
+                                }
                                 _ => {
                                     // Pass key event to textarea
                                     tui.input_textarea.input(Event::Key(key));
@@ -201,6 +220,9 @@ pub fn spawn_input_task(
 
                     // Render immediately after input (event-driven, not polled)
                     if had_input {
+                        // Update ghost text suggestion based on new input
+                        tui.update_ghost_text();
+
                         if let Err(e) = tui.render() {
                             eprintln!("Render error: {}", e);
                         }

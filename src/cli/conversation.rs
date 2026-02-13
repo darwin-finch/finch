@@ -14,6 +14,10 @@ pub struct ConversationHistory {
     max_messages: usize,
     #[serde(skip)]
     max_tokens_estimate: usize,
+    #[serde(skip)]
+    compaction_threshold_percent: f32, // Trigger compaction at this % of max tokens (e.g., 0.8 = 80%)
+    #[serde(skip)]
+    auto_compact_enabled: bool, // Whether auto-compaction is enabled
 }
 
 impl ConversationHistory {
@@ -23,6 +27,8 @@ impl ConversationHistory {
             messages: Vec::new(),
             max_messages: 20, // Keep last 20 messages (10 user + 10 assistant turns)
             max_tokens_estimate: 32_000, // ~8K tokens * 4 chars/token
+            compaction_threshold_percent: 0.8, // Compact at 80% of max tokens
+            auto_compact_enabled: true, // Auto-compaction enabled by default
         }
     }
 
@@ -32,6 +38,8 @@ impl ConversationHistory {
             messages: Vec::new(),
             max_messages,
             max_tokens_estimate,
+            compaction_threshold_percent: 0.8,
+            auto_compact_enabled: true,
         }
     }
 
@@ -125,6 +133,49 @@ impl ConversationHistory {
         total_chars / 4 // Rough estimate: 1 token ≈ 4 characters
     }
 
+    /// Get percentage of context window used (0.0 to 1.0)
+    pub fn context_usage_percent(&self) -> f32 {
+        let current_tokens = self.estimated_tokens() as f32;
+        let max_tokens = (self.max_tokens_estimate / 4) as f32; // Convert char estimate to tokens
+        (current_tokens / max_tokens).min(1.0)
+    }
+
+    /// Get percentage remaining until auto-compaction (0.0 to 1.0)
+    ///
+    /// Returns the percentage of context window remaining before compaction triggers.
+    /// Example: If threshold is 80% and current usage is 60%, returns 0.25 (25% remaining)
+    pub fn compaction_percent_remaining(&self) -> f32 {
+        if !self.auto_compact_enabled {
+            return 1.0; // Compaction disabled, always 100% remaining
+        }
+
+        let usage = self.context_usage_percent();
+        let threshold = self.compaction_threshold_percent;
+
+        if usage >= threshold {
+            0.0 // At or past threshold
+        } else {
+            // Calculate remaining percentage relative to threshold
+            // e.g., usage=60%, threshold=80% → remaining = (80-60)/80 = 25%
+            (threshold - usage) / threshold
+        }
+    }
+
+    /// Check if compaction should be triggered
+    pub fn should_compact(&self) -> bool {
+        self.auto_compact_enabled && self.context_usage_percent() >= self.compaction_threshold_percent
+    }
+
+    /// Enable or disable auto-compaction
+    pub fn set_auto_compact(&mut self, enabled: bool) {
+        self.auto_compact_enabled = enabled;
+    }
+
+    /// Set compaction threshold (0.0 to 1.0, e.g., 0.8 = 80%)
+    pub fn set_compaction_threshold(&mut self, threshold: f32) {
+        self.compaction_threshold_percent = threshold.clamp(0.0, 1.0);
+    }
+
     /// Save conversation to JSON file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let json =
@@ -161,6 +212,8 @@ impl ConversationHistory {
         // Restore default config values (these are skipped during serialization)
         history.max_messages = 20;
         history.max_tokens_estimate = 32_000;
+        history.compaction_threshold_percent = 0.8;
+        history.auto_compact_enabled = true;
 
         Ok(history)
     }

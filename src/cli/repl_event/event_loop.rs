@@ -381,6 +381,9 @@ impl EventLoop {
             .await
             .add_user_message(input.clone());
 
+        // Update compaction percentage in status bar
+        self.update_compaction_status().await;
+
         // Set as active query (for cancellation)
         *self.active_query_id.write().await = Some(query_id);
 
@@ -783,6 +786,9 @@ impl EventLoop {
                     .await
                     .add_assistant_message(response.clone());
 
+                // Update compaction percentage in status bar
+                self.update_compaction_status().await;
+
                 // Update query state
                 self.query_states
                     .update_state(query_id, QueryState::Completed { response: response.clone() })
@@ -979,6 +985,21 @@ impl EventLoop {
         self.query_states
             .cleanup_old_queries(Duration::from_secs(30))
             .await;
+    }
+
+    /// Update the compaction percentage in the status bar
+    async fn update_compaction_status(&self) {
+        let conversation = self.conversation.read().await;
+        let percent_remaining = conversation.compaction_percent_remaining();
+
+        // Format percentage (0-100%)
+        let percent_display = (percent_remaining * 100.0) as u8;
+
+        // Update status bar with compaction percentage
+        self.status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::CompactionPercent,
+            format!("{}% until compaction", percent_display),
+        );
     }
 
     /// Handle a tool result
