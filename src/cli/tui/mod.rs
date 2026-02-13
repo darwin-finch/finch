@@ -226,10 +226,10 @@ impl TuiRenderer {
         let scrollback = ScrollbackBuffer::new(viewport_height, term_width as usize);
 
         // Calculate visible scrollback area (above inline viewport)
-        // Inline viewport is dynamic: 1 (separator) + up to 10 (input) + 4 (status) = 15 lines max
-        // Reserve space for maximum possible inline viewport height
-        let max_inline_viewport_height = 15; // 1 + 10 + 4
-        let visible_scrollback_rows = _term_height.saturating_sub(max_inline_viewport_height) as usize;
+        // Inline viewport starts at 6 lines: 1 (separator) + 1 (input) + 4 (status)
+        // Will resize dynamically up to 15 lines as input grows
+        let initial_viewport_size = 6u16;
+        let visible_scrollback_rows = _term_height.saturating_sub(initial_viewport_size) as usize;
 
         // Initialize shadow buffers for diff-based rendering
         let shadow_buffer = ShadowBuffer::new(term_width as usize, visible_scrollback_rows);
@@ -417,18 +417,60 @@ impl TuiRenderer {
         Ok(())
     }
 
-    /// Render the TUI inline viewport (6 lines: separator + input + status)
+    /// Resize viewport if needed based on input lines and dialog presence
+    fn resize_viewport_if_needed(&mut self, input_lines: u16, has_dialog: bool) -> Result<()> {
+        // Calculate needed viewport size
+        let needed_size = if has_dialog {
+            // Dialog mode: need more space (will calculate exact size later)
+            15 // Use max size for dialogs
+        } else {
+            // Normal mode: 1 separator + input lines + 4 status
+            1 + input_lines + 4
+        };
+
+        // Only recreate if size changed
+        if needed_size != self.current_inline_viewport_size {
+            eprintln!("[DEBUG resize] Viewport: {} → {} lines",
+                self.current_inline_viewport_size, needed_size);
+
+            let backend = CrosstermBackend::new(io::stdout());
+            self.terminal = Terminal::with_options(
+                backend,
+                TerminalOptions {
+                    viewport: Viewport::Inline(needed_size),
+                },
+            ).context("Failed to recreate terminal with new viewport size")?;
+
+            self.current_inline_viewport_size = needed_size;
+
+            // Update shadow buffer size to match new viewport
+            let term_size = crossterm::terminal::size()?;
+            let visible_scrollback_rows = term_size.1.saturating_sub(needed_size) as usize;
+            self.shadow_buffer = ShadowBuffer::new(term_size.0 as usize, visible_scrollback_rows);
+            self.prev_frame_buffer = ShadowBuffer::new(term_size.0 as usize, visible_scrollback_rows);
+        }
+
+        Ok(())
+    }
+
+    /// Render the TUI inline viewport (dynamic size: 6-15 lines)
     /// Messages are written to terminal scrollback via insert_before()
     pub fn render(&mut self) -> Result<()> {
         if !self.is_active {
             return Ok(());
         }
 
+        // Calculate input lines for viewport sizing
+        let input_lines = self.input_textarea.lines().len().max(1).min(10) as u16;
+        let has_dialog = self.active_dialog.is_some();
+
+        // Resize viewport if needed BEFORE rendering
+        self.resize_viewport_if_needed(input_lines, has_dialog)?;
+
         // Double buffering: Check if anything changed
         let current_input_text = self.input_textarea.lines().join("\n");
         let current_cursor = self.input_textarea.cursor();
         let current_status_content = self.status_bar.get_status();
-        let has_dialog = self.active_dialog.is_some();
 
         let input_changed = current_input_text != self.prev_input_text;
         let cursor_changed = current_cursor != self.prev_cursor_pos;
@@ -637,14 +679,21 @@ impl TuiRenderer {
 
             let num_lines = wrapped_lines.len().min(u16::MAX as usize) as u16;
 
+            eprintln!("[DEBUG insert_before] Requesting {} lines, have {} wrapped_lines",
+                num_lines, wrapped_lines.len());
+
             // Use insert_before to write to terminal scrollback (pushes content up)
             use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
             execute!(io::stdout(), BeginSynchronizedUpdate)?;
 
             self.terminal.insert_before(num_lines, |buf| {
+                eprintln!("[DEBUG insert_before] buf.area: h={}, got {} lines to write",
+                    buf.area.height, wrapped_lines.len());
                 for (i, line) in wrapped_lines.iter().enumerate() {
                     if i < buf.area.height as usize {
                         buf.set_string(0, i as u16, line, ratatui::style::Style::default());
+                    } else {
+                        eprintln!("[DEBUG insert_before] TRUNCATED line {} (buf too small!)", i);
                     }
                 }
             })?;
