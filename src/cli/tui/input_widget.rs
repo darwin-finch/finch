@@ -12,8 +12,16 @@ use ratatui::{
 };
 use tui_textarea::TextArea;
 
+use crate::config::ColorScheme;
+
 /// Render a TextArea with a colored prompt prefix
-pub fn render_input_widget<'a>(frame: &mut Frame, textarea: &'a TextArea<'a>, area: Rect, prompt: &str) {
+pub fn render_input_widget<'a>(
+    frame: &mut Frame,
+    textarea: &'a TextArea<'a>,
+    area: Rect,
+    prompt: &str,
+    colors: &ColorScheme,
+) {
     // Split area: prompt (3 chars) + textarea (rest)
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -27,7 +35,7 @@ pub fn render_input_widget<'a>(frame: &mut Frame, textarea: &'a TextArea<'a>, ar
     let prompt_text = format!(" {} ", prompt);
     let prompt_widget = Paragraph::new(Span::styled(
         prompt_text,
-        Style::default().fg(Color::Cyan),
+        Style::default().fg(colors.ui.cursor.to_color()),
     ));
     frame.render_widget(prompt_widget, chunks[0]);
 

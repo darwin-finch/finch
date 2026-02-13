@@ -509,7 +509,7 @@ impl TuiRenderer {
                     frame.render_widget(separator_widget, chunks[0]);
 
                     // Render input
-                    render_input_widget(frame, &input_textarea, chunks[1], "❯");
+                    render_input_widget(frame, &input_textarea, chunks[1], "❯", &self.colors);
 
                     // Render status
                     let status_widget = StatusWidget::new(&status_bar, &self.colors);
