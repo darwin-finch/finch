@@ -258,10 +258,18 @@ See `docs/ROADMAP.md` for detailed implementation plans.
       - Shows RAM requirements (8GB-128GB+ depending on model)
     - Effort: 2 hours (actual)
 
-20. **[ ] Mistral model testing**
-    - Test Mistral with LlamaAdapter
-    - Files: `src/models/adapters/llama.rs`, new test
-    - Effort: 2-8 hours (variable)
+20. **[~] Mistral model testing** ⏸️ BLOCKED
+    - Status: MistralAdapter exists and has passing unit tests
+    - Blocker: Only ONNX loader exists, which currently supports Qwen2 only
+    - Mistral ONNX models not yet integrated (waiting for onnx-community/Mistral models)
+    - Adapter ready at: `src/models/adapters/mistral.rs`
+    - Tests passing: format_chat_prompt, clean_output, token_ids
+    - Next steps when unblocked:
+      1. Wait for onnx-community to publish Mistral ONNX models
+      2. Add Mistral support to ONNX loader (similar to Qwen2)
+      3. Test end-to-end generation
+    - Files: `src/models/adapters/mistral.rs` (ready), `src/models/loaders/onnx.rs` (needs Mistral support)
+    - Effort: 2-8 hours (when ONNX models available)
 
 21. **[x] Proxy-only mode** (NEW) 🟡 MEDIUM PRIORITY - ✅ COMPLETE
     - Allow users to use Shammah without local model (like Claude Code)
