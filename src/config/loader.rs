@@ -44,6 +44,7 @@ pub fn load_config() -> Result<Config> {
 
 fn try_load_from_shammah_config() -> Result<Option<Config>> {
     use super::backend::BackendConfig;
+    use super::colors::ColorScheme;
     use super::settings::ClientConfig;
     use super::TeacherEntry;
 
@@ -75,6 +76,8 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
         client: Option<ClientConfig>,
         #[serde(default)]
         teachers: Vec<TeacherEntry>,
+        #[serde(default)]
+        colors: Option<ColorScheme>,
     }
 
     fn default_tui_enabled() -> bool {
@@ -94,6 +97,9 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
     config.backend = toml_config.backend;
     if let Some(client) = toml_config.client {
         config.client = client;
+    }
+    if let Some(colors) = toml_config.colors {
+        config.colors = colors;
     }
 
     // Validate configuration

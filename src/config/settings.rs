@@ -1,6 +1,7 @@
 // Configuration structs
 
 use super::backend::BackendConfig;
+use super::colors::ColorScheme;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,6 +35,9 @@ pub struct Config {
 
     /// Teacher LLM provider configuration (array of teachers in priority order)
     pub teachers: Vec<TeacherEntry>,
+
+    /// TUI color scheme (customizable for accessibility)
+    pub colors: ColorScheme,
 }
 
 /// Server configuration for daemon mode
@@ -268,6 +272,7 @@ impl Config {
             backend: BackendConfig::default(),
             server: ServerConfig::default(),
             client: ClientConfig::default(),
+            colors: ColorScheme::default(),
             teachers,
         }
     }
@@ -295,6 +300,7 @@ impl Config {
             backend: self.backend.clone(),
             client: Some(self.client.clone()),
             teachers: self.teachers.clone(),
+            colors: Some(self.colors.clone()),
         };
 
         let toml_string = toml::to_string_pretty(&toml_config)?;
@@ -314,4 +320,6 @@ struct TomlConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     client: Option<ClientConfig>,
     teachers: Vec<TeacherEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    colors: Option<ColorScheme>,
 }

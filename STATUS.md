@@ -328,11 +328,32 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/models/lora.rs`, `scripts/train_lora.py`, `src/models/loaders/onnx.rs`
     - Effort: 40-80 hours (revised from 8-16)
 
-25. **[ ] Color scheme customization** (NEW)
-    - Let users customize TUI colors via config
-    - Accessibility improvement
-    - Files: `src/cli/tui/`, `src/config/mod.rs`
-    - Effort: 6-10 hours
+25. **[~] Color scheme customization** (NEW) 🚧 PARTIAL
+    - Infrastructure complete, wiring in progress
+    - Completed:
+      - ✅ Created ColorScheme struct with full color configuration
+      - ✅ Defined color categories: Status, Messages, UI, Dialogs
+      - ✅ Support for named colors ("cyan", "green") and RGB ([255, 0, 0])
+      - ✅ Added to Config struct with Default implementation
+      - ✅ TOML serialization/deserialization working
+      - ✅ Config loader handles optional colors section
+      - ✅ All unit tests passing
+    - Remaining work:
+      - ⏳ Pass ColorScheme to TUI components (TuiRenderer, StatusWidget, etc.)
+      - ⏳ Update StatusWidget::get_line_style() to use scheme colors
+      - ⏳ Update dialog_widget to use scheme colors
+      - ⏳ Update input_widget to use scheme colors
+      - ⏳ Update message rendering to use scheme colors
+      - ⏳ Test end-to-end color customization
+    - Files:
+      - ✅ src/config/colors.rs (NEW - complete)
+      - ✅ src/config/mod.rs (updated)
+      - ✅ src/config/settings.rs (updated)
+      - ✅ src/config/loader.rs (updated)
+      - ⏳ src/cli/tui/status_widget.rs (needs update)
+      - ⏳ src/cli/tui/dialog_widget.rs (needs update)
+      - ⏳ src/cli/tui/input_widget.rs (needs update)
+    - Effort: 3 hours done, 3-4 hours remaining
 
 ### Phase 6: Very Complex (20+ hours)
 
