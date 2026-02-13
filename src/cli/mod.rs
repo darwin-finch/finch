@@ -13,6 +13,7 @@ mod repl;
 pub mod repl_event; // Phase 2-3: Event loop infrastructure
 pub mod setup_wizard; // First-run setup wizard (API keys + device selection)
 mod status_bar;
+pub mod suggestions; // Contextual prompt suggestions (like Claude Code)
 pub mod tui; // Phase 2: Terminal UI
 
 pub use commands::handle_command;
@@ -24,3 +25,4 @@ pub use output_manager::OutputManager;
 pub use repl::Repl;
 pub use setup_wizard::show_setup_wizard;
 pub use status_bar::{StatusBar, StatusLine, StatusLineType};
+pub use suggestions::{Suggestion, SuggestionContext, SuggestionManager, SuggestionSource};
