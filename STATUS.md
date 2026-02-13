@@ -90,13 +90,14 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 **Organization:** Items sorted easiest → hardest for efficient progress and quick wins.
 
 **Summary:**
-- 28 total items (14 original + 14 new suggestions)
-- 23/28 complete (82.1%) ✅
+- 29 total items (14 original + 15 new suggestions)
+- 23/29 complete (79.3%) ✅
+- 3 INCOMPLETE (Plan mode toggle, LLM dialogs, Additional adapters)
 - 2 BLOCKED (Mistral support, local model adapters)
 - 1 COMPLEX (LoRA adapter loading - 40-80 hours)
 - 2 UI ENHANCEMENTS (Plan mode - 20-40h, LLM dialogs - 8-16h)
 - Phase 1: Quick wins (4 items, 1-2h each) ⚡
-- Phase 2: Medium difficulty (6 items, 2-4h each)
+- Phase 2: Medium difficulty (7 items, 2-4h each)
 - Phase 3: Moderate complexity (4 items, 3-6h each)
 - Phase 4: Challenging (7 items, 3-8h each)
 - Phase 5: Complex (4 items, 4-20h each)
@@ -399,6 +400,17 @@ See `docs/ROADMAP.md` for detailed implementation plans.
       - "Enter project name: ______"
     - Files: `src/cli/llm_dialogs.rs` (new), `src/cli/tui/mod.rs` (integration)
     - Effort: 8-16 hours
+
+29. **[ ] Plan mode toggle with visual indicator** (NEW)
+    - Add shift-tab keyboard shortcut to toggle plan mode
+    - Display mode indicator in status bar (like Claude Code):
+      - Normal: `⏵⏵ accept edits on (shift+tab to cycle)`
+      - Plan mode: `⏸ plan mode on (shift+tab to cycle)`
+    - `/plan` command should also toggle this mode
+    - Does NOT require full plan mode functionality (Item 26)
+    - Just adds UI toggle and status indicator as foundation
+    - Files: `src/cli/tui/async_input.rs`, `src/cli/tui/mod.rs`, `src/cli/status_bar.rs`
+    - Effort: 2-4 hours
 
 ### Phase 7: Documentation (Ongoing)
 

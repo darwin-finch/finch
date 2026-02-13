@@ -5,6 +5,7 @@ mod commands;
 mod conversation;
 pub mod global_output; // Phase 3.5: Global output system with macros
 mod input;
+pub mod llm_dialogs; // LLM-prompted user dialogs (AskUserQuestion)
 pub mod menu;
 pub mod messages; // Trait-based polymorphic message system
 pub mod output_layer; // Phase 3.5: Tracing integration
@@ -19,6 +20,7 @@ pub mod tui; // Phase 2: Terminal UI
 pub use commands::handle_command;
 pub use conversation::ConversationHistory;
 pub use input::InputHandler;
+pub use llm_dialogs::{AskUserQuestionInput, AskUserQuestionOutput, Question, QuestionOption};
 pub use messages::{Message, MessageId, MessageRef, MessageStatus};
 pub use messages::{ProgressMessage, StaticMessage, StreamingResponseMessage, ToolExecutionMessage, UserQueryMessage};
 pub use output_manager::OutputManager;
