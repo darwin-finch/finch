@@ -637,7 +637,28 @@ impl TuiRenderer {
                             DType::Confirm { .. } => 2, // Yes/No
                             DType::TextInput { .. } => 1, // Single input line
                         };
-                        let dialog_height = num_options as u16 + 4; // +4 for title, help, borders
+
+                        // Calculate wrapped title height (account for long titles like JSON inputs)
+                        let title_width = total_area.width.saturating_sub(4) as usize; // -4 for borders and padding
+                        let title_lines = if title_width > 0 {
+                            let mut line_count = 0;
+                            for line in dialog.title.lines() {
+                                let visible_len = visible_length(line);
+                                line_count += (visible_len + title_width - 1) / title_width; // Ceiling division
+                            }
+                            line_count.max(1) as u16
+                        } else {
+                            1
+                        };
+
+                        // Calculate total dialog height: title + options + help + borders
+                        // +3 for help line, borders, and padding
+                        let base_dialog_height = num_options as u16 + title_lines + 3;
+
+                        // Cap dialog height to 80% of terminal to leave room for context
+                        let max_dialog_height = (total_area.height * 4) / 5; // 80% of terminal
+                        let dialog_height = base_dialog_height.min(max_dialog_height).max(8); // At least 8 lines
+
                         let status_height = 4u16;
                         let separator_height = 1u16;
 

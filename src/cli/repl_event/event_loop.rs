@@ -1046,6 +1046,11 @@ impl EventLoop {
             }
         }
 
+        // Check if tool execution changed the mode (e.g., EnterPlanMode, PresentPlan)
+        // and update status bar accordingly
+        let current_mode = self.mode.read().await.clone();
+        self.update_plan_mode_indicator(&current_mode);
+
         // Store tool result
         self.tool_results
             .write()
