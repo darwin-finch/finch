@@ -162,6 +162,9 @@ impl EventLoop {
         // Initialize compaction status display
         self.update_compaction_status().await;
 
+        // Initialize plan mode indicator (starts in Normal mode)
+        self.update_plan_mode_indicator(&crate::cli::repl::ReplMode::Normal);
+
         // Render interval (100ms) - blit overwrites visible area with shadow buffer
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
 
@@ -998,10 +1001,10 @@ impl EventLoop {
         // Format percentage (0-100%)
         let percent_display = (percent_remaining * 100.0) as u8;
 
-        // Update status bar with compaction percentage
+        // Update status bar with compaction percentage (matches Claude Code format)
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::CompactionPercent,
-            format!("{}% until compaction", percent_display),
+            format!("Context left until auto-compact: {}%", percent_display),
         );
     }
 

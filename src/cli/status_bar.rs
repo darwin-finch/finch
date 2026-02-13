@@ -113,6 +113,13 @@ impl StatusBar {
             });
         }
 
+        if let Some(content) = lines.get(&StatusLineType::CompactionPercent) {
+            result.push(StatusLine {
+                line_type: StatusLineType::CompactionPercent,
+                content: content.clone(),
+            });
+        }
+
         // Add custom lines (sorted by ID for consistency)
         let mut custom_lines: Vec<_> = lines
             .iter()
