@@ -91,8 +91,7 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 
 **Summary:**
 - 28 total items (14 original + 14 new suggestions)
-- 22/28 complete (78.6%) ✅
-- 1 IN PROGRESS (Prompt suggestions - 50% complete)
+- 23/28 complete (82.1%) ✅
 - 2 BLOCKED (Mistral support, local model adapters)
 - 1 COMPLEX (LoRA adapter loading - 40-80 hours)
 - 2 UI ENHANCEMENTS (Plan mode - 20-40h, LLM dialogs - 8-16h)
@@ -375,15 +374,17 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/cli/plan_mode.rs` (major refactor)
     - Effort: 20-40 hours
 
-27. **[~] Prompt suggestions** (NEW) 🚧 IN PROGRESS
-    - ✅ Basic infrastructure complete (hardcoded + LLM support)
-    - ✅ SuggestionManager with context-aware suggestions
-    - ✅ Support for both hardcoded and LLM-generated suggestions
-    - ⏳ TUI integration (display in status bar)
-    - ⏳ LLM integration (periodic suggestion generation)
-    - ⏳ User interaction (click/select suggestions)
-    - Files: `src/cli/suggestions.rs` (✅ done), `src/cli/tui/mod.rs` (pending)
-    - Effort: 6-12 hours (50% complete)
+27. **[x] Prompt suggestions** (NEW) ✅ COMPLETE
+    - ✅ Full infrastructure with hardcoded + LLM support
+    - ✅ SuggestionManager with 7 context-aware states
+    - ✅ TUI integration with status bar display
+    - ✅ Auto-update on context changes (idle, query complete, error, etc.)
+    - ✅ First-run suggestions shown immediately
+    - ✅ Documentation: docs/PROMPT_SUGGESTIONS.md
+    - Future enhancement: LLM integration in REPL event loop
+    - Future enhancement: Clickable suggestions (auto-fill input)
+    - Files: `src/cli/suggestions.rs`, `src/cli/tui/mod.rs`, `docs/PROMPT_SUGGESTIONS.md`
+    - Effort: 6-12 hours (✅ complete)
 
 28. **[ ] LLM-prompted user dialogs** (NEW)
     - Implement Claude Code's AskUserQuestion feature
