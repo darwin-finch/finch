@@ -77,6 +77,8 @@ pub struct TuiRenderer {
     command_history: Vec<String>,
     /// Current position in history (None = not navigating)
     history_index: Option<usize>,
+    /// Saved draft when navigating history (restored when returning to None)
+    history_draft: Option<String>,
     /// Internal scrollback buffer with structured messages
     scrollback: ScrollbackBuffer,
     /// Dynamic viewport height (updated on resize)
@@ -262,6 +264,7 @@ impl TuiRenderer {
             input_textarea: Self::create_clean_textarea(),
             command_history: Self::load_history(), // Load history from disk
             history_index: None,
+            history_draft: None,
             scrollback,
             viewport_height,
             current_inline_viewport_size: 6, // Initial: 1 separator + 1 input + 4 status

@@ -64,6 +64,7 @@ pub fn spawn_input_task(
                                     // Add to command history
                                     tui.command_history.push(input.clone());
                                     tui.history_index = None;
+                                    tui.history_draft = None; // Clear any saved draft
 
                                     // Clear textarea for next input
                                     tui.input_textarea = TuiRenderer::create_clean_textarea();
@@ -111,6 +112,12 @@ pub fn spawn_input_task(
                                                 tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
                                             }
                                         } else if !tui.command_history.is_empty() {
+                                            // Save current input as draft before entering history
+                                            let current_text = tui.input_textarea.lines().join("\n");
+                                            if !current_text.trim().is_empty() {
+                                                tui.history_draft = Some(current_text);
+                                            }
+
                                             tui.history_index = Some(tui.command_history.len() - 1);
                                             let cmd = &tui.command_history[tui.command_history.len() - 1];
                                             tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
@@ -136,9 +143,15 @@ pub fn spawn_input_task(
                                                 let cmd = &tui.command_history[idx + 1];
                                                 tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
                                             } else {
-                                                // At newest entry, down arrow clears input
+                                                // At newest entry - restore draft or clear
                                                 tui.history_index = None;
-                                                tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                                if let Some(draft) = tui.history_draft.take() {
+                                                    // Restore the saved draft
+                                                    tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&draft);
+                                                } else {
+                                                    // No draft - clear input
+                                                    tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                                }
                                             }
                                         }
                                     } else {
