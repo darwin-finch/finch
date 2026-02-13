@@ -34,6 +34,7 @@ enum WizardStep {
     DeviceSelection(usize),
     ModelFamilySelection(usize),
     ModelSizeSelection(usize),
+    ModelPreview, // Show resolved model info before proceeding
     CustomModelRepo(String, BackendDevice), // (repo input, selected device)
     TeacherConfig(Vec<TeacherEntry>, usize), // (teachers list, selected index)
     AddTeacherProviderSelection(Vec<TeacherEntry>, usize), // (existing teachers, selected provider idx)
@@ -152,7 +153,7 @@ fn run_wizard_loop(
 
     loop {
         terminal.draw(|f| {
-            render_wizard_step(f, &step, &devices, &model_families, &model_sizes, &custom_model_repo);
+            render_wizard_step(f, &step, &devices, &model_families, &model_sizes, &custom_model_repo, selected_device_idx, selected_family_idx, selected_size_idx);
         })?;
 
         // Handle input
@@ -296,10 +297,27 @@ fn run_wizard_loop(
                             }
                         }
                         KeyCode::Enter => {
+                            step = WizardStep::ModelPreview;
+                        }
+                        KeyCode::Esc => {
+                            anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::ModelPreview => {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('y') => {
+                            // User confirmed - proceed to custom model repo input
                             step = WizardStep::CustomModelRepo(
                                 custom_model_repo.clone(),
                                 devices[selected_device_idx]
                             );
+                        }
+                        KeyCode::Char('b') | KeyCode::Backspace => {
+                            // Go back to model size selection
+                            step = WizardStep::ModelSizeSelection(selected_size_idx);
                         }
                         KeyCode::Esc => {
                             anyhow::bail!("Setup cancelled");
@@ -503,6 +521,9 @@ fn render_wizard_step(
     model_families: &[ModelFamily],
     model_sizes: &[ModelSize],
     _custom_repo: &str,
+    selected_device_idx: usize,
+    selected_family_idx: usize,
+    selected_size_idx: usize,
 ) {
     let size = f.area();
     let dialog_area = centered_rect(70, 70, size);
@@ -524,6 +545,7 @@ fn render_wizard_step(
         WizardStep::DeviceSelection(selected) => render_device_selection(f, inner, devices, *selected),
         WizardStep::ModelFamilySelection(selected) => render_model_family_selection(f, inner, model_families, *selected),
         WizardStep::ModelSizeSelection(selected) => render_model_size_selection(f, inner, model_sizes, *selected),
+        WizardStep::ModelPreview => render_model_preview(f, inner, devices[selected_device_idx], model_families[selected_family_idx], model_sizes[selected_size_idx]),
         WizardStep::CustomModelRepo(input, device) => render_custom_model_repo(f, inner, input, *device),
         WizardStep::TeacherConfig(teachers, selected) => render_teacher_config(f, inner, teachers, *selected),
         WizardStep::AddTeacherProviderSelection(_, selected) => render_provider_selection(f, inner, *selected),
@@ -875,6 +897,145 @@ fn render_model_size_selection(f: &mut Frame, area: Rect, sizes: &[ModelSize], s
     f.render_stateful_widget(list, chunks[1], &mut list_state);
 
     let help = Paragraph::new("↑/↓: Navigate  Enter: Select  Esc: Cancel")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[2]);
+}
+
+fn render_model_preview(f: &mut Frame, area: Rect, device: BackendDevice, family: ModelFamily, size: ModelSize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(10),    // Model info
+            Constraint::Length(2),  // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Step 7: Model Preview")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    // Resolve model repository and info
+    let size_str = size.to_size_string(family);
+    let (repo, params, download_size, ram_req) = match (family, device) {
+        // ONNX models (currently only Qwen2)
+        (ModelFamily::Qwen2, _) if !matches!(device, BackendDevice::CoreML) => {
+            let repo = format!("onnx-community/Qwen2.5-{}-Instruct", size_str);
+            let (params, dl, ram) = match size {
+                ModelSize::Small => ("1.5B parameters", "~3 GB", "8-16 GB"),
+                ModelSize::Medium => ("3B parameters", "~6 GB", "16-32 GB"),
+                ModelSize::Large => ("7B parameters", "~14 GB", "32-64 GB"),
+                ModelSize::XLarge => ("7B parameters", "~14 GB", "32-64 GB"), // Max for ONNX
+            };
+            (repo, params, dl, ram)
+        }
+
+        // CoreML models
+        (ModelFamily::Qwen2, BackendDevice::CoreML) => {
+            let repo = match size {
+                ModelSize::Small => "anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4".to_string(),
+                _ => format!("anemll/Qwen2.5-{}-Instruct", size_str),
+            };
+            let (params, dl, ram) = match size {
+                ModelSize::Small => ("0.6B parameters", "~1.5 GB", "8 GB"),
+                ModelSize::Medium => ("3B parameters", "~6 GB", "16 GB"),
+                ModelSize::Large => ("7B parameters", "~14 GB", "32 GB"),
+                ModelSize::XLarge => ("14B parameters", "~28 GB", "64 GB"),
+            };
+            (repo, params, dl, ram)
+        }
+
+        (ModelFamily::Llama3, BackendDevice::CoreML) => {
+            let repo = match size {
+                ModelSize::Small => "smpanaro/Llama-3.2-1B-Instruct-CoreML",
+                ModelSize::Medium => "andmev/Llama-3.2-3B-Instruct-CoreML",
+                ModelSize::Large => "andmev/Llama-3.1-8B-Instruct-CoreML",
+                _ => "andmev/Llama-3.1-8B-Instruct-CoreML", // Max for CoreML
+            }.to_string();
+            let (params, dl, ram) = match size {
+                ModelSize::Small => ("1B parameters", "~2 GB", "8 GB"),
+                ModelSize::Medium => ("3B parameters", "~6 GB", "16 GB"),
+                _ => ("8B parameters", "~16 GB", "32 GB"),
+            };
+            (repo, params, dl, ram)
+        }
+
+        (ModelFamily::Gemma2, BackendDevice::CoreML) => {
+            ("anemll/anemll-google-gemma-3-270m-it-M1-ctx512-monolithic_0.3.5".to_string(), "270M parameters", "~1 GB", "8 GB")
+        }
+
+        (ModelFamily::Mistral, BackendDevice::CoreML) => {
+            ("apple/mistral-coreml".to_string(), "7B parameters", "~14 GB", "32 GB")
+        }
+
+        // Standard models (Metal, CUDA, CPU)
+        (ModelFamily::Qwen2, _) => {
+            let repo = format!("Qwen/Qwen2.5-{}-Instruct", size_str);
+            let (params, dl, ram) = match size {
+                ModelSize::Small => ("1.5B parameters", "~3 GB", "8-16 GB"),
+                ModelSize::Medium => ("3B parameters", "~6 GB", "16-32 GB"),
+                ModelSize::Large => ("7B parameters", "~14 GB", "32-64 GB"),
+                ModelSize::XLarge => ("14B parameters", "~28 GB", "64+ GB"),
+            };
+            (repo, params, dl, ram)
+        }
+
+        (ModelFamily::Gemma2, _) => {
+            let repo = format!("google/gemma-2-{}-it", size_str);
+            let (params, dl, ram) = match size {
+                ModelSize::Small => ("2B parameters", "~4 GB", "8-16 GB"),
+                ModelSize::Medium => ("9B parameters", "~18 GB", "32-64 GB"),
+                _ => ("27B parameters", "~54 GB", "64+ GB"),
+            };
+            (repo, params, dl, ram)
+        }
+
+        (ModelFamily::Llama3, _) => {
+            let repo = format!("meta-llama/Llama-3.2-{}-Instruct", size_str);
+            let (params, dl, ram) = match size {
+                ModelSize::Small => ("3B parameters", "~6 GB", "16 GB"),
+                ModelSize::Medium => ("8B parameters", "~16 GB", "32 GB"),
+                _ => ("70B parameters", "~140 GB", "128+ GB"),
+            };
+            (repo, params, dl, ram)
+        }
+
+        (ModelFamily::Mistral, _) => {
+            let repo = if matches!(size, ModelSize::Large | ModelSize::XLarge) {
+                "mistralai/Mistral-22B-Instruct-v0.3".to_string()
+            } else {
+                "mistralai/Mistral-7B-Instruct-v0.3".to_string()
+            };
+            let (params, dl, ram) = if matches!(size, ModelSize::Large | ModelSize::XLarge) {
+                ("22B parameters", "~44 GB", "64+ GB")
+            } else {
+                ("7B parameters", "~14 GB", "32 GB")
+            };
+            (repo, params, dl, ram)
+        }
+    };
+
+    let info_text = format!(
+        "The following model will be downloaded:\n\n\
+         📦 Repository: {}\n\
+         🧠 Size: {}\n\
+         💾 Download: {}\n\
+         🔧 Device: {}\n\
+         💻 RAM Required: {}\n\n\
+         This model will be cached in ~/.cache/huggingface/hub/\n\
+         for offline use. First download may take 5-30 minutes.\n\n\
+         Press Enter to continue, 'b' to go back, Esc to cancel.",
+        repo, params, download_size, device.name(), ram_req
+    );
+
+    let info = Paragraph::new(info_text)
+        .style(Style::default().fg(Color::Reset))
+        .wrap(Wrap { trim: false });
+    f.render_widget(info, chunks[1]);
+
+    let help = Paragraph::new("Enter: Continue  b: Back  Esc: Cancel")
         .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);

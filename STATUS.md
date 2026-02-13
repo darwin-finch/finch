@@ -244,10 +244,19 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/cli/tui/mod.rs`, `src/cli/tui/async_input.rs`, `src/cli/repl_event/event_loop.rs`
     - Effort: 5 hours (actual)
 
-19. **[ ] Multi-model setup wizard**
-    - Let users choose models in wizard
-    - Files: `src/cli/setup.rs`
-    - Effort: 4-6 hours
+19. **[x] Multi-model setup wizard** - ✅ COMPLETE
+    - Added Model Preview step showing resolved model details
+    - Displays: repository name, parameters, download size, device, RAM requirement
+    - Shows exact model that will be downloaded (e.g., "onnx-community/Qwen2.5-3B-Instruct")
+    - Helps users understand what they're downloading before committing
+    - Keyboard shortcuts: Enter (continue), b (back), Esc (cancel)
+    - Files: `src/cli/setup_wizard.rs`
+    - Implementation:
+      - Added ModelPreview wizard step after ModelSizeSelection
+      - Resolves repository based on family + size + device
+      - Shows download estimates (3GB-140GB depending on model)
+      - Shows RAM requirements (8GB-128GB+ depending on model)
+    - Effort: 2 hours (actual)
 
 20. **[ ] Mistral model testing**
     - Test Mistral with LlamaAdapter
