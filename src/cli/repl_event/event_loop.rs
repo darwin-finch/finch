@@ -91,6 +91,9 @@ pub struct EventLoop {
 
     /// REPL mode (Normal, Planning, Executing)
     mode: Arc<RwLock<ReplMode>>,
+
+    /// Plan content storage (for PresentPlan tool)
+    plan_content: Arc<RwLock<Option<String>>>,
 }
 
 impl EventLoop {
@@ -121,6 +124,9 @@ impl EventLoop {
         // Spawn input handler task
         let input_rx = spawn_input_task(Arc::clone(&tui_renderer));
 
+        // Initialize plan content storage
+        let plan_content = Arc::new(RwLock::new(None));
+
         // Create tool coordinator
         let tool_coordinator = ToolExecutionCoordinator::new(
             event_tx.clone(),
@@ -128,6 +134,8 @@ impl EventLoop {
             Arc::clone(&conversation),
             Arc::clone(&local_generator),
             Arc::clone(&tokenizer),
+            Arc::clone(&mode),
+            Arc::clone(&plan_content),
         );
 
         Self {
@@ -152,6 +160,7 @@ impl EventLoop {
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             daemon_client,
             mode,
+            plan_content,
         }
     }
 

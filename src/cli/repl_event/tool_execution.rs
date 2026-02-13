@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
 use crate::cli::conversation::ConversationHistory;
+use crate::cli::ReplMode;
 use super::events::ConfirmationResult;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
@@ -32,6 +33,12 @@ pub struct ToolExecutionCoordinator {
 
     /// Tokenizer (for training tools)
     tokenizer: Arc<TextTokenizer>,
+
+    /// REPL mode (for plan mode state)
+    repl_mode: Arc<RwLock<ReplMode>>,
+
+    /// Plan content storage
+    plan_content: Arc<RwLock<Option<String>>>,
 }
 
 impl ToolExecutionCoordinator {
@@ -42,6 +49,8 @@ impl ToolExecutionCoordinator {
         conversation: Arc<RwLock<ConversationHistory>>,
         local_generator: Arc<RwLock<LocalGenerator>>,
         tokenizer: Arc<TextTokenizer>,
+        repl_mode: Arc<RwLock<ReplMode>>,
+        plan_content: Arc<RwLock<Option<String>>>,
     ) -> Self {
         Self {
             event_tx,
@@ -49,6 +58,8 @@ impl ToolExecutionCoordinator {
             conversation,
             local_generator,
             tokenizer,
+            repl_mode,
+            plan_content,
         }
     }
 
@@ -65,6 +76,8 @@ impl ToolExecutionCoordinator {
         let conversation = Arc::clone(&self.conversation);
         let local_generator = Arc::clone(&self.local_generator);
         let tokenizer = Arc::clone(&self.tokenizer);
+        let repl_mode = Arc::clone(&self.repl_mode);
+        let plan_content = Arc::clone(&self.plan_content);
 
         tokio::spawn(async move {
             // Generate tool signature for approval checking
@@ -189,6 +202,8 @@ impl ToolExecutionCoordinator {
                         None, // router (for training)
                         Some(Arc::clone(&local_generator)),
                         Some(Arc::clone(&tokenizer)),
+                        Some(Arc::clone(&repl_mode)),
+                        Some(Arc::clone(&plan_content)),
                     )
             )
             .await;

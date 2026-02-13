@@ -336,6 +336,8 @@ impl QwenGenerator {
                     None, // batch_trainer
                     Some(Arc::clone(&self.local_generator)), // local_generator (for query_local tool)
                     Some(Arc::clone(&self.tokenizer)),  // tokenizer
+                    None, // repl_mode
+                    None, // plan_content
                 )
                 .await
                 .unwrap_or_else(|e| {

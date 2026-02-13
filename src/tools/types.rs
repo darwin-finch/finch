@@ -6,10 +6,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cli::ReplMode;
 use crate::cli::ConversationHistory;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::training::batch_trainer::BatchTrainer;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -29,6 +31,12 @@ pub struct ToolContext<'a> {
 
     /// Optional tokenizer for encoding/decoding text
     pub tokenizer: Option<Arc<TextTokenizer>>,
+
+    /// Optional REPL mode for plan mode state
+    pub repl_mode: Option<Arc<RwLock<ReplMode>>>,
+
+    /// Optional plan content storage
+    pub plan_content: Option<Arc<RwLock<Option<String>>>>,
 }
 
 /// Tool definition (Claude API-compatible)

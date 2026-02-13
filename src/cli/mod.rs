@@ -24,7 +24,7 @@ pub use llm_dialogs::{AskUserQuestionInput, AskUserQuestionOutput, Question, Que
 pub use messages::{Message, MessageId, MessageRef, MessageStatus};
 pub use messages::{ProgressMessage, StaticMessage, StreamingResponseMessage, ToolExecutionMessage, UserQueryMessage};
 pub use output_manager::OutputManager;
-pub use repl::Repl;
+pub use repl::{Repl, ReplMode};
 pub use setup_wizard::show_setup_wizard;
 pub use status_bar::{StatusBar, StatusLine, StatusLineType};
 pub use suggestions::{Suggestion, SuggestionContext, SuggestionManager, SuggestionSource};

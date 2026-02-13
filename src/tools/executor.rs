@@ -267,6 +267,8 @@ impl ToolExecutor {
         >,
         local_generator: Option<Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>>,
         tokenizer: Option<Arc<crate::models::tokenizer::TextTokenizer>>,
+        repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
+        plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
     ) -> Result<ToolResult>
     where
         F: Fn() -> Result<()> + Send + Sync,
@@ -311,6 +313,8 @@ impl ToolExecutor {
             batch_trainer,
             local_generator,
             tokenizer,
+            repl_mode,
+            plan_content,
         };
 
         match tool.execute(tool_use.input.clone(), &context).await {
@@ -348,6 +352,8 @@ impl ToolExecutor {
         >,
         local_generator: Option<Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>>,
         tokenizer: Option<Arc<crate::models::tokenizer::TextTokenizer>>,
+        repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
+        plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
     ) -> Result<Vec<ToolResult>>
     where
         F: Fn() -> Result<()> + Send + Sync + Clone,
@@ -365,6 +371,8 @@ impl ToolExecutor {
                     batch_trainer.clone(),
                     local_generator.clone(),
                     tokenizer.clone(),
+                    repl_mode.clone(),
+                    plan_content.clone(),
                 )
                 .await?;
             results.push(result);

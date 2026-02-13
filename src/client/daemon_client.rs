@@ -269,7 +269,7 @@ impl DaemonClient {
                         let tool_use = ToolUse { id: id.clone(), name, input };
 
                         let result = tool_executor
-                            .execute_tool::<fn() -> Result<()>>(&tool_use, None, None, None, None, None)
+                            .execute_tool::<fn() -> Result<()>>(&tool_use, None, None, None, None, None, None, None)
                             .await?;
 
                         tool_result_blocks.push(ContentBlock::ToolResult {

@@ -966,6 +966,8 @@ impl Repl {
                         None, // TODO: Add training via BootstrapLoader's generator
                         Some(Arc::clone(&self.local_generator)),
                         Some(Arc::clone(&self.tokenizer)),
+                        None, // repl_mode (not available in raw mode)
+                        None, // plan_content
                     )
                     .await?;
 
