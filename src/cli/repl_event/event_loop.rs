@@ -159,6 +159,9 @@ impl EventLoop {
     pub async fn run(&mut self) -> Result<()> {
         tracing::debug!("Event loop starting");
 
+        // Initialize compaction status display
+        self.update_compaction_status().await;
+
         // Render interval (100ms) - blit overwrites visible area with shadow buffer
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
 

@@ -363,12 +363,11 @@ impl<'a> Widget for DialogWidget<'a> {
             } => self.render_confirm(prompt, *default, *selected, &self.dialog.help_message),
         };
 
-        // Create paragraph with border
+        // Create paragraph with top border for header
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .borders(Borders::TOP)
                     .title(format!(" {} ", self.dialog.title))
                     .title_alignment(Alignment::Center)
                     .style(Style::default().fg(self.colors.dialog.border.to_color())),

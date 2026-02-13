@@ -617,17 +617,16 @@ impl TuiRenderer {
                         let separator_height = 1u16;
 
                         // Remaining space for scrollback
+                        // Don't render separator when dialog is active (dialog has its own border)
                         let scrollback_height = total_area.height
                             .saturating_sub(dialog_height)
-                            .saturating_sub(status_height)
-                            .saturating_sub(separator_height);
+                            .saturating_sub(status_height);
 
-                        // Layout: scrollback (top) + separator + dialog (bottom) + status
+                        // Layout: scrollback (top) + dialog (bottom) + status (no separator)
                         let chunks = Layout::default()
                             .direction(Direction::Vertical)
                             .constraints([
                                 Constraint::Length(scrollback_height), // Scrollback context
-                                Constraint::Length(separator_height),   // Separator
                                 Constraint::Length(dialog_height),      // Dialog
                                 Constraint::Length(status_height),      // Status
                             ])
@@ -649,22 +648,13 @@ impl TuiRenderer {
                         let scrollback_widget = Paragraph::new(context_lines);
                         frame.render_widget(scrollback_widget, chunks[0]);
 
-                        // Render separator
-                        let separator_char = '─';
-                        let separator_line = separator_char.to_string().repeat(chunks[1].width as usize);
-                        let separator_widget = Paragraph::new(Line::from(Span::styled(
-                            separator_line,
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                        frame.render_widget(separator_widget, chunks[1]);
-
                         // Render dialog
                         let dialog_widget = DialogWidget::new(dialog, &self.colors);
-                        frame.render_widget(dialog_widget, chunks[2]);
+                        frame.render_widget(dialog_widget, chunks[1]);
 
                         // Render status
                         let status_widget = StatusWidget::new(&status_bar, &self.colors);
-                        frame.render_widget(status_widget, chunks[3]);
+                        frame.render_widget(status_widget, chunks[2]);
                     }
                 } else {
                     // Normal mode: Render inline viewport (separator + input + status)
@@ -780,23 +770,20 @@ impl TuiRenderer {
             eprintln!("[DEBUG insert_before] Requesting {} lines, have {} wrapped_lines",
                 num_lines, wrapped_lines.len());
 
-            // Use insert_before to write to terminal scrollback (pushes content up)
+            // Write to terminal scrollback using raw terminal output (preserves ANSI codes)
             use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-            execute!(io::stdout(), BeginSynchronizedUpdate)?;
+            use crossterm::style::Print;
 
-            self.terminal.insert_before(num_lines, |buf| {
-                eprintln!("[DEBUG insert_before] buf.area: h={}, got {} lines to write",
-                    buf.area.height, wrapped_lines.len());
-                for (i, line) in wrapped_lines.iter().enumerate() {
-                    if i < buf.area.height as usize {
-                        buf.set_string(0, i as u16, line, ratatui::style::Style::default());
-                    } else {
-                        eprintln!("[DEBUG insert_before] TRUNCATED line {} (buf too small!)", i);
-                    }
-                }
-            })?;
+            let mut stdout = io::stdout();
+            execute!(stdout, BeginSynchronizedUpdate)?;
 
-            execute!(io::stdout(), EndSynchronizedUpdate)?;
+            // Write each line with ANSI codes preserved
+            for line in &wrapped_lines {
+                execute!(stdout, Print(line), Print("\n"))?;
+            }
+
+            execute!(stdout, EndSynchronizedUpdate)?;
+            stdout.flush()?;
 
             // Mark TUI for render (separator might need to move)
             self.needs_tui_render = true;

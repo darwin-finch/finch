@@ -49,6 +49,10 @@ pub fn spawn_input_task(
                                     tui.active_dialog = None;
                                     tui.pending_dialog_result = Some(result);
                                 }
+
+                                // Mark for render so dialog updates are shown
+                                first_event_modified_input = true;
+
                                 Ok(None) // Don't submit input while dialog is active
                             } else if key.code == KeyCode::Enter {
                             // Check if Shift is held (Shift+Enter inserts newline, Enter submits)
