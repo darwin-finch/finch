@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{self, Event},
+    event::{self, Event, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
@@ -81,6 +81,8 @@ pub struct TuiRenderer {
     scrollback: ScrollbackBuffer,
     /// Dynamic viewport height (updated on resize)
     viewport_height: usize,
+    /// Current inline viewport size (1 + input_lines + 4)
+    current_inline_viewport_size: u16,
     /// Shadow buffer for rendering (2D character array)
     shadow_buffer: ShadowBuffer,
     /// Previous frame buffer (for diff-based updates)
@@ -190,17 +192,24 @@ impl TuiRenderer {
         enable_raw_mode().context("Failed to enable raw mode")?;
         let mut stdout = io::stdout();
 
+        // Enable keyboard enhancement flags for better modifier key support (Shift+Enter, etc.)
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        ).context("Failed to enable keyboard enhancements")?;
+
         // Ensure cursor is visible
         execute!(stdout, cursor::Show).context("Failed to show cursor")?;
 
         let backend = CrosstermBackend::new(stdout);
 
-        // Use Inline viewport - 6 lines at bottom (separator + input + status)
+        // Use Inline viewport - DYNAMIC size based on input (starts at 6 lines minimum)
         // Messages will be written above this using insert_before()
+        // Size: 1 separator + input (1-10 lines) + 4 status = 6-15 lines
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(6),
+                viewport: Viewport::Inline(6), // Start with minimum size
             },
         ).context("Failed to create terminal with inline viewport")?;
 
@@ -255,6 +264,7 @@ impl TuiRenderer {
             history_index: None,
             scrollback,
             viewport_height,
+            current_inline_viewport_size: 6, // Initial: 1 separator + 1 input + 4 status
             shadow_buffer,
             prev_frame_buffer,
             needs_full_refresh: false,
@@ -521,16 +531,11 @@ impl TuiRenderer {
                     // Calculate dynamic input height based on textarea lines (min 1, max 10)
                     let input_lines = input_textarea.lines().len().max(1).min(10) as u16;
 
-                    // Calculate viewport height and position at bottom of screen
-                    let viewport_height = 1 + input_lines + 4; // separator + input + status
-                    let total_height = frame.area().height;
-                    let top_space = total_height.saturating_sub(viewport_height);
-
-                    // Layout: top space (for scrollback) + viewport at bottom
+                    // Layout: separator + input + status (NO SPACER)
+                    // The viewport size itself should match this dynamically
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
-                            Constraint::Length(top_space),   // Top space (scrollback area)
                             Constraint::Length(1),           // Separator line
                             Constraint::Length(input_lines), // Input area (dynamic)
                             Constraint::Length(4),           // Status area
@@ -543,19 +548,19 @@ impl TuiRenderer {
                     use ratatui::style::{Color, Style};
 
                     let separator_char = '─'; // Unicode box-drawing (U+2500)
-                    let separator_line = separator_char.to_string().repeat(chunks[1].width as usize);
+                    let separator_line = separator_char.to_string().repeat(chunks[0].width as usize);
                     let separator_widget = Paragraph::new(Line::from(Span::styled(
                         separator_line,
                         Style::default().fg(Color::DarkGray),
                     )));
-                    frame.render_widget(separator_widget, chunks[1]);
+                    frame.render_widget(separator_widget, chunks[0]);
 
                     // Render input
-                    render_input_widget(frame, &input_textarea, chunks[2], "❯", &self.colors);
+                    render_input_widget(frame, &input_textarea, chunks[1], "❯", &self.colors);
 
                     // Render status
                     let status_widget = StatusWidget::new(&status_bar, &self.colors);
-                    frame.render_widget(status_widget, chunks[3]);
+                    frame.render_widget(status_widget, chunks[2]);
                 }
             })
             .context("Failed to draw frame")?;
@@ -921,6 +926,10 @@ impl TuiRenderer {
                 eprintln!("Warning: Failed to save command history: {}", e);
             }
 
+            // Disable keyboard enhancement flags
+            execute!(stdout, PopKeyboardEnhancementFlags)
+                .context("Failed to disable keyboard enhancements")?;
+
             // Disable raw mode
             disable_raw_mode().context("Failed to disable raw mode")?;
 
@@ -1244,6 +1253,9 @@ impl Drop for TuiRenderer {
             // Show cursor
             let _ = execute!(stdout, cursor::Show);
             let _ = stdout.flush();
+
+            // Disable keyboard enhancements
+            let _ = execute!(stdout, PopKeyboardEnhancementFlags);
 
             // Disable raw mode
             let _ = disable_raw_mode();

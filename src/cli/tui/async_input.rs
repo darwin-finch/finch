@@ -51,21 +51,14 @@ pub fn spawn_input_task(
                                 }
                                 Ok(None) // Don't submit input while dialog is active
                             } else if key.code == KeyCode::Enter {
-                            // Debug: Log key event to see if SHIFT is detected
-                            tracing::debug!("[async_input] Enter key - modifiers: {:?}, has SHIFT: {}",
-                                key.modifiers,
-                                key.modifiers.contains(KeyModifiers::SHIFT));
-
                             // Check if Shift is held (Shift+Enter inserts newline, Enter submits)
                             if key.modifiers.contains(KeyModifiers::SHIFT) {
                                 // Shift+Enter: Insert newline (pass to textarea)
-                                tracing::debug!("[async_input] Shift+Enter detected, inserting newline");
                                 tui.input_textarea.input(Event::Key(key));
                                 first_event_modified_input = true; // Mark for render
                                 Ok(None)
                             } else {
                                 // Enter without Shift: Submit input
-                                tracing::debug!("[async_input] Plain Enter detected, submitting input");
                                 let input = tui.input_textarea.lines().join("\n");
                                 if !input.trim().is_empty() {
                                     // Add to command history
