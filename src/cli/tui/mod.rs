@@ -734,52 +734,19 @@ impl TuiRenderer {
             self.needs_full_refresh = true;
         }
 
-        // Write new messages to terminal scrollback using insert_before()
-        // This pushes content up above the inline viewport (permanent, scrollable)
+        // Write new messages to terminal scrollback using raw terminal output
+        // This preserves ANSI color codes and lets the terminal handle wrapping
         if !new_messages.is_empty() {
-            let (term_width, _) = crossterm::terminal::size()?;
-
-            // Format messages with proper wrapping using shadow buffer
-            let mut wrapped_lines = Vec::new();
-            for msg in &new_messages {
-                let formatted = msg.format(&self.colors);
-                for line in formatted.lines() {
-                    // Use shadow buffer's wrapping logic
-                    let visible_len = visible_length(line);
-                    if visible_len <= term_width as usize {
-                        wrapped_lines.push(line.to_string());
-                    } else {
-                        // Wrap long lines
-                        let chars_per_row = term_width as usize;
-                        let (visible_chars, _) = extract_visible_chars(line);
-                        let num_rows = (visible_chars.len() + chars_per_row - 1) / chars_per_row.max(1);
-
-                        for row_idx in 0..num_rows {
-                            let start = row_idx * chars_per_row;
-                            let end = (start + chars_per_row).min(visible_chars.len());
-                            let chunk: String = visible_chars[start..end].iter().collect();
-                            wrapped_lines.push(chunk);
-                        }
-                    }
-                }
-                wrapped_lines.push(String::new()); // Blank line between messages
-            }
-
-            let num_lines = wrapped_lines.len().min(u16::MAX as usize) as u16;
-
-            eprintln!("[DEBUG insert_before] Requesting {} lines, have {} wrapped_lines",
-                num_lines, wrapped_lines.len());
-
-            // Write to terminal scrollback using raw terminal output (preserves ANSI codes)
             use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
             use crossterm::style::Print;
 
             let mut stdout = io::stdout();
             execute!(stdout, BeginSynchronizedUpdate)?;
 
-            // Write each line with ANSI codes preserved
-            for line in &wrapped_lines {
-                execute!(stdout, Print(line), Print("\n"))?;
+            // Write each message with ANSI codes preserved
+            for msg in &new_messages {
+                let formatted = msg.format(&self.colors);
+                execute!(stdout, Print(formatted), Print("\n"))?;
             }
 
             execute!(stdout, EndSynchronizedUpdate)?;
