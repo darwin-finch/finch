@@ -18,7 +18,8 @@ impl Tool for EnterPlanModeTool {
         "Enter read-only planning mode to explore the codebase before making changes. \
          Use this when you need to research and develop an implementation plan. \
          In plan mode, only read-only tools (Read, Glob, Grep, WebFetch) and \
-         AskUserQuestion are available. When ready, use PresentPlan to show your plan."
+         AskUserQuestion are available. Use AskUserQuestion to clarify requirements \
+         with the user. When ready, use PresentPlan to show your plan."
     }
 
     fn input_schema(&self) -> ToolInputSchema {

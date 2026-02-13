@@ -28,8 +28,8 @@ use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
-    BashTool, EnterPlanModeTool, GlobTool, GrepTool, PresentPlanTool, ReadTool, RestartTool,
-    SaveAndExecTool, WebFetchTool,
+    AskUserQuestionTool, BashTool, EnterPlanModeTool, GlobTool, GrepTool, PresentPlanTool,
+    ReadTool, RestartTool, SaveAndExecTool, WebFetchTool,
 };
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::{ToolDefinition, ToolUse};
@@ -191,6 +191,9 @@ impl Repl {
         tool_registry.register(Box::new(EnterPlanModeTool));
         tool_registry.register(Box::new(PresentPlanTool));
 
+        // User interaction tools
+        tool_registry.register(Box::new(AskUserQuestionTool));
+
         // Create permission manager (allow all for now)
         let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
 
@@ -217,6 +220,8 @@ impl Repl {
                 // Plan mode tools
                 fallback_registry.register(Box::new(EnterPlanModeTool));
                 fallback_registry.register(Box::new(PresentPlanTool));
+                // User interaction tools
+                fallback_registry.register(Box::new(AskUserQuestionTool));
                 ToolExecutor::new(
                     fallback_registry,
                     PermissionManager::new().with_default_rule(PermissionRule::Allow),
@@ -870,11 +875,12 @@ impl Repl {
                     if tool_name == "EnterPlanMode" || tool_name == "enter_plan_mode" {
                         true
                     } else {
-                        // Auto-approve read-only tools when in plan mode
+                        // Auto-approve read-only tools and user interaction tools when in plan mode
                         let is_plan_mode = matches!(self.mode, ReplMode::Planning { .. });
                         let is_readonly_tool = matches!(
                             tool_name,
-                            "read" | "Read" | "glob" | "Glob" | "grep" | "Grep" | "web_fetch" | "WebFetch"
+                            "read" | "Read" | "glob" | "Glob" | "grep" | "Grep" | "web_fetch" | "WebFetch" |
+                            "AskUserQuestion" | "ask_user_question"
                         );
 
                         is_plan_mode && is_readonly_tool

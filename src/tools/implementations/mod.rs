@@ -21,7 +21,11 @@ pub mod save_and_exec;
 pub mod enter_plan_mode;
 pub mod present_plan;
 
+// User interaction tools
+pub mod ask_user_question;
+
 // Re-exports for convenience
+pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
 pub use enter_plan_mode::EnterPlanModeTool;
 pub use glob::GlobTool;

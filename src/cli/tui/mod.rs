@@ -785,14 +785,17 @@ impl TuiRenderer {
         if !new_messages.is_empty() {
             // Format and strip ANSI codes for scrollback
             let mut lines = Vec::new();
-            for msg in &new_messages {
+            for (idx, msg) in new_messages.iter().enumerate() {
                 let formatted = msg.format(&self.colors);
                 // Strip ANSI codes for plain text display
                 let plain_text = strip_ansi_codes(&formatted);
                 for line in plain_text.lines() {
                     lines.push(line.to_string());
                 }
-                lines.push(String::new()); // Blank line between messages
+                // Add blank line between messages (not after the last one)
+                if idx < new_messages.len() - 1 {
+                    lines.push(String::new());
+                }
             }
 
             let num_lines = lines.len().min(u16::MAX as usize) as u16;
