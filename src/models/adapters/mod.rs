@@ -10,11 +10,13 @@ pub mod qwen;
 pub mod llama;
 pub mod mistral;
 pub mod phi;
+pub mod deepseek;
 
 pub use qwen::QwenAdapter;
 pub use llama::LlamaAdapter;
 pub use mistral::MistralAdapter;
 pub use phi::PhiAdapter;
+pub use deepseek::DeepSeekAdapter;
 
 use std::fmt;
 
@@ -90,6 +92,8 @@ impl AdapterRegistry {
             Box::new(MistralAdapter)
         } else if name_lower.contains("phi") {
             Box::new(PhiAdapter)
+        } else if name_lower.contains("deepseek") {
+            Box::new(DeepSeekAdapter)
         } else if name_lower.contains("gemma") {
             // Gemma uses similar format to Llama
             Box::new(LlamaAdapter)
@@ -111,6 +115,7 @@ impl AdapterRegistry {
             ModelFamily::Mistral => Box::new(MistralAdapter),
             ModelFamily::Gemma => Box::new(LlamaAdapter),
             ModelFamily::Phi => Box::new(PhiAdapter),
+            ModelFamily::DeepSeek => Box::new(DeepSeekAdapter),
         }
     }
 }
@@ -123,6 +128,7 @@ pub enum ModelFamily {
     Mistral,
     Gemma,
     Phi,
+    DeepSeek,
 }
 
 impl ModelFamily {
@@ -137,6 +143,8 @@ impl ModelFamily {
             Some(ModelFamily::Mistral)
         } else if name_lower.contains("phi") {
             Some(ModelFamily::Phi)
+        } else if name_lower.contains("deepseek") {
+            Some(ModelFamily::DeepSeek)
         } else if name_lower.contains("gemma") {
             Some(ModelFamily::Gemma)
         } else {
@@ -162,6 +170,9 @@ mod tests {
 
         let phi = AdapterRegistry::get_adapter("Phi-3-mini-4k-instruct");
         assert_eq!(phi.family_name(), "Phi");
+
+        let deepseek = AdapterRegistry::get_adapter("deepseek-coder-6.7b-instruct");
+        assert_eq!(deepseek.family_name(), "DeepSeek");
     }
 
     #[test]
@@ -170,6 +181,7 @@ mod tests {
         assert_eq!(ModelFamily::from_name("Llama-3-8B"), Some(ModelFamily::Llama));
         assert_eq!(ModelFamily::from_name("Mistral-7B"), Some(ModelFamily::Mistral));
         assert_eq!(ModelFamily::from_name("Phi-3-mini"), Some(ModelFamily::Phi));
+        assert_eq!(ModelFamily::from_name("deepseek-coder-7b"), Some(ModelFamily::DeepSeek));
         assert_eq!(ModelFamily::from_name("unknown-model"), None);
     }
 }
