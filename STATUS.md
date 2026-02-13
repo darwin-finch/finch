@@ -91,14 +91,13 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 
 **Summary:**
 - 29 total items (14 original + 15 new suggestions)
-- 24/29 complete (82.8%) ✅
-- 2 INCOMPLETE (Plan mode toggle, Additional adapters)
-- 2 BLOCKED (Mistral support, local model adapters)
-- 1 COMPLEX (LoRA adapter loading - 40-80 hours)
-- 1 UI ENHANCEMENT (Plan mode redesign - 20-40h)
-- Phase 1: Quick wins (4 items, 1-2h each) ⚡
-- Phase 2: Medium difficulty (7 items, 2-4h each)
-- Phase 3: Moderate complexity (4 items, 3-6h each)
+- 25/29 complete (86.2%) ✅
+- 1 INCOMPLETE (Additional adapters - 4-8h per model)
+- 2 BLOCKED (Mistral support, LoRA adapter loading)
+- 1 COMPLEX (Plan mode redesign - 20-40 hours)
+- Phase 1: Quick wins (4 items, 1-2h each) ⚡ - ALL COMPLETE
+- Phase 2: Medium difficulty (7 items, 2-4h each) - ALL COMPLETE
+- Phase 3: Moderate complexity (4 items, 3-6h each) - ALL COMPLETE
 - Phase 4: Challenging (7 items, 3-8h each)
 - Phase 5: Complex (4 items, 4-20h each)
 - Phase 6: Very complex (1 item, 20-40h)
@@ -403,16 +402,18 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/cli/llm_dialogs.rs`, `src/cli/tui/mod.rs`, `src/cli/repl_event/event_loop.rs`, `src/cli/repl.rs`
     - Effort: 10 hours (actual)
 
-29. **[ ] Plan mode toggle with visual indicator** (NEW)
-    - Add shift-tab keyboard shortcut to toggle plan mode
-    - Display mode indicator in status bar (like Claude Code):
+29. **[x] Plan mode toggle with visual indicator** (NEW) ✅ COMPLETE
+    - ✅ Shift+Tab keyboard shortcut to toggle plan mode
+    - ✅ Status bar indicator shows current mode:
       - Normal: `⏵⏵ accept edits on (shift+tab to cycle)`
       - Plan mode: `⏸ plan mode on (shift+tab to cycle)`
-    - `/plan` command should also toggle this mode
-    - Does NOT require full plan mode functionality (Item 26)
-    - Just adds UI toggle and status indicator as foundation
-    - Files: `src/cli/tui/async_input.rs`, `src/cli/tui/mod.rs`, `src/cli/status_bar.rs`
-    - Effort: 2-4 hours
+    - ✅ `/plan` command (without arguments) toggles mode
+    - ✅ Visual feedback when toggling
+    - ✅ Updated help text with shortcuts
+    - ✅ Provides foundation for full plan mode (Item 26)
+    - Does NOT implement plan mode functionality (just UI toggle)
+    - Files: `src/cli/tui/mod.rs`, `src/cli/tui/async_input.rs`, `src/cli/commands.rs`, `src/cli/repl_event/event_loop.rs`
+    - Effort: 2 hours (actual)
 
 ### Phase 7: Documentation (Ongoing)
 
