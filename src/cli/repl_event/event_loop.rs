@@ -574,6 +574,14 @@ impl EventLoop {
                         tracing::debug!("[EVENT_LOOP] Stream receive loop ended, {} blocks received", blocks.len());
                         tracing::debug!("Stream receive loop ended");
 
+                        // Send stats update with basic info (streaming doesn't provide token counts)
+                        let _ = event_tx.send(ReplEvent::StatsUpdate {
+                            model: "streaming".to_string(),  // TODO: Get actual model name from generator
+                            input_tokens: None,  // Not available in streaming
+                            output_tokens: Some(text.split_whitespace().count() as u32),  // Rough estimate
+                            latency_ms: None,  // TODO: Track timing
+                        });
+
                         tracing::debug!("[EVENT_LOOP] Sending StreamingComplete event");
                         // Send streaming complete
                         let _ = event_tx.send(ReplEvent::StreamingComplete {

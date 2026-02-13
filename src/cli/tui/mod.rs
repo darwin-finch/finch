@@ -858,6 +858,9 @@ impl TuiRenderer {
                         // Dialog returned a result, exit loop
                         break dialog_result;
                     }
+
+                    // Force render because dialog state changes (selected_index) aren't detected by double-buffering
+                    self.needs_tui_render = true;
                 }
             }
         };
