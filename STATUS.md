@@ -305,10 +305,20 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 ### Phase 5: Complex (8-20 hours each)
 
-23. **[ ] Additional model adapters** (Phi, DeepSeek, etc.)
-    - Create adapters for other model families
-    - Files: `src/models/adapters/`
-    - Effort: 4-8 hours per model
+23. **[~] Additional model adapters** (Phi, DeepSeek, etc.) 🔄 IN PROGRESS
+    - ✅ Phi adapter complete (Phi-2, Phi-3, Phi-3.5)
+      - ChatML-style format with Phi-specific tokens
+      - Smart output cleaning (Q&A patterns, role markers)
+      - 6/6 tests passing
+      - Files: `src/models/adapters/phi.rs` (185 lines)
+    - ✅ DeepSeek adapter complete (DeepSeek-Coder, DeepSeek-V2, DeepSeek-V3)
+      - Instruction/response format with code block handling
+      - Tuned for code generation (temp=0.8, max_tokens=2048)
+      - 6/6 tests passing
+      - Files: `src/models/adapters/deepseek.rs` (192 lines)
+    - 📊 Progress: 6 model families now supported (Qwen, Llama, Mistral, Gemma, Phi, DeepSeek)
+    - 🎯 Remaining: CodeLlama, Yi, StarCoder, or other families (optional)
+    - Effort: 3 hours actual (2 models × 1.5h each)
 
 24. **[ ] Adapter loading in runtime** 🚧 COMPLEX
     - Goal: Load trained LoRA adapters during ONNX inference
