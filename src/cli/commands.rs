@@ -27,11 +27,6 @@ pub enum Command {
     // Plan mode commands
     PlanModeToggle,  // Toggle plan mode on/off (Shift+Tab or /plan without args)
     Plan(String),
-    Approve,
-    Reject,
-    ShowPlan,
-    SavePlan,
-    Done,
     // Feedback commands for weighted LoRA training
     FeedbackCritical(Option<String>), // High-weight (10x) - critical strategy errors
     FeedbackMedium(Option<String>),   // Medium-weight (3x) - improvements
@@ -53,11 +48,6 @@ impl Command {
             "/debug" => return Some(Command::Debug),
             "/training" => return Some(Command::Training),
             "/clear" | "/reset" => return Some(Command::Clear),
-            "/approve" | "/execute" => return Some(Command::Approve),
-            "/reject" | "/cancel" => return Some(Command::Reject),
-            "/show-plan" => return Some(Command::ShowPlan),
-            "/save-plan" => return Some(Command::SavePlan),
-            "/done" | "/complete" => return Some(Command::Done),
             // Feedback commands (simple form)
             "/critical" => return Some(Command::FeedbackCritical(None)),
             "/medium" => return Some(Command::FeedbackMedium(None)),
@@ -201,12 +191,9 @@ pub fn handle_command(
         }
         // Plan mode commands are handled directly in REPL
         Command::PlanModeToggle
-        | Command::Plan(_)
-        | Command::Approve
-        | Command::Reject
-        | Command::ShowPlan
-        | Command::SavePlan
-        | Command::Done => Ok(CommandOutput::Status("Plan mode commands should be handled in REPL.".to_string())),
+        | Command::Plan(_) => {
+            Ok(CommandOutput::Status("Plan mode commands should be handled in REPL.".to_string()))
+        }
         // Feedback commands are handled directly in REPL
         Command::FeedbackCritical(_) | Command::FeedbackMedium(_) | Command::FeedbackGood(_) => {
             Ok(CommandOutput::Status("Feedback commands should be handled in REPL.".to_string()))
