@@ -91,11 +91,11 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 
 **Summary:**
 - 29 total items (14 original + 15 new suggestions)
-- 23/29 complete (79.3%) ✅
-- 3 INCOMPLETE (Plan mode toggle, LLM dialogs, Additional adapters)
+- 24/29 complete (82.8%) ✅
+- 2 INCOMPLETE (Plan mode toggle, Additional adapters)
 - 2 BLOCKED (Mistral support, local model adapters)
 - 1 COMPLEX (LoRA adapter loading - 40-80 hours)
-- 2 UI ENHANCEMENTS (Plan mode - 20-40h, LLM dialogs - 8-16h)
+- 1 UI ENHANCEMENT (Plan mode redesign - 20-40h)
 - Phase 1: Quick wins (4 items, 1-2h each) ⚡
 - Phase 2: Medium difficulty (7 items, 2-4h each)
 - Phase 3: Moderate complexity (4 items, 3-6h each)
@@ -387,19 +387,21 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/cli/suggestions.rs`, `src/cli/tui/mod.rs`, `docs/PROMPT_SUGGESTIONS.md`
     - Effort: 6-12 hours (✅ complete)
 
-28. **[ ] LLM-prompted user dialogs** (NEW)
-    - Implement Claude Code's AskUserQuestion feature
-    - Allow LLM to prompt user with interactive dialogs
-    - Support checkboxes, multi-select, and text input
-    - LLM specifies: question, options, help text
-    - Display using existing DialogWidget infrastructure
-    - Research: How does Claude Code's prompt API work?
-    - Example use cases:
-      - "Which library? [React/Vue/Angular]"
-      - "Select features: [Auth, DB, API, Tests]"
-      - "Enter project name: ______"
-    - Files: `src/cli/llm_dialogs.rs` (new), `src/cli/tui/mod.rs` (integration)
-    - Effort: 8-16 hours
+28. **[x] LLM-prompted user dialogs** (NEW) ✅ COMPLETE
+    - ✅ Full implementation of Claude Code's AskUserQuestion feature
+    - ✅ Core data structures (Question, QuestionOption, Input/Output)
+    - ✅ Validation logic (question/option counts, header length)
+    - ✅ TUI integration (show_llm_question method)
+    - ✅ Event loop integration (intercepts before tool execution)
+    - ✅ Tool definition added to available tools
+    - ✅ Sequential dialog display with answer collection
+    - ✅ Proper error handling and cancellation support
+    - ✅ Comprehensive documentation (docs/LLM_DIALOGS.md)
+    - ✅ Supports single-select and multi-select dialogs (1-4 questions, 2-4 options each)
+    - LLM can now prompt user with structured questions during execution
+    - Example: "Which library?" with options [Redux, Zustand, Jotai]
+    - Files: `src/cli/llm_dialogs.rs`, `src/cli/tui/mod.rs`, `src/cli/repl_event/event_loop.rs`, `src/cli/repl.rs`
+    - Effort: 10 hours (actual)
 
 29. **[ ] Plan mode toggle with visual indicator** (NEW)
     - Add shift-tab keyboard shortcut to toggle plan mode
