@@ -1143,8 +1143,46 @@ impl EventLoop {
 
         // Create approval dialog
         let tool_name = &tool_use.name;
-        let tool_input = serde_json::to_string_pretty(&tool_use.input)
-            .unwrap_or_else(|_| format!("{:?}", tool_use.input));
+
+        // Create a concise summary of key parameters (not full JSON dump)
+        let summary = match tool_name.as_str() {
+            "bash" | "Bash" => {
+                if let Some(cmd) = tool_use.input.get("command").and_then(|v| v.as_str()) {
+                    format!("Command: {}", if cmd.len() > 60 { format!("{}...", &cmd[..60]) } else { cmd.to_string() })
+                } else {
+                    "Execute shell command".to_string()
+                }
+            }
+            "read" | "Read" => {
+                if let Some(path) = tool_use.input.get("file_path").and_then(|v| v.as_str()) {
+                    format!("File: {}", path)
+                } else {
+                    "Read file".to_string()
+                }
+            }
+            "grep" | "Grep" => {
+                if let Some(pattern) = tool_use.input.get("pattern").and_then(|v| v.as_str()) {
+                    format!("Pattern: {}", if pattern.len() > 40 { format!("{}...", &pattern[..40]) } else { pattern.to_string() })
+                } else {
+                    "Search files".to_string()
+                }
+            }
+            "glob" | "Glob" => {
+                if let Some(pattern) = tool_use.input.get("pattern").and_then(|v| v.as_str()) {
+                    format!("Pattern: {}", pattern)
+                } else {
+                    "Find files".to_string()
+                }
+            }
+            "EnterPlanMode" => {
+                if let Some(reason) = tool_use.input.get("reason").and_then(|v| v.as_str()) {
+                    format!("Reason: {}", if reason.len() > 50 { format!("{}...", &reason[..50]) } else { reason.to_string() })
+                } else {
+                    "Enter planning mode".to_string()
+                }
+            }
+            _ => format!("Execute {} tool", tool_name)
+        };
 
         let options = vec![
             DialogOption::with_description("Allow Once", "Execute this tool once without saving approval"),
@@ -1156,7 +1194,7 @@ impl EventLoop {
         ];
 
         let dialog = Dialog::select(
-            format!("Tool '{}' requires approval\n\nInput:\n{}", tool_name, tool_input),
+            format!("Tool '{}' requires approval\n{}", tool_name, summary),
             options,
         );
 

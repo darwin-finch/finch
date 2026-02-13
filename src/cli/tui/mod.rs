@@ -655,8 +655,8 @@ impl TuiRenderer {
                         // +3 for help line, borders, and padding
                         let base_dialog_height = num_options as u16 + title_lines + 3;
 
-                        // Cap dialog height to 80% of terminal to leave room for context
-                        let max_dialog_height = (total_area.height * 4) / 5; // 80% of terminal
+                        // Allow dialog to use most of the terminal (leave just 6 lines for status/input)
+                        let max_dialog_height = total_area.height.saturating_sub(10); // Leave 10 lines for context
                         let dialog_height = base_dialog_height.min(max_dialog_height).max(8); // At least 8 lines
 
                         let status_height = 4u16;
