@@ -306,11 +306,13 @@ impl EventLoop {
                                 drop(mode);
                                 // Enter planning with default task
                                 self.handle_plan_command("Interactive planning session".to_string()).await?;
+                                // Status bar updated in handle_plan_command
                             }
                             ReplMode::Planning { .. } => {
                                 drop(mode);
                                 // Exit planning
                                 self.handle_reject_command().await?;
+                                // Status bar updated in handle_reject_command
                             }
                             ReplMode::Executing { .. } => {
                                 drop(mode);
@@ -1179,6 +1181,22 @@ impl EventLoop {
 
     // ========== Plan Mode Handlers ==========
 
+    /// Update status bar with current plan mode indicator
+    fn update_plan_mode_indicator(&self, mode: &ReplMode) {
+        use crate::cli::status_bar::StatusLineType;
+
+        let indicator = match mode {
+            ReplMode::Normal => "⏵⏵ accept edits on (shift+tab to cycle)",
+            ReplMode::Planning { .. } => "⏸ plan mode on (shift+tab to cycle)",
+            ReplMode::Executing { .. } => "▶ executing plan (shift+tab disabled)",
+        };
+
+        self.status_bar.update_line(
+            StatusLineType::Custom("plan_mode".to_string()),
+            indicator,
+        );
+    }
+
     /// Check if a tool is allowed in the current mode
     fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool {
         match mode {
@@ -1229,11 +1247,15 @@ impl EventLoop {
         let plan_path = plans_dir.join(format!("plan_{}.md", timestamp));
 
         // Transition to planning mode
-        *self.mode.write().await = ReplMode::Planning {
+        let new_mode = ReplMode::Planning {
             task: task.clone(),
             plan_path: plan_path.clone(),
             created_at: Utc::now(),
         };
+        *self.mode.write().await = new_mode.clone();
+
+        // Update status bar
+        self.update_plan_mode_indicator(&new_mode);
 
         self.output_manager.write_info(format!("{}", "✓ Entered planning mode".blue().bold()));
         self.output_manager.write_info(format!("📋 Task: {}", task));
@@ -1321,11 +1343,15 @@ impl EventLoop {
         let clear_context = matches!(dialog_result, crate::cli::tui::DialogResult::Selected(0));
 
         // Transition to executing mode
-        *self.mode.write().await = ReplMode::Executing {
+        let new_mode = ReplMode::Executing {
             task: task_clone,
             plan_path: plan_path_clone.clone(),
             approved_at: Utc::now(),
         };
+        *self.mode.write().await = new_mode.clone();
+
+        // Update status bar
+        self.update_plan_mode_indicator(&new_mode);
 
         if clear_context {
             // Clear conversation and add plan as context
@@ -1385,6 +1411,10 @@ impl EventLoop {
                 drop(mode);
                 self.output_manager.write_info(format!("{}", "✗ Plan rejected. Returning to normal mode.".yellow()));
                 *self.mode.write().await = ReplMode::Normal;
+
+                // Update status bar
+                self.update_plan_mode_indicator(&ReplMode::Normal);
+
                 self.conversation.write().await.add_user_message("[System: Plan rejected by user.]".to_string());
                 self.render_tui().await?;
             }
@@ -1476,6 +1506,10 @@ impl EventLoop {
                 drop(mode);
                 self.output_manager.write_info("✓ Plan execution complete. Returning to normal mode.");
                 *self.mode.write().await = ReplMode::Normal;
+
+                // Update status bar
+                self.update_plan_mode_indicator(&ReplMode::Normal);
+
                 self.render_tui().await?;
             }
             ReplMode::Planning { .. } => {
