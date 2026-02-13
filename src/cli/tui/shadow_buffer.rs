@@ -120,14 +120,14 @@ impl ShadowBuffer {
 
     /// Render messages to shadow buffer with proper wrapping
     /// Returns bottom-aligned content (last N rows that fit)
-    pub fn render_messages(&mut self, messages: &[MessageRef]) {
+    pub fn render_messages(&mut self, messages: &[MessageRef], colors: &crate::config::ColorScheme) {
         // Clear buffer first
         self.clear();
 
         // Format all messages and collect lines
         let mut all_lines: Vec<String> = Vec::new();
         for msg in messages {
-            let formatted = msg.format();
+            let formatted = msg.format(colors);
             for line in formatted.lines() {
                 all_lines.push(line.to_string());
             }

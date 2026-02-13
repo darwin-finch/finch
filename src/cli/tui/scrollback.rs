@@ -135,7 +135,7 @@ impl ScrollbackBuffer {
         // Calculate total height of all messages
         let message_heights: Vec<usize> = self.messages
             .iter()
-            .map(|m| calculate_display_height(&m.format(), self.terminal_width))
+            .map(|m| calculate_display_height(&m.format(&crate::config::ColorScheme::default()), self.terminal_width))
             .collect();
 
         let total_height: usize = message_heights.iter().sum();
@@ -172,7 +172,7 @@ impl ScrollbackBuffer {
     pub fn scroll_up(&mut self, lines: usize) {
         let total_height: usize = self.messages
             .iter()
-            .map(|m| calculate_display_height(&m.format(), self.terminal_width))
+            .map(|m| calculate_display_height(&m.format(&crate::config::ColorScheme::default()), self.terminal_width))
             .sum();
 
         let max_scroll = total_height.saturating_sub(self.viewport_height);
@@ -204,7 +204,7 @@ impl ScrollbackBuffer {
     pub fn scroll_to_top(&mut self) {
         let total_height: usize = self.messages
             .iter()
-            .map(|m| calculate_display_height(&m.format(), self.terminal_width))
+            .map(|m| calculate_display_height(&m.format(&crate::config::ColorScheme::default()), self.terminal_width))
             .sum();
 
         self.scroll_offset = total_height.saturating_sub(self.viewport_height);
@@ -226,7 +226,7 @@ impl ScrollbackBuffer {
     pub fn scroll_percentage(&self) -> u8 {
         let total_height: usize = self.messages
             .iter()
-            .map(|m| calculate_display_height(&m.format(), self.terminal_width))
+            .map(|m| calculate_display_height(&m.format(&crate::config::ColorScheme::default()), self.terminal_width))
             .sum();
 
         if total_height <= self.viewport_height {
@@ -292,7 +292,7 @@ impl ScrollbackBuffer {
         // Collect message data first to avoid borrow checker issues
         let message_data: Vec<(MessageId, usize)> = self.messages
             .iter()
-            .map(|msg| (msg.id(), calculate_display_height(&msg.format(), self.terminal_width)))
+            .map(|msg| (msg.id(), calculate_display_height(&msg.format(&crate::config::ColorScheme::default()), self.terminal_width)))
             .collect();
 
         for (message_id, height) in message_data {

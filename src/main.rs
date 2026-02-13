@@ -154,8 +154,9 @@ async fn main() -> Result<()> {
     // This prevents lazy initialization with stdout enabled
     use shammah::cli::{OutputManager, StatusBar};
     use shammah::cli::global_output::{set_global_output, set_global_status};
+    use shammah::config::ColorScheme;
 
-    let output_manager = Arc::new(OutputManager::new());
+    let output_manager = Arc::new(OutputManager::new(ColorScheme::default()));
     let status_bar = Arc::new(StatusBar::new());
 
     // Disable stdout immediately for TUI mode (will re-enable for --raw/--no-tui later)

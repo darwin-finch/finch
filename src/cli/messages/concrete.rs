@@ -4,17 +4,44 @@
 // No need for downcasting - handlers receive concrete types directly.
 
 use super::{Message, MessageId, MessageStatus};
+use crate::config::{ColorScheme, ColorSpec};
 use std::sync::{Arc, RwLock};
 
-/// ANSI color codes for formatting
-mod colors {
-    pub const CYAN: &str = "\x1b[36m";
-    pub const RED: &str = "\x1b[31m";
-    pub const GREEN: &str = "\x1b[32m";
-    pub const YELLOW: &str = "\x1b[33m";
-    pub const BLUE: &str = "\x1b[34m";
-    pub const RESET: &str = "\x1b[0m";
+/// Helper to convert ColorSpec to ANSI escape code
+fn color_to_ansi(color: &ColorSpec) -> String {
+    use ratatui::style::Color;
+
+    match color {
+        ColorSpec::Named(name) => {
+            // Map named colors to ANSI codes
+            match name.to_lowercase().as_str() {
+                "black" => "\x1b[30m",
+                "red" => "\x1b[31m",
+                "green" => "\x1b[32m",
+                "yellow" => "\x1b[33m",
+                "blue" => "\x1b[34m",
+                "magenta" => "\x1b[35m",
+                "cyan" => "\x1b[36m",
+                "white" => "\x1b[37m",
+                "gray" | "grey" => "\x1b[90m",
+                "darkgray" | "darkgrey" => "\x1b[90m",
+                "lightred" => "\x1b[91m",
+                "lightgreen" => "\x1b[92m",
+                "lightyellow" => "\x1b[93m",
+                "lightblue" => "\x1b[94m",
+                "lightmagenta" => "\x1b[95m",
+                "lightcyan" => "\x1b[96m",
+                _ => "\x1b[37m", // Default to white
+            }.to_string()
+        }
+        ColorSpec::Rgb(r, g, b) => {
+            // True color ANSI escape code
+            format!("\x1b[38;2;{};{};{}m", r, g, b)
+        }
+    }
 }
+
+const RESET: &str = "\x1b[0m";
 
 // ============================================================================
 // UserQueryMessage - Immutable message for user input
@@ -40,8 +67,13 @@ impl Message for UserQueryMessage {
         self.id
     }
 
-    fn format(&self) -> String {
-        format!("{} ❯ {}{}", colors::CYAN, self.content, colors::RESET)
+    fn format(&self, colors: &ColorScheme) -> String {
+        format!(
+            "{} ❯ {}{}",
+            color_to_ansi(&colors.messages.user),
+            self.content,
+            RESET
+        )
     }
 
     fn status(&self) -> MessageStatus {
@@ -102,7 +134,7 @@ impl Message for StreamingResponseMessage {
         self.id
     }
 
-    fn format(&self) -> String {
+    fn format(&self, colors: &ColorScheme) -> String {
         let content = self.content.read().unwrap();
         let status = *self.status.read().unwrap();
         let thinking = *self.thinking.read().unwrap();
@@ -120,7 +152,12 @@ impl Message for StreamingResponseMessage {
                 }
             }
             MessageStatus::Failed => {
-                format!("{}❌ Response failed{}\n{}", colors::RED, colors::RESET, content)
+                format!(
+                    "{}❌ Response failed{}\n{}",
+                    color_to_ansi(&colors.messages.error),
+                    RESET,
+                    content
+                )
             }
             MessageStatus::Complete => content.clone(),
         }
@@ -196,12 +233,17 @@ impl Message for ToolExecutionMessage {
         self.id
     }
 
-    fn format(&self) -> String {
+    fn format(&self, colors: &ColorScheme) -> String {
         let stdout = self.stdout.read().unwrap();
         let stderr = self.stderr.read().unwrap();
         let exit_code = *self.exit_code.read().unwrap();
 
-        let mut result = format!("{}[{}]{}", colors::BLUE, self.tool_name, colors::RESET);
+        let mut result = format!(
+            "{}[{}]{}",
+            color_to_ansi(&colors.messages.tool),
+            self.tool_name,
+            RESET
+        );
 
         if !stdout.is_empty() {
             result.push('\n');
@@ -210,15 +252,30 @@ impl Message for ToolExecutionMessage {
 
         if !stderr.is_empty() {
             result.push('\n');
-            result.push_str(&format!("{}stderr: {}{}", colors::RED, stderr, colors::RESET));
+            result.push_str(&format!(
+                "{}stderr: {}{}",
+                color_to_ansi(&colors.messages.error),
+                stderr,
+                RESET
+            ));
         }
 
         if let Some(code) = exit_code {
             result.push('\n');
             if code == 0 {
-                result.push_str(&format!("{}✓ exit code: {}{}", colors::GREEN, code, colors::RESET));
+                result.push_str(&format!(
+                    "{}✓ exit code: {}{}",
+                    color_to_ansi(&colors.messages.system),
+                    code,
+                    RESET
+                ));
             } else {
-                result.push_str(&format!("{}✗ exit code: {}{}", colors::RED, code, colors::RESET));
+                result.push_str(&format!(
+                    "{}✗ exit code: {}{}",
+                    color_to_ansi(&colors.messages.error),
+                    code,
+                    RESET
+                ));
             }
         }
 
@@ -286,7 +343,7 @@ impl Message for ProgressMessage {
         self.id
     }
 
-    fn format(&self) -> String {
+    fn format(&self, colors: &ColorScheme) -> String {
         let current = *self.current.read().unwrap();
         let status = *self.status.read().unwrap();
 
@@ -303,13 +360,33 @@ impl Message for ProgressMessage {
 
         match status {
             MessageStatus::Complete => {
-                format!("{}{} {} 100% ✓{}", colors::GREEN, self.label, bar, colors::RESET)
+                format!(
+                    "{}{} {} 100% ✓{}",
+                    color_to_ansi(&colors.status.download),
+                    self.label,
+                    bar,
+                    RESET
+                )
             }
             MessageStatus::Failed => {
-                format!("{}{} {} {}% ✗{}", colors::RED, self.label, bar, percentage, colors::RESET)
+                format!(
+                    "{}{} {} {}% ✗{}",
+                    color_to_ansi(&colors.messages.error),
+                    self.label,
+                    bar,
+                    percentage,
+                    RESET
+                )
             }
             MessageStatus::InProgress => {
-                format!("{}{} {} {}%{}", colors::YELLOW, self.label, bar, percentage, colors::RESET)
+                format!(
+                    "{}{} {} {}%{}",
+                    color_to_ansi(&colors.status.operation),
+                    self.label,
+                    bar,
+                    percentage,
+                    RESET
+                )
             }
         }
     }
@@ -391,19 +468,39 @@ impl Message for StaticMessage {
         self.id
     }
 
-    fn format(&self) -> String {
+    fn format(&self, colors: &ColorScheme) -> String {
         match self.message_type {
             StaticMessageType::Info => {
-                format!("{}ℹ️  {}{}", colors::GREEN, self.content, colors::RESET)
+                format!(
+                    "{}ℹ️  {}{}",
+                    color_to_ansi(&colors.messages.system),
+                    self.content,
+                    RESET
+                )
             }
             StaticMessageType::Error => {
-                format!("{}❌ {}{}", colors::RED, self.content, colors::RESET)
+                format!(
+                    "{}❌ {}{}",
+                    color_to_ansi(&colors.messages.error),
+                    self.content,
+                    RESET
+                )
             }
             StaticMessageType::Success => {
-                format!("{}✓ {}{}", colors::GREEN, self.content, colors::RESET)
+                format!(
+                    "{}✓ {}{}",
+                    color_to_ansi(&colors.messages.system),
+                    self.content,
+                    RESET
+                )
             }
             StaticMessageType::Warning => {
-                format!("{}⚠️  {}{}", colors::YELLOW, self.content, colors::RESET)
+                format!(
+                    "{}⚠️  {}{}",
+                    color_to_ansi(&colors.status.operation),
+                    self.content,
+                    RESET
+                )
             }
             StaticMessageType::Plain => {
                 // No prefix - content already formatted

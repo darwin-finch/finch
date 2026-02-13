@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::{OutputManager, StatusBar};
 use super::tui::TuiRenderer;
+use crate::config::ColorScheme;
 
 /// Global singleton OutputManager (swappable - set by main())
 /// Starts with a minimal default, replaced with the real instance in main()
 pub static GLOBAL_OUTPUT: Lazy<RwLock<Arc<OutputManager>>> =
-    Lazy::new(|| RwLock::new(Arc::new(OutputManager::new())));
+    Lazy::new(|| RwLock::new(Arc::new(OutputManager::new(ColorScheme::default()))));
 
 /// Global singleton StatusBar (swappable - set by main())
 /// Starts with a minimal default, replaced with the real instance in main()

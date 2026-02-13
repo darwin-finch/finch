@@ -37,16 +37,19 @@ pub struct OutputManager {
     pending_flush: Arc<RwLock<Vec<String>>>,
     /// Trait-based message storage (reactive updates)
     messages: Arc<RwLock<Vec<MessageRef>>>,
+    /// Color scheme for message formatting
+    colors: crate::config::ColorScheme,
 }
 
 impl OutputManager {
     /// Create a new OutputManager
-    pub fn new() -> Self {
+    pub fn new(colors: crate::config::ColorScheme) -> Self {
         Self {
             write_to_stdout: Arc::new(RwLock::new(true)), // Enabled by default, but main.rs disables immediately for TUI
             buffering_mode: Arc::new(RwLock::new(false)), // Default: immediate write
             pending_flush: Arc::new(RwLock::new(Vec::new())),
             messages: Arc::new(RwLock::new(Vec::new())),
+            colors,
         }
     }
 
@@ -108,7 +111,7 @@ impl OutputManager {
 
     /// Write a trait-based message to terminal
     fn write_trait_to_terminal(&self, message: &MessageRef) {
-        let formatted = message.format();
+        let formatted = message.format(&self.colors);
 
         let buffering = *self.buffering_mode.read().unwrap();
         let write_stdout = *self.write_to_stdout.read().unwrap();
@@ -210,7 +213,7 @@ impl OutputManager {
 
 impl Default for OutputManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(crate::config::ColorScheme::default())
     }
 }
 
@@ -221,6 +224,7 @@ impl Clone for OutputManager {
             buffering_mode: Arc::clone(&self.buffering_mode),
             pending_flush: Arc::clone(&self.pending_flush),
             messages: Arc::clone(&self.messages),
+            colors: self.colors.clone(),
         }
     }
 }
@@ -231,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_basic_operations() {
-        let manager = OutputManager::new();
+        let manager = OutputManager::new(crate::config::ColorScheme::default());
 
         manager.write_user("Hello");
         manager.write_response("Hi there!");
@@ -248,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_streaming_append() {
-        let manager = OutputManager::new();
+        let manager = OutputManager::new(crate::config::ColorScheme::default());
 
         manager.write_response("Hello");
         manager.append_response(" world");
@@ -261,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_circular_buffer() {
-        let manager = OutputManager::new();
+        let manager = OutputManager::new(crate::config::ColorScheme::default());
 
         // Add more than MAX_BUFFER_SIZE messages
         for i in 0..1100 {
@@ -278,7 +282,7 @@ mod tests {
 
     #[test]
     fn test_get_last_messages() {
-        let manager = OutputManager::new();
+        let manager = OutputManager::new(crate::config::ColorScheme::default());
 
         for i in 0..10 {
             manager.write_user(format!("Message {}", i));
@@ -293,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let manager = OutputManager::new();
+        let manager = OutputManager::new(crate::config::ColorScheme::default());
 
         manager.write_user("Test");
         assert_eq!(manager.len(), 1);
@@ -305,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_system_info_message() {
-        let manager = OutputManager::new();
+        let manager = OutputManager::new(crate::config::ColorScheme::default());
 
         manager.write_info("Help: Available commands...");
 

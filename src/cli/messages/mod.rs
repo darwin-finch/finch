@@ -60,7 +60,7 @@ pub trait Message: Send + Sync {
     fn id(&self) -> MessageId;
 
     /// Format this message for display (with ANSI colors and styling)
-    fn format(&self) -> String;
+    fn format(&self, colors: &crate::config::ColorScheme) -> String;
 
     /// Get the current status of this message
     fn status(&self) -> MessageStatus;

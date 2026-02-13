@@ -455,7 +455,7 @@ impl TuiRenderer {
                             .take(scrollback_height as usize)
                             .rev()
                             .flat_map(|msg| {
-                                let formatted = msg.format();
+                                let formatted = msg.format(&self.colors);
                                 formatted.lines().map(|line| Line::raw(line.to_string())).collect::<Vec<_>>()
                             })
                             .collect();
@@ -565,7 +565,7 @@ impl TuiRenderer {
             // Format messages with proper wrapping using shadow buffer
             let mut wrapped_lines = Vec::new();
             for msg in &new_messages {
-                let formatted = msg.format();
+                let formatted = msg.format(&self.colors);
                 for line in formatted.lines() {
                     // Use shadow buffer's wrapping logic
                     let visible_len = visible_length(line);
@@ -860,7 +860,7 @@ impl TuiRenderer {
 
         // Render all messages to shadow buffer (with proper wrapping)
         let all_messages = self.scrollback.get_visible_messages();
-        self.shadow_buffer.render_messages(&all_messages);
+        self.shadow_buffer.render_messages(&all_messages, &self.colors);
 
         // Clear terminal and render entire shadow buffer
         let mut stdout = io::stdout();
@@ -920,7 +920,7 @@ impl TuiRenderer {
 
         // Render all visible messages to shadow buffer
         let all_messages = self.scrollback.get_visible_messages();
-        self.shadow_buffer.render_messages(&all_messages);
+        self.shadow_buffer.render_messages(&all_messages, &self.colors);
 
         // Diff with previous frame to find changes
         let changes = diff_buffers(&self.shadow_buffer, &self.prev_frame_buffer);
@@ -1112,7 +1112,7 @@ impl TuiRenderer {
                     .take(extra_lines as usize)
                     .rev()
                     .flat_map(|msg| {
-                        let formatted = msg.format();
+                        let formatted = msg.format(&self.colors);
                         formatted.lines().map(|line| Line::raw(line.to_string())).collect::<Vec<_>>()
                     })
                     .collect();
