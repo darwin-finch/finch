@@ -29,3 +29,8 @@ training-data/
 
 # But DO commit example configs
 !examples/*.json
+
+# Logs
+*.log
+debug.log
+shammah_errors.log
