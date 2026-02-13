@@ -90,17 +90,17 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 **Organization:** Items sorted easiest → hardest for efficient progress and quick wins.
 
 **Summary:**
-- 29 total items (14 original + 15 new suggestions)
-- 25/29 complete (86.2%) ✅
-- 1 INCOMPLETE (Additional adapters - 4-8h per model)
+- 32 total items (14 original + 18 new suggestions)
+- 25/32 complete (78.1%) ✅
+- 4 INCOMPLETE (Ctrl+/ fix, Inline suggestions, Auto-compaction, Additional adapters)
 - 2 BLOCKED (Mistral support, LoRA adapter loading)
 - 1 COMPLEX (Plan mode redesign - 20-40 hours)
-- Phase 1: Quick wins (4 items, 1-2h each) ⚡ - ALL COMPLETE
-- Phase 2: Medium difficulty (7 items, 2-4h each) - ALL COMPLETE
+- Phase 1: Quick wins (5 items, 1-2h each) ⚡ - 4/5 COMPLETE
+- Phase 2: Medium difficulty (8 items, 2-4h each) - 6/8 COMPLETE
 - Phase 3: Moderate complexity (4 items, 3-6h each) - ALL COMPLETE
-- Phase 4: Challenging (7 items, 3-8h each)
-- Phase 5: Complex (4 items, 4-20h each)
-- Phase 6: Very complex (1 item, 20-40h)
+- Phase 4: Challenging (7 items, 3-8h each) - ALL COMPLETE
+- Phase 5: Complex (5 items, 4-20h each) - 1/5 COMPLETE
+- Phase 6: Very complex (3 items, 20-40h each) - 3/3 COMPLETE
 
 **New Items Added:**
 1. Error message improvements
@@ -144,6 +144,12 @@ See `docs/ROADMAP.md` for detailed implementation plans.
    - Files: Root *.md → docs/archive/
    - Effort: 10 minutes (actual)
 
+5. **[ ] Ctrl+/ shortcut fix** (NEW) 🟡 MEDIUM PRIORITY
+   - Current issue: Ctrl+/ is advertised in help text but doesn't work
+   - Decision needed: Implement the shortcut or remove from help
+   - Files: `src/cli/tui/async_input.rs`, `src/cli/commands.rs`
+   - Effort: 15 minutes
+
 ### Phase 2: Medium Difficulty (2-4 hours each)
 
 5. **[x] Shift-return multi-line support** - ✅ COMPLETE
@@ -185,16 +191,33 @@ See `docs/ROADMAP.md` for detailed implementation plans.
    - Files: `src/cli/commands.rs`
    - Effort: 30 minutes (actual)
 
+11. **[ ] Inline ghost text suggestions** (NEW) 🟡 MEDIUM PRIORITY
+   - Claude Code-style inline autocomplete with ghost text
+   - Shows LLM-generated suggestions as grayed-out text in input
+   - Tab to accept, continue typing to ignore
+   - Requires tui-textarea custom rendering
+   - Files: `src/cli/tui/async_input.rs`, `src/cli/tui/input_widget.rs`, `src/cli/suggestions.rs`
+   - Effort: 2-3 hours
+
+12. **[ ] Conversation auto-compaction** (NEW) 🟢 COST SAVINGS
+   - Automatically compact conversation history when it gets too long
+   - Summarize older messages to reduce token usage
+   - Save money on API calls while preserving context
+   - Configurable compaction threshold (e.g., 20k tokens)
+   - Uses Claude API to generate summaries
+   - Files: `src/conversation/mod.rs`, `src/config/settings.rs`
+   - Effort: 2-3 hours
+
 ### Phase 3: Moderate Complexity (3-6 hours each)
 
-11. **[x] Control-C query termination** 🔴 HIGH PRIORITY - ✅ COMPLETE
+13. **[x] Control-C query termination** 🔴 HIGH PRIORITY - ✅ COMPLETE
     - Cancel in-progress queries with Ctrl+C
     - Stops streaming, marks query as cancelled, clears state
     - TODO: Pass cancellation to HTTP requests (abort connections)
     - Files: `src/cli/tui/async_input.rs`, `src/cli/repl_event/events.rs`, `src/cli/repl_event/event_loop.rs`
     - Effort: 2 hours (actual)
 
-12. **[x] Simple response feedback system** (NEW) - ✅ COMPLETE
+14. **[x] Simple response feedback system** (NEW) - ✅ COMPLETE
     - Keyboard shortcuts: Ctrl+G (good), Ctrl+B (bad)
     - Logs to ~/.shammah/feedback.jsonl in JSONL format
     - Weighted feedback (good=1x, bad=10x for LoRA training)
@@ -202,14 +225,14 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/feedback/mod.rs`, `src/cli/tui/async_input.rs`, `src/cli/tui/mod.rs`
     - Effort: 2 hours (actual)
 
-13. **[x] Crash recovery mechanism** (NEW) - ✅ COMPLETE
+15. **[x] Crash recovery mechanism** (NEW) - ✅ COMPLETE
     - Handle daemon crashes gracefully with auto-restart
     - Detects connection failures and retries queries
     - Auto-restart daemon on connection errors
     - Files: `src/client/daemon_client.rs`, `src/cli/repl_event/event_loop.rs`
     - Effort: 1.5 hours (actual)
 
-14. **[x] Python deps installation helper** (NEW) - ✅ COMPLETE
+16. **[x] Python deps installation helper** (NEW) - ✅ COMPLETE
     - Add `shammah train setup` command
     - Create venv at ~/.shammah/venv
     - Install torch, transformers, peft, safetensors, accelerate
@@ -219,27 +242,27 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 ### Phase 4: Challenging (4-8 hours each)
 
-15. **[x] Command history navigation** - ✅ COMPLETE
+17. **[x] Command history navigation** - ✅ COMPLETE
     - Up/down arrows for previous queries
     - Supports multi-line commands, persists to ~/.shammah/history.txt
     - Loads on startup, saves on shutdown (1000 command limit)
     - Files: `src/cli/tui/async_input.rs`, `src/cli/tui/mod.rs`
     - Effort: 2 hours (actual)
 
-16. **[x] Memory usage monitoring** (NEW) - ✅ COMPLETE
+18. **[x] Memory usage monitoring** (NEW) - ✅ COMPLETE
     - Track and display system and process memory usage
     - Show available system RAM, warn if low/critical
     - Files: `src/monitoring/mod.rs`, `src/cli/commands.rs`, `src/cli/repl_event/event_loop.rs`
     - Effort: 1 hour (actual)
 
-17. **[x] Multi-provider setup wizard** - ✅ COMPLETE
+19. **[x] Multi-provider setup wizard** - ✅ COMPLETE
     - Support all providers (Claude, GPT-4, Gemini, Grok, Mistral, Groq) in wizard
     - Users can add multiple providers, delete providers, configure API keys
     - Keyboard shortcuts: a (add), d (delete), ↑/↓ (select)
     - Files: `src/cli/setup_wizard.rs`
     - Effort: 4 hours (actual)
 
-18. **[x] Tool confirmation system fix** 🔴 CRITICAL SECURITY - ✅ COMPLETE
+20. **[x] Tool confirmation system fix** 🔴 CRITICAL SECURITY - ✅ COMPLETE
     - Fixed deadlock issue by integrating dialogs with async input system
     - Dialog key events handled in async_input task (non-blocking)
     - Tool approval dialog shows 6 options (once, session exact/pattern, persistent exact/pattern, deny)
@@ -248,7 +271,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/cli/tui/mod.rs`, `src/cli/tui/async_input.rs`, `src/cli/repl_event/event_loop.rs`
     - Effort: 5 hours (actual)
 
-19. **[x] Multi-model setup wizard** - ✅ COMPLETE
+21. **[x] Multi-model setup wizard** - ✅ COMPLETE
     - Added Model Preview step showing resolved model details
     - Displays: repository name, parameters, download size, device, RAM requirement
     - Shows exact model that will be downloaded (e.g., "onnx-community/Qwen2.5-3B-Instruct")
@@ -262,7 +285,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
       - Shows RAM requirements (8GB-128GB+ depending on model)
     - Effort: 2 hours (actual)
 
-20. **[~] Mistral model testing** ⏸️ BLOCKED
+22. **[~] Mistral model testing** ⏸️ BLOCKED
     - Status: MistralAdapter exists and has passing unit tests
     - Blocker: Only ONNX loader exists, which currently supports Qwen2 only
     - Mistral ONNX models not yet integrated (waiting for onnx-community/Mistral models)
@@ -275,7 +298,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/models/adapters/mistral.rs` (ready), `src/models/loaders/onnx.rs` (needs Mistral support)
     - Effort: 2-8 hours (when ONNX models available)
 
-21. **[x] Proxy-only mode** (NEW) 🟡 MEDIUM PRIORITY - ✅ COMPLETE
+23. **[x] Proxy-only mode** (NEW) 🟡 MEDIUM PRIORITY - ✅ COMPLETE
     - Allow users to use Shammah without local model (like Claude Code)
     - Daemon still spawns but skips model loading
     - Pure proxy to teacher APIs with tool execution
@@ -292,7 +315,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 ### Phase 4: Challenging (4-8 hours each) - Continued
 
-22. **[x] Flexible tool approval patterns** (NEW) 🔴 HIGH PRIORITY - ✅ COMPLETE
+24. **[x] Flexible tool approval patterns** (NEW) 🔴 HIGH PRIORITY - ✅ COMPLETE
     - Allow patterns to match command, args, and directory separately
     - Added PatternType::Structured enum variant
     - ToolSignature now includes command, args, directory fields
@@ -305,7 +328,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 ### Phase 5: Complex (8-20 hours each)
 
-23. **[~] Additional model adapters** (Phi, DeepSeek, etc.) 🔄 IN PROGRESS
+25. **[~] Additional model adapters** (Phi, DeepSeek, etc.) 🔄 IN PROGRESS
     - ✅ Phi adapter complete (Phi-2, Phi-3, Phi-3.5)
       - ChatML-style format with Phi-specific tokens
       - Smart output cleaning (Q&A patterns, role markers)
@@ -320,7 +343,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - 🎯 Remaining: CodeLlama, Yi, StarCoder, or other families (optional)
     - Effort: 3 hours actual (2 models × 1.5h each)
 
-24. **[ ] Adapter loading in runtime** 🚧 COMPLEX
+26. **[ ] Adapter loading in runtime** 🚧 COMPLEX
     - Goal: Load trained LoRA adapters during ONNX inference
     - Current state:
       - ✅ Python training script saves adapters to safetensors format
@@ -342,7 +365,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/models/lora.rs`, `scripts/train_lora.py`, `src/models/loaders/onnx.rs`
     - Effort: 40-80 hours (revised from 8-16)
 
-25. **[x] Color scheme customization** (NEW) ✅ COMPLETE
+27. **[x] Color scheme customization** (NEW) ✅ COMPLETE
     - Users can now customize TUI colors via config.toml
     - Completed:
       - ✅ Created ColorScheme struct with full color configuration
@@ -378,13 +401,13 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 ### Phase 6: Very Complex (20+ hours)
 
-26. **[ ] Plan mode redesign**
+28. **[ ] Plan mode redesign**
     - Match Claude Code's plan mode quality
     - Multi-step planning, approval workflow
     - Files: `src/cli/plan_mode.rs` (major refactor)
     - Effort: 20-40 hours
 
-27. **[x] Prompt suggestions** (NEW) ✅ COMPLETE
+29. **[x] Prompt suggestions** (NEW) ✅ COMPLETE
     - ✅ Full infrastructure with hardcoded + LLM support
     - ✅ SuggestionManager with 7 context-aware states
     - ✅ TUI integration with status bar display
@@ -396,7 +419,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/cli/suggestions.rs`, `src/cli/tui/mod.rs`, `docs/PROMPT_SUGGESTIONS.md`
     - Effort: 6-12 hours (✅ complete)
 
-28. **[x] LLM-prompted user dialogs** (NEW) ✅ COMPLETE
+30. **[x] LLM-prompted user dialogs** (NEW) ✅ COMPLETE
     - ✅ Full implementation of Claude Code's AskUserQuestion feature
     - ✅ Core data structures (Question, QuestionOption, Input/Output)
     - ✅ Validation logic (question/option counts, header length)
@@ -412,7 +435,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/cli/llm_dialogs.rs`, `src/cli/tui/mod.rs`, `src/cli/repl_event/event_loop.rs`, `src/cli/repl.rs`
     - Effort: 10 hours (actual)
 
-29. **[x] Plan mode toggle with visual indicator** (NEW) ✅ COMPLETE
+31. **[x] Plan mode toggle with visual indicator** (NEW) ✅ COMPLETE
     - ✅ Shift+Tab keyboard shortcut to toggle plan mode
     - ✅ Status bar indicator shows current mode:
       - Normal: `⏵⏵ accept edits on (shift+tab to cycle)`
