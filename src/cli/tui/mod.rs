@@ -730,8 +730,9 @@ impl TuiRenderer {
         }
 
         // Blit updates to visible area with rate limiting
+        // Skip blitting if we just resized (shadow buffers are empty and need to be repopulated)
         // diff_buffers() will return empty if nothing changed (fast early return)
-        if !messages.is_empty() && self.last_blit.elapsed() >= self.blit_interval {
+        if !messages.is_empty() && !self.needs_full_refresh && self.last_blit.elapsed() >= self.blit_interval {
             self.blit_visible_area()?;
             self.last_blit = std::time::Instant::now();
         }
