@@ -14,12 +14,14 @@ pub enum DialogType {
     Select {
         options: Vec<DialogOption>,
         selected_index: usize,
+        allow_custom: bool,  // Enable "Other" option with text input
     },
     /// Multi-select menu with checkboxes and space to toggle
     MultiSelect {
         options: Vec<DialogOption>,
         selected_indices: HashSet<usize>,
         cursor_index: usize,
+        allow_custom: bool,  // Enable "Other" option with text input
     },
     /// Text input with cursor and editing support
     TextInput {
@@ -67,6 +69,8 @@ pub struct Dialog {
     pub title: String,
     pub dialog_type: DialogType,
     pub help_message: Option<String>,
+    pub custom_input: Option<String>,  // Stores custom text if "Other" is being entered
+    pub custom_mode_active: bool,       // Whether user is currently typing custom text
 }
 
 impl Dialog {
@@ -77,8 +81,26 @@ impl Dialog {
             dialog_type: DialogType::Select {
                 options,
                 selected_index: 0,
+                allow_custom: false,
             },
             help_message: None,
+            custom_input: None,
+            custom_mode_active: false,
+        }
+    }
+
+    /// Create a new single-select dialog with custom "Other" option
+    pub fn select_with_custom(title: impl Into<String>, options: Vec<DialogOption>) -> Self {
+        Self {
+            title: title.into(),
+            dialog_type: DialogType::Select {
+                options,
+                selected_index: 0,
+                allow_custom: true,
+            },
+            help_message: None,
+            custom_input: Some(String::new()),
+            custom_mode_active: false,
         }
     }
 
@@ -90,8 +112,27 @@ impl Dialog {
                 options,
                 selected_indices: HashSet::new(),
                 cursor_index: 0,
+                allow_custom: false,
             },
             help_message: None,
+            custom_input: None,
+            custom_mode_active: false,
+        }
+    }
+
+    /// Create a new multi-select dialog with custom "Other" option
+    pub fn multiselect_with_custom(title: impl Into<String>, options: Vec<DialogOption>) -> Self {
+        Self {
+            title: title.into(),
+            dialog_type: DialogType::MultiSelect {
+                options,
+                selected_indices: HashSet::new(),
+                cursor_index: 0,
+                allow_custom: true,
+            },
+            help_message: None,
+            custom_input: Some(String::new()),
+            custom_mode_active: false,
         }
     }
 
@@ -107,6 +148,8 @@ impl Dialog {
                 default,
             },
             help_message: None,
+            custom_input: None,
+            custom_mode_active: false,
         }
     }
 
@@ -121,6 +164,8 @@ impl Dialog {
                 selected: default,
             },
             help_message: None,
+            custom_input: None,
+            custom_mode_active: false,
         }
     }
 
@@ -132,16 +177,38 @@ impl Dialog {
 
     /// Handle a key event and return a result if the dialog should close
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<DialogResult> {
+        // Priority 1: Handle custom text input mode
+        if self.custom_mode_active {
+            return self.handle_custom_input_key(key);
+        }
+
+        // Priority 2: Check for 'o' key to enter custom mode (if allowed)
+        if matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
+            let allow_custom = match &self.dialog_type {
+                DialogType::Select { allow_custom, .. } => *allow_custom,
+                DialogType::MultiSelect { allow_custom, .. } => *allow_custom,
+                _ => false,
+            };
+
+            if allow_custom {
+                self.custom_mode_active = true;
+                return None; // Don't close dialog, just enter custom mode
+            }
+        }
+
+        // Priority 3: Handle normal dialog input
         match &mut self.dialog_type {
             DialogType::Select {
                 options,
                 selected_index,
+                ..
             } => Self::handle_select_key(key, options, selected_index),
 
             DialogType::MultiSelect {
                 options,
                 selected_indices,
                 cursor_index,
+                ..
             } => Self::handle_multiselect_key(key, options, selected_indices, cursor_index),
 
             DialogType::TextInput {
@@ -151,6 +218,47 @@ impl Dialog {
             } => Self::handle_text_input_key(key, input, cursor_pos),
 
             DialogType::Confirm { selected, .. } => Self::handle_confirm_key(key, selected),
+        }
+    }
+
+    /// Handle key events when in custom text input mode
+    fn handle_custom_input_key(&mut self, key: KeyEvent) -> Option<DialogResult> {
+        match key.code {
+            KeyCode::Char(c) => {
+                // Insert character
+                if let Some(ref mut input) = self.custom_input {
+                    input.push(c);
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                // Delete last character
+                if let Some(ref mut input) = self.custom_input {
+                    input.pop();
+                }
+                None
+            }
+            KeyCode::Enter => {
+                // Submit custom text
+                if let Some(ref input) = self.custom_input {
+                    if !input.trim().is_empty() {
+                        Some(DialogResult::CustomText(input.clone()))
+                    } else {
+                        None // Don't submit empty custom text
+                    }
+                } else {
+                    None
+                }
+            }
+            KeyCode::Esc => {
+                // Exit custom mode (return to normal selection)
+                self.custom_mode_active = false;
+                if let Some(ref mut input) = self.custom_input {
+                    input.clear();
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -299,6 +407,8 @@ pub enum DialogResult {
     MultiSelected(Vec<usize>),
     /// Text input - entered string
     TextEntered(String),
+    /// Custom "Other" text - user provided custom response
+    CustomText(String),
     /// Confirmation - boolean result
     Confirmed(bool),
     /// User cancelled (pressed Esc)

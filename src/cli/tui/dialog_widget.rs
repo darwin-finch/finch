@@ -30,6 +30,9 @@ impl<'a> DialogWidget<'a> {
         &self,
         options: &[DialogOption],
         selected_index: usize,
+        allow_custom: bool,
+        custom_input: &Option<String>,
+        custom_mode_active: bool,
         help: &Option<String>,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -75,6 +78,35 @@ impl<'a> DialogWidget<'a> {
             lines.push(Line::from(spans));
         }
 
+        // Add "Other" option if enabled
+        if allow_custom {
+            lines.push(Line::from(""));
+            let other_style = if custom_mode_active {
+                Style::default()
+                    .fg(self.colors.dialog.selected_fg.to_color())
+                    .bg(self.colors.dialog.selected_bg.to_color())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(self.colors.dialog.option.to_color())
+            };
+            lines.push(Line::from(Span::styled(
+                "Press 'o' for Other (custom response)",
+                other_style,
+            )));
+        }
+
+        // Show custom input field if active
+        if custom_mode_active {
+            if let Some(input_text) = custom_input {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("> ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
+                    Span::styled(input_text.clone(), Style::default().fg(self.colors.ui.input.to_color())),
+                    Span::styled("█", Style::default().fg(self.colors.ui.cursor.to_color())),
+                ]));
+            }
+        }
+
         // Add help message if present
         if let Some(help_text) = help {
             lines.push(Line::from(""));
@@ -86,10 +118,22 @@ impl<'a> DialogWidget<'a> {
 
         // Add keybindings hint
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "↑/↓ or j/k: Navigate | 1-9: Select directly | Enter: Confirm | Esc: Cancel",
-            Style::default().fg(self.colors.ui.separator.to_color()),
-        )));
+        if custom_mode_active {
+            lines.push(Line::from(Span::styled(
+                "Type your response | Enter: Submit | Esc: Cancel custom input",
+                Style::default().fg(self.colors.ui.separator.to_color()),
+            )));
+        } else {
+            let hint = if allow_custom {
+                "↑/↓ or j/k: Navigate | 1-9: Select | o: Other | Enter: Confirm | Esc: Cancel"
+            } else {
+                "↑/↓ or j/k: Navigate | 1-9: Select directly | Enter: Confirm | Esc: Cancel"
+            };
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(self.colors.ui.separator.to_color()),
+            )));
+        }
 
         lines
     }
@@ -100,6 +144,9 @@ impl<'a> DialogWidget<'a> {
         options: &[DialogOption],
         selected_indices: &std::collections::HashSet<usize>,
         cursor_index: usize,
+        allow_custom: bool,
+        custom_input: &Option<String>,
+        custom_mode_active: bool,
         help: &Option<String>,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -146,6 +193,35 @@ impl<'a> DialogWidget<'a> {
             lines.push(Line::from(spans));
         }
 
+        // Add "Other" option if enabled
+        if allow_custom {
+            lines.push(Line::from(""));
+            let other_style = if custom_mode_active {
+                Style::default()
+                    .fg(self.colors.dialog.selected_fg.to_color())
+                    .bg(self.colors.dialog.selected_bg.to_color())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(self.colors.dialog.option.to_color())
+            };
+            lines.push(Line::from(Span::styled(
+                "Press 'o' for Other (custom response)",
+                other_style,
+            )));
+        }
+
+        // Show custom input field if active
+        if custom_mode_active {
+            if let Some(input_text) = custom_input {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("> ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
+                    Span::styled(input_text.clone(), Style::default().fg(self.colors.ui.input.to_color())),
+                    Span::styled("█", Style::default().fg(self.colors.ui.cursor.to_color())),
+                ]));
+            }
+        }
+
         // Add help message if present
         if let Some(help_text) = help {
             lines.push(Line::from(""));
@@ -157,10 +233,22 @@ impl<'a> DialogWidget<'a> {
 
         // Add keybindings hint
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "↑/↓ or j/k: Navigate | Space: Toggle | Enter: Confirm | Esc: Cancel",
-            Style::default().fg(self.colors.ui.separator.to_color()),
-        )));
+        if custom_mode_active {
+            lines.push(Line::from(Span::styled(
+                "Type your response | Enter: Submit | Esc: Cancel custom input",
+                Style::default().fg(self.colors.ui.separator.to_color()),
+            )));
+        } else {
+            let hint = if allow_custom {
+                "↑/↓ or j/k: Navigate | Space: Toggle | o: Other | Enter: Confirm | Esc: Cancel"
+            } else {
+                "↑/↓ or j/k: Navigate | Space: Toggle | Enter: Confirm | Esc: Cancel"
+            };
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(self.colors.ui.separator.to_color()),
+            )));
+        }
 
         lines
     }
@@ -330,16 +418,28 @@ impl<'a> Widget for DialogWidget<'a> {
             DialogType::Select {
                 options,
                 selected_index,
-            } => self.render_select(options, *selected_index, &self.dialog.help_message),
+                allow_custom,
+            } => self.render_select(
+                options,
+                *selected_index,
+                *allow_custom,
+                &self.dialog.custom_input,
+                self.dialog.custom_mode_active,
+                &self.dialog.help_message
+            ),
 
             DialogType::MultiSelect {
                 options,
                 selected_indices,
                 cursor_index,
+                allow_custom,
             } => self.render_multiselect(
                 options,
                 selected_indices,
                 *cursor_index,
+                *allow_custom,
+                &self.dialog.custom_input,
+                self.dialog.custom_mode_active,
                 &self.dialog.help_message,
             ),
 
