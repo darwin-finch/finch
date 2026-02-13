@@ -111,6 +111,8 @@ pub struct TuiRenderer {
     prev_status_content: String,
     /// Color scheme for TUI elements
     colors: crate::config::ColorScheme,
+    /// Suggestion manager for contextual prompts
+    suggestions: crate::cli::SuggestionManager,
 }
 
 impl TuiRenderer {
@@ -240,7 +242,7 @@ impl TuiRenderer {
         execute!(stdout, EndSynchronizedUpdate)?;
         stdout.flush()?;
 
-        Ok(Self {
+        let mut renderer = Self {
             terminal,
             output_manager,
             status_bar,
@@ -266,12 +268,40 @@ impl TuiRenderer {
             pending_dialog_result: None,
             last_interaction: None,
             colors,
-        })
+            suggestions: crate::cli::SuggestionManager::new(),
+        };
+
+        // Initialize first-run suggestions
+        renderer.update_suggestion_status();
+
+        Ok(renderer)
     }
 
     /// Record the last query-response pair for feedback
     pub fn record_interaction(&mut self, query: String, response: String) {
         self.last_interaction = Some((query, response));
+        // Update suggestion context: query just completed
+        self.suggestions.set_context(crate::cli::SuggestionContext::QueryComplete);
+        self.suggestions.increment_query_count();
+        self.update_suggestion_status();
+    }
+
+    /// Update the status bar with current suggestions
+    fn update_suggestion_status(&self) {
+        if let Some(suggestion_line) = self.suggestions.get_suggestion_line() {
+            self.status_bar.update_line(
+                crate::cli::StatusLineType::Suggestions,
+                suggestion_line,
+            );
+        } else {
+            self.status_bar.remove_line(&crate::cli::StatusLineType::Suggestions);
+        }
+    }
+
+    /// Update suggestion context based on TUI state
+    pub fn update_suggestion_context(&mut self, context: crate::cli::SuggestionContext) {
+        self.suggestions.set_context(context);
+        self.update_suggestion_status();
     }
 
     /// Check and process pending feedback

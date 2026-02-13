@@ -21,6 +21,8 @@ pub enum StatusLineType {
     DownloadProgress,
     /// Current operation status
     OperationStatus,
+    /// Contextual suggestions (like Claude Code)
+    Suggestions,
     /// Custom status line with ID
     Custom(String),
 }
@@ -98,6 +100,13 @@ impl StatusBar {
         if let Some(content) = lines.get(&StatusLineType::OperationStatus) {
             result.push(StatusLine {
                 line_type: StatusLineType::OperationStatus,
+                content: content.clone(),
+            });
+        }
+
+        if let Some(content) = lines.get(&StatusLineType::Suggestions) {
+            result.push(StatusLine {
+                line_type: StatusLineType::Suggestions,
                 content: content.clone(),
             });
         }

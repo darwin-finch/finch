@@ -48,6 +48,11 @@ impl<'a> StatusWidget<'a> {
                 // Operation status: from color scheme
                 Style::default().fg(self.colors.status.operation.to_color())
             }
+            StatusLineType::Suggestions => {
+                // Suggestions: cyan with subtle styling
+                Style::default()
+                    .fg(self.colors.ui.cursor.to_color())
+            }
             StatusLineType::Custom(_) => {
                 // Custom status lines: readable dark gray
                 Style::default().fg(Color::DarkGray)
