@@ -30,7 +30,7 @@ impl Tool for PresentPlanTool {
         )])
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
         // Extract and validate plan
         let plan_content = input["plan"]
             .as_str()
@@ -40,22 +40,48 @@ impl Tool for PresentPlanTool {
             bail!("Plan content cannot be empty");
         }
 
-        // TODO: Show approval dialog at event loop level
-        // TODO: Handle approval/rejection/feedback
-        // TODO: Clear context on approval
+        // Check if repl_mode is available
+        let mode = context.repl_mode.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Plan mode not available in this context"))?;
 
-        // For now, just acknowledge the plan was presented
+        // Verify we're in planning mode
+        let plan_path = {
+            let current_mode = mode.read().await;
+            match &*current_mode {
+                crate::cli::ReplMode::Planning { plan_path, .. } => plan_path.clone(),
+                crate::cli::ReplMode::Normal => {
+                    return Ok("⚠️  Not in planning mode. Use EnterPlanMode first.".to_string());
+                }
+                crate::cli::ReplMode::Executing { .. } => {
+                    return Ok("⚠️  Already executing plan. Use /done to return to normal mode.".to_string());
+                }
+            }
+        };
+
+        // Store plan content
+        if let Some(ref plan_storage) = context.plan_content {
+            *plan_storage.write().await = Some(plan_content.to_string());
+        }
+
+        // Save plan to file
+        std::fs::write(&plan_path, plan_content)?;
+
+        // Return plan with approval instructions
         Ok(format!(
             "📋 **Implementation Plan Presented**\n\n\
              {}\n\n\
-             ⚠️  **Note:** Plan approval dialog will be shown to the user.\n\
-             (Dialog integration pending - Phase 2 in progress)\n\n\
-             Next steps:\n\
-             • User will approve, request changes, or reject\n\
-             • If approved: context cleared, all tools enabled\n\
-             • If changes requested: revise plan and call PresentPlan again\n\
-             • If rejected: exit plan mode",
-            plan_content
+             ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n\
+             ✓ Plan saved to: {}\n\n\
+             **Waiting for User Approval**\n\n\
+             The plan has been presented to the user. They will now:\n\
+             • **Approve** it to proceed with execution (context cleared, all tools enabled)\n\
+             • **Request changes** with feedback for you to revise\n\
+             • **Reject** it to exit plan mode\n\n\
+             ⏸️  You are in **read-only planning mode** until the user approves.\n\
+             Only exploration tools (Read, Glob, Grep, WebFetch) are available.\n\n\
+             If the user requests changes, revise the plan and call PresentPlan again with the updated version.",
+            plan_content,
+            plan_path.display()
         ))
     }
 }
