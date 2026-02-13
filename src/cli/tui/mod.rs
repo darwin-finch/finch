@@ -1023,7 +1023,7 @@ impl TuiRenderer {
         let (_term_width, term_height) = crossterm::terminal::size()?;
 
         // Calculate visible scrollback area (above inline viewport)
-        let visible_rows = term_height.saturating_sub(6); // -6 for inline viewport
+        let visible_rows = term_height.saturating_sub(self.current_inline_viewport_size);
 
         if visible_rows == 0 {
             return Ok(()); // Terminal too small
@@ -1083,7 +1083,7 @@ impl TuiRenderer {
 
         // Get terminal size
         let (_term_width, term_height) = crossterm::terminal::size()?;
-        let visible_rows = term_height.saturating_sub(6); // -6 for inline viewport
+        let visible_rows = term_height.saturating_sub(self.current_inline_viewport_size);
 
         if visible_rows == 0 {
             return Ok(()); // Terminal too small
