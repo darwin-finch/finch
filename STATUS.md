@@ -306,10 +306,27 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Files: `src/models/adapters/`
     - Effort: 4-8 hours per model
 
-24. **[ ] Adapter loading in runtime**
-    - Load trained LoRA adapters in ONNX runtime
-    - Files: `src/models/lora.rs`, `src/generators/qwen.rs`
-    - Effort: 8-16 hours
+24. **[ ] Adapter loading in runtime** 🚧 COMPLEX
+    - Goal: Load trained LoRA adapters during ONNX inference
+    - Current state:
+      - ✅ Python training script saves adapters to safetensors format
+      - ✅ TrainingCoordinator writes JSONL queue
+      - ✅ LoRAConfig and infrastructure exist
+      - ❌ ONNX Runtime is inference-only (no training APIs)
+      - ❌ No built-in way to apply LoRA weights at runtime
+    - Technical challenges:
+      1. ONNX Runtime doesn't support dynamic weight modification
+      2. Options require significant engineering:
+         a. Merge LoRA into base model (requires reloading entire model)
+         b. Runtime weight modification (requires low-level ONNX manipulation)
+         c. Export merged model as new ONNX (requires PyTorch, 2x memory)
+      3. Current Python approach requires loading model twice (memory intensive)
+    - Recommended approach:
+      - Wait for ONNX Runtime to add training/adapter support
+      - Or implement custom Rust LoRA on top of ONNX (40-80 hours)
+      - Or use burn.rs with ONNX export (requires rewrite)
+    - Files: `src/models/lora.rs`, `scripts/train_lora.py`, `src/models/loaders/onnx.rs`
+    - Effort: 40-80 hours (revised from 8-16)
 
 25. **[ ] Color scheme customization** (NEW)
     - Let users customize TUI colors via config
