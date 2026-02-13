@@ -25,6 +25,7 @@ pub enum Command {
     PatternsClear,
     PatternsAdd,
     // Plan mode commands
+    PlanModeToggle,  // Toggle plan mode on/off (Shift+Tab or /plan without args)
     Plan(String),
     Approve,
     Reject,
@@ -64,11 +65,19 @@ impl Command {
             _ => {}
         }
 
-        // Handle /plan command with task description
+        // Handle /plan command
+        if trimmed == "/plan" {
+            // Without arguments: toggle plan mode
+            return Some(Command::PlanModeToggle);
+        }
+
         if let Some(rest) = trimmed.strip_prefix("/plan ") {
             let task = rest.trim();
             if !task.is_empty() {
                 return Some(Command::Plan(task.to_string()));
+            } else {
+                // "/plan " with only whitespace: toggle plan mode
+                return Some(Command::PlanModeToggle);
             }
         }
 
@@ -191,7 +200,8 @@ pub fn handle_command(
             Ok(CommandOutput::Status("Pattern management commands should be handled in REPL.".to_string()))
         }
         // Plan mode commands are handled directly in REPL
-        Command::Plan(_)
+        Command::PlanModeToggle
+        | Command::Plan(_)
         | Command::Approve
         | Command::Reject
         | Command::ShowPlan
@@ -237,6 +247,7 @@ pub fn format_help() -> String {
          \x1b[90m  What are patterns?\x1b[0m Saved rules for auto-approving tool executions.\n\
          \x1b[90m  Example:\x1b[0m \"Always allow reading *.rs files\" or \"Allow git status\"\n\n\
          \x1b[1;33m📝 Plan Mode Commands:\x1b[0m\n\
+         \x1b[36m  /plan\x1b[0m              Toggle plan mode on/off (also: Shift+Tab)\n\
          \x1b[36m  /plan <task>\x1b[0m       Enter planning mode for a complex task\n\
          \x1b[36m  /show-plan\x1b[0m         Display the current plan\n\
          \x1b[36m  /save-plan\x1b[0m         Manually save current response as plan\n\
@@ -259,10 +270,11 @@ pub fn format_help() -> String {
          \x1b[36m  Ctrl+D\x1b[0m             Exit REPL (same as /quit)\n\
          \x1b[36m  Ctrl+G\x1b[0m             Mark last response as \x1b[32mgood\x1b[0m (1x training weight)\n\
          \x1b[36m  Ctrl+B\x1b[0m             Mark last response as \x1b[31mbad\x1b[0m (10x training weight)\n\
+         \x1b[36m  Shift+Tab\x1b[0m          Toggle plan mode on/off\n\
          \x1b[36m  Shift+Enter\x1b[0m        Multi-line input (insert newline)\n\
          \x1b[36m  Shift+PgUp\x1b[0m         Scroll up in history\n\
          \x1b[36m  Shift+PgDown\x1b[0m       Scroll down in history\n\
-         \x1b[90m  ↑ / ↓ arrows\x1b[0m       Navigate command history (coming soon)\n\n\
+         \x1b[90m  ↑ / ↓ arrows\x1b[0m       Navigate command history\n\n\
          \x1b[1;33m🛠️  Tool Execution:\x1b[0m\n\
          When Claude needs to use tools (read files, run commands, etc.), you'll\n\
          be asked to approve each action. You can:\n\

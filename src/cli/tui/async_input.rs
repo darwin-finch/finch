@@ -90,6 +90,11 @@ pub fn spawn_input_task(
                                     tui.pending_feedback = Some(crate::feedback::FeedbackRating::Bad);
                                     Ok(None)
                                 }
+                                (KeyCode::BackTab, _) => {
+                                    // Shift+Tab: Toggle plan mode
+                                    tui.toggle_plan_mode();
+                                    Ok(None)
+                                }
                                 (KeyCode::Up, KeyModifiers::NONE) => {
                                     // Navigate history backwards (older commands)
                                     if let Some(idx) = tui.history_index {

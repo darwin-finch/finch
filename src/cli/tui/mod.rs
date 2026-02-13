@@ -113,6 +113,8 @@ pub struct TuiRenderer {
     colors: crate::config::ColorScheme,
     /// Suggestion manager for contextual prompts
     suggestions: crate::cli::SuggestionManager,
+    /// Whether plan mode is currently active
+    plan_mode: bool,
 }
 
 impl TuiRenderer {
@@ -269,10 +271,14 @@ impl TuiRenderer {
             last_interaction: None,
             colors,
             suggestions: crate::cli::SuggestionManager::new(),
+            plan_mode: false,
         };
 
         // Initialize first-run suggestions
         renderer.update_suggestion_status();
+
+        // Initialize plan mode indicator
+        renderer.update_plan_mode_status();
 
         Ok(renderer)
     }
@@ -284,6 +290,37 @@ impl TuiRenderer {
         self.suggestions.set_context(crate::cli::SuggestionContext::QueryComplete);
         self.suggestions.increment_query_count();
         self.update_suggestion_status();
+    }
+
+    /// Toggle plan mode on/off
+    pub fn toggle_plan_mode(&mut self) {
+        self.plan_mode = !self.plan_mode;
+        self.update_plan_mode_status();
+    }
+
+    /// Set plan mode explicitly
+    pub fn set_plan_mode(&mut self, enabled: bool) {
+        self.plan_mode = enabled;
+        self.update_plan_mode_status();
+    }
+
+    /// Get current plan mode status
+    pub fn is_plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    /// Update the status bar with plan mode indicator
+    fn update_plan_mode_status(&self) {
+        let indicator = if self.plan_mode {
+            "⏸ plan mode on (shift+tab to cycle)"
+        } else {
+            "⏵⏵ accept edits on (shift+tab to cycle)"
+        };
+
+        self.status_bar.update_line(
+            crate::cli::StatusLineType::Custom("plan_mode".to_string()),
+            indicator,
+        );
     }
 
     /// Update the status bar with current suggestions

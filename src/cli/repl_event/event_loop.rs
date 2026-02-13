@@ -290,6 +290,19 @@ impl EventLoop {
                         // Handle /local command - query local model directly (bypass routing)
                         self.handle_local_query(query).await?;
                     }
+                    Command::PlanModeToggle => {
+                        // Toggle plan mode
+                        let mut tui = self.tui_renderer.lock().await;
+                        tui.toggle_plan_mode();
+                        let mode_status = if tui.is_plan_mode() {
+                            "Plan mode enabled"
+                        } else {
+                            "Plan mode disabled"
+                        };
+                        drop(tui);
+                        self.output_manager.write_info(mode_status);
+                        self.render_tui().await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
