@@ -39,8 +39,11 @@ impl LocalGenerator {
 
         // Extract actual model name from GeneratorModel if available
         let model_name = if let Some(ref gen) = neural_generator {
-            // Blocking read to get model name
-            gen.blocking_read().name().to_string()
+            // Try non-blocking read to get model name (avoid deadlock in async context)
+            match gen.try_read() {
+                Ok(g) => g.name().to_string(),
+                Err(_) => "LocalModel".to_string(), // Fallback if lock is held
+            }
         } else {
             // Default placeholder when no model loaded yet
             "Unknown".to_string()

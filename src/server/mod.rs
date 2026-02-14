@@ -142,24 +142,48 @@ impl AgentServer {
         let local_gen_clone = Arc::clone(&self.local_generator);
         let state_monitor = Arc::clone(&self.generator_state);
         tokio::spawn(async move {
+            tracing::info!("Model monitor task started");
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 let state = state_monitor.read().await;
-                if let GeneratorState::Ready { model, .. } = &*state {
-                    // Inject model into LocalGenerator
-                    let mut gen = local_gen_clone.write().await;
-                    *gen = LocalGenerator::with_models(Some(Arc::clone(model)));
+                tracing::debug!("Monitor checking state: {:?}", std::mem::discriminant(&*state));
 
-                    tracing::info!("✓ Model ready - local generation enabled");
-                    break; // Stop monitoring once injected
+                if let GeneratorState::Ready { model, model_name } = &*state {
+                    let model_clone = Arc::clone(model);
+                    let name = model_name.clone();
+                    drop(state); // Release read lock before acquiring write lock
+
+                    tracing::info!("Model is ready: {}, injecting into LocalGenerator", name);
+
+                    // Try to inject with timeout
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(5),
+                        async {
+                            tracing::info!("Acquiring write lock on LocalGenerator...");
+                            let mut gen = local_gen_clone.write().await;
+                            tracing::info!("Write lock acquired, creating new LocalGenerator...");
+                            *gen = LocalGenerator::with_models(Some(model_clone));
+                            tracing::info!("LocalGenerator updated");
+                        }
+                    ).await {
+                        Ok(_) => {
+                            tracing::info!("✓ Model injected - local generation enabled");
+                            break; // Stop monitoring once injected
+                        }
+                        Err(_) => {
+                            tracing::error!("❌ Timeout while injecting model (5s) - write lock may be held");
+                        }
+                    }
                 } else if matches!(
                     *state,
                     GeneratorState::Failed { .. } | GeneratorState::NotAvailable
                 ) {
+                    tracing::warn!("Model loading failed or not available, stopping monitor");
                     break; // Stop monitoring on failure
                 }
             }
+            tracing::info!("Model monitor task exiting");
         });
 
         // Create application state
