@@ -44,13 +44,8 @@ impl<'a> TabbedDialogWidget<'a> {
         )));
         lines.push(Line::from(""));
 
-        // Render options for current question
-        if current_tab.custom_mode_active {
-            // Show custom input field
-            lines.extend(self.render_custom_input(current_tab));
-        } else {
-            lines.extend(self.render_options(current_tab));
-        }
+        // Always render options with inline custom input
+        lines.extend(self.render_options(current_tab));
 
         // Render help/keybindings
         lines.push(Line::from(""));
@@ -104,6 +99,7 @@ impl<'a> TabbedDialogWidget<'a> {
     fn render_options(&self, tab_state: &super::tabbed_dialog::TabState) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
+        // Render regular options
         for (idx, option) in tab_state.question.options.iter().enumerate() {
             let is_selected = if tab_state.question.multi_select {
                 // Multi-select: check if in selected set
@@ -160,26 +156,33 @@ impl<'a> TabbedDialogWidget<'a> {
             lines.push(Line::from(spans));
         }
 
-        // Add "Press 'o' for Other" option
+        // Add blank line before custom input section
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Press 'o' for Other (custom response)",
-            Style::default().fg(self.colors.dialog.option.to_color()),
-        )));
 
-        lines
-    }
-
-    /// Render custom input field
-    fn render_custom_input(&self, tab_state: &super::tabbed_dialog::TabState) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-
-        if let Some(input_text) = &tab_state.custom_input {
+        // Render custom input field inline (always visible)
+        if tab_state.custom_mode_active {
+            // Show custom text input with cursor
+            let input_text = tab_state.custom_input.as_ref().map(|s| s.as_str()).unwrap_or("");
             lines.push(Line::from(vec![
-                Span::styled("> ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
-                Span::styled(input_text.clone(), Style::default().fg(self.colors.dialog.option.to_color())),
+                Span::styled("❯ ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
+                Span::styled(input_text.to_string(), Style::default().fg(self.colors.dialog.option.to_color())),
                 Span::styled("█", Style::default().fg(self.colors.ui.cursor.to_color())),
             ]));
+
+            // Show "Submit" option if there's custom text
+            if !input_text.trim().is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Press Enter to submit",
+                    Style::default().fg(self.colors.dialog.option.to_color()),
+                )));
+            }
+        } else {
+            // Show prompt to enter custom response
+            lines.push(Line::from(Span::styled(
+                "Press 'o' for Other (custom response)",
+                Style::default().fg(self.colors.dialog.option.to_color()),
+            )));
         }
 
         lines
@@ -188,11 +191,11 @@ impl<'a> TabbedDialogWidget<'a> {
     /// Render help text / keybindings
     fn render_help(&self, tab_state: &super::tabbed_dialog::TabState) -> Vec<Line<'static>> {
         let help_text = if tab_state.custom_mode_active {
-            "Type response | Enter: Save & Next | Esc: Cancel custom input"
+            "Type custom response | Enter: Submit | Esc: Cancel | Backspace: Delete"
         } else if tab_state.question.multi_select {
-            "←/→: Switch tabs | ↑/↓: Navigate | Space: Toggle | Enter: Save & Next | Esc: Cancel"
+            "←/→: Switch tabs | ↑/↓: Navigate | Space: Toggle | Enter: Submit | o: Other | Esc: Cancel"
         } else {
-            "←/→: Switch tabs | ↑/↓ or j/k: Navigate | 1-9: Select | Enter: Save & Next | Esc: Cancel"
+            "←/→: Switch tabs | ↑/↓ or j/k: Navigate | 1-9: Select | Enter: Submit | o: Other | Esc: Cancel"
         };
 
         vec![Line::from(Span::styled(
@@ -210,7 +213,7 @@ impl Widget for TabbedDialogWidget<'_> {
             .unwrap_or_else(|| " Questions ".to_string());
 
         let block = Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::BOTTOM)
             .border_style(Style::default().fg(self.colors.dialog.border.to_color()))
             .title(title)
             .title_alignment(Alignment::Center);
