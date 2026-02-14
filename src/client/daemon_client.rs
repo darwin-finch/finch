@@ -72,6 +72,9 @@ impl DaemonClient {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_seconds))
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Some(Duration::from_secs(config.timeout_seconds)))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
             .context("Failed to build HTTP client")?;
 
