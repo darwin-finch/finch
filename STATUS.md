@@ -79,9 +79,17 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 - Professional terminal UI with scrollback
 - Dual-layer rendering (scrollback + inline viewport)
 - Shadow buffer for diff-based updates
-- Streaming response support
+- Streaming response support with real-time token display
 - Rate limiting (20 FPS max)
 - Proper ANSI code handling
+
+**SSE Streaming Support:**
+- Server-Sent Events for local model queries
+- Prevents connection timeouts on long-running queries (>10s)
+- Token-by-token generation with callbacks
+- Proper stream termination and error handling
+- Real-time UI updates via StreamingResponseMessage
+- Note: Tokens arrive in burst after generation (ONNX limitation)
 
 ---
 

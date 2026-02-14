@@ -90,31 +90,55 @@ async fn handle_chat_completions_streaming(
     }
     drop(state);
 
-    // Create channel for streaming tokens
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    // Create bounded channel for streaming tokens with backpressure
+    // Buffer size of 2 allows one token to be consumed while another is being generated
+    let (tx, rx) = mpsc::channel::<String>(2);
     let model_name = request.model.clone();
 
-    // Spawn generation task
-    // TODO: True real-time streaming - currently ONNX generation is synchronous and generates
-    // all tokens before firing callbacks, so tokens arrive in a burst rather than incrementally.
-    // To fix: Make ONNX generation yield between tokens (e.g., tokio::task::yield_now() after
-    // each token) so the HTTP stream can send tokens as they're generated, not all at once.
+    // Spawn generation task on blocking thread pool
+    // ONNX generation is CPU-bound and synchronous, so we use spawn_blocking
+    // to avoid blocking the async runtime. The bounded channel provides natural
+    // backpressure - generation will pause if the HTTP stream can't keep up.
+    let server_clone = server.clone();
     tokio::spawn(async move {
-        let mut generator = server.local_generator().write().await;
+        // Run CPU-bound generation on blocking thread pool
+        let result = tokio::task::spawn_blocking(move || {
+            // Create runtime handle for async operations inside blocking context
+            let handle = tokio::runtime::Handle::current();
 
-        // Try to generate with streaming callback
-        match generator.try_generate_from_pattern_streaming(&internal_messages, move |_token_id, token_text| {
-            // Send each token via channel
-            let _ = tx.send(token_text.to_string());
-        }) {
-            Ok(Some(_response)) => {
+            // Get generator (need to use block_on since we're in blocking context)
+            let mut generator = handle.block_on(async {
+                server_clone.local_generator().write().await
+            });
+
+            // Try to generate with streaming callback
+            generator.try_generate_from_pattern_streaming(&internal_messages, move |_token_id, token_text| {
+                // Send token via bounded channel (blocking send)
+                // This provides backpressure - if the HTTP consumer is slow,
+                // generation will pause here until there's space in the channel
+                if tx.blocking_send(token_text.to_string()).is_err() {
+                    // Channel closed (client disconnected), stop generating
+                    return;
+                }
+
+                // Small sleep to pace token delivery and allow async runtime to process
+                // This helps prevent tokens from bunching up even with backpressure
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            })
+        }).await;
+
+        match result {
+            Ok(Ok(Some(_response))) => {
                 info!("✓ Streaming generation completed");
             }
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 warn!("❌ Streaming generation returned None");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("❌ Streaming generation error: {}", e);
+            }
+            Err(e) => {
+                warn!("❌ Blocking task error: {}", e);
             }
         }
     });

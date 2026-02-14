@@ -836,11 +836,6 @@ impl TuiRenderer {
             // Updates happen via Arc<RwLock<>>, shadow buffer sees them automatically
         }
 
-        // If there are any messages, trigger refresh to keep visible area updated
-        if !messages.is_empty() {
-            self.needs_full_refresh = true;
-        }
-
         // Write new messages to terminal scrollback using insert_before()
         // Note: ANSI codes are stripped for scrollback (ratatui limitation)
         if !new_messages.is_empty() {
@@ -874,10 +869,10 @@ impl TuiRenderer {
             self.needs_tui_render = true;
         }
 
-        // Blit updates to visible area with rate limiting
-        // Skip blitting if we just resized (shadow buffers are empty and need to be repopulated)
-        // diff_buffers() will return empty if nothing changed (fast early return)
-        if !messages.is_empty() && !self.needs_full_refresh && self.last_blit.elapsed() >= self.blit_interval {
+        // Blit updates to visible area with rate limiting (for message updates)
+        // This is the reactive part - messages update via Arc<RwLock<>>, we just re-render
+        // Rate limited to 20 FPS (50ms interval) to avoid excessive CPU
+        if !messages.is_empty() && self.last_blit.elapsed() >= self.blit_interval {
             self.blit_visible_area()?;
             self.last_blit = std::time::Instant::now();
         }

@@ -406,23 +406,28 @@ impl EventLoop {
             self.output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
             self.render_tui().await?;
 
-            // Daemon mode: use HTTP to query with streaming UI updates
+            // Spawn streaming query in background so event loop continues running
+            // This allows TUI to keep rendering while tokens stream in
+            let daemon_client = daemon_client.clone();
             let msg_clone = msg.clone();
-            match daemon_client.query_local_only_streaming_with_callback(&query, move |token_text| {
-                msg_clone.append_chunk(token_text);
-            }).await {
-                Ok(_) => {
-                    // Mark complete
-                    msg.set_complete();
-                    self.output_manager.write_info("✓ Local model (bypassed routing)");
-                    self.render_tui().await?;
+            let output_mgr = self.output_manager.clone();
+
+            tokio::spawn(async move {
+                match daemon_client.query_local_only_streaming_with_callback(&query, move |token_text| {
+                    msg_clone.append_chunk(token_text);
+                }).await {
+                    Ok(_) => {
+                        msg.set_complete();
+                        output_mgr.write_info("✓ Local model (bypassed routing)");
+                    }
+                    Err(e) => {
+                        msg.set_failed();
+                        output_mgr.write_error(format!("Local query failed: {}", e));
+                    }
                 }
-                Err(e) => {
-                    msg.set_failed();
-                    self.output_manager.write_error(format!("Local query failed: {}", e));
-                    self.render_tui().await?;
-                }
-            }
+            });
+
+            // Return immediately - event loop continues, TUI keeps rendering
         } else {
             // No daemon mode - show error
             self.output_manager.write_error("Error: /local requires daemon mode.");
