@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::claude::{ContentBlock, Message};
 use crate::daemon::ensure_daemon_running;
@@ -72,9 +72,8 @@ impl DaemonClient {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_seconds))
-            .connect_timeout(Duration::from_secs(10))
-            .pool_idle_timeout(Some(Duration::from_secs(config.timeout_seconds)))
-            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(0)  // Disable connection pooling
             .build()
             .context("Failed to build HTTP client")?;
 
@@ -149,7 +148,22 @@ impl DaemonClient {
             .json(&request)
             .send()
             .await
-            .context("Failed to send request to daemon")?
+            .map_err(|e| {
+                // Log detailed error info
+                error!("HTTP request failed: {}", e);
+                if e.is_timeout() {
+                    error!("  → Error type: TIMEOUT");
+                } else if e.is_connect() {
+                    error!("  → Error type: CONNECTION");
+                } else if e.is_request() {
+                    error!("  → Error type: REQUEST");
+                } else if e.is_body() {
+                    error!("  → Error type: BODY");
+                } else {
+                    error!("  → Error type: OTHER");
+                }
+                anyhow::anyhow!("Failed to send request to daemon: {}", e)
+            })?
             .json()
             .await
             .context("Failed to parse response from daemon")?;
@@ -376,7 +390,7 @@ impl DaemonClient {
         let response = self
             .client
             .get(&url)
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))  // Increased from 5 to 30 seconds
             .send()
             .await
             .context("Failed to check daemon health")?
@@ -390,7 +404,7 @@ impl DaemonClient {
     /// Internal health check (used during connection)
     async fn check_health(base_url: &str) -> Result<()> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))  // Increased from 5 to 30 seconds
             .build()
             .context("Failed to build HTTP client")?;
 

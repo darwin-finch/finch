@@ -282,10 +282,17 @@ async fn handle_local_only_query(
         .map_err(|e| error_response(&e.to_string(), "invalid_request_error"))?;
 
     // Generate response (no tools for now - direct generation only)
+    info!("Acquiring write lock on generator...");
     let mut generator = server.local_generator().write().await;
+    info!("Write lock acquired, starting generation...");
+
     let content_blocks = match generator.try_generate_from_pattern_with_tools(&internal_messages, None) {
-        Ok(Some(response)) => response.content_blocks,
+        Ok(Some(response)) => {
+            info!("Generation successful, {} content blocks", response.content_blocks.len());
+            response.content_blocks
+        }
         Ok(None) => {
+            warn!("Generation returned None");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -308,9 +315,12 @@ async fn handle_local_only_query(
         }
     };
     drop(generator);
+    info!("Write lock dropped");
 
     // Convert response to OpenAI format
+    info!("Converting response to OpenAI format...");
     let openai_response = convert_response_to_openai(content_blocks, &request.model)?;
+    info!("Response converted, sending back to client");
 
     Ok(Json(openai_response))
 }
