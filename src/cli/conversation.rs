@@ -225,6 +225,199 @@ impl Default for ConversationHistory {
     }
 }
 
+/// Conversation compactor that summarizes older messages to reduce token usage
+///
+/// When conversations grow too large, this compactor:
+/// 1. Keeps the most recent messages intact (for context continuity)
+/// 2. Summarizes older messages into a single summary message
+/// 3. Uses the teacher API to generate high-quality summaries
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// use crate::cli::conversation::{ConversationHistory, ConversationCompactor};
+/// use crate::providers::fallback_chain::FallbackChain;
+///
+/// let mut history = ConversationHistory::new();
+/// // ... add many messages ...
+///
+/// // Check if compaction is needed
+/// let compactor = ConversationCompactor::new(&fallback_chain);
+/// if compactor.should_compact(&history) {
+///     // Compact conversation in background
+///     compactor.compact(&mut history).await?;
+/// }
+/// ```
+///
+/// # Integration Points
+///
+/// The compactor should be called in the REPL event loop after each query completion:
+/// - File: `src/cli/repl_event/event_loop.rs`
+/// - Location: After successful query completion, before next query
+/// - Async: Yes, runs in background (non-blocking)
+///
+/// Example integration:
+/// ```rust,ignore
+/// // In event_loop.rs, after query completes:
+/// if self.compactor.should_compact(&self.conversation) {
+///     tokio::spawn(async move {
+///         if let Err(e) = compactor.compact(&mut conversation).await {
+///             tracing::warn!("Failed to compact conversation: {}", e);
+///         }
+///     });
+/// }
+/// ```
+pub struct ConversationCompactor<'a> {
+    /// Fallback chain for API calls
+    fallback_chain: &'a crate::providers::fallback_chain::FallbackChain,
+    /// Number of recent messages to keep intact (default: 4)
+    keep_recent_count: usize,
+    /// Compaction threshold as percentage of max tokens (default: 0.8 = 80%)
+    threshold_percent: f32,
+}
+
+impl<'a> ConversationCompactor<'a> {
+    /// Create a new conversation compactor
+    pub fn new(fallback_chain: &'a crate::providers::fallback_chain::FallbackChain) -> Self {
+        Self {
+            fallback_chain,
+            keep_recent_count: 4, // Keep last 4 messages (2 turns)
+            threshold_percent: 0.8,
+        }
+    }
+
+    /// Create with custom settings
+    pub fn with_settings(
+        fallback_chain: &'a crate::providers::fallback_chain::FallbackChain,
+        keep_recent_count: usize,
+        threshold_percent: f32,
+    ) -> Self {
+        Self {
+            fallback_chain,
+            keep_recent_count,
+            threshold_percent: threshold_percent.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Check if conversation should be compacted
+    pub fn should_compact(&self, history: &ConversationHistory) -> bool {
+        history.should_compact()
+    }
+
+    /// Compact conversation history by summarizing older messages
+    ///
+    /// Returns the compacted conversation history or an error if compaction fails
+    pub async fn compact(&self, history: &mut ConversationHistory) -> anyhow::Result<()> {
+        use crate::claude::types::ContentBlock;
+        use crate::providers::ProviderRequest;
+
+        // Check if compaction is needed
+        if !self.should_compact(history) {
+            tracing::debug!("Conversation does not need compaction");
+            return Ok(());
+        }
+
+        let messages = history.get_messages();
+
+        // If we have fewer messages than keep_recent_count, nothing to compact
+        if messages.len() <= self.keep_recent_count {
+            tracing::debug!("Not enough messages to compact (need at least {})", self.keep_recent_count + 1);
+            return Ok(());
+        }
+
+        // Split messages into "to summarize" and "to keep"
+        let split_point = messages.len() - self.keep_recent_count;
+        let to_summarize = &messages[..split_point];
+        let to_keep = &messages[split_point..];
+
+        tracing::info!(
+            "Compacting conversation: {} messages total, summarizing {}, keeping {}",
+            messages.len(),
+            to_summarize.len(),
+            to_keep.len()
+        );
+
+        // Build summarization prompt
+        let mut conversation_text = String::new();
+        for msg in to_summarize {
+            conversation_text.push_str(&format!("{}: {}\n\n", msg.role, msg.text()));
+        }
+
+        let summarization_prompt = format!(
+            "Please provide a concise summary of this conversation. \
+             Focus on key topics discussed, decisions made, and important context. \
+             Keep it under 200 words.\n\n\
+             Conversation:\n{}",
+            conversation_text
+        );
+
+        // Send summarization request to teacher API
+        let request = ProviderRequest {
+            model: String::new(), // Use provider default
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: summarization_prompt,
+                }],
+            }],
+            max_tokens: 1024,
+            tools: None,
+            temperature: None,
+            stream: false,
+        };
+
+        let response = self
+            .fallback_chain
+            .send_message_with_fallback(&request)
+            .await?;
+
+        // Extract summary text from response
+        let summary_text = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if summary_text.is_empty() {
+            anyhow::bail!("Failed to generate conversation summary (empty response)");
+        }
+
+        tracing::debug!("Generated summary: {} chars", summary_text.len());
+
+        // Build compacted conversation:
+        // 1. A single summary message (user role, for context)
+        // 2. All recent messages (to_keep)
+        let mut compacted_messages = Vec::new();
+
+        // Add summary as a user message
+        compacted_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: format!("[Summary of previous conversation]\n\n{}", summary_text),
+            }],
+        });
+
+        // Add recent messages
+        compacted_messages.extend(to_keep.iter().cloned());
+
+        // Replace conversation history with compacted version
+        history.restore_snapshot(compacted_messages);
+
+        tracing::info!(
+            "Conversation compacted: {} → {} messages (saved ~{} tokens)",
+            messages.len(),
+            history.message_count(),
+            to_summarize.iter().map(|m| m.text().len() / 4).sum::<usize>() - summary_text.len() / 4
+        );
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
