@@ -160,12 +160,12 @@ pub fn question_to_dialog(question: &Question) -> crate::cli::tui::Dialog {
         .collect();
 
     if question.multi_select {
-        // Multi-select dialog
-        Dialog::multiselect(question.header.clone(), dialog_options)
+        // Multi-select dialog with custom text option
+        Dialog::multiselect_with_custom(question.header.clone(), dialog_options)
             .with_help(&question.question)
     } else {
-        // Single-select dialog
-        Dialog::select(question.header.clone(), dialog_options)
+        // Single-select dialog with custom text option
+        Dialog::select_with_custom(question.header.clone(), dialog_options)
             .with_help(&question.question)
     }
 }
@@ -204,6 +204,10 @@ pub fn extract_answer(
             } else {
                 Some(labels.join(", "))
             }
+        }
+        DialogResult::CustomText(text) => {
+            // User provided custom text via 'o' key
+            Some(text.clone())
         }
         _ => None,
     }
