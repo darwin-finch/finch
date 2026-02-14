@@ -30,6 +30,8 @@ use crate::cli::messages::{MessageId, MessageRef};
 mod async_input;
 mod dialog;
 mod dialog_widget;
+mod tabbed_dialog;
+mod tabbed_dialog_widget;
 mod input_widget;
 mod scrollback;
 mod shadow_buffer;
@@ -38,6 +40,8 @@ mod status_widget;
 pub use async_input::spawn_input_task;
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
+pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
+pub use tabbed_dialog_widget::TabbedDialogWidget;
 pub use input_widget::render_input_widget;
 pub use scrollback::ScrollbackBuffer;
 pub use shadow_buffer::{ShadowBuffer, diff_buffers, visible_length, extract_visible_chars};
@@ -96,6 +100,8 @@ pub struct TuiRenderer {
     is_active: bool,
     /// Active dialog being displayed (if any)
     pub active_dialog: Option<Dialog>,
+    /// Active tabbed dialog being displayed (if any)
+    pub active_tabbed_dialog: Option<TabbedDialog>,
     /// Text input area for integrated TUI input
     input_textarea: TextArea<'static>,
     /// Command history for up/down arrow navigation
@@ -355,6 +361,7 @@ impl TuiRenderer {
             status_bar,
             is_active: true,
             active_dialog: None,
+            active_tabbed_dialog: None,
             input_textarea: Self::create_clean_textarea(),
             command_history: Self::load_history(), // Load history from disk
             history_index: None,
@@ -585,7 +592,7 @@ impl TuiRenderer {
 
         // Calculate input lines for viewport sizing
         let input_lines = self.input_textarea.lines().len().max(1).min(10) as u16;
-        let has_dialog = self.active_dialog.is_some();
+        let has_dialog = self.active_dialog.is_some() || self.active_tabbed_dialog.is_some();
 
         // Resize viewport if needed BEFORE rendering
         self.resize_viewport_if_needed(input_lines, has_dialog)?;
@@ -612,6 +619,7 @@ impl TuiRenderer {
         self.needs_tui_render = false;
 
         let active_dialog = self.active_dialog.clone();
+        let active_tabbed_dialog = self.active_tabbed_dialog.clone();
         let status_bar = Arc::clone(&self.status_bar);
         let input_textarea = self.input_textarea.clone();
 
@@ -697,6 +705,59 @@ impl TuiRenderer {
                         // Render dialog
                         let dialog_widget = DialogWidget::new(dialog, &self.colors);
                         frame.render_widget(dialog_widget, chunks[1]);
+
+                        // Render status
+                        let status_widget = StatusWidget::new(&status_bar, &self.colors);
+                        frame.render_widget(status_widget, chunks[2]);
+                    } else if let Some(tabbed_dialog) = &active_tabbed_dialog {
+                        // Tabbed dialog mode: Show scrollback context + tabbed dialog
+                        use ratatui::text::Line;
+                        use ratatui::widgets::Paragraph;
+
+                        let total_area = frame.area();
+
+                        // Tabbed dialogs need more space (tabs + question + options + help)
+                        // Estimate: 3 lines (tabs) + 2 lines (question) + N options + 2 (help) + 3 (borders)
+                        let num_options = tabbed_dialog.current_tab().question.options.len();
+                        let base_dialog_height = (3 + 2 + num_options + 2 + 3) as u16;
+
+                        let max_dialog_height = total_area.height.saturating_sub(10);
+                        let dialog_height = base_dialog_height.min(max_dialog_height).max(12);
+
+                        let status_height = 4u16;
+                        let scrollback_height = total_area.height
+                            .saturating_sub(dialog_height)
+                            .saturating_sub(status_height);
+
+                        // Layout: scrollback + tabbed dialog + status
+                        let chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([
+                                Constraint::Length(scrollback_height),
+                                Constraint::Length(dialog_height),
+                                Constraint::Length(status_height),
+                            ])
+                            .split(total_area);
+
+                        // Render scrollback context
+                        let scrollback_messages = self.scrollback.get_visible_messages();
+                        let context_lines: Vec<Line> = scrollback_messages
+                            .iter()
+                            .rev()
+                            .take(scrollback_height as usize)
+                            .rev()
+                            .flat_map(|msg| {
+                                let formatted = msg.format(&self.colors);
+                                formatted.lines().map(|line| Line::raw(line.to_string())).collect::<Vec<_>>()
+                            })
+                            .collect();
+
+                        let scrollback_widget = Paragraph::new(context_lines);
+                        frame.render_widget(scrollback_widget, chunks[0]);
+
+                        // Render tabbed dialog
+                        let tabbed_dialog_widget = TabbedDialogWidget::new(tabbed_dialog, &self.colors);
+                        frame.render_widget(tabbed_dialog_widget, chunks[1]);
 
                         // Render status
                         let status_widget = StatusWidget::new(&status_bar, &self.colors);
@@ -898,49 +959,131 @@ impl TuiRenderer {
         Ok(result)
     }
 
+    /// Show a tabbed dialog and wait for user completion
+    ///
+    /// Displays multiple questions simultaneously with tab navigation.
+    /// Returns TabbedDialogResult (Completed with answers or Cancelled).
+    pub fn show_tabbed_dialog(&mut self, tabbed_dialog: TabbedDialog) -> Result<TabbedDialogResult> {
+        if !self.is_active {
+            anyhow::bail!("Cannot show tabbed dialog when TUI is not active");
+        }
+
+        // Validate terminal size
+        let (_width, height) = crossterm::terminal::size()
+            .context("Failed to get terminal size")?;
+
+        if height < 20 {
+            anyhow::bail!(
+                "Terminal too small for tabbed dialog (need 20+ lines, have {}). Please resize terminal.",
+                height
+            );
+        }
+
+        // Set active tabbed dialog
+        self.active_tabbed_dialog = Some(tabbed_dialog);
+
+        let result = loop {
+            // Render with tabbed dialog overlay
+            self.render()?;
+
+            // Poll for key events (100ms timeout)
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    // Handle the key event
+                    let dialog = self
+                        .active_tabbed_dialog
+                        .as_mut()
+                        .expect("tabbed dialog should exist in show_tabbed_dialog loop");
+
+                    if let Some(dialog_result) = dialog.handle_key_event(key) {
+                        // Dialog returned a result, exit loop
+                        break dialog_result;
+                    }
+
+                    // Force render because dialog state changes
+                    self.needs_tui_render = true;
+                }
+            }
+        };
+
+        // Clean up: remove tabbed dialog
+        self.active_tabbed_dialog = None;
+
+        // Trigger a render to restore normal layout
+        self.render()?;
+
+        Ok(result)
+    }
+
     /// Show LLM-prompted questions and collect answers
     ///
-    /// Displays 1-4 questions sequentially using DialogWidget and collects
-    /// user's answers. Returns AskUserQuestionOutput with all answers.
+    /// Uses tabbed dialog for multiple questions or single dialog for one question.
+    /// Returns AskUserQuestionOutput with all answers.
     pub fn show_llm_question(
         &mut self,
         input: &crate::cli::AskUserQuestionInput,
     ) -> Result<crate::cli::AskUserQuestionOutput> {
         use crate::cli::llm_dialogs;
-        use std::collections::HashMap;
 
         // Validate input
         llm_dialogs::validate_input(input)
             .context("Invalid AskUserQuestion input")?;
 
-        let mut answers = HashMap::new();
+        // Use tabbed dialog for multiple questions
+        if input.questions.len() > 1 {
+            // Create tabbed dialog
+            let tabbed_dialog = TabbedDialog::new(
+                input.questions.clone(),
+                None, // No title for now
+            );
 
-        // Show each question sequentially
-        for question in &input.questions {
-            // Convert to Dialog
-            let dialog = llm_dialogs::question_to_dialog(question);
-
-            // Show dialog and wait for answer
-            let result = self.show_dialog(dialog)
-                .with_context(|| format!("Failed to show question: {}", question.question))?;
+            // Show tabbed dialog and wait for result
+            let result = self.show_tabbed_dialog(tabbed_dialog)
+                .context("Failed to show tabbed dialog")?;
 
             // Check for cancellation
-            if result.is_cancelled() {
-                anyhow::bail!("User cancelled dialog");
+            match result {
+                TabbedDialogResult::Completed(answers) => {
+                    Ok(crate::cli::AskUserQuestionOutput {
+                        questions: input.questions.clone(),
+                        answers,
+                    })
+                }
+                TabbedDialogResult::Cancelled => {
+                    anyhow::bail!("User cancelled dialog")
+                }
+            }
+        } else {
+            // Single question: use regular dialog (fallback)
+            use std::collections::HashMap;
+            let mut answers = HashMap::new();
+
+            for question in &input.questions {
+                // Convert to Dialog
+                let dialog = llm_dialogs::question_to_dialog(question);
+
+                // Show dialog and wait for answer
+                let result = self.show_dialog(dialog)
+                    .with_context(|| format!("Failed to show question: {}", question.question))?;
+
+                // Check for cancellation
+                if result.is_cancelled() {
+                    anyhow::bail!("User cancelled dialog");
+                }
+
+                // Extract answer
+                if let Some(answer) = llm_dialogs::extract_answer(question, &result) {
+                    answers.insert(question.question.clone(), answer);
+                } else {
+                    anyhow::bail!("Failed to extract answer from dialog result");
+                }
             }
 
-            // Extract answer
-            if let Some(answer) = llm_dialogs::extract_answer(question, &result) {
-                answers.insert(question.question.clone(), answer);
-            } else {
-                anyhow::bail!("Failed to extract answer from dialog result");
-            }
+            Ok(crate::cli::AskUserQuestionOutput {
+                questions: input.questions.clone(),
+                answers,
+            })
         }
-
-        Ok(crate::cli::AskUserQuestionOutput {
-            questions: input.questions.clone(),
-            answers,
-        })
     }
 
     /// Read a line of input from the integrated text area
