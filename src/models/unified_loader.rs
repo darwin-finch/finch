@@ -470,12 +470,10 @@ impl UnifiedModelLoader {
 
             (ModelFamily::DeepSeek, _) => {
                 // DeepSeek ONNX models (R1 Distill series)
-                match config.size {
-                    ModelSize::Small => "onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX".to_string(),
-                    ModelSize::Medium => "aless2212/deepseek-coder-7b-instruct-v1.5-onnx-fp16".to_string(),
-                    ModelSize::Large => "aless2212/deepseek-coder-7b-instruct-v1.5-onnx-fp16".to_string(),
-                    ModelSize::XLarge => "aless2212/deepseek-coder-7b-instruct-v1.5-onnx-fp16".to_string(),
-                }
+                // Only 1.5B is available in ONNX format
+                // For larger sizes, recommend switching to Qwen or Phi in the wizard
+                // For now, all sizes use the 1.5B model
+                "onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX".to_string()
             }
 
             // Unsupported combinations will be caught in load_model_variant
