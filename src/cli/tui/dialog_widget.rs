@@ -101,7 +101,8 @@ impl<'a> DialogWidget<'a> {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("> ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
-                    Span::styled(input_text.clone(), Style::default().fg(self.colors.ui.input.to_color())),
+                    // Use dialog option color (cyan) instead of ui.input which might be white
+                    Span::styled(input_text.clone(), Style::default().fg(self.colors.dialog.option.to_color())),
                     Span::styled("█", Style::default().fg(self.colors.ui.cursor.to_color())),
                 ]));
             }
@@ -216,7 +217,8 @@ impl<'a> DialogWidget<'a> {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     Span::styled("> ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
-                    Span::styled(input_text.clone(), Style::default().fg(self.colors.ui.input.to_color())),
+                    // Use dialog option color (cyan) instead of ui.input which might be white
+                    Span::styled(input_text.clone(), Style::default().fg(self.colors.dialog.option.to_color())),
                     Span::styled("█", Style::default().fg(self.colors.ui.cursor.to_color())),
                 ]));
             }
