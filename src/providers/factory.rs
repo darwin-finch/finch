@@ -84,14 +84,21 @@ fn create_provider_from_entry(entry: &TeacherEntry) -> Result<Box<dyn LlmProvide
     }
 }
 
-/// Create the active teacher provider (first in teacher list)
+/// Create a fallback chain with all teachers in priority order
 ///
-/// This is the primary teacher that the local model will learn from.
+/// The first teacher is the primary provider, additional teachers are fallbacks.
+/// If the primary fails, the system will try the next teacher automatically.
 pub fn create_provider(teachers: &[TeacherEntry]) -> Result<Box<dyn LlmProvider>> {
-    teachers
-        .first()
-        .ok_or_else(|| anyhow!("No teacher providers configured"))
-        .and_then(|entry| create_provider_from_entry(entry))
+    let providers = create_providers(teachers)?;
+
+    if providers.len() == 1 {
+        // Single provider - return directly (no fallback needed)
+        Ok(providers.into_iter().next().unwrap())
+    } else {
+        // Multiple providers - wrap in fallback chain
+        use super::FallbackChain;
+        Ok(Box::new(FallbackChain::new(providers)))
+    }
 }
 
 #[cfg(test)]

@@ -84,7 +84,10 @@ impl AdapterRegistry {
     pub fn get_adapter(model_name: &str) -> Box<dyn LocalModelAdapter> {
         let name_lower = model_name.to_lowercase();
 
-        if name_lower.contains("qwen") {
+        // Check DeepSeek BEFORE Qwen, since "DeepSeek-R1-Distill-Qwen" contains both
+        if name_lower.contains("deepseek") {
+            Box::new(DeepSeekAdapter)
+        } else if name_lower.contains("qwen") {
             Box::new(QwenAdapter)
         } else if name_lower.contains("llama") {
             Box::new(LlamaAdapter)
@@ -92,8 +95,6 @@ impl AdapterRegistry {
             Box::new(MistralAdapter)
         } else if name_lower.contains("phi") {
             Box::new(PhiAdapter)
-        } else if name_lower.contains("deepseek") {
-            Box::new(DeepSeekAdapter)
         } else if name_lower.contains("gemma") {
             // Gemma uses similar format to Llama
             Box::new(LlamaAdapter)
@@ -173,6 +174,11 @@ mod tests {
 
         let deepseek = AdapterRegistry::get_adapter("deepseek-coder-6.7b-instruct");
         assert_eq!(deepseek.family_name(), "DeepSeek");
+
+        // Test DeepSeek-R1-Distill-Qwen (contains both "deepseek" and "qwen")
+        // Should match DeepSeek, not Qwen
+        let deepseek_qwen = AdapterRegistry::get_adapter("DeepSeek-R1-Distill-Qwen-1.5B-ONNX");
+        assert_eq!(deepseek_qwen.family_name(), "DeepSeek");
     }
 
     #[test]

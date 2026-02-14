@@ -32,7 +32,8 @@ impl LocalModelAdapter for DeepSeekAdapter {
     }
 
     fn clean_output(&self, raw_output: &str) -> String {
-        // Remove DeepSeek template markers and clean output
+        // Remove DeepSeek template markers, ChatML tokens, and reasoning markers
+        // DeepSeek-R1-Distill-Qwen uses a mix of DeepSeek, ChatML, and reasoning tokens
         let mut cleaned = raw_output
             .split("<｜end▁of▁sentence｜>")
             .next()
@@ -40,11 +41,32 @@ impl LocalModelAdapter for DeepSeekAdapter {
             .split("</s>")
             .next()
             .unwrap_or(raw_output)
+            .split("</think>")
+            .next()
+            .unwrap_or(raw_output)
+            .split("<|im_end|>")
+            .next()
+            .unwrap_or(raw_output)
+            .split("<|endoftext|>")
+            .next()
+            .unwrap_or(raw_output)
             .trim()
             .to_string();
 
         // Remove template markers if they appear in output
-        for marker in &["<｜begin▁of▁sentence｜>", "### Instruction:", "### Response:"] {
+        // Include both DeepSeek-specific markers and ChatML/reasoning tokens
+        for marker in &[
+            "<｜begin▁of▁sentence｜>",
+            "<｜end▁of▁sentence｜>",
+            "### Instruction:",
+            "### Response:",
+            "<think>",
+            "</think>",
+            "<|im_start|>user",
+            "<|im_start|>system",
+            "<|im_start|>assistant",
+            "<|im_end|>",
+        ] {
             if let Some(idx) = cleaned.find(marker) {
                 if marker == &"### Response:" {
                     // Keep content after "### Response:"

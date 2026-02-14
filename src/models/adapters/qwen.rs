@@ -40,8 +40,13 @@ impl LocalModelAdapter for QwenAdapter {
                 .split("<|endoftext|>")
                 .next()
                 .unwrap_or(raw_output)
+                .split("<｜end▁of▁sentence｜>")
+                .next()
+                .unwrap_or(raw_output)
                 .replace("<|im_start|>assistant\n", "")
                 .replace("<|im_start|>assistant", "")
+                .replace("<think>", "")
+                .replace("</think>", "")
                 .trim()
                 .to_string();
         }
@@ -55,12 +60,18 @@ impl LocalModelAdapter for QwenAdapter {
             cleaned = &cleaned[last_assistant_start + 22..]; // Skip "<|im_start|>assistant\n"
         }
 
-        // Remove end markers
+        // Remove end markers (ChatML + DeepSeek + reasoning)
         cleaned = cleaned
             .split("<|im_end|>")
             .next()
             .unwrap_or(cleaned)
             .split("<|endoftext|>")
+            .next()
+            .unwrap_or(cleaned)
+            .split("<｜end▁of▁sentence｜>")
+            .next()
+            .unwrap_or(cleaned)
+            .split("</think>")
             .next()
             .unwrap_or(cleaned)
             .trim();
@@ -76,12 +87,20 @@ impl LocalModelAdapter for QwenAdapter {
             cleaned = &cleaned[last_assistant_pos + 10..]; // "assistant ".len() = 10
         }
 
-        // Step 3: Remove embedded role patterns that might appear in the middle
+        // Step 3: Remove embedded role patterns and special tokens
         // Replace patterns like "\nuser\n", "\nsystem\n", "\nassistant\n" with just "\n"
+        // Also remove DeepSeek BOS tokens and ChatML markers
         let mut temp = cleaned.to_string();
         temp = temp.replace("\nuser\n", "\n");
         temp = temp.replace("\nsystem\n", "\n");
         temp = temp.replace("\nassistant\n", "\n");
+        temp = temp.replace("<｜begin▁of▁sentence｜>", "");
+        temp = temp.replace("<｜end▁of▁sentence｜>", "");
+        temp = temp.replace("<think>", "");
+        temp = temp.replace("</think>", "");
+        temp = temp.replace("<|im_start|>user", "");
+        temp = temp.replace("<|im_start|>system", "");
+        temp = temp.replace("<|im_start|>assistant", "");
         cleaned = &temp;
 
         // Step 4: Remove leading role names (if any remain after above steps)

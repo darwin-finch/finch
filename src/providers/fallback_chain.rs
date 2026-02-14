@@ -128,6 +128,45 @@ impl FallbackChain {
     }
 }
 
+// Implement LlmProvider trait for FallbackChain
+#[async_trait::async_trait]
+impl LlmProvider for FallbackChain {
+    async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+        self.send_message_with_fallback(request).await
+    }
+
+    async fn send_message_stream(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+        self.send_message_stream_with_fallback(request).await
+    }
+
+    fn name(&self) -> &str {
+        self.primary_provider()
+            .map(|p| p.name())
+            .unwrap_or("FallbackChain")
+    }
+
+    fn default_model(&self) -> &str {
+        self.primary_provider()
+            .map(|p| p.default_model())
+            .unwrap_or("default")
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.primary_provider()
+            .map(|p| p.supports_streaming())
+            .unwrap_or(false)
+    }
+
+    fn supports_tools(&self) -> bool {
+        self.primary_provider()
+            .map(|p| p.supports_tools())
+            .unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
