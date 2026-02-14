@@ -14,6 +14,64 @@ use std::io;
 use crate::config::{BackendDevice, TeacherEntry};
 use crate::models::unified_loader::{ModelFamily, ModelSize};
 
+/// Check if a model family is compatible with a backend device
+fn is_model_available(family: ModelFamily, device: BackendDevice) -> bool {
+    match (family, device) {
+        // CoreML requires pre-converted models
+        #[cfg(target_os = "macos")]
+        (ModelFamily::Qwen2, BackendDevice::CoreML) => true,
+        #[cfg(target_os = "macos")]
+        (ModelFamily::Llama3, BackendDevice::CoreML) => true,
+        #[cfg(target_os = "macos")]
+        (ModelFamily::Gemma2, BackendDevice::CoreML) => true,
+        #[cfg(target_os = "macos")]
+        (ModelFamily::Mistral, BackendDevice::CoreML) => true,
+
+        // Phi and DeepSeek: NO CoreML support
+        #[cfg(target_os = "macos")]
+        (ModelFamily::Phi, BackendDevice::CoreML) => false,
+        #[cfg(target_os = "macos")]
+        (ModelFamily::DeepSeek, BackendDevice::CoreML) => false,
+
+        // Metal/CPU/CUDA: All families supported (via candle/standard repos)
+        _ => true,
+    }
+}
+
+/// Get error message for incompatible model/device combination
+fn get_compatibility_error(family: ModelFamily, device: BackendDevice) -> String {
+    match (family, device) {
+        #[cfg(target_os = "macos")]
+        (ModelFamily::DeepSeek, BackendDevice::CoreML) => {
+            format!(
+                "⚠️  {} models are not available for CoreML.\n\n\
+                 DeepSeek models require standard HuggingFace repositories\n\
+                 which are not compatible with CoreML's .mlpackage format.\n\n\
+                 Please select Metal or CPU as your device,\n\
+                 or choose a different model family (Qwen2, Llama3, Gemma2, or Mistral).",
+                family.name()
+            )
+        }
+        #[cfg(target_os = "macos")]
+        (ModelFamily::Phi, BackendDevice::CoreML) => {
+            format!(
+                "⚠️  {} models are not available for CoreML.\n\n\
+                 Phi models require standard HuggingFace repositories\n\
+                 which are not compatible with CoreML's .mlpackage format.\n\n\
+                 Please select Metal or CPU as your device,\n\
+                 or choose a different model family (Qwen2, Llama3, Gemma2, or Mistral).",
+                family.name()
+            )
+        }
+        _ => format!(
+            "⚠️  {} models are not compatible with {}.\n\n\
+             Please select a different device or model family.",
+            family.name(),
+            device.name()
+        ),
+    }
+}
+
 /// Setup wizard result containing all collected configuration
 pub struct SetupResult {
     pub claude_api_key: String,
@@ -34,6 +92,7 @@ enum WizardStep {
     DeviceSelection(usize),
     ModelFamilySelection(usize),
     ModelSizeSelection(usize),
+    IncompatibleCombination(String), // Error message for incompatible device/family
     ModelPreview, // Show resolved model info before proceeding
     CustomModelRepo(String, BackendDevice), // (repo input, selected device)
     TeacherConfig(Vec<TeacherEntry>, usize), // (teachers list, selected index)
@@ -299,7 +358,34 @@ fn run_wizard_loop(
                             }
                         }
                         KeyCode::Enter => {
-                            step = WizardStep::ModelPreview;
+                            // Check if selected device + model family is compatible
+                            let selected_device = devices[selected_device_idx];
+                            let selected_family = model_families[selected_family_idx];
+
+                            if !is_model_available(selected_family, selected_device) {
+                                // Show error and go back to family selection
+                                let error_msg = get_compatibility_error(selected_family, selected_device);
+                                step = WizardStep::IncompatibleCombination(error_msg);
+                            } else {
+                                step = WizardStep::ModelPreview;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::IncompatibleCombination(_error_msg) => {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('b') => {
+                            // Go back to model family selection to choose a compatible family
+                            step = WizardStep::ModelFamilySelection(selected_family_idx);
+                        }
+                        KeyCode::Char('d') => {
+                            // Go back to device selection to choose a compatible device
+                            step = WizardStep::DeviceSelection(selected_device_idx);
                         }
                         KeyCode::Esc => {
                             anyhow::bail!("Setup cancelled");
@@ -547,6 +633,7 @@ fn render_wizard_step(
         WizardStep::DeviceSelection(selected) => render_device_selection(f, inner, devices, *selected),
         WizardStep::ModelFamilySelection(selected) => render_model_family_selection(f, inner, model_families, *selected),
         WizardStep::ModelSizeSelection(selected) => render_model_size_selection(f, inner, model_sizes, *selected),
+        WizardStep::IncompatibleCombination(error_msg) => render_incompatible_combination(f, inner, error_msg),
         WizardStep::ModelPreview => render_model_preview(f, inner, devices[selected_device_idx], model_families[selected_family_idx], model_sizes[selected_size_idx]),
         WizardStep::CustomModelRepo(input, device) => render_custom_model_repo(f, inner, input, *device),
         WizardStep::TeacherConfig(teachers, selected) => render_teacher_config(f, inner, teachers, *selected),
@@ -899,6 +986,33 @@ fn render_model_size_selection(f: &mut Frame, area: Rect, sizes: &[ModelSize], s
     f.render_stateful_widget(list, chunks[1], &mut list_state);
 
     let help = Paragraph::new("↑/↓: Navigate  Enter: Select  Esc: Cancel")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[2]);
+}
+
+fn render_incompatible_combination(f: &mut Frame, area: Rect, error_msg: &str) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(10),    // Error message
+            Constraint::Length(2),  // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new("⚠️  Incompatible Configuration")
+        .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let error = Paragraph::new(error_msg)
+        .style(Style::default().fg(Color::Yellow))
+        .wrap(Wrap { trim: false })
+        .alignment(Alignment::Left);
+    f.render_widget(error, chunks[1]);
+
+    let help = Paragraph::new("Enter/b: Change Model Family  d: Change Device  Esc: Cancel")
         .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);

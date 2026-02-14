@@ -447,6 +447,49 @@ impl UnifiedModelLoader {
                 "apple/mistral-coreml".to_string()
             }
 
+            // Phi and DeepSeek: NO CoreML support
+            #[cfg(target_os = "macos")]
+            (ModelFamily::Phi, BackendDevice::CoreML) => {
+                anyhow::bail!(
+                    "Phi models are not available for CoreML.\n\
+                     \n\
+                     Phi models require standard HuggingFace repositories\n\
+                     which are not compatible with CoreML's .mlpackage format.\n\
+                     \n\
+                     To fix: Change config.toml:\n\
+                     [backend]\n\
+                     device = \"metal\"  # or \"cpu\"\n\
+                     model_family = \"Phi\"\n\
+                     \n\
+                     OR\n\
+                     \n\
+                     [backend]\n\
+                     device = \"coreml\"\n\
+                     model_family = \"Qwen2\"  # or \"Llama3\", \"Gemma2\", \"Mistral\""
+                )
+            }
+
+            #[cfg(target_os = "macos")]
+            (ModelFamily::DeepSeek, BackendDevice::CoreML) => {
+                anyhow::bail!(
+                    "DeepSeek models are not available for CoreML.\n\
+                     \n\
+                     DeepSeek models require standard HuggingFace repositories\n\
+                     which are not compatible with CoreML's .mlpackage format.\n\
+                     \n\
+                     To fix: Change config.toml:\n\
+                     [backend]\n\
+                     device = \"metal\"  # or \"cpu\"\n\
+                     model_family = \"DeepSeek\"\n\
+                     \n\
+                     OR\n\
+                     \n\
+                     [backend]\n\
+                     device = \"coreml\"\n\
+                     model_family = \"Qwen2\"  # or \"Llama3\", \"Gemma2\", \"Mistral\""
+                )
+            }
+
             // Standard Candle-compatible repos
             (ModelFamily::Qwen2, _) => {
                 format!("Qwen/Qwen2.5-{}-Instruct", size_str)
@@ -466,6 +509,25 @@ impl UnifiedModelLoader {
                     "mistralai/Mistral-22B-Instruct-v0.3".to_string()
                 } else {
                     "mistralai/Mistral-7B-Instruct-v0.3".to_string()
+                }
+            }
+
+            (ModelFamily::Phi, _) => {
+                // Phi models (different naming)
+                match config.size {
+                    ModelSize::Small => "microsoft/phi-2".to_string(),
+                    ModelSize::Medium => "microsoft/Phi-3-mini-4k-instruct".to_string(),
+                    ModelSize::Large | ModelSize::XLarge => "microsoft/Phi-3-medium-4k-instruct".to_string(),
+                }
+            }
+
+            (ModelFamily::DeepSeek, _) => {
+                // DeepSeek Coder models
+                match config.size {
+                    ModelSize::Small => "deepseek-ai/deepseek-coder-1.3b-instruct".to_string(),
+                    ModelSize::Medium => "deepseek-ai/deepseek-coder-6.7b-instruct".to_string(),
+                    ModelSize::Large => "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct".to_string(),
+                    ModelSize::XLarge => "deepseek-ai/deepseek-coder-33b-instruct".to_string(),
                 }
             }
 
