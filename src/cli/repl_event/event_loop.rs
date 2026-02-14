@@ -317,12 +317,23 @@ impl EventLoop {
                         let current_mode = self.mode.read().await.clone();
                         match current_mode {
                             ReplMode::Normal => {
-                                // Already in normal mode, show info about automatic plan mode
+                                // Enter plan mode manually
+                                let plan_path = std::env::temp_dir().join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+                                let new_mode = ReplMode::Planning {
+                                    task: "Manual exploration".to_string(),
+                                    plan_path: plan_path.clone(),
+                                    created_at: chrono::Utc::now(),
+                                };
+                                *self.mode.write().await = new_mode.clone();
                                 self.output_manager.write_info(
-                                    "ℹ️  Plan mode is now automatic. Just ask Claude to create a plan:\n\
-                                     Example: 'Please create a plan to add authentication'\n\
-                                     Claude will use the EnterPlanMode and PresentPlan tools automatically."
+                                    "📋 Entered plan mode.\n\
+                                     You can explore the codebase using read-only tools:\n\
+                                     - Read files, glob, grep, web_fetch are allowed\n\
+                                     - Write, edit, bash are restricted\n\
+                                     Use /plan to exit plan mode."
                                 );
+                                // Update status bar indicator
+                                self.update_plan_mode_indicator(&new_mode);
                             }
                             ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
                                 // Exit plan mode, return to normal
