@@ -242,7 +242,7 @@ impl Repl {
         let streaming_enabled = config.streaming_enabled;
 
         // Generate tool definitions from registry
-        let mut tool_definitions: Vec<ToolDefinition> = tool_executor
+        let tool_definitions: Vec<ToolDefinition> = tool_executor
             .lock()
             .await
             .registry()
@@ -250,58 +250,6 @@ impl Repl {
             .into_iter()
             .map(|tool| tool.definition())
             .collect();
-
-        // Add AskUserQuestion tool (handled specially in event loop, not in ToolExecutor)
-        tool_definitions.push(ToolDefinition {
-            name: "AskUserQuestion".to_string(),
-            description: "Ask the user questions with structured options to clarify requirements or gather preferences. Use this when you need the user to choose between specific options or provide structured input. Shows interactive dialogs with 1-4 questions, each with 2-4 options.".to_string(),
-            input_schema: crate::tools::types::ToolInputSchema {
-                schema_type: "object".to_string(),
-                properties: serde_json::json!({
-                    "questions": {
-                        "type": "array",
-                        "description": "Questions to ask (1-4 questions)",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question": {
-                                    "type": "string",
-                                    "description": "The question to ask the user"
-                                },
-                                "header": {
-                                    "type": "string",
-                                    "description": "Short header for display (max 12 chars)"
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "description": "Available options (2-4 options)",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": {
-                                                "type": "string",
-                                                "description": "Display label for this option"
-                                            },
-                                            "description": {
-                                                "type": "string",
-                                                "description": "Description of what this option means"
-                                            }
-                                        },
-                                        "required": ["label", "description"]
-                                    }
-                                },
-                                "multi_select": {
-                                    "type": "boolean",
-                                    "description": "Whether user can select multiple options (default: false)"
-                                }
-                            },
-                            "required": ["question", "header", "options"]
-                        }
-                    }
-                }),
-                required: vec!["questions".to_string()],
-            },
-        });
 
         // Get global OutputManager and StatusBar (created in main.rs)
         // DO NOT create new instances - that would break stdout control!
