@@ -138,6 +138,30 @@ impl AgentServer {
 
         tracing::info!("Training worker spawned");
 
+        // Monitor generator state and inject model when ready
+        let local_gen_clone = Arc::clone(&self.local_generator);
+        let state_monitor = Arc::clone(&self.generator_state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                let state = state_monitor.read().await;
+                if let GeneratorState::Ready { model, .. } = &*state {
+                    // Inject model into LocalGenerator
+                    let mut gen = local_gen_clone.write().await;
+                    *gen = LocalGenerator::with_models(Some(Arc::clone(model)));
+
+                    tracing::info!("✓ Model ready - local generation enabled");
+                    break; // Stop monitoring once injected
+                } else if matches!(
+                    *state,
+                    GeneratorState::Failed { .. } | GeneratorState::NotAvailable
+                ) {
+                    break; // Stop monitoring on failure
+                }
+            }
+        });
+
         // Create application state
         let app_state = Arc::new(self);
 
