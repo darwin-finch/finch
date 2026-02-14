@@ -247,15 +247,6 @@ impl UnifiedModelLoader {
     pub fn load(&self, config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
         tracing::info!("Loading model: {:?} {:?} on {:?}", config.family, config.size, config.backend);
 
-        // Phase 5: Currently only Qwen2 is supported via ONNX
-        // Other families will be added as ONNX models become available
-        if config.family != ModelFamily::Qwen2 {
-            anyhow::bail!(
-                "Only Qwen2 models are currently supported via ONNX.\n\
-                 Other families (Gemma2, Llama3, Mistral) will be added soon."
-            );
-        }
-
         // Convert unified ModelLoadConfig to OnnxLoadConfig
         let onnx_config = self.to_onnx_config(&config)?;
 
@@ -285,14 +276,11 @@ impl UnifiedModelLoader {
             ModelSize::XLarge => OnnxModelSize::XLarge,  // 7B (max for ONNX currently)
         };
 
-        // Build model name based on family and size
-        let model_name = if let Some(ref repo) = config.repo_override {
-            // Extract model name from custom repo (e.g., "user/model-name" → "model-name")
-            repo.split('/').last().unwrap_or(repo).to_string()
-        } else {
-            // Standard naming for Qwen2
-            format!("Qwen2.5-{}-Instruct", onnx_size.to_string())
-        };
+        // Resolve HuggingFace repository ID based on family and size
+        let repo_id = self.resolve_repository(config)?;
+
+        // Extract model name from repo ID (e.g., "onnx-community/Qwen2.5-1.5B-Instruct" → "Qwen2.5-1.5B-Instruct")
+        let model_name = repo_id.split('/').last().unwrap_or(&repo_id).to_string();
 
         // Map BackendDevice to execution providers
         use super::loaders::onnx_config::ExecutionProvider;
@@ -329,6 +317,7 @@ impl UnifiedModelLoader {
 
         Ok(OnnxLoadConfig {
             model_name,
+            repo_id,
             size: onnx_size,
             cache_dir,
             execution_providers,

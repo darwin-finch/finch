@@ -52,6 +52,9 @@ pub struct OnnxLoadConfig {
     /// Model name (e.g., "Qwen2.5-1.5B-Instruct")
     pub model_name: String,
 
+    /// HuggingFace repository ID (e.g., "onnx-community/Qwen2.5-1.5B-Instruct")
+    pub repo_id: String,
+
     /// Model size variant
     pub size: ModelSize,
 
@@ -68,9 +71,12 @@ impl OnnxLoadConfig {
     pub fn from_system_ram(cache_dir: PathBuf) -> Self {
         let ram_gb = sysinfo::System::new_all().total_memory() / (1024 * 1024 * 1024);
         let size = ModelSize::from_ram(ram_gb as usize);
+        let model_name = format!("Qwen2.5-{}-Instruct", size.to_string());
+        let repo_id = format!("onnx-community/{}", model_name);
 
         Self {
-            model_name: format!("Qwen2.5-{}-Instruct", size.to_string()),
+            model_name,
+            repo_id,
             size,
             cache_dir,
             execution_providers: None,
@@ -79,8 +85,12 @@ impl OnnxLoadConfig {
 
     /// Create config for specific model size
     pub fn with_size(size: ModelSize, cache_dir: PathBuf) -> Self {
+        let model_name = format!("Qwen2.5-{}-Instruct", size.to_string());
+        let repo_id = format!("onnx-community/{}", model_name);
+
         Self {
-            model_name: format!("Qwen2.5-{}-Instruct", size.to_string()),
+            model_name,
+            repo_id,
             size,
             cache_dir,
             execution_providers: None,
@@ -89,7 +99,7 @@ impl OnnxLoadConfig {
 
     /// Get HuggingFace repository ID for ONNX models
     pub fn huggingface_repo(&self) -> String {
-        format!("onnx-community/Qwen2.5-{}-Instruct", self.size.to_string())
+        self.repo_id.clone()
     }
 }
 
