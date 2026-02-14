@@ -102,8 +102,7 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 
 **Summary:**
 - 32 total items (14 original + 18 new suggestions)
-- 28/32 complete (87.5%) ✅
-- 1 INCOMPLETE (Auto-compaction - partial)
+- 29/32 complete (90.6%) ✅
 - 2 BLOCKED (Mistral support, LoRA adapter loading)
 - 1 OPTIONAL (Additional adapters - in progress)
 - Phase 1: Quick wins (5 items, 1-2h each) ⚡ - 5/5 COMPLETE ✅
@@ -217,16 +216,18 @@ See `docs/ROADMAP.md` for detailed implementation plans.
    - Files: `src/cli/tui/mod.rs` (update_ghost_text), `src/cli/tui/async_input.rs`, `src/cli/tui/input_widget.rs`
    - Effort: 2-3 hours (actual)
 
-12. **[~] Conversation auto-compaction** (NEW) 🟡 PARTIAL - UI Complete, Backend Pending
+12. **[x] Conversation auto-compaction** (NEW) ✅ COMPLETE
    - Status bar display for compaction info implemented (commit a18ced0)
-   - Backend logic NOT YET implemented (no ConversationCompactor struct)
-   - TODO: Implement actual conversation compaction logic
-     - Automatically compact conversation history when it gets too long
-     - Summarize older messages to reduce token usage
-     - Configurable compaction threshold (e.g., 20k tokens)
-     - Uses Claude API to generate summaries
-   - Files: `src/conversation/mod.rs`, `src/config/settings.rs`
-   - Effort: 1-2 hours remaining (UI done, backend needed)
+   - Backend logic implemented (commit 97a1479)
+   - ConversationCompactor struct with full functionality:
+     - Automatically summarizes older messages when conversation grows too large
+     - Keeps recent messages intact (configurable, default: 4 messages)
+     - Uses teacher API (Claude/GPT-4/etc.) to generate summaries
+     - Threshold-based triggering (default: 80% of max tokens)
+     - Async API with should_compact() check
+   - Integration point documented in code (src/cli/repl_event/event_loop.rs)
+   - Files: `src/cli/conversation.rs`
+   - Effort: 2 hours (actual)
 
 ### Phase 3: Moderate Complexity (3-6 hours each)
 
