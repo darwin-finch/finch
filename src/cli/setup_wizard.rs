@@ -99,6 +99,8 @@ fn run_wizard_loop(
         ModelFamily::Gemma2,
         ModelFamily::Llama3,
         ModelFamily::Mistral,
+        ModelFamily::Phi,
+        ModelFamily::DeepSeek,
     ];
     let mut selected_family_idx = existing_config
         .map(|c| {
@@ -1012,6 +1014,36 @@ fn render_model_preview(f: &mut Frame, area: Rect, device: BackendDevice, family
                 ("22B parameters", "~44 GB", "64+ GB")
             } else {
                 ("7B parameters", "~14 GB", "32 GB")
+            };
+            (repo, params, dl, ram)
+        }
+
+        (ModelFamily::Phi, _) => {
+            let repo = match size {
+                ModelSize::Small => "microsoft/phi-2".to_string(),
+                ModelSize::Medium => "microsoft/Phi-3-mini-4k-instruct".to_string(),
+                ModelSize::Large | ModelSize::XLarge => "microsoft/Phi-3-medium-4k-instruct".to_string(),
+            };
+            let (params, dl, ram) = match size {
+                ModelSize::Small => ("2.7B parameters", "~5 GB", "8-16 GB"),
+                ModelSize::Medium => ("3.8B parameters", "~8 GB", "16-32 GB"),
+                _ => ("14B parameters", "~28 GB", "32-64 GB"),
+            };
+            (repo, params, dl, ram)
+        }
+
+        (ModelFamily::DeepSeek, _) => {
+            let repo = match size {
+                ModelSize::Small => "deepseek-ai/deepseek-coder-1.3b-instruct".to_string(),
+                ModelSize::Medium => "deepseek-ai/deepseek-coder-6.7b-instruct".to_string(),
+                ModelSize::Large => "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct".to_string(),
+                ModelSize::XLarge => "deepseek-ai/deepseek-coder-33b-instruct".to_string(),
+            };
+            let (params, dl, ram) = match size {
+                ModelSize::Small => ("1.3B parameters", "~3 GB", "8-16 GB"),
+                ModelSize::Medium => ("6.7B parameters", "~13 GB", "16-32 GB"),
+                ModelSize::Large => ("16B parameters", "~32 GB", "32-64 GB"),
+                ModelSize::XLarge => ("33B parameters", "~66 GB", "64+ GB"),
             };
             (repo, params, dl, ram)
         }

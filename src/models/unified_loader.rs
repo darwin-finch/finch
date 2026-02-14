@@ -39,6 +39,10 @@ pub enum ModelFamily {
     Llama3,
     /// Mistral series (7B, 22B)
     Mistral,
+    /// Microsoft Phi series (2B, 3.8B, 14B)
+    Phi,
+    /// DeepSeek Coder series (1.3B, 6.7B, 33B)
+    DeepSeek,
 }
 
 impl ModelFamily {
@@ -49,6 +53,8 @@ impl ModelFamily {
             Self::Gemma2 => "Gemma 2",
             Self::Llama3 => "Llama 3",
             Self::Mistral => "Mistral",
+            Self::Phi => "Phi",
+            Self::DeepSeek => "DeepSeek",
         }
     }
 
@@ -59,6 +65,8 @@ impl ModelFamily {
             Self::Gemma2 => "Gemma 2 - Google's model, good for chat",
             Self::Llama3 => "Llama 3 - Meta's model, popular choice",
             Self::Mistral => "Mistral - Efficient 7B model",
+            Self::Phi => "Phi - Microsoft's compact model, efficient",
+            Self::DeepSeek => "DeepSeek - Specialized for coding tasks",
         }
     }
 }
@@ -113,6 +121,18 @@ impl ModelSize {
             (ModelFamily::Mistral, Self::Medium) => "7B",
             (ModelFamily::Mistral, Self::Large) => "22B",
             (ModelFamily::Mistral, Self::XLarge) => "22B",
+
+            // Phi: 2B (Phi-2), 3.8B (Phi-3-mini), 14B (Phi-3-medium)
+            (ModelFamily::Phi, Self::Small) => "2B",
+            (ModelFamily::Phi, Self::Medium) => "3.8B",
+            (ModelFamily::Phi, Self::Large) => "14B",
+            (ModelFamily::Phi, Self::XLarge) => "14B",
+
+            // DeepSeek: 1.3B, 6.7B, 16B (V2-Lite), 33B
+            (ModelFamily::DeepSeek, Self::Small) => "1.3B",
+            (ModelFamily::DeepSeek, Self::Medium) => "6.7B",
+            (ModelFamily::DeepSeek, Self::Large) => "16B",
+            (ModelFamily::DeepSeek, Self::XLarge) => "33B",
         }
     }
 
