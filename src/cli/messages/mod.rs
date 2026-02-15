@@ -67,6 +67,12 @@ pub trait Message: Send + Sync {
 
     /// Get the raw content (without formatting, for change detection)
     fn content(&self) -> String;
+
+    /// Get the background style for this message type (for TUI rendering)
+    /// Returns None for default (no background)
+    fn background_style(&self) -> Option<ratatui::style::Style> {
+        None // Default: no background
+    }
 }
 
 /// Type alias for a shared message reference

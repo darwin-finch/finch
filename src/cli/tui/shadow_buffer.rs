@@ -87,7 +87,7 @@ impl ShadowBuffer {
 
     /// Write a line to the buffer at row y, handling wrapping
     /// Returns number of rows consumed
-    fn write_line(&mut self, y: usize, line: &str) -> usize {
+    fn write_line(&mut self, y: usize, line: &str, style: Style) -> usize {
         if y >= self.height {
             return 0;
         }
@@ -104,14 +104,14 @@ impl ShadowBuffer {
         let num_rows = (visible_chars.len() + chars_per_row - 1) / chars_per_row;
         let num_rows = num_rows.min(self.height - y); // Don't exceed buffer
 
-        // Write wrapped chunks
+        // Write wrapped chunks with style
         for row_idx in 0..num_rows {
             let start = row_idx * chars_per_row;
             let end = (start + chars_per_row).min(visible_chars.len());
             let chunk = &visible_chars[start..end];
 
             for (col_idx, &ch) in chunk.iter().enumerate() {
-                self.set(col_idx, y + row_idx, Cell::new(ch));
+                self.set(col_idx, y + row_idx, Cell { ch, style });
             }
         }
 
@@ -124,12 +124,13 @@ impl ShadowBuffer {
         // Clear buffer first
         self.clear();
 
-        // Format all messages and collect lines
-        let mut all_lines: Vec<String> = Vec::new();
+        // Format all messages and collect lines with their styles
+        let mut all_lines: Vec<(String, Style)> = Vec::new(); // (line_text, style)
         for msg in messages {
             let formatted = msg.format(colors);
+            let style = msg.background_style().unwrap_or_default();
             for line in formatted.lines() {
-                all_lines.push(line.to_string());
+                all_lines.push((line.to_string(), style));
             }
         }
 
@@ -141,7 +142,7 @@ impl ShadowBuffer {
         let mut total_rows_needed = 0;
         let mut line_row_counts: Vec<usize> = Vec::new();
 
-        for line in &all_lines {
+        for (line, _style) in &all_lines {
             let visible_len = visible_length(line);
             let rows = if visible_len == 0 {
                 1
@@ -153,15 +154,15 @@ impl ShadowBuffer {
         }
 
         // Bottom-align: determine which lines to render
-        let mut lines_to_render: Vec<(usize, &String)> = Vec::new(); // (line_idx, line_text)
+        let mut lines_to_render: Vec<(usize, &String, Style)> = Vec::new(); // (line_idx, line_text, style)
         let mut accumulated_rows = 0;
 
         // Walk backwards from last line
-        for (line_idx, (line, row_count)) in all_lines.iter().zip(&line_row_counts).enumerate().rev() {
+        for (line_idx, ((line, style), row_count)) in all_lines.iter().zip(&line_row_counts).enumerate().rev() {
             if accumulated_rows + row_count > self.height {
                 break; // Can't fit more
             }
-            lines_to_render.push((line_idx, line));
+            lines_to_render.push((line_idx, line, *style));
             accumulated_rows += row_count;
         }
 
@@ -170,10 +171,10 @@ impl ShadowBuffer {
         // Calculate starting row (bottom-aligned)
         let start_row = self.height.saturating_sub(accumulated_rows);
 
-        // Render lines
+        // Render lines with their styles
         let mut current_y = start_row;
-        for (_line_idx, line) in lines_to_render {
-            let rows_consumed = self.write_line(current_y, line);
+        for (_line_idx, line, style) in lines_to_render {
+            let rows_consumed = self.write_line(current_y, line, style);
             current_y += rows_consumed;
         }
     }

@@ -68,16 +68,11 @@ impl Message for UserQueryMessage {
     }
 
     fn format(&self, colors: &ColorScheme) -> String {
-        use crossterm::style::{Color, Attribute, SetForegroundColor, SetBackgroundColor, ResetColor};
-
-        // Grey background for user messages (like Claude Code)
-        // Use RGB(220, 220, 220) for light grey background with black text
         format!(
-            "{}{} ❯ {}{}",
-            SetBackgroundColor(Color::Rgb { r: 220, g: 220, b: 220 }),
-            SetForegroundColor(Color::Black),
+            "{} ❯ {}{}",
+            color_to_ansi(&colors.messages.user),
             self.content,
-            ResetColor
+            RESET
         )
     }
 
@@ -87,6 +82,14 @@ impl Message for UserQueryMessage {
 
     fn content(&self) -> String {
         self.content.clone()
+    }
+
+    fn background_style(&self) -> Option<ratatui::style::Style> {
+        use ratatui::style::{Color, Style};
+        // Grey background for user messages (like Claude Code)
+        Some(Style::default()
+            .bg(Color::Rgb(220, 220, 220))
+            .fg(Color::Black))
     }
 }
 
