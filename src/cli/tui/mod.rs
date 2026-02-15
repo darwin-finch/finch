@@ -865,20 +865,20 @@ impl TuiRenderer {
         }
 
         // Write new messages to terminal scrollback using insert_before()
-        // Note: ANSI codes are stripped for scrollback (ratatui limitation)
         if !new_messages.is_empty() {
-            // Format and strip ANSI codes for scrollback
-            let mut lines = Vec::new();
+            // Format messages with their styles
+            let mut lines: Vec<(String, ratatui::style::Style)> = Vec::new();
             for (idx, msg) in new_messages.iter().enumerate() {
                 let formatted = msg.format(&self.colors);
                 // Strip ANSI codes for plain text display
                 let plain_text = strip_ansi_codes(&formatted);
+                let style = msg.background_style().unwrap_or_default();
                 for line in plain_text.lines() {
-                    lines.push(line.to_string());
+                    lines.push((line.to_string(), style));
                 }
                 // Add blank line between messages (not after the last one)
                 if idx < new_messages.len() - 1 {
-                    lines.push(String::new());
+                    lines.push((String::new(), ratatui::style::Style::default()));
                 }
             }
 
@@ -886,9 +886,9 @@ impl TuiRenderer {
 
             // Use insert_before to properly manage viewport
             self.terminal.insert_before(num_lines, |buf| {
-                for (i, line) in lines.iter().enumerate() {
+                for (i, (line, style)) in lines.iter().enumerate() {
                     if i < buf.area.height as usize {
-                        buf.set_string(0, i as u16, line, ratatui::style::Style::default());
+                        buf.set_string(0, i as u16, line, *style);
                     }
                 }
             })?;
