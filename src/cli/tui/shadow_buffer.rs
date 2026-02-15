@@ -32,6 +32,11 @@ impl Cell {
     fn empty() -> Self {
         Self::new(' ')
     }
+
+    /// Create empty cell with specific style (preserves background)
+    fn empty_with_style(style: Style) -> Self {
+        Self { ch: ' ', style }
+    }
 }
 
 /// 2D shadow buffer for terminal rendering
@@ -62,10 +67,11 @@ impl ShadowBuffer {
         self.cells = vec![vec![Cell::empty(); width]; height];
     }
 
-    /// Clear the buffer (fill with spaces)
+    /// Clear the buffer (reset all cells to default)
     pub fn clear(&mut self) {
         for row in &mut self.cells {
             for cell in row {
+                // Reset BOTH character AND style
                 *cell = Cell::empty();
             }
         }
@@ -110,8 +116,15 @@ impl ShadowBuffer {
             let end = (start + chars_per_row).min(visible_chars.len());
             let chunk = &visible_chars[start..end];
 
+            // Write actual characters
             for (col_idx, &ch) in chunk.iter().enumerate() {
                 self.set(col_idx, y + row_idx, Cell { ch, style });
+            }
+
+            // Fill remaining cells in row with spaces (but preserve background style)
+            // This ensures the background extends to the full width
+            for col_idx in chunk.len()..chars_per_row {
+                self.set(col_idx, y + row_idx, Cell { ch: ' ', style });
             }
         }
 
@@ -160,7 +173,7 @@ impl ShadowBuffer {
         // Walk backwards from last line
         for (line_idx, ((line, style), row_count)) in all_lines.iter().zip(&line_row_counts).enumerate().rev() {
             if accumulated_rows + row_count > self.height {
-                break; // Can't fit more
+                break; // Stop when can't fit more
             }
             lines_to_render.push((line_idx, line, *style));
             accumulated_rows += row_count;
@@ -169,13 +182,27 @@ impl ShadowBuffer {
         lines_to_render.reverse(); // Restore chronological order
 
         // Calculate starting row (bottom-aligned)
-        let start_row = self.height.saturating_sub(accumulated_rows);
+        let start_row = self.height.saturating_sub(accumulated_rows.min(self.height));
 
-        // Render lines with their styles
+        // Render lines with their styles, handling truncation if needed
         let mut current_y = start_row;
         for (_line_idx, line, style) in lines_to_render {
+            // Check if we have room left
+            let rows_available = self.height.saturating_sub(current_y);
+            if rows_available == 0 {
+                break; // No more room
+            }
+
             let rows_consumed = self.write_line(current_y, line, style);
+
+            // If message was truncated (consumed more rows than available), that's ok
+            // The write_line method already handles this by capping at buffer height
             current_y += rows_consumed;
+
+            // Stop if we've filled the buffer
+            if current_y >= self.height {
+                break;
+            }
         }
     }
 
