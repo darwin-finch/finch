@@ -34,72 +34,88 @@ impl LocalModelAdapter for DeepSeekAdapter {
     fn clean_output(&self, raw_output: &str) -> String {
         // Remove DeepSeek template markers, ChatML tokens, and reasoning markers
         // DeepSeek-R1-Distill-Qwen uses a mix of DeepSeek, ChatML, and reasoning tokens
-        let mut cleaned = raw_output
+
+        let mut cleaned = raw_output.to_string();
+
+        // Step 1: Remove <think>...</think> sections (including nested ones)
+        // Handle reasoning markers first before other processing
+        while let Some(think_start) = cleaned.find("<think>") {
+            if let Some(think_end) = cleaned[think_start..].find("</think>") {
+                let end_pos = think_start + think_end + 8; // 8 = "</think>".len()
+                cleaned = format!("{}{}", &cleaned[..think_start], &cleaned[end_pos..]);
+            } else {
+                // Unclosed <think>, just remove the marker
+                cleaned = cleaned.replace("<think>", "");
+                break;
+            }
+        }
+
+        // Step 2: Find last occurrence of assistant marker (handles template echoing)
+        if let Some(last_assistant_start) = cleaned.rfind("<|im_start|>assistant") {
+            cleaned = cleaned[last_assistant_start + 22..].to_string(); // Skip "<|im_start|>assistant\n"
+        }
+
+        // Step 3: Remove end markers (ChatML + DeepSeek)
+        cleaned = cleaned
             .split("<｜end▁of▁sentence｜>")
             .next()
-            .unwrap_or(raw_output)
+            .unwrap_or(&cleaned)
             .split("</s>")
             .next()
-            .unwrap_or(raw_output)
-            .split("</think>")
-            .next()
-            .unwrap_or(raw_output)
+            .unwrap_or(&cleaned)
             .split("<|im_end|>")
             .next()
-            .unwrap_or(raw_output)
+            .unwrap_or(&cleaned)
             .split("<|endoftext|>")
             .next()
-            .unwrap_or(raw_output)
+            .unwrap_or(&cleaned)
             .trim()
             .to_string();
 
-        // Remove template markers if they appear in output
-        // Include both DeepSeek-specific markers and ChatML/reasoning tokens
-        for marker in &[
-            "<｜begin▁of▁sentence｜>",
-            "<｜end▁of▁sentence｜>",
-            "### Instruction:",
-            "### Response:",
-            "<think>",
-            "</think>",
-            "<|im_start|>user",
-            "<|im_start|>system",
-            "<|im_start|>assistant",
-            "<|im_end|>",
-        ] {
-            if let Some(idx) = cleaned.find(marker) {
-                if marker == &"### Response:" {
-                    // Keep content after "### Response:"
-                    cleaned = cleaned[idx + marker.len()..].trim().to_string();
-                } else {
-                    // Remove the marker
-                    cleaned = cleaned.replace(marker, "").trim().to_string();
-                }
-            }
+        // Step 4: Handle role names as plain text (when treated as regular tokens)
+        // Find the LAST occurrence of "assistant\n" or "assistant " (without special tokens)
+        if let Some(last_assistant_pos) = cleaned.rfind("assistant\n") {
+            // Take everything after "assistant\n"
+            cleaned = cleaned[last_assistant_pos + 10..].to_string(); // "assistant\n".len() = 10
+        } else if let Some(last_assistant_pos) = cleaned.rfind("assistant ") {
+            // Handle "assistant " (space instead of newline)
+            cleaned = cleaned[last_assistant_pos + 10..].to_string(); // "assistant ".len() = 10
         }
 
-        // Handle potential instruction/response pattern in output
-        if cleaned.contains("### Instruction:") && cleaned.contains("### Response:") {
-            // Find the last occurrence of "### Response:" and take content after it
-            if let Some(idx) = cleaned.rfind("### Response:") {
-                cleaned = cleaned[idx + 14..].trim().to_string();
-            }
-        }
+        // Step 5: Remove all remaining special tokens and role markers
+        cleaned = cleaned.replace("\nuser\n", "\n");
+        cleaned = cleaned.replace("\nsystem\n", "\n");
+        cleaned = cleaned.replace("\nassistant\n", "\n");
+        cleaned = cleaned.replace("<｜begin▁of▁sentence｜>", "");
+        cleaned = cleaned.replace("<｜end▁of▁sentence｜>", "");
+        cleaned = cleaned.replace("<|im_start|>user", "");
+        cleaned = cleaned.replace("<|im_start|>system", "");
+        cleaned = cleaned.replace("<|im_start|>assistant", "");
+        cleaned = cleaned.replace("### Instruction:", "");
+        cleaned = cleaned.replace("### Response:", "");
 
-        // Remove any remaining markdown artifacts from code models
-        // DeepSeek-Coder might include code block markers
+        // Step 6: Remove leading role names (if any remain)
+        cleaned = cleaned
+            .trim_start_matches("system")
+            .trim_start_matches("user")
+            .trim_start_matches("assistant")
+            .trim_start_matches('\n')
+            .trim()
+            .to_string();
+
+        // Step 7: Remove markdown code block markers (DeepSeek-Coder specific)
         if cleaned.starts_with("```") {
             let lines: Vec<&str> = cleaned.lines().collect();
             if lines.len() > 2 && lines[0].starts_with("```") {
                 // Check if last line is closing ```
                 if lines.last().map(|l| l.trim()) == Some("```") {
                     // Extract content between markers
-                    cleaned = lines[1..lines.len()-1].join("\n").trim().to_string();
+                    cleaned = lines[1..lines.len()-1].join("\n");
                 }
             }
         }
 
-        cleaned
+        cleaned.trim().to_string()
     }
 
     fn family_name(&self) -> &str {
