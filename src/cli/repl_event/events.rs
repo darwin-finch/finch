@@ -57,18 +57,7 @@ pub enum ReplEvent {
         message: String,
     },
 
-    /// Streaming response started
-    StreamingStarted {
-        query_id: Uuid,
-    },
-
-    /// Streaming response delta
-    StreamingDelta {
-        query_id: Uuid,
-        delta: String,
-    },
-
-    /// Streaming response completed
+    /// Streaming response completed (used for non-streaming path)
     StreamingComplete {
         query_id: Uuid,
         full_response: String,

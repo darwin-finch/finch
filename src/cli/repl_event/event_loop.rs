@@ -76,9 +76,6 @@ pub struct EventLoop {
     /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
     tool_results: Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>,
 
-    /// Streaming messages tracked by query_id
-    streaming_messages: Arc<RwLock<std::collections::HashMap<Uuid, Arc<crate::cli::messages::StreamingResponseMessage>>>>,
-
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
 
@@ -154,7 +151,6 @@ impl EventLoop {
             streaming_enabled,
             tool_coordinator,
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            streaming_messages: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             daemon_client,
@@ -193,8 +189,6 @@ impl EventLoop {
                 // REPL event (query complete, tool result, etc.)
                 Some(event) = self.event_rx.recv() => {
                     let event_name = match &event {
-                        ReplEvent::StreamingStarted { .. } => "StreamingStarted",
-                        ReplEvent::StreamingDelta { .. } => "StreamingDelta",
                         ReplEvent::StreamingComplete { .. } => "StreamingComplete",
                         ReplEvent::QueryComplete { .. } => "QueryComplete",
                         ReplEvent::QueryFailed { .. } => "QueryFailed",
@@ -463,6 +457,7 @@ impl EventLoop {
         let tui_renderer = Arc::clone(&self.tui_renderer);
         let mode = Arc::clone(&self.mode);
         let output_manager = Arc::clone(&self.output_manager);
+        let status_bar = Arc::clone(&self.status_bar);
 
         tokio::spawn(async move {
             Self::process_query_with_tools(
@@ -480,6 +475,7 @@ impl EventLoop {
                 tui_renderer,
                 mode,
                 output_manager,
+                status_bar,
             )
             .await;
         });
@@ -502,6 +498,7 @@ impl EventLoop {
         tui_renderer: Arc<tokio::sync::Mutex<TuiRenderer>>,
         mode: Arc<RwLock<ReplMode>>,
         output_manager: Arc<OutputManager>,
+        status_bar: Arc<crate::cli::StatusBar>,
     ) {
         tracing::debug!("process_query_with_tools starting for query_id: {:?}", query_id);
 
@@ -556,8 +553,6 @@ impl EventLoop {
             // Try streaming first if supported
             if caps.supports_streaming {
                 tracing::debug!("Generator supports streaming, attempting to stream");
-                // Send streaming started event
-                let _ = event_tx.send(ReplEvent::StreamingStarted { query_id });
 
                 match generator
                     .generate_stream(messages.clone(), Some((*tool_definitions).clone()))
@@ -566,6 +561,12 @@ impl EventLoop {
                     Ok(Some(mut rx)) => {
                         tracing::debug!("[EVENT_LOOP] Streaming started, entering receive loop");
                         tracing::debug!("Streaming started successfully");
+
+                        // Create message directly in this task
+                        use crate::cli::messages::StreamingResponseMessage;
+                        let msg = Arc::new(StreamingResponseMessage::new());
+                        output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
+
                         // Process stream (handles tools via StreamChunk::ContentBlockComplete)
                         let mut blocks = Vec::new();
                         let mut text = String::new();
@@ -575,10 +576,8 @@ impl EventLoop {
                                 Ok(StreamChunk::TextDelta(delta)) => {
                                     tracing::debug!("Received TextDelta: {} bytes", delta.len());
                                     text.push_str(&delta);
-                                    let _ = event_tx.send(ReplEvent::StreamingDelta {
-                                        query_id,
-                                        delta,
-                                    });
+                                    // Update message directly - no event needed
+                                    msg.append_chunk(&delta);
                                 }
                                 Ok(StreamChunk::ContentBlockComplete(block)) => {
                                     tracing::debug!("Received ContentBlockComplete: {:?}", block);
@@ -586,6 +585,7 @@ impl EventLoop {
                                 }
                                 Err(e) => {
                                     tracing::error!("Stream error in event loop: {}", e);
+                                    msg.set_failed();
                                     let _ = event_tx.send(ReplEvent::QueryFailed {
                                         query_id,
                                         error: format!("{}", e),
@@ -598,6 +598,9 @@ impl EventLoop {
                         tracing::debug!("[EVENT_LOOP] Stream receive loop ended, {} blocks received", blocks.len());
                         tracing::debug!("Stream receive loop ended");
 
+                        // Mark message as complete
+                        msg.set_complete();
+
                         // Send stats update with basic info (streaming doesn't provide token counts)
                         let _ = event_tx.send(ReplEvent::StatsUpdate {
                             model: "streaming".to_string(),  // TODO: Get actual model name from generator
@@ -606,13 +609,7 @@ impl EventLoop {
                             latency_ms: None,  // TODO: Track timing
                         });
 
-                        tracing::debug!("[EVENT_LOOP] Sending StreamingComplete event");
-                        // Send streaming complete
-                        let _ = event_tx.send(ReplEvent::StreamingComplete {
-                            query_id,
-                            full_response: text.clone(),
-                        });
-                        tracing::debug!("[EVENT_LOOP] StreamingComplete event sent");
+                        tracing::debug!("[EVENT_LOOP] Streaming complete");
 
                         // Extract tools from blocks
                         tracing::debug!("[EVENT_LOOP] Extracting tools from blocks");
@@ -629,6 +626,9 @@ impl EventLoop {
                             .collect();
 
                         tracing::debug!("[EVENT_LOOP] Found {} tool uses", tool_uses.len());
+
+                        // Clear streaming status
+                        status_bar.clear_operation();
 
                         if !tool_uses.is_empty() {
                             tracing::debug!("[EVENT_LOOP] Tools detected, updating query state");
@@ -706,11 +706,19 @@ impl EventLoop {
                             return;
                         }
 
-                        // No tools - StreamingComplete already handled conversation and state
-                        tracing::debug!("[EVENT_LOOP] No tools found, query complete");
-                        tracing::debug!("Query complete (no tools), streaming finished");
-                        tracing::debug!("process_query_with_tools exiting normally");
-                        tracing::debug!("[EVENT_LOOP] process_query_with_tools returning");
+                        // No tools - add assistant message to conversation
+                        tracing::debug!("[EVENT_LOOP] No tools found, adding assistant message to conversation");
+                        conversation
+                            .write()
+                            .await
+                            .add_assistant_message(text.clone());
+
+                        // Update query state
+                        query_states
+                            .update_state(query_id, QueryState::Completed { response: text.clone() })
+                            .await;
+
+                        tracing::debug!("[EVENT_LOOP] Query complete, returning");
                         return;
                     }
                     Ok(None) | Err(_) => {
@@ -899,37 +907,8 @@ impl EventLoop {
                 self.output_manager.write_status(message);
             }
 
-            ReplEvent::StreamingStarted { query_id } => {
-                // Create streaming response message
-                use crate::cli::messages::StreamingResponseMessage;
-                use std::sync::Arc;
-
-                let mut messages = self.streaming_messages.write().await;
-                // Only create if one doesn't exist (avoid duplicates)
-                if !messages.contains_key(&query_id) {
-                    let msg = Arc::new(StreamingResponseMessage::new());
-                    self.output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
-                    messages.insert(query_id, msg);
-                }
-            }
-
-            ReplEvent::StreamingDelta { query_id, delta } => {
-                // Update the streaming message in memory
-                if let Some(msg) = self.streaming_messages.read().await.get(&query_id) {
-                    msg.append_chunk(&delta);
-                    // Content will appear in scrollback via periodic render + full_refresh_viewport()
-                }
-            }
-
             ReplEvent::StreamingComplete { query_id, full_response } => {
-                tracing::debug!("[EVENT_LOOP] Handling StreamingComplete event");
-                // Mark streaming message as complete
-                if let Some(msg) = self.streaming_messages.write().await.remove(&query_id) {
-                    msg.set_complete();
-                    // Message will be written to scrollback on next flush_output_safe()
-                    // since it's now marked Complete
-                }
-                tracing::debug!("[EVENT_LOOP] Streaming message marked complete");
+                tracing::debug!("[EVENT_LOOP] Handling StreamingComplete event (non-streaming path)");
 
                 // Clear streaming status
                 self.status_bar.clear_operation();
@@ -998,11 +977,6 @@ impl EventLoop {
                 };
 
                 if let Some(qid) = query_id {
-                    // Mark streaming message as cancelled
-                    if let Some(msg) = self.streaming_messages.write().await.remove(&qid) {
-                        msg.set_complete(); // Mark complete to stop updates
-                    }
-
                     // Update query state to cancelled
                     self.query_states
                         .update_state(qid, QueryState::Failed {
