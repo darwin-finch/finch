@@ -514,6 +514,20 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 - Current solution works but is not optimal
 **Impact:** LoRA fine-tuning has high memory overhead
 **Fix:** Long-term - Build pure Rust LoRA system
+
+### 5. TUI Background Flickering on New Messages
+**Issue:** User input grey backgrounds briefly flicker when new messages arrive
+- Occurs during insert_before() operation (writing to terminal scrollback)
+- Ratatui's insert_before() may clear/rewrite viewport internally
+- Backgrounds restored by immediate blit, but brief flicker visible
+**Impact:** Minor visual issue, does not affect functionality
+**Current state:** Much improved with synchronized updates, but not eliminated
+**Status:** Tolerable - reported 2026-02-15
+**Investigation needed:** Explore using shadow buffer exclusively for all rendering
+- Would avoid insert_before() entirely
+- Requires rewriting scrollback management
+- May lose native terminal scrollback (Shift+PgUp)
+**Fix:** Low priority - cosmetic issue with acceptable workaround
 - Option 1: Custom Rust LoRA on top of ONNX Runtime
 - Option 2: Use burn.rs with ONNX export
 - Option 3: Wait for ONNX Runtime training support
