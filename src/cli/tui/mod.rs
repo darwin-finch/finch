@@ -936,15 +936,19 @@ impl TuiRenderer {
                 }
             })?;
 
-            // IMMEDIATELY blit to ensure viewport is properly rendered
-            // Use unsynchronized version since we already have a sync block
-            self.blit_visible_area_internal(false)?;
-            self.last_blit = std::time::Instant::now();
-
             execute!(stdout, EndSynchronizedUpdate)?;
 
-            // Mark TUI for render (separator might need to move)
-            self.needs_tui_render = true;
+            // CRITICAL: insert_before() changes terminal state in a way that invalidates
+            // our diff-based blitting. The prev_frame_buffer no longer matches the terminal,
+            // so we need to clear it to force a full re-blit on the next update.
+            self.prev_frame_buffer.clear();
+
+            // CRITICAL: insert_before() may internally clear/redraw the viewport,
+            // erasing the separator. Call render() immediately to redraw it.
+            self.render()?;
+
+            // Update blit timestamp
+            self.last_blit = std::time::Instant::now();
         } else if !messages.is_empty() && self.last_blit.elapsed() >= self.blit_interval {
             // Blit updates to visible area with rate limiting (for message updates)
             // This is the reactive part - messages update via Arc<RwLock<>>, we just re-render
