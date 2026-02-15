@@ -767,6 +767,30 @@ let split_layout = Layout::default()
 - Check last message content before adding
 - Skip duplicate detection in flush_output_safe()
 
+### Separator Line Erasure ✅ FIXED
+
+**Symptom:** Horizontal separator line disappears after message completion
+
+**Causes:**
+1. `insert_before()` internally clears/redraws viewport, erasing the separator
+2. `prev_frame_buffer` becomes stale after `insert_before()`, causing incorrect diffs
+
+**Fix (Commit b1276ea, 2026-02-15):**
+```rust
+// After insert_before(), clear prev_frame_buffer to force full re-blit
+self.prev_frame_buffer.clear();
+
+// Immediately call render() to redraw separator before user sees terminal
+self.render()?;
+```
+
+**Why This Works:**
+- Clearing `prev_frame_buffer` invalidates diff state, ensuring next blit is accurate
+- Immediate `render()` redraws separator before next event loop iteration
+- No more visual artifacts or disappearing content
+
+**Impact:** TUI now stable and production-ready
+
 ---
 
 ## Key Architectural Decisions

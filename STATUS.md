@@ -1,7 +1,7 @@
 # Shammah - Project Status
 
-**Last Updated:** 2026-02-12
-**Version:** 0.4.0 (Proxy-Only Mode + Multi-Provider Setup)
+**Last Updated:** 2026-02-15
+**Version:** 0.4.0 (Production-Ready with TUI Fixes)
 
 ## Current State: Production-Ready Local AI Proxy ✅
 
@@ -82,6 +82,8 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 - Streaming response support with real-time token display
 - Rate limiting (20 FPS max)
 - Proper ANSI code handling
+- Fixed separator line erasure (commit b1276ea)
+- Daemon-side incremental output cleaning (commit 1cf1d02)
 
 **SSE Streaming Support:**
 - Server-Sent Events for local model queries
@@ -515,19 +517,15 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 **Impact:** LoRA fine-tuning has high memory overhead
 **Fix:** Long-term - Build pure Rust LoRA system
 
-### 5. TUI Background Flickering on New Messages
-**Issue:** User input grey backgrounds briefly flicker when new messages arrive
-- Occurs during insert_before() operation (writing to terminal scrollback)
-- Ratatui's insert_before() may clear/rewrite viewport internally
-- Backgrounds restored by immediate blit, but brief flicker visible
-**Impact:** Minor visual issue, does not affect functionality
-**Current state:** Much improved with synchronized updates, but not eliminated
-**Status:** Tolerable - reported 2026-02-15
-**Investigation needed:** Explore using shadow buffer exclusively for all rendering
-- Would avoid insert_before() entirely
-- Requires rewriting scrollback management
-- May lose native terminal scrollback (Shift+PgUp)
-**Fix:** Low priority - cosmetic issue with acceptable workaround
+### 5. ~~TUI Separator Line Erasure~~ ✅ FIXED
+**Issue:** Horizontal separator line disappeared after message completion
+- Occurred with messages ending in newlines or short messages
+- Caused by ratatui's insert_before() clearing viewport
+**Status:** ✅ FIXED (2026-02-15) - Commit b1276ea
+**Solution:**
+- Clear prev_frame_buffer after insert_before() to invalidate diff state
+- Call render() immediately to redraw separator before user sees terminal
+**Impact:** TUI now stable with no visual artifacts
 - Option 1: Custom Rust LoRA on top of ONNX Runtime
 - Option 2: Use burn.rs with ONNX export
 - Option 3: Wait for ONNX Runtime training support
