@@ -850,14 +850,12 @@ impl TuiRenderer {
 
         // Get all trait-based messages from OutputManager
         let messages = output_manager.get_messages();
-        tracing::debug!("[TUI] flush_output_safe: {} messages from output_manager", messages.len());
 
         for msg in &messages {
             let msg_id = msg.id();
 
             // If message not in scrollback yet, it's NEW - add and write to terminal
             if self.scrollback.get_message(msg_id).is_none() {
-                tracing::debug!("[TUI] Found NEW message (id: {}), adding to scrollback", msg_id);
                 self.scrollback.add_message(msg.clone());
                 new_messages.push(msg.clone());
                 self.needs_full_refresh = true;
@@ -865,7 +863,6 @@ impl TuiRenderer {
             // Otherwise it's an UPDATE - message already in scrollback
             // Updates happen via Arc<RwLock<>>, shadow buffer sees them automatically
         }
-        tracing::debug!("[TUI] flush_output_safe: {} new messages to write", new_messages.len());
 
         // Write new messages to terminal scrollback using insert_before()
         // Note: ANSI codes are stripped for scrollback (ratatui limitation)

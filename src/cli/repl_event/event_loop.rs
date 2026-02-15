@@ -900,18 +900,17 @@ impl EventLoop {
             }
 
             ReplEvent::StreamingStarted { query_id } => {
-                // Create streaming response message only if one doesn't exist
-                // (fallback providers reuse the same message)
+                // Create streaming response message
                 use crate::cli::messages::StreamingResponseMessage;
                 use std::sync::Arc;
 
                 let mut messages = self.streaming_messages.write().await;
+                // Only create if one doesn't exist (avoid duplicates)
                 if !messages.contains_key(&query_id) {
                     let msg = Arc::new(StreamingResponseMessage::new());
                     self.output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
                     messages.insert(query_id, msg);
                 }
-                // If message already exists, fallback provider will reuse it
             }
 
             ReplEvent::StreamingDelta { query_id, delta } => {
