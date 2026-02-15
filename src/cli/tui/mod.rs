@@ -52,6 +52,34 @@ use dialog::DialogType as DType;
 
 // Note: input_handler (TuiInputHandler) removed - we now use integrated tui-textarea
 
+/// Convert ratatui Color to crossterm Color
+fn ratatui_to_crossterm_color(color: ratatui::style::Color) -> crossterm::style::Color {
+    use ratatui::style::Color as RColor;
+    use crossterm::style::Color as CColor;
+
+    match color {
+        RColor::Black => CColor::Black,
+        RColor::Red => CColor::Red,
+        RColor::Green => CColor::Green,
+        RColor::Yellow => CColor::Yellow,
+        RColor::Blue => CColor::Blue,
+        RColor::Magenta => CColor::Magenta,
+        RColor::Cyan => CColor::Cyan,
+        RColor::Gray => CColor::Grey,
+        RColor::DarkGray => CColor::DarkGrey,
+        RColor::LightRed => CColor::Red,
+        RColor::LightGreen => CColor::Green,
+        RColor::LightYellow => CColor::Yellow,
+        RColor::LightBlue => CColor::Blue,
+        RColor::LightMagenta => CColor::Magenta,
+        RColor::LightCyan => CColor::Cyan,
+        RColor::White => CColor::White,
+        RColor::Rgb(r, g, b) => CColor::Rgb { r, g, b },
+        RColor::Indexed(i) => CColor::AnsiValue(i),
+        RColor::Reset => CColor::Reset,
+    }
+}
+
 /// Strip ANSI escape codes from a string
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
@@ -1339,21 +1367,38 @@ impl TuiRenderer {
         execute!(stdout, BeginSynchronizedUpdate)?;
 
         for (row, _cells) in changes_by_row {
-            // Clear line and write entire row (more efficient than per-cell updates)
+            // Clear line and write entire row with styles
             execute!(stdout, cursor::MoveTo(0, row as u16), Clear(ClearType::UntilNewLine))?;
 
-            // Build full line content from shadow buffer
-            let mut line_content = String::new();
+            // Write cells with their styles
+            execute!(stdout, cursor::MoveTo(0, row as u16))?;
+
+            use crossterm::style::{SetBackgroundColor, SetForegroundColor, ResetColor};
+            use ratatui::style::Color as RatatuiColor;
+
+            let mut current_style = ratatui::style::Style::default();
+
             for x in 0..self.shadow_buffer.width {
                 if let Some(cell) = self.shadow_buffer.get(x, row) {
-                    line_content.push(cell.ch);
+                    // Apply style changes if needed
+                    if cell.style != current_style {
+                        // Convert ratatui colors to crossterm colors
+                        if let Some(bg) = cell.style.bg {
+                            let crossterm_color = ratatui_to_crossterm_color(bg);
+                            execute!(stdout, SetBackgroundColor(crossterm_color))?;
+                        }
+                        if let Some(fg) = cell.style.fg {
+                            let crossterm_color = ratatui_to_crossterm_color(fg);
+                            execute!(stdout, SetForegroundColor(crossterm_color))?;
+                        }
+                        current_style = cell.style;
+                    }
+                    execute!(stdout, Print(cell.ch))?;
                 }
             }
 
-            // Write entire line at once
-            if !line_content.is_empty() {
-                execute!(stdout, cursor::MoveTo(0, row as u16), Print(line_content))?;
-            }
+            // Reset colors at end of line
+            execute!(stdout, ResetColor)?;
         }
 
         execute!(stdout, EndSynchronizedUpdate)?;
