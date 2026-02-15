@@ -68,11 +68,16 @@ impl Message for UserQueryMessage {
     }
 
     fn format(&self, colors: &ColorScheme) -> String {
+        use crossterm::style::{Color, Attribute, SetForegroundColor, SetBackgroundColor, ResetColor};
+
+        // Grey background for user messages (like Claude Code)
+        // Use RGB(220, 220, 220) for light grey background with black text
         format!(
-            "{} ❯ {}{}",
-            color_to_ansi(&colors.messages.user),
+            "{}{} ❯ {}{}",
+            SetBackgroundColor(Color::Rgb { r: 220, g: 220, b: 220 }),
+            SetForegroundColor(Color::Black),
             self.content,
-            RESET
+            ResetColor
         )
     }
 
