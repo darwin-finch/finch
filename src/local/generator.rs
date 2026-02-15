@@ -312,8 +312,14 @@ impl TemplateGenerator {
             Box::new(move |token_id, token_text| {
                 // Filter out special tokens (template markers, control characters)
                 // Only stream actual content tokens
-                let is_special = token_text.contains("<|")  // Qwen special tokens like <|im_end|>
+                let is_special = token_text.contains("<|")  // Qwen ChatML tokens like <|im_end|>
                     || token_text.contains("|>")
+                    || token_text.contains("<｜")  // DeepSeek tokens (full-width)
+                    || token_text.contains("｜>")
+                    || token_text.contains("▁of▁")  // DeepSeek sentence markers
+                    || token_text.contains("<think>")  // DeepSeek reasoning markers
+                    || token_text.contains("</think>")
+                    || token_text.contains("\\boxed")  // LaTeX formatting
                     || token_text.trim().is_empty();  // Skip whitespace-only tokens
 
                 if !is_special {
