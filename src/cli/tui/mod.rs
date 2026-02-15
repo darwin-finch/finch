@@ -1382,6 +1382,11 @@ impl TuiRenderer {
                 if let Some(cell) = self.shadow_buffer.get(x, row) {
                     // Apply style changes if needed
                     if cell.style != current_style {
+                        // Reset colors first if transitioning away from styled cell
+                        if current_style != ratatui::style::Style::default() {
+                            execute!(stdout, ResetColor)?;
+                        }
+
                         // Convert ratatui colors to crossterm colors
                         if let Some(bg) = cell.style.bg {
                             let crossterm_color = ratatui_to_crossterm_color(bg);
