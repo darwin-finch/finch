@@ -315,12 +315,31 @@ impl GeminiProvider {
                                 {
                                     if let Some(candidate) = stream_response.candidates.into_iter().next() {
                                         for part in candidate.content.parts {
-                                            if let GeminiPart::Text { text } = part {
-                                                accumulated_text.push_str(&text);
-                                                // Send delta immediately
-                                                if tx.send(Ok(StreamChunk::TextDelta(text))).await.is_err() {
-                                                    done = true;
-                                                    break;
+                                            match part {
+                                                GeminiPart::Text { text } => {
+                                                    accumulated_text.push_str(&text);
+                                                    // Send delta immediately
+                                                    if tx.send(Ok(StreamChunk::TextDelta(text))).await.is_err() {
+                                                        done = true;
+                                                        break;
+                                                    }
+                                                }
+                                                GeminiPart::FunctionCall { function_call } => {
+                                                    // Generate unique ID for tool call
+                                                    let unique_id = format!("gemini_{}_{}", function_call.name, Uuid::new_v4());
+                                                    let tool_use = ContentBlock::ToolUse {
+                                                        id: unique_id,
+                                                        name: function_call.name,
+                                                        input: function_call.args,
+                                                    };
+                                                    // Send complete tool use block
+                                                    if tx.send(Ok(StreamChunk::ContentBlockComplete(tool_use))).await.is_err() {
+                                                        done = true;
+                                                        break;
+                                                    }
+                                                }
+                                                GeminiPart::FunctionResponse { .. } => {
+                                                    // Skip function responses
                                                 }
                                             }
                                         }

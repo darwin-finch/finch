@@ -513,22 +513,24 @@ impl EventLoop {
             drop(state);
 
             // Route based on readiness and confidence
+            // NOTE: In daemon mode, these logs are misleading (daemon makes actual routing decision)
+            // TODO: Detect daemon mode and skip client-side routing entirely
             if qwen_ready {
                 match router.route(&query) {
                     crate::router::RouteDecision::Local { confidence, .. } if confidence > 0.7 => {
                         // Use Qwen
-                        tracing::info!("Routing to Qwen (confidence: {:.2})", confidence);
+                        tracing::debug!("Client-side routing: Qwen (confidence: {:.2})", confidence);
                         Arc::clone(&qwen_gen)
                     }
                     _ => {
                         // Use Claude
-                        tracing::info!("Routing to Claude (low confidence or no match)");
+                        tracing::debug!("Client-side routing: teacher (low confidence or no match)");
                         Arc::clone(&claude_gen)
                     }
                 }
             } else {
                 // Qwen not ready, use Claude
-                tracing::info!("Routing to Claude (Qwen not ready)");
+                tracing::debug!("Client-side routing: teacher (Qwen not ready)");
                 Arc::clone(&claude_gen)
             }
         };
