@@ -36,7 +36,19 @@ Unlike training a model from scratch (months + expensive GPUs), Shammah uses pre
 
 ### Installation
 
-**Option 1: Download Pre-Built Binary** (Easiest)
+**Option 1: One-Liner Install** (Easiest)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+```
+
+This will:
+- Detect your platform automatically
+- Download the latest release
+- Install to `~/.local/bin/shammah`
+- Verify the installation
+
+**Option 2: Download Pre-Built Binary**
 
 ```bash
 # macOS (Apple Silicon)
@@ -52,7 +64,7 @@ curl -L https://github.com/schancel/shammah/releases/latest/download/shammah-lin
 ./shammah --version
 ```
 
-**Option 2: Build from Source**
+**Option 3: Build from Source**
 
 ```bash
 git clone https://github.com/schancel/shammah
