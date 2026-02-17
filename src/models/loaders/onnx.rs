@@ -335,8 +335,15 @@ impl LoadedOnnxModel {
             // Update KV cache for next iteration
             past_key_values = new_kv_cache;
 
-            // 3. Sample next token
-            let next_token = Self::sample_token_static(&logits)?;
+            // 3. Sample next token with repetition penalty (pass previous output tokens)
+            let previous_output = &output_ids[input_ids.len()..]; // Only new tokens, not input
+            let next_token = Self::sample_token_with_params(
+                &logits,
+                previous_output,
+                0.7,  // temperature: moderate randomness
+                0.9,  // top_p: nucleus sampling
+                1.15, // repetition_penalty: discourage repetition
+            )?;
             debug!("Generated token: {}", next_token);
 
             // 4. Check for EOS
@@ -560,21 +567,96 @@ impl LoadedOnnxModel {
 
     /// Sample next token from logits (greedy sampling) - static to avoid borrowing issues
     fn sample_token_static(logits: &[f32]) -> Result<u32> {
+        Self::sample_token_with_params(logits, &[], 0.7, 0.9, 1.1)
+    }
+
+    /// Sample token with temperature, top-p, and repetition penalty
+    fn sample_token_with_params(
+        logits: &[f32],
+        previous_tokens: &[u32],
+        temperature: f32,
+        top_p: f32,
+        repetition_penalty: f32,
+    ) -> Result<u32> {
         if logits.is_empty() {
             bail!("Cannot sample from empty logits");
         }
 
-        // Find token with maximum logit (greedy sampling)
-        let (max_idx, max_val) = logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .ok_or_else(|| anyhow::anyhow!("Failed to find max logit"))?;
+        let mut scores = logits.to_vec();
 
-        debug!("Sampled token {} (logit: {:.4})", max_idx, max_val);
-        Ok(max_idx as u32)
+        // Apply repetition penalty
+        if repetition_penalty != 1.0 && !previous_tokens.is_empty() {
+            for &token_id in previous_tokens {
+                if (token_id as usize) < scores.len() {
+                    let score = scores[token_id as usize];
+                    // If score > 0, divide by penalty; if score < 0, multiply by penalty
+                    scores[token_id as usize] = if score > 0.0 {
+                        score / repetition_penalty
+                    } else {
+                        score * repetition_penalty
+                    };
+                }
+            }
+        }
+
+        // Apply temperature
+        if temperature != 1.0 {
+            for score in &mut scores {
+                *score /= temperature;
+            }
+        }
+
+        // Convert logits to probabilities using softmax
+        let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_scores: Vec<f32> = scores.iter().map(|&s| (s - max_score).exp()).collect();
+        let sum_exp: f32 = exp_scores.iter().sum();
+        let probs: Vec<f32> = exp_scores.iter().map(|&e| e / sum_exp).collect();
+
+        // Create sorted indices by probability (descending)
+        let mut indexed_probs: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
+        indexed_probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Top-p (nucleus) sampling
+        let mut cumulative_prob = 0.0;
+        let mut top_p_indices = Vec::new();
+
+        for &(idx, prob) in &indexed_probs {
+            cumulative_prob += prob;
+            top_p_indices.push((idx, prob));
+            if cumulative_prob >= top_p {
+                break;
+            }
+        }
+
+        // Renormalize probabilities for selected tokens
+        let selected_prob_sum: f32 = top_p_indices.iter().map(|(_, p)| p).sum();
+        if selected_prob_sum <= 0.0 {
+            // Fallback to greedy if something went wrong
+            if let Some(&(max_idx, _)) = indexed_probs.first() {
+                return Ok(max_idx as u32);
+            }
+            bail!("No valid tokens to sample");
+        }
+
+        // Sample from the top-p distribution
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut rand_val: f32 = rng.gen::<f32>() * selected_prob_sum;
+
+        for &(idx, prob) in &top_p_indices {
+            rand_val -= prob;
+            if rand_val <= 0.0 {
+                debug!("Sampled token {} (prob: {:.4}, temp: {:.1}, top_p: {:.1})", idx, prob, temperature, top_p);
+                return Ok(idx as u32);
+            }
+        }
+
+        // Fallback (should not reach here)
+        if let Some(&(idx, _)) = top_p_indices.last() {
+            Ok(idx as u32)
+        } else {
+            bail!("Failed to sample token")
+        }
     }
 
     /// Get EOS token ID from tokenizer

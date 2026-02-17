@@ -29,6 +29,28 @@ impl LocalModelAdapter for QwenAdapter {
     }
 
     fn clean_output(&self, raw_output: &str) -> String {
+        Self::clean_output_static(raw_output)
+    }
+
+    fn family_name(&self) -> &str {
+        "Qwen"
+    }
+
+    fn generation_config(&self) -> GenerationConfig {
+        GenerationConfig {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 20,
+            repetition_penalty: 1.05,
+            max_tokens: 512,
+        }
+    }
+}
+
+impl QwenAdapter {
+    /// Static method for cleaning output without adapter instance
+    /// This can be called from message rendering for streaming responses
+    pub fn clean_output_static(raw_output: &str) -> String {
         // IMPORTANT: If output contains tool XML markers, use minimal cleaning
         // to preserve the tool_use and tool_result blocks intact
         if raw_output.contains("<tool_use>") || raw_output.contains("<tool_result>") {
@@ -113,14 +135,19 @@ impl LocalModelAdapter for QwenAdapter {
 
         // Step 5: Detect question/answer pattern and extract just the answer
         // Pattern: "What is X?\nAnswer" → extract "Answer"
+        // IMPORTANT: Only trigger this for SHORT responses (2-3 lines) that look like prompt echoes
+        // Don't truncate normal multi-line responses that happen to contain questions!
         let lines: Vec<&str> = cleaned.lines().collect();
-        if lines.len() > 1 {
-            // If first line ends with '?', it's likely the echoed question
-            // Answer is in the last non-empty line
+        if lines.len() == 2 || lines.len() == 3 {
+            // Only for very short responses that look like prompt echoes
             if let Some(first_line) = lines.first() {
-                if first_line.trim().ends_with('?') {
+                // First line should end with '?' AND be a reasonable question length (< 100 chars)
+                if first_line.trim().ends_with('?') && first_line.len() < 100 {
+                    // Last line should be short (< 50 chars) like a direct answer
                     if let Some(last_line) = lines.iter().rev().find(|l| !l.trim().is_empty()) {
-                        cleaned = last_line.trim();
+                        if last_line.len() < 50 {
+                            cleaned = last_line.trim();
+                        }
                     }
                 }
             }
@@ -162,20 +189,6 @@ impl LocalModelAdapter for QwenAdapter {
         }
 
         cleaned.trim().to_string()
-    }
-
-    fn family_name(&self) -> &str {
-        "Qwen"
-    }
-
-    fn generation_config(&self) -> GenerationConfig {
-        GenerationConfig {
-            temperature: 0.7,
-            top_p: 0.8,
-            top_k: 20,
-            repetition_penalty: 1.05,
-            max_tokens: 512,
-        }
     }
 }
 

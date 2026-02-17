@@ -172,12 +172,17 @@ impl ShadowBuffer {
 
         // Walk backwards from last line
         for (line_idx, ((line, style), row_count)) in all_lines.iter().zip(&line_row_counts).enumerate().rev() {
+            eprintln!("[SHADOW_BUFFER] line_idx={}, row_count={}, accumulated={}, fits={}",
+                     line_idx, row_count, accumulated_rows, accumulated_rows + row_count <= self.height);
             if accumulated_rows + row_count > self.height {
+                eprintln!("[SHADOW_BUFFER] Breaking: {} + {} > {}", accumulated_rows, row_count, self.height);
                 break; // Stop when can't fit more
             }
             lines_to_render.push((line_idx, line, *style));
             accumulated_rows += row_count;
         }
+
+        eprintln!("[SHADOW_BUFFER] lines_to_render: {} lines", lines_to_render.len());
 
         lines_to_render.reverse(); // Restore chronological order
 
