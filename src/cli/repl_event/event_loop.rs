@@ -251,7 +251,11 @@ impl EventLoop {
                     // Don't spam logs, but good to know the loop is alive
                     // tracing::debug!("[EVENT_LOOP] Render tick");
                     if let Err(e) = self.render_tui().await {
-                        eprintln!("Warning: TUI render failed: {}", e);
+                        tracing::warn!("TUI render failed in event loop: {}", e);
+                        // Set recovery flag for next tick
+                        let mut tui = self.tui_renderer.lock().await;
+                        tui.needs_full_refresh = true;
+                        tui.last_render_error = Some(e.to_string());
                         // Continue event loop - don't crash
                     }
                 }
@@ -1013,6 +1017,17 @@ impl EventLoop {
     /// Render the TUI
     async fn render_tui(&self) -> Result<()> {
         let mut tui = self.tui_renderer.lock().await;
+
+        // Check if recovery needed from previous render failure
+        if tui.needs_full_refresh {
+            tracing::info!("Performing full TUI refresh after render error");
+            // Try to recover by clearing error state
+            tui.needs_full_refresh = false;
+            tui.last_render_error = None;
+            // Force a full redraw
+            tui.needs_tui_render = true;
+        }
+
         tui.flush_output_safe(&self.output_manager)?;
         // Check if full refresh needed (for InProgress streaming messages)
         tui.check_and_refresh()?;

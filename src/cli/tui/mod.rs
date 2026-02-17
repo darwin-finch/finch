@@ -105,6 +105,37 @@ fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
+/// Execute a crossterm command with retry logic for transient IO errors
+fn execute_with_retry<T>(command: T) -> Result<()>
+where
+    T: crossterm::Command + Clone,
+{
+    const MAX_ATTEMPTS: usize = 3;
+    const RETRY_DELAY_MS: u64 = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match crossterm::execute!(io::stdout(), command.clone()) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < MAX_ATTEMPTS - 1 => {
+                tracing::warn!(
+                    "Terminal IO failed (attempt {}/{}): {}",
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    e
+                );
+                // Small delay to let terminal state stabilize
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                continue;
+            }
+            Err(e) => {
+                // All retries exhausted
+                return Err(anyhow::anyhow!("Terminal IO failed after {} attempts: {}", MAX_ATTEMPTS, e));
+            }
+        }
+    }
+    unreachable!()
+}
+
 /// Calculate viewport height dynamically based on terminal size
 fn calculate_viewport_height(terminal_size: (u16, u16)) -> usize {
     let (_, term_height) = terminal_size;
@@ -149,7 +180,9 @@ pub struct TuiRenderer {
     /// Previous frame buffer (for diff-based updates)
     prev_frame_buffer: ShadowBuffer,
     /// Whether full refresh is needed
-    needs_full_refresh: bool,
+    pub(crate) needs_full_refresh: bool,
+    /// Last render error (for recovery)
+    pub(crate) last_render_error: Option<String>,
     /// Pending feedback rating from user ('g' or 'b' key press)
     pub pending_feedback: Option<crate::feedback::FeedbackRating>,
     /// Pending cancellation request (Ctrl+C pressed)
@@ -167,7 +200,7 @@ pub struct TuiRenderer {
     /// Blit rate limit (min interval between blits)
     blit_interval: Duration,
     /// Whether TUI needs to be redrawn (double buffering)
-    needs_tui_render: bool,
+    pub(crate) needs_tui_render: bool,
     /// Previous input text (for change detection)
     prev_input_text: String,
     /// Previous cursor position (for change detection)
@@ -400,6 +433,7 @@ impl TuiRenderer {
             shadow_buffer,
             prev_frame_buffer,
             needs_full_refresh: false,
+            last_render_error: None,
             last_refresh: std::time::Instant::now(),
             refresh_interval: Duration::from_millis(100), // 10 FPS - blit to overwrite visible area
             last_blit: std::time::Instant::now(),
@@ -678,7 +712,7 @@ impl TuiRenderer {
 
         // Wrap in synchronized update to prevent tearing
         use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-        execute!(io::stdout(), BeginSynchronizedUpdate)?;
+        execute_with_retry(BeginSynchronizedUpdate)?;
 
         self.terminal
             .draw(|frame| {
@@ -855,7 +889,7 @@ impl TuiRenderer {
             })
             .context("Failed to draw frame")?;
 
-        execute!(io::stdout(), EndSynchronizedUpdate)?;
+        execute_with_retry(EndSynchronizedUpdate)?;
 
         Ok(())
     }
@@ -1340,7 +1374,7 @@ impl TuiRenderer {
 
         // Clear terminal and render entire shadow buffer
         let mut stdout = io::stdout();
-        execute!(stdout, BeginSynchronizedUpdate)?;
+        execute_with_retry(BeginSynchronizedUpdate)?;
 
         // Clear the entire visible area
         for row in 0..visible_rows {
@@ -1370,7 +1404,7 @@ impl TuiRenderer {
             }
         }
 
-        execute!(stdout, EndSynchronizedUpdate)?;
+        execute_with_retry(EndSynchronizedUpdate)?;
         stdout.flush()?;
 
         // Update previous frame buffer
@@ -1421,7 +1455,7 @@ impl TuiRenderer {
         // Apply changes to terminal
         let mut stdout = io::stdout();
         if use_sync {
-            execute!(stdout, BeginSynchronizedUpdate)?;
+            execute_with_retry(BeginSynchronizedUpdate)?;
         }
 
         for (row, _cells) in changes_by_row {
@@ -1467,7 +1501,7 @@ impl TuiRenderer {
         }
 
         if use_sync {
-            execute!(stdout, EndSynchronizedUpdate)?;
+            execute_with_retry(EndSynchronizedUpdate)?;
         }
         stdout.flush()?;
 

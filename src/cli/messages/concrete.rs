@@ -117,23 +117,47 @@ impl StreamingResponseMessage {
 
     /// Append a chunk of streamed text
     pub fn append_chunk(&self, text: &str) {
-        let mut content = self.content.write().unwrap();
-        content.push_str(text);
+        match self.content.write() {
+            Ok(mut content) => content.push_str(text),
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage content lock poisoned in append_chunk, recovering");
+                let mut content = poisoned.into_inner();
+                content.push_str(text);
+            }
+        }
     }
 
     /// Set whether the model is thinking (for UI indicator)
     pub fn set_thinking(&self, thinking: bool) {
-        *self.thinking.write().unwrap() = thinking;
+        match self.thinking.write() {
+            Ok(mut t) => *t = thinking,
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage thinking lock poisoned in set_thinking, recovering");
+                *poisoned.into_inner() = thinking;
+            }
+        }
     }
 
     /// Mark this response as complete
     pub fn set_complete(&self) {
-        *self.status.write().unwrap() = MessageStatus::Complete;
+        match self.status.write() {
+            Ok(mut s) => *s = MessageStatus::Complete,
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage status lock poisoned in set_complete, recovering");
+                *poisoned.into_inner() = MessageStatus::Complete;
+            }
+        }
     }
 
     /// Mark this response as failed
     pub fn set_failed(&self) {
-        *self.status.write().unwrap() = MessageStatus::Failed;
+        match self.status.write() {
+            Ok(mut s) => *s = MessageStatus::Failed,
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage status lock poisoned in set_failed, recovering");
+                *poisoned.into_inner() = MessageStatus::Failed;
+            }
+        }
     }
 }
 
@@ -143,9 +167,30 @@ impl Message for StreamingResponseMessage {
     }
 
     fn format(&self, colors: &ColorScheme) -> String {
-        let content = self.content.read().unwrap();
-        let status = *self.status.read().unwrap();
-        let thinking = *self.thinking.read().unwrap();
+        // Handle poisoned locks gracefully - recover with safe defaults
+        let content = match self.content.read() {
+            Ok(c) => c.clone(),
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage content lock poisoned, using recovered data");
+                poisoned.into_inner().clone()
+            }
+        };
+
+        let status = match self.status.read() {
+            Ok(s) => *s,
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage status lock poisoned, defaulting to InProgress");
+                *poisoned.into_inner()
+            }
+        };
+
+        let thinking = match self.thinking.read() {
+            Ok(t) => *t,
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage thinking lock poisoned, defaulting to false");
+                *poisoned.into_inner()
+            }
+        };
 
         // No cleaning - already cleaned by daemon during streaming
         let text = content.clone();
@@ -175,11 +220,23 @@ impl Message for StreamingResponseMessage {
     }
 
     fn status(&self) -> MessageStatus {
-        *self.status.read().unwrap()
+        match self.status.read() {
+            Ok(s) => *s,
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage status lock poisoned in status(), using recovered data");
+                *poisoned.into_inner()
+            }
+        }
     }
 
     fn content(&self) -> String {
-        self.content.read().unwrap().clone()
+        match self.content.read() {
+            Ok(c) => c.clone(),
+            Err(poisoned) => {
+                tracing::warn!("StreamingResponseMessage content lock poisoned in content(), using recovered data");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 }
 
@@ -217,25 +274,55 @@ impl ToolExecutionMessage {
 
     /// Append to stdout
     pub fn append_stdout(&self, text: &str) {
-        let mut stdout = self.stdout.write().unwrap();
-        stdout.push_str(text);
+        match self.stdout.write() {
+            Ok(mut stdout) => stdout.push_str(text),
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage stdout lock poisoned in append_stdout, recovering");
+                let mut stdout = poisoned.into_inner();
+                stdout.push_str(text);
+            }
+        }
     }
 
     /// Append to stderr
     pub fn append_stderr(&self, text: &str) {
-        let mut stderr = self.stderr.write().unwrap();
-        stderr.push_str(text);
+        match self.stderr.write() {
+            Ok(mut stderr) => stderr.push_str(text),
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage stderr lock poisoned in append_stderr, recovering");
+                let mut stderr = poisoned.into_inner();
+                stderr.push_str(text);
+            }
+        }
     }
 
     /// Set exit code (marks as complete)
     pub fn set_exit_code(&self, code: i32) {
-        *self.exit_code.write().unwrap() = Some(code);
-        *self.status.write().unwrap() = MessageStatus::Complete;
+        match self.exit_code.write() {
+            Ok(mut e) => *e = Some(code),
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage exit_code lock poisoned in set_exit_code, recovering");
+                *poisoned.into_inner() = Some(code);
+            }
+        }
+        match self.status.write() {
+            Ok(mut s) => *s = MessageStatus::Complete,
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage status lock poisoned in set_exit_code, recovering");
+                *poisoned.into_inner() = MessageStatus::Complete;
+            }
+        }
     }
 
     /// Mark as failed
     pub fn set_failed(&self) {
-        *self.status.write().unwrap() = MessageStatus::Failed;
+        match self.status.write() {
+            Ok(mut s) => *s = MessageStatus::Failed,
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage status lock poisoned in set_failed, recovering");
+                *poisoned.into_inner() = MessageStatus::Failed;
+            }
+        }
     }
 }
 
@@ -245,9 +332,30 @@ impl Message for ToolExecutionMessage {
     }
 
     fn format(&self, colors: &ColorScheme) -> String {
-        let stdout = self.stdout.read().unwrap();
-        let stderr = self.stderr.read().unwrap();
-        let exit_code = *self.exit_code.read().unwrap();
+        // Handle poisoned locks gracefully
+        let stdout = match self.stdout.read() {
+            Ok(s) => s.clone(),
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage stdout lock poisoned, using recovered data");
+                poisoned.into_inner().clone()
+            }
+        };
+
+        let stderr = match self.stderr.read() {
+            Ok(s) => s.clone(),
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage stderr lock poisoned, using recovered data");
+                poisoned.into_inner().clone()
+            }
+        };
+
+        let exit_code = match self.exit_code.read() {
+            Ok(e) => *e,
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage exit_code lock poisoned, using recovered data");
+                *poisoned.into_inner()
+            }
+        };
 
         let mut result = format!(
             "{}[{}]{}",
@@ -294,12 +402,32 @@ impl Message for ToolExecutionMessage {
     }
 
     fn status(&self) -> MessageStatus {
-        *self.status.read().unwrap()
+        match self.status.read() {
+            Ok(s) => *s,
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage status lock poisoned, using recovered data");
+                *poisoned.into_inner()
+            }
+        }
     }
 
     fn content(&self) -> String {
-        let stdout = self.stdout.read().unwrap();
-        let stderr = self.stderr.read().unwrap();
+        let stdout = match self.stdout.read() {
+            Ok(s) => s.clone(),
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage stdout lock poisoned in content(), using recovered data");
+                poisoned.into_inner().clone()
+            }
+        };
+
+        let stderr = match self.stderr.read() {
+            Ok(s) => s.clone(),
+            Err(poisoned) => {
+                tracing::warn!("ToolExecutionMessage stderr lock poisoned in content(), using recovered data");
+                poisoned.into_inner().clone()
+            }
+        };
+
         format!("{}\n{}", stdout, stderr)
     }
 }
@@ -330,22 +458,46 @@ impl ProgressMessage {
 
     /// Update progress
     pub fn update_progress(&self, current: u64) {
-        *self.current.write().unwrap() = current;
+        match self.current.write() {
+            Ok(mut c) => *c = current,
+            Err(poisoned) => {
+                tracing::warn!("ProgressMessage current lock poisoned in update_progress, recovering");
+                *poisoned.into_inner() = current;
+            }
+        }
 
         // Auto-complete when reaching 100%
         if current >= self.total {
-            *self.status.write().unwrap() = MessageStatus::Complete;
+            match self.status.write() {
+                Ok(mut s) => *s = MessageStatus::Complete,
+                Err(poisoned) => {
+                    tracing::warn!("ProgressMessage status lock poisoned in update_progress, recovering");
+                    *poisoned.into_inner() = MessageStatus::Complete;
+                }
+            }
         }
     }
 
     /// Mark as complete
     pub fn set_complete(&self) {
-        *self.status.write().unwrap() = MessageStatus::Complete;
+        match self.status.write() {
+            Ok(mut s) => *s = MessageStatus::Complete,
+            Err(poisoned) => {
+                tracing::warn!("ProgressMessage status lock poisoned in set_complete, recovering");
+                *poisoned.into_inner() = MessageStatus::Complete;
+            }
+        }
     }
 
     /// Mark as failed
     pub fn set_failed(&self) {
-        *self.status.write().unwrap() = MessageStatus::Failed;
+        match self.status.write() {
+            Ok(mut s) => *s = MessageStatus::Failed,
+            Err(poisoned) => {
+                tracing::warn!("ProgressMessage status lock poisoned in set_failed, recovering");
+                *poisoned.into_inner() = MessageStatus::Failed;
+            }
+        }
     }
 }
 
@@ -355,8 +507,22 @@ impl Message for ProgressMessage {
     }
 
     fn format(&self, colors: &ColorScheme) -> String {
-        let current = *self.current.read().unwrap();
-        let status = *self.status.read().unwrap();
+        // Handle poisoned locks gracefully
+        let current = match self.current.read() {
+            Ok(c) => *c,
+            Err(poisoned) => {
+                tracing::warn!("ProgressMessage current lock poisoned, using recovered data");
+                *poisoned.into_inner()
+            }
+        };
+
+        let status = match self.status.read() {
+            Ok(s) => *s,
+            Err(poisoned) => {
+                tracing::warn!("ProgressMessage status lock poisoned, using recovered data");
+                *poisoned.into_inner()
+            }
+        };
 
         let percentage = if self.total > 0 {
             (current as f64 / self.total as f64 * 100.0) as u8
@@ -403,11 +569,24 @@ impl Message for ProgressMessage {
     }
 
     fn status(&self) -> MessageStatus {
-        *self.status.read().unwrap()
+        match self.status.read() {
+            Ok(s) => *s,
+            Err(poisoned) => {
+                tracing::warn!("ProgressMessage status lock poisoned, using recovered data");
+                *poisoned.into_inner()
+            }
+        }
     }
 
     fn content(&self) -> String {
-        let current = *self.current.read().unwrap();
+        let current = match self.current.read() {
+            Ok(c) => *c,
+            Err(poisoned) => {
+                tracing::warn!("ProgressMessage current lock poisoned in content(), using recovered data");
+                *poisoned.into_inner()
+            }
+        };
+
         format!("{}: {}/{}", self.label, current, self.total)
     }
 }
@@ -526,5 +705,103 @@ impl Message for StaticMessage {
 
     fn content(&self) -> String {
         self.content.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_streaming_message_handles_poisoned_lock() {
+        let msg = StreamingResponseMessage::new();
+
+        // Poison the content lock by panicking while holding it
+        let content_clone = Arc::clone(&msg.content);
+        let handle = std::thread::spawn(move || {
+            let _guard = content_clone.write().unwrap();
+            panic!("Intentional panic to poison lock");
+        });
+        let _ = handle.join(); // Let thread panic
+
+        // Now the lock is poisoned - format() should NOT panic
+        let colors = crate::config::ColorScheme::default();
+        let result = msg.format(&colors);
+
+        // Should recover and return some string (not panic)
+        assert!(!result.is_empty());
+        // Should either be empty or show streaming indicator
+        assert!(result.contains("[streaming...]") || result.is_empty() || result.contains("▸"));
+    }
+
+    #[test]
+    fn test_streaming_message_concurrent_access() {
+        let msg = Arc::new(StreamingResponseMessage::new());
+        let mut handles = vec![];
+
+        // Spawn 10 threads reading/writing concurrently
+        for i in 0..10 {
+            let msg_clone = Arc::clone(&msg);
+            handles.push(std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    msg_clone.append_chunk(&format!("chunk {}", i));
+                } else {
+                    let colors = crate::config::ColorScheme::default();
+                    let _ = msg_clone.format(&colors);
+                }
+            }));
+        }
+
+        // All threads should complete without deadlock or panic
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Message should contain some content
+        let content = msg.content();
+        assert!(content.contains("chunk"));
+    }
+
+    #[test]
+    fn test_tool_message_handles_poisoned_lock() {
+        let msg = ToolExecutionMessage::new("test_tool");
+
+        // Poison the stdout lock
+        let stdout_clone = Arc::clone(&msg.stdout);
+        let handle = std::thread::spawn(move || {
+            let _guard = stdout_clone.write().unwrap();
+            panic!("Intentional panic to poison lock");
+        });
+        let _ = handle.join();
+
+        // format() should NOT panic
+        let colors = crate::config::ColorScheme::default();
+        let result = msg.format(&colors);
+
+        // Should recover and return formatted output
+        assert!(result.contains("test_tool"));
+    }
+
+    #[test]
+    fn test_progress_message_handles_poisoned_lock() {
+        let msg = ProgressMessage::new("Download", 100);
+
+        // Poison the current lock
+        let current_clone = Arc::clone(&msg.current);
+        let handle = std::thread::spawn(move || {
+            let _guard = current_clone.write().unwrap();
+            panic!("Intentional panic to poison lock");
+        });
+        let _ = handle.join();
+
+        // format() should NOT panic
+        let colors = crate::config::ColorScheme::default();
+        let result = msg.format(&colors);
+
+        // Should recover and show progress bar
+        assert!(result.contains("Download"));
+        assert!(result.contains("["));
+        assert!(result.contains("]"));
     }
 }

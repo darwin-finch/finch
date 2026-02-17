@@ -230,7 +230,10 @@ pub fn spawn_input_task(
                         tui.update_ghost_text();
 
                         if let Err(e) = tui.render() {
-                            eprintln!("Render error: {}", e);
+                            tracing::error!("Async input render failed: {}", e);
+                            // Signal event loop that render failed - recovery needed
+                            tui.needs_full_refresh = true;
+                            tui.last_render_error = Some(e.to_string());
                         }
                     }
 
