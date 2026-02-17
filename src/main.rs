@@ -183,6 +183,7 @@ async fn main() -> Result<()> {
             // Extract values before partial move
             let backend_device = result.backend_device();
             let backend_enabled = result.backend_enabled;
+            let inference_provider = result.inference_provider;
             let model_family = result.model_family;
             let model_size = result.model_size;
             let custom_model_repo = result.custom_model_repo;
@@ -190,7 +191,7 @@ async fn main() -> Result<()> {
             let mut new_config = Config::new(result.teachers);
             new_config.backend = shammah::config::BackendConfig {
                 enabled: backend_enabled,
-                inference_provider: shammah::models::unified_loader::InferenceProvider::Onnx,  // Default to ONNX
+                inference_provider,
                 execution_target: backend_device,
                 model_family,
                 model_size,
@@ -912,6 +913,7 @@ async fn run_setup() -> Result<()> {
     // Extract values before partial move
     let backend_device = result.backend_device();
     let backend_enabled = result.backend_enabled;
+    let inference_provider = result.inference_provider;
     let model_family = result.model_family;
     let model_size = result.model_size;
     let custom_model_repo = result.custom_model_repo;
@@ -919,11 +921,10 @@ async fn run_setup() -> Result<()> {
     // Create config from wizard results
     let mut config = Config::new(result.teachers);
 
-    // Update backend config with selected device, model family, and size
-    use shammah::models::unified_loader::InferenceProvider;
+    // Update backend config with selected provider, device, model family, and size
     config.backend = BackendConfig {
         enabled: backend_enabled,
-        inference_provider: InferenceProvider::Onnx,  // Default to ONNX
+        inference_provider,
         execution_target: backend_device,
         model_family,
         model_size,

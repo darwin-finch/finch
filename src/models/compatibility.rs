@@ -302,6 +302,30 @@ pub fn get_compatible_families(target: ExecutionTarget) -> Vec<ModelFamily> {
         .collect()
 }
 
+/// Get all model families compatible with a given provider and execution target
+pub fn get_compatible_families_for_provider(
+    provider: InferenceProvider,
+    target: ExecutionTarget,
+) -> Vec<ModelFamily> {
+    COMPATIBILITY_MATRIX
+        .iter()
+        .filter(|c| {
+            // Must support the execution target
+            if !c.supported_targets.contains(&target) {
+                return false;
+            }
+
+            // Must have a repository for this provider
+            match provider {
+                InferenceProvider::Onnx => c.onnx_size_repos.is_some() || !c.onnx_repo_template.is_empty(),
+                #[cfg(feature = "candle")]
+                InferenceProvider::Candle => c.candle_size_repos.is_some() || !c.candle_repo_template.is_empty(),
+            }
+        })
+        .map(|c| c.family)
+        .collect()
+}
+
 /// Check if a model family is compatible with an execution target
 pub fn is_compatible(family: ModelFamily, target: ExecutionTarget) -> bool {
     COMPATIBILITY_MATRIX

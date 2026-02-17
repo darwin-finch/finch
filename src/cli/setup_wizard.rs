@@ -12,7 +12,7 @@ use ratatui::{
 use std::io;
 
 use crate::config::{ExecutionTarget, TeacherEntry};
-use crate::models::unified_loader::{ModelFamily, ModelSize};
+use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use crate::models::compatibility;
 
 /// Check if a model family is compatible with an execution target
@@ -41,6 +41,7 @@ pub struct SetupResult {
     pub claude_api_key: String,
     pub hf_token: Option<String>,
     pub backend_enabled: bool,
+    pub inference_provider: InferenceProvider,
     pub execution_target: ExecutionTarget,
     pub model_family: ModelFamily,
     pub model_size: ModelSize,
@@ -61,6 +62,7 @@ enum WizardStep {
     ClaudeApiKey(String),
     HfToken(String),
     EnableLocalModel(bool), // Ask if user wants local model (true = yes, false = proxy-only)
+    InferenceProviderSelection(usize), // Select inference provider (ONNX/Candle)
     ExecutionTargetSelection(usize), // Select hardware target (CoreML/CPU/CUDA)
     ModelFamilySelection(usize),
     ModelSizeSelection(usize),
@@ -116,6 +118,21 @@ fn run_wizard_loop(
 
     let mut hf_token = String::new(); // TODO: Add HF token to config
 
+    // Inference providers available
+    let inference_providers = vec![
+        InferenceProvider::Onnx,
+        #[cfg(feature = "candle")]
+        InferenceProvider::Candle,
+    ];
+    let mut selected_provider_idx = existing_config
+        .map(|c| {
+            inference_providers
+                .iter()
+                .position(|p| *p == c.backend.inference_provider)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+
     let execution_targets = ExecutionTarget::available_targets();
     let mut selected_target_idx = existing_config
         .map(|c| {
@@ -126,7 +143,9 @@ fn run_wizard_loop(
         })
         .unwrap_or(0);
 
-    let model_families = vec![
+    // Model families will be filtered based on selected provider + target
+    // Start with all families, will be filtered dynamically
+    let all_model_families = vec![
         ModelFamily::Qwen2,
         ModelFamily::Gemma2,
         ModelFamily::Llama3,
@@ -134,6 +153,7 @@ fn run_wizard_loop(
         ModelFamily::Phi,
         ModelFamily::DeepSeek,
     ];
+    let mut model_families = all_model_families.clone();
     let mut selected_family_idx = existing_config
         .map(|c| {
             model_families
@@ -187,7 +207,19 @@ fn run_wizard_loop(
 
     loop {
         terminal.draw(|f| {
-            render_wizard_step(f, &step, &execution_targets, &model_families, &model_sizes, &custom_model_repo, selected_target_idx, selected_family_idx, selected_size_idx);
+            render_wizard_step(
+                f,
+                &step,
+                &inference_providers,
+                &execution_targets,
+                &model_families,
+                &model_sizes,
+                &custom_model_repo,
+                selected_provider_idx,
+                selected_target_idx,
+                selected_family_idx,
+                selected_size_idx,
+            );
         })?;
 
         // Handle input
@@ -253,8 +285,8 @@ fn run_wizard_loop(
                         KeyCode::Enter => {
                             backend_enabled = *enable; // Save user's choice
                             if *enable {
-                                // User wants local model - continue to execution target selection
-                                step = WizardStep::ExecutionTargetSelection(selected_target_idx);
+                                // User wants local model - continue to provider selection
+                                step = WizardStep::InferenceProviderSelection(selected_provider_idx);
                             } else {
                                 // User wants proxy-only - skip to teacher config
                                 teachers[0].api_key = claude_key.clone();
@@ -263,6 +295,32 @@ fn run_wizard_loop(
                         }
                         KeyCode::Esc => {
                             anyhow::bail!("Setup cancelled");
+                        }
+                        _ => {}
+                    }
+                }
+
+                WizardStep::InferenceProviderSelection(selected) => {
+                    match key.code {
+                        KeyCode::Up => {
+                            if *selected > 0 {
+                                *selected -= 1;
+                                selected_provider_idx = *selected;
+                            }
+                        }
+                        KeyCode::Down => {
+                            if *selected < inference_providers.len() - 1 {
+                                *selected += 1;
+                                selected_provider_idx = *selected;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            // Proceed to execution target selection
+                            step = WizardStep::ExecutionTargetSelection(selected_target_idx);
+                        }
+                        KeyCode::Esc => {
+                            // Go back to enable local model
+                            step = WizardStep::EnableLocalModel(backend_enabled);
                         }
                         _ => {}
                     }
@@ -283,10 +341,29 @@ fn run_wizard_loop(
                             }
                         }
                         KeyCode::Enter => {
-                            step = WizardStep::ModelFamilySelection(selected_family_idx);
+                            // Filter model families based on selected provider + target
+                            use crate::models::compatibility::get_compatible_families_for_provider;
+                            let selected_provider = inference_providers[selected_provider_idx];
+                            let selected_target = execution_targets[selected_target_idx];
+                            model_families = get_compatible_families_for_provider(selected_provider, selected_target);
+
+                            if model_families.is_empty() {
+                                // No compatible models for this combination
+                                let error_msg = format!(
+                                    "No models available for {} on {}",
+                                    selected_provider.name(),
+                                    selected_target.name()
+                                );
+                                step = WizardStep::IncompatibleCombination(error_msg);
+                            } else {
+                                // Reset family selection to first compatible model
+                                selected_family_idx = 0;
+                                step = WizardStep::ModelFamilySelection(selected_family_idx);
+                            }
                         }
                         KeyCode::Esc => {
-                            anyhow::bail!("Setup cancelled");
+                            // Go back to provider selection
+                            step = WizardStep::InferenceProviderSelection(selected_provider_idx);
                         }
                         _ => {}
                     }
@@ -617,6 +694,7 @@ fn run_wizard_loop(
                                 claude_api_key: claude_key.clone(),
                                 hf_token: if hf_token.is_empty() { None } else { Some(hf_token.clone()) },
                                 backend_enabled,
+                                inference_provider: inference_providers[selected_provider_idx],
                                 execution_target: execution_targets[selected_target_idx],
                                 model_family: model_families[selected_family_idx],
                                 model_size: model_sizes[selected_size_idx],
@@ -653,10 +731,12 @@ fn cleanup_terminal(terminal: &mut ratatui::Terminal<ratatui::backend::Crossterm
 fn render_wizard_step(
     f: &mut Frame,
     step: &WizardStep,
+    inference_providers: &[InferenceProvider],
     execution_targets: &[ExecutionTarget],
     model_families: &[ModelFamily],
     model_sizes: &[ModelSize],
     _custom_repo: &str,
+    selected_provider_idx: usize,
     selected_target_idx: usize,
     selected_family_idx: usize,
     selected_size_idx: usize,
@@ -678,6 +758,7 @@ fn render_wizard_step(
         WizardStep::ClaudeApiKey(input) => render_api_key_input(f, inner, input),
         WizardStep::HfToken(input) => render_hf_token_input(f, inner, input),
         WizardStep::EnableLocalModel(enable) => render_enable_local_model(f, inner, *enable),
+        WizardStep::InferenceProviderSelection(selected) => render_inference_provider_selection(f, inner, inference_providers, *selected),
         WizardStep::ExecutionTargetSelection(selected) => render_execution_target_selection(f, inner, execution_targets, *selected),
         WizardStep::ModelFamilySelection(selected) => render_model_family_selection(f, inner, model_families, *selected),
         WizardStep::ModelSizeSelection(selected) => render_model_size_selection(f, inner, model_sizes, *selected),
@@ -873,6 +954,95 @@ fn render_enable_local_model(f: &mut Frame, area: Rect, enable: bool) {
     f.render_widget(help, chunks[2]);
 }
 
+fn render_inference_provider_selection(f: &mut Frame, area: Rect, providers: &[InferenceProvider], selected: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(10),    // Provider options
+            Constraint::Length(2),  // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new("Step 4: Select Inference Provider")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
+
+    let mut provider_lines = vec![
+        Line::from(Span::styled(
+            "Choose the inference engine for running models locally:\n",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+
+    for (i, provider) in providers.iter().enumerate() {
+        let is_selected = i == selected;
+        let style = if is_selected {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Reset)
+        };
+
+        let indicator = if is_selected { "▸ " } else { "  " };
+
+        match provider {
+            InferenceProvider::Onnx => {
+                provider_lines.push(Line::from(""));
+                provider_lines.push(Line::from(vec![
+                    Span::styled(indicator, style),
+                    Span::styled("ONNX Runtime (Recommended)", style),
+                ]));
+                provider_lines.push(Line::from(
+                    "  • Cross-platform, optimized inference engine"
+                ));
+                provider_lines.push(Line::from(
+                    "  • CoreML/ANE acceleration on Mac (best performance)"
+                ));
+                provider_lines.push(Line::from(
+                    "  • CUDA acceleration on NVIDIA GPUs"
+                ));
+                provider_lines.push(Line::from(
+                    "  • Community-converted ONNX models"
+                ));
+            }
+            #[cfg(feature = "candle")]
+            InferenceProvider::Candle => {
+                provider_lines.push(Line::from(""));
+                provider_lines.push(Line::from(vec![
+                    Span::styled(indicator, style),
+                    Span::styled("Candle (Alternative)", style),
+                ]));
+                provider_lines.push(Line::from(
+                    "  • Native Rust ML framework"
+                ));
+                provider_lines.push(Line::from(
+                    "  • Metal/CUDA/CPU support"
+                ));
+                provider_lines.push(Line::from(
+                    "  • Access to larger models (8B Llama, 27B Gemma)"
+                ));
+                provider_lines.push(Line::from(
+                    "  • Original model repositories"
+                ));
+                provider_lines.push(Line::from(vec![
+                    Span::styled("  ⚠ Note: ", Style::default().fg(Color::Yellow)),
+                    Span::raw("ANE/CoreML works best with ONNX Runtime"),
+                ]));
+            }
+        }
+    }
+
+    let provider_list = Paragraph::new(provider_lines)
+        .wrap(Wrap { trim: false });
+    f.render_widget(provider_list, chunks[1]);
+
+    let help = Paragraph::new("↑/↓: Select  Enter: Confirm  Esc: Back")
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[2]);
+}
+
 fn render_execution_target_selection(f: &mut Frame, area: Rect, targets: &[ExecutionTarget], selected: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -883,7 +1053,7 @@ fn render_execution_target_selection(f: &mut Frame, area: Rect, targets: &[Execu
         ])
         .split(area);
 
-    let title = Paragraph::new("Step 4: Select Execution Target")
+    let title = Paragraph::new("Step 5: Select Execution Target")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
