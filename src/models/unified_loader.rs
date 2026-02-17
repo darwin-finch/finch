@@ -5,27 +5,74 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::config::BackendDevice;
+use crate::config::ExecutionTarget;
 use super::download::ModelDownloader;
 use super::generator_new::TextGeneration;
 use super::loaders::onnx::{OnnxLoader, LoadedOnnxModel};
 use super::loaders::onnx_config::{OnnxLoadConfig, ModelSize as OnnxModelSize};
 use super::model_selector::QwenSize;
 
-// Phase 4: Candle removed, ONNX only
-// Legacy types kept for compatibility (will be removed after migration complete)
+/// Inference provider selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InferenceProvider {
+    /// ONNX Runtime (recommended, works on all platforms)
+    #[serde(rename = "onnx")]
+    Onnx,
+    /// Candle (alternative, native Rust implementation)
+    #[cfg(feature = "candle")]
+    #[serde(rename = "candle")]
+    Candle,
+}
 
-/// Configuration for loading any model on any backend
+impl Default for InferenceProvider {
+    fn default() -> Self {
+        Self::Onnx  // ONNX is the default provider
+    }
+}
+
+impl InferenceProvider {
+    /// Get human-readable name
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Onnx => "ONNX Runtime",
+            #[cfg(feature = "candle")]
+            Self::Candle => "Candle",
+        }
+    }
+
+    /// Get description for users
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Onnx => "ONNX Runtime (Recommended) - Cross-platform, optimized",
+            #[cfg(feature = "candle")]
+            Self::Candle => "Candle - Native Rust implementation, good for development",
+        }
+    }
+}
+
+/// Configuration for loading any model on any execution target with any provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelLoadConfig {
+    /// Which inference provider to use (ONNX Runtime or Candle)
+    #[serde(default)]
+    pub provider: InferenceProvider,
     /// Which model architecture to use
     pub family: ModelFamily,
     /// Which size variant (Small = 1-3B, Medium = 3-9B, Large = 7-14B, XLarge = 14B+)
     pub size: ModelSize,
-    /// Which backend device to run on
-    pub backend: BackendDevice,
+    /// Which execution target to run on (CoreML/CPU/CUDA)
+    #[serde(alias = "backend")] // Support old field name
+    pub target: ExecutionTarget,
     /// Optional: override HuggingFace repository (for custom models)
     pub repo_override: Option<String>,
+}
+
+impl ModelLoadConfig {
+    /// Legacy field accessor for backward compatibility
+    #[deprecated(note = "Use target field directly")]
+    pub fn backend(&self) -> ExecutionTarget {
+        self.target
+    }
 }
 
 /// Supported model families
@@ -243,22 +290,84 @@ impl UnifiedModelLoader {
         })
     }
 
-    /// Load model with configuration (Phase 5: ONNX implementation)
+    /// Load model with configuration (supports both ONNX and Candle providers)
     pub fn load(&self, config: ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
-        tracing::info!("Loading model: {:?} {:?} on {:?}", config.family, config.size, config.backend);
+        tracing::info!(
+            "Loading model: {:?} {:?} ({:?}) on {:?}",
+            config.family,
+            config.size,
+            config.provider,
+            config.target
+        );
 
-        // Convert unified ModelLoadConfig to OnnxLoadConfig
-        let onnx_config = self.to_onnx_config(&config)?;
+        match config.provider {
+            InferenceProvider::Onnx => {
+                // Convert unified ModelLoadConfig to OnnxLoadConfig
+                let onnx_config = self.to_onnx_config(&config)?;
 
-        // Load via ONNX
-        let onnx_loader = OnnxLoader::new(onnx_config.cache_dir.clone());
-        let model = onnx_loader.load_model_sync(&onnx_config)
-            .context("Failed to load ONNX model")?;
+                // Load via ONNX
+                let onnx_loader = OnnxLoader::new(onnx_config.cache_dir.clone());
+                let model = onnx_loader
+                    .load_model_sync(&onnx_config)
+                    .context("Failed to load ONNX model")?;
 
-        tracing::info!("Successfully loaded model: {}", model.model_name());
+                tracing::info!("Successfully loaded ONNX model: {}", model.model_name());
 
-        // Box and return as TextGeneration trait object
-        Ok(Box::new(model))
+                // Box and return as TextGeneration trait object
+                Ok(Box::new(model))
+            }
+
+            #[cfg(feature = "candle")]
+            InferenceProvider::Candle => {
+                // Load via Candle
+                self.load_candle(&config)
+            }
+        }
+    }
+
+    /// Load model using Candle provider
+    #[cfg(feature = "candle")]
+    fn load_candle(&self, config: &ModelLoadConfig) -> Result<Box<dyn TextGeneration>> {
+        use super::loaders::candle::CandleLoader;
+
+        tracing::info!("Loading Candle model");
+
+        // Resolve repository ID
+        let repo_id = self.resolve_repository(config)?;
+
+        // Check if model is cached
+        let model_path = if self.cache.is_cached(&repo_id) {
+            tracing::debug!("Model found in cache");
+            self.cache.get_cache_path(&repo_id)
+        } else {
+            tracing::info!("Model not cached, downloading from HuggingFace...");
+
+            // Estimate download size
+            let estimated_size_gb = match config.size {
+                ModelSize::Small => 3.0,
+                ModelSize::Medium => 8.0,
+                ModelSize::Large => 16.0,
+                ModelSize::XLarge => 30.0,
+            };
+
+            // Download model
+            let (cache_path, _rx) = self
+                .downloader
+                .download_model(&repo_id, estimated_size_gb)
+                .with_context(|| format!("Failed to download model from {}", repo_id))?;
+
+            cache_path
+        };
+
+        // Load via Candle loader
+        let candle_loader = CandleLoader::new();
+        let model = candle_loader
+            .load(&model_path, config.family, config.size, config.target)
+            .context("Failed to load Candle model")?;
+
+        tracing::info!("Successfully loaded Candle model");
+
+        Ok(model)
     }
 
     /// Convert ModelLoadConfig to OnnxLoadConfig (Phase 5 helper)
@@ -282,37 +391,28 @@ impl UnifiedModelLoader {
         // Extract model name from repo ID (e.g., "onnx-community/Qwen2.5-1.5B-Instruct" → "Qwen2.5-1.5B-Instruct")
         let model_name = repo_id.split('/').last().unwrap_or(&repo_id).to_string();
 
-        // Map BackendDevice to execution providers
+        // Map ExecutionTarget to ONNX Runtime execution providers
         use super::loaders::onnx_config::ExecutionProvider;
 
-        let execution_providers = match config.backend {
+        let execution_providers = match config.target {
             #[cfg(target_os = "macos")]
-            BackendDevice::CoreML => {
+            ExecutionTarget::CoreML => {
                 Some(vec![
                     ExecutionProvider::CoreML,
                     ExecutionProvider::CPU,
                 ])
             }
             #[cfg(feature = "cuda")]
-            BackendDevice::Cuda => {
+            ExecutionTarget::Cuda => {
                 Some(vec![
                     ExecutionProvider::CUDA,
                     ExecutionProvider::CPU,
                 ])
             }
-            #[cfg(target_os = "macos")]
-            BackendDevice::Metal => {
-                // Metal not directly supported by ONNX, use CoreML (which uses ANE/GPU)
-                tracing::warn!("Metal not directly supported by ONNX, using CoreML instead");
-                Some(vec![
-                    ExecutionProvider::CoreML,
-                    ExecutionProvider::CPU,
-                ])
-            }
-            BackendDevice::Cpu => {
+            ExecutionTarget::Cpu => {
                 Some(vec![ExecutionProvider::CPU])
             }
-            BackendDevice::Auto => None, // Let ONNX loader decide
+            ExecutionTarget::Auto => None, // Let ONNX loader decide
         };
 
         Ok(OnnxLoadConfig {
@@ -334,7 +434,7 @@ impl UnifiedModelLoader {
             "Loading {} {} on {}",
             config.family.name(),
             config.size.to_size_string(config.family),
-            config.backend.name()
+            config.target.name()
         );
 
         // 2. Check cache or download
@@ -365,144 +465,23 @@ impl UnifiedModelLoader {
         self.load_model_variant(&config, &model_path)
     }
 
-    /// Resolve HuggingFace repository ID based on family and backend
+    /// Resolve HuggingFace repository ID based on provider, family, and size
+    ///
+    /// Uses the compatibility matrix to get the correct repository
     fn resolve_repository(&self, config: &ModelLoadConfig) -> Result<String> {
         // Check for user override first
         if let Some(ref repo) = config.repo_override {
             return Ok(repo.clone());
         }
 
-        let size_str = config.size.to_size_string(config.family);
-
-        let repo = match (&config.family, &config.backend) {
-            // CoreML needs pre-converted .mlpackage models (macOS only)
-            // Community and official conversions from HuggingFace
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Qwen2, BackendDevice::CoreML) => {
-                // Only Small (0.6B) has proper CoreML structure with config.json + tokenizer.json
-                match config.size {
-                    ModelSize::Small => "anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4".to_string(),
-                    _ => {
-                        anyhow::bail!(
-                            "CoreML Qwen only available for Small (0.6B).\n\
-                             \n\
-                             Repository: anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4\n\
-                             \n\
-                             For larger models, use ONNX Runtime (recommended) or wait for broader CoreML support.\n\
-                             Note: CPU backend is too slow for production use.\n\
-                             \n\
-                             To fix: Change config.toml:\n\
-                             [backend]\n\
-                             device = \"coreml\"\n\
-                             model_size = \"Small\"  # <-- Change this"
-                        )
-                    }
-                }
-            }
-
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Llama3, BackendDevice::CoreML) => {
-                // Community CoreML conversions (andmev, smpanaro)
-                match config.size {
-                    ModelSize::Small => "smpanaro/Llama-3.2-1B-Instruct-CoreML".to_string(),
-                    ModelSize::Medium => "andmev/Llama-3.2-3B-Instruct-CoreML".to_string(),
-                    ModelSize::Large => "andmev/Llama-3.1-8B-Instruct-CoreML".to_string(),
-                    _ => {
-                        anyhow::bail!(
-                            "CoreML Llama only available up to 8B. \
-                             For larger models, use Metal or CPU."
-                        )
-                    }
-                }
-            }
-
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Gemma2, BackendDevice::CoreML) => {
-                // anemll has Gemma 3 270M
-                match config.size {
-                    ModelSize::Small => "anemll/anemll-google-gemma-3-270m-it-M1-ctx512-monolithic_0.3.5".to_string(),
-                    _ => {
-                        anyhow::bail!(
-                            "CoreML Gemma only available for Small (270M). \
-                             For larger models, use Metal or CPU."
-                        )
-                    }
-                }
-            }
-
-            #[cfg(target_os = "macos")]
-            (ModelFamily::Mistral, BackendDevice::CoreML) => {
-                // REMOVED: apple/mistral-coreml doesn't exist (404 errors)
-                anyhow::bail!(
-                    "Mistral CoreML models are not available.\n\n\
-                     The repository 'apple/mistral-coreml' does not exist.\n\n\
-                     Please select Metal or CPU as your device to use ONNX models:\n\
-                     - microsoft/Mistral-7B-Instruct-v0.2-ONNX (7B)\n\
-                     - nvidia/Mistral-7B-Instruct-v0.3-ONNX-INT4 (7B, quantized)\n\n\
-                     Or choose a different model family (Qwen2, Llama3, or Gemma2)."
-                )
-            }
-
-            // ONNX models from onnx-community and other providers
-            (ModelFamily::Qwen2, _) => {
-                // FIXED: Use onnx-community instead of original Qwen repo
-                format!("onnx-community/Qwen2.5-{}-Instruct", size_str)
-            }
-
-            (ModelFamily::Gemma2, _) => {
-                // FIXED: Use onnx-community Gemma 3 models (newer than Gemma 2)
-                match config.size {
-                    ModelSize::Small => "onnx-community/gemma-3-270m-it-ONNX".to_string(),
-                    ModelSize::Medium => "onnx-community/gemma-3-1b-it-ONNX".to_string(),
-                    ModelSize::Large => "onnx-community/gemma-2-9b-it-ONNX-DirectML-GenAI-INT4".to_string(),
-                    ModelSize::XLarge => "onnx-community/gemma-2-9b-it-ONNX-DirectML-GenAI-INT4".to_string(),
-                }
-            }
-
-            (ModelFamily::Llama3, _) => {
-                // FIXED: Use onnx-community Llama 3.2 ONNX models
-                format!("onnx-community/Llama-3.2-{}-Instruct-ONNX", size_str)
-            }
-
-            (ModelFamily::Mistral, _) => {
-                // FIXED: Use Microsoft/NVIDIA ONNX models instead of original Mistral
-                // Mistral has fixed model names, not size-parameterized
-                if matches!(config.size, ModelSize::Large | ModelSize::XLarge) {
-                    // Use Ministral 3B for smaller sizes, or keep 7B for larger
-                    "microsoft/Mistral-7B-Instruct-v0.2-ONNX".to_string()
-                } else {
-                    // Small/Medium: Use Ministral 3B or Mistral 7B
-                    "microsoft/Mistral-7B-Instruct-v0.2-ONNX".to_string()
-                }
-            }
-
-            (ModelFamily::Phi, _) => {
-                // Phi ONNX models from Microsoft
-                match config.size {
-                    ModelSize::Small => "onnx-community/Phi-4-mini-instruct-ONNX".to_string(), // 3.8B
-                    ModelSize::Medium => "microsoft/Phi-3.5-mini-instruct-onnx".to_string(), // 3.8B
-                    ModelSize::Large => "microsoft/Phi-4-mini-instruct-onnx".to_string(), // 14B
-                    ModelSize::XLarge => "microsoft/Phi-4-mini-instruct-onnx".to_string(), // 14B
-                }
-            }
-
-            (ModelFamily::DeepSeek, _) => {
-                // DeepSeek ONNX models (R1 Distill series)
-                // Only 1.5B is available in ONNX format
-                // For larger sizes, recommend switching to Qwen or Phi in the wizard
-                // For now, all sizes use the 1.5B model
-                "onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX".to_string()
-            }
-
-            // Unsupported combinations will be caught in load_model_variant
-            _ => anyhow::bail!(
-                "Repository resolution not implemented for {:?} on {:?}",
+        // Use compatibility matrix to resolve repository
+        super::compatibility::get_repository(config.provider, config.family, config.size)
+            .with_context(|| format!(
+                "No {:?} model repository available for {:?} {:?}",
+                config.provider,
                 config.family,
-                config.backend
-            ),
-        };
-
-        Ok(repo)
+                config.size
+            ))
     }
 
     /// Load model variant based on family + backend combination
@@ -699,35 +678,38 @@ mod tests {
     fn test_repository_resolution() {
         let loader = UnifiedModelLoader::new().unwrap();
 
-        // Qwen standard
+        // Qwen standard (ONNX community)
         let config = ModelLoadConfig {
+            provider: InferenceProvider::Onnx,
             family: ModelFamily::Qwen2,
             size: ModelSize::Small,
-            backend: BackendDevice::Metal,
+            target: ExecutionTarget::Cpu,
             repo_override: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "Qwen/Qwen2.5-1.5B-Instruct");
+        assert_eq!(repo, "onnx-community/Qwen2.5-1.5B-Instruct");
 
-        // Gemma
+        // Gemma (onnx-community)
         let config = ModelLoadConfig {
+            provider: InferenceProvider::Onnx,
             family: ModelFamily::Gemma2,
             size: ModelSize::Small,
-            backend: BackendDevice::Cpu,
+            target: ExecutionTarget::Cpu,
             repo_override: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "google/gemma-2-2b-it");
+        assert_eq!(repo, "onnx-community/gemma-3-270m-it-ONNX");
 
-        // Llama
+        // Llama (onnx-community)
         let config = ModelLoadConfig {
+            provider: InferenceProvider::Onnx,
             family: ModelFamily::Llama3,
             size: ModelSize::Medium,
-            backend: BackendDevice::Cpu,
+            target: ExecutionTarget::Cpu,
             repo_override: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "meta-llama/Llama-3.2-8B-Instruct");
+        assert_eq!(repo, "onnx-community/Llama-3.2-3B-Instruct-ONNX");
     }
 
     #[test]
@@ -735,15 +717,16 @@ mod tests {
     fn test_coreml_repository_resolution() {
         let loader = UnifiedModelLoader::new().unwrap();
 
-        // CoreML uses anemll org
+        // CoreML uses same onnx-community repos (execution provider difference only)
         let config = ModelLoadConfig {
+            provider: InferenceProvider::Onnx,
             family: ModelFamily::Qwen2,
             size: ModelSize::Medium,
-            backend: BackendDevice::CoreML,
+            target: ExecutionTarget::CoreML,
             repo_override: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
-        assert_eq!(repo, "anemll/Qwen2.5-3B-Instruct");
+        assert_eq!(repo, "onnx-community/Qwen2.5-Coder-3B-Instruct");
     }
 
     #[test]
@@ -751,9 +734,10 @@ mod tests {
         let loader = UnifiedModelLoader::new().unwrap();
 
         let config = ModelLoadConfig {
+            provider: InferenceProvider::Onnx,
             family: ModelFamily::Qwen2,
             size: ModelSize::Small,
-            backend: BackendDevice::Cpu,
+            target: ExecutionTarget::Cpu,
             repo_override: Some("custom-org/custom-model".to_string()),
         };
         let repo = loader.resolve_repository(&config).unwrap();

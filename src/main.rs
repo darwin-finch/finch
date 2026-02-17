@@ -180,13 +180,21 @@ async fn main() -> Result<()> {
             let result = show_setup_wizard()?;
 
             // Create and save config
+            // Extract values before partial move
+            let backend_device = result.backend_device();
+            let backend_enabled = result.backend_enabled;
+            let model_family = result.model_family;
+            let model_size = result.model_size;
+            let custom_model_repo = result.custom_model_repo;
+
             let mut new_config = Config::new(result.teachers);
             new_config.backend = shammah::config::BackendConfig {
-                enabled: result.backend_enabled,
-                device: result.backend_device,
-                model_family: result.model_family,
-                model_size: result.model_size,
-                model_repo: result.custom_model_repo,
+                enabled: backend_enabled,
+                inference_provider: shammah::models::unified_loader::InferenceProvider::Onnx,  // Default to ONNX
+                execution_target: backend_device,
+                model_family,
+                model_size,
+                model_repo: custom_model_repo,
                 ..Default::default()
             };
             new_config.save()?;
@@ -703,13 +711,14 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     if config.backend.enabled {
         let loader_clone = Arc::clone(&bootstrap_loader);
         let state_clone = Arc::clone(&generator_state);
+        let provider = config.backend.inference_provider;
         let model_family = config.backend.model_family;
         let model_size = config.backend.model_size;
-        let device = config.backend.device;
+        let device = config.backend.execution_target;
         let model_repo = config.backend.model_repo.clone();
         tokio::spawn(async move {
             if let Err(e) = loader_clone
-                .load_generator_async(model_family, model_size, device, model_repo)
+                .load_generator_async(provider, model_family, model_size, device, model_repo)
                 .await
             {
                 output_status!("⚠️  Model loading failed: {}", e);
@@ -900,16 +909,25 @@ async fn run_setup() -> Result<()> {
     // Run the wizard
     let result = show_setup_wizard()?;
 
+    // Extract values before partial move
+    let backend_device = result.backend_device();
+    let backend_enabled = result.backend_enabled;
+    let model_family = result.model_family;
+    let model_size = result.model_size;
+    let custom_model_repo = result.custom_model_repo;
+
     // Create config from wizard results
     let mut config = Config::new(result.teachers);
 
     // Update backend config with selected device, model family, and size
+    use shammah::models::unified_loader::InferenceProvider;
     config.backend = BackendConfig {
-        enabled: result.backend_enabled,
-        device: result.backend_device,
-        model_family: result.model_family,
-        model_size: result.model_size,
-        model_repo: result.custom_model_repo,
+        enabled: backend_enabled,
+        inference_provider: InferenceProvider::Onnx,  // Default to ONNX
+        execution_target: backend_device,
+        model_family,
+        model_size,
+        model_repo: custom_model_repo,
         ..Default::default()
     };
 

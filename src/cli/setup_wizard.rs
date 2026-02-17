@@ -11,101 +11,29 @@ use ratatui::{
 };
 use std::io;
 
-use crate::config::{BackendDevice, TeacherEntry};
+use crate::config::{ExecutionTarget, TeacherEntry};
 use crate::models::unified_loader::{ModelFamily, ModelSize};
+use crate::models::compatibility;
 
-/// Check if a model family is compatible with a backend device
-fn is_model_available(family: ModelFamily, device: BackendDevice) -> bool {
-    match (family, device) {
-        // CoreML support (macOS only, experimental - has runtime issues per MEMORY.md)
-        #[cfg(target_os = "macos")]
-        (ModelFamily::Qwen2, BackendDevice::CoreML) => true,  // Limited: Only Small (0.6B)
-        #[cfg(target_os = "macos")]
-        (ModelFamily::Llama3, BackendDevice::CoreML) => true, // Small/Medium/Large (1B/3B/8B)
-        #[cfg(target_os = "macos")]
-        (ModelFamily::Gemma2, BackendDevice::CoreML) => true, // Limited: Only Small (270M)
-
-        // CoreML NOT supported for these models
-        #[cfg(target_os = "macos")]
-        (ModelFamily::Mistral, BackendDevice::CoreML) => false, // apple/mistral-coreml doesn't exist (404)
-        #[cfg(target_os = "macos")]
-        (ModelFamily::Phi, BackendDevice::CoreML) => false, // No CoreML conversion available
-        #[cfg(target_os = "macos")]
-        (ModelFamily::DeepSeek, BackendDevice::CoreML) => false, // No CoreML conversion available
-
-        // ONNX support (Metal/CPU - all models work via onnx-community/microsoft/nvidia)
-        (ModelFamily::Qwen2, _) => true,     // onnx-community/Qwen2.5-{size}-Instruct
-        (ModelFamily::Llama3, _) => true,    // onnx-community/Llama-3.2-{size}-Instruct-ONNX
-        (ModelFamily::Gemma2, _) => true,    // onnx-community/gemma-{version}-{size}-it-ONNX
-        (ModelFamily::Mistral, _) => true,   // microsoft/Mistral-7B-Instruct-v0.2-ONNX
-        (ModelFamily::Phi, _) => true,       // onnx-community/Phi-4-mini-instruct-ONNX
-        (ModelFamily::DeepSeek, _) => true,  // onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX
-
-        #[allow(unreachable_patterns)]
-        _ => false,
-    }
+/// Check if a model family is compatible with an execution target
+///
+/// Uses the compatibility matrix for single source of truth
+fn is_model_available(family: ModelFamily, target: ExecutionTarget) -> bool {
+    compatibility::is_compatible(family, target)
 }
 
-/// Get error message for incompatible model/device combination
-fn get_compatibility_error(family: ModelFamily, device: BackendDevice) -> String {
-    match (family, device) {
-        #[cfg(target_os = "macos")]
-        (ModelFamily::Mistral, BackendDevice::CoreML) => {
-            format!(
-                "⚠️  {} models are not available for CoreML.\n\n\
-                 The repository 'apple/mistral-coreml' does not exist (404 errors).\n\n\
-                 ✅ Solution: Select Metal or CPU to use ONNX models:\n\
-                 • microsoft/Mistral-7B-Instruct-v0.2-ONNX\n\
-                 • nvidia/Mistral-7B-Instruct-v0.3-ONNX-INT4 (quantized)\n\n\
-                 Or choose a different model family that supports CoreML:\n\
-                 • Qwen2 (limited sizes)\n\
-                 • Llama3 (1B/3B/8B)\n\
-                 • Gemma2 (limited sizes)\n\n\
-                 Press 'd' to change device, or 'b' to change model family.",
-                family.name()
-            )
-        }
-        #[cfg(target_os = "macos")]
-        (ModelFamily::DeepSeek, BackendDevice::CoreML) => {
-            format!(
-                "⚠️  {} models are not available for CoreML.\n\n\
-                 DeepSeek uses ONNX format from onnx-community,\n\
-                 which is not compatible with CoreML's .mlpackage format.\n\n\
-                 ✅ Solution: Select Metal or CPU to use:\n\
-                 • onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX\n\n\
-                 Or choose a CoreML-compatible model:\n\
-                 • Qwen2 (limited sizes)\n\
-                 • Llama3 (1B/3B/8B)\n\
-                 • Gemma2 (limited sizes)\n\n\
-                 Press 'd' to change device, or 'b' to change model family.",
-                family.name()
-            )
-        }
-        #[cfg(target_os = "macos")]
-        (ModelFamily::Phi, BackendDevice::CoreML) => {
-            format!(
-                "⚠️  {} models are not available for CoreML.\n\n\
-                 Phi uses ONNX format from onnx-community and Microsoft,\n\
-                 which is not compatible with CoreML's .mlpackage format.\n\n\
-                 ✅ Solution: Select Metal or CPU to use:\n\
-                 • onnx-community/Phi-4-mini-instruct-ONNX\n\
-                 • microsoft/Phi-3.5-mini-instruct-onnx\n\n\
-                 Or choose a CoreML-compatible model:\n\
-                 • Qwen2 (limited sizes)\n\
-                 • Llama3 (1B/3B/8B)\n\
-                 • Gemma2 (limited sizes)\n\n\
-                 Press 'd' to change device, or 'b' to change model family.",
-                family.name()
-            )
-        }
-        _ => format!(
-            "⚠️  {} models are not compatible with {}.\n\n\
-             Please select a different device or model family.\n\n\
-             Press 'd' to change device, or 'b' to change model family.",
-            family.name(),
-            device.name()
-        ),
-    }
+/// Get error message for incompatible model/target combination
+///
+/// NOTE: With ONNX Runtime, all models support all execution targets.
+/// This function is kept for future edge cases but should rarely trigger.
+fn get_compatibility_error(family: ModelFamily, target: ExecutionTarget) -> String {
+    format!(
+        "⚠️  {} models are not available for {} execution target.\n\n\
+         Please select a different target or model family.\n\n\
+         Press 't' to change target, or 'b' to change model family.",
+        family.name(),
+        target.name()
+    )
 }
 
 /// Setup wizard result containing all collected configuration
@@ -113,11 +41,19 @@ pub struct SetupResult {
     pub claude_api_key: String,
     pub hf_token: Option<String>,
     pub backend_enabled: bool,
-    pub backend_device: BackendDevice,
+    pub execution_target: ExecutionTarget,
     pub model_family: ModelFamily,
     pub model_size: ModelSize,
     pub custom_model_repo: Option<String>,
     pub teachers: Vec<TeacherEntry>,
+}
+
+impl SetupResult {
+    /// Legacy field accessor for backward compatibility
+    #[deprecated(note = "Use execution_target instead")]
+    pub fn backend_device(&self) -> ExecutionTarget {
+        self.execution_target
+    }
 }
 
 enum WizardStep {
@@ -125,12 +61,12 @@ enum WizardStep {
     ClaudeApiKey(String),
     HfToken(String),
     EnableLocalModel(bool), // Ask if user wants local model (true = yes, false = proxy-only)
-    DeviceSelection(usize),
+    ExecutionTargetSelection(usize), // Select hardware target (CoreML/CPU/CUDA)
     ModelFamilySelection(usize),
     ModelSizeSelection(usize),
-    IncompatibleCombination(String), // Error message for incompatible device/family
+    IncompatibleCombination(String), // Error message for incompatible target/family
     ModelPreview, // Show resolved model info before proceeding
-    CustomModelRepo(String, BackendDevice), // (repo input, selected device)
+    CustomModelRepo(String, ExecutionTarget), // (repo input, selected target)
     TeacherConfig(Vec<TeacherEntry>, usize), // (teachers list, selected index)
     AddTeacherProviderSelection(Vec<TeacherEntry>, usize), // (existing teachers, selected provider idx)
     AddTeacherApiKey(Vec<TeacherEntry>, String, String), // (existing teachers, provider, api_key input)
@@ -180,12 +116,12 @@ fn run_wizard_loop(
 
     let mut hf_token = String::new(); // TODO: Add HF token to config
 
-    let devices = BackendDevice::available_devices();
-    let mut selected_device_idx = existing_config
+    let execution_targets = ExecutionTarget::available_targets();
+    let mut selected_target_idx = existing_config
         .map(|c| {
-            devices
+            execution_targets
                 .iter()
-                .position(|d| d == &c.backend.device)
+                .position(|t| *t == c.backend.execution_target)
                 .unwrap_or(0)
         })
         .unwrap_or(0);
@@ -251,7 +187,7 @@ fn run_wizard_loop(
 
     loop {
         terminal.draw(|f| {
-            render_wizard_step(f, &step, &devices, &model_families, &model_sizes, &custom_model_repo, selected_device_idx, selected_family_idx, selected_size_idx);
+            render_wizard_step(f, &step, &execution_targets, &model_families, &model_sizes, &custom_model_repo, selected_target_idx, selected_family_idx, selected_size_idx);
         })?;
 
         // Handle input
@@ -317,8 +253,8 @@ fn run_wizard_loop(
                         KeyCode::Enter => {
                             backend_enabled = *enable; // Save user's choice
                             if *enable {
-                                // User wants local model - continue to device selection
-                                step = WizardStep::DeviceSelection(selected_device_idx);
+                                // User wants local model - continue to execution target selection
+                                step = WizardStep::ExecutionTargetSelection(selected_target_idx);
                             } else {
                                 // User wants proxy-only - skip to teacher config
                                 teachers[0].api_key = claude_key.clone();
@@ -332,18 +268,18 @@ fn run_wizard_loop(
                     }
                 }
 
-                WizardStep::DeviceSelection(selected) => {
+                WizardStep::ExecutionTargetSelection(selected) => {
                     match key.code {
                         KeyCode::Up => {
                             if *selected > 0 {
                                 *selected -= 1;
-                                selected_device_idx = *selected;
+                                selected_target_idx = *selected;
                             }
                         }
                         KeyCode::Down => {
-                            if *selected < devices.len() - 1 {
+                            if *selected < execution_targets.len() - 1 {
                                 *selected += 1;
-                                selected_device_idx = *selected;
+                                selected_target_idx = *selected;
                             }
                         }
                         KeyCode::Enter => {
@@ -395,13 +331,13 @@ fn run_wizard_loop(
                             }
                         }
                         KeyCode::Enter => {
-                            // Check if selected device + model family is compatible
-                            let selected_device = devices[selected_device_idx];
+                            // Check if selected target + model family is compatible
+                            let selected_target = execution_targets[selected_target_idx];
                             let selected_family = model_families[selected_family_idx];
 
-                            if !is_model_available(selected_family, selected_device) {
+                            if !is_model_available(selected_family, selected_target) {
                                 // Show error and go back to family selection
-                                let error_msg = get_compatibility_error(selected_family, selected_device);
+                                let error_msg = get_compatibility_error(selected_family, selected_target);
                                 step = WizardStep::IncompatibleCombination(error_msg);
                             } else {
                                 step = WizardStep::ModelPreview;
@@ -420,9 +356,9 @@ fn run_wizard_loop(
                             // Go back to model family selection to choose a compatible family
                             step = WizardStep::ModelFamilySelection(selected_family_idx);
                         }
-                        KeyCode::Char('d') => {
-                            // Go back to device selection to choose a compatible device
-                            step = WizardStep::DeviceSelection(selected_device_idx);
+                        KeyCode::Char('t') => {
+                            // Go back to execution target selection to choose a compatible target
+                            step = WizardStep::ExecutionTargetSelection(selected_target_idx);
                         }
                         KeyCode::Esc => {
                             anyhow::bail!("Setup cancelled");
@@ -437,7 +373,7 @@ fn run_wizard_loop(
                             // User confirmed - proceed to custom model repo input
                             step = WizardStep::CustomModelRepo(
                                 custom_model_repo.clone(),
-                                devices[selected_device_idx]
+                                execution_targets[selected_target_idx]
                             );
                         }
                         KeyCode::Char('b') | KeyCode::Backspace => {
@@ -681,7 +617,7 @@ fn run_wizard_loop(
                                 claude_api_key: claude_key.clone(),
                                 hf_token: if hf_token.is_empty() { None } else { Some(hf_token.clone()) },
                                 backend_enabled,
-                                backend_device: devices[selected_device_idx],
+                                execution_target: execution_targets[selected_target_idx],
                                 model_family: model_families[selected_family_idx],
                                 model_size: model_sizes[selected_size_idx],
                                 custom_model_repo: if custom_model_repo.is_empty() {
@@ -717,11 +653,11 @@ fn cleanup_terminal(terminal: &mut ratatui::Terminal<ratatui::backend::Crossterm
 fn render_wizard_step(
     f: &mut Frame,
     step: &WizardStep,
-    devices: &[BackendDevice],
+    execution_targets: &[ExecutionTarget],
     model_families: &[ModelFamily],
     model_sizes: &[ModelSize],
     _custom_repo: &str,
-    selected_device_idx: usize,
+    selected_target_idx: usize,
     selected_family_idx: usize,
     selected_size_idx: usize,
 ) {
@@ -742,12 +678,12 @@ fn render_wizard_step(
         WizardStep::ClaudeApiKey(input) => render_api_key_input(f, inner, input),
         WizardStep::HfToken(input) => render_hf_token_input(f, inner, input),
         WizardStep::EnableLocalModel(enable) => render_enable_local_model(f, inner, *enable),
-        WizardStep::DeviceSelection(selected) => render_device_selection(f, inner, devices, *selected),
+        WizardStep::ExecutionTargetSelection(selected) => render_execution_target_selection(f, inner, execution_targets, *selected),
         WizardStep::ModelFamilySelection(selected) => render_model_family_selection(f, inner, model_families, *selected),
         WizardStep::ModelSizeSelection(selected) => render_model_size_selection(f, inner, model_sizes, *selected),
         WizardStep::IncompatibleCombination(error_msg) => render_incompatible_combination(f, inner, error_msg),
-        WizardStep::ModelPreview => render_model_preview(f, inner, devices[selected_device_idx], model_families[selected_family_idx], model_sizes[selected_size_idx]),
-        WizardStep::CustomModelRepo(input, device) => render_custom_model_repo(f, inner, input, *device),
+        WizardStep::ModelPreview => render_model_preview(f, inner, execution_targets[selected_target_idx], model_families[selected_family_idx], model_sizes[selected_size_idx]),
+        WizardStep::CustomModelRepo(input, target) => render_custom_model_repo(f, inner, input, *target),
         WizardStep::TeacherConfig(teachers, selected) => render_teacher_config(f, inner, teachers, *selected),
         WizardStep::AddTeacherProviderSelection(_, selected) => render_provider_selection(f, inner, *selected),
         WizardStep::AddTeacherApiKey(_, provider, input) => render_teacher_api_key_input(f, inner, provider, input),
@@ -937,34 +873,32 @@ fn render_enable_local_model(f: &mut Frame, area: Rect, enable: bool) {
     f.render_widget(help, chunks[2]);
 }
 
-fn render_device_selection(f: &mut Frame, area: Rect, devices: &[BackendDevice], selected: usize) {
+fn render_execution_target_selection(f: &mut Frame, area: Rect, targets: &[ExecutionTarget], selected: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // Title
-            Constraint::Min(8),     // Device list
+            Constraint::Min(8),     // Target list
             Constraint::Length(2),  // Help
         ])
         .split(area);
 
-    let title = Paragraph::new("Step 3: Select Inference Device")
+    let title = Paragraph::new("Step 4: Select Execution Target")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    let items: Vec<ListItem> = devices
+    let items: Vec<ListItem> = targets
         .iter()
-        .map(|device| {
-            let description = device.description();
-            let emoji = match device {
+        .map(|target| {
+            let description = target.description();
+            let emoji = match target {
                 #[cfg(target_os = "macos")]
-                BackendDevice::CoreML => "⚡",
-                #[cfg(target_os = "macos")]
-                BackendDevice::Metal => "🚀",
+                ExecutionTarget::CoreML => "⚡",
                 #[cfg(feature = "cuda")]
-                BackendDevice::Cuda => "💨",
-                BackendDevice::Cpu => "🐌",
-                BackendDevice::Auto => "🤖",
+                ExecutionTarget::Cuda => "💨",
+                ExecutionTarget::Cpu => "🔄",
+                ExecutionTarget::Auto => "🤖",
             };
 
             ListItem::new(Line::from(vec![
@@ -979,7 +913,7 @@ fn render_device_selection(f: &mut Frame, area: Rect, devices: &[BackendDevice],
     list_state.select(Some(selected));
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL))
+        .block(Block::default().borders(Borders::ALL).title(" Where should inference run? "))
         .highlight_style(
             Style::default()
                 .bg(Color::Cyan)
@@ -1131,7 +1065,7 @@ fn render_incompatible_combination(f: &mut Frame, area: Rect, error_msg: &str) {
     f.render_widget(help, chunks[2]);
 }
 
-fn render_model_preview(f: &mut Frame, area: Rect, device: BackendDevice, family: ModelFamily, size: ModelSize) {
+fn render_model_preview(f: &mut Frame, area: Rect, target: ExecutionTarget, family: ModelFamily, size: ModelSize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1146,134 +1080,17 @@ fn render_model_preview(f: &mut Frame, area: Rect, device: BackendDevice, family
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    // Resolve model repository and info
-    let size_str = size.to_size_string(family);
-    let (repo, params, download_size, ram_req) = match (family, device) {
-        // ONNX models (currently only Qwen2)
-        (ModelFamily::Qwen2, _) if !matches!(device, BackendDevice::CoreML) => {
-            let repo = format!("onnx-community/Qwen2.5-{}-Instruct", size_str);
-            let (params, dl, ram) = match size {
-                ModelSize::Small => ("1.5B parameters", "~3 GB", "8-16 GB"),
-                ModelSize::Medium => ("3B parameters", "~6 GB", "16-32 GB"),
-                ModelSize::Large => ("7B parameters", "~14 GB", "32-64 GB"),
-                ModelSize::XLarge => ("7B parameters", "~14 GB", "32-64 GB"), // Max for ONNX
-            };
-            (repo, params, dl, ram)
-        }
+    // Use compatibility matrix to resolve repository (ONNX provider by default)
+    use crate::models::unified_loader::InferenceProvider;
+    let repo = compatibility::get_repository(InferenceProvider::Onnx, family, size)
+        .unwrap_or_else(|| format!("onnx-community/{}-{}-Instruct", family.name(), size.to_size_string(family)));
 
-        // CoreML models
-        (ModelFamily::Qwen2, BackendDevice::CoreML) => {
-            let repo = match size {
-                ModelSize::Small => "anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4".to_string(),
-                _ => format!("anemll/Qwen2.5-{}-Instruct", size_str),
-            };
-            let (params, dl, ram) = match size {
-                ModelSize::Small => ("0.6B parameters", "~1.5 GB", "8 GB"),
-                ModelSize::Medium => ("3B parameters", "~6 GB", "16 GB"),
-                ModelSize::Large => ("7B parameters", "~14 GB", "32 GB"),
-                ModelSize::XLarge => ("14B parameters", "~28 GB", "64 GB"),
-            };
-            (repo, params, dl, ram)
-        }
-
-        (ModelFamily::Llama3, BackendDevice::CoreML) => {
-            let repo = match size {
-                ModelSize::Small => "smpanaro/Llama-3.2-1B-Instruct-CoreML",
-                ModelSize::Medium => "andmev/Llama-3.2-3B-Instruct-CoreML",
-                ModelSize::Large => "andmev/Llama-3.1-8B-Instruct-CoreML",
-                _ => "andmev/Llama-3.1-8B-Instruct-CoreML", // Max for CoreML
-            }.to_string();
-            let (params, dl, ram) = match size {
-                ModelSize::Small => ("1B parameters", "~2 GB", "8 GB"),
-                ModelSize::Medium => ("3B parameters", "~6 GB", "16 GB"),
-                _ => ("8B parameters", "~16 GB", "32 GB"),
-            };
-            (repo, params, dl, ram)
-        }
-
-        (ModelFamily::Gemma2, BackendDevice::CoreML) => {
-            ("anemll/anemll-google-gemma-3-270m-it-M1-ctx512-monolithic_0.3.5".to_string(), "270M parameters", "~1 GB", "8 GB")
-        }
-
-        (ModelFamily::Mistral, BackendDevice::CoreML) => {
-            ("apple/mistral-coreml".to_string(), "7B parameters", "~14 GB", "32 GB")
-        }
-
-        // Standard models (Metal, CUDA, CPU)
-        (ModelFamily::Qwen2, _) => {
-            let repo = format!("Qwen/Qwen2.5-{}-Instruct", size_str);
-            let (params, dl, ram) = match size {
-                ModelSize::Small => ("1.5B parameters", "~3 GB", "8-16 GB"),
-                ModelSize::Medium => ("3B parameters", "~6 GB", "16-32 GB"),
-                ModelSize::Large => ("7B parameters", "~14 GB", "32-64 GB"),
-                ModelSize::XLarge => ("14B parameters", "~28 GB", "64+ GB"),
-            };
-            (repo, params, dl, ram)
-        }
-
-        (ModelFamily::Gemma2, _) => {
-            let repo = format!("google/gemma-2-{}-it", size_str);
-            let (params, dl, ram) = match size {
-                ModelSize::Small => ("2B parameters", "~4 GB", "8-16 GB"),
-                ModelSize::Medium => ("9B parameters", "~18 GB", "32-64 GB"),
-                _ => ("27B parameters", "~54 GB", "64+ GB"),
-            };
-            (repo, params, dl, ram)
-        }
-
-        (ModelFamily::Llama3, _) => {
-            let repo = format!("meta-llama/Llama-3.2-{}-Instruct", size_str);
-            let (params, dl, ram) = match size {
-                ModelSize::Small => ("3B parameters", "~6 GB", "16 GB"),
-                ModelSize::Medium => ("8B parameters", "~16 GB", "32 GB"),
-                _ => ("70B parameters", "~140 GB", "128+ GB"),
-            };
-            (repo, params, dl, ram)
-        }
-
-        (ModelFamily::Mistral, _) => {
-            let repo = if matches!(size, ModelSize::Large | ModelSize::XLarge) {
-                "mistralai/Mistral-22B-Instruct-v0.3".to_string()
-            } else {
-                "mistralai/Mistral-7B-Instruct-v0.3".to_string()
-            };
-            let (params, dl, ram) = if matches!(size, ModelSize::Large | ModelSize::XLarge) {
-                ("22B parameters", "~44 GB", "64+ GB")
-            } else {
-                ("7B parameters", "~14 GB", "32 GB")
-            };
-            (repo, params, dl, ram)
-        }
-
-        (ModelFamily::Phi, _) => {
-            let repo = match size {
-                ModelSize::Small => "microsoft/phi-2".to_string(),
-                ModelSize::Medium => "microsoft/Phi-3-mini-4k-instruct".to_string(),
-                ModelSize::Large | ModelSize::XLarge => "microsoft/Phi-3-medium-4k-instruct".to_string(),
-            };
-            let (params, dl, ram) = match size {
-                ModelSize::Small => ("2.7B parameters", "~5 GB", "8-16 GB"),
-                ModelSize::Medium => ("3.8B parameters", "~8 GB", "16-32 GB"),
-                _ => ("14B parameters", "~28 GB", "32-64 GB"),
-            };
-            (repo, params, dl, ram)
-        }
-
-        (ModelFamily::DeepSeek, _) => {
-            let repo = match size {
-                ModelSize::Small => "deepseek-ai/deepseek-coder-1.3b-instruct".to_string(),
-                ModelSize::Medium => "deepseek-ai/deepseek-coder-6.7b-instruct".to_string(),
-                ModelSize::Large => "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct".to_string(),
-                ModelSize::XLarge => "deepseek-ai/deepseek-coder-33b-instruct".to_string(),
-            };
-            let (params, dl, ram) = match size {
-                ModelSize::Small => ("1.3B parameters", "~3 GB", "8-16 GB"),
-                ModelSize::Medium => ("6.7B parameters", "~13 GB", "16-32 GB"),
-                ModelSize::Large => ("16B parameters", "~32 GB", "32-64 GB"),
-                ModelSize::XLarge => ("33B parameters", "~66 GB", "64+ GB"),
-            };
-            (repo, params, dl, ram)
-        }
+    // Estimate parameters, download size, and RAM based on size
+    let (params, download_size, ram_req) = match size {
+        ModelSize::Small => ("~1-3B parameters", "~2-4 GB", "8-16 GB"),
+        ModelSize::Medium => ("~3-9B parameters", "~6-12 GB", "16-32 GB"),
+        ModelSize::Large => ("~7-14B parameters", "~14-28 GB", "32-64 GB"),
+        ModelSize::XLarge => ("~14B+ parameters", "~28-56 GB", "64+ GB"),
     };
 
     let info_text = format!(
@@ -1281,12 +1098,14 @@ fn render_model_preview(f: &mut Frame, area: Rect, device: BackendDevice, family
          📦 Repository: {}\n\
          🧠 Size: {}\n\
          💾 Download: {}\n\
-         🔧 Device: {}\n\
+         ⚡ Execution Target: {}\n\
          💻 RAM Required: {}\n\n\
          This model will be cached in ~/.cache/huggingface/hub/\n\
          for offline use. First download may take 5-30 minutes.\n\n\
+         All models use ONNX Runtime. Your selection determines which\n\
+         execution provider is used (CoreML/CPU/CUDA).\n\n\
          Press Enter to continue, 'b' to go back, Esc to cancel.",
-        repo, params, download_size, device.name(), ram_req
+        repo, params, download_size, target.name(), ram_req
     );
 
     let info = Paragraph::new(info_text)
@@ -1300,7 +1119,7 @@ fn render_model_preview(f: &mut Frame, area: Rect, device: BackendDevice, family
     f.render_widget(help, chunks[2]);
 }
 
-fn render_custom_model_repo(f: &mut Frame, area: Rect, input: &str, _device: BackendDevice) {
+fn render_custom_model_repo(f: &mut Frame, area: Rect, input: &str, _target: ExecutionTarget) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use super::download::{DownloadProgress, ModelDownloader};
 use super::generator_new::GeneratorModel;
 use super::model_selector::{ModelSelector, QwenSize};
-use crate::config::BackendDevice;
+use crate::config::ExecutionTarget;
 use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
 use super::{DevicePreference, GeneratorConfig};
 use crate::cli::OutputManager;
@@ -146,30 +146,33 @@ impl BootstrapLoader {
     /// Load generator in background using UnifiedModelLoader
     pub async fn load_generator_async(
         &self,
+        provider: super::unified_loader::InferenceProvider,
         model_family: ModelFamily,
         model_size: ModelSize,
-        backend: BackendDevice,
+        execution_target: ExecutionTarget,
         model_repo: Option<String>,
     ) -> Result<()> {
         // Step 1: Initializing
         *self.state.write().await = GeneratorState::Initializing;
 
         let model_name = format!(
-            "{} {}",
+            "{} {} ({:?})",
             model_family.name(),
-            model_size.to_size_string(model_family)
+            model_size.to_size_string(model_family),
+            provider
         );
 
-        tracing::info!("Loading model: {} on {:?}", model_name, backend);
+        tracing::info!("Loading model: {} on {:?}", model_name, execution_target);
         if let Some(ref repo) = model_repo {
             tracing::info!("Using custom repository: {}", repo);
         }
 
         // Step 3: Create model load config
         let load_config = ModelLoadConfig {
+            provider,
             family: model_family,
             size: model_size,
-            backend,
+            target: execution_target,
             repo_override: model_repo.clone(),
         };
 
@@ -206,9 +209,10 @@ impl BootstrapLoader {
             // Wrap in GeneratorModel (currently we need to convert)
             // For now, we'll use the Pretrained variant
             let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+                provider,
                 family: model_family,
                 size: model_size,
-                backend,
+                target: execution_target,
                 repo_override: model_repo.clone(),
             });
 

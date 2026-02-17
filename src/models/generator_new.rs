@@ -74,7 +74,7 @@ impl GeneratorModel {
                     "Loading pre-trained model: {} {} on {}",
                     load_config.family.name(),
                     load_config.size.to_size_string(load_config.family),
-                    load_config.backend.name()
+                    load_config.target.name()
                 );
 
                 let loader = UnifiedModelLoader::new()?;
@@ -256,12 +256,13 @@ mod tests {
     #[ignore] // Requires downloaded Qwen model
     fn test_generator_qwen() {
         use crate::models::unified_loader::{ModelLoadConfig, ModelFamily, ModelSize};
-        use crate::config::backend::BackendDevice;
+        use crate::config::backend::ExecutionTarget;
 
         let config = GeneratorConfig::Pretrained(ModelLoadConfig {
+            provider: crate::models::unified_loader::InferenceProvider::Onnx,
             family: ModelFamily::Qwen2,
             size: ModelSize::Small,
-            backend: BackendDevice::Cpu,
+            target: ExecutionTarget::Cpu,
             repo_override: None,
         });
 

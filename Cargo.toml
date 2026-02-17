@@ -67,18 +67,27 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 # Text processing for TF-IDF
 rust-stemmers = "1.2"
 
-# Machine Learning (ONNX Runtime - Phase 4: Candle removed)
+# Machine Learning (Dual providers: ONNX Runtime + Candle)
+# ONNX Runtime (recommended for most users)
 ort = { version = "2.0.0-rc.11", features = ["download-binaries", "ndarray"] }
-ndarray = "0.17"  # Multi-dimensional arrays for ONNX tensor creation (matches ort requirement)
+ndarray = "0.17"  # Multi-dimensional arrays for ONNX tensor creation
+# Candle (alternative provider, optional)
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+# Shared dependencies
 sysinfo = "0.32"  # System RAM detection for model selection
-tokenizers = "0.21"  # Tokenization (kept, used by ONNX loader)
+tokenizers = "0.21"  # Tokenization (used by both ONNX and Candle)
 hf-hub = "0.4"  # HuggingFace Hub integration for model downloads
 indicatif = "0.17"  # Progress bars for download tracking
 rand = "0.8"  # Random number generation for sampling
+safetensors = "0.4"  # Model weight loading (used by Candle)
 
-# CoreML support via ONNX Runtime execution provider (macOS only)
+# CoreML/Metal support (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]
-# candle-coreml removed - using ort's CoreML EP instead
+# ONNX Runtime uses CoreML execution provider
+# Candle uses Metal (requires candle feature flag)
+candle-metal-kernels = { version = "0.8", optional = true }
 
 # For web tools (Phase 3)
 scraper = "0.18"
@@ -97,6 +106,14 @@ nix = { version = "0.29", features = ["signal"] }
 [dev-dependencies]
 mockito = "1.2"
 tempfile = "3.8"
+
+[features]
+default = ["onnx"]  # ONNX Runtime is the default provider
+onnx = []  # ONNX Runtime support (always available)
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]  # Candle support (optional)
+candle-metal = ["candle", "dep:candle-metal-kernels"]  # Candle with Metal acceleration (macOS only)
+cuda = []  # CUDA support (requires CUDA toolkit)
+all-providers = ["onnx", "candle"]  # Both inference providers
 
 [[bin]]
 name = "shammah"

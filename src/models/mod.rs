@@ -4,6 +4,7 @@
 pub mod adapters;  // Local model adapters (chat templates, token IDs)
 pub mod bootstrap; // Progressive bootstrap for instant startup
 pub mod common;
+pub mod compatibility; // Model compatibility matrix (which models work with which targets)
 pub mod download;
 pub mod generator_new; // New unified generator (ONNX-based)
 pub mod learning;
@@ -26,6 +27,10 @@ pub use bootstrap::{BootstrapLoader, DownloadProgressSnapshot, GeneratorState};
 pub use common::{
     device_info, get_device_with_preference, is_metal_available, DevicePreference,
     GeneratorConfig, ModelConfig, Saveable,
+};
+pub use compatibility::{
+    get_available_sizes, get_compatible_families, get_repository, get_supported_targets,
+    is_compatible, ModelCompatibility,
 };
 pub use download::{DownloadProgress, ModelDownloader};
 pub use generator_new::{GeneratorModel, TextGeneration, TokenCallback};
