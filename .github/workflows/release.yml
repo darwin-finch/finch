@@ -20,11 +20,10 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux build disabled temporarily - debugging compilation issues
-          # - os: ubuntu-latest
-          #   target: x86_64-unknown-linux-gnu
-          #   artifact_name: shammah
-          #   asset_name: shammah-linux-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: shammah
+            asset_name: shammah-linux-x86_64
           # macOS Intel disabled - macos-13 runner unavailable
           # - os: macos-13
           #   target: x86_64-apple-darwin
@@ -50,8 +49,26 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Check environment (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "=== System Info ==="
+          uname -a
+          echo "=== GCC Version ==="
+          gcc --version || echo "gcc not found"
+          echo "=== PKG_CONFIG ==="
+          pkg-config --version || echo "pkg-config not found"
+          echo "=== Available libraries ==="
+          ldconfig -p | grep -E "ssl|crypto" || echo "No SSL libraries found"
+
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} --verbose
+        run: |
+          echo "=== Starting build ==="
+          cargo build --release --target ${{ matrix.target }} 2>&1 | tee build.log || {
+            echo "=== Build failed! Last 50 lines of output: ==="
+            tail -50 build.log
+            exit 1
+          }
 
       - name: Strip binary (Linux/macOS)
         run: |
@@ -103,9 +120,10 @@ jobs:
 
           **Or download manually:**
 
+          - [Linux x86_64](https://github.com/${{ github.repository }}/releases/download/${tag}/shammah-linux-x86_64.tar.gz)
           - [macOS ARM64 (Apple Silicon)](https://github.com/${{ github.repository }}/releases/download/${tag}/shammah-macos-aarch64.tar.gz)
 
-          *Note: Linux and macOS Intel binaries coming soon*
+          *Note: macOS Intel binaries coming soon*
 
           Extract and add to your PATH:
           \`\`\`bash
@@ -118,8 +136,9 @@ jobs:
           See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
           EOF
 
-          # Create release with macOS ARM64 binary
+          # Create release with binaries
           gh release create "${tag}" \
             --title "Shammah v${version}" \
             --notes-file release_notes.md \
+            artifacts/shammah-linux-x86_64/shammah-linux-x86_64.tar.gz \
             artifacts/shammah-macos-aarch64/shammah-macos-aarch64.tar.gz
