@@ -199,8 +199,6 @@ pub struct TuiRenderer {
     last_blit: std::time::Instant,
     /// Blit rate limit (min interval between blits)
     blit_interval: Duration,
-    /// Whether TUI needs to be redrawn (double buffering)
-    pub(crate) needs_tui_render: bool,
     /// Previous input text (for change detection)
     prev_input_text: String,
     /// Previous cursor position (for change detection)
@@ -438,7 +436,6 @@ impl TuiRenderer {
             refresh_interval: Duration::from_millis(100), // 10 FPS - blit to overwrite visible area
             last_blit: std::time::Instant::now(),
             blit_interval: Duration::from_millis(50), // 20 FPS max for blitting
-            needs_tui_render: true, // Initial render needed
             prev_input_text: String::new(),
             prev_cursor_pos: (0, 0),
             prev_status_content: String::new(),
@@ -659,7 +656,6 @@ impl TuiRenderer {
 
             // Force full refresh after viewport resize
             self.needs_full_refresh = true;
-            self.needs_tui_render = true;
 
             // Clear double-buffering state to force re-render of everything
             self.prev_input_text.clear();
@@ -684,26 +680,17 @@ impl TuiRenderer {
         // Resize viewport if needed BEFORE rendering
         self.resize_viewport_if_needed(input_lines, has_dialog)?;
 
-        // Double buffering: Check if anything changed
+        // Update previous state for double buffering (used for debugging/logging)
         let current_input_text = self.input_textarea.lines().join("\n");
         let current_cursor = self.input_textarea.cursor();
         let current_status_content = self.status_bar.get_status();
 
-        let input_changed = current_input_text != self.prev_input_text;
-        let cursor_changed = current_cursor != self.prev_cursor_pos;
-        let status_changed = current_status_content != self.prev_status_content;
-        let force_render = self.needs_tui_render;
-
-        // Skip render if nothing changed (including cursor position)
-        if !input_changed && !cursor_changed && !status_changed && !force_render {
-            return Ok(());
-        }
-
-        // Update previous state for next comparison
         self.prev_input_text = current_input_text;
         self.prev_cursor_pos = current_cursor;
         self.prev_status_content = current_status_content.clone();
-        self.needs_tui_render = false;
+
+        // Always render when called (optimization removed for reliability)
+        // render() is only called when needed (events, new messages, etc.)
 
         let active_dialog = self.active_dialog.clone();
         let active_tabbed_dialog = self.active_tabbed_dialog.clone();
@@ -978,7 +965,7 @@ impl TuiRenderer {
             self.prev_frame_buffer.clear();
 
             // CRITICAL: insert_before() may internally clear/redraw the viewport,
-            // erasing the separator. Call render() immediately to redraw it.
+            // erasing the separator. Force a render to redraw the viewport immediately.
             self.render()?;
 
             // Update blit timestamp
@@ -1053,8 +1040,8 @@ impl TuiRenderer {
                         break dialog_result;
                     }
 
-                    // Force render because dialog state changes (selected_index) aren't detected by double-buffering
-                    self.needs_tui_render = true;
+                    // Render to show dialog state changes
+                    self.render()?;
                 }
             }
         };
@@ -1109,8 +1096,8 @@ impl TuiRenderer {
                         break dialog_result;
                     }
 
-                    // Force render because dialog state changes
-                    self.needs_tui_render = true;
+                    // Render to show dialog state changes
+                    self.render()?;
                 }
             }
         };
@@ -1608,7 +1595,6 @@ impl TuiRenderer {
 
         // Force full refresh after resize
         self.needs_full_refresh = true;
-        self.needs_tui_render = true;
 
         Ok(())
     }
@@ -1666,7 +1652,6 @@ impl TuiRenderer {
 
         // Store dialog
         self.active_dialog = Some(dialog);
-        self.needs_tui_render = true; // Force render for dialog
 
         // Render dialog
         self.render()?;
@@ -1678,7 +1663,6 @@ impl TuiRenderer {
     pub fn hide_dialog(&mut self) -> Result<()> {
         // Clear dialog
         self.active_dialog = None;
-        self.needs_tui_render = true; // Force render after dialog closes
 
         // Re-render TUI (will show normal mode now)
         self.render()?;

@@ -889,6 +889,11 @@ impl EventLoop {
                 // Display error
                 self.output_manager.write_error(format!("Query failed: {}", error));
 
+                // Render TUI to ensure viewport is redrawn after error message
+                if let Err(e) = self.render_tui().await {
+                    tracing::warn!("Failed to render TUI after query error: {}", e);
+                }
+
                 // DON'T clear active query - fallback might still be running
                 // It will be cleared on StreamingComplete or final failure
             }
@@ -1024,8 +1029,6 @@ impl EventLoop {
             // Try to recover by clearing error state
             tui.needs_full_refresh = false;
             tui.last_render_error = None;
-            // Force a full redraw
-            tui.needs_tui_render = true;
         }
 
         tui.flush_output_safe(&self.output_manager)?;

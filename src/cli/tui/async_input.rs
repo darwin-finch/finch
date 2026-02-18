@@ -51,9 +51,7 @@ pub fn spawn_input_task(
                                 }
 
                                 // Mark for render so dialog updates are shown
-                                // Force render because dialog state changes (selected_index) aren't detected by double-buffering
                                 first_event_modified_input = true;
-                                tui.needs_tui_render = true;
 
                                 Ok(None) // Don't submit input while dialog is active
                             } else if key.code == KeyCode::Enter {
