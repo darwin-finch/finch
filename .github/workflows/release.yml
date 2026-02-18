@@ -61,16 +61,14 @@ jobs:
           echo "=== Available libraries ==="
           ldconfig -p | grep -E "ssl|crypto" || echo "No SSL libraries found"
 
-      - name: Build release binary
+      - name: Check compilation
         run: |
-          echo "=== Starting build ==="
-          set -o pipefail
-          cargo build --release --target ${{ matrix.target }} 2>&1 | tee build.log
-          if [ $? -ne 0 ]; then
-            echo "=== Build failed! Last 50 lines: ==="
-            tail -50 build.log
-            exit 1
-          fi
+          echo "=== Running cargo check ==="
+          cargo check --release --target ${{ matrix.target }}
+          echo "=== Cargo check passed ==="
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binary (Linux/macOS)
         run: |
