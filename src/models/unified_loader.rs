@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use crate::config::ExecutionTarget;
 use super::download::ModelDownloader;
 use super::generator_new::TextGeneration;
+#[cfg(feature = "onnx")]
 use super::loaders::onnx::{OnnxLoader, LoadedOnnxModel};
+#[cfg(feature = "onnx")]
 use super::loaders::onnx_config::{OnnxLoadConfig, ModelSize as OnnxModelSize};
 use super::model_selector::QwenSize;
 
