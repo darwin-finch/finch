@@ -24,6 +24,10 @@ pub mod present_plan;
 // User interaction tools
 pub mod ask_user_question;
 
+// GUI automation tools (macOS only)
+#[cfg(target_os = "macos")]
+pub mod gui;
+
 // Re-exports for convenience
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
@@ -35,3 +39,6 @@ pub use read::ReadTool;
 pub use restart::RestartTool;
 pub use save_and_exec::SaveAndExecTool;
 pub use web_fetch::WebFetchTool;
+
+#[cfg(target_os = "macos")]
+pub use gui::{GuiClickTool, GuiInspectTool, GuiTypeTool};

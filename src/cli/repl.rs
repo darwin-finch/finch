@@ -31,6 +31,8 @@ use crate::tools::implementations::{
     AskUserQuestionTool, BashTool, EnterPlanModeTool, GlobTool, GrepTool, PresentPlanTool,
     ReadTool, RestartTool, SaveAndExecTool, WebFetchTool,
 };
+#[cfg(target_os = "macos")]
+use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::{ToolDefinition, ToolUse};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
@@ -193,6 +195,17 @@ impl Repl {
 
         // User interaction tools
         tool_registry.register(Box::new(AskUserQuestionTool));
+
+        // GUI automation tools (macOS only)
+        #[cfg(target_os = "macos")]
+        {
+            if config.features.gui_automation {
+                tracing::info!("Registering GUI automation tools (macOS)");
+                tool_registry.register(Box::new(GuiClickTool));
+                tool_registry.register(Box::new(GuiTypeTool));
+                tool_registry.register(Box::new(GuiInspectTool));
+            }
+        }
 
         // Create permission manager
         // Use config.features.auto_approve_tools to determine default rule

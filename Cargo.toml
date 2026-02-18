@@ -88,6 +88,9 @@ safetensors = "0.4"  # Model weight loading (used by Candle)
 # ONNX Runtime uses CoreML execution provider
 # Candle uses Metal (requires candle feature flag)
 candle-metal-kernels = { version = "0.8", optional = true }
+# GUI automation (Phase 3: Accessibility tools)
+core-graphics = "0.23"  # Mouse/keyboard events for GUI automation
+core-foundation = "0.10"  # Foundation types (required by core-graphics)
 
 # For web tools (Phase 3)
 scraper = "0.18"
