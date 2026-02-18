@@ -95,6 +95,9 @@ core-foundation = "0.10"  # Foundation types (required by core-graphics)
 # For web tools (Phase 3)
 scraper = "0.18"
 
+# MCP (Model Context Protocol) for external tool integration (Phase 4)
+rust-mcp-sdk = { version = "0.8", default-features = false, features = ["client", "stdio", "sse"] }
+
 # Tools
 async-trait = "0.1"
 regex = "1.10"

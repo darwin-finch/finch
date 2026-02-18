@@ -78,6 +78,9 @@ pub struct Config {
 
     /// Feature flags (optional behaviors)
     pub features: FeaturesConfig,
+
+    /// MCP (Model Context Protocol) server configurations
+    pub mcp_servers: HashMap<String, crate::tools::mcp::McpServerConfig>,
 }
 
 /// Server configuration for daemon mode
@@ -316,6 +319,7 @@ impl Config {
             colors: ColorScheme::default(),
             teachers,
             features,
+            mcp_servers: HashMap::new(), // No MCP servers by default
         }
     }
 

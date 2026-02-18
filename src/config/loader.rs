@@ -80,6 +80,8 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
         colors: Option<ColorScheme>,
         #[serde(default)]
         features: Option<FeaturesConfig>,
+        #[serde(default)]
+        mcp_servers: Option<std::collections::HashMap<String, crate::tools::mcp::McpServerConfig>>,
     }
 
     fn default_tui_enabled() -> bool {
@@ -113,6 +115,11 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
     }
     if let Some(colors) = toml_config.colors {
         config.colors = colors;
+    }
+
+    // Set MCP servers configuration
+    if let Some(mcp_servers) = toml_config.mcp_servers {
+        config.mcp_servers = mcp_servers;
     }
 
     // Validate configuration
