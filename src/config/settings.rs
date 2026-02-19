@@ -61,6 +61,9 @@ pub struct Config {
     /// Only used for local inference, NOT sent to Claude API
     pub constitution_path: Option<PathBuf>,
 
+    /// Active persona name (e.g., "default", "expert-coder", "louis")
+    pub active_persona: String,
+
     /// Backend configuration (device selection, model paths)
     pub backend: BackendConfig,
 
@@ -313,6 +316,7 @@ impl Config {
             streaming_enabled: features.streaming_enabled, // Deprecated, maintained for compat
             tui_enabled: true,       // TUI is the default for interactive terminals
             constitution_path,
+            active_persona: "default".to_string(),
             backend: BackendConfig::default(),
             server: ServerConfig::default(),
             client: ClientConfig::default(),
