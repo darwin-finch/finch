@@ -16,6 +16,44 @@ use crate::config::{ExecutionTarget, FeaturesConfig, TeacherEntry};
 use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use crate::models::compatibility;
 
+/// Try to detect an existing Anthropic API key from the environment or Claude Code config.
+fn detect_anthropic_api_key() -> Option<String> {
+    // 1. Check the standard environment variable first
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !key.trim().is_empty() {
+            return Some(key.trim().to_string());
+        }
+    }
+
+    // 2. Check Claude Code's settings file (~/.claude/settings.json)
+    if let Some(home) = dirs::home_dir() {
+        let claude_settings = home.join(".claude").join("settings.json");
+        if let Ok(contents) = std::fs::read_to_string(&claude_settings) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(key) = json.get("apiKey").and_then(|v| v.as_str()) {
+                    if !key.trim().is_empty() {
+                        return Some(key.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Try to detect an existing xAI/Grok API key from the environment.
+fn detect_xai_api_key() -> Option<String> {
+    for var in &["XAI_API_KEY", "GROK_API_KEY"] {
+        if let Ok(key) = std::env::var(var) {
+            if !key.trim().is_empty() {
+                return Some(key.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Helper function to display ModelSize
 fn model_size_display(size: &ModelSize) -> &'static str {
     match size {
@@ -49,11 +87,11 @@ impl WizardSection {
 
     fn name(&self) -> &str {
         match self {
-            Self::Themes => "Themes",
-            Self::Models => "Primary Model",
-            Self::Personas => "Personas",
-            Self::Features => "Features",
-            Self::Review => "Review",
+            Self::Themes => "Look & Feel",
+            Self::Models => "API Key",
+            Self::Personas => "Style",
+            Self::Features => "Settings",
+            Self::Review => "Finish",
         }
     }
 }
@@ -204,19 +242,25 @@ impl WizardState {
                     enabled: true,
                 }
             } else {
-                // Default: remote Claude
+                // Default: remote Claude - try to auto-detect key
+                let detected_key = detect_anthropic_api_key()
+                    .or_else(detect_xai_api_key)
+                    .unwrap_or_default();
                 ModelConfig::Remote {
                     provider: "claude".to_string(),
-                    api_key: String::new(),
+                    api_key: detected_key,
                     model: String::new(),
                     enabled: true,
                 }
             }
         } else {
-            // Default: remote Claude
+            // Default: remote Claude - try to auto-detect key
+            let detected_key = detect_anthropic_api_key()
+                .or_else(detect_xai_api_key)
+                .unwrap_or_default();
             ModelConfig::Remote {
                 provider: "claude".to_string(),
-                api_key: String::new(),
+                api_key: detected_key,
                 model: String::new(),
                 enabled: true,
             }
@@ -740,11 +784,8 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         selected_idx,
     }) = state.sections.get_mut(&WizardSection::Features)
     {
-        // Calculate number of features (platform-dependent)
-        #[cfg(target_os = "macos")]
-        let num_features = 6;
-        #[cfg(not(target_os = "macos"))]
-        let num_features = 5;
+        // Only 2 user-facing settings shown (streaming + auto-approve)
+        let num_features = 2;
 
         match key.code {
             KeyCode::Up => {
@@ -759,45 +800,11 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
             }
             KeyCode::Char(' ') => {
                 // Toggle selected feature
+                // Index 0 = "Live responses" (streaming), 1 = "Skip permission prompts" (auto_approve)
                 match *selected_idx {
-                    0 => *auto_approve = !*auto_approve,
-                    1 => *streaming = !*streaming,
-                    2 => *debug = !*debug,
-                    #[cfg(target_os = "macos")]
-                    3 => *gui_automation = !*gui_automation,
-                    #[cfg(target_os = "macos")]
-                    4 => *daemon_only_mode = !*daemon_only_mode,
-                    #[cfg(target_os = "macos")]
-                    5 => *mdns_discovery = !*mdns_discovery,
-                    #[cfg(not(target_os = "macos"))]
-                    3 => *daemon_only_mode = !*daemon_only_mode,
-                    #[cfg(not(target_os = "macos"))]
-                    4 => *mdns_discovery = !*mdns_discovery,
+                    0 => *streaming = !*streaming,
+                    1 => *auto_approve = !*auto_approve,
                     _ => {}
-                }
-            }
-            KeyCode::Char(c @ '1'..='6') => {
-                // Number keys also work (backwards compatibility)
-                let idx = (c as u8 - b'1') as usize;
-                if idx < num_features {
-                    *selected_idx = idx;
-                    // Auto-toggle
-                    match idx {
-                        0 => *auto_approve = !*auto_approve,
-                        1 => *streaming = !*streaming,
-                        2 => *debug = !*debug,
-                        #[cfg(target_os = "macos")]
-                        3 => *gui_automation = !*gui_automation,
-                        #[cfg(target_os = "macos")]
-                        4 => *daemon_only_mode = !*daemon_only_mode,
-                        #[cfg(target_os = "macos")]
-                        5 => *mdns_discovery = !*mdns_discovery,
-                        #[cfg(not(target_os = "macos"))]
-                        3 => *daemon_only_mode = !*daemon_only_mode,
-                        #[cfg(not(target_os = "macos"))]
-                        4 => *mdns_discovery = !*mdns_discovery,
-                        _ => {}
-                    }
                 }
             }
             KeyCode::Enter => {
@@ -997,7 +1004,7 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
         .unwrap_or(0);
 
     let tabs = Tabs::new(tab_titles)
-        .block(Block::default().borders(Borders::ALL).title("Shammah Setup"))
+        .block(Block::default().borders(Borders::ALL).title(" Finch Setup "))
         .select(selected_idx)
         .style(Style::default().fg(Color::Blue))
         .highlight_style(
@@ -1012,11 +1019,11 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
 
     // Render help text
     let help_text = match state.current_section {
-        WizardSection::Themes => "Tab/Arrows: Navigate sections | ↑/↓: Select theme | Enter: Next | Esc: Cancel",
-        WizardSection::Models => "Tab: Next section | E: Edit | S: Skip | Esc: Cancel",
-        WizardSection::Personas => "Tab/Arrows: Navigate sections | ↑/↓: Select persona | Enter: Set as default",
-        WizardSection::Features => "Tab/Arrows: Navigate sections | ↑/↓: Navigate | Space: Toggle | Enter: Next",
-        WizardSection::Review => "Tab/Arrows: Navigate sections | Enter/y: Confirm | n/Esc: Cancel",
+        WizardSection::Themes => "↑/↓: Choose theme | Enter: Next | Tab: Jump to section",
+        WizardSection::Models => "E: Enter API key | S: Skip | Tab: Next",
+        WizardSection::Personas => "↑/↓: Choose style | Enter: Next | Tab: Jump to section",
+        WizardSection::Features => "↑/↓: Navigate | Space: Toggle | Enter: Save | Tab: Jump to section",
+        WizardSection::Review => "Enter: Save & start | Tab: Go back to edit",
     };
 
     let help = Paragraph::new(help_text)
@@ -1191,18 +1198,27 @@ fn render_models_section(
         ])
         .split(area);
 
-    let title = Paragraph::new("Primary Model Configuration (Optional)")
+    let title = Paragraph::new("Connect to Claude")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    let description = Paragraph::new(
-        "Configure which AI model will answer your queries by default.\n\
-         Press 'S' to skip and use Claude as the default."
-    )
-    .style(Style::default().fg(Color::Blue))
-    .alignment(Alignment::Center)
-    .wrap(Wrap { trim: true });
+    // Show helpful hint when no key is configured
+    let has_key = match primary_model {
+        ModelConfig::Remote { api_key, .. } => !api_key.is_empty(),
+        ModelConfig::Local { .. } => true,
+    };
+
+    let description_text = if has_key {
+        "Your API key is ready to go.".to_string()
+    } else {
+        "Paste your Anthropic API key below. Don't have one?\n\
+         Get a free key at: console.anthropic.com/keys".to_string()
+    };
+    let description = Paragraph::new(description_text)
+        .style(Style::default().fg(Color::Blue))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
     f.render_widget(description, chunks[1]);
 
     // Build list items: primary model + tool models
@@ -1315,9 +1331,9 @@ fn render_models_section(
 
     // Instructions
     let instructions_text = if editing_mode {
-        "Editing API key | Type to edit | Enter/Esc: Done"
+        "Type your API key | Enter: Done"
     } else {
-        "E: Edit primary model | S: Skip (use default) | Tab: Next section"
+        "E: Enter API key | S: Skip for now | Tab: Next"
     };
     let instructions = Paragraph::new(instructions_text)
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
@@ -1374,7 +1390,7 @@ fn render_personas_section(
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Personas"));
+        .block(Block::default().borders(Borders::ALL).title("Choose a Style"));
 
     f.render_widget(list, chunks[0]);
 
@@ -1430,36 +1446,23 @@ fn render_features_section(
         ])
         .split(area);
 
-    let title = Paragraph::new("Feature Flags")
+    let title = Paragraph::new("Settings")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    // Build feature list
-    let mut features: Vec<(&str, bool, Option<&str>)> = vec![
-        ("Auto-approve tools", auto_approve, Some("Skip confirmation dialogs (⚠️  use with caution)")),
-        ("Streaming responses", streaming, Some("Enable real-time response streaming")),
-        ("Debug logging", debug, Some("Enable detailed logs for troubleshooting")),
+    // Only show user-facing settings (hide developer options like debug, daemon, mDNS, GUI)
+    let features: Vec<(&str, bool, Option<&str>)> = vec![
+        ("Live responses", streaming, Some("See Finch's answer as it types, word by word")),
+        ("Skip permission prompts", auto_approve, Some("Let Finch run tools without asking each time")),
     ];
 
+    // Suppress unused variable warnings for hidden developer options
+    let _ = debug;
     #[cfg(target_os = "macos")]
-    features.push((
-        "GUI automation (macOS)",
-        gui_automation,
-        Some("Enable GuiClick, GuiType, GuiInspect tools"),
-    ));
-
-    features.push((
-        "Daemon-only mode",
-        daemon_only_mode,
-        Some("Run as daemon without REPL (server mode)"),
-    ));
-
-    features.push((
-        "mDNS service discovery",
-        mdns_discovery,
-        Some("Advertise and discover remote daemons via Bonjour"),
-    ));
+    let _ = gui_automation;
+    let _ = daemon_only_mode;
+    let _ = mdns_discovery;
 
     let items: Vec<ListItem> = features
         .iter()
@@ -1512,12 +1515,11 @@ fn render_features_section(
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Features"));
+        .block(Block::default().borders(Borders::ALL).title("Options"));
     f.render_widget(list, chunks[1]);
 
     let instructions = Paragraph::new(
-        "Use ↑/↓ arrow keys to move selection (>>> item <<<)\n\
-         Space: Toggle selected feature | Enter: Next section"
+        "↑/↓: Move | Space: Toggle on/off | Enter: Continue"
     )
     .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .alignment(Alignment::Center);
@@ -1528,7 +1530,7 @@ fn render_features_section(
 fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
     use crate::config::ColorTheme;
 
-    let title = Paragraph::new("Review Configuration")
+    let title = Paragraph::new("Ready to go!")
         .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
 
@@ -1536,7 +1538,7 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("Configuration Summary:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("Here's what you set up:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
     ];
@@ -1552,73 +1554,51 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
     }
 
     // Models
-    if let Some(SectionState::Models { primary_model, tool_models, .. }) = state.sections.get(&WizardSection::Models) {
-        lines.push(Line::from(vec![
-            Span::styled("Primary Model: ", Style::default().fg(Color::Yellow)),
-            Span::raw(primary_model.display_name()),
-        ]));
-        if !tool_models.is_empty() {
-            let enabled_tools: Vec<_> = tool_models
-                .iter()
-                .filter(|m| m.enabled())
-                .map(|m| m.display_name())
-                .collect();
-            if !enabled_tools.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("Tool Models: ", Style::default().fg(Color::Yellow)),
-                    Span::raw(enabled_tools.join(", ")),
-                ]));
+    if let Some(SectionState::Models { primary_model, .. }) = state.sections.get(&WizardSection::Models) {
+        let ai_label = match primary_model {
+            ModelConfig::Remote { api_key, .. } if !api_key.is_empty() => "Claude (API key configured)",
+            ModelConfig::Remote { .. } => "Claude (no API key — will prompt on first use)",
+            ModelConfig::Local { family, size, .. } => {
+                // Use a static fallback — dynamic format not possible here
+                let _ = (family, size);
+                "Local model"
             }
-        }
+        };
+        lines.push(Line::from(vec![
+            Span::styled("AI: ", Style::default().fg(Color::Yellow)),
+            Span::raw(ai_label),
+        ]));
     }
 
     // Persona
     if let Some(SectionState::Personas { default_persona, .. }) = state.sections.get(&WizardSection::Personas) {
         lines.push(Line::from(vec![
-            Span::styled("Default Persona: ", Style::default().fg(Color::Yellow)),
+            Span::styled("Style: ", Style::default().fg(Color::Yellow)),
             Span::raw(default_persona),
         ]));
     }
 
-    // Features
+    // Features (only show user-facing ones)
     if let Some(SectionState::Features {
         auto_approve,
         streaming,
-        debug,
-        #[cfg(target_os = "macos")]
-        gui_automation,
-        daemon_only_mode,
-        mdns_discovery,
         ..
     }) = state.sections.get(&WizardSection::Features)
     {
-        let mut feature_flags = vec![];
-        if *auto_approve {
-            feature_flags.push("Auto-approve");
-        }
+        let mut settings = vec![];
         if *streaming {
-            feature_flags.push("Streaming");
+            settings.push("Live responses");
         }
-        if *debug {
-            feature_flags.push("Debug");
-        }
-        #[cfg(target_os = "macos")]
-        if *gui_automation {
-            feature_flags.push("GUI automation");
-        }
-        if *daemon_only_mode {
-            feature_flags.push("Daemon-only");
-        }
-        if *mdns_discovery {
-            feature_flags.push("mDNS discovery");
+        if *auto_approve {
+            settings.push("Skip permission prompts");
         }
 
         lines.push(Line::from(vec![
-            Span::styled("Features: ", Style::default().fg(Color::Yellow)),
-            Span::raw(if feature_flags.is_empty() {
-                "None enabled".to_string()
+            Span::styled("Settings: ", Style::default().fg(Color::Yellow)),
+            Span::raw(if settings.is_empty() {
+                "Defaults".to_string()
             } else {
-                feature_flags.join(", ")
+                settings.join(", ")
             }),
         ]));
     }
@@ -1626,13 +1606,10 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
     lines.push(Line::from(""));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("Press Enter or 'y' to save and continue", Style::default().fg(Color::Green)),
+        Span::styled("Press Enter to save & start chatting", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Press 'n' or Esc to cancel", Style::default().fg(Color::Red)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Use Tab/Arrows to go back and edit any section", Style::default().fg(Color::Gray)),
+        Span::styled("Tab: Go back to change anything", Style::default().fg(Color::Gray)),
     ]));
 
     let block = Block::default().borders(Borders::ALL);
