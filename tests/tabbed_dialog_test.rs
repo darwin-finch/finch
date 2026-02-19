@@ -1,7 +1,7 @@
 // Integration test for tabbed dialog functionality
 
-use shammah::cli::llm_dialogs::{Question, QuestionOption};
-use shammah::cli::tui::{TabbedDialog, TabbedDialogResult};
+use finch::cli::llm_dialogs::{Question, QuestionOption};
+use finch::cli::tui::{TabbedDialog, TabbedDialogResult};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[test]

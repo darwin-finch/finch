@@ -1565,6 +1565,11 @@ impl Repl {
                         self.handle_persona_show().await?;
                         continue;
                     }
+                    // Phase 3: Service discovery
+                    Command::Discover => {
+                        self.handle_discover().await?;
+                        continue;
+                    }
                     _ => {
                         let output = handle_command(
                             command,
@@ -3022,6 +3027,62 @@ impl Repl {
                 self.output_status(format!("\n{}. User: {}", i + 1, example.user));
                 self.output_status(format!("   Assistant: {}", example.assistant));
             }
+        }
+
+        Ok(())
+    }
+
+    /// Phase 3: Handle /discover command (mDNS service discovery)
+    async fn handle_discover(&self) -> Result<()> {
+        use crate::service::ServiceDiscoveryClient;
+        use std::time::Duration;
+
+        self.output_status("🔍 Discovering Finch instances on local network...\n");
+
+        // Create discovery client
+        let client = match ServiceDiscoveryClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                self.output_error(format!("Failed to create discovery client: {}", e));
+                return Ok(());
+            }
+        };
+
+        // Discover services (5 second timeout)
+        let services = match client.discover(Duration::from_secs(5)) {
+            Ok(s) => s,
+            Err(e) => {
+                self.output_error(format!("Failed to discover services: {}", e));
+                return Ok(());
+            }
+        };
+
+        if services.is_empty() {
+            self.output_status("No Finch instances found on the local network.");
+            self.output_status("\nTo start a daemon in advertising mode:");
+            self.output_status("  1. Edit ~/.finch/config.toml");
+            self.output_status("  2. Set [server] advertise = true");
+            self.output_status("  3. Run: finch daemon");
+        } else {
+            self.output_status(format!("Found {} Finch instance(s):\n", services.len()));
+
+            for (i, service) in services.iter().enumerate() {
+                self.output_status(format!("{}. {}", i + 1, service.name));
+                self.output_status(format!("   Host: {}:{}", service.host, service.port));
+                self.output_status(format!("   Model: {}", service.model));
+                if !service.description.is_empty() {
+                    self.output_status(format!("   Description: {}", service.description));
+                }
+                if !service.capabilities.is_empty() {
+                    self.output_status(format!("   Capabilities: {}", service.capabilities.join(", ")));
+                }
+                self.output_status("");
+            }
+
+            self.output_status("To connect to a remote daemon:");
+            self.output_status("  1. Edit ~/.finch/config.toml");
+            self.output_status("  2. Set [client] daemon_address = \"HOST:PORT\"");
+            self.output_status("  3. Restart Finch");
         }
 
         Ok(())

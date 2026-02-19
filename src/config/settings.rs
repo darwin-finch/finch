@@ -101,6 +101,14 @@ pub struct ServerConfig {
     pub auth_enabled: bool,
     /// Valid API keys for authentication
     pub api_keys: Vec<String>,
+    /// Operating mode: "full" (daemon + REPL) or "daemon-only" (no REPL)
+    pub mode: String,
+    /// Enable mDNS/Bonjour advertisement for service discovery
+    pub advertise: bool,
+    /// Service name for advertisement (defaults to "finch-{hostname}")
+    pub service_name: String,
+    /// Service description
+    pub service_description: String,
 }
 
 /// Client configuration for connecting to daemon
@@ -114,6 +122,10 @@ pub struct ClientConfig {
     pub auto_spawn: bool,
     /// Request timeout in seconds
     pub timeout_seconds: u64,
+    /// Enable mDNS/Bonjour service discovery for remote daemons
+    pub auto_discover: bool,
+    /// Prefer local daemon over remote
+    pub prefer_local: bool,
 }
 
 impl Default for ServerConfig {
@@ -125,6 +137,10 @@ impl Default for ServerConfig {
             session_timeout_minutes: 30,
             auth_enabled: false,
             api_keys: vec![],
+            mode: "full".to_string(),  // "full" (daemon + REPL) or "daemon-only"
+            advertise: false,           // Disabled by default
+            service_name: String::new(), // Empty = auto-generate from hostname
+            service_description: "Finch AI Assistant".to_string(),
         }
     }
 }
@@ -136,6 +152,8 @@ impl Default for ClientConfig {
             daemon_address: "127.0.0.1:11435".to_string(), // Port 11435 (11434 is used by Ollama)
             auto_spawn: true,
             timeout_seconds: 120,
+            auto_discover: false, // Disabled by default (use explicit daemon_address)
+            prefer_local: true,   // Try local daemon first before discovering remote
         }
     }
 }

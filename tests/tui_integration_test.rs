@@ -42,7 +42,7 @@ fn test_tui_module_exists() {
 /// Test TUI output manager integration
 #[test]
 fn test_output_manager() {
-    use shammah::cli::OutputManager;
+    use finch::cli::OutputManager;
 
     let manager = OutputManager::new();
 

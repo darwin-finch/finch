@@ -35,6 +35,10 @@ axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 
+# Service discovery (Phase 3: Daemon-Only Mode)
+mdns-sd = "0.11"  # Cross-platform mDNS/DNS-SD for service advertisement
+hostname = "0.4"  # System hostname detection
+
 # Session management
 dashmap = "5.5"
 

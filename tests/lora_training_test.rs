@@ -2,7 +2,7 @@
 //
 // Tests JSONL queue writing and Python subprocess spawning
 
-use shammah::models::{TrainingCoordinator, WeightedExample};
+use finch::models::{TrainingCoordinator, WeightedExample};
 use std::fs;
 use std::path::Path;
 

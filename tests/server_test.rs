@@ -1,6 +1,6 @@
 // Integration tests for HTTP server
 
-use shammah::{
+use finch::{
     claude::ClaudeClient,
     config::Config,
     metrics::MetricsLogger,
@@ -41,7 +41,7 @@ async fn test_server_creation() {
 
 #[test]
 fn test_session_manager() {
-    use shammah::server::SessionManager;
+    use finch::server::SessionManager;
 
     let manager = SessionManager::new(10, 30);
 

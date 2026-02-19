@@ -7,7 +7,7 @@
 // 4. Template artifacts are stripped (ChatML, etc.)
 
 use anyhow::Result;
-use shammah::models::adapters::{
+use finch::models::adapters::{
     LocalModelAdapter, QwenAdapter, DeepSeekAdapter, LlamaAdapter,
 };
 

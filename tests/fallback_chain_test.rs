@@ -6,8 +6,8 @@
 // 3. Fallback logic preserves provider-specific configuration
 
 use anyhow::Result;
-use shammah::providers::{LlmProvider, ProviderRequest};
-use shammah::claude::{Message, ContentBlock};
+use finch::providers::{LlmProvider, ProviderRequest};
+use finch::claude::{Message, ContentBlock};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 

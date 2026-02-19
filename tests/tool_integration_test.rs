@@ -2,8 +2,8 @@
 //
 // Tests the full flow: format tools → parse tool calls → execute
 
-use shammah::models::{ToolCallParser, ToolPromptFormatter};
-use shammah::tools::types::{ToolDefinition, ToolInputSchema};
+use finch::models::{ToolCallParser, ToolPromptFormatter};
+use finch::tools::types::{ToolDefinition, ToolInputSchema};
 
 #[test]
 fn test_tool_prompt_formatting() {

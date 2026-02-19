@@ -7,8 +7,8 @@
 // 4. Provider-specific model names are enforced
 
 use anyhow::Result;
-use shammah::config::{Config, TeacherEntry};
-use shammah::providers;
+use finch::config::{Config, TeacherEntry};
+use finch::providers;
 
 /// Test that Gemini provider rejects invalid model names
 #[test]

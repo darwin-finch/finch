@@ -7,11 +7,11 @@
 // 4. Multiple parts in a single response are handled correctly
 
 use anyhow::Result;
-use shammah::claude::ContentBlock;
-use shammah::claude::Message;
-use shammah::generators::StreamChunk;
-use shammah::providers::gemini::GeminiProvider;
-use shammah::providers::{LlmProvider, ProviderRequest};
+use finch::claude::ContentBlock;
+use finch::claude::Message;
+use finch::generators::StreamChunk;
+use finch::providers::gemini::GeminiProvider;
+use finch::providers::{LlmProvider, ProviderRequest};
 
 /// Test that Gemini provider supports tools
 #[test]
@@ -134,7 +134,7 @@ fn test_gemini_tool_use_id_format() {
 /// Test that ProviderRequest can include tools
 #[test]
 fn test_provider_request_with_tools() -> Result<()> {
-    use shammah::tools::types::{ToolDefinition, ToolInputSchema};
+    use finch::tools::types::{ToolDefinition, ToolInputSchema};
 
     let tools = vec![
         ToolDefinition {

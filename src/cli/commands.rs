@@ -43,6 +43,8 @@ pub enum Command {
     PersonaList,              // List available personas
     PersonaSelect(String),    // Switch to a different persona
     PersonaShow,              // Show current persona and system prompt
+    // Service discovery (Phase 3)
+    Discover,                 // Discover Finch daemons on local network
 }
 
 impl Command {
@@ -65,6 +67,8 @@ impl Command {
             // Persona commands
             "/persona" | "/persona list" => return Some(Command::PersonaList),
             "/persona show" => return Some(Command::PersonaShow),
+            // Service discovery
+            "/discover" => return Some(Command::Discover),
             _ => {}
         }
 
@@ -259,6 +263,10 @@ pub fn handle_command(
         Command::PersonaList | Command::PersonaSelect(_) | Command::PersonaShow => {
             Ok(CommandOutput::Status("Persona commands should be handled in REPL.".to_string()))
         }
+        // Service discovery is handled directly in REPL (Phase 3)
+        Command::Discover => {
+            Ok(CommandOutput::Status("Discover command should be handled in REPL.".to_string()))
+        }
     }
 }
 
@@ -285,8 +293,19 @@ pub fn format_help() -> String {
          \x1b[36m  /mcp refresh\x1b[0m       Refresh tool list from all servers\n\
          \x1b[36m  /mcp reload\x1b[0m        Reconnect to all MCP servers\n\
          \x1b[0m\n\
-         \x1b[90m  What is MCP?\x1b[0m Model Context Protocol - extend Shammah with external\n\
+         \x1b[90m  What is MCP?\x1b[0m Model Context Protocol - extend Finch with external\n\
          \x1b[90m  tools (GitHub, filesystem, databases, etc.) via MCP servers.\n\n\
+         \x1b[1;33m🎭 Persona Commands:\x1b[0m\n\
+         \x1b[36m  /persona\x1b[0m           List available personas\n\
+         \x1b[36m  /persona select <name>\x1b[0m Switch to a different persona\n\
+         \x1b[36m  /persona show\x1b[0m      Show current persona and system prompt\n\
+         \x1b[0m\n\
+         \x1b[90m  What are personas?\x1b[0m Customize AI behavior and personality.\n\
+         \x1b[90m  Built-in:\x1b[0m default, expert-coder, teacher, analyst, creative, researcher\n\n\
+         \x1b[1;33m🔍 Service Discovery:\x1b[0m\n\
+         \x1b[36m  /discover\x1b[0m          Discover Finch daemons on local network\n\
+         \x1b[0m\n\
+         \x1b[90m  Uses mDNS/Bonjour to find remote Finch instances for distributed GPU access.\x1b[0m\n\n\
          \x1b[1;33m🔒 Tool Confirmation Patterns:\x1b[0m\n\
          \x1b[36m  /patterns\x1b[0m          List all saved confirmation patterns\n\
          \x1b[36m  /patterns add\x1b[0m      Add a new pattern (interactive wizard)\n\

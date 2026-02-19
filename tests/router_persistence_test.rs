@@ -6,7 +6,7 @@
 // 3. Graceful degradation with bad data
 
 use anyhow::Result;
-use shammah::models::{ThresholdRouter, QueryCategory};
+use finch::models::{ThresholdRouter, QueryCategory};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;

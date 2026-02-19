@@ -822,8 +822,8 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     // Create and start agent server (with LocalGenerator support)
     let server = AgentServer::new(
-        config,
-        server_config,
+        config.clone(),
+        server_config.clone(),
         claude_client,
         router,
         metrics_logger,
@@ -832,6 +832,46 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         generator_state,
         training_coordinator,
     )?;
+
+    // Set up mDNS service advertisement if enabled
+    let service_discovery = if config.server.advertise {
+        use finch::service::{ServiceDiscovery, ServiceConfig};
+
+        let service_config = ServiceConfig {
+            name: config.server.service_name.clone(),
+            description: config.server.service_description.clone(),
+            model: format!("{:?}", config.backend.model_size),  // e.g., "Small", "Medium", "Large"
+            capabilities: vec!["code".to_string(), "general".to_string(), "tool-use".to_string()],
+        };
+
+        match ServiceDiscovery::new(service_config) {
+            Ok(discovery) => {
+                // Extract port from bind_address
+                let port = config.server.bind_address
+                    .split(':')
+                    .last()
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(11435);
+
+                match discovery.advertise(port) {
+                    Ok(_) => {
+                        tracing::info!("✓ mDNS advertisement enabled");
+                        Some(discovery)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to advertise service: {}. Continuing without mDNS.", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create service discovery: {}. Continuing without mDNS.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Set up graceful shutdown handling
     let server_handle = tokio::spawn(async move {
@@ -855,6 +895,13 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                     tracing::error!(error = %e, "Server task panicked");
                 }
             }
+        }
+    }
+
+    // Stop mDNS advertisement if enabled
+    if let Some(discovery) = service_discovery {
+        if let Err(e) = discovery.stop() {
+            tracing::warn!("Failed to stop service advertisement: {}", e);
         }
     }
 

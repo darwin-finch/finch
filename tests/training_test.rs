@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
-use shammah::models::{ModelConfig, RouterModel, ValidatorModel};
+use finch::models::{ModelConfig, RouterModel, ValidatorModel};
 
 #[test]
 fn test_router_training_reduces_loss() -> Result<()> {

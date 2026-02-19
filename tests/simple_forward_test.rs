@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
-use shammah::models::{ModelConfig, RouterModel};
+use finch::models::{ModelConfig, RouterModel};
 
 #[test]
 fn test_simple_forward_pass() -> Result<()> {
