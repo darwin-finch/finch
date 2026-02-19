@@ -1712,7 +1712,7 @@ fn render_models_section(
     let primary_display = match primary_model {
         ModelConfig::Local { family, size, execution, .. } => {
             format!(
-                "{}Local {} {} ({}){}",
+                "{}★ Primary: Local {} {} ({}){}",
                 prefix,
                 family.name(),
                 model_size_display(size),
@@ -1732,7 +1732,7 @@ fn render_models_section(
                 String::new()
             };
             format!(
-                "{}{}{} [{}]{}",
+                "{}★ Primary: {}{} [{}]{}",
                 prefix, provider, model_display, key_display, suffix
             )
         }

@@ -1,7 +1,7 @@
 # Shammah - Project Status
 
-**Last Updated:** 2026-02-20
-**Version:** 0.5.1-dev (Setup Wizard UX + First-Run Experience)
+**Last Updated:** 2026-02-20 (session 2)
+**Version:** 0.5.2-dev (Setup Wizard UI Improvements)
 
 ## Current State: Production-Ready Local AI Proxy ✅
 
@@ -125,6 +125,17 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 - Fixed: Persona saved as display name ("Expert Coder") instead of slug ("expert-coder")
 - Fixed: Empty API key patched from env vars after wizard completes
 - Config path confirmed: ~/.finch/config.toml (not ~/.shammah/)
+
+**Setup Wizard UI Improvements (Feb 20, 2026, commit 790f49b):**
+- Edit mode input panel: pressing E/M shows a bordered box below the providers list
+  instead of embedding live input in the list item — list always shows saved/masked value
+- Add provider flow now starts with type selection (Cloud AI / Local ONNX / Scan network)
+- Local ONNX path: pick model family (6 options) → pick size (4 options) → added to list
+- Network scan path: background thread scans LAN via mDNS, shows spinner, then agent list
+- mDNS Settings toggle renamed "Discover agents" → "Advertise on network" (correct semantics)
+- mDNS init now reads only server.advertise (not also client.auto_discover)
+- Known limitation: Local ONNX path hardcodes ExecutionTarget::Cpu; Candle inference
+  provider is not selectable in the new wizard even when compiled with the candle feature
 
 ---
 
