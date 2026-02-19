@@ -300,6 +300,11 @@ async fn main() -> Result<()> {
                     };
                     new_config.active_theme = active_theme;
                     new_config.active_persona = default_persona;
+                    if let Some(hf_tok) = result.hf_token {
+                        if !hf_tok.is_empty() {
+                            new_config.huggingface_token = Some(hf_tok);
+                        }
+                    }
                     new_config.features = finch::config::FeaturesConfig {
                         auto_approve_tools: result.auto_approve_tools,
                         streaming_enabled: result.streaming_enabled,
