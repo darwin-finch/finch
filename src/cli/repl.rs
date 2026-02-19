@@ -437,7 +437,7 @@ impl Repl {
         let active_persona = match crate::config::Persona::load_builtin(&config.active_persona) {
             Ok(persona) => {
                 if is_interactive && !daemon_mode {
-                    output_status!("✓ Persona loaded: {}", persona.name);
+                    output_status!("✓ Persona loaded: {}", persona.name());
                 }
                 Arc::new(RwLock::new(persona))
             }
@@ -2969,7 +2969,7 @@ impl Repl {
         ];
 
         let current_persona = self.active_persona.read().await;
-        let current_name = current_persona.name.to_lowercase();
+        let current_name = current_persona.name().to_lowercase();
 
         for (name, desc) in builtin_personas {
             let marker = if name == current_name { "→ " } else { "  " };
@@ -2985,7 +2985,7 @@ impl Repl {
         // Try to load the persona
         match crate::config::Persona::load_builtin(name) {
             Ok(persona) => {
-                let old_name = self.active_persona.read().await.name.clone();
+                let old_name = self.active_persona.read().await.name().to_string();
                 *self.active_persona.write().await = persona;
 
                 // Clear conversation to apply new persona from scratch
@@ -3007,18 +3007,18 @@ impl Repl {
     async fn handle_persona_show(&self) -> Result<()> {
         let persona = self.active_persona.read().await;
 
-        self.output_status(format!("📖 Current Persona: {}\n", persona.name));
-        self.output_status(format!("Tone: {}", persona.tone));
-        self.output_status(format!("Verbosity: {}", persona.verbosity));
-        self.output_status(format!("Focus: {}\n", persona.focus));
+        self.output_status(format!("📖 Current Persona: {}\n", persona.name()));
+        self.output_status(format!("Tone: {}", persona.tone()));
+        self.output_status(format!("Verbosity: {}", persona.verbosity()));
+        self.output_status(format!("Focus: {}\n", persona.focus()));
         self.output_status("System Prompt:");
         self.output_status("─".repeat(60));
-        self.output_status(&persona.system_prompt);
+        self.output_status(&persona.behavior.system_prompt);
         self.output_status("─".repeat(60));
 
-        if !persona.examples.is_empty() {
-            self.output_status(format!("\nExamples ({}):", persona.examples.len()));
-            for (i, example) in persona.examples.iter().take(2).enumerate() {
+        if !persona.behavior.examples.is_empty() {
+            self.output_status(format!("\nExamples ({}):", persona.behavior.examples.len()));
+            for (i, example) in persona.behavior.examples.iter().take(2).enumerate() {
                 self.output_status(format!("\n{}. User: {}", i + 1, example.user));
                 self.output_status(format!("   Assistant: {}", example.assistant));
             }

@@ -10,18 +10,32 @@ use std::path::Path;
 /// A persona defines how the AI should behave
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Persona {
+    /// Metadata about the persona
+    pub persona: PersonaMetadata,
+
+    /// Behavior configuration
+    pub behavior: PersonaBehavior,
+}
+
+/// Metadata about a persona
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaMetadata {
     /// Persona name (e.g., "Louis", "Expert Coder")
     pub name: String,
 
     /// Description of this persona
     pub description: String,
 
+    /// Version string
+    #[serde(default)]
+    pub version: String,
+}
+
+/// Behavior configuration for a persona
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaBehavior {
     /// System prompt that defines behavior
     pub system_prompt: String,
-
-    /// Example interactions (for few-shot learning)
-    #[serde(default)]
-    pub examples: Vec<PersonaExample>,
 
     /// Tone (e.g., "Professional", "Casual", "Technical")
     #[serde(default)]
@@ -34,6 +48,10 @@ pub struct Persona {
     /// Focus area (e.g., "Helpfulness", "Accuracy", "Creativity")
     #[serde(default)]
     pub focus: String,
+
+    /// Example interactions (for few-shot learning)
+    #[serde(default)]
+    pub examples: Vec<PersonaExample>,
 }
 
 /// Example interaction for few-shot learning
@@ -72,16 +90,36 @@ impl Persona {
     /// Get system prompt formatted for injection
     pub fn to_system_message(&self) -> String {
         // Optionally include examples in system prompt
-        if self.examples.is_empty() {
-            self.system_prompt.clone()
+        if self.behavior.examples.is_empty() {
+            self.behavior.system_prompt.clone()
         } else {
-            let mut prompt = self.system_prompt.clone();
+            let mut prompt = self.behavior.system_prompt.clone();
             prompt.push_str("\n\nExample interactions:\n");
-            for example in &self.examples {
+            for example in &self.behavior.examples {
                 prompt.push_str(&format!("\nUser: {}\nAssistant: {}\n", example.user, example.assistant));
             }
             prompt
         }
+    }
+
+    /// Get persona name
+    pub fn name(&self) -> &str {
+        &self.persona.name
+    }
+
+    /// Get persona tone
+    pub fn tone(&self) -> &str {
+        &self.behavior.tone
+    }
+
+    /// Get persona verbosity
+    pub fn verbosity(&self) -> &str {
+        &self.behavior.verbosity
+    }
+
+    /// Get persona focus
+    pub fn focus(&self) -> &str {
+        &self.behavior.focus
     }
 
     /// List available builtin personas
@@ -93,13 +131,18 @@ impl Persona {
 impl Default for Persona {
     fn default() -> Self {
         Self {
-            name: "Default".to_string(),
-            description: "Helpful AI assistant".to_string(),
-            system_prompt: "You are a helpful AI assistant. Provide clear, accurate, and concise responses.".to_string(),
-            examples: Vec::new(),
-            tone: "Professional".to_string(),
-            verbosity: "Balanced".to_string(),
-            focus: "Helpfulness".to_string(),
+            persona: PersonaMetadata {
+                name: "Default".to_string(),
+                description: "Helpful AI assistant".to_string(),
+                version: "1.0".to_string(),
+            },
+            behavior: PersonaBehavior {
+                system_prompt: "You are a helpful AI assistant. Provide clear, accurate, and concise responses.".to_string(),
+                tone: "Professional".to_string(),
+                verbosity: "Balanced".to_string(),
+                focus: "Helpfulness".to_string(),
+                examples: Vec::new(),
+            },
         }
     }
 }
@@ -111,8 +154,8 @@ mod tests {
     #[test]
     fn test_default_persona() {
         let persona = Persona::default();
-        assert_eq!(persona.name, "Default");
-        assert!(!persona.system_prompt.is_empty());
+        assert_eq!(persona.name(), "Default");
+        assert!(!persona.behavior.system_prompt.is_empty());
     }
 
     #[test]
