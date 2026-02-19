@@ -602,16 +602,25 @@ mod tests {
         let sig1 = ToolSignature {
             tool_name: "bash".to_string(),
             context_key: "cargo test in /project".to_string(),
+            command: Some("cargo".to_string()),
+            args: Some("test".to_string()),
+            directory: Some("/project".to_string()),
         };
 
         let sig2 = ToolSignature {
             tool_name: "bash".to_string(),
             context_key: "cargo build in /project".to_string(),
+            command: Some("cargo".to_string()),
+            args: Some("build".to_string()),
+            directory: Some("/project".to_string()),
         };
 
         let sig3 = ToolSignature {
             tool_name: "bash".to_string(),
             context_key: "npm test in /project".to_string(),
+            command: Some("npm".to_string()),
+            args: Some("test".to_string()),
+            directory: Some("/project".to_string()),
         };
 
         assert!(pattern.matches(&sig1));
@@ -623,7 +632,10 @@ mod tests {
     fn test_exact_approval_matches() {
         let sig = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo test in /project".to_string(),
+            context_key: "cargo test in /project".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         let approval = ExactApproval::new(sig.clone());
@@ -632,7 +644,10 @@ mod tests {
 
         let different_sig = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo build in /project".to_string(),
+            context_key: "cargo build in /project".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         assert!(!approval.matches(&different_sig));
@@ -644,7 +659,10 @@ mod tests {
 
         let sig = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo test in /project".to_string(),
+            context_key: "cargo test in /project".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         // Add pattern
@@ -704,7 +722,10 @@ mod tests {
 
         let sig = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo test in /project".to_string(),
+            context_key: "cargo test in /project".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         // Should match specific pattern (0 wildcards) over general (2 wildcards)
@@ -727,17 +748,26 @@ mod tests {
 
         let sig1 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo test".to_string(),
+            context_key: "cargo test".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         let sig2 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo build".to_string(),
+            context_key: "cargo build".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         let sig3 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo run".to_string(),
+            context_key: "cargo run".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         assert!(pattern.matches(&sig1));
@@ -756,17 +786,26 @@ mod tests {
 
         let sig1 = ToolSignature {
             tool_name: "read".to_string(),
-            context_key: "reading /project/src/main.rs".to_string(),
+            context_key: "reading /project/src/main.rs".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         let sig2 = ToolSignature {
             tool_name: "read".to_string(),
-            context_key: "reading /project/src/lib.rs".to_string(),
+            context_key: "reading /project/src/lib.rs".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         let sig3 = ToolSignature {
             tool_name: "read".to_string(),
-            context_key: "reading /project/src/test.txt".to_string(),
+            context_key: "reading /project/src/test.txt".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         assert!(pattern.matches(&sig1));
@@ -937,12 +976,18 @@ mod tests {
 
         let sig1 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "test123".to_string(),
+            context_key: "test123".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         let sig2 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "testABC".to_string(),
+            context_key: "testABC".to_string(),,
+            command: None,
+            args: None,
+            directory: None
         };
 
         // Should match test123 but not testABC
@@ -973,3 +1018,4 @@ mod tests {
         assert_eq!(pattern.created_by.as_deref(), Some("user@example.com"));
     }
 }
+

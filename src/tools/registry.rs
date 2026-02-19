@@ -177,6 +177,8 @@ mod tests {
             batch_trainer: None,
             local_generator: None,
             tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
         };
 
         let result = tool

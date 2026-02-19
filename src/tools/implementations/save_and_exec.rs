@@ -136,6 +136,11 @@ mod tests {
         let context = ToolContext {
             conversation: None,
             save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
         };
         let input = serde_json::json!({
             "command": "echo test"
@@ -152,6 +157,11 @@ mod tests {
         let context = ToolContext {
             conversation: None,
             save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
         };
         let input = serde_json::json!({
             "reason": "test"

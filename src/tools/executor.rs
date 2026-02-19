@@ -757,11 +757,17 @@ mod tests {
         let sig1 = ToolSignature {
             tool_name: "bash".to_string(),
             context_key: "cargo test".to_string(),
+            command: Some("cargo".to_string()),
+            args: Some("test".to_string()),
+            directory: None,
         };
 
         let sig2 = ToolSignature {
             tool_name: "bash".to_string(),
             context_key: "cargo build".to_string(),
+            command: Some("cargo".to_string()),
+            args: Some("build".to_string()),
+            directory: None,
         };
 
         // Initially, nothing is approved
@@ -791,6 +797,9 @@ mod tests {
         let sig = ToolSignature {
             tool_name: "bash".to_string(),
             context_key: "cargo fmt".to_string(),
+            command: Some("cargo".to_string()),
+            args: Some("fmt".to_string()),
+            directory: None,
         };
 
         // Initially not approved
