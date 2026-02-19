@@ -1102,20 +1102,32 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    // Render theme options with colors visible on both light and dark backgrounds
+    // Render theme options with VERY obvious selection indicator
     let themes = ColorTheme::all();
     let items: Vec<ListItem> = themes
         .iter()
         .enumerate()
         .map(|(i, theme)| {
-            let marker = if i == selected_theme { "▶ " } else { "  " };
-            let style = if i == selected_theme {
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+            let is_selected = i == selected_theme;
+            let (prefix, suffix, style) = if is_selected {
+                (
+                    ">>> ",
+                    " <<<",
+                    Style::default()
+                        .bg(Color::White)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                )
             } else {
-                Style::default().fg(Color::Blue)
+                (
+                    "    ",
+                    "",
+                    Style::default().fg(Color::Blue)
+                )
             };
-            ListItem::new(format!("{}{} - {}", marker, theme.name(), theme.description()))
-                .style(style)
+
+            let text = format!("{}{} - {}{}", prefix, theme.name(), theme.description(), suffix);
+            ListItem::new(text).style(style)
         })
         .collect();
 
@@ -1150,8 +1162,8 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
     f.render_widget(preview, chunks[2]);
 
     let instructions = Paragraph::new(
-        "Select a color theme that works well with your terminal background.\n\
-         Use ↑/↓ to navigate, Enter to confirm. If you can't see this text, try pressing ↓ then Enter."
+        "Use ↑/↓ arrow keys to move selection (>>> theme <<<)\n\
+         Selected theme shows with white background. Press Enter to confirm."
     )
     .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
     .wrap(Wrap { trim: false });
@@ -1434,26 +1446,42 @@ fn render_features_section(
         .map(|(i, (name, enabled, desc))| {
             // Use emoji checkboxes: ✅ (green check) for ON, ☐ (empty box) for OFF
             let checkbox = if *enabled { "✅" } else { "☐" };
-            let marker = if i == selected_idx { "▶ " } else { "  " };
 
-            // Style based on selection state (not enabled state, for accessibility)
-            let name_style = if i == selected_idx {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else if *enabled {
-                Style::default().fg(Color::Blue)
+            let is_selected = i == selected_idx;
+
+            // Make selection VERY obvious with brackets and reverse video
+            let (prefix, suffix, name_style) = if is_selected {
+                (
+                    ">>> ",
+                    " <<<",
+                    Style::default()
+                        .bg(Color::White)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                )
             } else {
-                Style::default().fg(Color::DarkGray)
+                (
+                    "    ",
+                    "",
+                    if *enabled {
+                        Style::default().fg(Color::Blue)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    }
+                )
             };
 
             let mut lines = vec![Line::from(vec![
-                Span::raw(marker),
+                Span::raw(prefix),
                 Span::raw(format!("{} ", checkbox)),
-                Span::styled(*name, name_style),
+                Span::styled(*name, name_style.clone()),
+                Span::styled(suffix, name_style),
             ])];
 
             if let Some(description) = desc {
+                let desc_indent = if is_selected { "        " } else { "        " };
                 lines.push(Line::from(vec![
-                    Span::raw("     "),
+                    Span::raw(desc_indent),
                     Span::styled(*description, Style::default().fg(Color::DarkGray)),
                 ]));
             }
@@ -1467,9 +1495,10 @@ fn render_features_section(
     f.render_widget(list, chunks[1]);
 
     let instructions = Paragraph::new(
-        "↑/↓: Navigate | Space: Toggle | 1-6: Quick toggle | Enter: Next"
+        "Use ↑/↓ arrow keys to move selection (>>> item <<<)\n\
+         Space: Toggle selected feature | Enter: Next section"
     )
-    .style(Style::default().fg(Color::Yellow))
+    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     .alignment(Alignment::Center);
     f.render_widget(instructions, chunks[2]);
 }
