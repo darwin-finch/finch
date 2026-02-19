@@ -43,6 +43,10 @@ pub enum Command {
     PersonaList,              // List available personas
     PersonaSelect(String),    // Switch to a different persona
     PersonaShow,              // Show current persona and system prompt
+    // Model/Teacher switching (Runtime provider switching)
+    ModelList,                // List all configured teachers/models
+    ModelSwitch(String),      // Switch to a specific teacher (e.g., /model grok)
+    ModelShow,                // Show current active teacher
     // Service discovery (Phase 3)
     Discover,                 // Discover Finch daemons on local network
 }
@@ -67,6 +71,9 @@ impl Command {
             // Persona commands
             "/persona" | "/persona list" => return Some(Command::PersonaList),
             "/persona show" => return Some(Command::PersonaShow),
+            // Model/Teacher commands
+            "/model" | "/model show" | "/teacher" | "/teacher show" => return Some(Command::ModelShow),
+            "/model list" | "/teacher list" => return Some(Command::ModelList),
             // Service discovery
             "/discover" => return Some(Command::Discover),
             _ => {}
@@ -77,6 +84,15 @@ impl Command {
             let persona_name = rest.trim();
             if !persona_name.is_empty() {
                 return Some(Command::PersonaSelect(persona_name.to_string()));
+            }
+        }
+
+        // Handle /model <name> or /teacher <name>
+        if let Some(rest) = trimmed.strip_prefix("/model ").or_else(|| trimmed.strip_prefix("/teacher ")) {
+            let teacher_name = rest.trim();
+            // Filter out subcommands
+            if teacher_name != "list" && teacher_name != "show" && !teacher_name.is_empty() {
+                return Some(Command::ModelSwitch(teacher_name.to_string()));
             }
         }
 
@@ -263,6 +279,10 @@ pub fn handle_command(
         Command::PersonaList | Command::PersonaSelect(_) | Command::PersonaShow => {
             Ok(CommandOutput::Status("Persona commands should be handled in REPL.".to_string()))
         }
+        // Model/Teacher switching commands are handled directly in REPL
+        Command::ModelList | Command::ModelSwitch(_) | Command::ModelShow => {
+            Ok(CommandOutput::Status("Model commands should be handled in REPL.".to_string()))
+        }
         // Service discovery is handled directly in REPL (Phase 3)
         Command::Discover => {
             Ok(CommandOutput::Status("Discover command should be handled in REPL.".to_string()))
@@ -284,8 +304,15 @@ pub fn format_help() -> String {
          \x1b[36m  /memory\x1b[0m            Show memory usage (system and process)\n\
          \x1b[36m  /training\x1b[0m          Show detailed training statistics\n\n\
          \x1b[1;33m🤖 Model Commands:\x1b[0m\n\
+         \x1b[36m  /model\x1b[0m             Show current active model/teacher\n\
+         \x1b[36m  /model list\x1b[0m        List all configured teachers (Claude, Grok, etc.)\n\
+         \x1b[36m  /model <name>\x1b[0m      Switch to a specific teacher\n\
+         \x1b[0m                     Example: /model grok\n\
          \x1b[36m  /local <query>\x1b[0m     Query local model directly (bypass routing)\n\
-         \x1b[0m                     Example: /local What is 2+2?\n\n\
+         \x1b[0m                     Example: /local What is 2+2?\n\
+         \x1b[0m\n\
+         \x1b[90m  What is model switching?\x1b[0m Switch between Claude, Grok, GPT-4, etc.\n\
+         \x1b[90m  while keeping your conversation memory intact.\x1b[0m\n\n\
          \x1b[1;33m🔌 MCP Plugin Commands:\x1b[0m\n\
          \x1b[36m  /mcp list\x1b[0m          List connected MCP servers\n\
          \x1b[36m  /mcp tools\x1b[0m         List all MCP tools from all servers\n\

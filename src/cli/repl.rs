@@ -94,6 +94,9 @@ pub struct Repl {
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
     // Teacher session with context optimization
     teacher_session: Arc<RwLock<TeacherSession>>,
+    // Teacher management (for runtime switching)
+    available_teachers: Vec<crate::config::TeacherEntry>,
+    active_teacher_index: usize,
     router: Router, // Now contains ThresholdRouter
     metrics_logger: MetricsLogger,
     // Online learning models
@@ -424,6 +427,9 @@ impl Repl {
             prompt_caching_enabled: true,
         };
 
+        // Store teachers for runtime switching
+        let available_teachers = config.teachers.clone();
+
         let teacher_provider = match crate::providers::create_provider(&config.teachers) {
             Ok(provider) => provider,
             Err(e) => {
@@ -486,6 +492,8 @@ impl Repl {
             claude_client,
             daemon_client,
             teacher_session,
+            available_teachers,
+            active_teacher_index: 0, // First teacher is active by default
             router, // Contains ThresholdRouter now
             metrics_logger,
             threshold_validator,
@@ -1599,6 +1607,19 @@ impl Repl {
                     }
                     Command::PersonaShow => {
                         self.handle_persona_show().await?;
+                        continue;
+                    }
+                    // Model/Teacher switching
+                    Command::ModelList => {
+                        self.handle_model_list().await?;
+                        continue;
+                    }
+                    Command::ModelSwitch(ref name) => {
+                        self.handle_model_switch(name).await?;
+                        continue;
+                    }
+                    Command::ModelShow => {
+                        self.handle_model_show().await?;
                         continue;
                     }
                     // Phase 3: Service discovery
@@ -3078,6 +3099,130 @@ impl Repl {
                 self.output_status(format!("\n{}. User: {}", i + 1, example.user));
                 self.output_status(format!("   Assistant: {}", example.assistant));
             }
+        }
+
+        Ok(())
+    }
+
+    /// Handle /model list command
+    async fn handle_model_list(&self) -> Result<()> {
+        self.output_status("📋 Available Models/Teachers:\n");
+
+        for (idx, teacher) in self.available_teachers.iter().enumerate() {
+            let marker = if idx == self.active_teacher_index { "→ " } else { "  " };
+            let model_name = teacher.model.as_ref().unwrap_or(&teacher.provider);
+            let label = teacher.name.as_ref().unwrap_or(model_name);
+
+            self.output_status(format!(
+                "{}{}. {} ({})",
+                marker,
+                idx + 1,
+                label,
+                teacher.provider
+            ));
+        }
+
+        self.output_status("\nUse '/model <name>' or '/model <number>' to switch");
+        self.output_status("Memory will be preserved across switches");
+        Ok(())
+    }
+
+    /// Handle /model <name> command
+    async fn handle_model_switch(&mut self, name: &str) -> Result<()> {
+        // Try to parse as number first (1-indexed)
+        let target_index = if let Ok(num) = name.parse::<usize>() {
+            if num == 0 || num > self.available_teachers.len() {
+                self.output_error(format!("Invalid model number: {}. Use 1-{}", num, self.available_teachers.len()));
+                return Ok(());
+            }
+            num - 1 // Convert to 0-indexed
+        } else {
+            // Try to find by provider name or label
+            match self.available_teachers.iter().position(|t| {
+                t.provider.eq_ignore_ascii_case(name) ||
+                t.name.as_ref().map(|l| l.eq_ignore_ascii_case(name)).unwrap_or(false)
+            }) {
+                Some(idx) => idx,
+                None => {
+                    self.output_error(format!("Teacher '{}' not found", name));
+                    self.output_status("Use '/model list' to see available teachers");
+                    return Ok(());
+                }
+            }
+        };
+
+        // Check if already active
+        if target_index == self.active_teacher_index {
+            self.output_status("Already using this teacher");
+            return Ok(());
+        }
+
+        // Create new provider
+        let new_teacher = &self.available_teachers[target_index];
+        let new_provider = match crate::providers::create_provider_from_entry(new_teacher) {
+            Ok(provider) => provider,
+            Err(e) => {
+                self.output_error(format!("Failed to create provider: {}", e));
+                return Ok(());
+            }
+        };
+
+        // Get old teacher name
+        let old_teacher = &self.available_teachers[self.active_teacher_index];
+        let old_name = old_teacher.name.as_ref().unwrap_or(&old_teacher.provider);
+
+        // Update teacher session
+        let teacher_config = TeacherContextConfig {
+            max_context_turns: 15,
+            tool_result_retention_turns: 5,
+            prompt_caching_enabled: true,
+        };
+
+        *self.teacher_session.write().await = TeacherSession::with_config(
+            new_provider,
+            teacher_config,
+        );
+
+        // Update active index
+        self.active_teacher_index = target_index;
+
+        // Get new teacher name
+        let new_name = new_teacher.name.as_ref().unwrap_or(&new_teacher.provider);
+
+        // Get memory node count
+        let memory_info = if let Some(ref memory) = self.memory_system {
+            let stats = memory.stats().await?;
+            format!(" (💾 {} nodes in memory)", stats.tree_node_count)
+        } else {
+            String::new()
+        };
+
+        self.output_status(format!("✓ Switched teacher: {} → {}{}", old_name, new_name, memory_info));
+
+        Ok(())
+    }
+
+    /// Handle /model show command
+    async fn handle_model_show(&self) -> Result<()> {
+        let active_teacher = &self.available_teachers[self.active_teacher_index];
+        let name = active_teacher.name.as_ref().unwrap_or(&active_teacher.provider);
+        let default_model = "(default)".to_string();
+        let model = active_teacher.model.as_ref().unwrap_or(&default_model);
+
+        self.output_status(format!("📖 Current Model/Teacher: {}", name));
+        self.output_status(format!("Provider: {}", active_teacher.provider));
+        self.output_status(format!("Model: {}", model));
+
+        // Get conversation stats
+        let conv = self.conversation.read().await;
+        let message_count = conv.message_count();
+
+        self.output_status(format!("\nConversation: {} messages", message_count));
+
+        // Get memory stats if available
+        if let Some(ref memory) = self.memory_system {
+            let stats = memory.stats().await?;
+            self.output_status(format!("Memory: {} nodes", stats.tree_node_count));
         }
 
         Ok(())

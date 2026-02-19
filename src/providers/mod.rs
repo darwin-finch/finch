@@ -25,7 +25,7 @@ pub mod fallback_chain;
 pub mod teacher_session;
 
 // Re-export commonly used types
-pub use factory::{create_provider, create_providers};
+pub use factory::{create_provider, create_provider_from_entry, create_providers};
 pub use fallback_chain::FallbackChain;
 pub use teacher_session::{
     ConversationState, OptimizationStats, TeacherContextConfig, TeacherSession,
