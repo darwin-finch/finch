@@ -181,6 +181,56 @@ impl MemTreeConsole {
         Ok(node_id)
     }
 
+    /// Add a tool result node
+    pub fn add_tool_result(&mut self, parent_id: NodeId, success: bool, text: String) -> Result<NodeId> {
+        let node_id = self.next_id();
+
+        let parent_depth = self.nodes.get(&parent_id).map(|n| n.depth).unwrap_or(0);
+
+        let console_node = ConsoleNode {
+            id: node_id,
+            node_type: ConsoleNodeType::ToolResult { success },
+            text,
+            children: Vec::new(),
+            expanded: true,
+            depth: parent_depth + 1,
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        self.nodes.insert(node_id, console_node);
+
+        if let Some(parent) = self.nodes.get_mut(&parent_id) {
+            parent.children.push(node_id);
+        }
+
+        Ok(node_id)
+    }
+
+    /// Add a thinking/stats node
+    pub fn add_thinking(&mut self, parent_id: NodeId, duration_ms: u64, text: String) -> Result<NodeId> {
+        let node_id = self.next_id();
+
+        let parent_depth = self.nodes.get(&parent_id).map(|n| n.depth).unwrap_or(0);
+
+        let console_node = ConsoleNode {
+            id: node_id,
+            node_type: ConsoleNodeType::Thinking { duration_ms },
+            text,
+            children: Vec::new(),
+            expanded: true,
+            depth: parent_depth + 1,
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        self.nodes.insert(node_id, console_node);
+
+        if let Some(parent) = self.nodes.get_mut(&parent_id) {
+            parent.children.push(node_id);
+        }
+
+        Ok(node_id)
+    }
+
     /// Toggle expansion of a node
     pub fn toggle_expand(&mut self, node_id: NodeId) {
         if let Some(node) = self.nodes.get_mut(&node_id) {

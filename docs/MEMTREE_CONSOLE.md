@@ -97,20 +97,21 @@ Long output can be collapsed:
 
 ✅ **Complete:**
 - Basic tree structure (ConsoleNode, ConsoleNodeType)
-- Node creation (user messages, responses, tool calls)
+- Node creation (user messages, responses, tool calls, tool results, thinking)
 - Expand/collapse logic
 - Visual rendering (icons, indentation, selection)
 - Navigation (up/down, select)
 - Integration with MemTree
+- Event loop integration (EventHandler translates ReplEvent to tree operations)
+- Tool execution integration (formats tool calls, displays results)
 
 ⚪ **Todo:**
-- Event loop integration
-- Tool execution integration
-- Input handling
-- Keyboard shortcuts
+- Input handling (multi-line input widget)
+- Keyboard shortcuts (full navigation controls)
 - Export/import tree structure
 - Search within tree
 - Persistence across sessions
+- Wire up EventHandler in main REPL loop
 
 ## Usage Example
 
@@ -166,9 +167,11 @@ console.render(&mut frame, area);
 
 ## File Locations
 
-- **Core**: `src/cli/memtree_console.rs`
+- **Core**: `src/cli/memtree_console/console.rs`
+- **Event Handler**: `src/cli/memtree_console/event_handler.rs`
+- **Module**: `src/cli/memtree_console/mod.rs`
 - **Memory**: `src/memory/memtree.rs`
-- **Tests**: `src/cli/memtree_console.rs` (at bottom)
+- **Tests**: Tests included in `console.rs` and `event_handler.rs`
 
 ## Testing
 
