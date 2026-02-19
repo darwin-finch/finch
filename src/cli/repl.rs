@@ -1353,6 +1353,7 @@ impl Repl {
             Arc::clone(&self.tokenizer),
             self.daemon_client.clone(),
             mode,
+            None, // memory_tree - will be added in future when memory system is integrated
         );
 
         // Run the event loop
@@ -1552,6 +1553,10 @@ impl Repl {
                             self.output_status("");
                             self.print_status_line().await;
                         }
+                        continue;
+                    }
+                    Command::Compact(ref instruction) => {
+                        self.handle_compact_command(instruction.clone()).await?;
                         continue;
                     }
                     Command::PatternsList => {
@@ -3318,6 +3323,90 @@ impl Repl {
             self.output_status("  1. Edit ~/.finch/config.toml");
             self.output_status("  2. Add [memory] section with enabled = true");
             self.output_status("  3. Restart Finch");
+        }
+
+        Ok(())
+    }
+
+    /// Handle /compact command - clear history but keep a summary
+    async fn handle_compact_command(&mut self, instruction: Option<String>) -> Result<()> {
+        // Get current conversation history
+        let conversation = self.conversation.read().await;
+        let history = conversation.get_messages();
+
+        if history.is_empty() {
+            self.output_status("No conversation history to compact.");
+            return Ok(());
+        }
+
+        // Build a prompt to summarize the conversation
+        let summary_prompt = if let Some(inst) = instruction {
+            format!(
+                "Please summarize the following conversation, focusing on: {}\n\n\
+                Conversation history:\n{}",
+                inst,
+                history
+                    .iter()
+                    .map(|msg| format!("{}: {}", msg.role, msg.text_content()))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            )
+        } else {
+            format!(
+                "Please provide a concise summary of the following conversation, \
+                highlighting key topics, decisions, and any unresolved questions:\n\n\
+                Conversation history:\n{}",
+                history
+                    .iter()
+                    .map(|msg| format!("{}: {}", msg.role, msg.text_content()))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            )
+        };
+
+        drop(conversation); // Release lock before async operations
+
+        self.output_status("📝 Generating conversation summary...");
+
+        // Get summary from teacher
+        use crate::claude::types::Message;
+        use crate::providers::ProviderRequest;
+
+        let request = ProviderRequest::new(vec![Message::user(summary_prompt)]);
+        let summary_result = self
+            .teacher_session
+            .write()
+            .await
+            .send_message(&request)
+            .await;
+
+        match summary_result {
+            Ok(response) => {
+                // Extract text from response
+                let summary = response.text();
+
+                // Clear conversation
+                self.conversation.write().await.clear();
+
+                // Add summary as a system message to maintain context
+                let system_msg = Message::with_content(
+                    "system",
+                    vec![crate::claude::types::ContentBlock::text(
+                        format!("Previous conversation summary: {}", summary.trim())
+                    )]
+                );
+                self.conversation.write().await.add_message(system_msg);
+
+                self.output_status("✓ Conversation compacted. Context preserved in summary.");
+                if self.is_interactive {
+                    self.output_status("");
+                    self.print_status_line().await;
+                }
+            }
+            Err(e) => {
+                self.output_status(format!("⚠️  Failed to generate summary: {}", e));
+                self.output_status("   Conversation history not modified.");
+            }
         }
 
         Ok(())

@@ -1,6 +1,7 @@
 // CLI module
 // Public interface for command-line interface
 
+pub mod command_autocomplete;
 mod commands;
 mod conversation;
 pub mod global_output; // Phase 3.5: Global output system with macros

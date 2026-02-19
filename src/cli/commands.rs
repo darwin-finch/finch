@@ -21,6 +21,7 @@ pub enum Command {
     Debug,
     Training,
     Clear,
+    Compact(Option<String>), // Clear with summary (optional instruction)
     PatternsList,
     PatternsRemove(String),
     PatternsClear,
@@ -64,6 +65,7 @@ impl Command {
             "/debug" => return Some(Command::Debug),
             "/training" => return Some(Command::Training),
             "/clear" | "/reset" => return Some(Command::Clear),
+            "/compact" => return Some(Command::Compact(None)),
             // Feedback commands (simple form)
             "/critical" => return Some(Command::FeedbackCritical(None)),
             "/medium" => return Some(Command::FeedbackMedium(None)),
@@ -158,6 +160,16 @@ impl Command {
             return Some(Command::FeedbackGood(None));
         }
 
+        // Handle /compact command with optional instruction
+        if let Some(rest) = trimmed.strip_prefix("/compact ") {
+            let instruction = rest.trim();
+            return Some(Command::Compact(if instruction.is_empty() {
+                None
+            } else {
+                Some(instruction.to_string())
+            }));
+        }
+
         // Handle /local command with query
         if let Some(rest) = trimmed.strip_prefix("/local ") {
             let query = rest.trim();
@@ -247,6 +259,7 @@ pub fn handle_command(
         }
         Command::Quit => Ok(CommandOutput::Status("Goodbye!".to_string())),
         Command::Clear => Ok(CommandOutput::Status("".to_string())), // Handled in REPL directly
+        Command::Compact(_) => Ok(CommandOutput::Status("".to_string())), // Handled in REPL directly
         // Pattern commands are now handled directly in REPL
         Command::PatternsList
         | Command::PatternsRemove(_)
@@ -298,7 +311,8 @@ pub fn format_help() -> String {
          \x1b[1;33m📋 Basic Commands:\x1b[0m\n\
          \x1b[36m  /help\x1b[0m              Show this help message\n\
          \x1b[36m  /quit\x1b[0m              Exit the REPL (also: Ctrl+D)\n\
-         \x1b[36m  /clear\x1b[0m             Clear conversation history (start fresh)\n\
+         \x1b[36m  /clear\x1b[0m             Clear conversation history and free up context\n\
+         \x1b[36m  /compact [note]\x1b[0m    Clear history but keep a summary in context\n\
          \x1b[36m  /debug\x1b[0m             Toggle debug output\n\
          \x1b[36m  /metrics\x1b[0m           Display usage statistics\n\
          \x1b[36m  /memory\x1b[0m            Show memory usage (system and process)\n\
@@ -605,6 +619,37 @@ mod tests {
             Some(Command::Training)
         ));
         assert!(matches!(Command::parse("/clear"), Some(Command::Clear)));
+    }
+
+    #[test]
+    fn test_parse_compact() {
+        // Test /compact without argument
+        match Command::parse("/compact") {
+            Some(Command::Compact(None)) => (),
+            _ => panic!("Expected Compact(None)"),
+        }
+
+        // Test /compact with instruction
+        match Command::parse("/compact focus on key decisions") {
+            Some(Command::Compact(Some(instruction))) => {
+                assert_eq!(instruction, "focus on key decisions");
+            }
+            _ => panic!("Expected Compact(Some(...))"),
+        }
+
+        // Test with extra whitespace
+        match Command::parse("/compact   key points  ") {
+            Some(Command::Compact(Some(instruction))) => {
+                assert_eq!(instruction, "key points");
+            }
+            _ => panic!("Expected Compact(Some(...))"),
+        }
+
+        // Test empty instruction (should be None)
+        match Command::parse("/compact ") {
+            Some(Command::Compact(None)) => (),
+            other => panic!("Expected Compact(None), got {:?}", other),
+        }
     }
 
     #[test]

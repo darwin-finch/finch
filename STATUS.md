@@ -1,7 +1,7 @@
 # Shammah - Project Status
 
-**Last Updated:** 2026-02-15
-**Version:** 0.4.0 (Production-Ready with TUI Fixes)
+**Last Updated:** 2026-02-19
+**Version:** 0.5.0-dev (Runtime Switching + MemTree Console)
 
 ## Current State: Production-Ready Local AI Proxy ✅
 
@@ -95,6 +95,23 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 - Bounded channel (size 2) provides natural backpressure
 - Background query execution keeps event loop responsive
 - Reactive TUI rendering (20 FPS) shows updates immediately
+
+**Runtime Model/Teacher Switching (Feb 19, 2026):**
+- `/model` and `/teacher` commands for runtime provider switching
+- Switch between Claude, Grok, GPT-4, Gemini, Mistral, Groq mid-session
+- Memory tree preservation across switches (nodes maintained)
+- Conversation history preserved during transitions
+- List providers, show current, switch by name or index
+- Graceful error handling for invalid teacher names
+
+**MemTree Console Infrastructure (Feb 19, 2026):**
+- Tree-structured conversation view (alternative to list scrollback)
+- Event-driven architecture for REPL event → tree node translation
+- Console state management with expand/collapse navigation
+- ViewMode enum (List vs Tree) for future mode switching
+- ConsoleNode types: UserMessage, AssistantResponse, ToolCall, ToolResult, System, Thinking
+- Event handler maps query UUIDs to tree node IDs
+- Infrastructure complete, TUI rendering pending
 
 ---
 

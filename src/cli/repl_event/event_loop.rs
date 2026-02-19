@@ -90,6 +90,24 @@ pub struct EventLoop {
 
     /// Plan content storage (for PresentPlan tool)
     plan_content: Arc<RwLock<Option<String>>>,
+
+    /// Memory tree console for tree-structured conversation view
+    memtree_console: Arc<RwLock<crate::cli::memtree_console::MemTreeConsole>>,
+
+    /// Event handler for translating REPL events to tree operations
+    memtree_handler: Arc<tokio::sync::Mutex<crate::cli::memtree_console::EventHandler>>,
+
+    /// Current view mode (List or Tree)
+    view_mode: Arc<RwLock<ViewMode>>,
+}
+
+/// View mode for the REPL
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Traditional list view (current scrollback)
+    List,
+    /// Tree-structured conversation view
+    Tree,
 }
 
 impl EventLoop {
@@ -111,6 +129,7 @@ impl EventLoop {
         tokenizer: Arc<TextTokenizer>,
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
         mode: Arc<RwLock<ReplMode>>,
+        memory_tree: Option<Arc<RwLock<crate::memory::MemTree>>>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -134,6 +153,25 @@ impl EventLoop {
             Arc::clone(&plan_content),
         );
 
+        // Initialize memtree console if memory tree is provided
+        let (memtree_console, memtree_handler) = if let Some(tree) = memory_tree {
+            let console = crate::cli::memtree_console::MemTreeConsole::new(tree);
+            let handler = crate::cli::memtree_console::EventHandler::new();
+            (
+                Arc::new(RwLock::new(console)),
+                Arc::new(tokio::sync::Mutex::new(handler)),
+            )
+        } else {
+            // Create a dummy tree if no memory system is available
+            let dummy_tree = Arc::new(RwLock::new(crate::memory::MemTree::new()));
+            let console = crate::cli::memtree_console::MemTreeConsole::new(dummy_tree);
+            let handler = crate::cli::memtree_console::EventHandler::new();
+            (
+                Arc::new(RwLock::new(console)),
+                Arc::new(tokio::sync::Mutex::new(handler)),
+            )
+        };
+
         Self {
             event_rx,
             event_tx,
@@ -156,6 +194,9 @@ impl EventLoop {
             daemon_client,
             mode,
             plan_content,
+            memtree_console,
+            memtree_handler,
+            view_mode: Arc::new(RwLock::new(ViewMode::List)), // Start in list view
         }
     }
 

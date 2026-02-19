@@ -8,6 +8,40 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::TuiRenderer;
 
+/// Sanitize pasted content to prevent TUI breakage
+/// Filters out:
+/// - Image escape sequences (kitty, iTerm2, sixel)
+/// - Non-printable control characters (except newlines/tabs)
+/// - Invalid UTF-8 sequences
+fn sanitize_paste_char(c: char) -> bool {
+    match c {
+        // Allow printable ASCII
+        ' '..='~' => true,
+        // Allow common whitespace
+        '\t' | '\n' | '\r' => true,
+        // Allow extended Unicode (for international text)
+        '\u{0080}'..='\u{10FFFF}' => {
+            // Block private use areas (often used for images)
+            !matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
+        }
+        // Block everything else (control chars, escape sequences)
+        _ => false,
+    }
+}
+
+/// Check if a key event should be accepted during paste
+/// Filters out problematic characters while allowing normal input
+fn should_accept_key_event(key: &KeyEvent) -> bool {
+    match &key.code {
+        KeyCode::Char(c) => {
+            // Apply sanitization filter
+            sanitize_paste_char(*c)
+        }
+        // Allow all other key codes (Enter, Backspace, arrows, etc.)
+        _ => true,
+    }
+}
+
 /// Spawn a background task that polls keyboard input and sends to channel
 ///
 /// This enables non-blocking input handling in the event loop:
@@ -185,9 +219,11 @@ pub fn spawn_input_task(
                                     Ok(None)
                                 }
                                 _ => {
-                                    // Pass key event to textarea
-                                    tui.input_textarea.input(Event::Key(key));
-                                    first_event_modified_input = true; // Mark for render
+                                    // Pass key event to textarea (with sanitization)
+                                    if should_accept_key_event(&key) {
+                                        tui.input_textarea.input(Event::Key(key));
+                                        first_event_modified_input = true; // Mark for render
+                                    }
                                     Ok(None)
                                 }
                             }
@@ -213,9 +249,12 @@ pub fn spawn_input_task(
                                 }
                             }
                             Ok(Event::Key(key)) => {
-                                // Pass key event to textarea
-                                tui.input_textarea.input(Event::Key(key));
-                                had_input = true;
+                                // Sanitize pasted content (filter images/control chars)
+                                if should_accept_key_event(&key) {
+                                    tui.input_textarea.input(Event::Key(key));
+                                    had_input = true;
+                                }
+                                // Silently ignore problematic characters
                             }
                             Ok(_) => {} // Ignore other events
                             Err(_) => break, // Error, stop batching

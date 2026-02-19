@@ -15,9 +15,10 @@ use ratatui::{
     Frame,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-use crate::memory::{MemTree, TreeNode, NodeId};
+use crate::memory::{MemTree, NodeId};
 
 /// A node in the console tree view
 #[derive(Debug, Clone)]

@@ -911,14 +911,18 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
 
 ## Current Project Status
 
-**Phase**: Core Infrastructure + Setup Wizard Redesign + MCP Foundation ✅
-**Version**: 0.5.0-dev (Tabbed Wizard + Feature Flags + GUI Tools + MCP Infrastructure)
-**Recent Work**: Phases 1-4 of Setup Wizard Redesign (Feb 2026)
+**Phase**: Core Infrastructure + Runtime Switching + MemTree Console 🚧
+**Version**: 0.5.0-dev (Runtime Model Switching + Tree Console Infrastructure)
+**Recent Work** (Feb 19, 2026):
+  - ✅ Runtime model/teacher switching with memory preservation
+  - ✅ MemTree console infrastructure (event handler + tree state)
+  - 🚧 Tree view TUI rendering (in progress)
+**Previous Work**: Phases 1-4 of Setup Wizard Redesign (Feb 2026)
   - Phase 1: Tabbed setup wizard with section navigation
   - Phase 2: Feature flags configuration system
   - Phase 3: macOS GUI automation tools (infrastructure)
   - Phase 4: MCP plugin system (config + module structure)
-**Next**: Complete MCP implementation (JSON-RPC), test GUI tools on macOS
+**Next**: Complete tree view rendering, keyboard navigation
 
 ### What's Done
 
@@ -983,6 +987,22 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
 - ✅ **Daemon Management** - Auto-spawn, stop, start, status commands
 - ✅ **Config Validation** - Helpful error messages on startup
 - ✅ **Download Progress** - Visual progress bars in TUI
+
+**Runtime Model Switching (Feb 19, 2026):**
+- ✅ `/model` and `/teacher` commands for runtime provider switching
+- ✅ Switch between Claude, Grok, GPT-4, Gemini, Mistral, Groq mid-session
+- ✅ Memory tree preservation across switches (nodes maintained)
+- ✅ Conversation history preserved during transitions
+- ✅ List, show, and switch by name or index
+
+**MemTree Console Infrastructure (Feb 19, 2026):**
+- ✅ Tree-structured conversation view architecture
+- ✅ Event handler for REPL event → tree node translation
+- ✅ Console state management with expand/collapse support
+- ✅ ViewMode enum (List vs Tree) for future mode switching
+- ✅ ConsoleNode types: UserMessage, AssistantResponse, ToolCall, ToolResult
+- 🚧 TUI rendering with ratatui widgets (in progress)
+- 🚧 Keyboard navigation for tree view (in progress)
 
 ### What's Next
 

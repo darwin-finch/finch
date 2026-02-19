@@ -36,6 +36,7 @@ mod input_widget;
 mod scrollback;
 mod shadow_buffer;
 mod status_widget;
+mod autocomplete_widget;
 
 pub use async_input::spawn_input_task;
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
@@ -46,6 +47,7 @@ pub use input_widget::render_input_widget;
 pub use scrollback::ScrollbackBuffer;
 pub use shadow_buffer::{ShadowBuffer, diff_buffers, visible_length, extract_visible_chars};
 pub use status_widget::StatusWidget;
+pub use autocomplete_widget::{AutocompleteState, render_autocomplete_dropdown};
 
 // Import DialogType for internal use
 use dialog::DialogType as DType;
@@ -211,6 +213,10 @@ pub struct TuiRenderer {
     suggestions: crate::cli::SuggestionManager,
     /// Inline ghost text suggestion (shown after cursor)
     ghost_text: Option<String>,
+    /// Command autocomplete registry
+    command_registry: crate::cli::command_autocomplete::CommandRegistry,
+    /// Autocomplete dropdown state
+    autocomplete_state: AutocompleteState,
 }
 
 impl TuiRenderer {
@@ -276,10 +282,11 @@ impl TuiRenderer {
             .split(popup_layout[1])[1]
     }
 
-    /// Update ghost text suggestion based on current input
+    /// Update ghost text suggestion and autocomplete dropdown based on current input
     ///
     /// Generates inline autocomplete suggestions for common commands and patterns.
     /// Ghost text appears after the cursor and can be accepted with Tab.
+    /// Autocomplete dropdown shows all matching commands when typing /.
     pub(super) fn update_ghost_text(&mut self) {
         let current_input = self.input_textarea.lines().join("\n");
         let trimmed = current_input.trim();
@@ -287,40 +294,47 @@ impl TuiRenderer {
         // Only suggest on single-line inputs
         if self.input_textarea.lines().len() > 1 {
             self.ghost_text = None;
+            self.autocomplete_state.hide();
             return;
         }
 
         // Don't suggest if input is empty
         if trimmed.is_empty() {
             self.ghost_text = None;
+            self.autocomplete_state.hide();
             return;
         }
 
-        // Command suggestions (prefix matching)
-        let commands = vec![
-            ("/help", "Show available commands"),
-            ("/local", "Check local model status"),
-            ("/clear", "Clear conversation history"),
-            ("/plan", "Toggle plan mode"),
-            ("/approve", "Approve current plan"),
-            ("/reject", "Reject current plan"),
-            ("/show-plan", "Display current plan"),
-            ("/save-plan", "Save last response to plan"),
-            ("/done", "Exit plan mode"),
-            ("/exit", "Exit finch"),
-            ("/quit", "Exit finch"),
-        ];
+        // Check if we're typing a command (starts with /)
+        if trimmed.starts_with('/') {
+            // Get matching commands from registry
+            let matches = self.command_registry.match_prefix(trimmed);
 
-        // Find matching command
-        for (cmd, _desc) in commands {
-            if cmd.starts_with(trimmed) && cmd != trimmed {
-                // Found a match - suggest the rest
-                self.ghost_text = Some(cmd[trimmed.len()..].to_string());
+            if !matches.is_empty() {
+                // Show autocomplete dropdown
+                self.autocomplete_state.show_matches(matches);
+
+                // Set ghost text to first match (for Tab completion)
+                if let Some(selected) = self.autocomplete_state.get_selected() {
+                    if selected.name.starts_with(trimmed) && selected.name != trimmed {
+                        self.ghost_text = Some(selected.name[trimmed.len()..].to_string());
+                    } else {
+                        self.ghost_text = None;
+                    }
+                } else {
+                    self.ghost_text = None;
+                }
                 return;
+            } else {
+                // No matches - hide autocomplete
+                self.autocomplete_state.hide();
             }
+        } else {
+            // Not a command - hide autocomplete
+            self.autocomplete_state.hide();
         }
 
-        // Common query patterns
+        // Common query patterns (for non-command input)
         let patterns = vec![
             ("Can you help", " me with..."),
             ("How do I", " ..."),
@@ -446,6 +460,8 @@ impl TuiRenderer {
             colors,
             suggestions: crate::cli::SuggestionManager::new(),
             ghost_text: None,
+            command_registry: crate::cli::command_autocomplete::CommandRegistry::new(),
+            autocomplete_state: AutocompleteState::new(),
         };
 
         // Initialize first-run suggestions
@@ -868,6 +884,11 @@ impl TuiRenderer {
 
                     // Render input with ghost text
                     render_input_widget(frame, &input_textarea, chunks[1], "❯", &self.colors, self.ghost_text.as_deref());
+
+                    // Render autocomplete dropdown (if visible)
+                    if self.autocomplete_state.visible {
+                        render_autocomplete_dropdown(frame, &self.autocomplete_state, chunks[1], &self.colors);
+                    }
 
                     // Render status
                     let status_widget = StatusWidget::new(&status_bar, &self.colors);
