@@ -1862,8 +1862,12 @@ fn run_wizard_loop(
                         KeyCode::Enter => {
                             backend_enabled = *enable; // Save user's choice
                             if *enable {
-                                // User wants local model - continue to provider selection
-                                step = WizardStep::InferenceProviderSelection(selected_provider_idx);
+                                // User wants local model - skip provider selection if only one option
+                                if inference_providers.len() <= 1 {
+                                    step = WizardStep::ExecutionTargetSelection(selected_target_idx);
+                                } else {
+                                    step = WizardStep::InferenceProviderSelection(selected_provider_idx);
+                                }
                             } else {
                                 // User wants proxy-only - skip to teacher config
                                 teachers[0].api_key = claude_key.clone();
@@ -1939,8 +1943,12 @@ fn run_wizard_loop(
                             }
                         }
                         KeyCode::Esc => {
-                            // Go back to provider selection
-                            step = WizardStep::InferenceProviderSelection(selected_provider_idx);
+                            // Go back to provider selection (or enable local if only one provider)
+                            if inference_providers.len() <= 1 {
+                                step = WizardStep::EnableLocalModel(backend_enabled);
+                            } else {
+                                step = WizardStep::InferenceProviderSelection(selected_provider_idx);
+                            }
                         }
                         _ => {}
                     }
