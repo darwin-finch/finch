@@ -84,11 +84,39 @@ enum TrainCommand {
     Setup,
 }
 
-/// Build a teacher list from well-known environment variables.
-/// Checked in priority order: Anthropic → OpenAI → Grok → Gemini → Mistral → Groq.
+/// Build a teacher list from well-known environment variables and config files.
+/// Collects ALL available keys so every provider the user has configured is available.
 fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
-    let mut teachers = Vec::new();
+    let mut teachers: Vec<finch::config::TeacherEntry> = Vec::new();
+    let mut seen_providers = std::collections::HashSet::new();
 
+    let mut add = |provider: &str, key: &str| {
+        if seen_providers.contains(provider) { return; }
+        seen_providers.insert(provider.to_string());
+        teachers.push(finch::config::TeacherEntry {
+            provider: provider.to_string(),
+            api_key: key.trim().to_string(),
+            model: None,
+            base_url: None,
+            name: None,
+        });
+    };
+
+    // 1. Claude Code config file (~/.claude/settings.json)
+    if let Some(home) = dirs::home_dir() {
+        let claude_settings = home.join(".claude").join("settings.json");
+        if let Ok(contents) = std::fs::read_to_string(&claude_settings) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(key) = json.get("apiKey").and_then(|v| v.as_str()) {
+                    if !key.trim().is_empty() {
+                        add("claude", key);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Environment variables
     let candidates = [
         ("ANTHROPIC_API_KEY", "claude"),
         ("OPENAI_API_KEY",    "openai"),
@@ -102,14 +130,7 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
     for (env_var, provider) in &candidates {
         if let Ok(key) = std::env::var(env_var) {
             if !key.trim().is_empty() {
-                teachers.push(finch::config::TeacherEntry {
-                    provider: provider.to_string(),
-                    api_key: key.trim().to_string(),
-                    model: None,
-                    base_url: None,
-                    name: None,
-                });
-                break; // Use the first found provider as primary
+                add(provider, &key);
             }
         }
     }
@@ -217,6 +238,19 @@ async fn main() -> Result<()> {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("{}", e);
+
+            // Before showing the wizard, try to auto-detect API keys.
+            // If any exist (env vars, Claude Code config, etc.) just start immediately.
+            let auto_teachers = build_teachers_from_env();
+            if !auto_teachers.is_empty() {
+                let names: Vec<&str> = auto_teachers.iter().map(|t| t.provider.as_str()).collect();
+                eprintln!("\n\x1b[1;32m✓ Auto-configured: {}\x1b[0m", names.join(", "));
+                eprintln!("\x1b[33m  Run `finch setup` any time to change settings.\x1b[0m\n");
+                let cfg = Config::new(auto_teachers);
+                cfg.save().ok();
+                cfg
+            } else {
+
             eprintln!("\n\x1b[1;33m⚠️  Running first-time setup wizard...\x1b[0m\n");
 
             // Run setup wizard
@@ -291,6 +325,7 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => return Err(e),
             }
+            } // end else (no auto-detected keys)
         }
     };
 
