@@ -255,6 +255,10 @@ pub fn handle_command(
         Command::McpList | Command::McpTools(_) | Command::McpRefresh | Command::McpReload => {
             Ok(CommandOutput::Status("MCP commands should be handled in REPL.".to_string()))
         }
+        // Persona commands are handled directly in REPL (Phase 2)
+        Command::PersonaList | Command::PersonaSelect(_) | Command::PersonaShow => {
+            Ok(CommandOutput::Status("Persona commands should be handled in REPL.".to_string()))
+        }
     }
 }
 

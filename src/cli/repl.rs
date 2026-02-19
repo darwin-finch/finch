@@ -203,6 +203,39 @@ impl Repl {
         // User interaction tools
         tool_registry.register(Box::new(AskUserQuestionTool));
 
+        // Phase 1: Initialize LLM registry (before ToolExecutor creation)
+        let llm_registry = if config.teachers.len() > 1 {
+            match crate::llms::LLMRegistry::from_teachers(&config.teachers) {
+                Ok(registry) => {
+                    if is_interactive && !daemon_mode {
+                        output_status!(
+                            "✓ Multi-LLM system enabled ({} primary + {} tools)",
+                            1,
+                            config.teachers.len() - 1
+                        );
+                    }
+                    Some(Arc::new(registry))
+                }
+                Err(e) => {
+                    output_status!("⚠️  Failed to create LLM registry: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Phase 1: Register LLM delegation tools if multi-LLM is configured
+        if let Some(ref registry) = llm_registry {
+            let llm_tools = crate::tools::implementations::llm_tools::create_llm_tools(registry);
+            for tool in llm_tools {
+                tool_registry.register(tool);
+            }
+            if is_interactive && !daemon_mode {
+                output_status!("✓ LLM delegation tools registered ({} tools)", registry.tool_names().len());
+            }
+        }
+
         // GUI automation tools (macOS only)
         #[cfg(target_os = "macos")]
         {
@@ -384,28 +417,6 @@ impl Repl {
         if daemon_client.is_none() && is_interactive && !daemon_mode {
             output_status!("⚠️  Daemon not available, using teacher API directly");
         }
-
-        // Phase 1: Initialize LLM registry (if multiple teachers configured)
-        let llm_registry = if config.teachers.len() > 1 {
-            match crate::llms::LLMRegistry::from_teachers(&config.teachers) {
-                Ok(registry) => {
-                    if is_interactive && !daemon_mode {
-                        output_status!(
-                            "✓ Multi-LLM system enabled ({} primary + {} tools)",
-                            1,
-                            config.teachers.len() - 1
-                        );
-                    }
-                    Some(Arc::new(registry))
-                }
-                Err(e) => {
-                    output_status!("⚠️  Failed to create LLM registry: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         // Phase 1: Initialize conversation logger
         let log_path = dirs::home_dir()
@@ -1541,6 +1552,19 @@ impl Repl {
                         self.handle_local_query(query).await?;
                         continue;
                     }
+                    // Phase 2: Persona commands
+                    Command::PersonaList => {
+                        self.handle_persona_list().await?;
+                        continue;
+                    }
+                    Command::PersonaSelect(ref name) => {
+                        self.handle_persona_select(name).await?;
+                        continue;
+                    }
+                    Command::PersonaShow => {
+                        self.handle_persona_show().await?;
+                        continue;
+                    }
                     _ => {
                         let output = handle_command(
                             command,
@@ -2332,6 +2356,24 @@ impl Repl {
     pub async fn process_query(&mut self, query: &str) -> Result<String> {
         let start_time = Instant::now();
 
+        // Phase 2: Inject persona system prompt if first message in conversation
+        {
+            let conv = self.conversation.read().await;
+            if conv.get_messages().is_empty() {
+                drop(conv);
+                let persona = self.active_persona.read().await;
+                let system_prompt = persona.to_system_message();
+
+                // Add as a Message with system role
+                use crate::claude::{Message, ContentBlock};
+                let system_msg = Message {
+                    role: "system".to_string(),
+                    content: vec![ContentBlock::Text { text: system_prompt }],
+                };
+                self.conversation.write().await.add_message(system_msg);
+            }
+        }
+
         // Add user message to conversation history
         self.conversation.write().await.add_user_message(query.to_string());
 
@@ -2693,6 +2735,22 @@ impl Repl {
         let router_confidence = Some(router_stats.confidence_threshold);
         let validator_confidence = Some(quality_score);
 
+        // Phase 1: Log conversation BEFORE creating metric (routing_decision_str is moved)
+        let model_name = if routing_decision_str == "local" {
+            "local".to_string()
+        } else {
+            "teacher".to_string()
+        };
+        let tools_used = vec![]; // TODO: Track tools used during execution
+        if let Err(e) = self.conversation_logger
+            .lock()
+            .await
+            .log_interaction(query, &claude_response, &model_name, &tools_used)
+            .await
+        {
+            tracing::warn!("Failed to log conversation: {}", e);
+        }
+
         let metric = RequestMetric::new(
             query_hash,
             routing_decision_str,
@@ -2891,6 +2949,78 @@ impl Repl {
                 self.output_status("    Start the daemon: finch daemon --bind 127.0.0.1:11435");
             } else {
                 eprintln!("{}", error_msg);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Phase 2: Handle /persona list command
+    async fn handle_persona_list(&self) -> Result<()> {
+        self.output_status("📋 Available Personas:\n");
+
+        let builtin_personas = vec![
+            ("default", "Balanced helpful assistant"),
+            ("expert-coder", "Code review focus, best practices"),
+            ("teacher", "Patient, educational, step-by-step"),
+            ("analyst", "Data-focused, structured, citations"),
+            ("creative", "Brainstorming, storytelling, creative solutions"),
+            ("researcher", "Deep research, citations, fact-checking"),
+        ];
+
+        let current_persona = self.active_persona.read().await;
+        let current_name = current_persona.name.to_lowercase();
+
+        for (name, desc) in builtin_personas {
+            let marker = if name == current_name { "→ " } else { "  " };
+            self.output_status(format!("{}• {} - {}", marker, name, desc));
+        }
+
+        self.output_status("\nUse '/persona select <name>' to switch personas");
+        Ok(())
+    }
+
+    /// Phase 2: Handle /persona select <name> command
+    async fn handle_persona_select(&mut self, name: &str) -> Result<()> {
+        // Try to load the persona
+        match crate::config::Persona::load_builtin(name) {
+            Ok(persona) => {
+                let old_name = self.active_persona.read().await.name.clone();
+                *self.active_persona.write().await = persona;
+
+                // Clear conversation to apply new persona from scratch
+                self.conversation.write().await.clear();
+
+                self.output_status(format!("✓ Switched persona: {} → {}", old_name, name));
+                self.output_status("  (Conversation cleared to apply new persona)");
+                Ok(())
+            }
+            Err(e) => {
+                self.output_error(format!("Failed to load persona '{}': {}", name, e));
+                self.output_status("Use '/persona list' to see available personas");
+                Ok(())
+            }
+        }
+    }
+
+    /// Phase 2: Handle /persona show command
+    async fn handle_persona_show(&self) -> Result<()> {
+        let persona = self.active_persona.read().await;
+
+        self.output_status(format!("📖 Current Persona: {}\n", persona.name));
+        self.output_status(format!("Tone: {}", persona.tone));
+        self.output_status(format!("Verbosity: {}", persona.verbosity));
+        self.output_status(format!("Focus: {}\n", persona.focus));
+        self.output_status("System Prompt:");
+        self.output_status("─".repeat(60));
+        self.output_status(&persona.system_prompt);
+        self.output_status("─".repeat(60));
+
+        if !persona.examples.is_empty() {
+            self.output_status(format!("\nExamples ({}):", persona.examples.len()));
+            for (i, example) in persona.examples.iter().take(2).enumerate() {
+                self.output_status(format!("\n{}. User: {}", i + 1, example.user));
+                self.output_status(format!("   Assistant: {}", example.assistant));
             }
         }
 
