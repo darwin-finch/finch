@@ -183,7 +183,8 @@ impl ModelConfig {
 
 #[derive(Debug, Clone)]
 struct PersonaInfo {
-    name: String,
+    slug: String,       // Key used to load the persona (e.g. "expert-coder")
+    name: String,       // Display name (e.g. "Expert Coder")
     description: String,
     system_prompt: String,
     builtin: bool,
@@ -295,8 +296,9 @@ impl WizardState {
         // Personas section
         let builtin_personas: Vec<PersonaInfo> = Persona::list_builtins()
             .iter()
-            .filter_map(|name| {
-                Persona::load_builtin(name).ok().map(|p| PersonaInfo {
+            .filter_map(|slug| {
+                Persona::load_builtin(slug).ok().map(|p| PersonaInfo {
+                    slug: slug.to_string(),
                     name: p.name().to_string(),
                     description: p.persona.description.clone(),
                     system_prompt: p.behavior.system_prompt.clone(),
@@ -311,7 +313,7 @@ impl WizardState {
 
         let selected_idx = builtin_personas
             .iter()
-            .position(|p| p.name.to_lowercase() == default_persona.to_lowercase())
+            .position(|p| p.slug == default_persona || p.name.to_lowercase() == default_persona.to_lowercase())
             .unwrap_or(0);
 
         sections.insert(
@@ -742,9 +744,9 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 }
             }
             KeyCode::Enter => {
-                // Set selected persona as default
+                // Save the slug (not display name) so it loads correctly
                 if let Some(persona) = available_personas.get(*selected_idx) {
-                    *default_persona = persona.name.clone();
+                    *default_persona = persona.slug.clone();
                 }
                 state.mark_completed(WizardSection::Personas);
                 state.next_section();

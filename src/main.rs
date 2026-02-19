@@ -269,7 +269,26 @@ async fn main() -> Result<()> {
                     let daemon_only_mode = result.daemon_only_mode;
                     let mdns_discovery = result.mdns_discovery;
 
-                    let mut new_config = Config::new(result.teachers);
+                    // Patch any empty API keys with auto-detected values
+                    let mut teachers = result.teachers;
+                    let auto = build_teachers_from_env();
+                    for teacher in &mut teachers {
+                        if teacher.api_key.is_empty() {
+                            if let Some(detected) = auto.iter().find(|t| t.provider == teacher.provider) {
+                                teacher.api_key = detected.api_key.clone();
+                            } else if let Some(first) = auto.first() {
+                                // If provider doesn't match, use whatever key we found
+                                teacher.api_key = first.api_key.clone();
+                                teacher.provider = first.provider.clone();
+                            }
+                        }
+                    }
+                    // If still no teachers with keys, add auto-detected ones
+                    if teachers.iter().all(|t| t.api_key.is_empty()) {
+                        teachers = auto;
+                    }
+
+                    let mut new_config = Config::new(teachers);
                     new_config.backend = finch::config::BackendConfig {
                         enabled: backend_enabled,
                         inference_provider,
