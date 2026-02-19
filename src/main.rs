@@ -198,6 +198,10 @@ async fn main() -> Result<()> {
             let model_family = result.model_family;
             let model_size = result.model_size;
             let custom_model_repo = result.custom_model_repo;
+            let active_theme = result.active_theme.clone();
+            let default_persona = result.default_persona.clone();
+            let daemon_only_mode = result.daemon_only_mode;
+            let mdns_discovery = result.mdns_discovery;
 
             let mut new_config = Config::new(result.teachers);
             new_config.backend = finch::config::BackendConfig {
@@ -209,14 +213,29 @@ async fn main() -> Result<()> {
                 model_repo: custom_model_repo,
                 ..Default::default()
             };
+
+            // Set theme and persona
+            new_config.active_theme = active_theme;
+            new_config.active_persona = default_persona;
+
             // Save feature flags
             new_config.features = finch::config::FeaturesConfig {
                 auto_approve_tools: result.auto_approve_tools,
                 streaming_enabled: result.streaming_enabled,
                 debug_logging: result.debug_logging,
                 #[cfg(target_os = "macos")]
-                gui_automation: false, // Not yet implemented in wizard
+                gui_automation: result.gui_automation,
             };
+
+            // Set server config for daemon-only mode and mDNS
+            if daemon_only_mode {
+                new_config.server.mode = "daemon-only".to_string();
+            }
+            if mdns_discovery {
+                new_config.server.advertise = true;
+                new_config.client.auto_discover = true;
+            }
+
             // Update deprecated streaming_enabled field for backward compat
             new_config.streaming_enabled = new_config.features.streaming_enabled;
             new_config.save()?;

@@ -64,6 +64,12 @@ pub struct Config {
     /// Active persona name (e.g., "default", "expert-coder", "louis")
     pub active_persona: String,
 
+    /// Active color theme (e.g., "dark", "light", "high-contrast", "solarized")
+    pub active_theme: String,
+
+    /// HuggingFace API token for model downloads (optional)
+    pub huggingface_token: Option<String>,
+
     /// Backend configuration (device selection, model paths)
     pub backend: BackendConfig,
 
@@ -338,6 +344,8 @@ impl Config {
             tui_enabled: true,       // TUI is the default for interactive terminals
             constitution_path,
             active_persona: "default".to_string(),
+            active_theme: "dark".to_string(), // Default to dark theme
+            huggingface_token: None, // No HF token by default
             backend: BackendConfig::default(),
             server: ServerConfig::default(),
             client: ClientConfig::default(),
@@ -369,6 +377,8 @@ impl Config {
         let toml_config = TomlConfig {
             streaming_enabled: self.features.streaming_enabled, // Use features value
             tui_enabled: self.tui_enabled,
+            active_theme: Some(self.active_theme.clone()),
+            huggingface_token: self.huggingface_token.clone(),
             backend: self.backend.clone(),
             client: Some(self.client.clone()),
             teachers: self.teachers.clone(),
@@ -389,6 +399,10 @@ impl Config {
 struct TomlConfig {
     streaming_enabled: bool, // Deprecated, kept for backward compat
     tui_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    huggingface_token: Option<String>,
     backend: BackendConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     client: Option<ClientConfig>,

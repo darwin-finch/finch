@@ -6,6 +6,192 @@
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 
+/// Predefined color themes for different terminal backgrounds
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorTheme {
+    /// White text on black background (default)
+    Dark,
+    /// Black text on white background
+    Light,
+    /// High contrast yellow/white on black
+    HighContrast,
+    /// Solarized Dark palette
+    Solarized,
+}
+
+impl ColorTheme {
+    /// Convert theme to color scheme
+    pub fn to_scheme(&self) -> ColorScheme {
+        match self {
+            Self::Dark => Self::dark_scheme(),
+            Self::Light => Self::light_scheme(),
+            Self::HighContrast => Self::high_contrast_scheme(),
+            Self::Solarized => Self::solarized_scheme(),
+        }
+    }
+
+    fn dark_scheme() -> ColorScheme {
+        ColorScheme {
+            status: StatusColors {
+                live_stats: default_green(),
+                training: default_dark_gray(),
+                download: default_cyan(),
+                operation: default_yellow(),
+                border: default_gray(),
+            },
+            messages: MessageColors {
+                user: default_cyan(),
+                assistant: default_white(),
+                system: default_dark_gray(),
+                error: default_red(),
+                tool: default_yellow(),
+            },
+            ui: UiColors {
+                border: default_gray(),
+                separator: default_dark_gray(),
+                input: default_white(),
+                cursor: default_cyan(),
+            },
+            dialog: DialogColors {
+                border: default_cyan(),
+                title: default_cyan(),
+                selected_bg: default_cyan(),
+                selected_fg: default_black(),
+                option: default_cyan(),
+            },
+        }
+    }
+
+    fn light_scheme() -> ColorScheme {
+        ColorScheme {
+            status: StatusColors {
+                live_stats: ColorSpec::Rgb(0, 128, 0), // Dark green
+                training: ColorSpec::Named("gray".to_string()),
+                download: ColorSpec::Rgb(0, 0, 139), // Dark blue
+                operation: ColorSpec::Rgb(184, 134, 11), // Dark goldenrod
+                border: ColorSpec::Named("darkgray".to_string()),
+            },
+            messages: MessageColors {
+                user: ColorSpec::Rgb(0, 0, 255), // Blue
+                assistant: ColorSpec::Named("black".to_string()),
+                system: ColorSpec::Named("gray".to_string()),
+                error: ColorSpec::Named("red".to_string()),
+                tool: ColorSpec::Rgb(139, 69, 19), // Brown
+            },
+            ui: UiColors {
+                border: ColorSpec::Named("darkgray".to_string()),
+                separator: ColorSpec::Named("gray".to_string()),
+                input: ColorSpec::Named("black".to_string()),
+                cursor: ColorSpec::Rgb(0, 0, 255), // Blue
+            },
+            dialog: DialogColors {
+                border: ColorSpec::Rgb(0, 0, 139), // Dark blue
+                title: ColorSpec::Rgb(0, 0, 139),
+                selected_bg: ColorSpec::Rgb(0, 0, 139),
+                selected_fg: ColorSpec::Named("white".to_string()),
+                option: ColorSpec::Rgb(0, 0, 139),
+            },
+        }
+    }
+
+    fn high_contrast_scheme() -> ColorScheme {
+        ColorScheme {
+            status: StatusColors {
+                live_stats: ColorSpec::Named("yellow".to_string()),
+                training: ColorSpec::Named("white".to_string()),
+                download: ColorSpec::Named("cyan".to_string()),
+                operation: ColorSpec::Named("yellow".to_string()),
+                border: ColorSpec::Named("white".to_string()),
+            },
+            messages: MessageColors {
+                user: ColorSpec::Named("yellow".to_string()),
+                assistant: ColorSpec::Named("white".to_string()),
+                system: ColorSpec::Named("gray".to_string()),
+                error: ColorSpec::Named("red".to_string()),
+                tool: ColorSpec::Named("cyan".to_string()),
+            },
+            ui: UiColors {
+                border: ColorSpec::Named("white".to_string()),
+                separator: ColorSpec::Named("gray".to_string()),
+                input: ColorSpec::Named("yellow".to_string()),
+                cursor: ColorSpec::Named("yellow".to_string()),
+            },
+            dialog: DialogColors {
+                border: ColorSpec::Named("yellow".to_string()),
+                title: ColorSpec::Named("yellow".to_string()),
+                selected_bg: ColorSpec::Named("yellow".to_string()),
+                selected_fg: ColorSpec::Named("black".to_string()),
+                option: ColorSpec::Named("yellow".to_string()),
+            },
+        }
+    }
+
+    fn solarized_scheme() -> ColorScheme {
+        // Solarized Dark color palette
+        ColorScheme {
+            status: StatusColors {
+                live_stats: ColorSpec::Rgb(133, 153, 0), // Solarized green
+                training: ColorSpec::Rgb(88, 110, 117), // Solarized base01
+                download: ColorSpec::Rgb(38, 139, 210), // Solarized blue
+                operation: ColorSpec::Rgb(181, 137, 0), // Solarized yellow
+                border: ColorSpec::Rgb(101, 123, 131), // Solarized base0
+            },
+            messages: MessageColors {
+                user: ColorSpec::Rgb(38, 139, 210), // Solarized blue
+                assistant: ColorSpec::Rgb(147, 161, 161), // Solarized base1
+                system: ColorSpec::Rgb(88, 110, 117), // Solarized base01
+                error: ColorSpec::Rgb(220, 50, 47), // Solarized red
+                tool: ColorSpec::Rgb(181, 137, 0), // Solarized yellow
+            },
+            ui: UiColors {
+                border: ColorSpec::Rgb(101, 123, 131), // Solarized base0
+                separator: ColorSpec::Rgb(88, 110, 117), // Solarized base01
+                input: ColorSpec::Rgb(147, 161, 161), // Solarized base1
+                cursor: ColorSpec::Rgb(38, 139, 210), // Solarized blue
+            },
+            dialog: DialogColors {
+                border: ColorSpec::Rgb(38, 139, 210), // Solarized blue
+                title: ColorSpec::Rgb(38, 139, 210),
+                selected_bg: ColorSpec::Rgb(38, 139, 210),
+                selected_fg: ColorSpec::Rgb(0, 43, 54), // Solarized base03
+                option: ColorSpec::Rgb(38, 139, 210),
+            },
+        }
+    }
+
+    /// Get all available themes
+    pub fn all() -> Vec<Self> {
+        vec![Self::Dark, Self::Light, Self::HighContrast, Self::Solarized]
+    }
+
+    /// Get theme name for display
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+            Self::HighContrast => "High Contrast",
+            Self::Solarized => "Solarized",
+        }
+    }
+
+    /// Get theme description
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Dark => "White text on black background (default)",
+            Self::Light => "Black text on white background",
+            Self::HighContrast => "Yellow/white on black (accessibility)",
+            Self::Solarized => "Solarized Dark color palette",
+        }
+    }
+}
+
+impl Default for ColorTheme {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
+
 /// Color scheme for TUI elements
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColorScheme {

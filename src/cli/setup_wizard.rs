@@ -16,39 +16,43 @@ use crate::config::{ExecutionTarget, FeaturesConfig, TeacherEntry};
 use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use crate::models::compatibility;
 
+/// Helper function to display ModelSize
+fn model_size_display(size: &ModelSize) -> &'static str {
+    match size {
+        ModelSize::Small => "Small (~1-3B)",
+        ModelSize::Medium => "Medium (~3-9B)",
+        ModelSize::Large => "Large (~7-14B)",
+        ModelSize::XLarge => "XLarge (~14B+)",
+    }
+}
+
 /// Main sections of the tabbed wizard
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WizardSection {
-    ApiKeys,
-    Backend,
-    Teachers,
+    Themes,
+    Models,
+    Personas,
     Features,
-    #[cfg(target_os = "macos")]
-    Accessibility,
     Review,
 }
 
 impl WizardSection {
     fn all() -> Vec<Self> {
         vec![
-            Self::ApiKeys,
-            Self::Backend,
-            Self::Teachers,
+            Self::Themes,
+            Self::Models,
+            Self::Personas,
             Self::Features,
-            #[cfg(target_os = "macos")]
-            Self::Accessibility,
             Self::Review,
         ]
     }
 
     fn name(&self) -> &str {
         match self {
-            Self::ApiKeys => "API Keys",
-            Self::Backend => "Backend",
-            Self::Teachers => "Teachers",
+            Self::Themes => "Themes",
+            Self::Models => "Models",
+            Self::Personas => "Personas",
             Self::Features => "Features",
-            #[cfg(target_os = "macos")]
-            Self::Accessibility => "Accessibility",
             Self::Review => "Review",
         }
     }
@@ -57,50 +61,94 @@ impl WizardSection {
 /// State for each wizard section
 #[derive(Debug, Clone)]
 enum SectionState {
-    ApiKeys {
-        claude_key: String,
-        hf_token: String,
-        editing_field: ApiKeysField,
+    Themes {
+        selected_theme: usize,
     },
-    Backend {
-        enabled: bool,
-        provider_idx: usize,
-        target_idx: usize,
-        family_idx: usize,
-        size_idx: usize,
-        custom_repo: String,
-        editing_field: BackendField,
+    Models {
+        primary_model: ModelConfig,
+        tool_models: Vec<ModelConfig>,
+        selected_idx: usize, // 0 = primary, 1+ = tool models
+        editing_mode: bool,
+        error: Option<String>,
     },
-    Teachers {
-        entries: Vec<TeacherEntry>,
+    Personas {
+        available_personas: Vec<PersonaInfo>,
         selected_idx: usize,
+        default_persona: String,
     },
     Features {
         auto_approve: bool,
         streaming: bool,
         debug: bool,
-    },
-    #[cfg(target_os = "macos")]
-    Accessibility {
+        #[cfg(target_os = "macos")]
         gui_automation: bool,
+        daemon_only_mode: bool,
+        mdns_discovery: bool,
+        selected_idx: usize, // For arrow key navigation
     },
     Review,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ApiKeysField {
-    ClaudeKey,
-    HfToken,
+#[derive(Debug, Clone)]
+enum ModelConfig {
+    Local {
+        family: ModelFamily,
+        size: ModelSize,
+        execution: ExecutionTarget,
+        enabled: bool,
+    },
+    Remote {
+        provider: String,
+        api_key: String,
+        model: String,
+        enabled: bool,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum BackendField {
-    Enabled,
-    Provider,
-    Target,
-    Family,
-    Size,
-    CustomRepo,
+impl ModelConfig {
+    fn enabled(&self) -> bool {
+        match self {
+            Self::Local { enabled, .. } => *enabled,
+            Self::Remote { enabled, .. } => *enabled,
+        }
+    }
+
+    fn set_enabled(&mut self, value: bool) {
+        match self {
+            Self::Local { enabled, .. } => *enabled = value,
+            Self::Remote { enabled, .. } => *enabled = value,
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match self {
+            Self::Local { family, size, .. } => {
+                format!("Local {} {}", family.name(), model_size_display(size))
+            }
+            Self::Remote { provider, model, .. } => {
+                if !model.is_empty() {
+                    format!("{} - {}", provider, model)
+                } else {
+                    provider.clone()
+                }
+            }
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        match self {
+            Self::Local { .. } => true, // Local models are always "configured"
+            Self::Remote { api_key, .. } => !api_key.is_empty(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PersonaInfo {
+    name: String,
+    description: String,
+    system_prompt: String,
+    builtin: bool,
 }
 
 /// Overall wizard state with tabbed navigation
@@ -117,29 +165,152 @@ struct WizardState {
 
 impl WizardState {
     fn new(existing_config: Option<&crate::config::Config>) -> Self {
-        // Initialize sections with default or pre-filled values
+        use crate::config::ColorTheme;
+        use crate::config::persona::Persona;
+
         let mut sections = HashMap::new();
 
-        // API Keys section
-        let claude_key = existing_config
-            .and_then(|c| c.active_teacher())
-            .map(|t| t.api_key.clone())
-            .unwrap_or_default();
+        // Themes section
+        let current_theme = existing_config
+            .map(|c| c.active_theme.as_str())
+            .unwrap_or("dark");
+        let themes = ColorTheme::all();
+        let selected_theme = themes
+            .iter()
+            .position(|t| t.name().to_lowercase() == current_theme.to_lowercase())
+            .unwrap_or(0);
+
         sections.insert(
-            WizardSection::ApiKeys,
-            SectionState::ApiKeys {
-                claude_key,
-                hf_token: String::new(),
-                editing_field: ApiKeysField::ClaudeKey,
+            WizardSection::Themes,
+            SectionState::Themes { selected_theme },
+        );
+
+        // Models section - unified Backend + Teachers
+        let primary_model = if let Some(config) = existing_config {
+            if config.backend.enabled {
+                // Local model is primary
+                ModelConfig::Local {
+                    family: config.backend.model_family,
+                    size: config.backend.model_size,
+                    execution: config.backend.execution_target,
+                    enabled: true,
+                }
+            } else if let Some(teacher) = config.active_teacher() {
+                // Remote API is primary
+                ModelConfig::Remote {
+                    provider: teacher.provider.clone(),
+                    api_key: teacher.api_key.clone(),
+                    model: teacher.model.clone().unwrap_or_default(),
+                    enabled: true,
+                }
+            } else {
+                // Default: remote Claude
+                ModelConfig::Remote {
+                    provider: "claude".to_string(),
+                    api_key: String::new(),
+                    model: String::new(),
+                    enabled: true,
+                }
+            }
+        } else {
+            // Default: remote Claude
+            ModelConfig::Remote {
+                provider: "claude".to_string(),
+                api_key: String::new(),
+                model: String::new(),
+                enabled: true,
+            }
+        };
+
+        let tool_models: Vec<ModelConfig> = existing_config
+            .map(|c| {
+                c.teachers
+                    .iter()
+                    .skip(1) // Skip first teacher (that's the primary)
+                    .map(|t| ModelConfig::Remote {
+                        provider: t.provider.clone(),
+                        api_key: t.api_key.clone(),
+                        model: t.model.clone().unwrap_or_default(),
+                        enabled: true,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        sections.insert(
+            WizardSection::Models,
+            SectionState::Models {
+                primary_model,
+                tool_models,
+                selected_idx: 0,
+                editing_mode: false,
+                error: None,
             },
         );
 
-        // Backend section
-        let inference_providers = vec![
-            InferenceProvider::Onnx,
-            #[cfg(feature = "candle")]
-            InferenceProvider::Candle,
-        ];
+        // Personas section
+        let builtin_personas: Vec<PersonaInfo> = Persona::list_builtins()
+            .iter()
+            .filter_map(|name| {
+                Persona::load_builtin(name).ok().map(|p| PersonaInfo {
+                    name: p.name().to_string(),
+                    description: p.persona.description.clone(),
+                    system_prompt: p.behavior.system_prompt.clone(),
+                    builtin: true,
+                })
+            })
+            .collect();
+
+        let default_persona = existing_config
+            .map(|c| c.active_persona.clone())
+            .unwrap_or_else(|| "default".to_string());
+
+        let selected_idx = builtin_personas
+            .iter()
+            .position(|p| p.name.to_lowercase() == default_persona.to_lowercase())
+            .unwrap_or(0);
+
+        sections.insert(
+            WizardSection::Personas,
+            SectionState::Personas {
+                available_personas: builtin_personas,
+                selected_idx,
+                default_persona,
+            },
+        );
+
+        // Features section (simplified, no memory toggle, accessibility moved here)
+        sections.insert(
+            WizardSection::Features,
+            SectionState::Features {
+                auto_approve: existing_config
+                    .map(|c| c.features.auto_approve_tools)
+                    .unwrap_or(false),
+                streaming: existing_config
+                    .map(|c| c.features.streaming_enabled)
+                    .unwrap_or(true),
+                debug: existing_config
+                    .map(|c| c.features.debug_logging)
+                    .unwrap_or(false),
+                #[cfg(target_os = "macos")]
+                gui_automation: existing_config
+                    .map(|c| c.features.gui_automation)
+                    .unwrap_or(false),
+                daemon_only_mode: existing_config
+                    .map(|c| c.server.mode == "daemon-only")
+                    .unwrap_or(false),
+                mdns_discovery: existing_config
+                    .map(|c| c.server.advertise || c.client.auto_discover)
+                    .unwrap_or(false),
+                selected_idx: 0,
+            },
+        );
+
+        // Review section
+        sections.insert(WizardSection::Review, SectionState::Review);
+
+        // Cached data (kept for compatibility, though Models section doesn't use these the same way)
+        let inference_providers = vec![InferenceProvider::Onnx];
         let execution_targets = ExecutionTarget::available_targets();
         let all_model_families = vec![
             ModelFamily::Qwen2,
@@ -156,91 +327,8 @@ impl WizardState {
             ModelSize::XLarge,
         ];
 
-        let provider_idx = existing_config
-            .map(|c| {
-                inference_providers
-                    .iter()
-                    .position(|p| *p == c.backend.inference_provider)
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-        let target_idx = existing_config
-            .map(|c| {
-                execution_targets
-                    .iter()
-                    .position(|t| *t == c.backend.execution_target)
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-
-        sections.insert(
-            WizardSection::Backend,
-            SectionState::Backend {
-                enabled: existing_config.map(|c| c.backend.enabled).unwrap_or(true),
-                provider_idx,
-                target_idx,
-                family_idx: 0,
-                size_idx: 1, // Medium by default
-                custom_repo: existing_config
-                    .and_then(|c| c.backend.model_repo.clone())
-                    .unwrap_or_default(),
-                editing_field: BackendField::Enabled,
-            },
-        );
-
-        // Teachers section
-        let teachers = existing_config
-            .map(|c| c.teachers.clone())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| {
-                vec![TeacherEntry {
-                    provider: "claude".to_string(),
-                    api_key: String::new(),
-                    model: None,
-                    base_url: None,
-                    name: Some("Claude (Primary)".to_string()),
-                }]
-            });
-        sections.insert(
-            WizardSection::Teachers,
-            SectionState::Teachers {
-                entries: teachers,
-                selected_idx: 0,
-            },
-        );
-
-        // Features section
-        sections.insert(
-            WizardSection::Features,
-            SectionState::Features {
-                auto_approve: existing_config
-                    .map(|c| c.features.auto_approve_tools)
-                    .unwrap_or(false),
-                streaming: existing_config
-                    .map(|c| c.features.streaming_enabled)
-                    .unwrap_or(true),
-                debug: existing_config
-                    .map(|c| c.features.debug_logging)
-                    .unwrap_or(false),
-            },
-        );
-
-        // Accessibility section (macOS only)
-        #[cfg(target_os = "macos")]
-        sections.insert(
-            WizardSection::Accessibility,
-            SectionState::Accessibility {
-                gui_automation: existing_config
-                    .map(|c| c.features.gui_automation)
-                    .unwrap_or(false),
-            },
-        );
-
-        // Review section
-        sections.insert(WizardSection::Review, SectionState::Review);
-
         Self {
-            current_section: WizardSection::ApiKeys,
+            current_section: WizardSection::Themes,
             sections,
             completed: HashSet::new(),
             inference_providers,
@@ -300,6 +388,14 @@ fn get_compatibility_error(family: ModelFamily, target: ExecutionTarget) -> Stri
 
 /// Setup wizard result containing all collected configuration
 pub struct SetupResult {
+    // Theme
+    pub active_theme: String,
+
+    // Models (primary + tools)
+    pub primary_model: ModelConfig,
+    pub tool_models: Vec<ModelConfig>,
+
+    // Backward compatibility fields (mapped from primary_model)
     pub claude_api_key: String,
     pub hf_token: Option<String>,
     pub backend_enabled: bool,
@@ -309,10 +405,18 @@ pub struct SetupResult {
     pub model_size: ModelSize,
     pub custom_model_repo: Option<String>,
     pub teachers: Vec<TeacherEntry>,
+
+    // Persona
+    pub default_persona: String,
+
     // Feature flags
     pub auto_approve_tools: bool,
     pub streaming_enabled: bool,
     pub debug_logging: bool,
+    #[cfg(target_os = "macos")]
+    pub gui_automation: bool,
+    pub daemon_only_mode: bool,
+    pub mdns_discovery: bool,
 }
 
 impl SetupResult {
@@ -436,54 +540,36 @@ fn run_tabbed_wizard(
 /// Handle input for the current section
 fn handle_section_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     match state.current_section {
-        WizardSection::ApiKeys => handle_api_keys_input(state, key),
-        WizardSection::Backend => handle_backend_input(state, key),
-        WizardSection::Teachers => handle_teachers_input(state, key),
+        WizardSection::Themes => handle_themes_input(state, key),
+        WizardSection::Models => handle_models_input(state, key),
+        WizardSection::Personas => handle_personas_input(state, key),
         WizardSection::Features => handle_features_input(state, key),
-        #[cfg(target_os = "macos")]
-        WizardSection::Accessibility => handle_accessibility_input(state, key),
         WizardSection::Review => handle_review_input(state, key),
     }
 }
 
-/// Handle input for API Keys section
-fn handle_api_keys_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
-    if let Some(SectionState::ApiKeys {
-        claude_key,
-        hf_token,
-        editing_field,
-    }) = state.sections.get_mut(&WizardSection::ApiKeys)
+/// Handle input for Themes section
+fn handle_themes_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
+    if let Some(SectionState::Themes { selected_theme }) =
+        state.sections.get_mut(&WizardSection::Themes)
     {
+        use crate::config::ColorTheme;
+        let themes = ColorTheme::all();
+
         match key.code {
-            KeyCode::Up | KeyCode::Down => {
-                // Toggle between fields
-                *editing_field = match editing_field {
-                    ApiKeysField::ClaudeKey => ApiKeysField::HfToken,
-                    ApiKeysField::HfToken => ApiKeysField::ClaudeKey,
-                };
-            }
-            KeyCode::Char(c) => {
-                match editing_field {
-                    ApiKeysField::ClaudeKey => claude_key.push(c),
-                    ApiKeysField::HfToken => hf_token.push(c),
+            KeyCode::Up => {
+                if *selected_theme > 0 {
+                    *selected_theme -= 1;
                 }
             }
-            KeyCode::Backspace => {
-                match editing_field {
-                    ApiKeysField::ClaudeKey => {
-                        claude_key.pop();
-                    }
-                    ApiKeysField::HfToken => {
-                        hf_token.pop();
-                    }
+            KeyCode::Down => {
+                if *selected_theme < themes.len() - 1 {
+                    *selected_theme += 1;
                 }
             }
             KeyCode::Enter => {
-                // Mark as completed if Claude key is provided
-                if !claude_key.is_empty() {
-                    state.mark_completed(WizardSection::ApiKeys);
-                    state.next_section();
-                }
+                state.mark_completed(WizardSection::Themes);
+                state.next_section();
             }
             KeyCode::Esc => {
                 anyhow::bail!("Setup cancelled");
@@ -494,127 +580,119 @@ fn handle_api_keys_input(state: &mut WizardState, key: crossterm::event::KeyEven
     Ok(false)
 }
 
-/// Handle input for Backend section
-fn handle_backend_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
-    if let Some(SectionState::Backend {
-        enabled,
-        provider_idx,
-        target_idx,
-        family_idx,
-        size_idx,
-        custom_repo,
-        editing_field,
-    }) = state.sections.get_mut(&WizardSection::Backend)
+/// Handle input for Models section (unified Backend + Teachers)
+fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
+    if let Some(SectionState::Models {
+        primary_model,
+        tool_models,
+        selected_idx,
+        editing_mode,
+        error,
+    }) = state.sections.get_mut(&WizardSection::Models)
     {
-        match key.code {
-            KeyCode::Up => {
-                // Navigate fields up
-                *editing_field = match editing_field {
-                    BackendField::Enabled => BackendField::CustomRepo,
-                    BackendField::Provider => BackendField::Enabled,
-                    BackendField::Target => BackendField::Provider,
-                    BackendField::Family => BackendField::Target,
-                    BackendField::Size => BackendField::Family,
-                    BackendField::CustomRepo => BackendField::Size,
-                };
-            }
-            KeyCode::Down => {
-                // Navigate fields down
-                *editing_field = match editing_field {
-                    BackendField::Enabled => BackendField::Provider,
-                    BackendField::Provider => BackendField::Target,
-                    BackendField::Target => BackendField::Family,
-                    BackendField::Family => BackendField::Size,
-                    BackendField::Size => BackendField::CustomRepo,
-                    BackendField::CustomRepo => BackendField::Enabled,
-                };
-            }
-            KeyCode::Left => {
-                // Decrease selected index for current field
-                match editing_field {
-                    BackendField::Provider => {
-                        if *provider_idx > 0 {
-                            *provider_idx -= 1;
+        // Clear error on any input
+        *error = None;
+
+        if *editing_mode {
+            // In editing mode - simple text input for API keys
+            match key.code {
+                KeyCode::Char(c) => {
+                    if *selected_idx == 0 {
+                        // Editing primary model
+                        if let ModelConfig::Remote { api_key, .. } = primary_model {
+                            api_key.push(c);
+                        }
+                    } else {
+                        // Editing tool model
+                        let tool_idx = *selected_idx - 1;
+                        if let Some(ModelConfig::Remote { api_key, .. }) =
+                            tool_models.get_mut(tool_idx)
+                        {
+                            api_key.push(c);
                         }
                     }
-                    BackendField::Target => {
-                        if *target_idx > 0 {
-                            *target_idx -= 1;
-                        }
-                    }
-                    BackendField::Family => {
-                        if *family_idx > 0 {
-                            *family_idx -= 1;
-                        }
-                    }
-                    BackendField::Size => {
-                        if *size_idx > 0 {
-                            *size_idx -= 1;
-                        }
-                    }
-                    _ => {}
                 }
-            }
-            KeyCode::Right => {
-                // Increase selected index for current field
-                match editing_field {
-                    BackendField::Provider => {
-                        if *provider_idx < state.inference_providers.len() - 1 {
-                            *provider_idx += 1;
+                KeyCode::Backspace => {
+                    if *selected_idx == 0 {
+                        if let ModelConfig::Remote { api_key, .. } = primary_model {
+                            api_key.pop();
+                        }
+                    } else {
+                        let tool_idx = *selected_idx - 1;
+                        if let Some(ModelConfig::Remote { api_key, .. }) =
+                            tool_models.get_mut(tool_idx)
+                        {
+                            api_key.pop();
                         }
                     }
-                    BackendField::Target => {
-                        if *target_idx < state.execution_targets.len() - 1 {
-                            *target_idx += 1;
+                }
+                KeyCode::Enter | KeyCode::Esc => {
+                    *editing_mode = false;
+                }
+                _ => {}
+            }
+        } else {
+            // Navigation mode
+            match key.code {
+                KeyCode::Up => {
+                    if *selected_idx > 0 {
+                        *selected_idx -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    let total = 1 + tool_models.len();
+                    if *selected_idx < total - 1 {
+                        *selected_idx += 1;
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    // Toggle enabled for tool models
+                    if *selected_idx > 0 {
+                        let tool_idx = *selected_idx - 1;
+                        if let Some(model) = tool_models.get_mut(tool_idx) {
+                            model.set_enabled(!model.enabled());
                         }
                     }
-                    BackendField::Family => {
-                        if *family_idx < state.model_families.len() - 1 {
-                            *family_idx += 1;
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    // Enter edit mode
+                    *editing_mode = true;
+                }
+                KeyCode::Enter => {
+                    // Validate and proceed
+                    if !primary_model.is_configured() {
+                        *error = Some("Primary model must be configured with an API key".to_string());
+                        return Ok(false);
+                    }
+
+                    // Validate API key format
+                    if let ModelConfig::Remote { provider, api_key, .. } = primary_model {
+                        if !api_key.starts_with("sk-") && provider == "claude" {
+                            *error = Some("Claude API key must start with 'sk-ant-'".to_string());
+                            return Ok(false);
                         }
                     }
-                    BackendField::Size => {
-                        if *size_idx < state.model_sizes.len() - 1 {
-                            *size_idx += 1;
-                        }
-                    }
-                    _ => {}
+
+                    state.mark_completed(WizardSection::Models);
+                    state.next_section();
                 }
-            }
-            KeyCode::Char(' ') | KeyCode::Char('t') => {
-                // Toggle enabled field
-                if matches!(editing_field, BackendField::Enabled) {
-                    *enabled = !*enabled;
+                KeyCode::Esc => {
+                    anyhow::bail!("Setup cancelled");
                 }
+                _ => {}
             }
-            KeyCode::Char(c) => {
-                // Edit custom repo
-                if matches!(editing_field, BackendField::CustomRepo) {
-                    custom_repo.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if matches!(editing_field, BackendField::CustomRepo) {
-                    custom_repo.pop();
-                }
-            }
-            KeyCode::Enter => {
-                // Mark as completed
-                state.mark_completed(WizardSection::Backend);
-                state.next_section();
-            }
-            _ => {}
         }
     }
     Ok(false)
 }
 
-/// Handle input for Teachers section
-fn handle_teachers_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
-    if let Some(SectionState::Teachers {
-        entries,
+/// Handle input for Personas section
+fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
+    if let Some(SectionState::Personas {
+        available_personas,
         selected_idx,
-    }) = state.sections.get_mut(&WizardSection::Teachers)
+        default_persona,
+    }) = state.sections.get_mut(&WizardSection::Personas)
     {
         match key.code {
             KeyCode::Up => {
@@ -623,16 +701,20 @@ fn handle_teachers_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 }
             }
             KeyCode::Down => {
-                if *selected_idx < entries.len().saturating_sub(1) {
+                if *selected_idx < available_personas.len() - 1 {
                     *selected_idx += 1;
                 }
             }
             KeyCode::Enter => {
-                // Mark as completed if at least one teacher configured
-                if !entries.is_empty() && !entries[0].api_key.is_empty() {
-                    state.mark_completed(WizardSection::Teachers);
-                    state.next_section();
+                // Set selected persona as default
+                if let Some(persona) = available_personas.get(*selected_idx) {
+                    *default_persona = persona.name.clone();
                 }
+                state.mark_completed(WizardSection::Personas);
+                state.next_section();
+            }
+            KeyCode::Esc => {
+                anyhow::bail!("Setup cancelled");
             }
             _ => {}
         }
@@ -640,50 +722,85 @@ fn handle_teachers_input(state: &mut WizardState, key: crossterm::event::KeyEven
     Ok(false)
 }
 
-/// Handle input for Features section
+/// Handle input for Features section (with arrow key navigation)
 fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     if let Some(SectionState::Features {
         auto_approve,
         streaming,
         debug,
+        #[cfg(target_os = "macos")]
+        gui_automation,
+        daemon_only_mode,
+        mdns_discovery,
+        selected_idx,
     }) = state.sections.get_mut(&WizardSection::Features)
     {
+        // Calculate number of features (platform-dependent)
+        #[cfg(target_os = "macos")]
+        let num_features = 6;
+        #[cfg(not(target_os = "macos"))]
+        let num_features = 5;
+
         match key.code {
-            KeyCode::Char('1') | KeyCode::Char(' ') => {
-                *auto_approve = !*auto_approve;
+            KeyCode::Up => {
+                if *selected_idx > 0 {
+                    *selected_idx -= 1;
+                }
             }
-            KeyCode::Char('2') => {
-                *streaming = !*streaming;
+            KeyCode::Down => {
+                if *selected_idx < num_features - 1 {
+                    *selected_idx += 1;
+                }
             }
-            KeyCode::Char('3') => {
-                *debug = !*debug;
+            KeyCode::Char(' ') => {
+                // Toggle selected feature
+                match *selected_idx {
+                    0 => *auto_approve = !*auto_approve,
+                    1 => *streaming = !*streaming,
+                    2 => *debug = !*debug,
+                    #[cfg(target_os = "macos")]
+                    3 => *gui_automation = !*gui_automation,
+                    #[cfg(target_os = "macos")]
+                    4 => *daemon_only_mode = !*daemon_only_mode,
+                    #[cfg(target_os = "macos")]
+                    5 => *mdns_discovery = !*mdns_discovery,
+                    #[cfg(not(target_os = "macos"))]
+                    3 => *daemon_only_mode = !*daemon_only_mode,
+                    #[cfg(not(target_os = "macos"))]
+                    4 => *mdns_discovery = !*mdns_discovery,
+                    _ => {}
+                }
+            }
+            KeyCode::Char(c @ '1'..='6') => {
+                // Number keys also work (backwards compatibility)
+                let idx = (c as u8 - b'1') as usize;
+                if idx < num_features {
+                    *selected_idx = idx;
+                    // Auto-toggle
+                    match idx {
+                        0 => *auto_approve = !*auto_approve,
+                        1 => *streaming = !*streaming,
+                        2 => *debug = !*debug,
+                        #[cfg(target_os = "macos")]
+                        3 => *gui_automation = !*gui_automation,
+                        #[cfg(target_os = "macos")]
+                        4 => *daemon_only_mode = !*daemon_only_mode,
+                        #[cfg(target_os = "macos")]
+                        5 => *mdns_discovery = !*mdns_discovery,
+                        #[cfg(not(target_os = "macos"))]
+                        3 => *daemon_only_mode = !*daemon_only_mode,
+                        #[cfg(not(target_os = "macos"))]
+                        4 => *mdns_discovery = !*mdns_discovery,
+                        _ => {}
+                    }
+                }
             }
             KeyCode::Enter => {
                 state.mark_completed(WizardSection::Features);
                 state.next_section();
             }
-            _ => {}
-        }
-    }
-    Ok(false)
-}
-
-/// Handle input for Accessibility section (macOS only)
-#[cfg(target_os = "macos")]
-fn handle_accessibility_input(
-    state: &mut WizardState,
-    key: crossterm::event::KeyEvent,
-) -> Result<bool> {
-    if let Some(SectionState::Accessibility { gui_automation }) =
-        state.sections.get_mut(&WizardSection::Accessibility)
-    {
-        match key.code {
-            KeyCode::Char(' ') | KeyCode::Char('1') => {
-                *gui_automation = !*gui_automation;
-            }
-            KeyCode::Enter => {
-                state.mark_completed(WizardSection::Accessibility);
-                state.next_section();
+            KeyCode::Esc => {
+                anyhow::bail!("Setup cancelled");
             }
             _ => {}
         }
@@ -707,91 +824,137 @@ fn handle_review_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 
 /// Build the final SetupResult from wizard state
 fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
-    // Extract API keys
-    let (claude_key, hf_token) = if let Some(SectionState::ApiKeys {
-        claude_key,
-        hf_token,
-        ..
-    }) = state.sections.get(&WizardSection::ApiKeys)
+    use crate::config::ColorTheme;
+
+    // Extract theme
+    let active_theme = if let Some(SectionState::Themes { selected_theme }) =
+        state.sections.get(&WizardSection::Themes)
     {
-        (claude_key.clone(), if hf_token.is_empty() { None } else { Some(hf_token.clone()) })
+        let themes = ColorTheme::all();
+        themes[*selected_theme].name().to_lowercase()
     } else {
-        anyhow::bail!("API keys not configured");
+        "dark".to_string()
     };
 
-    // Extract backend config
-    let (backend_enabled, provider_idx, target_idx, family_idx, size_idx, custom_repo) =
-        if let Some(SectionState::Backend {
-            enabled,
-            provider_idx,
-            target_idx,
-            family_idx,
-            size_idx,
-            custom_repo,
-            ..
-        }) = state.sections.get(&WizardSection::Backend)
-        {
-            (
-                *enabled,
-                *provider_idx,
-                *target_idx,
-                *family_idx,
-                *size_idx,
-                if custom_repo.is_empty() {
-                    None
-                } else {
-                    Some(custom_repo.clone())
-                },
-            )
-        } else {
-            anyhow::bail!("Backend not configured");
-        };
-
-    // Extract teachers
-    let teachers = if let Some(SectionState::Teachers { entries, .. }) =
-        state.sections.get(&WizardSection::Teachers)
+    // Extract models
+    let (primary_model, tool_models) = if let Some(SectionState::Models {
+        primary_model,
+        tool_models,
+        ..
+    }) = state.sections.get(&WizardSection::Models)
     {
-        // Fill first teacher's API key from claude_key if empty
-        let mut teachers = entries.clone();
-        if !teachers.is_empty() && teachers[0].api_key.is_empty() {
-            teachers[0].api_key = claude_key.clone();
-        }
-        teachers
+        (primary_model.clone(), tool_models.clone())
     } else {
-        vec![TeacherEntry {
-            provider: "claude".to_string(),
-            api_key: claude_key.clone(),
-            model: None,
-            base_url: None,
-            name: Some("Claude (Primary)".to_string()),
-        }]
+        anyhow::bail!("Models not configured");
+    };
+
+    // Extract persona
+    let default_persona = if let Some(SectionState::Personas { default_persona, .. }) =
+        state.sections.get(&WizardSection::Personas)
+    {
+        default_persona.clone()
+    } else {
+        "default".to_string()
     };
 
     // Extract features
-    let (auto_approve, streaming, debug) = if let Some(SectionState::Features {
+    let (auto_approve, streaming, debug, daemon_only, mdns) = if let Some(SectionState::Features {
         auto_approve,
         streaming,
         debug,
+        daemon_only_mode,
+        mdns_discovery,
+        ..
     }) = state.sections.get(&WizardSection::Features)
     {
-        (*auto_approve, *streaming, *debug)
+        (*auto_approve, *streaming, *debug, *daemon_only_mode, *mdns_discovery)
     } else {
-        (false, true, false)
+        (false, true, false, false, false)
     };
 
+    #[cfg(target_os = "macos")]
+    let gui_automation = if let Some(SectionState::Features { gui_automation, .. }) =
+        state.sections.get(&WizardSection::Features)
+    {
+        *gui_automation
+    } else {
+        false
+    };
+
+    // Map to backward-compatible fields
+    let (claude_api_key, backend_enabled, inference_provider, execution_target, model_family, model_size) =
+        match &primary_model {
+            ModelConfig::Local { family, size, execution, .. } => (
+                String::new(), // No API key for local
+                true,
+                InferenceProvider::Onnx,
+                *execution,
+                *family,
+                *size,
+            ),
+            ModelConfig::Remote { provider, api_key, .. } => {
+                // Remote API is primary - backend disabled
+                (
+                    api_key.clone(),
+                    false,
+                    InferenceProvider::Onnx,
+                    ExecutionTarget::Cpu, // Placeholder
+                    ModelFamily::Qwen2,   // Placeholder
+                    ModelSize::Medium,    // Placeholder
+                )
+            }
+        };
+
+    // Build teachers list from primary + tool models
+    let mut teachers: Vec<TeacherEntry> = Vec::new();
+
+    // Primary model as first teacher (if remote)
+    if let ModelConfig::Remote { provider, api_key, model, .. } = &primary_model {
+        teachers.push(TeacherEntry {
+            provider: provider.clone(),
+            api_key: api_key.clone(),
+            model: if model.is_empty() { None } else { Some(model.clone()) },
+            base_url: None,
+            name: Some(format!("{} (Primary)", provider)),
+        });
+    }
+
+    // Tool models as additional teachers
+    for tool_model in &tool_models {
+        if let ModelConfig::Remote { provider, api_key, model, enabled } = tool_model {
+            if *enabled {
+                teachers.push(TeacherEntry {
+                    provider: provider.clone(),
+                    api_key: api_key.clone(),
+                    model: if model.is_empty() { None } else { Some(model.clone()) },
+                    base_url: None,
+                    name: Some(provider.clone()),
+                });
+            }
+        }
+    }
+
     Ok(SetupResult {
-        claude_api_key: claude_key,
-        hf_token,
+        active_theme,
+        primary_model,
+        tool_models,
+        claude_api_key,
+        hf_token: None, // TODO: Add HF token input to Models section if needed
         backend_enabled,
-        inference_provider: state.inference_providers[provider_idx],
-        execution_target: state.execution_targets[target_idx],
-        model_family: state.model_families[family_idx],
-        model_size: state.model_sizes[size_idx],
-        custom_model_repo: custom_repo,
+        inference_provider,
+        execution_target,
+        model_family,
+        model_size,
+        custom_model_repo: None,
         teachers,
+        default_persona,
         auto_approve_tools: auto_approve,
         streaming_enabled: streaming,
         debug_logging: debug,
+        #[cfg(target_os = "macos")]
+        gui_automation,
+        daemon_only_mode: daemon_only,
+        mdns_discovery: mdns,
     })
 }
 
@@ -844,12 +1007,10 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
 
     // Render help text
     let help_text = match state.current_section {
-        WizardSection::ApiKeys => "Tab/Arrows: Navigate sections | ↑/↓: Switch fields | Enter: Next | Esc: Cancel",
-        WizardSection::Backend => "Tab/Arrows: Navigate sections | ↑/↓: Navigate fields | ←/→: Change values | Enter: Next",
-        WizardSection::Teachers => "Tab/Arrows: Navigate sections | ↑/↓: Select teacher | Enter: Next",
-        WizardSection::Features => "Tab/Arrows: Navigate sections | 1/2/3: Toggle features | Enter: Next",
-        #[cfg(target_os = "macos")]
-        WizardSection::Accessibility => "Tab/Arrows: Navigate sections | Space: Toggle | Enter: Next",
+        WizardSection::Themes => "Tab/Arrows: Navigate sections | ↑/↓: Select theme | Enter: Next | Esc: Cancel",
+        WizardSection::Models => "Tab/Arrows: Navigate sections | ↑/↓: Navigate | E: Edit | Space: Toggle | Enter: Next",
+        WizardSection::Personas => "Tab/Arrows: Navigate sections | ↑/↓: Select persona | Enter: Set as default",
+        WizardSection::Features => "Tab/Arrows: Navigate sections | ↑/↓: Navigate | Space: Toggle | Enter: Next",
         WizardSection::Review => "Tab/Arrows: Navigate sections | Enter/y: Confirm | n/Esc: Cancel",
     };
 
@@ -864,44 +1025,50 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
     let section_state = state.sections.get(&state.current_section);
 
     match section_state {
-        Some(SectionState::ApiKeys {
-            claude_key,
-            hf_token,
-            editing_field,
-        }) => render_api_keys_section(f, area, claude_key, hf_token, *editing_field),
-        Some(SectionState::Backend {
-            enabled,
-            provider_idx,
-            target_idx,
-            family_idx,
-            size_idx,
-            custom_repo,
-            editing_field,
-        }) => render_backend_section(
+        Some(SectionState::Themes { selected_theme }) => {
+            render_themes_section(f, area, *selected_theme)
+        }
+        Some(SectionState::Models {
+            primary_model,
+            tool_models,
+            selected_idx,
+            editing_mode,
+            error,
+        }) => render_models_section(
             f,
             area,
-            *enabled,
-            *provider_idx,
-            *target_idx,
-            *family_idx,
-            *size_idx,
-            custom_repo,
-            *editing_field,
-            state,
+            primary_model,
+            tool_models,
+            *selected_idx,
+            *editing_mode,
+            error.as_deref(),
         ),
-        Some(SectionState::Teachers {
-            entries,
+        Some(SectionState::Personas {
+            available_personas,
             selected_idx,
-        }) => render_teachers_section(f, area, entries, *selected_idx),
+            default_persona,
+        }) => render_personas_section(f, area, available_personas, *selected_idx, default_persona),
         Some(SectionState::Features {
             auto_approve,
             streaming,
             debug,
-        }) => render_features_section(f, area, *auto_approve, *streaming, *debug),
-        #[cfg(target_os = "macos")]
-        Some(SectionState::Accessibility { gui_automation }) => {
-            render_accessibility_section(f, area, *gui_automation)
-        }
+            #[cfg(target_os = "macos")]
+            gui_automation,
+            daemon_only_mode,
+            mdns_discovery,
+            selected_idx,
+        }) => render_features_section(
+            f,
+            area,
+            *auto_approve,
+            *streaming,
+            *debug,
+            #[cfg(target_os = "macos")]
+            *gui_automation,
+            *daemon_only_mode,
+            *mdns_discovery,
+            *selected_idx,
+        ),
         Some(SectionState::Review) => render_review_section(f, area, state),
         None => {
             let error = Paragraph::new("Error: Section state not found")
@@ -911,354 +1078,387 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
     }
 }
 
-/// Render API Keys section
-fn render_api_keys_section(
-    f: &mut Frame,
-    area: Rect,
-    claude_key: &str,
-    hf_token: &str,
-    editing_field: ApiKeysField,
-) {
+/// Render Themes section
+fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
+    use crate::config::ColorTheme;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Length(4), // Claude key field
-            Constraint::Length(4), // HF token field
-            Constraint::Min(1),    // Instructions
+            Constraint::Length(3),  // Title
+            Constraint::Min(8),     // Theme list
+            Constraint::Length(8),  // Preview
+            Constraint::Length(3),  // Instructions
         ])
         .split(area);
 
-    let title = Paragraph::new("API Keys Configuration")
+    let title = Paragraph::new("Theme Selection")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    // Claude API key
-    let claude_style = if matches!(editing_field, ApiKeysField::ClaudeKey) {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let claude_display = if claude_key.len() > 60 {
-        format!("{}...{} ({} chars)", &claude_key[..30], &claude_key[claude_key.len()-10..], claude_key.len())
-    } else if !claude_key.is_empty() {
-        claude_key.to_string()
-    } else {
-        "[Enter Claude API key]".to_string()
-    };
-    let claude_widget = Paragraph::new(claude_display)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Claude API Key (Required)")
-                .border_style(claude_style),
-        )
-        .style(claude_style);
-    f.render_widget(claude_widget, chunks[1]);
+    // Render theme options
+    let themes = ColorTheme::all();
+    let items: Vec<ListItem> = themes
+        .iter()
+        .enumerate()
+        .map(|(i, theme)| {
+            let marker = if i == selected_theme { "▶ " } else { "  " };
+            let style = if i == selected_theme {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("{}{} - {}", marker, theme.name(), theme.description()))
+                .style(style)
+        })
+        .collect();
 
-    // HuggingFace token
-    let hf_style = if matches!(editing_field, ApiKeysField::HfToken) {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let hf_display = if !hf_token.is_empty() {
-        hf_token.to_string()
-    } else {
-        "[Optional - for model downloads]".to_string()
-    };
-    let hf_widget = Paragraph::new(hf_display)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("HuggingFace Token (Optional)")
-                .border_style(hf_style),
-        )
-        .style(hf_style);
-    f.render_widget(hf_widget, chunks[2]);
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Available Themes"));
+    f.render_widget(list, chunks[1]);
+
+    // Render preview of selected theme
+    let preview_theme = themes[selected_theme].to_scheme();
+    let preview_lines = vec![
+        Line::from(vec![
+            Span::styled("User: ", Style::default().fg(preview_theme.messages.user.to_color())),
+            Span::raw("What is 2+2?"),
+        ]),
+        Line::from(vec![
+            Span::styled("Assistant: ", Style::default().fg(preview_theme.messages.assistant.to_color())),
+            Span::raw("The answer is 4."),
+        ]),
+        Line::from(vec![
+            Span::styled("🔧 Tool: ", Style::default().fg(preview_theme.messages.tool.to_color())),
+            Span::raw("Reading file..."),
+        ]),
+        Line::from(vec![
+            Span::styled("❌ Error: ", Style::default().fg(preview_theme.messages.error.to_color())),
+            Span::raw("File not found"),
+        ]),
+    ];
+
+    let preview = Paragraph::new(preview_lines)
+        .block(Block::default().borders(Borders::ALL).title("Preview"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(preview, chunks[2]);
 
     let instructions = Paragraph::new(
-        "Enter your API keys. Press ↑/↓ to switch between fields.\n\
-         Claude API key is required. HF token is optional but recommended for model downloads."
+        "Select a color theme that works well with your terminal background.\n\
+         The preview shows how messages will appear."
     )
     .style(Style::default().fg(Color::Yellow))
     .wrap(Wrap { trim: false });
     f.render_widget(instructions, chunks[3]);
 }
 
-/// Render Backend section
-fn render_backend_section(
+/// Render Models section (unified Backend + Teachers)
+fn render_models_section(
     f: &mut Frame,
     area: Rect,
-    enabled: bool,
-    provider_idx: usize,
-    target_idx: usize,
-    family_idx: usize,
-    size_idx: usize,
-    custom_repo: &str,
-    editing_field: BackendField,
-    state: &WizardState,
+    primary_model: &ModelConfig,
+    tool_models: &[ModelConfig],
+    selected_idx: usize,
+    editing_mode: bool,
+    error: Option<&str>,
 ) {
-    let title = Paragraph::new("Backend Configuration")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .alignment(Alignment::Center);
-
-    let content = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                if matches!(editing_field, BackendField::Enabled) {
-                    "▸ "
-                } else {
-                    "  "
-                },
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(format!(
-                "Enable local model: {}",
-                if enabled { "Yes ✓" } else { "No" }
-            )),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                if matches!(editing_field, BackendField::Provider) {
-                    "▸ "
-                } else {
-                    "  "
-                },
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(format!(
-                "Provider: {}",
-                state.inference_providers[provider_idx].name()
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                if matches!(editing_field, BackendField::Target) {
-                    "▸ "
-                } else {
-                    "  "
-                },
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(format!(
-                "Target: {}",
-                state.execution_targets[target_idx].name()
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                if matches!(editing_field, BackendField::Family) {
-                    "▸ "
-                } else {
-                    "  "
-                },
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(format!(
-                "Model Family: {}",
-                state.model_families[family_idx].name()
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                if matches!(editing_field, BackendField::Size) {
-                    "▸ "
-                } else {
-                    "  "
-                },
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(format!(
-                "Model Size: {}",
-                match state.model_sizes[size_idx] {
-                    ModelSize::Small => "Small (~1-3B)",
-                    ModelSize::Medium => "Medium (~3-9B) ★",
-                    ModelSize::Large => "Large (~7-14B)",
-                    ModelSize::XLarge => "XLarge (~14B+)",
-                }
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                if matches!(editing_field, BackendField::CustomRepo) {
-                    "▸ "
-                } else {
-                    "  "
-                },
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw(format!(
-                "Custom repo: {}",
-                if custom_repo.is_empty() {
-                    "(auto)"
-                } else {
-                    custom_repo
-                }
-            )),
-        ]),
-    ];
-
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(inner);
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(8),     // Primary model + tool models
+            Constraint::Length(3),  // Instructions
+            Constraint::Length(2),  // Error (if present)
+        ])
+        .split(area);
 
-    f.render_widget(title, chunks[0]);
-
-    let para = Paragraph::new(content).wrap(Wrap { trim: false });
-    f.render_widget(para, chunks[1]);
-}
-
-/// Render Teachers section
-fn render_teachers_section(
-    f: &mut Frame,
-    area: Rect,
-    entries: &[TeacherEntry],
-    selected_idx: usize,
-) {
-    let title = Paragraph::new("Teacher Configuration")
+    let title = Paragraph::new("Model Configuration")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
+    f.render_widget(title, chunks[0]);
 
-    let items: Vec<ListItem> = entries
+    // Build list items: primary model + tool models
+    let mut items = vec![];
+
+    // Primary model
+    let primary_marker = if selected_idx == 0 { "▶ " } else { "  " };
+    let primary_style = if selected_idx == 0 {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+
+    let primary_display = match primary_model {
+        ModelConfig::Local { family, size, execution, .. } => {
+            format!(
+                "{}★ PRIMARY: Local {} {} ({})",
+                primary_marker,
+                family.name(),
+                model_size_display(size),
+                execution.name()
+            )
+        }
+        ModelConfig::Remote { provider, api_key, model, .. } => {
+            let key_display = if api_key.is_empty() {
+                "[Not configured]".to_string()
+            } else if editing_mode && selected_idx == 0 {
+                api_key.clone()
+            } else {
+                format!("{}...{}", &api_key.chars().take(10).collect::<String>(), api_key.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>())
+            };
+            let model_part = if !model.is_empty() {
+                format!(" - {}", model)
+            } else {
+                String::new()
+            };
+            format!(
+                "{}★ PRIMARY: {}{} [{}]",
+                primary_marker, provider, model_part, key_display
+            )
+        }
+    };
+
+    items.push(ListItem::new(primary_display).style(primary_style));
+
+    // Tool models
+    for (idx, tool_model) in tool_models.iter().enumerate() {
+        let tool_idx = idx + 1;
+        let marker = if selected_idx == tool_idx { "▶ " } else { "  " };
+        let checkbox = if tool_model.enabled() { "☑" } else { "☐" };
+        let style = if selected_idx == tool_idx {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else if tool_model.enabled() {
+            Style::default()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let display = match tool_model {
+            ModelConfig::Local { family, size, .. } => {
+                format!(
+                    "{}{} Tool: Local {} {}",
+                    marker, checkbox, family.name(), model_size_display(size)
+                )
+            }
+            ModelConfig::Remote { provider, model, .. } => {
+                let model_part = if !model.is_empty() {
+                    format!(" - {}", model)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{}{} Tool: {}{}",
+                    marker, checkbox, provider, model_part
+                )
+            }
+        };
+
+        items.push(ListItem::new(display).style(style));
+    }
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Models (Primary + Tools)"),
+        );
+    f.render_widget(list, chunks[1]);
+
+    // Instructions
+    let instructions_text = if editing_mode {
+        "Editing API key | Type to edit | Enter/Esc: Done"
+    } else {
+        "↑/↓: Navigate | E: Edit | Space: Toggle (tools) | Enter: Next"
+    };
+    let instructions = Paragraph::new(instructions_text)
+        .style(Style::default().fg(Color::Yellow))
+        .alignment(Alignment::Center);
+    f.render_widget(instructions, chunks[2]);
+
+    // Error message (if present)
+    if let Some(err) = error {
+        let error_widget = Paragraph::new(err)
+            .style(Style::default().fg(Color::Red))
+            .alignment(Alignment::Center);
+        f.render_widget(error_widget, chunks[3]);
+    }
+}
+
+/// Render Personas section
+fn render_personas_section(
+    f: &mut Frame,
+    area: Rect,
+    personas: &[PersonaInfo],
+    selected_idx: usize,
+    default_persona: &str,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(area);
+
+    // Left: Persona list
+    let items: Vec<ListItem> = personas
         .iter()
         .enumerate()
-        .map(|(idx, teacher)| {
-            let display_name = teacher.name.as_deref().unwrap_or(&teacher.provider);
-            let priority = if idx == 0 { "PRIMARY" } else { "FALLBACK" };
-            let style = if idx == 0 {
-                Style::default().fg(Color::Green)
-            } else {
+        .map(|(i, persona)| {
+            let is_default = persona.name.to_lowercase() == default_persona.to_lowercase();
+            let marker = if is_default { "★ " } else { "  " };
+            let style = if i == selected_idx {
+                Style::default().bg(Color::Cyan).fg(Color::Black)
+            } else if is_default {
                 Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
             };
-
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!("{}. ", idx + 1),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(display_name, Style::default().fg(Color::White)),
-                    Span::raw("  "),
-                    Span::styled(priority, style),
-                ]),
-                Line::from(vec![
-                    Span::raw("   Provider: "),
-                    Span::styled(&teacher.provider, Style::default().fg(Color::Gray)),
-                ]),
-            ])
+            ListItem::new(format!("{}{}", marker, persona.name)).style(style)
         })
         .collect();
 
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(inner);
-
-    f.render_widget(title, chunks[0]);
-
-    let mut list_state = ListState::default();
-    list_state.select(Some(selected_idx));
-
     let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Personas"))
         .highlight_style(
             Style::default()
                 .bg(Color::Cyan)
                 .fg(Color::Black)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▸ ");
+        .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(list, chunks[1], &mut list_state);
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected_idx));
+    f.render_stateful_widget(list, chunks[0], &mut list_state);
+
+    // Right: Preview
+    if let Some(persona) = personas.get(selected_idx) {
+        let preview_lines = vec![
+            Line::from(vec![
+                Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(&persona.name),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "Description: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&persona.description),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "System Prompt:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(persona.system_prompt.as_str()),
+        ];
+
+        let preview = Paragraph::new(preview_lines)
+            .block(Block::default().borders(Borders::ALL).title("Preview"))
+            .wrap(Wrap { trim: false });
+        f.render_widget(preview, chunks[1]);
+    }
 }
 
-/// Render Features section
+/// Render Features section (simplified, with arrow key navigation)
 fn render_features_section(
     f: &mut Frame,
     area: Rect,
     auto_approve: bool,
     streaming: bool,
     debug: bool,
+    #[cfg(target_os = "macos")] gui_automation: bool,
+    daemon_only_mode: bool,
+    mdns_discovery: bool,
+    selected_idx: usize,
 ) {
-    // Reuse the existing render_features_config function
-    render_features_config(f, area, auto_approve, streaming, debug);
-}
-
-/// Render Accessibility section (macOS only)
-#[cfg(target_os = "macos")]
-fn render_accessibility_section(f: &mut Frame, area: Rect, gui_automation: bool) {
-    let title = Paragraph::new("Accessibility (macOS)")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .alignment(Alignment::Center);
-
-    let checkbox = if gui_automation { "☑" } else { "☐" };
-    let content = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("1. ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("{} Enable GUI automation tools", checkbox),
-                if gui_automation {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::Gray)
-                },
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("   "),
-            Span::styled(
-                "Enables GuiClick, GuiType, GuiInspect tools",
-                Style::default().fg(Color::Gray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("   "),
-            Span::styled(
-                "⚠️  Requires Accessibility permissions",
-                Style::default().fg(Color::Yellow),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("   "),
-            Span::styled(
-                "System Preferences > Security & Privacy > Privacy > Accessibility",
-                Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
-            ),
-        ]),
-    ];
-
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
-        .split(inner);
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(10),    // Feature list
+            Constraint::Length(3),  // Instructions
+        ])
+        .split(area);
 
+    let title = Paragraph::new("Feature Flags")
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    let para = Paragraph::new(content).wrap(Wrap { trim: false });
-    f.render_widget(para, chunks[1]);
+    // Build feature list
+    let mut features: Vec<(&str, bool, Option<&str>)> = vec![
+        ("Auto-approve tools", auto_approve, Some("Skip confirmation dialogs (⚠️  use with caution)")),
+        ("Streaming responses", streaming, Some("Enable real-time response streaming")),
+        ("Debug logging", debug, Some("Enable detailed logs for troubleshooting")),
+    ];
+
+    #[cfg(target_os = "macos")]
+    features.push((
+        "GUI automation (macOS)",
+        gui_automation,
+        Some("Enable GuiClick, GuiType, GuiInspect tools"),
+    ));
+
+    features.push((
+        "Daemon-only mode",
+        daemon_only_mode,
+        Some("Run as daemon without REPL (server mode)"),
+    ));
+
+    features.push((
+        "mDNS service discovery",
+        mdns_discovery,
+        Some("Advertise and discover remote daemons via Bonjour"),
+    ));
+
+    let items: Vec<ListItem> = features
+        .iter()
+        .enumerate()
+        .map(|(i, (name, enabled, desc))| {
+            let checkbox = if *enabled { "☑" } else { "☐" };
+            let marker = if i == selected_idx { "▶ " } else { "  " };
+            let style = if i == selected_idx {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else if *enabled {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let mut lines = vec![Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("{} {}", checkbox, name), style),
+            ])];
+
+            if let Some(description) = desc {
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(*description, Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+
+            ListItem::new(lines)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Features"));
+    f.render_widget(list, chunks[1]);
+
+    let instructions = Paragraph::new(
+        "↑/↓: Navigate | Space: Toggle | 1-6: Quick toggle | Enter: Next"
+    )
+    .style(Style::default().fg(Color::Yellow))
+    .alignment(Alignment::Center);
+    f.render_widget(instructions, chunks[2]);
 }
 
 /// Render Review section
 fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
+    use crate::config::ColorTheme;
+
     let title = Paragraph::new("Review Configuration")
         .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
@@ -1272,48 +1472,85 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
         Line::from(""),
     ];
 
-    // API Keys
-    if let Some(SectionState::ApiKeys { claude_key, hf_token, .. }) = state.sections.get(&WizardSection::ApiKeys) {
+    // Theme
+    if let Some(SectionState::Themes { selected_theme }) = state.sections.get(&WizardSection::Themes) {
+        let themes = ColorTheme::all();
+        let theme_name = themes[*selected_theme].name().to_string();
         lines.push(Line::from(vec![
-            Span::styled("API Keys: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("Claude key configured ({}), HF token: {}",
-                if claude_key.is_empty() { "missing" } else { "set" },
-                if hf_token.is_empty() { "not set" } else { "set" }
-            )),
+            Span::styled("Theme: ", Style::default().fg(Color::Yellow)),
+            Span::raw(theme_name),
         ]));
     }
 
-    // Backend
-    if let Some(SectionState::Backend { enabled, provider_idx, target_idx, family_idx, size_idx, .. }) = state.sections.get(&WizardSection::Backend) {
+    // Models
+    if let Some(SectionState::Models { primary_model, tool_models, .. }) = state.sections.get(&WizardSection::Models) {
         lines.push(Line::from(vec![
-            Span::styled("Backend: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{}, {}, {}, {}",
-                if *enabled { "Enabled" } else { "Disabled" },
-                state.inference_providers[*provider_idx].name(),
-                state.execution_targets[*target_idx].name(),
-                state.model_families[*family_idx].name(),
-            )),
+            Span::styled("Primary Model: ", Style::default().fg(Color::Yellow)),
+            Span::raw(primary_model.display_name()),
         ]));
+        if !tool_models.is_empty() {
+            let enabled_tools: Vec<_> = tool_models
+                .iter()
+                .filter(|m| m.enabled())
+                .map(|m| m.display_name())
+                .collect();
+            if !enabled_tools.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Tool Models: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(enabled_tools.join(", ")),
+                ]));
+            }
+        }
     }
 
-    // Teachers
-    if let Some(SectionState::Teachers { entries, .. }) = state.sections.get(&WizardSection::Teachers) {
+    // Persona
+    if let Some(SectionState::Personas { default_persona, .. }) = state.sections.get(&WizardSection::Personas) {
         lines.push(Line::from(vec![
-            Span::styled("Teachers: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{} configured", entries.len())),
+            Span::styled("Default Persona: ", Style::default().fg(Color::Yellow)),
+            Span::raw(default_persona),
         ]));
     }
 
     // Features
-    if let Some(SectionState::Features { auto_approve, streaming, debug }) = state.sections.get(&WizardSection::Features) {
+    if let Some(SectionState::Features {
+        auto_approve,
+        streaming,
+        debug,
+        #[cfg(target_os = "macos")]
+        gui_automation,
+        daemon_only_mode,
+        mdns_discovery,
+        ..
+    }) = state.sections.get(&WizardSection::Features)
+    {
+        let mut feature_flags = vec![];
+        if *auto_approve {
+            feature_flags.push("Auto-approve");
+        }
+        if *streaming {
+            feature_flags.push("Streaming");
+        }
+        if *debug {
+            feature_flags.push("Debug");
+        }
+        #[cfg(target_os = "macos")]
+        if *gui_automation {
+            feature_flags.push("GUI automation");
+        }
+        if *daemon_only_mode {
+            feature_flags.push("Daemon-only");
+        }
+        if *mdns_discovery {
+            feature_flags.push("mDNS discovery");
+        }
+
         lines.push(Line::from(vec![
             Span::styled("Features: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format!(
-                "Auto-approve: {}, Streaming: {}, Debug: {}",
-                if *auto_approve { "Yes" } else { "No" },
-                if *streaming { "Yes" } else { "No" },
-                if *debug { "Yes" } else { "No" }
-            )),
+            Span::raw(if feature_flags.is_empty() {
+                "None enabled".to_string()
+            } else {
+                feature_flags.join(", ")
+            }),
         ]));
     }
 
@@ -1998,7 +2235,27 @@ fn run_wizard_loop(
                 WizardStep::Confirm => {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => {
+                            // Build primary model config from backend settings
+                            let primary_model = if backend_enabled {
+                                ModelConfig::Local {
+                                    family: model_families[selected_family_idx],
+                                    size: model_sizes[selected_size_idx],
+                                    execution: execution_targets[selected_target_idx],
+                                    enabled: true,
+                                }
+                            } else {
+                                ModelConfig::Remote {
+                                    provider: "claude".to_string(),
+                                    api_key: claude_key.clone(),
+                                    model: String::new(),
+                                    enabled: true,
+                                }
+                            };
+
                             return Ok(SetupResult {
+                                active_theme: "dark".to_string(),
+                                primary_model,
+                                tool_models: vec![],
                                 claude_api_key: claude_key.clone(),
                                 hf_token: if hf_token.is_empty() { None } else { Some(hf_token.clone()) },
                                 backend_enabled,
@@ -2012,9 +2269,14 @@ fn run_wizard_loop(
                                     Some(custom_model_repo.clone())
                                 },
                                 teachers: teachers.clone(),
+                                default_persona: "default".to_string(),
                                 auto_approve_tools,
                                 streaming_enabled,
                                 debug_logging,
+                                #[cfg(target_os = "macos")]
+                                gui_automation: false,
+                                daemon_only_mode: false,
+                                mdns_discovery: false,
                             });
                         }
                         KeyCode::Char('n') | KeyCode::Esc => {
