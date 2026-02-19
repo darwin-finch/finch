@@ -1114,8 +1114,8 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
                     ">>> ",
                     " <<<",
                     Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
+                        .bg(Color::Black)
+                        .fg(Color::White)
                         .add_modifier(Modifier::BOLD)
                 )
             } else {
@@ -1215,8 +1215,8 @@ fn render_models_section(
             ">>> ",
             " <<<",
             Style::default()
-                .bg(Color::White)
-                .fg(Color::Black)
+                .bg(Color::Black)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD)
         )
     } else {
@@ -1270,8 +1270,8 @@ fn render_models_section(
                 ">>> ",
                 " <<<",
                 Style::default()
-                    .bg(Color::White)
-                    .fg(Color::Black)
+                    .bg(Color::Black)
+                    .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
             )
         } else if tool_model.enabled() {
@@ -1359,8 +1359,8 @@ fn render_personas_section(
                     ">>> ",
                     " <<<",
                     Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
+                        .bg(Color::Black)
+                        .fg(Color::White)
                         .add_modifier(Modifier::BOLD)
                 )
             } else if is_default {
@@ -1476,8 +1476,8 @@ fn render_features_section(
                     ">>> ",
                     " <<<",
                     Style::default()
-                        .bg(Color::White)
-                        .fg(Color::Black)
+                        .bg(Color::Black)
+                        .fg(Color::White)
                         .add_modifier(Modifier::BOLD)
                 )
             } else {
@@ -2749,7 +2749,7 @@ fn render_execution_target_selection(f: &mut Frame, area: Rect, targets: &[Execu
         .highlight_style(
             Style::default()
                 .bg(Color::Cyan)
-                .fg(Color::Black)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -2796,7 +2796,7 @@ fn render_model_family_selection(f: &mut Frame, area: Rect, families: &[ModelFam
         .highlight_style(
             Style::default()
                 .bg(Color::Cyan)
-                .fg(Color::Black)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -2857,7 +2857,7 @@ fn render_model_size_selection(f: &mut Frame, area: Rect, sizes: &[ModelSize], s
         .highlight_style(
             Style::default()
                 .bg(Color::Cyan)
-                .fg(Color::Black)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
@@ -3076,7 +3076,7 @@ fn render_teacher_config(f: &mut Frame, area: Rect, teachers: &[TeacherEntry], s
         .highlight_style(
             Style::default()
                 .bg(Color::Cyan)
-                .fg(Color::Black)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▸ ");
