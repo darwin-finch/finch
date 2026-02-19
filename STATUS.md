@@ -1,7 +1,7 @@
 # Shammah - Project Status
 
-**Last Updated:** 2026-02-19
-**Version:** 0.5.0-dev (Runtime Switching + MemTree Console)
+**Last Updated:** 2026-02-20
+**Version:** 0.5.1-dev (Setup Wizard UX + First-Run Experience)
 
 ## Current State: Production-Ready Local AI Proxy ✅
 
@@ -112,6 +112,19 @@ Shammah is now a fully functional local-first AI coding assistant with ONNX Runt
 - ConsoleNode types: UserMessage, AssistantResponse, ToolCall, ToolResult, System, Thinking
 - Event handler maps query UUIDs to tree node IDs
 - Infrastructure complete, TUI rendering pending
+
+**Setup Wizard UX Overhaul (Feb 20, 2026):**
+- Auto-detect API keys from ANTHROPIC_API_KEY, XAI_API_KEY, OPENAI_API_KEY, etc.
+- Auto-read Claude Code config (~/.claude/settings.json) for existing Anthropic key
+- Skip wizard entirely on first run if any keys found — just prints "✓ Auto-configured"
+- Skips inference provider selection when only one option (ONNX default)
+- Friendly tab names: "Look & Feel", "API Key", "Style", "Settings", "Finish"
+- "Connect to Claude" with URL hint when no key configured
+- Hidden developer settings (daemon mode, mDNS, debug logging, GUI automation)
+- Fixed: API key format validation was blocking navigation (sk-ant- check removed)
+- Fixed: Persona saved as display name ("Expert Coder") instead of slug ("expert-coder")
+- Fixed: Empty API key patched from env vars after wizard completes
+- Config path confirmed: ~/.finch/config.toml (not ~/.shammah/)
 
 ---
 
