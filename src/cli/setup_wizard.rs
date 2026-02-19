@@ -11,8 +11,38 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use crate::service::discovery_client::{ServiceDiscoveryClient, DiscoveredService};
 
-use crate::config::{ExecutionTarget, FeaturesConfig, TeacherEntry};
+/// Step in the "Add Provider" flow (overlay inside Models section)
+#[derive(Debug, Clone)]
+enum AddProviderStep {
+    // Step 0: what kind of provider to add?
+    SelectAddType { selected: usize },
+    // Cloud AI path (steps 1-3)
+    SelectProvider { selected: usize },
+    EnterApiKey { provider: String, api_key: String },
+    EnterModel { provider: String, api_key: String, model: String },
+    // Local ONNX path (steps 1-2)
+    SelectLocalFamily { selected: usize },
+    SelectLocalSize { family: ModelFamily, selected: usize },
+    // Network scan path
+    Scanning { results: Arc<Mutex<Option<Vec<DiscoveredService>>>> },
+    SelectAgent { agents: Vec<DiscoveredService>, selected: usize },
+}
+
+/// Cloud provider options shown in the add-provider overlay
+const CLOUD_PROVIDERS: &[(&str, &str, &str)] = &[
+    ("claude",  "Anthropic Claude", "claude-sonnet-4-6"),
+    ("openai",  "OpenAI GPT",       "gpt-4o"),
+    ("grok",    "xAI Grok",         "grok-2"),
+    ("gemini",  "Google Gemini",    "gemini-2.0-flash"),
+    ("mistral", "Mistral AI",       "mistral-large-latest"),
+    ("groq",    "Groq (fast)",      "llama-3.3-70b-versatile"),
+];
+
+use crate::config::{ExecutionTarget, TeacherEntry};
 use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use crate::models::compatibility;
 
@@ -107,17 +137,24 @@ enum SectionState {
         tool_models: Vec<ModelConfig>,
         selected_idx: usize, // 0 = primary, 1+ = tool models
         editing_mode: bool,
+        editing_model_mode: bool, // editing model name for selected entry
+        model_input: String,      // model name input buffer
+        adding_provider: Option<AddProviderStep>,
         error: Option<String>,
     },
     Personas {
         available_personas: Vec<PersonaInfo>,
         selected_idx: usize,
         default_persona: String,
+        editing_prompt: bool,
+        prompt_input: String,
     },
     Features {
         auto_approve: bool,
         streaming: bool,
         debug: bool,
+        hf_token: String,
+        editing_hf_token: bool,
         #[cfg(target_os = "macos")]
         gui_automation: bool,
         daemon_only_mode: bool,
@@ -289,6 +326,9 @@ impl WizardState {
                 tool_models,
                 selected_idx: 0,
                 editing_mode: false,
+                editing_model_mode: false,
+                model_input: String::new(),
+                adding_provider: None,
                 error: None,
             },
         );
@@ -322,10 +362,12 @@ impl WizardState {
                 available_personas: builtin_personas,
                 selected_idx,
                 default_persona,
+                editing_prompt: false,
+                prompt_input: String::new(),
             },
         );
 
-        // Features section (simplified, no memory toggle, accessibility moved here)
+        // Features section
         sections.insert(
             WizardSection::Features,
             SectionState::Features {
@@ -338,6 +380,10 @@ impl WizardState {
                 debug: existing_config
                     .map(|c| c.features.debug_logging)
                     .unwrap_or(false),
+                hf_token: existing_config
+                    .and_then(|c| c.huggingface_token.clone())
+                    .unwrap_or_default(),
+                editing_hf_token: false,
                 #[cfg(target_os = "macos")]
                 gui_automation: existing_config
                     .map(|c| c.features.gui_automation)
@@ -346,7 +392,7 @@ impl WizardState {
                     .map(|c| c.server.mode == "daemon-only")
                     .unwrap_or(false),
                 mdns_discovery: existing_config
-                    .map(|c| c.server.advertise || c.client.auto_discover)
+                    .map(|c| c.server.advertise)
                     .unwrap_or(false),
                 selected_idx: 0,
             },
@@ -539,6 +585,39 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
     result
 }
 
+/// Returns true if the Models section is currently in the Scanning sub-step
+fn is_scanning_state(state: &WizardState) -> bool {
+    if let Some(SectionState::Models { adding_provider, .. }) =
+        state.sections.get(&WizardSection::Models)
+    {
+        matches!(adding_provider, Some(AddProviderStep::Scanning { .. }))
+    } else {
+        false
+    }
+}
+
+/// If a network scan has finished, advance to SelectAgent (or close overlay if no agents)
+fn advance_scan_if_done(state: &mut WizardState) {
+    if let Some(SectionState::Models { adding_provider, .. }) =
+        state.sections.get_mut(&WizardSection::Models)
+    {
+        // Check if results are ready without holding the lock across the reassignment
+        let agents_opt = if let Some(AddProviderStep::Scanning { results }) = adding_provider.as_ref() {
+            results.try_lock().ok().and_then(|g| g.as_ref().cloned())
+        } else {
+            return;
+        };
+
+        if let Some(agents) = agents_opt {
+            *adding_provider = if agents.is_empty() {
+                None // No agents found — close overlay
+            } else {
+                Some(AddProviderStep::SelectAgent { agents, selected: 0 })
+            };
+        }
+    }
+}
+
 /// Run the NEW tabbed wizard with section navigation
 fn run_tabbed_wizard(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
@@ -551,32 +630,50 @@ fn run_tabbed_wizard(
             render_tabbed_wizard(f, &state);
         })?;
 
-        // Handle input
-        if let Event::Key(key) = event::read()? {
-            // Global navigation (works in any section)
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                anyhow::bail!("Setup cancelled");
-            }
-
-            match key.code {
-                // Tab navigation
-                KeyCode::Tab => {
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                        state.prev_section();
-                    } else {
-                        state.next_section();
-                    }
+        // When scanning for network agents, poll with a short timeout so we can check
+        // the background thread's results without blocking on keyboard input.
+        let key_opt: Option<crossterm::event::KeyEvent> = if is_scanning_state(&state) {
+            advance_scan_if_done(&mut state);
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(key) => Some(key),
+                    _ => None,
                 }
-                KeyCode::Left => state.prev_section(),
-                KeyCode::Right => state.next_section(),
+            } else {
+                None
+            }
+        } else {
+            match event::read()? {
+                Event::Key(key) => Some(key),
+                _ => None,
+            }
+        };
 
-                // Section-specific handling
-                _ => {
-                    let should_exit = handle_section_input(&mut state, key)?;
-                    if should_exit {
-                        // User confirmed in Review section - build result
-                        return build_setup_result(&state);
-                    }
+        let Some(key) = key_opt else { continue; };
+
+        // Global navigation (works in any section)
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            anyhow::bail!("Setup cancelled");
+        }
+
+        match key.code {
+            // Tab navigation
+            KeyCode::Tab => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    state.prev_section();
+                } else {
+                    state.next_section();
+                }
+            }
+            KeyCode::Left => state.prev_section(),
+            KeyCode::Right => state.next_section(),
+
+            // Section-specific handling
+            _ => {
+                let should_exit = handle_section_input(&mut state, key)?;
+                if should_exit {
+                    // User confirmed in Review section - build result
+                    return build_setup_result(&state);
                 }
             }
         }
@@ -633,23 +730,255 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
         tool_models,
         selected_idx,
         editing_mode,
+        editing_model_mode,
+        model_input,
+        adding_provider,
         error,
     }) = state.sections.get_mut(&WizardSection::Models)
     {
         // Clear error on any input
         *error = None;
 
-        if *editing_mode {
-            // In editing mode - simple text input for API keys
+        // Handle add-provider overlay first
+        if adding_provider.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    *adding_provider = None;
+                }
+                KeyCode::Up => {
+                    match adding_provider {
+                        Some(AddProviderStep::SelectAddType { selected }) => {
+                            if *selected > 0 { *selected -= 1; }
+                        }
+                        Some(AddProviderStep::SelectProvider { selected }) => {
+                            if *selected > 0 { *selected -= 1; }
+                        }
+                        Some(AddProviderStep::SelectLocalFamily { selected }) => {
+                            if *selected > 0 { *selected -= 1; }
+                        }
+                        Some(AddProviderStep::SelectLocalSize { selected, .. }) => {
+                            if *selected > 0 { *selected -= 1; }
+                        }
+                        Some(AddProviderStep::SelectAgent { selected, .. }) => {
+                            if *selected > 0 { *selected -= 1; }
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Down => {
+                    match adding_provider {
+                        Some(AddProviderStep::SelectAddType { selected }) => {
+                            if *selected < 2 { *selected += 1; }
+                        }
+                        Some(AddProviderStep::SelectProvider { selected }) => {
+                            if *selected < CLOUD_PROVIDERS.len() - 1 { *selected += 1; }
+                        }
+                        Some(AddProviderStep::SelectLocalFamily { selected }) => {
+                            if *selected < 5 { *selected += 1; }
+                        }
+                        Some(AddProviderStep::SelectLocalSize { selected, .. }) => {
+                            if *selected < 3 { *selected += 1; }
+                        }
+                        Some(AddProviderStep::SelectAgent { agents, selected }) => {
+                            if *selected + 1 < agents.len() { *selected += 1; }
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Char(c) => {
+                    match adding_provider {
+                        Some(AddProviderStep::EnterApiKey { api_key, .. }) => {
+                            api_key.push(c);
+                        }
+                        Some(AddProviderStep::EnterModel { model, .. }) => {
+                            model.push(c);
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Backspace => {
+                    match adding_provider {
+                        Some(AddProviderStep::EnterApiKey { api_key, .. }) => {
+                            api_key.pop();
+                        }
+                        Some(AddProviderStep::EnterModel { model, .. }) => {
+                            model.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Enter => {
+                    // Ignore Enter while network scan is in progress
+                    if matches!(adding_provider, Some(AddProviderStep::Scanning { .. })) {
+                        return Ok(false);
+                    }
+
+                    let next_step = match adding_provider.take() {
+                        // ── type selection ──────────────────────────────────────────────
+                        Some(AddProviderStep::SelectAddType { selected }) => match selected {
+                            0 => Some(AddProviderStep::SelectProvider { selected: 0 }),
+                            1 => Some(AddProviderStep::SelectLocalFamily { selected: 0 }),
+                            2 => {
+                                // Start background network scan
+                                let results_arc: Arc<Mutex<Option<Vec<DiscoveredService>>>> =
+                                    Arc::new(Mutex::new(None));
+                                let arc_clone = Arc::clone(&results_arc);
+                                std::thread::spawn(move || {
+                                    if let Ok(client) = ServiceDiscoveryClient::new() {
+                                        let found = client
+                                            .discover(Duration::from_secs(5))
+                                            .unwrap_or_default();
+                                        *arc_clone.lock().unwrap() = Some(found);
+                                    } else {
+                                        *arc_clone.lock().unwrap() = Some(vec![]);
+                                    }
+                                });
+                                Some(AddProviderStep::Scanning { results: results_arc })
+                            }
+                            _ => None,
+                        },
+                        // ── cloud AI path ────────────────────────────────────────────
+                        Some(AddProviderStep::SelectProvider { selected }) => {
+                            let (provider_id, _, _) = CLOUD_PROVIDERS[selected];
+                            Some(AddProviderStep::EnterApiKey {
+                                provider: provider_id.to_string(),
+                                api_key: String::new(),
+                            })
+                        }
+                        Some(AddProviderStep::EnterApiKey { provider, api_key }) => {
+                            Some(AddProviderStep::EnterModel {
+                                provider,
+                                api_key,
+                                model: String::new(),
+                            })
+                        }
+                        Some(AddProviderStep::EnterModel { provider, api_key, model }) => {
+                            let resolved_model = if model.is_empty() {
+                                CLOUD_PROVIDERS
+                                    .iter()
+                                    .find(|(id, _, _)| *id == provider.as_str())
+                                    .map(|(_, _, def)| def.to_string())
+                                    .unwrap_or_default()
+                            } else {
+                                model
+                            };
+                            tool_models.push(ModelConfig::Remote {
+                                provider,
+                                api_key,
+                                model: resolved_model,
+                                enabled: true,
+                            });
+                            *selected_idx = tool_models.len();
+                            None
+                        }
+                        // ── local ONNX path ──────────────────────────────────────────
+                        Some(AddProviderStep::SelectLocalFamily { selected }) => {
+                            let families = [
+                                ModelFamily::Qwen2,
+                                ModelFamily::Gemma2,
+                                ModelFamily::Llama3,
+                                ModelFamily::Mistral,
+                                ModelFamily::Phi,
+                                ModelFamily::DeepSeek,
+                            ];
+                            let family = families[selected.min(families.len() - 1)];
+                            Some(AddProviderStep::SelectLocalSize { family, selected: 0 })
+                        }
+                        Some(AddProviderStep::SelectLocalSize { family, selected }) => {
+                            let sizes = [
+                                ModelSize::Small,
+                                ModelSize::Medium,
+                                ModelSize::Large,
+                                ModelSize::XLarge,
+                            ];
+                            let size = sizes[selected.min(sizes.len() - 1)];
+                            // Replace primary if it has no key and there are no tool models
+                            let replace_primary = matches!(
+                                primary_model,
+                                ModelConfig::Remote { api_key, .. } if api_key.is_empty()
+                            ) && tool_models.is_empty();
+                            if replace_primary {
+                                *primary_model = ModelConfig::Local {
+                                    family,
+                                    size,
+                                    execution: ExecutionTarget::Cpu,
+                                    enabled: true,
+                                };
+                                *selected_idx = 0;
+                            } else {
+                                tool_models.push(ModelConfig::Local {
+                                    family,
+                                    size,
+                                    execution: ExecutionTarget::Cpu,
+                                    enabled: true,
+                                });
+                                *selected_idx = tool_models.len();
+                            }
+                            None
+                        }
+                        // ── network scan results ─────────────────────────────────────
+                        Some(AddProviderStep::SelectAgent { agents, selected }) => {
+                            if !agents.is_empty() {
+                                let agent = &agents[selected.min(agents.len() - 1)];
+                                tool_models.push(ModelConfig::Remote {
+                                    provider: "finch".to_string(),
+                                    api_key: String::new(),
+                                    model: format!("{}:{}", agent.host, agent.port),
+                                    enabled: true,
+                                });
+                                *selected_idx = tool_models.len();
+                            }
+                            None
+                        }
+                        None => None,
+                        // Scanning handled above with early return
+                        Some(AddProviderStep::Scanning { .. }) => None,
+                    };
+                    *adding_provider = next_step;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        if *editing_model_mode {
+            // Editing model name for the selected entry
+            match key.code {
+                KeyCode::Char(c) => {
+                    model_input.push(c);
+                }
+                KeyCode::Backspace => {
+                    model_input.pop();
+                }
+                KeyCode::Enter | KeyCode::Esc => {
+                    // Save model name
+                    let mi = model_input.clone();
+                    if *selected_idx == 0 {
+                        if let ModelConfig::Remote { model, .. } = primary_model {
+                            *model = mi;
+                        }
+                    } else {
+                        let tool_idx = *selected_idx - 1;
+                        if let Some(ModelConfig::Remote { model, .. }) =
+                            tool_models.get_mut(tool_idx)
+                        {
+                            *model = mi;
+                        }
+                    }
+                    *editing_model_mode = false;
+                    model_input.clear();
+                }
+                _ => {}
+            }
+        } else if *editing_mode {
+            // In API key editing mode
             match key.code {
                 KeyCode::Char(c) => {
                     if *selected_idx == 0 {
-                        // Editing primary model
                         if let ModelConfig::Remote { api_key, .. } = primary_model {
                             api_key.push(c);
                         }
                     } else {
-                        // Editing tool model
                         let tool_idx = *selected_idx - 1;
                         if let Some(ModelConfig::Remote { api_key, .. }) =
                             tool_models.get_mut(tool_idx)
@@ -701,8 +1030,44 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     }
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
-                    // Enter edit mode for primary model
+                    // Enter API key edit mode
                     *editing_mode = true;
+                }
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    // Edit model name for selected entry
+                    let current_model = if *selected_idx == 0 {
+                        if let ModelConfig::Remote { model, .. } = primary_model {
+                            model.clone()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        let tool_idx = *selected_idx - 1;
+                        if let Some(ModelConfig::Remote { model, .. }) = tool_models.get(tool_idx) {
+                            model.clone()
+                        } else {
+                            String::new()
+                        }
+                    };
+                    *model_input = current_model;
+                    *editing_model_mode = true;
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    // Open add-provider overlay (type selection first)
+                    *adding_provider = Some(AddProviderStep::SelectAddType { selected: 0 });
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    // Delete selected tool model (cannot delete primary)
+                    if *selected_idx > 0 {
+                        let tool_idx = *selected_idx - 1;
+                        if tool_idx < tool_models.len() {
+                            tool_models.remove(tool_idx);
+                            // Adjust selection
+                            if *selected_idx > tool_models.len() {
+                                *selected_idx = tool_models.len();
+                            }
+                        }
+                    }
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
                     // Skip - just move to next section without validation
@@ -730,8 +1095,41 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
         available_personas,
         selected_idx,
         default_persona,
+        editing_prompt,
+        prompt_input,
     }) = state.sections.get_mut(&WizardSection::Personas)
     {
+        if *editing_prompt {
+            // In system prompt editing mode
+            match key.code {
+                KeyCode::Char('s') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    // Ctrl+S: save edited prompt
+                    let new_prompt = prompt_input.clone();
+                    if let Some(persona) = available_personas.get_mut(*selected_idx) {
+                        persona.system_prompt = new_prompt;
+                    }
+                    *editing_prompt = false;
+                }
+                KeyCode::Esc => {
+                    // Cancel edit, discard changes
+                    *editing_prompt = false;
+                    prompt_input.clear();
+                }
+                KeyCode::Enter => {
+                    // Insert newline
+                    prompt_input.push('\n');
+                }
+                KeyCode::Backspace => {
+                    prompt_input.pop();
+                }
+                KeyCode::Char(c) => {
+                    prompt_input.push(c);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Up => {
                 if *selected_idx > 0 {
@@ -741,6 +1139,13 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
             KeyCode::Down => {
                 if *selected_idx < available_personas.len() - 1 {
                     *selected_idx += 1;
+                }
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                // Enter system prompt editing mode
+                if let Some(persona) = available_personas.get(*selected_idx) {
+                    *prompt_input = persona.system_prompt.clone();
+                    *editing_prompt = true;
                 }
             }
             KeyCode::Enter => {
@@ -766,6 +1171,8 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         auto_approve,
         streaming,
         debug,
+        hf_token,
+        editing_hf_token,
         #[cfg(target_os = "macos")]
         gui_automation,
         daemon_only_mode,
@@ -773,8 +1180,28 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         selected_idx,
     }) = state.sections.get_mut(&WizardSection::Features)
     {
-        // Only 2 user-facing settings shown (streaming + auto-approve)
-        let num_features = 2;
+        if *editing_hf_token {
+            // In HF token editing mode
+            match key.code {
+                KeyCode::Char(c) => {
+                    hf_token.push(c);
+                }
+                KeyCode::Backspace => {
+                    hf_token.pop();
+                }
+                KeyCode::Enter | KeyCode::Esc => {
+                    *editing_hf_token = false;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        // 6 features: 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon_only, 5=mdns
+        #[cfg(target_os = "macos")]
+        let num_features = 7; // +1 for gui_automation at index 3, hf_token at 4, daemon at 5, mdns at 6
+        #[cfg(not(target_os = "macos"))]
+        let num_features = 6;
 
         match key.code {
             KeyCode::Up => {
@@ -788,12 +1215,37 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 }
             }
             KeyCode::Char(' ') => {
-                // Toggle selected feature
-                // Index 0 = "Live responses" (streaming), 1 = "Skip permission prompts" (auto_approve)
+                // Toggle selected feature (all except hf_token index)
+                #[cfg(target_os = "macos")]
                 match *selected_idx {
                     0 => *streaming = !*streaming,
                     1 => *auto_approve = !*auto_approve,
+                    2 => *debug = !*debug,
+                    3 => *gui_automation = !*gui_automation,
+                    // index 4 = hf_token (no toggle)
+                    5 => *daemon_only_mode = !*daemon_only_mode,
+                    6 => *mdns_discovery = !*mdns_discovery,
                     _ => {}
+                }
+                #[cfg(not(target_os = "macos"))]
+                match *selected_idx {
+                    0 => *streaming = !*streaming,
+                    1 => *auto_approve = !*auto_approve,
+                    2 => *debug = !*debug,
+                    // index 3 = hf_token (no toggle)
+                    4 => *daemon_only_mode = !*daemon_only_mode,
+                    5 => *mdns_discovery = !*mdns_discovery,
+                    _ => {}
+                }
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                // 'E' enters HF token edit mode when that row is selected
+                #[cfg(target_os = "macos")]
+                let hf_idx = 4;
+                #[cfg(not(target_os = "macos"))]
+                let hf_idx = 3;
+                if *selected_idx == hf_idx {
+                    *editing_hf_token = true;
                 }
             }
             KeyCode::Enter => {
@@ -859,18 +1311,26 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract features
-    let (auto_approve, streaming, debug, daemon_only, mdns) = if let Some(SectionState::Features {
+    let (auto_approve, streaming, debug, hf_token_val, daemon_only, mdns) = if let Some(SectionState::Features {
         auto_approve,
         streaming,
         debug,
+        hf_token,
         daemon_only_mode,
         mdns_discovery,
         ..
     }) = state.sections.get(&WizardSection::Features)
     {
-        (*auto_approve, *streaming, *debug, *daemon_only_mode, *mdns_discovery)
+        (
+            *auto_approve,
+            *streaming,
+            *debug,
+            if hf_token.is_empty() { None } else { Some(hf_token.clone()) },
+            *daemon_only_mode,
+            *mdns_discovery,
+        )
     } else {
-        (false, true, false, false, false)
+        (false, true, false, None, false, false)
     };
 
     #[cfg(target_os = "macos")]
@@ -940,7 +1400,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         primary_model,
         tool_models,
         claude_api_key,
-        hf_token: None, // TODO: Add HF token input to Models section if needed
+        hf_token: hf_token_val,
         backend_enabled,
         inference_provider,
         execution_target,
@@ -1009,8 +1469,8 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     // Render help text
     let help_text = match state.current_section {
         WizardSection::Themes => "↑/↓: Choose theme | Enter: Next | Tab: Jump to section",
-        WizardSection::Models => "E: Enter API key | S: Skip | Tab: Next",
-        WizardSection::Personas => "↑/↓: Choose style | Enter: Next | Tab: Jump to section",
+        WizardSection::Models => "E: API key  M: Model name  A: Add  D: Remove  Tab: Next",
+        WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next | Tab: Jump",
         WizardSection::Features => "↑/↓: Navigate | Space: Toggle | Enter: Save | Tab: Jump to section",
         WizardSection::Review => "Enter: Save & start | Tab: Go back to edit",
     };
@@ -1034,6 +1494,9 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             tool_models,
             selected_idx,
             editing_mode,
+            editing_model_mode,
+            model_input,
+            adding_provider,
             error,
         }) => render_models_section(
             f,
@@ -1042,17 +1505,24 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             tool_models,
             *selected_idx,
             *editing_mode,
+            *editing_model_mode,
+            model_input,
+            adding_provider.as_ref(),
             error.as_deref(),
         ),
         Some(SectionState::Personas {
             available_personas,
             selected_idx,
             default_persona,
-        }) => render_personas_section(f, area, available_personas, *selected_idx, default_persona),
+            editing_prompt,
+            prompt_input,
+        }) => render_personas_section(f, area, available_personas, *selected_idx, default_persona, *editing_prompt, prompt_input),
         Some(SectionState::Features {
             auto_approve,
             streaming,
             debug,
+            hf_token,
+            editing_hf_token,
             #[cfg(target_os = "macos")]
             gui_automation,
             daemon_only_mode,
@@ -1064,6 +1534,8 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *auto_approve,
             *streaming,
             *debug,
+            hf_token,
+            *editing_hf_token,
             #[cfg(target_os = "macos")]
             *gui_automation,
             *daemon_only_mode,
@@ -1174,6 +1646,9 @@ fn render_models_section(
     tool_models: &[ModelConfig],
     selected_idx: usize,
     editing_mode: bool,
+    editing_model_mode: bool,
+    model_input: &str,
+    adding_provider: Option<&AddProviderStep>,
     error: Option<&str>,
 ) {
     let chunks = Layout::default()
@@ -1182,12 +1657,13 @@ fn render_models_section(
             Constraint::Length(3),  // Title
             Constraint::Length(4),  // Description
             Constraint::Min(6),     // Primary model + tool models
-            Constraint::Length(3),  // Instructions
+            Constraint::Length(3),  // Input panel (edit mode) or dim hint
+            Constraint::Length(2),  // Instructions
             Constraint::Length(2),  // Error (if present)
         ])
         .split(area);
 
-    let title = Paragraph::new("Connect to Claude")
+    let title = Paragraph::new("AI Providers")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
@@ -1199,10 +1675,11 @@ fn render_models_section(
     };
 
     let description_text = if has_key {
-        "Your API key is ready to go.".to_string()
+        format!("Primary provider configured. Press A to add more providers ({} total).",
+            1 + tool_models.len())
     } else {
-        "Paste your Anthropic API key below. Don't have one?\n\
-         Get a free key at: console.anthropic.com/keys".to_string()
+        "Paste your API key below (E), or add a provider with A.\n\
+         No key yet? Get one at console.anthropic.com/keys".to_string()
     };
     let description = Paragraph::new(description_text)
         .style(Style::default().fg(Color::Blue))
@@ -1246,19 +1723,17 @@ fn render_models_section(
         ModelConfig::Remote { provider, api_key, model, .. } => {
             let key_display = if api_key.is_empty() {
                 "[Not configured]".to_string()
-            } else if editing_mode && is_selected {
-                api_key.clone()
             } else {
                 format!("{}...{}", &api_key.chars().take(10).collect::<String>(), api_key.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>())
             };
-            let model_part = if !model.is_empty() {
+            let model_display = if !model.is_empty() {
                 format!(" - {}", model)
             } else {
                 String::new()
             };
             format!(
                 "{}{}{} [{}]{}",
-                prefix, provider, model_part, key_display, suffix
+                prefix, provider, model_display, key_display, suffix
             )
         }
     };
@@ -1295,14 +1770,14 @@ fn render_models_section(
                 )
             }
             ModelConfig::Remote { provider, model, .. } => {
-                let model_part = if !model.is_empty() {
+                let model_display = if !model.is_empty() {
                     format!(" - {}", model)
                 } else {
                     String::new()
                 };
                 format!(
                     "{}{} Tool: {}{}{}",
-                    prefix, checkbox, provider, model_part, suffix
+                    prefix, checkbox, provider, model_display, suffix
                 )
             }
         };
@@ -1314,27 +1789,304 @@ fn render_models_section(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Selected Model"),
+                .title("AI Providers"),
         );
     f.render_widget(list, chunks[2]);
 
-    // Instructions
-    let instructions_text = if editing_mode {
-        "Type your API key | Enter: Done"
+    // Input panel (chunks[3]): bordered text box when in editing mode, dim hint otherwise
+    if editing_mode {
+        // Show current API key in a bordered box so the user sees what they're typing
+        let current_key = if selected_idx == 0 {
+            match primary_model {
+                ModelConfig::Remote { api_key, .. } => api_key.as_str(),
+                _ => "",
+            }
+        } else {
+            match tool_models.get(selected_idx - 1) {
+                Some(ModelConfig::Remote { api_key, .. }) => api_key.as_str(),
+                _ => "",
+            }
+        };
+        let panel = Paragraph::new(format!("{}|", current_key))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Edit API Key")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+        f.render_widget(panel, chunks[3]);
+    } else if editing_model_mode {
+        let panel = Paragraph::new(format!("{}|", model_input))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Edit Model")
+                    .border_style(Style::default().fg(Color::Yellow)),
+            );
+        f.render_widget(panel, chunks[3]);
     } else {
-        "E: Enter API key | S: Skip for now | Tab: Next"
+        let hint = Paragraph::new("Press E to edit API key · M to edit model name")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        f.render_widget(hint, chunks[3]);
+    }
+
+    // Instructions (chunks[4])
+    let instructions_text = if editing_mode {
+        "Type here | Enter/Esc: Save & return"
+    } else if editing_model_mode {
+        "Type here | Enter/Esc: Save & return"
+    } else {
+        "E: API key | M: Model name | A: Add provider | D: Remove | Tab: Next"
     };
     let instructions = Paragraph::new(instructions_text)
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
-    f.render_widget(instructions, chunks[3]);
+    f.render_widget(instructions, chunks[4]);
 
-    // Error message (if present)
+    // Error message (chunks[5], if present)
     if let Some(err) = error {
         let error_widget = Paragraph::new(err)
             .style(Style::default().fg(Color::Red))
             .alignment(Alignment::Center);
-        f.render_widget(error_widget, chunks[4]);
+        f.render_widget(error_widget, chunks[5]);
+    }
+
+    // Render add-provider overlay if active
+    if let Some(step) = adding_provider {
+        render_add_provider_overlay(f, area, step);
+    }
+}
+
+/// Render the add-provider overlay (centered box)
+fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep) {
+    // Center a box that's 60% wide, 50% tall
+    let overlay_width = (area.width * 6 / 10).max(50).min(area.width);
+    let overlay_height = (area.height / 2).max(14).min(area.height);
+    let overlay_x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+    let overlay_y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+    let overlay = Rect::new(overlay_x, overlay_y, overlay_width, overlay_height);
+
+    // Clear the overlay area with a filled block
+    let background = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Add AI Provider ")
+        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(Color::Black));
+    f.render_widget(background, overlay);
+
+    let inner = Rect::new(
+        overlay.x + 1,
+        overlay.y + 1,
+        overlay.width.saturating_sub(2),
+        overlay.height.saturating_sub(2),
+    );
+
+    match step {
+        // ── type selection ───────────────────────────────────────────────────────────
+        AddProviderStep::SelectAddType { selected } => {
+            const ADD_TYPES: &[(&str, &str)] = &[
+                ("Cloud AI provider", "Connect to Claude, GPT-4, Grok, Gemini, Mistral, or Groq"),
+                ("Local ONNX model", "Run a model on this machine (no internet after download)"),
+                ("Scan local network", "Discover other Finch instances running on your LAN"),
+            ];
+            let items: Vec<ListItem> = ADD_TYPES
+                .iter()
+                .enumerate()
+                .map(|(i, (name, desc))| {
+                    let is_sel = i == *selected;
+                    let (prefix, suffix, style) = if is_sel {
+                        (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    } else {
+                        ("    ", "", Style::default().fg(Color::Cyan))
+                    };
+                    let lines = vec![
+                        Line::from(format!("{}{}{}", prefix, name, suffix)).style(style),
+                        Line::from(format!("        {}", desc)).style(Style::default().fg(Color::DarkGray)),
+                    ];
+                    ListItem::new(lines)
+                })
+                .collect();
+            let list = List::new(items)
+                .block(Block::default().title("What do you want to add?  ↑/↓: Move | Enter: Select | Esc: Cancel"));
+            f.render_widget(list, inner);
+        }
+        // ── cloud AI path ─────────────────────────────────────────────────────────────
+        AddProviderStep::SelectProvider { selected } => {
+            let items: Vec<ListItem> = CLOUD_PROVIDERS
+                .iter()
+                .enumerate()
+                .map(|(i, (_, display_name, default_model))| {
+                    let is_sel = i == *selected;
+                    let (prefix, suffix, style) = if is_sel {
+                        (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    } else {
+                        ("    ", "", Style::default().fg(Color::Cyan))
+                    };
+                    ListItem::new(format!("{}{} (e.g. {}){}", prefix, display_name, default_model, suffix)).style(style)
+                })
+                .collect();
+            let list = List::new(items)
+                .block(Block::default().title("Select cloud provider  ↑/↓: Move | Enter: Select | Esc: Back"));
+            f.render_widget(list, inner);
+        }
+        AddProviderStep::EnterApiKey { provider, api_key } => {
+            let hint = CLOUD_PROVIDERS.iter()
+                .find(|(id, _, _)| *id == provider.as_str())
+                .map(|(_, name, _)| format!("{} API key", name))
+                .unwrap_or_else(|| format!("{} API key", provider));
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("Provider: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(provider.as_str(), Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(&hint, Style::default().fg(Color::DarkGray))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Key: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(if api_key.is_empty() { "[type here]" } else { api_key.as_str() }),
+                    Span::styled("|", Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("Enter: Next  Esc: Cancel", Style::default().fg(Color::Yellow))),
+            ];
+            let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+            f.render_widget(para, inner);
+        }
+        AddProviderStep::EnterModel { provider, model, .. } => {
+            let default_model = CLOUD_PROVIDERS.iter()
+                .find(|(id, _, _)| *id == provider.as_str())
+                .map(|(_, _, def)| *def)
+                .unwrap_or("(default)");
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("Provider: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(provider.as_str(), Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("Model name (leave blank for '{}')", default_model),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Model: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(if model.is_empty() { "[type here or press Enter for default]" } else { model.as_str() }),
+                    Span::styled("|", Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("Enter: Add  Esc: Cancel", Style::default().fg(Color::Yellow))),
+            ];
+            let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+            f.render_widget(para, inner);
+        }
+        // ── local ONNX path ───────────────────────────────────────────────────────────
+        AddProviderStep::SelectLocalFamily { selected } => {
+            const LOCAL_FAMILIES: &[(&str, &str)] = &[
+                ("Qwen 2.5",   "Alibaba's general-purpose model — good default choice"),
+                ("Gemma 2",    "Google's efficient model — strong reasoning"),
+                ("Llama 3",    "Meta's open model — broad capability"),
+                ("Mistral",    "Mistral AI — fast and efficient"),
+                ("Phi",        "Microsoft's small model — great on low RAM"),
+                ("DeepSeek",   "DeepSeek's distilled reasoning model"),
+            ];
+            let items: Vec<ListItem> = LOCAL_FAMILIES
+                .iter()
+                .enumerate()
+                .map(|(i, (name, desc))| {
+                    let is_sel = i == *selected;
+                    let (prefix, suffix, style) = if is_sel {
+                        (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    } else {
+                        ("    ", "", Style::default().fg(Color::Cyan))
+                    };
+                    let lines = vec![
+                        Line::from(format!("{}{}{}", prefix, name, suffix)).style(style),
+                        Line::from(format!("        {}", desc)).style(Style::default().fg(Color::DarkGray)),
+                    ];
+                    ListItem::new(lines)
+                })
+                .collect();
+            let list = List::new(items)
+                .block(Block::default().title("Choose model family  ↑/↓: Move | Enter: Next | Esc: Back"));
+            f.render_widget(list, inner);
+        }
+        AddProviderStep::SelectLocalSize { family, selected } => {
+            const LOCAL_SIZES: &[(&str, &str)] = &[
+                ("Small  (~1-3B)", "Best for 8 GB RAM — fast, uses less memory"),
+                ("Medium (~3-9B)", "Best for 16 GB RAM — balanced quality"),
+                ("Large  (~7-14B)", "Best for 32 GB RAM — higher quality"),
+                ("XLarge (14B+)",  "Best for 64 GB RAM — maximum quality"),
+            ];
+            let family_name = family.name();
+            let items: Vec<ListItem> = LOCAL_SIZES
+                .iter()
+                .enumerate()
+                .map(|(i, (size, desc))| {
+                    let is_sel = i == *selected;
+                    let (prefix, suffix, style) = if is_sel {
+                        (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    } else {
+                        ("    ", "", Style::default().fg(Color::Cyan))
+                    };
+                    let lines = vec![
+                        Line::from(format!("{}{}{}", prefix, size, suffix)).style(style),
+                        Line::from(format!("        {}", desc)).style(Style::default().fg(Color::DarkGray)),
+                    ];
+                    ListItem::new(lines)
+                })
+                .collect();
+            let title = format!("Choose size for {}  ↑/↓: Move | Enter: Add | Esc: Back", family_name);
+            let list = List::new(items).block(Block::default().title(title));
+            f.render_widget(list, inner);
+        }
+        // ── network scan path ─────────────────────────────────────────────────────────
+        AddProviderStep::Scanning { .. } => {
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Scanning for Finch agents on local network…",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "(this takes up to 5 seconds)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled("Esc: Cancel", Style::default().fg(Color::Yellow))),
+            ];
+            let para = Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false });
+            f.render_widget(para, inner);
+        }
+        AddProviderStep::SelectAgent { agents, selected } => {
+            let items: Vec<ListItem> = agents
+                .iter()
+                .enumerate()
+                .map(|(i, agent)| {
+                    let is_sel = i == *selected;
+                    let (prefix, suffix, style) = if is_sel {
+                        (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    } else {
+                        ("    ", "", Style::default().fg(Color::Cyan))
+                    };
+                    let label = format!("{}{} @ {}:{}{}", prefix, agent.name, agent.host, agent.port, suffix);
+                    let model_line = format!("        model: {}", agent.model);
+                    let lines = vec![
+                        Line::from(label).style(style),
+                        Line::from(model_line).style(Style::default().fg(Color::DarkGray)),
+                    ];
+                    ListItem::new(lines)
+                })
+                .collect();
+            let list = List::new(items)
+                .block(Block::default().title("Discovered agents  ↑/↓: Move | Enter: Add | Esc: Cancel"));
+            f.render_widget(list, inner);
+        }
     }
 }
 
@@ -1345,6 +2097,8 @@ fn render_personas_section(
     personas: &[PersonaInfo],
     selected_idx: usize,
     default_persona: &str,
+    editing_prompt: bool,
+    prompt_input: &str,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1383,44 +2137,71 @@ fn render_personas_section(
 
     f.render_widget(list, chunks[0]);
 
-    // Right: Preview
+    // Right: Preview or edit
     if let Some(persona) = personas.get(selected_idx) {
-        let preview_lines = vec![
-            Line::from(vec![
-                Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(&persona.name),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "Description: ",
+        if editing_prompt {
+            // Edit mode: show editable text area
+            let edit_text = format!("{}\u{2502}", prompt_input); // show cursor as │
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    "Editing system prompt  (Ctrl+S: Save | Esc: Cancel)",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+            ];
+            for line in edit_text.lines() {
+                lines.push(Line::from(line.to_string()));
+            }
+            let edit_area = Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("Edit System Prompt")
+                    .border_style(Style::default().fg(Color::Yellow)))
+                .wrap(Wrap { trim: false });
+            f.render_widget(edit_area, chunks[1]);
+        } else {
+            let preview_lines = vec![
+                Line::from(vec![
+                    Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(&persona.name),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        "Description: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(&persona.description),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "System Prompt:",
                     Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(&persona.description),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "System Prompt:",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(persona.system_prompt.as_str()),
-        ];
+                )),
+                Line::from(""),
+                Line::from(persona.system_prompt.as_str()),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "E: Edit system prompt",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
 
-        let preview = Paragraph::new(preview_lines)
-            .block(Block::default().borders(Borders::ALL).title("Preview"))
-            .wrap(Wrap { trim: false });
-        f.render_widget(preview, chunks[1]);
+            let preview = Paragraph::new(preview_lines)
+                .block(Block::default().borders(Borders::ALL).title("Preview"))
+                .wrap(Wrap { trim: false });
+            f.render_widget(preview, chunks[1]);
+        }
     }
 }
 
-/// Render Features section (simplified, with arrow key navigation)
+/// Render Features section (all settings visible)
 fn render_features_section(
     f: &mut Frame,
     area: Rect,
     auto_approve: bool,
     streaming: bool,
     debug: bool,
+    hf_token: &str,
+    editing_hf_token: bool,
     #[cfg(target_os = "macos")] gui_automation: bool,
     daemon_only_mode: bool,
     mdns_discovery: bool,
@@ -1440,78 +2221,125 @@ fn render_features_section(
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    // Only show user-facing settings (hide developer options like debug, daemon, mDNS, GUI)
-    let features: Vec<(&str, bool, Option<&str>)> = vec![
-        ("Live responses", streaming, Some("See Finch's answer as it types, word by word")),
-        ("Skip permission prompts", auto_approve, Some("Let Finch run tools without asking each time")),
+    // Build feature list: toggle-able booleans + HF token text field
+    // Index mapping (non-macOS): 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns
+    // Index mapping (macOS):     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns
+
+    #[cfg(not(target_os = "macos"))]
+    let bool_features: Vec<(&str, bool, &str)> = vec![
+        ("Live responses",        streaming,        "See Finch's answer as it types, word by word"),
+        ("Skip permission prompts", auto_approve,   "Let Finch run tools without asking each time"),
+        ("Debug logging",         debug,            "Write verbose logs to ~/.finch/debug.log"),
+        // index 3 = HF token (handled separately below)
+        ("Daemon-only mode",      daemon_only_mode, "Run as background server, no interactive REPL"),
+        ("Advertise on network",  mdns_discovery,   "Broadcast this Finch instance via mDNS so others can discover it"),
+    ];
+    #[cfg(target_os = "macos")]
+    let bool_features: Vec<(&str, bool, &str)> = vec![
+        ("Live responses",        streaming,        "See Finch's answer as it types, word by word"),
+        ("Skip permission prompts", auto_approve,   "Let Finch run tools without asking each time"),
+        ("Debug logging",         debug,            "Write verbose logs to ~/.finch/debug.log"),
+        ("GUI automation",        gui_automation,   "Allow tools to click/type in macOS apps"),
+        // index 4 = HF token (handled separately)
+        ("Daemon-only mode",      daemon_only_mode, "Run as background server, no interactive REPL"),
+        ("Advertise on network",  mdns_discovery,   "Broadcast this Finch instance via mDNS so others can discover it"),
     ];
 
-    // Suppress unused variable warnings for hidden developer options
-    let _ = debug;
+    #[cfg(not(target_os = "macos"))]
+    let hf_idx = 3usize;
     #[cfg(target_os = "macos")]
-    let _ = gui_automation;
-    let _ = daemon_only_mode;
-    let _ = mdns_discovery;
+    let hf_idx = 4usize;
 
-    let items: Vec<ListItem> = features
-        .iter()
-        .enumerate()
-        .map(|(i, (name, enabled, desc))| {
-            // Use emoji checkboxes: ✅ (green check) for ON, ☐ (empty box) for OFF
-            let checkbox = if *enabled { "✅" } else { "☐" };
+    // Build list items interleaving bool features with the HF token row
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut list_idx = 0usize; // tracks which visual row we're building
 
-            let is_selected = i == selected_idx;
-
-            // Make selection VERY obvious with brackets and reverse video
-            let (prefix, suffix, name_style) = if is_selected {
-                (
-                    ">>> ",
-                    " <<<",
-                    Style::default()
-                        .bg(Color::Black)
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                )
+    for (feat_idx, (name, enabled, desc)) in bool_features.iter().enumerate() {
+        // Insert HF token row before the appropriate bool feature
+        if list_idx == hf_idx {
+            let is_hf_selected = selected_idx == hf_idx;
+            let (prefix, suffix, style) = if is_hf_selected {
+                (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD))
             } else {
-                (
-                    "    ",
-                    "",
-                    if *enabled {
-                        Style::default().fg(Color::Blue)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    }
-                )
+                ("    ", "", Style::default().fg(Color::Cyan))
             };
+            let token_display = if editing_hf_token {
+                format!("{}HF Token: {}|{}", prefix, hf_token, suffix)
+            } else if hf_token.is_empty() {
+                format!("{}HF Token: [not set — press E to enter]{}", prefix, suffix)
+            } else {
+                let masked = format!("{}...{}", &hf_token.chars().take(4).collect::<String>(),
+                    hf_token.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>());
+                format!("{}HF Token: {}{}", prefix, masked, suffix)
+            };
+            let hf_lines = vec![
+                Line::from(Span::styled(token_display, style)),
+                Line::from(Span::styled("        For model downloads from HuggingFace", Style::default().fg(Color::DarkGray))),
+            ];
+            items.push(ListItem::new(hf_lines));
+            list_idx += 1;
+        }
 
-            let mut lines = vec![Line::from(vec![
+        let is_selected = list_idx == selected_idx;
+        let checkbox = if *enabled { "✅" } else { "☐" };
+        let (prefix, suffix, name_style) = if is_selected {
+            (">>> ", " <<<", Style::default().bg(Color::Black).fg(Color::White).add_modifier(Modifier::BOLD))
+        } else {
+            ("    ", "", if *enabled { Style::default().fg(Color::Blue) } else { Style::default().fg(Color::DarkGray) })
+        };
+
+        let feat_lines = vec![
+            Line::from(vec![
                 Span::raw(prefix),
                 Span::raw(format!("{} ", checkbox)),
                 Span::styled(*name, name_style.clone()),
                 Span::styled(suffix, name_style),
-            ])];
+            ]),
+            Line::from(vec![
+                Span::raw("        "),
+                Span::styled(*desc, Style::default().fg(Color::DarkGray)),
+            ]),
+        ];
+        items.push(ListItem::new(feat_lines));
+        list_idx += 1;
+    }
 
-            if let Some(description) = desc {
-                let desc_indent = if is_selected { "        " } else { "        " };
-                lines.push(Line::from(vec![
-                    Span::raw(desc_indent),
-                    Span::styled(*description, Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-
-            ListItem::new(lines)
-        })
-        .collect();
+    // If hf_idx is after all bool features, append it at the end
+    if hf_idx >= list_idx {
+        let is_hf_selected = selected_idx == list_idx;
+        let (prefix, suffix, style) = if is_hf_selected {
+            (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD))
+        } else {
+            ("    ", "", Style::default().fg(Color::Cyan))
+        };
+        let token_display = if editing_hf_token {
+            format!("{}HF Token: {}|{}", prefix, hf_token, suffix)
+        } else if hf_token.is_empty() {
+            format!("{}HF Token: [not set — press E to enter]{}", prefix, suffix)
+        } else {
+            let masked = format!("{}...{}", &hf_token.chars().take(4).collect::<String>(),
+                hf_token.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>());
+            format!("{}HF Token: {}{}", prefix, masked, suffix)
+        };
+        let hf_lines = vec![
+            Line::from(Span::styled(token_display, style)),
+            Line::from(Span::styled("        For model downloads from HuggingFace", Style::default().fg(Color::DarkGray))),
+        ];
+        items.push(ListItem::new(hf_lines));
+    }
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("Options"));
     f.render_widget(list, chunks[1]);
 
-    let instructions = Paragraph::new(
-        "↑/↓: Move | Space: Toggle on/off | Enter: Continue"
-    )
-    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-    .alignment(Alignment::Center);
+    let instructions_text = if editing_hf_token {
+        "Type HuggingFace token | Enter/Esc: Done"
+    } else {
+        "↑/↓: Move | Space: Toggle | E: Edit HF token | Enter: Continue"
+    };
+    let instructions = Paragraph::new(instructions_text)
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
     f.render_widget(instructions, chunks[2]);
 }
 
