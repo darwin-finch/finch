@@ -655,20 +655,25 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     }
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
-                    // Enter edit mode
+                    // Enter edit mode for primary model
                     *editing_mode = true;
                 }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    // Skip - just move to next section without validation
+                    state.mark_completed(WizardSection::Models);
+                    state.next_section();
+                }
                 KeyCode::Enter => {
-                    // Validate and proceed
+                    // Try to validate, but if it fails, show a helpful error
                     if !primary_model.is_configured() {
-                        *error = Some("Primary model must be configured with an API key".to_string());
+                        *error = Some("Primary model not configured. Press 'E' to edit or 'S' to skip.".to_string());
                         return Ok(false);
                     }
 
                     // Validate API key format
                     if let ModelConfig::Remote { provider, api_key, .. } = primary_model {
-                        if !api_key.starts_with("sk-") && provider == "claude" {
-                            *error = Some("Claude API key must start with 'sk-ant-'".to_string());
+                        if provider == "claude" && !api_key.starts_with("sk-ant-") {
+                            *error = Some("Invalid API key. Press 'E' to edit or 'S' to skip.".to_string());
                             return Ok(false);
                         }
                     }
@@ -1008,7 +1013,7 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     // Render help text
     let help_text = match state.current_section {
         WizardSection::Themes => "Tab/Arrows: Navigate sections | ↑/↓: Select theme | Enter: Next | Esc: Cancel",
-        WizardSection::Models => "Tab/Arrows: Navigate sections | ↑/↓: Navigate | E: Edit | Space: Toggle | Enter: Next",
+        WizardSection::Models => "Tab: Next section | E: Edit | S: Skip | Esc: Cancel",
         WizardSection::Personas => "Tab/Arrows: Navigate sections | ↑/↓: Select persona | Enter: Set as default",
         WizardSection::Features => "Tab/Arrows: Navigate sections | ↑/↓: Navigate | Space: Toggle | Enter: Next",
         WizardSection::Review => "Tab/Arrows: Navigate sections | Enter/y: Confirm | n/Esc: Cancel",
@@ -1167,16 +1172,26 @@ fn render_models_section(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // Title
-            Constraint::Min(8),     // Primary model + tool models
+            Constraint::Length(4),  // Description
+            Constraint::Min(6),     // Primary model + tool models
             Constraint::Length(3),  // Instructions
             Constraint::Length(2),  // Error (if present)
         ])
         .split(area);
 
-    let title = Paragraph::new("Model Configuration")
+    let title = Paragraph::new("Model Configuration (Optional)")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
+
+    let description = Paragraph::new(
+        "Configure which AI model will answer your queries.\n\
+         PRIMARY = Main model used by default. Press 'S' to skip and use defaults."
+    )
+    .style(Style::default().fg(Color::Blue))
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: true });
+    f.render_widget(description, chunks[1]);
 
     // Build list items: primary model + tool models
     let mut items = vec![];
@@ -1261,27 +1276,27 @@ fn render_models_section(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Models (Primary + Tools)"),
+                .title("Current Configuration"),
         );
-    f.render_widget(list, chunks[1]);
+    f.render_widget(list, chunks[2]);
 
     // Instructions
     let instructions_text = if editing_mode {
         "Editing API key | Type to edit | Enter/Esc: Done"
     } else {
-        "↑/↓: Navigate | E: Edit | Space: Toggle (tools) | Enter: Next"
+        "E: Edit primary model | S: Skip (use default) | Tab: Next section"
     };
     let instructions = Paragraph::new(instructions_text)
-        .style(Style::default().fg(Color::Yellow))
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
-    f.render_widget(instructions, chunks[2]);
+    f.render_widget(instructions, chunks[3]);
 
     // Error message (if present)
     if let Some(err) = error {
         let error_widget = Paragraph::new(err)
             .style(Style::default().fg(Color::Red))
             .alignment(Alignment::Center);
-        f.render_widget(error_widget, chunks[3]);
+        f.render_widget(error_widget, chunks[4]);
     }
 }
 
@@ -1417,24 +1432,28 @@ fn render_features_section(
         .iter()
         .enumerate()
         .map(|(i, (name, enabled, desc))| {
-            let checkbox = if *enabled { "☑" } else { "☐" };
+            // Use emoji checkboxes: ✅ (green check) for ON, ☐ (empty box) for OFF
+            let checkbox = if *enabled { "✅" } else { "☐" };
             let marker = if i == selected_idx { "▶ " } else { "  " };
-            let style = if i == selected_idx {
+
+            // Style based on selection state (not enabled state, for accessibility)
+            let name_style = if i == selected_idx {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
             } else if *enabled {
-                Style::default().fg(Color::Green)
+                Style::default().fg(Color::Blue)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(Color::DarkGray)
             };
 
             let mut lines = vec![Line::from(vec![
                 Span::raw(marker),
-                Span::styled(format!("{} {}", checkbox, name), style),
+                Span::raw(format!("{} ", checkbox)),
+                Span::styled(*name, name_style),
             ])];
 
             if let Some(description) = desc {
                 lines.push(Line::from(vec![
-                    Span::raw("   "),
+                    Span::raw("     "),
                     Span::styled(*description, Style::default().fg(Color::DarkGray)),
                 ]));
             }
@@ -2712,7 +2731,7 @@ fn render_model_family_selection(f: &mut Frame, area: Rect, families: &[ModelFam
         .iter()
         .map(|family| {
             ListItem::new(Line::from(vec![
-                Span::styled(family.name(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(family.name(), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
                 Span::raw(" - "),
                 Span::styled(family.description(), Style::default().fg(Color::DarkGray)),
             ]))
@@ -2769,7 +2788,7 @@ fn render_model_size_selection(f: &mut Frame, area: Rect, sizes: &[ModelSize], s
             let style = if is_recommended {
                 Style::default().fg(Color::Green)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(Color::Blue)
             };
 
             ListItem::new(Line::from(vec![
@@ -2982,7 +3001,7 @@ fn render_teacher_config(f: &mut Frame, area: Rect, teachers: &[TeacherEntry], s
                         format!("{}. ", idx + 1),
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                     ),
-                    Span::styled(display_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(display_name, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
                     Span::raw("  "),
                     Span::styled(priority_label, priority_style),
                 ]),
