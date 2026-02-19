@@ -189,6 +189,7 @@ pub struct ToolExecutor {
     registry: ToolRegistry,
     permissions: PermissionManager,
     confirmation_cache: ToolConfirmationCache,
+    mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
 }
 
 impl ToolExecutor {
@@ -202,7 +203,44 @@ impl ToolExecutor {
             registry,
             permissions,
             confirmation_cache: ToolConfirmationCache::new(patterns_path)?,
+            mcp_client: None,
         })
+    }
+
+    /// Add MCP client to enable MCP tools
+    pub async fn with_mcp(mut self, config: &crate::config::Config) -> Result<Self> {
+        if !config.mcp_servers.is_empty() {
+            info!("Initializing MCP client with {} servers", config.mcp_servers.len());
+            let mcp_client = crate::tools::mcp::McpClient::from_config(&config.mcp_servers).await?;
+            let connected_servers = mcp_client.list_servers().await;
+            info!("MCP client initialized with {} connected servers", connected_servers.len());
+            self.mcp_client = Some(Arc::new(mcp_client));
+        }
+        Ok(self)
+    }
+
+    /// Get list of all available tools (built-in + MCP)
+    pub async fn list_all_tools(&self) -> Vec<crate::tools::types::ToolDefinition> {
+        let mut tools = Vec::new();
+
+        // Add built-in tools from registry
+        for tool_name in self.registry.tool_names() {
+            if let Some(tool) = self.registry.get(&tool_name) {
+                tools.push(crate::tools::types::ToolDefinition {
+                    name: tool_name.to_string(),
+                    description: tool.description().to_string(),
+                    input_schema: tool.input_schema(),
+                });
+            }
+        }
+
+        // Add MCP tools if client is available
+        if let Some(mcp) = &self.mcp_client {
+            let mcp_tools = mcp.list_tools().await;
+            tools.extend(mcp_tools);
+        }
+
+        tools
     }
 
     /// Check if a tool signature is pre-approved (returns approval source)
@@ -275,13 +313,39 @@ impl ToolExecutor {
     {
         info!("Executing tool: {}", tool_use.name);
 
-        // 1. Check if tool exists
+        // 1. Check if it's an MCP tool
+        if tool_use.name.starts_with("mcp_") {
+            if let Some(mcp) = &self.mcp_client {
+                info!("Routing to MCP client: {}", tool_use.name);
+                match mcp.execute_tool(&tool_use.name, tool_use.input.clone()).await {
+                    Ok(output) => {
+                        info!("MCP tool executed successfully");
+                        return Ok(ToolResult::success(tool_use.id.clone(), output));
+                    }
+                    Err(e) => {
+                        error!("MCP tool execution failed: {}", e);
+                        return Ok(ToolResult::error(
+                            tool_use.id.clone(),
+                            format!("MCP execution error: {}", e),
+                        ));
+                    }
+                }
+            } else {
+                error!("MCP tool requested but no MCP client available");
+                return Ok(ToolResult::error(
+                    tool_use.id.clone(),
+                    "MCP tools not available (no MCP servers configured)".to_string(),
+                ));
+            }
+        }
+
+        // 2. Check if built-in tool exists
         let tool = self
             .registry
             .get(&tool_use.name)
             .context(format!("Tool '{}' not found", tool_use.name))?;
 
-        // 2. Check permissions
+        // 3. Check permissions
         let permission_check = self
             .permissions
             .check_tool_use(&tool_use.name, &tool_use.input);
