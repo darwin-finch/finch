@@ -297,34 +297,37 @@ macro_rules! status_clear_operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::status_bar::StatusLineType;
 
     #[test]
     fn test_global_access() {
         let output = global_output();
+        let before = output.len();
         output.write_user("Test");
-        assert_eq!(output.len(), 1);
+        assert!(output.len() > before);
     }
 
     #[test]
-    #[ignore] // Flaky test - global state shared between tests makes count unreliable
     fn test_macros() {
-        // Clear any previous test data
-        global_output().clear();
-
+        // output_user! always writes to buffer; output_response!/output_status!
+        // are no-ops in non-interactive (test) mode — just verify no panics
+        let before = global_output().len();
         output_user!("Hello");
         output_response!("Response");
         output_status!("Status message");
-
-        assert_eq!(global_output().len(), 3);
+        assert!(global_output().len() >= before + 1, "output_user! must write to buffer");
     }
 
     #[test]
-    #[ignore] // Flaky test - global status state shared between tests
     fn test_status_macros() {
-        status_training!(10, 0.5, 0.8);
-        status_operation!("Testing");
-
-        let lines = global_status().get_lines();
-        assert_eq!(lines.len(), 2);
+        // Macros are no-ops in non-interactive mode, so test StatusBar API directly
+        let status = global_status();
+        status.update_training_stats(10, 0.5, 0.8);
+        status.update_operation("Testing");
+        let lines = status.get_lines();
+        let has_training = lines.iter().any(|l| matches!(l.line_type, StatusLineType::TrainingStats));
+        let has_operation = lines.iter().any(|l| matches!(l.line_type, StatusLineType::OperationStatus));
+        assert!(has_training, "Expected TrainingStats line");
+        assert!(has_operation, "Expected OperationStatus line");
     }
 }

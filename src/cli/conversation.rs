@@ -254,7 +254,7 @@ impl Default for ConversationHistory {
 ///
 /// # Usage
 ///
-/// ```rust,ignore
+/// ```text
 /// use crate::cli::conversation::{ConversationHistory, ConversationCompactor};
 /// use crate::providers::fallback_chain::FallbackChain;
 ///
@@ -277,7 +277,7 @@ impl Default for ConversationHistory {
 /// - Async: Yes, runs in background (non-blocking)
 ///
 /// Example integration:
-/// ```rust,ignore
+/// ```text
 /// // In event_loop.rs, after query completes:
 /// if self.compactor.should_compact(&self.conversation) {
 ///     tokio::spawn(async move {

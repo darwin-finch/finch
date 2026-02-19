@@ -135,6 +135,7 @@ impl ModelSize {
     /// Convert legacy QwenSize to generic ModelSize
     pub fn from_qwen(qwen_size: QwenSize) -> Self {
         match qwen_size {
+            QwenSize::Qwen500M => Self::Small,  // 0.5B maps to Small slot
             QwenSize::Qwen1_5B => Self::Small,
             QwenSize::Qwen3B => Self::Medium,
             QwenSize::Qwen7B => Self::Large,

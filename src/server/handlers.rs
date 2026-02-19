@@ -36,6 +36,10 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         // OpenAI-compatible endpoints
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/v1/models", get(handle_list_models))
+        // Node identity and work stats (distributed worker network)
+        .route("/v1/node/info", get(handle_node_info))
+        .route("/v1/node/stats", get(handle_node_stats))
+        // Note: node handlers load config independently (no AgentServer state needed)
         // Health and metrics
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
@@ -444,4 +448,24 @@ where
     fn from(err: E) -> Self {
         Self(err.into())
     }
+}
+
+/// Handle GET /v1/node/info — return this node's identity and capabilities
+pub async fn handle_node_info() -> Result<Json<serde_json::Value>, AppError> {
+    use crate::node::NodeInfo;
+    use crate::config::load_config;
+
+    let has_teacher = load_config()
+        .map(|c| c.active_teacher().is_some())
+        .unwrap_or(false);
+    let info = NodeInfo::load(has_teacher)?;
+    Ok(Json(serde_json::to_value(&info)?))
+}
+
+/// Handle GET /v1/node/stats — return this node's work statistics
+pub async fn handle_node_stats() -> Result<Json<serde_json::Value>, AppError> {
+    use crate::node::WorkTracker;
+
+    let stats = WorkTracker::load_persisted()?;
+    Ok(Json(serde_json::to_value(&stats)?))
 }

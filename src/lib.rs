@@ -21,6 +21,7 @@ pub mod providers; // Multi-provider LLM support
 pub mod router;
 pub mod scheduling; // Autonomous task scheduling (Phase 5)
 pub mod server; // HTTP daemon mode (Phase 1)
+pub mod node;    // Node identity and work statistics (distributed worker)
 pub mod service; // Service discovery (Phase 3)
 pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2)

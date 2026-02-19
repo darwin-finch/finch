@@ -9,7 +9,7 @@ use anyhow::Result;
 ///
 /// Phase 4: This is a stub. Use tokenizers crate directly with ONNX models:
 ///
-/// ```rust,ignore
+/// ```text
 /// use tokenizers::Tokenizer;
 /// let tokenizer = Tokenizer::from_file("tokenizer.json")?;
 /// let encoding = tokenizer.encode(text, true)?;

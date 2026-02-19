@@ -76,6 +76,20 @@ enum Command {
         /// Query text
         query: String,
     },
+    /// Run as a network worker node (accepts queries from other machines)
+    ///
+    /// Binds to 0.0.0.0 by default so other machines on the network can
+    /// delegate work to this node. Shows node identity and capabilities.
+    Worker {
+        /// Bind address (default: 0.0.0.0:8000 — accepts external connections)
+        #[arg(long, default_value = "0.0.0.0:8000")]
+        bind: String,
+        /// Show node info and exit without starting server
+        #[arg(long)]
+        info: bool,
+    },
+    /// Show this node's identity and capabilities
+    NodeInfo,
 }
 
 #[derive(Parser, Debug)]
@@ -182,6 +196,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::Query { query }) => {
             return run_query(&query).await;
+        }
+        Some(Command::Worker { bind, info }) => {
+            return run_worker(bind, info).await;
+        }
+        Some(Command::NodeInfo) => {
+            return run_node_info().await;
         }
         None => {
             // Fall through to REPL mode (check for piped input first)
@@ -1159,4 +1179,70 @@ async fn run_setup() -> Result<()> {
     println!("  Or start the daemon: finch daemon\n");
 
     Ok(())
+}
+
+/// Show this node's identity and capabilities
+async fn run_node_info() -> Result<()> {
+    use finch::node::NodeInfo;
+
+    let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
+    let has_teacher = config.active_teacher().is_some();
+    let info = NodeInfo::load(has_teacher)?;
+
+    println!("╔══════════════════════════════════════╗");
+    println!("║           finch node info            ║");
+    println!("╚══════════════════════════════════════╝");
+    println!("  Node ID  : {}", info.identity.id);
+    println!("  Name     : {}", info.identity.name);
+    println!("  Version  : {}", info.identity.version);
+    println!("  RAM      : {}GB", info.capabilities.ram_gb);
+    println!("  OS       : {}", info.capabilities.os);
+    if let Some(model) = &info.capabilities.local_model {
+        println!("  Model    : {}", model);
+    } else {
+        println!("  Model    : cloud-only (teacher API)");
+    }
+    println!("  Teacher  : {}", if info.capabilities.has_teacher_api { "configured" } else { "none" });
+    println!();
+    println!("  To run as a worker node:");
+    println!("    finch worker");
+    println!("  To accept queries from other machines:");
+    println!("    finch worker --bind 0.0.0.0:8000");
+
+    Ok(())
+}
+
+/// Run as a network worker node — accepts queries from external machines
+async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
+    use finch::node::NodeInfo;
+
+    let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
+    let has_teacher = config.active_teacher().is_some();
+    let info = NodeInfo::load(has_teacher)?;
+
+    // Always show node identity when starting as worker
+    println!("╔══════════════════════════════════════╗");
+    println!("║         finch worker node            ║");
+    println!("╚══════════════════════════════════════╝");
+    println!("  Node ID  : {}", info.identity.id);
+    println!("  Name     : {}", info.identity.name);
+    println!("  RAM      : {}GB", info.capabilities.ram_gb);
+    if let Some(model) = &info.capabilities.local_model {
+        println!("  Model    : {} (loading in background)", model);
+    } else {
+        println!("  Model    : cloud-only — forwarding to teacher API");
+    }
+    println!("  Bind     : {}", bind_address);
+    println!();
+
+    if info_only {
+        return Ok(());
+    }
+
+    // Start the daemon on the specified address (usually 0.0.0.0)
+    println!("  Starting worker daemon...");
+    println!("  Workers on your LAN can find this node via mDNS (_finch._tcp.local.)");
+    println!("  Press Ctrl+C to stop.\n");
+
+    run_daemon(bind_address).await
 }

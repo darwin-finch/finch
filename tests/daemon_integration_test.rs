@@ -9,6 +9,7 @@ use anyhow::Result;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::time::sleep;
+use dirs;
 
 /// Helper to check if daemon is running on a port
 async fn is_daemon_running(port: u16) -> bool {
@@ -51,6 +52,17 @@ fn run_query(query: &str) -> Result<String> {
 #[ignore] // Requires daemon binary and network
 async fn test_daemon_spawn_and_health() -> Result<()> {
     let port = 11440; // Use different port to avoid conflicts
+
+    // Skip if a daemon is already running — finch enforces a single daemon
+    // globally via PID file, so we cannot spawn a second one for testing
+    let pid_file = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".finch")
+        .join("daemon.pid");
+    if pid_file.exists() {
+        println!("Skipping test_daemon_spawn_and_health: daemon already running");
+        return Ok(());
+    }
 
     // Start daemon
     let mut daemon = start_daemon(port)?;

@@ -18,10 +18,10 @@ impl ModelSize {
     /// Select appropriate model size based on available RAM
     pub fn from_ram(ram_gb: usize) -> Self {
         match ram_gb {
-            0..=8 => ModelSize::Small,
-            9..=16 => ModelSize::Medium,
-            17..=32 => ModelSize::Large,
-            _ => ModelSize::XLarge,
+            0..=5 => ModelSize::Small,   // 0.5B — old laptops / 4GB machines
+            6..=11 => ModelSize::Medium,  // 1.5B — 8GB machines
+            12..=23 => ModelSize::Large,  // 3B   — 16GB machines
+            _ => ModelSize::XLarge,       // 7B   — 32GB+ machines
         }
     }
 
@@ -69,8 +69,8 @@ pub struct OnnxLoadConfig {
 impl OnnxLoadConfig {
     /// Create config with automatic RAM-based model selection
     pub fn from_system_ram(cache_dir: PathBuf) -> Self {
-        let ram_gb = sysinfo::System::new_all().total_memory() / (1024 * 1024 * 1024);
-        let size = ModelSize::from_ram(ram_gb as usize);
+        let ram_gb = crate::models::model_selector::ModelSelector::get_total_ram_gb();
+        let size = ModelSize::from_ram(ram_gb);
         let model_name = format!("Qwen2.5-{}-Instruct", size.to_string());
         let repo_id = format!("onnx-community/{}", model_name);
 
@@ -160,11 +160,12 @@ mod tests {
 
     #[test]
     fn test_model_size_from_ram() {
-        assert_eq!(ModelSize::from_ram(4), ModelSize::Small);
-        assert_eq!(ModelSize::from_ram(8), ModelSize::Small);
-        assert_eq!(ModelSize::from_ram(16), ModelSize::Medium);
-        assert_eq!(ModelSize::from_ram(32), ModelSize::Large);
-        assert_eq!(ModelSize::from_ram(64), ModelSize::XLarge);
+        assert_eq!(ModelSize::from_ram(4), ModelSize::Small);   // old laptop
+        assert_eq!(ModelSize::from_ram(5), ModelSize::Small);   // 5GB
+        assert_eq!(ModelSize::from_ram(8), ModelSize::Medium);  // 8GB machine
+        assert_eq!(ModelSize::from_ram(16), ModelSize::Large);  // 16GB machine
+        assert_eq!(ModelSize::from_ram(32), ModelSize::XLarge); // 32GB machine
+        assert_eq!(ModelSize::from_ram(64), ModelSize::XLarge); // 64GB machine
     }
 
     #[test]

@@ -137,45 +137,4 @@ mod tests {
         assert!(router.is_ok());
     }
 
-    #[tokio::test]
-    #[ignore] // ModelEnsemble removed in Phase 4 refactoring
-    async fn test_routing_cold_start() -> Result<()> {
-        let router = ModelRouter::new()?;
-
-        // During cold start (first 50 queries), should always forward
-        let decision = router.route("Hello, world!").await?;
-
-        match decision {
-            RouteDecision::Forward { .. } => Ok(()),
-            _ => panic!("Expected Forward during cold start"),
-        }
-    }
-
-    #[tokio::test]
-    #[ignore] // ModelEnsemble removed in Phase 4 refactoring
-    async fn test_local_generation() -> Result<()> {
-        let router = ModelRouter::new()?;
-        let query = "What is 2+2?";
-
-        // Should return some response (even if nonsense with random weights)
-        let response = router.generate_local(query).await?;
-        assert!(!response.is_empty());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    #[ignore] // ModelEnsemble removed in Phase 4 refactoring
-    async fn test_validation() -> Result<()> {
-        let router = ModelRouter::new()?;
-        let query = "What is Rust?";
-        let response = "Rust is a programming language.";
-
-        // With random weights, this will return a random decision
-        // Just test that it doesn't crash
-        let is_valid = router.validate(query, response).await?;
-        assert!(is_valid || !is_valid); // Always true, just testing it runs
-
-        Ok(())
-    }
 }

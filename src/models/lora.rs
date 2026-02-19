@@ -83,7 +83,7 @@ impl Default for LoRAConfig {
 /// LoRA adapter for fine-tuning pre-trained models
 ///
 /// # Example (Future Usage)
-/// ```rust,ignore
+/// ```text
 /// use finch::models::{GeneratorModel, LoRATrainingAdapter, LoRAConfig};
 ///
 /// // Load pre-trained Qwen model

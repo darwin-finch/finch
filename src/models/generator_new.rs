@@ -162,7 +162,7 @@ impl GeneratorModel {
     /// * `learning_rate` - Learning rate for optimization
     ///
     /// # Example (Future Usage)
-    /// ```rust,ignore
+    /// ```text
     /// use finch::models::{GeneratorModel, LoRAConfig};
     ///
     /// let mut generator = GeneratorModel::new(config)?;
@@ -238,20 +238,6 @@ impl Saveable for GeneratorModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::common::{DevicePreference, ModelConfig};
-
-    #[test]
-    #[ignore] // RandomInit removed in Phase 4 refactoring (use ONNX pre-trained models)
-    fn test_generator_random_init() {
-        let model_config = ModelConfig::small();
-        let config = GeneratorConfig::RandomInit(model_config);
-
-        let generator = GeneratorModel::new(config);
-        assert!(generator.is_ok());
-
-        let gen = generator.unwrap();
-        assert_eq!(gen.name(), "Custom Transformer (Random Init)");
-    }
 
     #[test]
     #[ignore] // Requires downloaded Qwen model
