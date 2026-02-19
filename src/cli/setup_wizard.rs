@@ -50,7 +50,7 @@ impl WizardSection {
     fn name(&self) -> &str {
         match self {
             Self::Themes => "Themes",
-            Self::Models => "Models",
+            Self::Models => "Primary Model",
             Self::Personas => "Personas",
             Self::Features => "Features",
             Self::Review => "Review",
@@ -1179,14 +1179,14 @@ fn render_models_section(
         ])
         .split(area);
 
-    let title = Paragraph::new("Model Configuration (Optional)")
+    let title = Paragraph::new("Primary Model Configuration (Optional)")
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
     let description = Paragraph::new(
-        "Configure which AI model will answer your queries.\n\
-         PRIMARY = Main model used by default. Press 'S' to skip and use defaults."
+        "Configure which AI model will answer your queries by default.\n\
+         Press 'S' to skip and use Claude as the default."
     )
     .style(Style::default().fg(Color::Blue))
     .alignment(Alignment::Center)
@@ -1199,15 +1199,15 @@ fn render_models_section(
     // Primary model
     let primary_marker = if selected_idx == 0 { "▶ " } else { "  " };
     let primary_style = if selected_idx == 0 {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Green)
+        Style::default().fg(Color::Blue)
     };
 
     let primary_display = match primary_model {
         ModelConfig::Local { family, size, execution, .. } => {
             format!(
-                "{}★ PRIMARY: Local {} {} ({})",
+                "{}Local {} {} ({})",
                 primary_marker,
                 family.name(),
                 model_size_display(size),
@@ -1228,7 +1228,7 @@ fn render_models_section(
                 String::new()
             };
             format!(
-                "{}★ PRIMARY: {}{} [{}]",
+                "{}{}{} [{}]",
                 primary_marker, provider, model_part, key_display
             )
         }
@@ -1276,7 +1276,7 @@ fn render_models_section(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Current Configuration"),
+                .title("Selected Model"),
         );
     f.render_widget(list, chunks[2]);
 
