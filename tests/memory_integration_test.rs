@@ -4,8 +4,8 @@ use finch::memory::{MemorySystem, MemoryConfig, EmbeddingEngine, TfIdfEmbedding,
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
-#[test]
-fn test_memory_system_creation() -> Result<()> {
+#[tokio::test]
+async fn test_memory_system_creation() -> Result<()> {
     let temp = NamedTempFile::new()?;
     let config = MemoryConfig {
         db_path: temp.path().to_path_buf(),
@@ -15,7 +15,7 @@ fn test_memory_system_creation() -> Result<()> {
     };
 
     let memory = MemorySystem::new(config)?;
-    let stats = memory.stats()?;
+    let stats = memory.stats().await?;
 
     assert_eq!(stats.conversation_count, 0);
     assert_eq!(stats.tree_node_count, 0);
@@ -23,8 +23,8 @@ fn test_memory_system_creation() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_insert_and_query() -> Result<()> {
+#[tokio::test]
+async fn test_insert_and_query() -> Result<()> {
     let temp = NamedTempFile::new()?;
     let config = MemoryConfig {
         db_path: temp.path().to_path_buf(),
@@ -39,24 +39,24 @@ fn test_insert_and_query() -> Result<()> {
         "How do I use Rust lifetimes?",
         Some("local"),
         Some("test-session"),
-    )?;
+    ).await?;
 
     memory.insert_conversation(
         "assistant",
         "Lifetimes in Rust ensure references are valid...",
         Some("local"),
         Some("test-session"),
-    )?;
+    ).await?;
 
     memory.insert_conversation(
         "user",
         "What is Python asyncio?",
         Some("local"),
         Some("test-session"),
-    )?;
+    ).await?;
 
     // Query for Rust-related content
-    let results = memory.query("Rust programming", Some(3))?;
+    let results = memory.query("Rust programming", Some(3)).await?;
 
     assert!(!results.is_empty());
     // Should find Rust-related conversations
@@ -65,8 +65,8 @@ fn test_insert_and_query() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_memory_stats() -> Result<()> {
+#[tokio::test]
+async fn test_memory_stats() -> Result<()> {
     let temp = NamedTempFile::new()?;
     let config = MemoryConfig {
         db_path: temp.path().to_path_buf(),
@@ -82,18 +82,18 @@ fn test_memory_stats() -> Result<()> {
             &format!("Question {}", i),
             Some("local"),
             None,
-        )?;
+        ).await?;
     }
 
-    let stats = memory.stats()?;
+    let stats = memory.stats().await?;
     assert_eq!(stats.conversation_count, 10);
     assert_eq!(stats.tree_node_count, 10);  // One node per conversation
 
     Ok(())
 }
 
-#[test]
-fn test_get_recent_conversations() -> Result<()> {
+#[tokio::test]
+async fn test_get_recent_conversations() -> Result<()> {
     let temp = NamedTempFile::new()?;
     let config = MemoryConfig {
         db_path: temp.path().to_path_buf(),
@@ -109,11 +109,11 @@ fn test_get_recent_conversations() -> Result<()> {
             &format!("Message {}", i),
             Some("local"),
             None,
-        )?;
+        ).await?;
     }
 
     // Get recent 3
-    let recent = memory.get_recent_conversations(3)?;
+    let recent = memory.get_recent_conversations(3).await?;
 
     assert_eq!(recent.len(), 3);
     // Should be in reverse chronological order
@@ -124,8 +124,8 @@ fn test_get_recent_conversations() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_embedding_similarity() -> Result<()> {
+#[tokio::test]
+async fn test_embedding_similarity() -> Result<()> {
     let engine = TfIdfEmbedding::new();
 
     let emb1 = engine.embed("rust programming language")?;
@@ -142,8 +142,8 @@ fn test_embedding_similarity() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_memtree_insertion() -> Result<()> {
+#[tokio::test]
+async fn test_memtree_insertion() -> Result<()> {
     let mut tree = MemTree::new();
     let engine = TfIdfEmbedding::new();
 
@@ -173,8 +173,8 @@ fn test_memtree_insertion() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_memory_persistence() -> Result<()> {
+#[tokio::test]
+async fn test_memory_persistence() -> Result<()> {
     let temp = NamedTempFile::new()?;
     let db_path = temp.path().to_path_buf();
 
@@ -191,7 +191,7 @@ fn test_memory_persistence() -> Result<()> {
             "Test persistence",
             Some("local"),
             None,
-        )?;
+        ).await?;
     }
 
     // Reopen and verify data persists
@@ -202,7 +202,7 @@ fn test_memory_persistence() -> Result<()> {
         };
 
         let memory = MemorySystem::new(config)?;
-        let stats = memory.stats()?;
+        let stats = memory.stats().await?;
 
         assert_eq!(stats.conversation_count, 1);
     }
@@ -210,8 +210,8 @@ fn test_memory_persistence() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_memory_disabled() -> Result<()> {
+#[tokio::test]
+async fn test_memory_disabled() -> Result<()> {
     // Test that memory can be disabled via config
     let temp = NamedTempFile::new()?;
     let config = MemoryConfig {

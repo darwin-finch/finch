@@ -15,7 +15,8 @@ pub use memtree::{MemTree, TreeNode, NodeId};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Configuration for memory system
 #[derive(Debug, Clone)]
@@ -48,8 +49,8 @@ impl Default for MemoryConfig {
 
 /// Memory system with MemTree and SQLite storage
 pub struct MemorySystem {
-    db: Arc<RwLock<Connection>>,
-    tree: Arc<RwLock<MemTree>>,
+    db: Arc<Mutex<Connection>>,
+    tree: Arc<Mutex<MemTree>>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
     config: MemoryConfig,
 }
@@ -83,15 +84,15 @@ impl MemorySystem {
         // (For now, start with empty tree - TODO: implement persistence)
 
         Ok(Self {
-            db: Arc::new(RwLock::new(conn)),
-            tree: Arc::new(RwLock::new(tree)),
+            db: Arc::new(Mutex::new(conn)),
+            tree: Arc::new(Mutex::new(tree)),
             embedding_engine: Arc::new(TfIdfEmbedding::new()),
             config,
         })
     }
 
     /// Insert a conversation turn into memory
-    pub fn insert_conversation(
+    pub async fn insert_conversation(
         &self,
         role: &str,
         content: &str,
@@ -104,7 +105,7 @@ impl MemorySystem {
 
         // Store in SQLite
         {
-            let conn = self.db.write().unwrap();
+            let conn = self.db.lock().await;
             conn.execute(
                 "INSERT INTO conversations (id, timestamp, role, content, tokens, model, session_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -123,7 +124,7 @@ impl MemorySystem {
 
         // Insert into MemTree
         let embedding = self.embedding_engine.embed(content)?;
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = self.tree.lock().await;
         tree.insert(content.to_string(), embedding)?;
 
         tracing::debug!("Inserted conversation into memory: {} chars", content.len());
@@ -132,14 +133,14 @@ impl MemorySystem {
     }
 
     /// Query memory for relevant context
-    pub fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>> {
+    pub async fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>> {
         let k = top_k.unwrap_or(self.config.max_context_items);
 
         // Generate query embedding
         let query_embedding = self.embedding_engine.embed(query_text)?;
 
         // Retrieve from MemTree
-        let tree = self.tree.read().unwrap();
+        let tree = self.tree.lock().await;
         let results = tree.retrieve(&query_embedding, k);
 
         // Extract texts
@@ -151,11 +152,11 @@ impl MemorySystem {
     }
 
     /// Get recent conversations (for context window)
-    pub fn get_recent_conversations(&self, limit: usize) -> Result<Vec<(String, String)>> {
-        let conn = self.db.read().unwrap();
+    pub async fn get_recent_conversations(&self, limit: usize) -> Result<Vec<(String, String)>> {
+        let conn = self.db.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT role, content FROM conversations 
-             ORDER BY timestamp DESC 
+            "SELECT role, content FROM conversations
+             ORDER BY timestamp DESC
              LIMIT ?1",
         )?;
 
@@ -169,8 +170,8 @@ impl MemorySystem {
     }
 
     /// Get memory statistics
-    pub fn stats(&self) -> Result<MemoryStats> {
-        let conn = self.db.read().unwrap();
+    pub async fn stats(&self) -> Result<MemoryStats> {
+        let conn = self.db.lock().await;
 
         let conversation_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM conversations",
@@ -178,7 +179,7 @@ impl MemorySystem {
             |row| row.get(0),
         )?;
 
-        let tree = self.tree.read().unwrap();
+        let tree = self.tree.lock().await;
         let tree_size = tree.size();
 
         Ok(MemoryStats {
@@ -208,8 +209,8 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_memory_system_creation() -> Result<()> {
+    #[tokio::test]
+    async fn test_memory_system_creation() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -219,7 +220,7 @@ mod tests {
         };
 
         let memory = MemorySystem::new(config)?;
-        let stats = memory.stats()?;
+        let stats = memory.stats().await?;
 
         assert_eq!(stats.conversation_count, 0);
         assert_eq!(stats.tree_node_count, 0);
@@ -227,8 +228,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_insert_conversation() -> Result<()> {
+    #[tokio::test]
+    async fn test_insert_conversation() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -242,17 +243,17 @@ mod tests {
             "How do I use Rust lifetimes?",
             Some("local"),
             Some("test-session"),
-        )?;
+        ).await?;
 
-        let stats = memory.stats()?;
+        let stats = memory.stats().await?;
         assert_eq!(stats.conversation_count, 1);
         assert_eq!(stats.tree_node_count, 1);
 
         Ok(())
     }
 
-    #[test]
-    fn test_query_memory() -> Result<()> {
+    #[tokio::test]
+    async fn test_query_memory() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -267,17 +268,17 @@ mod tests {
             "How do I use Rust lifetimes?",
             Some("local"),
             None,
-        )?;
+        ).await?;
 
         memory.insert_conversation(
             "user",
             "What is Python asyncio?",
             Some("local"),
             None,
-        )?;
+        ).await?;
 
         // Query for Rust-related content
-        let results = memory.query("Rust programming", Some(2))?;
+        let results = memory.query("Rust programming", Some(2)).await?;
 
         assert!(!results.is_empty());
         // Should return Rust-related conversation
@@ -286,8 +287,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_get_recent_conversations() -> Result<()> {
+    #[tokio::test]
+    async fn test_get_recent_conversations() -> Result<()> {
         let temp = NamedTempFile::new()?;
         let config = MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -303,11 +304,11 @@ mod tests {
                 &format!("Message {}", i),
                 Some("local"),
                 None,
-            )?;
+            ).await?;
         }
 
         // Get recent 3
-        let recent = memory.get_recent_conversations(3)?;
+        let recent = memory.get_recent_conversations(3).await?;
 
         assert_eq!(recent.len(), 3);
         // Should be in reverse chronological order

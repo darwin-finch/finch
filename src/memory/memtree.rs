@@ -216,7 +216,7 @@ impl Default for MemTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::TfIdfEmbedding;
+    use crate::memory::embeddings::{TfIdfEmbedding, EmbeddingEngine};
 
     #[test]
     fn test_memtree_creation() {

@@ -140,6 +140,8 @@ pub fn average_embeddings(embeddings: &[&Vec<f32>]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Import trait to use embed() method
+    use super::EmbeddingEngine;
 
     #[test]
     fn test_embedding_dimension() {

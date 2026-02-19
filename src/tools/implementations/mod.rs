@@ -31,6 +31,9 @@ pub mod gui;
 // LLM delegation tools (Phase 1)
 pub mod llm_tools;
 
+// Memory tools (Phase 4)
+pub mod memory_tools;
+
 // Re-exports for convenience
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
@@ -47,3 +50,5 @@ pub use web_fetch::WebFetchTool;
 pub use gui::{GuiClickTool, GuiInspectTool, GuiTypeTool};
 
 pub use llm_tools::LLMDelegationTool;
+
+pub use memory_tools::{CreateMemoryTool, ListRecentTool, SearchMemoryTool};

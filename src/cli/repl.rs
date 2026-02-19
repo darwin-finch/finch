@@ -183,6 +183,25 @@ impl Repl {
             None
         };
 
+        // Phase 4: Initialize memory system (before tool registry so we can register memory tools)
+        let memory_system = if config.memory.enabled {
+            match crate::memory::MemorySystem::new(config.memory.clone()) {
+                Ok(system) => {
+                    if is_interactive && !daemon_mode {
+                        output_status!("✓ Memory system enabled");
+                    }
+                    Some(Arc::new(system))
+                }
+                Err(e) => {
+                    output_status!("⚠️  Failed to initialize memory: {}", e);
+                    output_status!("   Continuing without memory");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Initialize tool execution system
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(Box::new(ReadTool));
@@ -247,6 +266,17 @@ impl Repl {
                 tool_registry.register(Box::new(GuiClickTool));
                 tool_registry.register(Box::new(GuiTypeTool));
                 tool_registry.register(Box::new(GuiInspectTool));
+            }
+        }
+
+        // Phase 4: Register memory tools if memory system is enabled
+        if let Some(ref memory) = memory_system {
+            use crate::tools::implementations::{SearchMemoryTool, CreateMemoryTool, ListRecentTool};
+            tool_registry.register(Box::new(SearchMemoryTool::new(memory.clone())));
+            tool_registry.register(Box::new(CreateMemoryTool::new(memory.clone())));
+            tool_registry.register(Box::new(ListRecentTool::new(memory.clone())));
+            if is_interactive && !daemon_mode {
+                output_status!("✓ Memory tools registered (search_memory, create_memory, list_recent_memories)");
             }
         }
 
@@ -449,25 +479,6 @@ impl Repl {
                 output_status!("   Using default persona");
                 Arc::new(RwLock::new(crate::config::Persona::default()))
             }
-        };
-
-        // Phase 4: Initialize memory system
-        let memory_system = if config.memory.enabled {
-            match crate::memory::MemorySystem::new(config.memory.clone()) {
-                Ok(system) => {
-                    if is_interactive && !daemon_mode {
-                        output_status!("✓ Memory system enabled");
-                    }
-                    Some(Arc::new(system))
-                }
-                Err(e) => {
-                    output_status!("⚠️  Failed to initialize memory: {}", e);
-                    output_status!("   Continuing without memory");
-                    None
-                }
-            }
-        } else {
-            None
         };
 
         Self {
@@ -2821,6 +2832,16 @@ impl Repl {
         // Add assistant response to conversation history
         self.conversation.write().await.add_assistant_message(claude_response.clone());
 
+        // Phase 4: Store conversation in memory automatically
+        if let Some(ref memory) = self.memory_system {
+            if let Err(e) = memory.insert_conversation("user", query, Some(&model_name), None).await {
+                tracing::warn!("Failed to store user message in memory: {}", e);
+            }
+            if let Err(e) = memory.insert_conversation("assistant", &claude_response, Some(&model_name), None).await {
+                tracing::warn!("Failed to store assistant message in memory: {}", e);
+            }
+        }
+
         // Store last query/response for feedback commands
         self.last_query = Some(query.to_string());
         self.last_response = Some(claude_response.clone());
@@ -3121,7 +3142,7 @@ impl Repl {
     /// Phase 4: Handle /memory command (memory statistics)
     async fn handle_memory_stats(&self) -> Result<()> {
         if let Some(memory) = &self.memory_system {
-            let stats = memory.stats()?;
+            let stats = memory.stats().await?;
 
             self.output_status("📚 Memory System Statistics:\n");
             self.output_status(format!("Conversations stored: {}", stats.conversation_count));
@@ -3130,7 +3151,7 @@ impl Repl {
 
             if stats.conversation_count > 0 {
                 // Show recent conversations
-                let recent = memory.get_recent_conversations(5)?;
+                let recent = memory.get_recent_conversations(5).await?;
                 if !recent.is_empty() {
                     self.output_status("Recent conversations:");
                     for (i, (role, content)) in recent.iter().enumerate().take(5) {
