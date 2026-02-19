@@ -39,6 +39,10 @@ pub enum Command {
     McpTools(Option<String>), // List tools from specific server (or all if None)
     McpRefresh,               // Refresh tools from all servers
     McpReload,                // Reconnect to all servers
+    // Persona management (Phase 2)
+    PersonaList,              // List available personas
+    PersonaSelect(String),    // Switch to a different persona
+    PersonaShow,              // Show current persona and system prompt
 }
 
 impl Command {
@@ -58,7 +62,18 @@ impl Command {
             "/critical" => return Some(Command::FeedbackCritical(None)),
             "/medium" => return Some(Command::FeedbackMedium(None)),
             "/good" => return Some(Command::FeedbackGood(None)),
+            // Persona commands
+            "/persona" | "/persona list" => return Some(Command::PersonaList),
+            "/persona show" => return Some(Command::PersonaShow),
             _ => {}
+        }
+
+        // Handle /persona select <name>
+        if let Some(rest) = trimmed.strip_prefix("/persona select ") {
+            let persona_name = rest.trim();
+            if !persona_name.is_empty() {
+                return Some(Command::PersonaSelect(persona_name.to_string()));
+            }
         }
 
         // Handle /plan command

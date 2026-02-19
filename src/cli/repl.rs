@@ -130,6 +130,13 @@ pub struct Repl {
     output_manager: OutputManager,
     status_bar: StatusBar,
     // TUI renderer moved to global (Phase 5: Native ratatui dialogs)
+
+    // Phase 1: Multi-LLM system
+    llm_registry: Option<Arc<crate::llms::LLMRegistry>>,
+    conversation_logger: Arc<tokio::sync::Mutex<crate::logging::ConversationLogger>>,
+
+    // Phase 2: Persona system
+    active_persona: Arc<RwLock<crate::config::Persona>>,
 }
 
 /// Background training statistics
@@ -378,6 +385,58 @@ impl Repl {
             output_status!("⚠️  Daemon not available, using teacher API directly");
         }
 
+        // Phase 1: Initialize LLM registry (if multiple teachers configured)
+        let llm_registry = if config.teachers.len() > 1 {
+            match crate::llms::LLMRegistry::from_teachers(&config.teachers) {
+                Ok(registry) => {
+                    if is_interactive && !daemon_mode {
+                        output_status!(
+                            "✓ Multi-LLM system enabled ({} primary + {} tools)",
+                            1,
+                            config.teachers.len() - 1
+                        );
+                    }
+                    Some(Arc::new(registry))
+                }
+                Err(e) => {
+                    output_status!("⚠️  Failed to create LLM registry: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Phase 1: Initialize conversation logger
+        let log_path = dirs::home_dir()
+            .map(|home| home.join(".finch").join("conversations.jsonl"))
+            .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl"));
+        let conversation_logger = Arc::new(tokio::sync::Mutex::new(
+            crate::logging::ConversationLogger::new(log_path)
+                .unwrap_or_else(|e| {
+                    output_status!("⚠️  Failed to create conversation logger: {}", e);
+                    panic!("Cannot create conversation logger")
+                })
+        ));
+        if is_interactive && !daemon_mode {
+            output_status!("✓ Conversation logging enabled (for future LoRA training)");
+        }
+
+        // Phase 2: Load active persona
+        let active_persona = match crate::config::Persona::load_builtin(&config.active_persona) {
+            Ok(persona) => {
+                if is_interactive && !daemon_mode {
+                    output_status!("✓ Persona loaded: {}", persona.name);
+                }
+                Arc::new(RwLock::new(persona))
+            }
+            Err(e) => {
+                output_status!("⚠️  Failed to load persona '{}': {}", config.active_persona, e);
+                output_status!("   Using default persona");
+                Arc::new(RwLock::new(crate::config::Persona::default()))
+            }
+        };
+
         Self {
             _config: config,
             claude_client,
@@ -409,6 +468,11 @@ impl Repl {
             output_manager,
             status_bar,
             // TUI renderer moved to global (Phase 5: Native ratatui dialogs)
+
+            // Phase 1 & 2: Multi-LLM + Persona
+            llm_registry,
+            conversation_logger,
+            active_persona,
         }
     }
 
