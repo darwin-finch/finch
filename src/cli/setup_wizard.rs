@@ -1208,28 +1208,40 @@ fn render_models_section(
     // Build list items: primary model + tool models
     let mut items = vec![];
 
-    // Primary model
-    let primary_marker = if selected_idx == 0 { "▶ " } else { "  " };
-    let primary_style = if selected_idx == 0 {
-        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+    // Primary model - make selection VERY obvious
+    let is_selected = selected_idx == 0;
+    let (prefix, suffix, primary_style) = if is_selected {
+        (
+            ">>> ",
+            " <<<",
+            Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        )
     } else {
-        Style::default().fg(Color::Blue)
+        (
+            "    ",
+            "",
+            Style::default().fg(Color::Blue)
+        )
     };
 
     let primary_display = match primary_model {
         ModelConfig::Local { family, size, execution, .. } => {
             format!(
-                "{}Local {} {} ({})",
-                primary_marker,
+                "{}Local {} {} ({}){}",
+                prefix,
                 family.name(),
                 model_size_display(size),
-                execution.name()
+                execution.name(),
+                suffix
             )
         }
         ModelConfig::Remote { provider, api_key, model, .. } => {
             let key_display = if api_key.is_empty() {
                 "[Not configured]".to_string()
-            } else if editing_mode && selected_idx == 0 {
+            } else if editing_mode && is_selected {
                 api_key.clone()
             } else {
                 format!("{}...{}", &api_key.chars().take(10).collect::<String>(), api_key.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>())
@@ -1240,32 +1252,41 @@ fn render_models_section(
                 String::new()
             };
             format!(
-                "{}{}{} [{}]",
-                primary_marker, provider, model_part, key_display
+                "{}{}{} [{}]{}",
+                prefix, provider, model_part, key_display, suffix
             )
         }
     };
 
     items.push(ListItem::new(primary_display).style(primary_style));
 
-    // Tool models
+    // Tool models - make selection VERY obvious
     for (idx, tool_model) in tool_models.iter().enumerate() {
         let tool_idx = idx + 1;
-        let marker = if selected_idx == tool_idx { "▶ " } else { "  " };
-        let checkbox = if tool_model.enabled() { "☑" } else { "☐" };
-        let style = if selected_idx == tool_idx {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        let is_tool_selected = selected_idx == tool_idx;
+
+        let (prefix, suffix, style) = if is_tool_selected {
+            (
+                ">>> ",
+                " <<<",
+                Style::default()
+                    .bg(Color::White)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            )
         } else if tool_model.enabled() {
-            Style::default()
+            ("    ", "", Style::default())
         } else {
-            Style::default().fg(Color::DarkGray)
+            ("    ", "", Style::default().fg(Color::DarkGray))
         };
+
+        let checkbox = if tool_model.enabled() { "☑" } else { "☐" };
 
         let display = match tool_model {
             ModelConfig::Local { family, size, .. } => {
                 format!(
-                    "{}{} Tool: Local {} {}",
-                    marker, checkbox, family.name(), model_size_display(size)
+                    "{}{} Tool: Local {} {}{}",
+                    prefix, checkbox, family.name(), model_size_display(size), suffix
                 )
             }
             ModelConfig::Remote { provider, model, .. } => {
@@ -1275,8 +1296,8 @@ fn render_models_section(
                     String::new()
                 };
                 format!(
-                    "{}{} Tool: {}{}",
-                    marker, checkbox, provider, model_part
+                    "{}{} Tool: {}{}{}",
+                    prefix, checkbox, provider, model_part, suffix
                 )
             }
         };
@@ -1325,37 +1346,37 @@ fn render_personas_section(
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    // Left: Persona list
+    // Left: Persona list - make selection VERY obvious
     let items: Vec<ListItem> = personas
         .iter()
         .enumerate()
         .map(|(i, persona)| {
             let is_default = persona.name.to_lowercase() == default_persona.to_lowercase();
-            let marker = if is_default { "★ " } else { "  " };
-            let style = if i == selected_idx {
-                Style::default().bg(Color::Cyan).fg(Color::Black)
+            let is_selected = i == selected_idx;
+
+            let (prefix, suffix, style) = if is_selected {
+                (
+                    ">>> ",
+                    " <<<",
+                    Style::default()
+                        .bg(Color::White)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                )
             } else if is_default {
-                Style::default().fg(Color::Yellow)
+                ("★   ", "", Style::default().fg(Color::Yellow))
             } else {
-                Style::default()
+                ("    ", "", Style::default())
             };
-            ListItem::new(format!("{}{}", marker, persona.name)).style(style)
+
+            ListItem::new(format!("{}{}{}", prefix, persona.name, suffix)).style(style)
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Personas"))
-        .highlight_style(
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+        .block(Block::default().borders(Borders::ALL).title("Personas"));
 
-    let mut list_state = ListState::default();
-    list_state.select(Some(selected_idx));
-    f.render_stateful_widget(list, chunks[0], &mut list_state);
+    f.render_widget(list, chunks[0]);
 
     // Right: Preview
     if let Some(persona) = personas.get(selected_idx) {
