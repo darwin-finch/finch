@@ -173,12 +173,12 @@ impl WizardState {
         // Themes section
         let current_theme = existing_config
             .map(|c| c.active_theme.as_str())
-            .unwrap_or("dark");
+            .unwrap_or("light"); // Default to Light theme for better initial visibility
         let themes = ColorTheme::all();
         let selected_theme = themes
             .iter()
             .position(|t| t.name().to_lowercase() == current_theme.to_lowercase())
-            .unwrap_or(0);
+            .unwrap_or(1); // Default to Light (index 1) if not found
 
         sections.insert(
             WizardSection::Themes,
@@ -994,10 +994,10 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     let tabs = Tabs::new(tab_titles)
         .block(Block::default().borders(Borders::ALL).title("Shammah Setup"))
         .select(selected_idx)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(Color::Blue))
         .highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         );
     f.render_widget(tabs, chunks[0]);
@@ -1015,7 +1015,7 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     };
 
     let help = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::Gray))
+        .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
@@ -1093,11 +1093,11 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
         .split(area);
 
     let title = Paragraph::new("Theme Selection")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    // Render theme options
+    // Render theme options with colors visible on both light and dark backgrounds
     let themes = ColorTheme::all();
     let items: Vec<ListItem> = themes
         .iter()
@@ -1105,9 +1105,9 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
         .map(|(i, theme)| {
             let marker = if i == selected_theme { "▶ " } else { "  " };
             let style = if i == selected_theme {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(Color::Blue)
             };
             ListItem::new(format!("{}{} - {}", marker, theme.name(), theme.description()))
                 .style(style)
@@ -1146,9 +1146,9 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
 
     let instructions = Paragraph::new(
         "Select a color theme that works well with your terminal background.\n\
-         The preview shows how messages will appear."
+         Use ↑/↓ to navigate, Enter to confirm. If you can't see this text, try pressing ↓ then Enter."
     )
-    .style(Style::default().fg(Color::Yellow))
+    .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
     .wrap(Wrap { trim: false });
     f.render_widget(instructions, chunks[3]);
 }
