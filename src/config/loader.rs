@@ -1,5 +1,5 @@
 // Configuration loader
-// Loads API key from ~/.shammah/config.toml or environment variable
+// Loads API key from ~/.finch/config.toml or environment variable
 
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -9,8 +9,8 @@ use crate::errors;
 
 /// Load configuration from Shammah config file or environment
 pub fn load_config() -> Result<Config> {
-    // Try loading from ~/.shammah/config.toml first
-    if let Some(config) = try_load_from_shammah_config()? {
+    // Try loading from ~/.finch/config.toml first
+    if let Some(config) = try_load_from_finch_config()? {
         return Ok(config);
     }
 
@@ -31,7 +31,7 @@ pub fn load_config() -> Result<Config> {
     // No config found - prompt user to run setup
     bail!(
         "No configuration found. Please run the setup wizard:\n\n\
-        \x1b[1;36mshammah setup\x1b[0m\n\n\
+        \x1b[1;36mfinch setup\x1b[0m\n\n\
         This will guide you through:\n\
         • API key configuration (Claude, OpenAI, etc.)\n\
         • Local model selection (Qwen, Gemma, Llama, Mistral)\n\
@@ -42,14 +42,14 @@ pub fn load_config() -> Result<Config> {
     );
 }
 
-fn try_load_from_shammah_config() -> Result<Option<Config>> {
+fn try_load_from_finch_config() -> Result<Option<Config>> {
     use super::backend::BackendConfig;
     use super::colors::ColorScheme;
     use super::settings::{ClientConfig, FeaturesConfig};
     use super::TeacherEntry;
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
-    let config_path = home.join(".shammah/config.toml");
+    let config_path = home.join(".finch/config.toml");
 
     if !config_path.exists() {
         return Ok(None);
@@ -92,7 +92,7 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
         .map_err(|e| anyhow::anyhow!(errors::config_parse_error(&e.to_string())))?;
 
     if toml_config.teachers.is_empty() {
-        bail!("Config is missing teachers array. Please run 'shammah setup' to configure.");
+        bail!("Config is missing teachers array. Please run 'finch setup' to configure.");
     }
 
     let mut config = Config::new(toml_config.teachers);
@@ -135,5 +135,5 @@ mod tests {
 
     // Note: Config creation tests removed - Config structure changed to use
     // teachers array instead of single api_key. Config is now loaded from
-    // ~/.shammah/config.toml via Config::load() or created via setup wizard.
+    // ~/.finch/config.toml via Config::load() or created via setup wizard.
 }

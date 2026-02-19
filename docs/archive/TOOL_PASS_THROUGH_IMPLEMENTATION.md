@@ -219,7 +219,7 @@ Test that tool_calls are returned to client:
 
 ```bash
 # Start daemon
-shammah daemon &
+finch daemon &
 
 # Send request with tools
 curl -X POST http://127.0.0.1:11434/v1/chat/completions \
@@ -284,10 +284,10 @@ Test end-to-end with CLI:
 echo '[client]
 use_daemon = true
 daemon_address = "127.0.0.1:11434"
-auto_spawn = true' >> ~/.shammah/config.toml
+auto_spawn = true' >> ~/.finch/config.toml
 
 # Query with tools
-shammah query "What files are in the current directory?"
+finch query "What files are in the current directory?"
 
 # Should auto-spawn daemon, execute tools locally, display answer
 ```
@@ -306,7 +306,7 @@ shammah query "What files are in the current directory?"
 ## Next Steps
 
 1. **Test with real daemon**: Start daemon and test with curl
-2. **Test CLI integration**: Test `shammah query` with daemon mode
+2. **Test CLI integration**: Test `finch query` with daemon mode
 3. **Test VSCode extension**: Verify tools work through daemon
 4. **Integration tests**: Write automated tests for tool pass-through
 5. **Documentation**: Update user docs with daemon tool usage
@@ -325,7 +325,7 @@ shammah query "What files are in the current directory?"
 
 ## References
 
-- **Plan**: `/Users/shammah/repos/claude-proxy/plan.md` (from transcript)
+- **Plan**: `/Users/finch/repos/claude-proxy/plan.md` (from transcript)
 - **Previous phases**:
   - Phase 5: ONNX KV Cache (Complete)
   - Phase 6: Local Model Tool Use (Complete)

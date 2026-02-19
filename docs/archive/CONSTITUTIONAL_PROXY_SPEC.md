@@ -5,7 +5,7 @@
 **Date:** January 29, 2026  
 **Target Platform:** macOS (Apple Silicon M1/M2/M3/M4)  
 **Language:** Rust  
-**Command:** `shammah`  
+**Command:** `finch`  
 **Status:** Ready for implementation
 
 ---
@@ -31,7 +31,7 @@ Build a local AI assistant ("Shammah" - watchman/guardian) in Rust that runs on 
 **This is a drop-in replacement for Claude Code that adds local processing.**
 
 Users should be able to:
-- Run `shammah` exactly like they run `claude`
+- Run `finch` exactly like they run `claude`
 - Use the same slash commands (`/help`, `/init`, `/clear`, etc.)
 - Use the same CLAUDE.md files for context
 - Use the same `.claude/settings.json` configuration format
@@ -55,18 +55,18 @@ Build in phases with validation gates. Each phase proves a critical assumption b
 
 **Command name options:**
 1. `claude-proxy` - Descriptive, makes it clear what it is
-2. `shammah` - Hebrew "watchman/guardian", nice metaphor for constitutional oversight
+2. `finch` - Hebrew "watchman/guardian", nice metaphor for constitutional oversight
 3. `cproxy` - Short and sweet
 4. `claude-local` - Emphasizes local processing
 5. `constitutional` - Full and explicit
 
-**Recommendation: `shammah`**
+**Recommendation: `finch`**
 - Unique, memorable, easy to type
 - Biblical reference to "watchman" fits the constitutional oversight role
 - Avoids confusion with "claude" command
-- Can still have `shammah proxy` as expanded name in docs
+- Can still have `finch proxy` as expanded name in docs
 
-**This document will use `shammah` going forward.**
+**This document will use `finch` going forward.**
 
 ---
 
@@ -115,7 +115,7 @@ Build in phases with validation gates. Each phase proves a critical assumption b
     "allowedTools": ["Read", "Write", "Bash(git *)", "WebSearch", "WebFetch"],
     "deny": ["Read(.env*)", "Bash(rm -rf *)"]
   },
-  "shammah": {
+  "finch": {
     "routing": {
       "mode": "adaptive",
       "initial_threshold": 0.30,
@@ -131,7 +131,7 @@ Build in phases with validation gates. Each phase proves a critical assumption b
 
 **Benefits:**
 - Zero additional setup if user has Claude Code
-- Same API key for both `claude` and `shammah`
+- Same API key for both `claude` and `finch`
 - Familiar file location and format
 - Natural integration with existing workflow
 
@@ -298,7 +298,7 @@ Reduce forwarding by handling current information needs and executable tasks loc
 - **Output:** File content (for reads) or success/error
 - **Expected impact:** 10-15% reduction in forwards
 - **Constraint:** User approval + directory restrictions
-  - Default: Only allowed in `~/Documents/shammah-workspace/`
+  - Default: Only allowed in `~/Documents/finch-workspace/`
   - Expanded: User can grant access to specific directories
   - Never: System directories, hidden files, /etc, /usr, etc.
 - **Safety checks:**
@@ -408,7 +408,7 @@ impl ToolManager {
 ```
 
 **Permission System:**
-- Persistent permissions: Stored in `~/.config/shammah/permissions.json`
+- Persistent permissions: Stored in `~/.config/finch/permissions.json`
 - Session permissions: Valid only for current session
 - Per-tool permissions: Enable/disable individual tools
 - Per-operation permissions: Approve specific commands/files
@@ -421,7 +421,7 @@ impl ToolManager {
   - Parameters (sanitized)
   - Result (success/failure)
   - User approval status
-- Logs stored in: `~/.local/share/shammah/logs/tools.jsonl`
+- Logs stored in: `~/.local/share/finch/logs/tools.jsonl`
 - Retention: 30 days
 
 ### Configuration
@@ -448,12 +448,12 @@ impl ToolManager {
       "require_confirmation": true,
       "allowed_commands": ["ls", "cat", "grep", "find"],
       "blocked_patterns": ["rm -rf", "dd", ":(){ :|:& };:"],
-      "working_directory": "~/Documents/shammah-workspace",
+      "working_directory": "~/Documents/finch-workspace",
       "timeout_seconds": 30
     },
     "file_operations": {
       "enabled": true,
-      "allowed_directories": ["~/Documents/shammah-workspace"],
+      "allowed_directories": ["~/Documents/finch-workspace"],
       "require_confirmation_for": ["delete", "write"],
       "backup_before_modify": true
     },
@@ -585,7 +585,7 @@ Else → Return local response
 
 ### Storage and Loading
 
-**Model files location:** `~/.local/share/shammah/models/`
+**Model files location:** `~/.local/share/finch/models/`
 ```
 models/
 ├── response-gen-v1.mlpackage      # 3-7B params, ~6-14GB
@@ -728,7 +728,7 @@ Move from simple Phase 2 models to ANE-optimized multi-model ensemble for speed 
 ### Directory Layout
 
 ```
-shammah/
+finch/
 ├── Cargo.toml
 ├── README.md
 ├── LICENSE
@@ -785,30 +785,30 @@ shammah/
 
 ```bash
 # Start interactive session in current directory
-$ shammah
+$ finch
 
 # Start in specific directory  
-$ shammah /path/to/project
+$ finch /path/to/project
 
 # Initialize config (first-time setup)
-$ shammah --init
+$ finch --init
 
 # Show version
-$ shammah --version
+$ finch --version
 
 # VS Code / MCP server mode
-$ shammah --mode mcp
+$ finch --mode mcp
 
 # HTTP daemon mode (for integrations)
-$ shammah --mode daemon --port 3141
+$ finch --mode daemon --port 3141
 ```
 
 ### Interactive Session (REPL)
 
-When you run `shammah`, you enter an interactive conversational session:
+When you run `finch`, you enter an interactive conversational session:
 
 ```
-$ shammah
+$ finch
 Shammah v1.0.0 (Constitutional AI Proxy)
 Using Claude API key from: ~/.claude/settings.json ✓
 Loading models: crisis-detect ✓ pattern-match ✓ response-gen ✓
@@ -869,27 +869,27 @@ Shammah can run in different modes to support various integrations:
 
 **1. Interactive Mode (default)**
 ```bash
-$ shammah
+$ finch
 # Opens REPL for conversational interaction
 ```
 
 **2. MCP Server Mode (for VS Code, Claude Desktop, etc.)**
 ```bash
-$ shammah --mode mcp
+$ finch --mode mcp
 # Runs as MCP server on stdio transport
 # VS Code connects to this
 ```
 
 **3. Daemon Mode (HTTP API)**
 ```bash
-$ shammah --mode daemon --port 3141
+$ finch --mode daemon --port 3141
 # Runs HTTP server for programmatic access
 # Useful for custom integrations
 ```
 
 **4. Single Query Mode (pipe-able)**
 ```bash
-$ echo "What is reciprocity?" | shammah --mode query
+$ echo "What is reciprocity?" | finch --mode query
 # Processes single query from stdin, outputs to stdout
 # Useful for scripts and automation
 ```
@@ -901,8 +901,8 @@ VS Code connects via `.claude/settings.json`:
 ```json
 {
   "mcpServers": {
-    "shammah": {
-      "command": "shammah",
+    "finch": {
+      "command": "finch",
       "args": ["--mode", "mcp"],
       "env": {
         "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}"
@@ -917,7 +917,7 @@ Then Shammah appears as an MCP tool provider in VS Code's agent mode, providing 
 **Daemon Mode:**
 For custom integrations or editor extensions:
 ```bash
-$ shammah --mode daemon --port 3141 --background
+$ finch --mode daemon --port 3141 --background
 
 # API endpoints:
 # POST /v1/chat - Interactive chat
@@ -1166,7 +1166,7 @@ and there are people who want to help...
 $ claude
 
 # They can now do this instead:
-$ shammah
+$ finch
 
 # Everything else works exactly the same
 # Same config files, same commands, same behavior
@@ -1197,14 +1197,14 @@ $ shammah
 
 **Stored As:**
 - JSONL format (one JSON object per line)
-- Location: `~/.local/share/shammah/metrics/`
+- Location: `~/.local/share/finch/metrics/`
 - Rotation: Daily files, keep last 30 days
 - Privacy: Queries stored as hash only (unless user opts in)
 
 ### Metric Visualization
 
 ```
-$ shammah metrics --summary
+$ finch metrics --summary
 Last 24 hours:
   Total requests: 1,247
   Forward rate: 12.3%
@@ -1255,12 +1255,12 @@ Looked in:
   [x] Claude Code config: ~/Library/Application Support/Claude/claude_desktop_config.json
   [x] Alternate location: ~/.claude/config.json
   [x] Legacy location: ~/.anthropic/api_key
-  [x] Proxy config: ~/.config/shammah/config.json
+  [x] Proxy config: ~/.config/finch/config.json
 
 To fix:
   1. Install Claude Code and configure your API key (recommended)
   2. Set environment variable: export ANTHROPIC_API_KEY="sk-ant-..."
-  3. Create config: shammah init
+  3. Create config: finch init
 ```
 
 ### API Errors
@@ -1447,7 +1447,7 @@ This is **completely optional** and should only be pursued after Phases 1-4 are 
 - Create VS Code extension using TypeScript
 - Implement `LanguageModelChatProvider` API
 - Communicate with Rust proxy via:
-  - HTTP server mode (proxy runs as `shammah serve --port 3000`)
+  - HTTP server mode (proxy runs as `finch serve --port 3000`)
   - Or stdio mode (extension spawns proxy process)
 - Register in `package.json`:
 
@@ -1455,7 +1455,7 @@ This is **completely optional** and should only be pursued after Phases 1-4 are 
 {
   "contributes": {
     "languageModelChatProviders": [{
-      "id": "shammah",
+      "id": "finch",
       "name": "Shammah",
       "vendor": "your-name",
       "family": "claude",
@@ -1485,7 +1485,7 @@ This is **completely optional** and should only be pursued after Phases 1-4 are 
 **What it is:** The proxy runs as an MCP server that provides tools and resources to VS Code's agent mode.
 
 **How it works:**
-- Proxy runs in MCP server mode: `shammah mcp`
+- Proxy runs in MCP server mode: `finch mcp`
 - VS Code connects via stdio or HTTP+SSE transport
 - Proxy exposes tools like:
   - `constitutional_reasoning` - Apply constitutional patterns
@@ -1546,8 +1546,8 @@ This is **completely optional** and should only be pursued after Phases 1-4 are 
 ```json
 {
   "mcpServers": {
-    "shammah": {
-      "command": "shammah",
+    "finch": {
+      "command": "finch",
       "args": ["mcp"],
       "env": {
         "ANTHROPIC_API_KEY": "${env:ANTHROPIC_API_KEY}"
@@ -1626,19 +1626,19 @@ async-trait = "0.1"     # Async traits for MCP
 **New CLI commands:**
 ```bash
 # Run as MCP server (stdio transport)
-shammah mcp
+finch mcp
 
 # Run as MCP server (HTTP transport)
-shammah mcp --http --port 3000
+finch mcp --http --port 3000
 
 # Run as HTTP API server (for Language Model Provider)
-shammah serve --port 3000
+finch serve --port 3000
 ```
 
 ### VS Code Extension Structure
 
 ```
-vscode-shammah/
+vscode-finch/
 ├── package.json              # Extension manifest
 ├── src/
 │   ├── extension.ts          # Extension entry point
@@ -1664,13 +1664,13 @@ vscode-shammah/
 ### User Experience
 
 **Setup (MCP Server):**
-1. User installs Rust proxy: `cargo install shammah`
+1. User installs Rust proxy: `cargo install finch`
 2. User adds to VS Code settings:
 ```json
 {
   "mcpServers": {
     "constitutional": {
-      "command": "shammah",
+      "command": "finch",
       "args": ["mcp"]
     }
   }
@@ -1679,7 +1679,7 @@ vscode-shammah/
 3. Constitutional tools appear in agent mode automatically
 
 **Setup (Language Model Provider):**
-1. User installs Rust proxy: `cargo install shammah`
+1. User installs Rust proxy: `cargo install finch`
 2. User installs VS Code extension from marketplace
 3. Extension auto-detects proxy installation
 4. "Shammah" appears in model picker

@@ -2859,7 +2859,7 @@ fn render_confirm(f: &mut Frame, area: Rect) {
     f.render_widget(title, chunks[0]);
 
     let summary = Paragraph::new(
-        "Configuration will be saved to: ~/.shammah/config.toml\n\n\
+        "Configuration will be saved to: ~/.finch/config.toml\n\n\
          ✓ Claude API key configured\n\
          ✓ HuggingFace token configured (or skipped)\n\
          ✓ Inference device selected\n\

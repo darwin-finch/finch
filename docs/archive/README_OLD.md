@@ -23,7 +23,7 @@ Think of it as a smart cache that learns not just answers, but reasoning pattern
   - Approve tools once or remember approvals (session or persistent)
   - Pattern-based approvals with wildcards (`*`, `**`) or regex
   - Manage patterns with `/patterns` commands
-  - Saves approved patterns to `~/.shammah/tool_patterns.json`
+  - Saves approved patterns to `~/.finch/tool_patterns.json`
   - See [docs/TOOL_CONFIRMATION.md](docs/TOOL_CONFIRMATION.md) for details
 
 - **Streaming Responses** - Real-time character-by-character output
@@ -47,7 +47,7 @@ Think of it as a smart cache that learns not just answers, but reasoning pattern
   - Threshold-based routing learns from query 1
   - Transitions to neural models after sufficient training data
   - Converges to 5% forwarding over ~6 months
-  - Models stored locally in `~/.shammah/`
+  - Models stored locally in `~/.finch/`
 
 - **Concurrent Safe** - Multiple sessions can run simultaneously
   - File locking prevents data corruption
@@ -132,12 +132,12 @@ Think of it as a smart cache that learns not just answers, but reasoning pattern
 
 ```bash
 # Build from source
-git clone https://github.com/shammah/claude-proxy
+git clone https://github.com/finch/claude-proxy
 cd claude-proxy
 cargo build --release
 
 # Run in interactive mode
-./target/release/shammah
+./target/release/finch
 
 # Example: Claude can now use tools to inspect your code
 > Can you read my Cargo.toml and tell me about dependencies?
@@ -150,13 +150,13 @@ cargo build --release
 # Claude uses Grep with regex pattern
 
 # Piped input mode (non-interactive)
-echo "What is 2+2?" | ./target/release/shammah
+echo "What is 2+2?" | ./target/release/finch
 # Output: 4
 
-cat query.txt | ./target/release/shammah
+cat query.txt | ./target/release/finch
 # Processes query from file and exits
 
-./target/release/shammah <<EOF
+./target/release/finch <<EOF
 What is the capital of France?
 EOF
 # Supports heredoc syntax
@@ -183,7 +183,7 @@ EOF
 
 # HTTP Daemon Mode (NEW - Phase 1)
 # Run as background server for multi-client access
-./target/release/shammah daemon --bind 127.0.0.1:8000
+./target/release/finch daemon --bind 127.0.0.1:8000
 
 # Test health check
 curl http://127.0.0.1:8000/health
@@ -223,10 +223,10 @@ Set your Claude API key in the configuration file:
 
 ```bash
 # Create config directory
-mkdir -p ~/.shammah
+mkdir -p ~/.finch
 
 # Add your API key
-cat > ~/.shammah/config.toml <<EOF
+cat > ~/.finch/config.toml <<EOF
 api_key = "your-claude-api-key"
 streaming_enabled = true
 EOF
@@ -234,9 +234,9 @@ EOF
 
 ### File Structure
 
-All data stored in `~/.shammah/`:
+All data stored in `~/.finch/`:
 ```
-~/.shammah/
+~/.finch/
 ├── config.toml               # API key and settings
 ├── constitution.md           # Optional: custom constitutional principles
 ├── crisis_keywords.txt       # Safety keywords for crisis detection
@@ -253,7 +253,7 @@ All data stored in `~/.shammah/`:
 Define custom constitutional principles for local generation:
 
 ```bash
-cat > ~/.shammah/constitution.md <<EOF
+cat > ~/.finch/constitution.md <<EOF
 # My Constitutional Principles
 
 1. Always prioritize user privacy
@@ -305,7 +305,7 @@ Shammah is now a working local-first AI proxy with tool execution, streaming res
   - Disabled when tools are used (detection pending)
 
 - ✅ **Constitution Support**: Infrastructure complete
-  - Configurable path (~/.shammah/constitution.md)
+  - Configurable path (~/.finch/constitution.md)
   - Loaded on startup, not sent to API
 
 ### In Progress
@@ -326,7 +326,7 @@ See [STATUS.md](STATUS.md) for detailed current state and [CONSTITUTIONAL_PROXY_
 
 ```bash
 # Clone repository
-git clone https://github.com/shammah/claude-proxy
+git clone https://github.com/finch/claude-proxy
 cd claude-proxy
 
 # Build project

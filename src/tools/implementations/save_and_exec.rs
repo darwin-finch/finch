@@ -23,7 +23,7 @@ impl SaveAndExecTool {
 impl Default for SaveAndExecTool {
     fn default() -> Self {
         let home = dirs::home_dir().expect("Could not determine home directory");
-        let session_state_file = home.join(".shammah/restart_state.json");
+        let session_state_file = home.join(".finch/restart_state.json");
         Self::new(session_state_file)
     }
 }
@@ -37,12 +37,12 @@ impl Tool for SaveAndExecTool {
     fn description(&self) -> &str {
         "Save conversation and model state, then execute a shell command.
         The current process will be replaced by the executed command.
-        Session state is saved to ~/.shammah/restart_state.json
+        Session state is saved to ~/.finch/restart_state.json
 
         Common use cases:
-        - Restart Shammah: ./target/release/shammah --restore-session ~/.shammah/restart_state.json
-        - Build and restart: cargo build --release && ./target/release/shammah --restore-session ~/.shammah/restart_state.json
-        - Run with prompt: ./target/release/shammah --restore-session ~/.shammah/restart_state.json --initial-prompt 'hello'
+        - Restart Shammah: ./target/release/finch --restore-session ~/.finch/restart_state.json
+        - Build and restart: cargo build --release && ./target/release/finch --restore-session ~/.finch/restart_state.json
+        - Run with prompt: ./target/release/finch --restore-session ~/.finch/restart_state.json --initial-prompt 'hello'
         - Run any command: python my_script.py"
     }
 
@@ -54,7 +54,7 @@ impl Tool for SaveAndExecTool {
             ),
             (
                 "command",
-                "Shell command to execute (e.g., './target/release/shammah', 'cargo build && ./target/release/shammah')",
+                "Shell command to execute (e.g., './target/release/finch', 'cargo build && ./target/release/finch')",
             ),
         ])
     }

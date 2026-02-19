@@ -223,8 +223,8 @@ api_key = "sk-ant-..."
 ### In Rust Code:
 
 ```rust
-use shammah::config::TeacherConfig;
-use shammah::providers::create_provider;
+use finch::config::TeacherConfig;
+use finch::providers::create_provider;
 
 // Load config
 let config = load_config()?;

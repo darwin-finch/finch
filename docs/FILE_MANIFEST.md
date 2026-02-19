@@ -75,7 +75,7 @@ The following were NOT modified (integration pending):
 ## Directory Structure
 
 ```
-shammah/ (to be renamed finch/)
+finch/ (to be renamed finch/)
 ├── src/
 │   ├── llms/                    # NEW - Phase 1
 │   │   └── mod.rs
@@ -181,7 +181,7 @@ git checkout -b pre-finch-rename
 git push -u origin pre-finch-rename
 
 # Or create archive
-tar -czf shammah-backup-$(date +%Y%m%d).tar.gz .
+tar -czf finch-backup-$(date +%Y%m%d).tar.gz .
 ```
 
 ### Rolling Back

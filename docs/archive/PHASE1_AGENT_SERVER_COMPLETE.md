@@ -34,20 +34,20 @@ src/server/
 
 #### Mode 1: REPL (Preserved)
 ```bash
-./target/release/shammah
+./target/release/finch
 > What is the golden rule?
 # Interactive REPL unchanged
 ```
 
 #### Mode 2: Daemon Mode (NEW)
 ```bash
-./target/release/shammah daemon --bind 127.0.0.1:8000
+./target/release/finch daemon --bind 127.0.0.1:8000
 # HTTP server for multi-client access
 ```
 
 #### Mode 3: Query Mode (NEW)
 ```bash
-./target/release/shammah query "What is 2+2?"
+./target/release/finch query "What is 2+2?"
 # Single query, immediate exit
 ```
 
@@ -148,7 +148,7 @@ pub struct SessionManager {
 
 ### 5. Configuration ✅
 
-**Added to `~/.shammah/config.toml`:**
+**Added to `~/.finch/config.toml`:**
 ```toml
 [server]
 enabled = false                  # Opt-in
@@ -256,7 +256,7 @@ $ cargo build --release
    Compiling dashmap v5.5.3
    Compiling tower-http v0.5.2
    Compiling prometheus v0.13.4
-   Compiling shammah v0.1.0
+   Compiling finch v0.1.0
     Finished `release` profile [optimized] target(s) in 1m 12s
 ```
 
@@ -283,7 +283,7 @@ test session_test::test_session_deletion ... ok
 
 ```bash
 # 1. Start daemon
-$ ./target/release/shammah daemon --bind 127.0.0.1:18000
+$ ./target/release/finch daemon --bind 127.0.0.1:18000
 Starting Shammah agent server on 127.0.0.1:18000
 
 # 2. Health check
@@ -292,9 +292,9 @@ $ curl http://127.0.0.1:18000/health
 
 # 3. Metrics endpoint
 $ curl http://127.0.0.1:18000/metrics
-# HELP shammah_queries_total Total number of queries
-# TYPE shammah_queries_total counter
-shammah_queries_total 0
+# HELP finch_queries_total Total number of queries
+# TYPE finch_queries_total counter
+finch_queries_total 0
 
 # 4. Send message (requires API key in config)
 $ curl -X POST http://127.0.0.1:18000/v1/messages \
@@ -384,13 +384,13 @@ $ curl -X POST http://127.0.0.1:18000/v1/messages \
 
 ### 1. Development Server
 ```bash
-shammah daemon --bind 127.0.0.1:8000
+finch daemon --bind 127.0.0.1:8000
 ```
 Local testing of Claude integrations
 
 ### 2. Team Server
 ```bash
-shammah daemon --bind 0.0.0.0:8000
+finch daemon --bind 0.0.0.0:8000
 ```
 Shared server with session isolation
 
@@ -401,26 +401,26 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-COPY --from=builder target/release/shammah /usr/local/bin/
+COPY --from=builder target/release/finch /usr/local/bin/
 EXPOSE 8000
-CMD ["shammah", "daemon", "--bind", "0.0.0.0:8000"]
+CMD ["finch", "daemon", "--bind", "0.0.0.0:8000"]
 ```
 
 ### 4. Systemd Service
 ```ini
 [Service]
-ExecStart=/opt/shammah/shammah daemon
+ExecStart=/opt/finch/finch daemon
 Restart=on-failure
 ```
 
 ### 5. nginx Reverse Proxy
 ```nginx
-upstream shammah {
+upstream finch {
     server 127.0.0.1:8000;
 }
 server {
     location / {
-        proxy_pass http://shammah;
+        proxy_pass http://finch;
         proxy_buffering off;
     }
 }
@@ -649,7 +649,7 @@ cargo build --release
 # ✅ Should succeed in ~1-2 minutes
 
 # 2. Start daemon
-./target/release/shammah daemon --bind 127.0.0.1:8000 &
+./target/release/finch daemon --bind 127.0.0.1:8000 &
 # ✅ Should print "Starting Shammah agent server..."
 
 # 3. Test health endpoint
@@ -667,7 +667,7 @@ curl -X POST http://127.0.0.1:8000/v1/messages \
 # ✅ Should return Claude-compatible response
 
 # 6. Stop daemon
-killall shammah
+killall finch
 # ✅ Should exit cleanly
 ```
 

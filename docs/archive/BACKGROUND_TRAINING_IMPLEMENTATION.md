@@ -127,7 +127,7 @@ async fn run_background_training(
 
 9. **Save Adapter Weights**:
    ```rust
-   let adapters_dir = /* ~/.shammah/adapters */;
+   let adapters_dir = /* ~/.finch/adapters */;
    std::fs::create_dir_all(&adapters_dir)?;
 
    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -185,7 +185,7 @@ async fn run_background_training(
 ✓ Background training completed!
    Trained on 10 examples
    Final loss: 0.8534
-   Adapter saved to: /Users/user/.shammah/adapters/lora_adapter_20260206_143025.safetensors
+   Adapter saved to: /Users/user/.finch/adapters/lora_adapter_20260206_143025.safetensors
 ```
 
 ## Technical Details
@@ -201,7 +201,7 @@ Training runs in a separate `tokio::spawn` task:
 
 Adapters saved with timestamp:
 ```
-~/.shammah/adapters/
+~/.finch/adapters/
 ├── lora_adapter_20260206_143025.safetensors
 ├── lora_adapter_20260206_143025.json  (config)
 ├── lora_adapter_20260206_155010.safetensors
@@ -521,7 +521,7 @@ $ RUST_LOG=info cargo run
 
 ### Adapter Storage
 
-Adapters stored in user directory (`~/.shammah/adapters/`):
+Adapters stored in user directory (`~/.finch/adapters/`):
 - **Privacy**: Not shared by default
 - **Permissions**: User-only read/write (0600)
 - **Location**: Outside project directory

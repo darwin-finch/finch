@@ -521,7 +521,7 @@ mod tests {
         conv.add_user_message("Test message".to_string());
         conv.add_assistant_message("Test response".to_string());
 
-        let temp_path = "/tmp/test_conv_shammah.json";
+        let temp_path = "/tmp/test_conv_finch.json";
         conv.save(temp_path).expect("Failed to save conversation");
 
         let loaded = ConversationHistory::load(temp_path).expect("Failed to load conversation");

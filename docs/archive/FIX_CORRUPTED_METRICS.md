@@ -117,12 +117,12 @@ Now streaming requests have the same retry behavior as buffered requests (3 retr
 **Action Taken**:
 ```bash
 # Backup corrupted files (optional)
-cp ~/.shammah/models/threshold_router.json ~/.shammah/models/threshold_router.json.backup
-cp ~/.shammah/models/threshold_validator.json ~/.shammah/models/threshold_validator.json.backup
+cp ~/.finch/models/threshold_router.json ~/.finch/models/threshold_router.json.backup
+cp ~/.finch/models/threshold_validator.json ~/.finch/models/threshold_validator.json.backup
 
 # Delete corrupted files
-rm ~/.shammah/models/threshold_router.json
-rm ~/.shammah/models/threshold_validator.json
+rm ~/.finch/models/threshold_router.json
+rm ~/.finch/models/threshold_validator.json
 ```
 
 Shammah will create fresh statistics files on next run.
@@ -238,6 +238,6 @@ Training: 10 queries | Local: 20% | Success: 50%
 
 ## References
 
-- Plan document: `/Users/shammah/repos/claude-proxy/plan_fix_corrupted_metrics.md`
-- Backup files: `~/.shammah/models/*.backup`
+- Plan document: `/Users/finch/repos/claude-proxy/plan_fix_corrupted_metrics.md`
+- Backup files: `~/.finch/models/*.backup`
 - Git commits: See git log for detailed changes

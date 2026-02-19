@@ -26,7 +26,7 @@ impl ServiceDiscovery {
 
     /// Advertise service on local network
     pub fn advertise(&self, _port: u16) -> Result<()> {
-        // TODO: Use mdns-sd crate to advertise _shammah._tcp.local.
+        // TODO: Use mdns-sd crate to advertise _finch._tcp.local.
         // TODO: Include properties: model, description, capabilities
         tracing::info!(
             "Advertising service: {} ({})",

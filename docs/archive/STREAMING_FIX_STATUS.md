@@ -75,12 +75,12 @@ However, this blocking shouldn't cause duplication - it should just serialize re
 
 1. **Start daemon:**
    ```bash
-   ./target/release/shammah daemon --bind 127.0.0.1:11435
+   ./target/release/finch daemon --bind 127.0.0.1:11435
    ```
 
 2. **In another terminal, start REPL:**
    ```bash
-   ./target/release/shammah
+   ./target/release/finch
    ```
 
 3. **Test DeepSeek thinking removal:**
@@ -104,10 +104,10 @@ However, this blocking shouldn't cause duplication - it should just serialize re
 1. **Run with debug logging:**
    ```bash
    # Terminal 1: Daemon with debug logs
-   RUST_LOG=debug ./target/release/shammah daemon --bind 127.0.0.1:11435 2>&1 | tee daemon_debug.log
+   RUST_LOG=debug ./target/release/finch daemon --bind 127.0.0.1:11435 2>&1 | tee daemon_debug.log
 
    # Terminal 2: REPL with debug logs
-   RUST_LOG=debug ./target/release/shammah 2>&1 | tee repl_debug.log
+   RUST_LOG=debug ./target/release/finch 2>&1 | tee repl_debug.log
    ```
 
 2. **Issue `/local` query:**

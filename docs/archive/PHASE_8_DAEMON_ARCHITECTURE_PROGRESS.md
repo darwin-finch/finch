@@ -17,7 +17,7 @@ Implemented key infrastructure for daemon architecture with auto-spawn, lifecycl
 - `src/daemon/spawn.rs` - Auto-spawn logic
 
 **Features:**
-- **PID File Management**: `~/.shammah/daemon.pid` tracks running daemon
+- **PID File Management**: `~/.finch/daemon.pid` tracks running daemon
 - **Process Existence Checks**:
   - Unix: `kill(pid, NULL)` signal check
   - Windows: `sysinfo` process enumeration
@@ -39,13 +39,13 @@ nix = { version = "0.29", features = ["signal"] }
 **Usage:**
 ```bash
 # Start daemon explicitly
-shammah daemon
+finch daemon
 
-# Daemon writes PID file: ~/.shammah/daemon.pid
+# Daemon writes PID file: ~/.finch/daemon.pid
 # On exit (Ctrl+C), PID file is removed automatically
 
 # Check if daemon is running
-ps aux | grep "shammah daemon"
+ps aux | grep "finch daemon"
 ```
 
 ---
@@ -161,7 +161,7 @@ DaemonConfig {
 ### ⏳ Task #4: Update REPL to Use Daemon Client (PENDING)
 
 **Scope:**
-- Add `use_daemon` config option to `~/.shammah/config.toml`
+- Add `use_daemon` config option to `~/.finch/config.toml`
 - Modify `Repl::new()` to optionally use `DaemonClient` instead of local model
 - Preserve all existing functionality (tools, streaming, feedback)
 - Add `/daemon` command to toggle mode or show status
@@ -256,7 +256,7 @@ DaemonConfig {
          │  └────────────────────────┘ │
          │                              │
          │  Lifecycle:                  │
-         │  - PID file (~/.shammah/)   │
+         │  - PID file (~/.finch/)   │
          │  - Auto-spawn support       │
          │  - Graceful shutdown        │
          └──────────────────────────────┘
@@ -269,31 +269,31 @@ DaemonConfig {
 ### 1. Test Daemon Lifecycle
 ```bash
 # Kill any existing daemon
-pkill -f "shammah daemon"
+pkill -f "finch daemon"
 
 # Start daemon explicitly
-shammah daemon --bind 127.0.0.1:11434 &
+finch daemon --bind 127.0.0.1:11434 &
 
 # Verify PID file created
-cat ~/.shammah/daemon.pid
+cat ~/.finch/daemon.pid
 
 # Check process running
-ps aux | grep "shammah daemon"
+ps aux | grep "finch daemon"
 
 # Test health endpoint
 curl http://127.0.0.1:11434/health
 
 # Stop daemon
-pkill -f "shammah daemon"
+pkill -f "finch daemon"
 
 # Verify PID file removed
-ls ~/.shammah/daemon.pid  # Should not exist
+ls ~/.finch/daemon.pid  # Should not exist
 ```
 
 ### 2. Test OpenAI API
 ```bash
 # Start daemon
-shammah daemon --bind 127.0.0.1:11434 &
+finch daemon --bind 127.0.0.1:11434 &
 
 # Test chat completions endpoint
 curl -X POST http://127.0.0.1:11434/v1/chat/completions \
@@ -325,7 +325,7 @@ curl http://127.0.0.1:11434/v1/models
 ### 3. Test Auto-spawn (Pending Client Integration)
 ```bash
 # Kill daemon
-pkill -f "shammah daemon"
+pkill -f "finch daemon"
 
 # Use client (should auto-spawn)
 # (Requires Task #4 completion)

@@ -21,7 +21,7 @@ The threshold router had accumulated **catastrophic** historical statistics from
 
 ### Why This Happened
 
-The router statistics file (`~/.shammah/models/threshold_router.json`) persisted data from earlier development when:
+The router statistics file (`~/.finch/models/threshold_router.json`) persisted data from earlier development when:
 - Models weren't loading correctly
 - ONNX runtime had issues
 - Adapters weren't configured properly
@@ -119,20 +119,20 @@ To manually reset router statistics:
 
 ```bash
 # Stop daemon
-kill $(cat ~/.shammah/daemon.pid)
+kill $(cat ~/.finch/daemon.pid)
 
 # Backup old stats
-mv ~/.shammah/models/threshold_router.json \
-   ~/.shammah/models/threshold_router.json.backup
+mv ~/.finch/models/threshold_router.json \
+   ~/.finch/models/threshold_router.json.backup
 
 # Restart daemon (will create fresh stats)
-shammah daemon --bind 127.0.0.1:11435 &
+finch daemon --bind 127.0.0.1:11435 &
 ```
 
 Or add a CLI command:
 
 ```bash
-shammah router reset  # Future feature
+finch router reset  # Future feature
 ```
 
 ## Monitoring
@@ -141,10 +141,10 @@ To check router health:
 
 ```bash
 # View current statistics
-cat ~/.shammah/models/threshold_router.json | jq .
+cat ~/.finch/models/threshold_router.json | jq .
 
 # Check routing decisions in logs
-tail -f ~/.shammah/daemon.log | grep "Routing decision"
+tail -f ~/.finch/daemon.log | grep "Routing decision"
 ```
 
 Expected patterns:
@@ -158,7 +158,7 @@ If you see mostly FORWARD, the router has learned that local models aren't worki
 
 - `src/models/threshold_router.rs` - Router implementation
 - `src/router/decision.rs` - Routing decision logic
-- `~/.shammah/models/threshold_router.json` - Persisted statistics
+- `~/.finch/models/threshold_router.json` - Persisted statistics
 - `src/server/openai_handlers.rs` - Query handling with routing
 
 ## Impact

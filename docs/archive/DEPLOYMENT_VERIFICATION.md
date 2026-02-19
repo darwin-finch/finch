@@ -2,7 +2,7 @@
 
 **Date:** January 31, 2026, 13:50 PST
 **Commit:** aacfbc2
-**Binary:** ./target/release/shammah (9.6MB, optimized)
+**Binary:** ./target/release/finch (9.6MB, optimized)
 **Status:** ✅ DEPLOYED
 
 ---
@@ -19,7 +19,7 @@
 - **Line 969:** Graceful shutdown save on REPL exit
 
 **Behavior Now:**
-- Pattern written to `~/.shammah/tool_patterns.json` IMMEDIATELY after approval
+- Pattern written to `~/.finch/tool_patterns.json` IMMEDIATELY after approval
 - User can exit anytime without losing patterns
 - No more re-prompts after restart
 
@@ -50,7 +50,7 @@
 **Steps:**
 ```bash
 # 1. Start REPL
-./target/release/shammah
+./target/release/finch
 
 # 2. Use a tool that requires approval (e.g., bash, read, etc.)
 > (trigger a tool that needs approval)
@@ -61,10 +61,10 @@
 # 4. Exit IMMEDIATELY (Ctrl-C) - before reaching 10 queries
 
 # 5. Check pattern was saved:
-cat ~/.shammah/tool_patterns.json | jq '.patterns | last'
+cat ~/.finch/tool_patterns.json | jq '.patterns | last'
 
 # 6. Restart REPL:
-./target/release/shammah
+./target/release/finch
 
 # 7. Use same tool again
 
@@ -73,7 +73,7 @@ cat ~/.shammah/tool_patterns.json | jq '.patterns | last'
 ```
 
 **Current State:**
-- Existing patterns file: `~/.shammah/tool_patterns.json` (2.6 KB)
+- Existing patterns file: `~/.finch/tool_patterns.json` (2.6 KB)
 - Contains 6 patterns and 1 exact approval from previous sessions
 - New patterns will save immediately with this fix
 
@@ -86,7 +86,7 @@ cat ~/.shammah/tool_patterns.json | jq '.patterns | last'
 **Steps:**
 ```bash
 # 1. Start REPL
-./target/release/shammah
+./target/release/finch
 
 # 2. Use query_local_model tool (if available)
 > query_local_model with {"query": "What is Rust?"}
@@ -118,7 +118,7 @@ cat ~/.shammah/tool_patterns.json | jq '.patterns | last'
 
 **Steps:**
 ```bash
-./target/release/shammah
+./target/release/finch
 
 # Generate training data
 > generate_training_data with [{"query": "What is Rust?", "response": "Rust is a systems programming language"}]
@@ -166,7 +166,7 @@ grep "No suitable local generation method" src/local/generator.rs
 - **Binary Size:** 9.6 MB
 - **Warnings:** 32 warnings (all pre-existing, unrelated to changes)
 - **Errors:** 0
-- **Location:** `./target/release/shammah`
+- **Location:** `./target/release/finch`
 
 ### Git Status ✅
 
@@ -203,7 +203,7 @@ cargo build --release
 ### What to Watch:
 
 **Pattern Persistence:**
-- Monitor `~/.shammah/tool_patterns.json` file size/modification time
+- Monitor `~/.finch/tool_patterns.json` file size/modification time
 - Check for "Warning: Failed to save pattern" messages in logs
 - Verify patterns persist across restarts
 
@@ -214,7 +214,7 @@ cargo build --release
 
 ### Log Locations:
 - Interactive mode: stderr output
-- Debug logs: Use `RUST_LOG=debug ./target/release/shammah`
+- Debug logs: Use `RUST_LOG=debug ./target/release/finch`
 
 ---
 
@@ -222,7 +222,7 @@ cargo build --release
 
 ### Pattern Persistence ✓
 - [ ] User approves pattern with "save permanently"
-- [ ] Pattern written to `~/.shammah/tool_patterns.json` immediately
+- [ ] Pattern written to `~/.finch/tool_patterns.json` immediately
 - [ ] User can exit app anytime (before 10 queries)
 - [ ] User restarts app
 - [ ] Same pattern/tool does NOT reprompt
@@ -282,4 +282,4 @@ cargo build --release
 
 **Deployment Complete!** 🎉
 
-All changes are live in `./target/release/shammah`. The fixes are ready to use immediately.
+All changes are live in `./target/release/finch`. The fixes are ready to use immediately.

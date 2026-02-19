@@ -26,7 +26,7 @@
    ```bash
    cargo run
    # or after building:
-   ./target/release/shammah
+   ./target/release/finch
    ```
 
 ## Configuration
@@ -71,7 +71,7 @@ cargo watch -x run
 ## Project Structure
 
 ```
-shammah/
+finch/
 ├── src/
 │   ├── main.rs           # Entry point
 │   ├── lib.rs            # Library exports

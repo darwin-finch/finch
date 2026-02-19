@@ -120,7 +120,7 @@ cargo build --release
 ### Test 1: Grey Background Line (Fix 1)
 
 ```bash
-./target/release/shammah
+./target/release/finch
 
 > hello
 # (wait for Claude's full response)
@@ -137,7 +137,7 @@ cargo build --release
 ### Test 2: Message Truncation (Fix 2)
 
 ```bash
-./target/release/shammah
+./target/release/finch
 
 > Write a detailed explanation of Rust ownership with code examples
 ```
@@ -153,7 +153,7 @@ cargo build --release
 ### Test 3: User Message Backgrounds (Regression Test)
 
 ```bash
-./target/release/shammah
+./target/release/finch
 
 > hello
 > how are you?
@@ -171,7 +171,7 @@ cargo build --release
 ### Test 4: Terminal Resize (Regression Test)
 
 ```bash
-./target/release/shammah
+./target/release/finch
 
 > hello
 > (resize terminal smaller)

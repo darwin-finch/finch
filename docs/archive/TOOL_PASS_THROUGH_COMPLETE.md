@@ -85,7 +85,7 @@ Changed all references from:
 
 ```bash
 # Start daemon
-./target/release/shammah daemon --bind 127.0.0.1:8080
+./target/release/finch daemon --bind 127.0.0.1:8080
 
 # Test with curl
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \

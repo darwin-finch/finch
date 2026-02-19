@@ -23,7 +23,7 @@ This guide covers setting up a development environment and contributing to Shamm
 ### 1. Clone Repository
 
 ```bash
-git clone https://github.com/shammah/claude-proxy.git
+git clone https://github.com/finch/claude-proxy.git
 cd claude-proxy
 ```
 
@@ -78,7 +78,7 @@ echo 'export ANTHROPIC_API_KEY="sk-ant-..."' >> ~/.zshrc
 cargo build
 ```
 
-Binary at: `target/debug/shammah`
+Binary at: `target/debug/finch`
 
 ### Release Build
 
@@ -86,7 +86,7 @@ Binary at: `target/debug/shammah`
 cargo build --release
 ```
 
-Binary at: `target/release/shammah`
+Binary at: `target/release/finch`
 
 ### Run Without Building
 
@@ -223,7 +223,7 @@ cargo watch -x run
 cargo watch -x test
 
 # Run specific binary
-cargo watch -x 'run --bin shammah'
+cargo watch -x 'run --bin finch'
 ```
 
 ## Project Structure
@@ -420,7 +420,7 @@ RUST_LOG=debug cargo run
 More granular:
 
 ```bash
-RUST_LOG=shammah=debug,shammah::router=trace cargo run
+RUST_LOG=finch=debug,finch::router=trace cargo run
 ```
 
 ### Use Debugger
@@ -437,7 +437,7 @@ RUST_LOG=shammah=debug,shammah::router=trace cargo run
       "request": "launch",
       "name": "Debug Shammah",
       "cargo": {
-        "args": ["build", "--bin=shammah"]
+        "args": ["build", "--bin=finch"]
       },
       "args": [],
       "cwd": "${workspaceFolder}"
@@ -449,7 +449,7 @@ RUST_LOG=shammah=debug,shammah::router=trace cargo run
 **CLI Debugger**:
 
 ```bash
-rust-lldb target/debug/shammah
+rust-lldb target/debug/finch
 ```
 
 ### Profile Performance
@@ -467,7 +467,7 @@ sudo cargo flamegraph
 ```bash
 # Install heaptrack (if available on macOS)
 cargo build --release
-heaptrack target/release/shammah
+heaptrack target/release/finch
 ```
 
 ## Common Tasks
@@ -571,7 +571,7 @@ git push origin v0.2.0
 ```bash
 cargo build --release
 
-# Binary at target/release/shammah
+# Binary at target/release/finch
 ```
 
 ### Publish to crates.io

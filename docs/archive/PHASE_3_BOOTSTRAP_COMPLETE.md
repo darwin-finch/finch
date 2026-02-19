@@ -73,7 +73,7 @@ Demonstrates:
 ### User Experience Flow
 
 ```
-$ shammah
+$ finch
 [REPL ready in 87ms]
 
 > How do I use Rust lifetimes?
@@ -97,7 +97,7 @@ $ shammah
 
 #### Before (Synchronous Loading):
 ```
-User runs shammah
+User runs finch
   ↓
 Wait 2-5 seconds (load model) ← BLOCKING
   ↓
@@ -113,7 +113,7 @@ User can query
 
 #### After (Progressive Bootstrap):
 ```
-User runs shammah
+User runs finch
   ↓
 REPL appears (<100ms) ← INSTANT
   ↓

@@ -307,8 +307,8 @@ impl TuiRenderer {
             ("/show-plan", "Display current plan"),
             ("/save-plan", "Save last response to plan"),
             ("/done", "Exit plan mode"),
-            ("/exit", "Exit shammah"),
-            ("/quit", "Exit shammah"),
+            ("/exit", "Exit finch"),
+            ("/quit", "Exit finch"),
         ];
 
         // Find matching command
@@ -525,7 +525,7 @@ impl TuiRenderer {
         use std::io::BufRead;
 
         let history_file = match dirs::home_dir() {
-            Some(home) => home.join(".shammah").join("history.txt"),
+            Some(home) => home.join(".finch").join("history.txt"),
             None => return Vec::new(),
         };
 
@@ -552,7 +552,7 @@ impl TuiRenderer {
 
         let history_file = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-            .join(".shammah")
+            .join(".finch")
             .join("history.txt");
 
         // Ensure parent directory exists

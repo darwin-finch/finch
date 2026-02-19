@@ -51,9 +51,9 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
         bail!(errors::wrap_error_with_suggestion(
             format!("Daemon is running (PID: {}) but not responding to health checks", pid),
             "Try stopping and restarting:\n\
-             1. shammah daemon-stop\n\
-             2. shammah daemon-start\n\n\
-             Or check logs: tail -f ~/.shammah/daemon.log"
+             1. finch daemon-stop\n\
+             2. finch daemon-start\n\n\
+             Or check logs: tail -f ~/.finch/daemon.log"
         ));
     }
 
@@ -78,7 +78,7 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
     bail!(errors::wrap_error_with_suggestion(
         "Daemon failed to start within 10 seconds",
         "Check daemon logs for errors:\n\
-         tail -f ~/.shammah/daemon.log\n\n\
+         tail -f ~/.finch/daemon.log\n\n\
          Common issues:\n\
          • Port already in use\n\
          • Insufficient permissions\n\
@@ -88,20 +88,20 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
 
 /// Spawn daemon as background process
 ///
-/// Detaches daemon from current process and redirects logs to ~/.shammah/daemon.log
+/// Detaches daemon from current process and redirects logs to ~/.finch/daemon.log
 /// - Unix: Standard spawn with log file redirection
 /// - Windows: Uses CREATE_NO_WINDOW flag to avoid console
 pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     let exe_path = std::env::current_exe()
         .context("Failed to determine current executable path")?;
 
-    // Create log file in ~/.shammah/daemon.log
+    // Create log file in ~/.finch/daemon.log
     let log_path = dirs::home_dir()
         .context("Failed to determine home directory")?
-        .join(".shammah")
+        .join(".finch")
         .join("daemon.log");
 
-    // Ensure .shammah directory exists
+    // Ensure .finch directory exists
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory: {}", parent.display()))?;

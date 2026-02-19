@@ -222,7 +222,7 @@ This means:
 
 ### Manual Test
 
-1. **Start shammah**: `./target/debug/shammah`
+1. **Start finch**: `./target/debug/finch`
 2. **Ask Claude**: "Please ask me a question via a dialog box about which library to use for date formatting"
 3. **Verify dialog appears**: Should see actual TUI dialog (not text formatting)
 4. **Try interactions**:

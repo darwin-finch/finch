@@ -2,7 +2,7 @@
 
 **Goal:** Progressive refactor to Ratatui-based TUI with Claude Code-like interface
 
-**Plan Document:** `/Users/shammah/.claude/plans/encapsulated-stargazing-sedgewick.md`
+**Plan Document:** `/Users/finch/.claude/plans/encapsulated-stargazing-sedgewick.md`
 
 **Started:** 2026-02-06
 
@@ -384,7 +384,7 @@ When TUI was enabled for testing, output was completely broken because:
     - [x] INFO → `output_status!()` or `output_progress!()` (for "Downloading"/"Loading")
     - [x] DEBUG/TRACE → `output_status!("🔍 {}")` (optional with SHAMMAH_DEBUG=1)
   - [x] Add formatting flexibility:
-    - [x] Strip ugly module paths (shammah::x::y → x::y, tokio::x::y → "message")
+    - [x] Strip ugly module paths (finch::x::y → x::y, tokio::x::y → "message")
     - [x] Clean module names (tokio/reqwest/hyper stripped)
     - [x] Customize message format with crate name prefix
   - [x] Add `init_tracing()` function in `src/main.rs`
@@ -445,7 +445,7 @@ When TUI was enabled for testing, output was completely broken because:
     - [ ] Test that macros write to globals
     - [ ] Clear global buffer between integration tests if needed
   - [ ] Test non-interactive mode
-    - [ ] Pipe test: echo "query" | shammah | grep "response"
+    - [ ] Pipe test: echo "query" | finch | grep "response"
     - [ ] Verify only Claude output on stdout
     - [ ] Verify logs don't pollute stdout
     - [ ] Test SHAMMAH_LOG=1 enables logging
@@ -631,7 +631,7 @@ When TUI was enabled for testing, output was completely broken because:
 
 - [ ] Fresh start test
   - [ ] `cargo build --release`
-  - [ ] `./target/release/shammah`
+  - [ ] `./target/release/finch`
   - [ ] Verify clean startup with TUI layout
   - [ ] Check status bar at bottom with training stats
 
@@ -768,7 +768,7 @@ When TUI was enabled for testing, output was completely broken because:
 
 **For Claude (when resumed):**
 - Read this file to understand current progress
-- Read plan at `/Users/shammah/.claude/plans/encapsulated-stargazing-sedgewick.md`
+- Read plan at `/Users/finch/.claude/plans/encapsulated-stargazing-sedgewick.md`
 - Continue from the next unchecked task
 - Update checkboxes as you complete tasks
 - Commit after each phase completes
@@ -777,8 +777,8 @@ When TUI was enabled for testing, output was completely broken because:
 
 ## References
 
-- **Plan Document:** `/Users/shammah/.claude/plans/encapsulated-stargazing-sedgewick.md`
-- **Project Root:** `/Users/shammah/repos/claude-proxy/`
-- **Main REPL:** `/Users/shammah/repos/claude-proxy/src/cli/repl.rs`
+- **Plan Document:** `/Users/finch/.claude/plans/encapsulated-stargazing-sedgewick.md`
+- **Project Root:** `/Users/finch/repos/claude-proxy/`
+- **Main REPL:** `/Users/finch/repos/claude-proxy/src/cli/repl.rs`
 - **Ratatui Docs:** https://ratatui.rs/
 - **Ratatui Examples:** https://github.com/ratatui/ratatui/tree/main/examples

@@ -15,10 +15,10 @@ impl InputHandler {
     pub fn new() -> Result<Self> {
         let mut editor = DefaultEditor::new().context("Failed to initialize readline editor")?;
 
-        // History path: ~/.shammah/history.txt
+        // History path: ~/.finch/history.txt
         let history_path = dirs::home_dir()
             .context("Failed to determine home directory")?
-            .join(".shammah")
+            .join(".finch")
             .join("history.txt");
 
         // Load existing history if available

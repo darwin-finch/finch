@@ -6,31 +6,31 @@ This document shows test cases for the piped input functionality.
 
 ### ✓ Test 1: Simple echo pipe
 ```bash
-echo "What is 2+2?" | ./target/debug/shammah
+echo "What is 2+2?" | ./target/debug/finch
 ```
 **Result**: Works correctly, outputs just the response with no REPL artifacts
 
 ### ✓ Test 2: Empty input
 ```bash
-echo "" | ./target/debug/shammah
+echo "" | ./target/debug/finch
 ```
 **Result**: Exits cleanly with no output
 
 ### ✓ Test 3: Multi-line query
 ```bash
-printf "What is Rust?\nPlease answer in one sentence." | ./target/debug/shammah
+printf "What is Rust?\nPlease answer in one sentence." | ./target/debug/finch
 ```
 **Result**: Processes entire input as single query
 
 ### ✓ Test 4: File input
 ```bash
-cat query.txt | ./target/debug/shammah
+cat query.txt | ./target/debug/finch
 ```
 **Result**: Reads and processes file contents
 
 ### ✓ Test 5: Heredoc syntax
 ```bash
-./target/debug/shammah <<EOF
+./target/debug/finch <<EOF
 What is the time complexity of quicksort?
 EOF
 ```
@@ -38,13 +38,13 @@ EOF
 
 ### ✓ Test 6: Exit code
 ```bash
-echo "test" | ./target/debug/shammah > /dev/null 2>&1 && echo "Exit code: 0"
+echo "test" | ./target/debug/finch > /dev/null 2>&1 && echo "Exit code: 0"
 ```
 **Result**: Returns exit code 0 on success
 
 ### ✓ Test 7: No REPL messages in piped mode
 ```bash
-echo "test" | ./target/debug/shammah 2>&1 | grep -E "(Shammah v|Using API|Ready\.|Type /help)"
+echo "test" | ./target/debug/finch 2>&1 | grep -E "(Shammah v|Using API|Ready\.|Type /help)"
 ```
 **Result**: No REPL startup messages appear in output
 

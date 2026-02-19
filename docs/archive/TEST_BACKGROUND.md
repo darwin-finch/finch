@@ -2,7 +2,7 @@
 
 ## Test Setup
 
-**Binary:** `./target/release/shammah`
+**Binary:** `./target/release/finch`
 **Build:** Fresh build with background fix (completed)
 **Daemon:** Running on PID 80886
 
@@ -13,8 +13,8 @@
 ### Step 1: Start REPL
 
 ```bash
-cd /Users/shammah/repos/claude-proxy
-./target/release/shammah
+cd /Users/finch/repos/claude-proxy
+./target/release/finch
 ```
 
 ### Step 2: Send User Messages
@@ -143,7 +143,7 @@ Background **persists** through all messages and updates.
 
 ```bash
 # Run REPL and check raw output
-script -q /dev/null ./target/release/shammah | cat -v | less
+script -q /dev/null ./target/release/finch | cat -v | less
 # Look for ANSI escape codes like: ^[[48;2;220;220;220m
 ```
 
@@ -176,7 +176,7 @@ After testing, report:
 ```bash
 #!/bin/bash
 echo "Starting REPL test..."
-./target/release/shammah << 'EOF'
+./target/release/finch << 'EOF'
 hello
 test message 2
 another test

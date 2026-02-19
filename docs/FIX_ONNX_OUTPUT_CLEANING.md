@@ -115,7 +115,7 @@ Created `/tmp/test_cleaning.rs` to verify logic independently:
 
 **Test 1: Simple Math**
 ```bash
-$ ./target/release/shammah query "What is 2+2?"
+$ ./target/release/finch query "What is 2+2?"
 2+2 equals 4.
 
 This is a basic arithmetic addition problem...
@@ -124,7 +124,7 @@ This is a basic arithmetic addition problem...
 
 **Test 2: Code Question**
 ```bash
-$ ./target/release/shammah query "How do I print in Rust?"
+$ ./target/release/finch query "How do I print in Rust?"
 In Rust, there are several ways to print output...
 
 ## 1. `println!` macro (most common)
@@ -138,7 +138,7 @@ println!("Hello, world!");
 
 **Test 3: More Math**
 ```bash
-$ ./target/release/shammah query "What is 10+10?"
+$ ./target/release/finch query "What is 10+10?"
 10 + 10 = 20
 
 This is a basic arithmetic operation...

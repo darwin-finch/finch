@@ -138,7 +138,7 @@ impl TrainingWorker {
     /// Get adapter output path
     fn get_adapter_path(&self) -> std::path::PathBuf {
         let home = dirs::home_dir().expect("Cannot determine home directory");
-        home.join(".shammah")
+        home.join(".finch")
             .join("adapters")
             .join("latest.safetensors")
     }

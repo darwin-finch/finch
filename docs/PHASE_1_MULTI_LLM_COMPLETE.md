@@ -101,7 +101,7 @@ name = "gpt4"  # Rest = tools
 let llm_registry = LLMRegistry::from_teachers(&config.teachers)?;
 
 // Create conversation logger
-let log_path = home.join(".shammah/conversations.jsonl");
+let log_path = home.join(".finch/conversations.jsonl");
 let mut logger = ConversationLogger::new(log_path)?;
 
 // Create LLM delegation tools
@@ -166,7 +166,7 @@ Manual testing needed:
 1. Start REPL with multiple teachers configured
 2. Verify LLM delegation tools appear in available tools
 3. Test delegation: Local → Claude, Claude → Grok, etc.
-4. Verify conversation logging to `~/.shammah/conversations.jsonl`
+4. Verify conversation logging to `~/.finch/conversations.jsonl`
 5. Test `/feedback` command (when implemented)
 
 ## Next Steps

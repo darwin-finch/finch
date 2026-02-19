@@ -108,7 +108,7 @@ The fix ensures:
 
 ```bash
 # Start REPL
-./target/release/shammah
+./target/release/finch
 
 # Type a user message
 > hello

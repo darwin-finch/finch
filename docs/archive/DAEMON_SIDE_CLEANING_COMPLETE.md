@@ -123,7 +123,7 @@ ONNX generate_stream → raw tokens → rx
 ### Test 1: Simple Query (No Truncation)
 ```bash
 # Start daemon
-shammah daemon
+finch daemon
 
 # In another terminal:
 curl -X POST http://localhost:8000/v1/chat/completions \

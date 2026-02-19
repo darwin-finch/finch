@@ -137,11 +137,11 @@ User Query
 
 ## Configuration Format
 
-**`~/.shammah/config.toml`**:
+**`~/.finch/config.toml`**:
 ```toml
 [mcp_servers.filesystem]
 command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/shammah"]
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/finch"]
 transport = "stdio"
 enabled = true
 
@@ -209,7 +209,7 @@ env = { GITHUB_TOKEN = "$GITHUB_TOKEN" }
 
 **Tasks**:
 1. Install filesystem MCP server: `npm install -g @modelcontextprotocol/server-filesystem`
-2. Configure in `~/.shammah/config.toml`
+2. Configure in `~/.finch/config.toml`
 3. Test `/mcp list` command
 4. Test AI using MCP tools: "Use mcp_filesystem_list_directory to list files in /tmp"
 5. Test error handling (invalid server, disconnection, etc.)

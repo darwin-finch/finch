@@ -3,7 +3,7 @@
 **Date:** 2026-02-15
 **Status:** ✅ All fixes implemented and verified
 **Build:** ✅ Successful
-**Binary:** `./target/release/shammah`
+**Binary:** `./target/release/finch`
 
 ---
 
@@ -72,7 +72,7 @@ accumulated_rows += row_count; // Mark as included (will be truncated during ren
 
 ```bash
 $ cargo build --release
-   Compiling shammah v0.1.0 (/Users/shammah/repos/claude-proxy)
+   Compiling finch v0.1.0 (/Users/finch/repos/claude-proxy)
     Finished `release` profile [optimized] target(s) in 1m 33s
 ```
 
@@ -86,7 +86,7 @@ $ cargo build --release
 
 ### Daemon Status
 ```bash
-$ ./target/release/shammah daemon-status
+$ ./target/release/finch daemon-status
 ✓ Daemon Status
   Status:          healthy
   PID:             84063
@@ -99,7 +99,7 @@ $ ./target/release/shammah daemon-status
 
 ### Basic Query Test
 ```bash
-$ echo "what is 2+2?" | ./target/release/shammah --direct
+$ echo "what is 2+2?" | ./target/release/finch --direct
 2 + 2 = 4
 ```
 
@@ -121,7 +121,7 @@ The fixes are implemented and the code compiles, but **interactive TUI testing i
 
 ### Test 1: Background Flickering Fix
 ```bash
-./target/release/shammah
+./target/release/finch
 ```
 
 **Steps:**
@@ -143,7 +143,7 @@ The fixes are implemented and the code compiles, but **interactive TUI testing i
 
 ### Test 2: DeepSeek Prompt Cleaning Fix
 ```bash
-./target/release/shammah
+./target/release/finch
 ```
 
 **Steps:**
@@ -163,7 +163,7 @@ The fixes are implemented and the code compiles, but **interactive TUI testing i
 
 ### Test 3: Message Disappearing Fix
 ```bash
-./target/release/shammah
+./target/release/finch
 ```
 
 **Steps:**
@@ -184,7 +184,7 @@ The fixes are implemented and the code compiles, but **interactive TUI testing i
 
 ### Test 4: Terminal Resize (Background Preservation)
 ```bash
-./target/release/shammah
+./target/release/finch
 ```
 
 **Steps:**
@@ -239,7 +239,7 @@ All fixes are:
 
 1. **Run Interactive REPL:**
    ```bash
-   ./target/release/shammah
+   ./target/release/finch
    ```
 
 2. **Test Each Fix:** Follow the test steps above

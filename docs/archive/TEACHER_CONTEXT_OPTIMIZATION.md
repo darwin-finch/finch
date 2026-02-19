@@ -19,7 +19,7 @@ The `TeacherSession` module provides three levels of context optimization to min
 ### Usage:
 
 ```rust
-use shammah::providers::{TeacherSession, create_provider};
+use finch::providers::{TeacherSession, create_provider};
 
 // Create provider
 let teacher_provider = create_provider(&config.teacher)?;
@@ -78,7 +78,7 @@ api_key = "..."
 ### Usage:
 
 ```rust
-use shammah::providers::{TeacherSession, TeacherContextConfig};
+use finch::providers::{TeacherSession, TeacherContextConfig};
 
 // Configure truncation
 let config = TeacherContextConfig {
@@ -261,8 +261,8 @@ After dropping tool results, truncate to `max_context_turns` most recent turns.
 ### In main application:
 
 ```rust
-use shammah::providers::{TeacherSession, TeacherContextConfig, create_provider};
-use shammah::config::load_config;
+use finch::providers::{TeacherSession, TeacherContextConfig, create_provider};
+use finch::config::load_config;
 
 #[tokio::main]
 async fn main() -> Result<()> {

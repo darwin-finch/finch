@@ -85,21 +85,21 @@ let needs_approval = matches!(approval_source, ApprovalSource::NotApproved);
 
 ## Verification
 
-✅ **Code compiles**: `cargo build --bin shammah` succeeds
+✅ **Code compiles**: `cargo build --bin finch` succeeds
 ✅ **Logic is correct**:
-   - Patterns saved to `~/.shammah/tool_patterns.json`
+   - Patterns saved to `~/.finch/tool_patterns.json`
    - Subsequent tool calls check cache first
    - Only prompts when truly needed
 ✅ **Thread-safe**: Uses existing `Arc<Mutex<>>` synchronization
 
 ## Testing Instructions
 
-1. **Start shammah**: `./target/debug/shammah`
+1. **Start finch**: `./target/debug/finch`
 2. **Trigger a tool request**: Ask Claude to read a file
 3. **Select "ALWAYS allow this pattern"**: Choose option 5 from dialog
-4. **Verify saved**: Check `~/.shammah/tool_patterns.json` exists
+4. **Verify saved**: Check `~/.finch/tool_patterns.json` exists
 5. **Ask for similar tool**: Same tool should NOT prompt again
-6. **Restart shammah**: Pattern should persist across sessions
+6. **Restart finch**: Pattern should persist across sessions
 
 ## Expected Behavior
 

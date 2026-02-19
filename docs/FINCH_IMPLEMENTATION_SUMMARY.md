@@ -151,7 +151,7 @@ gh issue create --title "..." --body "..." --label "phase-1"
 ```
 
 ### Config Migration
-Runtime migration will automatically move `~/.shammah` → `~/.finch` on first run.
+Runtime migration will automatically move `~/.finch` → `~/.finch` on first run.
 
 ---
 
@@ -160,7 +160,7 @@ Runtime migration will automatically move `~/.shammah` → `~/.finch` on first r
 ```bash
 $ cargo check
 ...
-warning: `shammah` (bin "shammah") generated 8 warnings
+warning: `finch` (bin "finch") generated 8 warnings
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.64s
 ```
 
@@ -187,7 +187,7 @@ let llm_registry = LLMRegistry::from_teachers(&config.teachers)?;
 
 // Create conversation logger
 let mut logger = ConversationLogger::new(
-    home_dir().join(".shammah/conversations.jsonl")
+    home_dir().join(".finch/conversations.jsonl")
 )?;
 
 // Load persona

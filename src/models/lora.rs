@@ -84,7 +84,7 @@ impl Default for LoRAConfig {
 ///
 /// # Example (Future Usage)
 /// ```rust,ignore
-/// use shammah::models::{GeneratorModel, LoRATrainingAdapter, LoRAConfig};
+/// use finch::models::{GeneratorModel, LoRATrainingAdapter, LoRAConfig};
 ///
 /// // Load pre-trained Qwen model
 /// let mut generator = GeneratorModel::new(config)?;
@@ -106,7 +106,7 @@ impl Default for LoRAConfig {
 /// generator.fine_tune_with_lora(&examples, lora_config, epochs: 3)?;
 ///
 /// // Save adapted model
-/// generator.save_lora("~/.shammah/adapters/physics.safetensors")?;
+/// generator.save_lora("~/.finch/adapters/physics.safetensors")?;
 /// ```
 #[derive(Debug)]
 pub struct LoRATrainingAdapter {
@@ -407,10 +407,10 @@ pub struct TrainingCoordinator {
 
 impl TrainingCoordinator {
     pub fn new(buffer_size: usize, threshold: usize, auto_train: bool) -> Self {
-        // Training queue: ~/.shammah/training_queue.jsonl
+        // Training queue: ~/.finch/training_queue.jsonl
         let queue_path = dirs::home_dir()
             .expect("No home directory")
-            .join(".shammah")
+            .join(".finch")
             .join("training_queue.jsonl");
 
         Self {

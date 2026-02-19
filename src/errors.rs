@@ -105,11 +105,11 @@ pub fn connection_refused_error(address: &str) -> String {
         • Wrong bind address\n\n\
         \x1b[1;32m{}:\x1b[0m\n\
         1. Start the daemon:\n\
-           \x1b[36mshammah daemon-start\x1b[0m\n\n\
+           \x1b[36mfinch daemon-start\x1b[0m\n\n\
         2. Check daemon logs:\n\
-           \x1b[36mtail -f ~/.shammah/daemon.log\x1b[0m\n\n\
+           \x1b[36mtail -f ~/.finch/daemon.log\x1b[0m\n\n\
         3. Check if daemon is running:\n\
-           \x1b[36mps aux | grep \"shammah daemon\"\x1b[0m",
+           \x1b[36mps aux | grep \"finch daemon\"\x1b[0m",
         address, t("possible_causes"), t("try")
     )
 }
@@ -124,11 +124,11 @@ pub fn model_not_found_error(model_name: &str) -> String {
         • Wrong model name\n\n\
         \x1b[1;32mTry:\x1b[0m\n\
         1. Run setup wizard to download models:\n\
-           \x1b[36mshammah setup\x1b[0m\n\n\
+           \x1b[36mfinch setup\x1b[0m\n\n\
         2. Check model cache:\n\
            \x1b[36mls ~/.cache/huggingface/hub/\x1b[0m\n\n\
         3. Verify model name in config:\n\
-           \x1b[36mcat ~/.shammah/config.toml\x1b[0m",
+           \x1b[36mcat ~/.finch/config.toml\x1b[0m",
         model_name
     )
 }
@@ -143,9 +143,9 @@ pub fn api_key_invalid_error(provider: &str) -> String {
         • API key has been revoked\n\n\
         \x1b[1;32mTry:\x1b[0m\n\
         1. Run setup wizard:\n\
-           \x1b[36mshammah setup\x1b[0m\n\n\
+           \x1b[36mfinch setup\x1b[0m\n\n\
         2. Check your config file:\n\
-           \x1b[36mcat ~/.shammah/config.toml\x1b[0m\n\n\
+           \x1b[36mcat ~/.finch/config.toml\x1b[0m\n\n\
         3. Verify API key format:\n\
            • Claude: sk-ant-...\n\
            • OpenAI: sk-...\n\
@@ -165,12 +165,12 @@ pub fn config_parse_error(error: &str) -> String {
         \x1b[1;33mError:\x1b[0m {}\n\n\
         \x1b[1;32mTry:\x1b[0m\n\
         1. Check config file syntax:\n\
-           \x1b[36mcat ~/.shammah/config.toml\x1b[0m\n\n\
+           \x1b[36mcat ~/.finch/config.toml\x1b[0m\n\n\
         2. Validate TOML format online:\n\
            https://www.toml-lint.com/\n\n\
         3. Backup and regenerate config:\n\
-           \x1b[36mmv ~/.shammah/config.toml ~/.shammah/config.toml.backup\x1b[0m\n\
-           \x1b[36mshammah setup\x1b[0m\n\n\
+           \x1b[36mmv ~/.finch/config.toml ~/.finch/config.toml.backup\x1b[0m\n\
+           \x1b[36mfinch setup\x1b[0m\n\n\
         4. Common mistakes:\n\
            • Missing quotes around strings\n\
            • Unclosed brackets []\n\
@@ -223,9 +223,9 @@ pub fn daemon_already_running_error(pid: u32) -> String {
         "Daemon is already running (PID: {})\n\n\
         \x1b[1;32mTo restart the daemon:\x1b[0m\n\
         1. Stop the existing daemon:\n\
-           \x1b[36mshammah daemon-stop\x1b[0m\n\n\
+           \x1b[36mfinch daemon-stop\x1b[0m\n\n\
         2. Start a new daemon:\n\
-           \x1b[36mshammah daemon-start\x1b[0m",
+           \x1b[36mfinch daemon-start\x1b[0m",
         pid
     )
 }
@@ -242,7 +242,7 @@ pub fn model_loading_error(model_name: &str, error: &str) -> String {
         \x1b[1;32mTry:\x1b[0m\n\
         1. Clear model cache and redownload:\n\
            \x1b[36mrm -rf ~/.cache/huggingface/hub/models--*{}\x1b[0m\n\
-           \x1b[36mshammah setup\x1b[0m\n\n\
+           \x1b[36mfinch setup\x1b[0m\n\n\
         2. Check available RAM:\n\
            \x1b[36mfree -h\x1b[0m  (Linux)\n\
            \x1b[36mvm_stat\x1b[0m   (macOS)\n\n\
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn test_model_not_found_has_setup_suggestion() {
         let msg = model_not_found_error("qwen-3b");
-        assert!(msg.contains("shammah setup"));
+        assert!(msg.contains("finch setup"));
         assert!(msg.contains("~/.cache/huggingface"));
     }
 

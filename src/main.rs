@@ -7,18 +7,18 @@ use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use shammah::claude::ClaudeClient;
-use shammah::cli::output_layer::OutputManagerLayer;
-use shammah::cli::{ConversationHistory, Repl};
-use shammah::config::{load_config, Config};
-use shammah::metrics::MetricsLogger;
-use shammah::models::ThresholdRouter;
-use shammah::providers::create_provider;
-use shammah::router::Router;
+use finch::claude::ClaudeClient;
+use finch::cli::output_layer::OutputManagerLayer;
+use finch::cli::{ConversationHistory, Repl};
+use finch::config::{load_config, Config};
+use finch::metrics::MetricsLogger;
+use finch::models::ThresholdRouter;
+use finch::providers::create_provider;
+use finch::router::Router;
 use tracing_subscriber::prelude::*;
 
 #[derive(Parser, Debug)]
-#[command(name = "shammah")]
+#[command(name = "finch")]
 #[command(about = "Local-first Constitutional AI Proxy", version)]
 struct Args {
     /// Run mode
@@ -151,9 +151,9 @@ async fn main() -> Result<()> {
 
     // CRITICAL: Create and configure OutputManager BEFORE initializing tracing
     // This prevents lazy initialization with stdout enabled
-    use shammah::cli::{OutputManager, StatusBar};
-    use shammah::cli::global_output::{set_global_output, set_global_status};
-    use shammah::config::ColorScheme;
+    use finch::cli::{OutputManager, StatusBar};
+    use finch::cli::global_output::{set_global_output, set_global_status};
+    use finch::config::ColorScheme;
 
     let output_manager = Arc::new(OutputManager::new(ColorScheme::default()));
     let status_bar = Arc::new(StatusBar::new());
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
             eprintln!("\n\x1b[1;33m⚠️  Running first-time setup wizard...\x1b[0m\n");
 
             // Run setup wizard
-            use shammah::cli::show_setup_wizard;
+            use finch::cli::show_setup_wizard;
             let result = show_setup_wizard()?;
 
             // Create and save config
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
             let custom_model_repo = result.custom_model_repo;
 
             let mut new_config = Config::new(result.teachers);
-            new_config.backend = shammah::config::BackendConfig {
+            new_config.backend = finch::config::BackendConfig {
                 enabled: backend_enabled,
                 inference_provider,
                 execution_target: backend_device,
@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
                 ..Default::default()
             };
             // Save feature flags
-            new_config.features = shammah::config::FeaturesConfig {
+            new_config.features = finch::config::FeaturesConfig {
                 auto_approve_tools: result.auto_approve_tools,
                 streaming_enabled: result.streaming_enabled,
                 debug_logging: result.debug_logging,
@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
 
     // Load or create threshold router
     let models_dir = dirs::home_dir()
-        .map(|home| home.join(".shammah").join("models"))
+        .map(|home| home.join(".finch").join("models"))
         .expect("Failed to determine home directory");
     std::fs::create_dir_all(&models_dir)?;
 
@@ -281,7 +281,7 @@ async fn main() -> Result<()> {
 
     // Try to connect to daemon BEFORE creating Repl
     // This allows Repl to suppress local model logs if daemon is available
-    use shammah::client::{DaemonClient, DaemonConfig};
+    use finch::client::{DaemonClient, DaemonConfig};
     let daemon_client = if use_daemon && config.client.use_daemon {
         let daemon_config = DaemonConfig {
             bind_address: config.client.daemon_address.clone(),
@@ -404,7 +404,7 @@ fn init_tracing() {
 /// Run HTTP daemon server
 /// Start the daemon in background
 async fn run_daemon_start(bind_address: String) -> Result<()> {
-    use shammah::daemon::{DaemonLifecycle, ensure_daemon_running};
+    use finch::daemon::{DaemonLifecycle, ensure_daemon_running};
 
     let lifecycle = DaemonLifecycle::new()?;
 
@@ -418,7 +418,7 @@ async fn run_daemon_start(bind_address: String) -> Result<()> {
 
     println!("Starting daemon...");
     println!("Bind address: {}", bind_address);
-    println!("Logs: ~/.shammah/daemon.log");
+    println!("Logs: ~/.finch/daemon.log");
 
     // Use ensure_daemon_running to spawn and wait for health check
     ensure_daemon_running(Some(&bind_address)).await?;
@@ -432,7 +432,7 @@ async fn run_daemon_start(bind_address: String) -> Result<()> {
 
 /// Stop the running daemon
 fn run_daemon_stop() -> Result<()> {
-    use shammah::daemon::DaemonLifecycle;
+    use finch::daemon::DaemonLifecycle;
 
     let lifecycle = DaemonLifecycle::new()?;
 
@@ -455,7 +455,7 @@ fn run_daemon_stop() -> Result<()> {
 
 /// Show daemon status
 async fn run_daemon_status() -> Result<()> {
-    use shammah::daemon::DaemonLifecycle;
+    use finch::daemon::DaemonLifecycle;
 
     let lifecycle = DaemonLifecycle::new()?;
 
@@ -463,7 +463,7 @@ async fn run_daemon_status() -> Result<()> {
     if !lifecycle.is_running() {
         println!("\x1b[1;33m⚠ Daemon is not running\x1b[0m");
         println!("\nStart the daemon with:");
-        println!("  \x1b[1;36mshammah daemon-start\x1b[0m");
+        println!("  \x1b[1;36mfinch daemon-start\x1b[0m");
         return Ok(());
     }
 
@@ -528,7 +528,7 @@ async fn run_train_setup() -> Result<()> {
     // Determine paths
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    let venv_dir = home.join(".shammah/venv");
+    let venv_dir = home.join(".finch/venv");
     let requirements_path = std::env::current_dir()?.join("scripts/requirements.txt");
 
     // Check if requirements.txt exists
@@ -555,7 +555,7 @@ async fn run_train_setup() -> Result<()> {
     println!("   ✓ Found {}", python_version.trim());
 
     // Step 2: Create virtual environment
-    println!("\n2️⃣  Creating virtual environment at ~/.shammah/venv...");
+    println!("\n2️⃣  Creating virtual environment at ~/.finch/venv...");
 
     if venv_dir.exists() {
         println!("   ⚠️  Virtual environment already exists, skipping creation");
@@ -619,20 +619,20 @@ async fn run_train_setup() -> Result<()> {
     println!("\n\x1b[1;32m✅ Setup complete!\x1b[0m\n");
     println!("Python environment ready at: \x1b[1m{}\x1b[0m", venv_dir.display());
     println!("\nTo use the training scripts:");
-    println!("  \x1b[1;36m~/.shammah/venv/bin/python scripts/train_lora.py\x1b[0m");
+    println!("  \x1b[1;36m~/.finch/venv/bin/python scripts/train_lora.py\x1b[0m");
     println!("\nTraining will run automatically when you provide feedback.");
 
     Ok(())
 }
 
 async fn run_daemon(bind_address: String) -> Result<()> {
-    use shammah::server::{AgentServer, ServerConfig};
-    use shammah::models::{BootstrapLoader, GeneratorState, DevicePreference, TrainingCoordinator};
-    use shammah::local::LocalGenerator;
-    use shammah::daemon::DaemonLifecycle;
+    use finch::server::{AgentServer, ServerConfig};
+    use finch::models::{BootstrapLoader, GeneratorState, DevicePreference, TrainingCoordinator};
+    use finch::local::LocalGenerator;
+    use finch::daemon::DaemonLifecycle;
     use std::sync::Arc;
     use tokio::sync::RwLock;
-    use shammah::{output_progress, output_status};
+    use finch::{output_progress, output_status};
 
     // Check if debug logging is enabled in config (before setting up tracing)
     // This allows the debug_logging feature flag to control log verbosity
@@ -645,10 +645,10 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         }
     }
 
-    // Set up file logging for daemon (append to ~/.shammah/daemon.log)
+    // Set up file logging for daemon (append to ~/.finch/daemon.log)
     let log_path = dirs::home_dir()
         .context("Failed to determine home directory")?
-        .join(".shammah")
+        .join(".finch")
         .join("daemon.log");
 
     let log_file = std::fs::OpenOptions::new()
@@ -690,7 +690,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Check if daemon is already running
     if lifecycle.is_running() {
         let existing_pid = lifecycle.read_pid()?;
-        anyhow::bail!(shammah::errors::daemon_already_running_error(existing_pid));
+        anyhow::bail!(finch::errors::daemon_already_running_error(existing_pid));
     }
 
     // Write PID file
@@ -704,7 +704,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     // Load or create threshold router
     let models_dir = dirs::home_dir()
-        .map(|home| home.join(".shammah").join("models"))
+        .map(|home| home.join(".finch").join("models"))
         .expect("Failed to determine home directory");
     std::fs::create_dir_all(&models_dir)?;
 
@@ -868,8 +868,8 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 /// Run a single query
 /// Run a single query (daemon-only mode)
 async fn run_query(query: &str) -> Result<()> {
-    use shammah::client::DaemonClient;
-    use shammah::daemon::ensure_daemon_running;
+    use finch::client::DaemonClient;
+    use finch::daemon::ensure_daemon_running;
 
     // Load configuration
     let config = load_config()?;
@@ -882,7 +882,7 @@ async fn run_query(query: &str) -> Result<()> {
     }
 
     // Create daemon client
-    let daemon_config = shammah::client::DaemonConfig::from_client_config(&config.client);
+    let daemon_config = finch::client::DaemonConfig::from_client_config(&config.client);
     let client = DaemonClient::connect(daemon_config).await?;
 
     // Send query to daemon
@@ -894,7 +894,7 @@ async fn run_query(query: &str) -> Result<()> {
 
 /// Run query using teacher API only (fallback when daemon fails)
 async fn run_query_teacher_only(query: &str, config: &Config) -> Result<()> {
-    use shammah::claude::{MessageRequest, ContentBlock};
+    use finch::claude::{MessageRequest, ContentBlock};
 
     eprintln!("⚠️  Running in teacher-only mode (no local model)");
 
@@ -907,7 +907,7 @@ async fn run_query_teacher_only(query: &str, config: &Config) -> Result<()> {
             .and_then(|t| t.model.clone())
             .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string()),
         max_tokens: 8000,
-        messages: vec![shammah::claude::Message {
+        messages: vec![finch::claude::Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
                 text: query.to_string(),
@@ -936,8 +936,8 @@ async fn run_query_teacher_only(query: &str, config: &Config) -> Result<()> {
 
 /// Run interactive setup wizard
 async fn run_setup() -> Result<()> {
-    use shammah::cli::show_setup_wizard;
-    use shammah::config::{BackendConfig, Config};
+    use finch::cli::show_setup_wizard;
+    use finch::config::{BackendConfig, Config};
 
     println!("Starting Shammah setup wizard...\n");
 
@@ -967,7 +967,7 @@ async fn run_setup() -> Result<()> {
     };
 
     // Update feature flags
-    config.features = shammah::config::FeaturesConfig {
+    config.features = finch::config::FeaturesConfig {
         auto_approve_tools: result.auto_approve_tools,
         streaming_enabled: result.streaming_enabled,
         debug_logging: result.debug_logging,
@@ -980,9 +980,9 @@ async fn run_setup() -> Result<()> {
     // Save configuration
     config.save()?;
 
-    println!("\n✓ Configuration saved to ~/.shammah/config.toml");
-    println!("  You can now run: shammah");
-    println!("  Or start the daemon: shammah daemon\n");
+    println!("\n✓ Configuration saved to ~/.finch/config.toml");
+    println!("  You can now run: finch");
+    println!("  Or start the daemon: finch daemon\n");
 
     Ok(())
 }

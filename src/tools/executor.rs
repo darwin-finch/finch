@@ -711,7 +711,7 @@ mod tests {
         };
 
         // Use temp path for tests
-        let temp_path = std::env::temp_dir().join("shammah_test_patterns.json");
+        let temp_path = std::env::temp_dir().join("finch_test_patterns.json");
         ToolExecutor::new(registry, permissions, temp_path).expect("Failed to create test executor")
     }
 

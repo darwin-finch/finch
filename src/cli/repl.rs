@@ -154,7 +154,7 @@ impl Repl {
         let daemon_mode = daemon_client.is_some();
 
         // Set up models directory
-        let models_dir = dirs::home_dir().map(|home| home.join(".shammah").join("models"));
+        let models_dir = dirs::home_dir().map(|home| home.join(".finch").join("models"));
 
         // Load validator only (router is now in Router)
         let threshold_validator = Self::load_validator(models_dir.as_ref(), is_interactive, daemon_mode);
@@ -183,8 +183,8 @@ impl Repl {
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()
-            .map(|home| home.join(".shammah").join("restart_state.json"))
-            .unwrap_or_else(|| PathBuf::from(".shammah/restart_state.json"));
+            .map(|home| home.join(".finch").join("restart_state.json"))
+            .unwrap_or_else(|| PathBuf::from(".finch/restart_state.json"));
 
         tool_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
         tool_registry.register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
@@ -218,8 +218,8 @@ impl Repl {
 
         // Determine patterns path
         let patterns_path = dirs::home_dir()
-            .map(|home| home.join(".shammah").join("tool_patterns.json"))
-            .unwrap_or_else(|| PathBuf::from(".shammah/tool_patterns.json"));
+            .map(|home| home.join(".finch").join("tool_patterns.json"))
+            .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
 
         // Create tool executor
         let executor = ToolExecutor::new(tool_registry, permissions, patterns_path)
@@ -244,7 +244,7 @@ impl Repl {
                 ToolExecutor::new(
                     fallback_registry,
                     PermissionManager::new().with_default_rule(PermissionRule::Allow),
-                    std::env::temp_dir().join("shammah_patterns_fallback.json"),
+                    std::env::temp_dir().join("finch_patterns_fallback.json"),
                 )
                 .expect("Failed to create fallback tool executor")
             });
@@ -1244,7 +1244,7 @@ impl Repl {
         if self.is_interactive {
             // Fancy startup for interactive mode
             self.output_status("Shammah v0.1.0 - Constitutional AI Proxy");
-            self.output_status("Using API key from: ~/.shammah/config.toml ✓");
+            self.output_status("Using API key from: ~/.finch/config.toml ✓");
             self.output_status("Loaded crisis detection keywords ✓");
             self.output_status("Online learning: ENABLED (threshold models) ✓");
             self.output_status("");
@@ -2824,7 +2824,7 @@ impl Repl {
                 "Error: /local requires daemon mode. The daemon provides direct model access.";
             if self.is_interactive {
                 self.output_status("⚠️  Daemon not available");
-                self.output_status("    Start the daemon: shammah daemon --bind 127.0.0.1:11435");
+                self.output_status("    Start the daemon: finch daemon --bind 127.0.0.1:11435");
             } else {
                 eprintln!("{}", error_msg);
             }
@@ -2906,7 +2906,7 @@ impl Repl {
         } else {
             dirs::home_dir()
                 .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-                .join(".shammah")
+                .join(".finch")
                 .join("adapters")
         };
 
@@ -2953,7 +2953,7 @@ impl Repl {
         // Create plans directory
         let plans_dir = dirs::home_dir()
             .context("Home directory not found")?
-            .join(".shammah")
+            .join(".finch")
             .join("plans");
         std::fs::create_dir_all(&plans_dir)?;
 

@@ -22,10 +22,10 @@ When running in daemon mode, Shammah:
 cargo build --release
 
 # Start daemon on default port (127.0.0.1:8000)
-./target/release/shammah daemon
+./target/release/finch daemon
 
 # Start on custom address
-./target/release/shammah daemon --bind 127.0.0.1:3000
+./target/release/finch daemon --bind 127.0.0.1:3000
 ```
 
 ### Test the Server
@@ -127,9 +127,9 @@ Prometheus metrics (plain text format).
 
 **Example Output:**
 ```
-# HELP shammah_queries_total Total number of queries
-# TYPE shammah_queries_total counter
-shammah_queries_total 0
+# HELP finch_queries_total Total number of queries
+# TYPE finch_queries_total counter
+finch_queries_total 0
 ```
 
 ## Session Management
@@ -151,7 +151,7 @@ Default maximum: 100 concurrent sessions (configurable). When limit reached, new
 
 ## Configuration
 
-Add daemon mode settings to `~/.shammah/config.toml`:
+Add daemon mode settings to `~/.finch/config.toml`:
 
 ```toml
 [server]
@@ -237,14 +237,14 @@ Expected performance (M1 Pro, 16GB RAM):
 
 Run locally for testing Claude integrations:
 ```bash
-shammah daemon --bind 127.0.0.1:8000
+finch daemon --bind 127.0.0.1:8000
 ```
 
 ### 2. Team Server
 
 Run on shared server for team access:
 ```bash
-shammah daemon --bind 0.0.0.0:8000
+finch daemon --bind 0.0.0.0:8000
 # Configure firewall rules
 ```
 
@@ -257,9 +257,9 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-COPY --from=builder /build/target/release/shammah /usr/local/bin/
+COPY --from=builder /build/target/release/finch /usr/local/bin/
 EXPOSE 8000
-CMD ["shammah", "daemon", "--bind", "0.0.0.0:8000"]
+CMD ["finch", "daemon", "--bind", "0.0.0.0:8000"]
 ```
 
 ### 4. Systemd Service
@@ -271,8 +271,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=shammah
-ExecStart=/opt/shammah/shammah daemon --bind 127.0.0.1:8000
+User=finch
+ExecStart=/opt/finch/finch daemon --bind 127.0.0.1:8000
 Restart=on-failure
 RestartSec=10
 
@@ -283,7 +283,7 @@ WantedBy=multi-user.target
 ### 5. nginx Reverse Proxy
 
 ```nginx
-upstream shammah {
+upstream finch {
     server 127.0.0.1:8000;
 }
 
@@ -292,7 +292,7 @@ server {
     server_name ai.example.com;
 
     location / {
-        proxy_pass http://shammah;
+        proxy_pass http://finch;
         proxy_http_version 1.1;
         proxy_buffering off;  # Important for streaming
         proxy_set_header Connection "";
@@ -401,7 +401,7 @@ Currently provides basic Prometheus metrics endpoint. Phase 4 will add:
 lsof -i :8000
 
 # Use different port
-shammah daemon --bind 127.0.0.1:8001
+finch daemon --bind 127.0.0.1:8001
 ```
 
 ### Session Limit Reached
@@ -424,7 +424,7 @@ session_timeout_minutes = 10
 
 Check metrics logs:
 ```bash
-tail -f ~/.shammah/metrics/$(date +%Y-%m-%d).jsonl
+tail -f ~/.finch/metrics/$(date +%Y-%m-%d).jsonl
 ```
 
 ## Security Considerations
@@ -457,7 +457,7 @@ A: Almost! The `/v1/messages` endpoint is Claude-compatible. However, streaming 
 A: Each client can provide a `session_id` in requests to maintain conversation history. If omitted, a new session is created.
 
 **Q: Can I run multiple Shammah daemons?**
-A: Yes! Each daemon instance shares the same `~/.shammah/` data directory safely via file locking. Models are loaded per-daemon.
+A: Yes! Each daemon instance shares the same `~/.finch/` data directory safely via file locking. Models are loaded per-daemon.
 
 **Q: Does daemon mode support streaming?**
 A: Not yet. Phase 2 will add SSE streaming support for `/v1/messages`.

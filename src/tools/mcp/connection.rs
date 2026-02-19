@@ -172,7 +172,7 @@ impl McpConnection {
                     }
                 },
                 "clientInfo": {
-                    "name": "shammah",
+                    "name": "finch",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             })))

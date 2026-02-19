@@ -324,7 +324,7 @@ error[E0061]: wrong number of arguments
 ### After: 0 Errors ✅
 
 ```bash
-warning: `shammah` (lib) generated 44 warnings
+warning: `finch` (lib) generated 44 warnings
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.68s
 ```
 

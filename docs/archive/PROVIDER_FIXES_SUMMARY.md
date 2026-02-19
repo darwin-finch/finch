@@ -53,7 +53,7 @@ Comprehensive audit and fix of all LLM provider implementations in Shammah. Disc
 
 **Scenario that would fail**:
 ```bash
-shammah
+finch
 > Read the file at src/main.rs       # Turn 1: Works
 > Now summarize what you read        # Turn 2: FAILS
 ```
@@ -68,7 +68,7 @@ shammah
 
 **Scenario that would fail** (Gemini only):
 ```bash
-shammah
+finch
 > Read both src/main.rs and src/lib.rs
 ```
 
@@ -191,19 +191,19 @@ For each provider (Gemini, OpenAI, Grok), verify:
 
 ### 1. Simple Query
 ```bash
-shammah query "What is 2+2?"
+finch query "What is 2+2?"
 ```
 **Expected**: Model responds with "4"
 
 ### 2. Streaming
 ```bash
-shammah query "Write a haiku about coding"
+finch query "Write a haiku about coding"
 ```
 **Expected**: Text appears incrementally
 
 ### 3. Single-Turn Tool Calling
 ```bash
-shammah
+finch
 > Read the file at src/main.rs
 ```
 **Expected**:
@@ -213,7 +213,7 @@ shammah
 
 ### 4. Multi-Turn Tool Calling (Critical Test)
 ```bash
-shammah
+finch
 > Read src/main.rs
 > Now read src/lib.rs and compare them
 ```
@@ -224,7 +224,7 @@ shammah
 
 ### 5. Multiple Simultaneous Tools
 ```bash
-shammah
+finch
 > Read both src/main.rs and src/lib.rs
 ```
 **Expected**:

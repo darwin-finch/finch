@@ -133,12 +133,12 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 ### Phase 1: Quick Wins ⚡ (Easy - 1-2 hours each)
 
 1. **[x] Daemon stop command** - ✅ COMPLETE
-   - Add `shammah daemon-stop` subcommand
+   - Add `finch daemon-stop` subcommand
    - Files: `src/main.rs`, `src/daemon/lifecycle.rs`
    - Effort: 1 hour (actual)
 
 2. **[x] Daemon start command** - ✅ COMPLETE
-   - Add `shammah daemon-start` subcommand
+   - Add `finch daemon-start` subcommand
    - Files: `src/main.rs`
    - Effort: 30 minutes (actual)
 
@@ -191,7 +191,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
    - Effort: 1 hour (actual)
 
 8. **[x] Daemon status command** - ✅ COMPLETE
-   - Add `shammah daemon-status` subcommand
+   - Add `finch daemon-status` subcommand
    - Show running/stopped, PID, uptime, active sessions
    - Files: `src/main.rs`
    - Effort: 1 hour (actual)
@@ -242,7 +242,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 14. **[x] Simple response feedback system** (NEW) - ✅ COMPLETE
     - Keyboard shortcuts: Ctrl+G (good), Ctrl+B (bad)
-    - Logs to ~/.shammah/feedback.jsonl in JSONL format
+    - Logs to ~/.finch/feedback.jsonl in JSONL format
     - Weighted feedback (good=1x, bad=10x for LoRA training)
     - Infrastructure complete, needs event loop integration
     - Files: `src/feedback/mod.rs`, `src/cli/tui/async_input.rs`, `src/cli/tui/mod.rs`
@@ -256,8 +256,8 @@ See `docs/ROADMAP.md` for detailed implementation plans.
     - Effort: 1.5 hours (actual)
 
 16. **[x] Python deps installation helper** (NEW) - ✅ COMPLETE
-    - Add `shammah train setup` command
-    - Create venv at ~/.shammah/venv
+    - Add `finch train setup` command
+    - Create venv at ~/.finch/venv
     - Install torch, transformers, peft, safetensors, accelerate
     - Verify installation by importing packages
     - Files: `src/main.rs`
@@ -267,7 +267,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 
 17. **[x] Command history navigation** - ✅ COMPLETE
     - Up/down arrows for previous queries
-    - Supports multi-line commands, persists to ~/.shammah/history.txt
+    - Supports multi-line commands, persists to ~/.finch/history.txt
     - Loads on startup, saves on shutdown (1000 command limit)
     - Files: `src/cli/tui/async_input.rs`, `src/cli/tui/mod.rs`
     - Effort: 2 hours (actual)
@@ -606,7 +606,7 @@ See `docs/ROADMAP.md` for detailed implementation plans.
 ### Basic Usage
 ```bash
 # Interactive REPL mode (daemon auto-spawns)
-shammah
+finch
 
 > Can you read my Cargo.toml and tell me about dependencies?
 ```
@@ -614,7 +614,7 @@ shammah
 ### Daemon Mode
 ```bash
 # Auto-spawns on first query (no manual start needed)
-shammah
+finch
 > /local what is 2+2?
 
 # Or use HTTP API directly

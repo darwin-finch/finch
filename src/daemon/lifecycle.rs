@@ -18,7 +18,7 @@ impl DaemonLifecycle {
     pub fn new() -> Result<Self> {
         let pid_file = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-            .join(".shammah")
+            .join(".finch")
             .join("daemon.pid");
 
         // Ensure parent directory exists

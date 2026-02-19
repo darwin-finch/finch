@@ -411,9 +411,9 @@ pub async fn metrics_endpoint(
     State(_server): State<Arc<AgentServer>>,
 ) -> Result<Response, AppError> {
     // TODO: Implement Prometheus metrics
-    let metrics = "# HELP shammah_queries_total Total number of queries\n\
-                   # TYPE shammah_queries_total counter\n\
-                   shammah_queries_total 0\n";
+    let metrics = "# HELP finch_queries_total Total number of queries\n\
+                   # TYPE finch_queries_total counter\n\
+                   finch_queries_total 0\n";
 
     Ok((StatusCode::OK, metrics).into_response())
 }

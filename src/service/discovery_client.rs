@@ -22,7 +22,7 @@ pub struct ServiceDiscoveryClient;
 impl ServiceDiscoveryClient {
     /// Discover services on local network (blocks for timeout duration)
     pub async fn discover(_timeout: Duration) -> Result<Vec<DiscoveredService>> {
-        // TODO: Use mdns-sd to browse for _shammah._tcp.local.
+        // TODO: Use mdns-sd to browse for _finch._tcp.local.
         // TODO: Parse service info and return discovered services
         tracing::info!("Discovering Shammah instances on local network...");
         Ok(Vec::new())

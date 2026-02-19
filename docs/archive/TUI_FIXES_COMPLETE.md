@@ -121,7 +121,7 @@ for y in 0..old_shadow.height.min(new_shadow.height) {
 
 ### Testing
 ```bash
-./target/release/shammah
+./target/release/finch
 
 > hello
 > how are you?
@@ -226,11 +226,11 @@ for (_line_idx, line, style) in lines_to_render {
 
 ```bash
 $ cargo build --release
-   Compiling shammah v0.1.0 (/Users/shammah/repos/claude-proxy)
+   Compiling finch v0.1.0 (/Users/finch/repos/claude-proxy)
     Finished `release` profile [optimized] target(s) in 1m 33s
 ```
 
-Binary location: `./target/release/shammah`
+Binary location: `./target/release/finch`
 
 ---
 
@@ -395,7 +395,7 @@ All three phases have been successfully implemented:
 - ✅ **Phase 1:** Messages disappearing FIXED
 
 **Status:** Ready for manual testing and verification.
-**Binary:** `./target/release/shammah`
+**Binary:** `./target/release/finch`
 **Build:** ✅ Successful (1m 33s)
 
 ---

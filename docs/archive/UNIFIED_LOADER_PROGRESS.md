@@ -386,7 +386,7 @@ src/models/
 
 ### Setup
 ```bash
-$ shammah setup
+$ finch setup
 
 Step 3: Select Backend
   ⚡ CoreML (Apple Neural Engine) - Fastest, best battery
@@ -404,7 +404,7 @@ Step 4: Select Model Family
 
 ### Code
 ```rust
-use shammah::models::{UnifiedModelLoader, ModelLoadConfig, ModelFamily, ModelSize, BackendDevice};
+use finch::models::{UnifiedModelLoader, ModelLoadConfig, ModelFamily, ModelSize, BackendDevice};
 
 // Create loader
 let loader = UnifiedModelLoader::new()?;

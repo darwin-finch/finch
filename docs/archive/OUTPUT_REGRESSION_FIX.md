@@ -89,7 +89,7 @@ Text appearing on separate lines with proper formatting.
 
 ```bash
 # Query mode (uses immediate mode - should work)
-./target/release/shammah query "What is 2+2?"
+./target/release/finch query "What is 2+2?"
 ```
 
 **Result:** ✅ Works correctly - returns "2 + 2 = 4" with proper formatting
@@ -98,14 +98,14 @@ Text appearing on separate lines with proper formatting.
 
 1. **TUI Mode (default):**
    ```bash
-   ./target/release/shammah
+   ./target/release/finch
    > test query
    ```
    **Verify:** Text appears on separate lines without horizontal overlap
 
 2. **Raw Mode:**
    ```bash
-   ./target/release/shammah --raw
+   ./target/release/finch --raw
    > test query
    ```
    **Verify:** Output is readable and properly formatted

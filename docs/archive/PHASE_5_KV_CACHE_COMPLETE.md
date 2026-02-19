@@ -235,13 +235,13 @@ let empty_key = ndarray::Array4::<f32>::zeros((1, num_kv_heads, 0, head_dim));
 **Compilation**: ✅ Success
 ```bash
 $ cargo build
-   Compiling shammah v0.1.0
+   Compiling finch v0.1.0
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s
 ```
 
 **Runtime Test**: ✅ Success
 ```bash
-$ ./target/debug/shammah query "what is 2+2?"
+$ ./target/debug/finch query "what is 2+2?"
 ⏳ Loading Qwen 2.5 1.5B...
   └─ Initializing Qwen 2.5 1.5B...
 2 + 2 = 4

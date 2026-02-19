@@ -59,7 +59,7 @@ impl Tool for EnterPlanModeTool {
         // Create plans directory
         let plans_dir = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Home directory not found"))?
-            .join(".shammah")
+            .join(".finch")
             .join("plans");
         std::fs::create_dir_all(&plans_dir)?;
 

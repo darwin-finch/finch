@@ -25,7 +25,7 @@ The experimental version was either:
 
 ## Fix
 
-Update `~/.shammah/config.toml`:
+Update `~/.finch/config.toml`:
 
 ```toml
 [[teachers]]
@@ -43,8 +43,8 @@ This works in conjunction with the FallbackChain fix (commit 34a21c3) that ensur
 
 ```bash
 # Restart daemon
-kill $(cat ~/.shammah/daemon.pid)
-./target/release/shammah daemon --bind 127.0.0.1:11435 &
+kill $(cat ~/.finch/daemon.pid)
+./target/release/finch daemon --bind 127.0.0.1:11435 &
 
 # Test Gemini query
 # Should now succeed without 404 errors

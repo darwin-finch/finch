@@ -53,7 +53,7 @@ Generated Text
 ```
 Setup Wizard
     ↓ (saves config)
-~/.shammah/config.toml
+~/.finch/config.toml
     ↓ (read at startup)
 REPL::new()
     ↓ (spawns background task)
@@ -448,7 +448,7 @@ async fn test_bootstrap_loader_onnx() {
 cargo clean && cargo build
 
 # 2. Run interactive
-./target/debug/shammah
+./target/debug/finch
 
 # Expected output:
 # ⏳ Initializing Qwen model (background)...

@@ -232,7 +232,7 @@ The feedback commands integrate with the LoRA training system:
 3. **Training Trigger**: When buffer reaches threshold (10 examples):
    - Background training task spawned
    - LoRATrainer trains on weighted batch
-   - Adapter saved to `~/.shammah/adapters/`
+   - Adapter saved to `~/.finch/adapters/`
    - Generator reloaded with new adapter
 
 4. **Sampling Integration**: (TODO)

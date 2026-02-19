@@ -14,7 +14,7 @@ This document will guide Claude Code to set up the complete Shammah project stru
 ### 1. Repository Structure
 
 ```
-shammah/
+finch/
 ├── README.md
 ├── CLAUDE.md
 ├── LICENSE
@@ -44,7 +44,7 @@ Create a comprehensive CLAUDE.md that includes:
 - **Key design decisions**: 
   - Claude Code compatibility (uses `~/.claude/settings.json`)
   - Storage in `~/.claude-proxy/`
-  - Command name: `shammah`
+  - Command name: `finch`
   - Three modes: Interactive REPL, Daemon, Single-query
 - **Development guidelines**:
   - Code style (use `cargo fmt`)
@@ -67,8 +67,8 @@ A user-facing README with:
   - 76% cost reduction
 - **Quick Start** (placeholder for future):
   ```bash
-  cargo install shammah
-  shammah
+  cargo install finch
+  finch
   ```
 - **How it works** (high-level):
   - Starts at 100% forwarding
@@ -83,13 +83,13 @@ Initial Cargo.toml with:
 
 ```toml
 [package]
-name = "shammah"
+name = "finch"
 version = "0.1.0"
 edition = "2021"
 authors = ["Your Name <your.email@example.com>"]
 description = "Local-first Constitutional AI proxy"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yourusername/shammah"
+repository = "https://github.com/yourusername/finch"
 
 [dependencies]
 # CLI
@@ -123,7 +123,7 @@ scraper = "0.18"
 mockito = "1.2"
 
 [[bin]]
-name = "shammah"
+name = "finch"
 path = "src/main.rs"
 
 [profile.release]

@@ -81,13 +81,13 @@ crate::cli::tui::DialogResult::CustomText(text) => {
 
 ## Verification
 
-✅ **Code compiles**: `cargo build --bin shammah` succeeds
+✅ **Code compiles**: `cargo build --bin finch` succeeds
 ✅ **Infrastructure exists**: Dialog system fully supports custom text input
 ✅ **Safety preserved**: Tool approvals with custom text default to Deny
 
 ## Testing Instructions
 
-1. **Start shammah**: `./target/debug/shammah`
+1. **Start finch**: `./target/debug/finch`
 2. **Trigger a tool approval dialog**: Ask Claude to read a file
 3. **Verify "Other" option visible**: Look for "Press 'o' for Other (custom response)"
 4. **Press 'o'**: Should enter custom text input mode

@@ -239,7 +239,7 @@ impl TemplateGenerator {
     /// Load constitution from file or use default
     fn load_constitution() -> String {
         let home = dirs::home_dir().expect("Could not determine home directory");
-        let constitution_path = home.join(".shammah/constitution.md");
+        let constitution_path = home.join(".finch/constitution.md");
 
         if constitution_path.exists() {
             match std::fs::read_to_string(&constitution_path) {

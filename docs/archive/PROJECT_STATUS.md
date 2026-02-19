@@ -25,7 +25,7 @@ This is a **local-first Constitutional AI proxy** that learns to handle 95% of r
 - 3 retries with exponential backoff (1s, 2s, 4s delays)
 
 **Statistics Reset**
-- Deleted corrupted files: `~/.shammah/models/threshold_router.json`, `threshold_validator.json`
+- Deleted corrupted files: `~/.finch/models/threshold_router.json`, `threshold_validator.json`
 - Backups saved as `*.backup`
 - Fresh statistics will be created on next run
 
@@ -141,7 +141,7 @@ aacfbc2 fix: immediate pattern persistence and force neural-only generation
 
 ## Statistics Files
 
-**Location:** `~/.shammah/models/`
+**Location:** `~/.finch/models/`
 
 **Expected Files:**
 - `threshold_router.json` - Router statistics (RESET on Jan 31)
@@ -153,7 +153,7 @@ aacfbc2 fix: immediate pattern persistence and force neural-only generation
 **Verification:**
 After next run, check that:
 ```bash
-cat ~/.shammah/models/threshold_router.json | jq '{total_queries, total_local_attempts, total_successes}'
+cat ~/.finch/models/threshold_router.json | jq '{total_queries, total_local_attempts, total_successes}'
 ```
 Should show: `total_queries >= total_local_attempts` (not equal!)
 

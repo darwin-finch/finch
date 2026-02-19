@@ -104,9 +104,9 @@ Initial release of Shammah - Local-first AI coding assistant.
 ### Infrastructure
 - Rust-based implementation
 - Cross-platform support (macOS, Linux, Windows)
-- Configuration file (~/.shammah/config.toml)
+- Configuration file (~/.finch/config.toml)
 - Model caching (~/.cache/huggingface/hub/)
-- Adapter storage (~/.shammah/adapters/)
+- Adapter storage (~/.finch/adapters/)
 
-[0.2.0]: https://github.com/schancel/shammah/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/schancel/shammah/releases/tag/v0.1.0
+[0.2.0]: https://github.com/schancel/finch/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/schancel/finch/releases/tag/v0.1.0

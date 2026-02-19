@@ -55,7 +55,7 @@ Asynchronous training that doesn't block the REPL:
 - Triggers after 10 feedback examples
 - Spawns tokio task for training
 - Creates LoRA adapter and trains on weighted batch
-- Saves adapter to `~/.shammah/adapters/`
+- Saves adapter to `~/.finch/adapters/`
 - Shows completion stats
 
 **User Experience:**
@@ -69,7 +69,7 @@ Asynchronous training that doesn't block the REPL:
 ✓ Background training completed!
    Trained on 10 examples
    Final loss: 0.8534
-   Adapter saved to: ~/.shammah/adapters/lora_adapter_20260206_143025.safetensors
+   Adapter saved to: ~/.finch/adapters/lora_adapter_20260206_143025.safetensors
 ```
 
 #### 5. **Training Coordinator** ✅
@@ -277,7 +277,7 @@ $ cargo run
 # 3. Repeat until threshold (10 examples)
 # 4. Verify background training triggers
 # 5. Verify can continue querying
-# 6. Check adapter saved in ~/.shammah/adapters/
+# 6. Check adapter saved in ~/.finch/adapters/
 ```
 
 ### Unit Tests Needed
@@ -453,7 +453,7 @@ Better than:
 ### Adapter Size
 - **Safetensors file**: ~5MB (depends on rank)
 - **JSON config**: ~1KB
-- **Storage**: `~/.shammah/adapters/`
+- **Storage**: `~/.finch/adapters/`
 
 ### Startup Impact
 - **Progressive Bootstrap**: <100ms (instant)
@@ -681,6 +681,6 @@ The system is ready for testing and refinement. Key remaining work includes:
 **Next Steps for User:**
 1. Test feedback commands with real queries
 2. Verify background training triggers correctly
-3. Check adapter files in `~/.shammah/adapters/`
+3. Check adapter files in `~/.finch/adapters/`
 4. Provide feedback on UX and functionality
 5. Decide on priority for remaining TODOs

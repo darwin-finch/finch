@@ -105,7 +105,7 @@ self.update_plan_mode_indicator(&current_mode);
 
 ### Test Dialog Height Fix
 
-1. **Start shammah**: `./target/debug/shammah`
+1. **Start finch**: `./target/debug/finch`
 2. **Trigger tool with long JSON**:
    - Ask: "Can you help me understand inline prompt suggestions?"
    - Claude will use EnterPlanMode with long JSON reason
@@ -117,7 +117,7 @@ self.update_plan_mode_indicator(&current_mode);
 
 ### Test Plan Mode Status Update
 
-1. **Start shammah**: `./target/debug/shammah`
+1. **Start finch**: `./target/debug/finch`
 2. **Ask a question that triggers EnterPlanMode**
 3. **Verify status bar updates**:
    - Before: `⏵⏵ accept edits on (shift+tab to cycle)`

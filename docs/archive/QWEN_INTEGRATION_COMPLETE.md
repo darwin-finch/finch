@@ -161,7 +161,7 @@ Model Ready?
 ### Bootstrap Flow
 
 ```
-$ shammah
+$ finch
   ↓
 REPL Init (<100ms)
   ├─ Load config
@@ -243,7 +243,7 @@ Documentation:
 ### Quick Start
 
 ```rust
-use shammah::models::{
+use finch::models::{
     GeneratorConfig, GeneratorModel, ModelSelector,
     ModelDownloader, DevicePreference
 };
@@ -273,7 +273,7 @@ let output = generator.generate(&input_ids, 50)?;
 ### Progressive Bootstrap
 
 ```rust
-use shammah::models::{GeneratorState, BootstrapLoader};
+use finch::models::{GeneratorState, BootstrapLoader};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -296,7 +296,7 @@ let decision = router.route_with_generator_check(query, is_ready);
 ### Model Selection
 
 ```rust
-use shammah::models::{ModelSelector, QwenSize};
+use finch::models::{ModelSelector, QwenSize};
 
 // Automatic (based on system RAM)
 let size = ModelSelector::select_model_for_system()?;
@@ -380,11 +380,11 @@ Both are well-maintained, widely-used crates:
 All existing code continues to work:
 ```rust
 // Old code still works
-use shammah::models::GeneratorModel;
+use finch::models::GeneratorModel;
 let model = GeneratorModel::new(&model_config)?;
 
 // New unified API available
-use shammah::models::{GeneratorModel, GeneratorConfig};
+use finch::models::{GeneratorModel, GeneratorConfig};
 let model = GeneratorModel::new(GeneratorConfig::RandomInit(model_config))?;
 ```
 

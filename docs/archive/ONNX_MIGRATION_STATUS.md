@@ -176,7 +176,7 @@ git reset --hard pre-onnx-migration
 
 # Verify old code works
 cargo build
-./target/debug/shammah
+./target/debug/finch
 ```
 
 **Checkpoint Tag**: `pre-onnx-migration` (created before Phase 1)

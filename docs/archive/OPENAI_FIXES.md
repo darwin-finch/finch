@@ -285,7 +285,7 @@ Since Grok uses `OpenAIProvider::new_grok()`, **all fixes automatically apply to
 
 1. **Simple Query Test** (OpenAI)
    ```bash
-   cat > ~/.shammah/config.toml <<EOF
+   cat > ~/.finch/config.toml <<EOF
    [fallback]
    provider = "openai"
 
@@ -294,13 +294,13 @@ Since Grok uses `OpenAIProvider::new_grok()`, **all fixes automatically apply to
    model = "gpt-4o"
    EOF
 
-   shammah query "What is 2+2?"
+   finch query "What is 2+2?"
    ```
    **Expected**: OpenAI responds with answer
 
 2. **Tool Calling Test** (Critical - tests Fix #1 and #2)
    ```bash
-   shammah
+   finch
    > Read the file at src/main.rs and tell me what it does
    ```
    **Expected**:
@@ -310,7 +310,7 @@ Since Grok uses `OpenAIProvider::new_grok()`, **all fixes automatically apply to
 
 3. **Multi-turn Tool Test** (Critical - tests Fix #1)
    ```bash
-   shammah
+   finch
    > Read src/main.rs
    > Now read src/lib.rs and compare them
    ```
@@ -321,7 +321,7 @@ Since Grok uses `OpenAIProvider::new_grok()`, **all fixes automatically apply to
 
 4. **Multiple Simultaneous Tools**
    ```bash
-   shammah
+   finch
    > Read both src/main.rs and src/lib.rs
    ```
    **Expected**:

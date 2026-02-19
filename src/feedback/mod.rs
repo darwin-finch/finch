@@ -1,7 +1,7 @@
 // Feedback system for response quality tracking
 //
 // Users can rate responses to collect training data for LoRA fine-tuning.
-// Feedback is logged to ~/.shammah/feedback.jsonl
+// Feedback is logged to ~/.finch/feedback.jsonl
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -89,11 +89,11 @@ impl FeedbackLogger {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
-        let shammah_dir = home.join(".shammah");
-        fs::create_dir_all(&shammah_dir)
-            .context("Failed to create ~/.shammah directory")?;
+        let finch_dir = home.join(".finch");
+        fs::create_dir_all(&finch_dir)
+            .context("Failed to create ~/.finch directory")?;
 
-        let file_path = shammah_dir.join("feedback.jsonl");
+        let file_path = finch_dir.join("feedback.jsonl");
 
         Ok(Self { file_path })
     }

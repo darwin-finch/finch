@@ -86,7 +86,7 @@ Command::PlanModeToggle | Command::Plan(_) => {
 
 ## Verification
 
-✅ **Code compiles**: `cargo build --bin shammah` succeeds
+✅ **Code compiles**: `cargo build --bin finch` succeeds
 ✅ **Logic is correct**:
    - Mode toggle respects current state
    - Status bar updates immediately
@@ -94,7 +94,7 @@ Command::PlanModeToggle | Command::Plan(_) => {
 
 ## Testing Instructions
 
-1. **Start shammah**: `./target/debug/shammah`
+1. **Start finch**: `./target/debug/finch`
 2. **Enter plan mode**: Ask Claude "Please create a plan to add authentication"
    - Or use `/plan` command
 3. **Verify plan mode active**: Status bar shows "⏸ plan mode on"
@@ -154,7 +154,7 @@ pub enum ReplMode {
 
 ## Impact
 
-**Before**: Users stuck in plan mode, had to restart shammah to exit
+**Before**: Users stuck in plan mode, had to restart finch to exit
 **After**: Users can exit plan mode anytime with `/plan` command
 
 **UX**: Restores user control while preserving automatic plan mode workflow

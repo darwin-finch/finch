@@ -129,7 +129,7 @@ pub async fn query_local_only(&self, query: &str) -> Result<String>
 
 **Verification:**
 ```bash
-shammah
+finch
 > List all available tools
 ```
 
@@ -140,10 +140,10 @@ Expected tools: Read, Bash, Glob, Grep, WebFetch, Restart, SaveAndExec
 **Setup:**
 ```bash
 # Terminal 1: Start daemon
-shammah daemon --bind 127.0.0.1:11435
+finch daemon --bind 127.0.0.1:11435
 
 # Terminal 2: Wait for model to load, then test
-shammah
+finch
 ```
 
 **Test:**
@@ -163,8 +163,8 @@ shammah
 **Setup:**
 ```bash
 # Start daemon and query immediately
-shammah daemon --bind 127.0.0.1:11435 &
-shammah
+finch daemon --bind 127.0.0.1:11435 &
+finch
 ```
 
 **Test:**
@@ -184,7 +184,7 @@ Error: Local model not ready (initializing/downloading/loading)
 **Setup:**
 ```bash
 # No daemon running
-shammah
+finch
 ```
 
 **Test:**
@@ -196,7 +196,7 @@ shammah
 ```
 🔧 Local Model Query (bypassing routing)
 ⚠️  Daemon not available
-    Start the daemon: shammah daemon --bind 127.0.0.1:11435
+    Start the daemon: finch daemon --bind 127.0.0.1:11435
 ```
 
 ### Test 5: Normal Queries Still Work

@@ -47,7 +47,7 @@ Phase 2 implementation has begun. We're building the 3-model ensemble with onlin
   - BPE tokenization with special tokens
   - encode/decode with Tensor support
   - Padding and truncation
-  - Save/load from ~/.shammah/tokenizer.json
+  - Save/load from ~/.finch/tokenizer.json
 - ✅ Implemented Model Ensemble (~350 lines)
   - Coordinates all three models
   - Complete online learning training loop
@@ -145,7 +145,7 @@ Total: ~1,640 lines of Phase 2 model code
 - **Optimization:** SGD/Adam with online updates
 - **Tokenization:** BPE via `tokenizers` crate
 - **Device:** Metal (Apple Silicon) or CPU
-- **Persistence:** Save/load weights to `~/.shammah/models/`
+- **Persistence:** Save/load weights to `~/.finch/models/`
 
 ## Expected Timeline
 

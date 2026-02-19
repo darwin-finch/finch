@@ -66,7 +66,7 @@ All file moves were done with proper git operations:
 ## Directory Structure (After Cleanup)
 
 ```
-shammah/
+finch/
 ├── README.md                   # User documentation
 ├── CLAUDE.md                   # AI context
 ├── STATUS.md                   # Project status

@@ -27,10 +27,10 @@ It uses pre-trained models (Qwen/Llama/Mistral via ONNX) so it works well from d
 Also includes full tool execution (read files, run tests, search codebase) and runs as an OpenAI-compatible API server for multi-client use.
 
 One-liner install:
-curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/schancel/finch/main/install.sh | bash
 
-GitHub: https://github.com/schancel/shammah
-Release: https://github.com/schancel/shammah/releases/tag/v0.2.0
+GitHub: https://github.com/schancel/finch
+Release: https://github.com/schancel/finch/releases/tag/v0.2.0
 
 Built in Rust, works on macOS (Intel + Apple Silicon) and Linux.
 
@@ -75,7 +75,7 @@ Tech stack:
 
 Installation is trivial:
 
-curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/schancel/finch/main/install.sh | bash
 
 30 seconds from zero to working AI assistant.
 
@@ -83,8 +83,8 @@ Built in Rust. Runs on macOS + Linux.
 
 4/5
 
-📦 Download: github.com/schancel/shammah/releases/tag/v0.2.0
-📖 Docs: github.com/schancel/shammah
+📦 Download: github.com/schancel/finch/releases/tag/v0.2.0
+📖 Docs: github.com/schancel/finch
 🛡️ License: MIT OR Apache-2.0
 
 For developers who value privacy and local-first tools.
@@ -105,9 +105,9 @@ Try it and let me know what you think!
 ✅ Privacy-first
 
 One-liner install:
-curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/schancel/finch/main/install.sh | bash
 
-github.com/schancel/shammah
+github.com/schancel/finch
 ```
 
 ---
@@ -149,19 +149,19 @@ This means you can prioritize critical feedback and the model actually learns YO
 
 One-liner:
 ```bash
-curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/schancel/finch/main/install.sh | bash
 ```
 
 Or download binaries:
-- [macOS ARM64](https://github.com/schancel/shammah/releases/latest/download/shammah-macos-aarch64.tar.gz)
-- [macOS x86_64](https://github.com/schancel/shammah/releases/latest/download/shammah-macos-x86_64.tar.gz)
-- [Linux x86_64](https://github.com/schancel/shammah/releases/latest/download/shammah-linux-x86_64.tar.gz)
+- [macOS ARM64](https://github.com/schancel/finch/releases/latest/download/finch-macos-aarch64.tar.gz)
+- [macOS x86_64](https://github.com/schancel/finch/releases/latest/download/finch-macos-x86_64.tar.gz)
+- [Linux x86_64](https://github.com/schancel/finch/releases/latest/download/finch-linux-x86_64.tar.gz)
 
 ## Quick Start
 
 ```bash
-./shammah setup  # Interactive wizard
-./shammah        # Start REPL
+./finch setup  # Interactive wizard
+./finch        # Start REPL
 
 > How do I implement a binary search tree in Rust?
 # Works immediately, model downloads in background
@@ -178,8 +178,8 @@ Or download binaries:
 
 ## Links
 
-- **GitHub**: https://github.com/schancel/shammah
-- **Release**: https://github.com/schancel/shammah/releases/tag/v0.2.0
+- **GitHub**: https://github.com/schancel/finch
+- **Release**: https://github.com/schancel/finch/releases/tag/v0.2.0
 - **Docs**: See README
 
 Would love to hear your thoughts! What models are you most interested in seeing supported?
@@ -245,19 +245,19 @@ src/
 ## Installation
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/schancel/finch/main/install.sh | bash
 ```
 
 Or build from source:
 ```bash
-git clone https://github.com/schancel/shammah
-cd shammah
+git clone https://github.com/schancel/finch
+cd finch
 cargo build --release
 ```
 
 ## GitHub
 
-https://github.com/schancel/shammah
+https://github.com/schancel/finch
 
 Built with:
 - Rust 1.70+
@@ -325,9 +325,9 @@ A local-first AI coding assistant that:
 • Privacy-first (code stays on your machine)
 
 One-liner install:
-curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/schancel/finch/main/install.sh | bash
 
-Check it out: https://github.com/schancel/shammah
+Check it out: https://github.com/schancel/finch
 
 Built in Rust, runs on macOS + Linux 🦀
 ```

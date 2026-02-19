@@ -127,12 +127,12 @@ User: "Create a GitHub issue for bug #42"
 ### Config File Format
 
 ```toml
-# ~/.shammah/config.toml
+# ~/.finch/config.toml
 
 # Filesystem access (local subprocess)
 [mcp_servers.filesystem]
 command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/shammah/code"]
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/finch/code"]
 transport = "stdio"
 enabled = true
 
@@ -547,7 +547,7 @@ Once complete:
 
 ```bash
 # Configure MCP server
-cat >> ~/.shammah/config.toml << EOF
+cat >> ~/.finch/config.toml << EOF
 [mcp_servers.github]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
@@ -557,7 +557,7 @@ enabled = true
 EOF
 
 # Use in REPL
-$ shammah
+$ finch
 > /mcp list
 github: npx -y @modelcontextprotocol/server-github (enabled)
 

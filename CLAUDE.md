@@ -206,7 +206,7 @@ pub struct LoRAConfig {
 3. Buffer reaches threshold (e.g., 10 examples)
 4. Background training triggered (non-blocking)
 5. LoRA adapter trained for N epochs
-6. Adapter saved to ~/.shammah/adapters/
+6. Adapter saved to ~/.finch/adapters/
 7. Adapter loaded for future queries
 8. Process repeats continuously
 ```
@@ -538,7 +538,7 @@ See `TUI_SCROLLBACK_FIX_COMPLETE.md` for:
 
 **Purpose:** User preferences and API key management
 
-**Config File (`~/.shammah/config.toml`):**
+**Config File (`~/.finch/config.toml`):**
 ```toml
 api_key = "your_anthropic_api_key"
 streaming_enabled = true
@@ -561,7 +561,7 @@ high_weight = 10.0
 medium_weight = 3.0
 normal_weight = 1.0
 
-adapters_dir = "~/.shammah/adapters"
+adapters_dir = "~/.finch/adapters"
 ```
 
 **Key Files:**
@@ -588,10 +588,10 @@ adapters_dir = "~/.shammah/adapters"
 
 **Storage:**
 - Models: `~/.cache/huggingface/hub/` (standard HF cache)
-- Adapters: `~/.shammah/adapters/`
-- Config: `~/.shammah/config.toml`
-- Metrics: `~/.shammah/metrics/`
-- Daemon: `~/.shammah/daemon.pid`, `~/.shammah/daemon.sock`
+- Adapters: `~/.finch/adapters/`
+- Config: `~/.finch/config.toml`
+- Metrics: `~/.finch/metrics/`
+- Daemon: `~/.finch/daemon.pid`, `~/.finch/daemon.sock`
 
 **Dependencies:**
 - `ort` - ONNX Runtime bindings (Rust)
@@ -684,11 +684,11 @@ tokio::spawn(async move {
 
 ### 4. Storage Location
 
-**Decision:** Store everything in `~/.shammah/`
+**Decision:** Store everything in `~/.finch/`
 
 **Structure:**
 ```
-~/.shammah/
+~/.finch/
 ├── config.toml              # User configuration
 ├── adapters/                # LoRA adapters
 │   ├── coding_2026-02-06.safetensors
@@ -712,7 +712,7 @@ tokio::spawn(async move {
 
 ### 5. Command Name
 
-**Decision:** Use `shammah` as the binary name
+**Decision:** Use `finch` as the binary name
 
 **Rationale:**
 - Distinct from `claude` command
@@ -723,18 +723,18 @@ tokio::spawn(async move {
 
 **Interactive REPL:**
 ```bash
-shammah
+finch
 > How do I use lifetimes in Rust?
 ```
 
 **Single Query:**
 ```bash
-shammah query "What is 2+2?"
+finch query "What is 2+2?"
 ```
 
 **HTTP Daemon:**
 ```bash
-shammah daemon --bind 127.0.0.1:8000
+finch daemon --bind 127.0.0.1:8000
 ```
 
 ## Development Guidelines

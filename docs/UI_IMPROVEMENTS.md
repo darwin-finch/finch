@@ -8,7 +8,7 @@ The CLI now matches Claude Code's visual style with real-time training status.
 
 ```
 Shammah v0.1.0 - Constitutional AI Proxy
-Using API key from: ~/.shammah/config.toml ✓
+Using API key from: ~/.finch/config.toml ✓
 Loaded 10 constitutional patterns ✓
 Loaded crisis detection keywords ✓
 Online learning: ENABLED (threshold models) ✓

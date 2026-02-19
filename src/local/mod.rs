@@ -192,7 +192,7 @@ impl LocalGenerator {
     fn check_and_reload_adapter(&mut self) -> Result<()> {
         let adapters_dir = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-            .join(".shammah")
+            .join(".finch")
             .join("adapters");
 
         if !adapters_dir.exists() {

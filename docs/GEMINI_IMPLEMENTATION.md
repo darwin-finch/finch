@@ -170,7 +170,7 @@ Tests included:
 
 ```bash
 # Update config
-cat > ~/.shammah/config.toml <<EOF
+cat > ~/.finch/config.toml <<EOF
 [fallback]
 provider = "gemini"
 
@@ -179,7 +179,7 @@ api_key = "YOUR_API_KEY"
 EOF
 
 # Test query
-shammah query "What is 2+2?"
+finch query "What is 2+2?"
 ```
 
 ## Gemini-Specific Considerations

@@ -38,7 +38,7 @@
 npm install -g @modelcontextprotocol/server-filesystem
 ```
 
-**2. Add to your config** (`~/.shammah/config.toml`):
+**2. Add to your config** (`~/.finch/config.toml`):
 ```toml
 [mcp_servers.filesystem]
 command = "npx"
@@ -49,7 +49,7 @@ enabled = true
 
 **3. Start Shammah**:
 ```bash
-shammah
+finch
 ```
 
 **4. Verify connection**:
@@ -103,7 +103,7 @@ which npx  # Should show /usr/local/bin/npx or similar
 
 ## Configuration
 
-MCP servers are configured in `~/.shammah/config.toml` under the `[mcp_servers]` section.
+MCP servers are configured in `~/.finch/config.toml` under the `[mcp_servers]` section.
 
 ### Basic Configuration
 
@@ -428,7 +428,7 @@ npm install -g @modelcontextprotocol/server-brave-search
    ```
 
 2. **Config error**:
-   - Check `~/.shammah/config.toml` syntax
+   - Check `~/.finch/config.toml` syntax
    - Ensure `enabled = true`
    - Verify command path: `which npx`
    - Check args are valid
@@ -453,7 +453,7 @@ npm install -g @modelcontextprotocol/server-brave-search
 5. **Check Shammah logs**:
    ```bash
    # Look for MCP-related errors
-   shammah 2>&1 | grep -i mcp
+   finch 2>&1 | grep -i mcp
    ```
 
 ### Tools not appearing
@@ -473,7 +473,7 @@ npm install -g @modelcontextprotocol/server-brave-search
    > /quit
 
    # Start again
-   shammah
+   finch
    ```
 
 3. **Check server compatibility**:
@@ -506,7 +506,7 @@ npm install -g @modelcontextprotocol/server-brave-search
 
 **Symptom**: Commands show this message
 
-**Solution**: Add at least one MCP server to `~/.shammah/config.toml`:
+**Solution**: Add at least one MCP server to `~/.finch/config.toml`:
 
 ```toml
 [mcp_servers.example]
@@ -621,7 +621,7 @@ debug_logging = true
 
 Then check logs for MCP-related messages:
 ```bash
-shammah 2>&1 | grep -i "mcp\|jsonrpc"
+finch 2>&1 | grep -i "mcp\|jsonrpc"
 ```
 
 ## Further Reading
@@ -633,7 +633,7 @@ shammah 2>&1 | grep -i "mcp\|jsonrpc"
 
 ## Getting Help
 
-**Issues**: https://github.com/schancel/shammah/issues
+**Issues**: https://github.com/schancel/finch/issues
 
 **Questions**: Create a GitHub discussion or issue
 

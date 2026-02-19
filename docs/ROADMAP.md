@@ -94,7 +94,7 @@ This document provides detailed plans for future Shammah development, organized 
   3. Handle Up/Down key events
   4. Restore current input when navigating away and back
   5. Handle multi-line history entries
-  6. Persist history to disk (`~/.shammah/history.txt`)
+  6. Persist history to disk (`~/.finch/history.txt`)
   7. Load history on startup (last N entries, e.g., 1000)
 
 **Edge Cases:**
@@ -197,16 +197,16 @@ Model: qwen-2.5-3b (local) | Tokens: 247 | Speed: 42.3 tok/s | Latency: 1.2s
 
 ### 1.3 Daemon Management Subcommands
 
-#### 1.3.1 `shammah daemon stop`
+#### 1.3.1 `finch daemon stop`
 
 **Problem:** No way to gracefully stop daemon from CLI
-**Current Workaround:** Users run `kill $(cat ~/.shammah/daemon.pid)`
+**Current Workaround:** Users run `kill $(cat ~/.finch/daemon.pid)`
 **Impact:** Medium - Quality of life improvement
 
 **Implementation Details:**
 - File: `src/cli/commands.rs`
 - Behavior:
-  1. Read PID from `~/.shammah/daemon.pid`
+  1. Read PID from `~/.finch/daemon.pid`
   2. Send SIGTERM to daemon process
   3. Wait up to 5 seconds for graceful shutdown
   4. If still running, send SIGKILL
@@ -224,7 +224,7 @@ Model: qwen-2.5-3b (local) | Tokens: 247 | Speed: 42.3 tok/s | Latency: 1.2s
 
 ---
 
-#### 1.3.2 `shammah daemon start`
+#### 1.3.2 `finch daemon start`
 
 **Problem:** No explicit start command (only auto-spawn)
 **Use Case:** Users want to pre-start daemon before making queries
@@ -245,7 +245,7 @@ Model: qwen-2.5-3b (local) | Tokens: 247 | Speed: 42.3 tok/s | Latency: 1.2s
 
 ---
 
-#### 1.3.3 `shammah daemon status`
+#### 1.3.3 `finch daemon status`
 
 **Problem:** No way to check daemon state from CLI
 **Expected Output:** Running/stopped, PID, uptime, active sessions
@@ -434,7 +434,7 @@ api_key = "..."
    - Handle failures gracefully
 
 4. **Plan Storage:**
-   - Save plans to `~/.shammah/plans/`
+   - Save plans to `~/.finch/plans/`
    - Allow resuming saved plans
    - Track plan history
 
@@ -459,12 +459,12 @@ api_key = "..."
 **Implementation:**
 1. Create virtual environment:
    ```bash
-   python -m venv ~/.shammah/venv
-   source ~/.shammah/venv/bin/activate
+   python -m venv ~/.finch/venv
+   source ~/.finch/venv/bin/activate
    pip install -r scripts/requirements.txt
    ```
 2. Add venv setup to first-run wizard (optional step)
-3. Add `shammah train setup` subcommand to install deps
+3. Add `finch train setup` subcommand to install deps
 4. Document in README
 
 **Dependencies in requirements.txt:**
@@ -507,7 +507,7 @@ api_key = "..."
 **Implementation (Option A):**
 1. Add merge step to Python training script
 2. Export merged model to ONNX
-3. Save to `~/.shammah/adapters/name_merged.onnx`
+3. Save to `~/.finch/adapters/name_merged.onnx`
 4. Rust: Implement adapter switching command
 5. Reload model when adapter changes
 

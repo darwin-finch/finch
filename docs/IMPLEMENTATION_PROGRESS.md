@@ -54,9 +54,9 @@
 
 **Actions**:
 1. Parse STATUS.md → create GitHub issues
-2. Find-replace "shammah" → "finch" across codebase
+2. Find-replace "finch" → "finch" across codebase
 3. Rename Cargo.toml package name
-4. Update ~/.shammah → ~/.finch migration
+4. Update ~/.finch → ~/.finch migration
 
 ## Integration Points (TODO)
 

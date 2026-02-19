@@ -88,7 +88,7 @@ Daemon succeeds → Send query via HTTP
 Added `--no-daemon` flag for troubleshooting:
 
 ```bash
-shammah --no-daemon --initial-prompt "Hello"
+finch --no-daemon --initial-prompt "Hello"
 ```
 
 Forces direct connection to teacher API, bypassing daemon entirely.
@@ -118,7 +118,7 @@ Forces direct connection to teacher API, bypassing daemon entirely.
 ### REPL Mode (Interactive)
 ```bash
 # Daemon auto-spawns in background
-shammah
+finch
 
 # Expected:
 # 1. Daemon spawns automatically (if not running)
@@ -129,7 +129,7 @@ shammah
 
 ### Query Mode (Single Query)
 ```bash
-shammah query "What is 2+2?"
+finch query "What is 2+2?"
 
 # Expected:
 # 1. Daemon auto-spawns if not running
@@ -140,7 +140,7 @@ shammah query "What is 2+2?"
 
 ### Piped Input
 ```bash
-echo "What is 2+2?" | shammah
+echo "What is 2+2?" | finch
 
 # Expected:
 # 1. Daemon auto-spawns if not running
@@ -150,7 +150,7 @@ echo "What is 2+2?" | shammah
 
 ### Debug Mode (Teacher-Only)
 ```bash
-shammah --no-daemon --initial-prompt "Hello"
+finch --no-daemon --initial-prompt "Hello"
 
 # Expected:
 # 1. Warning about no-daemon mode
@@ -164,10 +164,10 @@ shammah --no-daemon --initial-prompt "Hello"
 ### Test 1: Fresh Install
 ```bash
 # Remove existing config
-rm -rf ~/.shammah/config.toml
+rm -rf ~/.finch/config.toml
 
 # Run CLI (should trigger setup wizard)
-shammah
+finch
 
 # Expected:
 # 1. Setup wizard runs
@@ -178,7 +178,7 @@ shammah
 
 ### Test 2: Query Mode
 ```bash
-shammah query "What is 2+2?"
+finch query "What is 2+2?"
 
 # Expected:
 # 1. Daemon auto-spawns if not running
@@ -189,7 +189,7 @@ shammah query "What is 2+2?"
 
 ### Test 3: REPL with Commands
 ```bash
-shammah
+finch
 
 > /help
 # Shows available commands
@@ -210,7 +210,7 @@ shammah
 nc -l 11434 &
 
 # Run query
-shammah query "Hello"
+finch query "Hello"
 
 # Expected:
 # 1. Daemon spawn fails (port in use)
@@ -222,10 +222,10 @@ shammah query "Hello"
 ### Test 5: Daemon Already Running
 ```bash
 # Start daemon manually
-shammah daemon --bind 127.0.0.1:11434 &
+finch daemon --bind 127.0.0.1:11434 &
 
 # Run CLI
-shammah
+finch
 
 # Expected:
 # 1. CLI detects daemon is running
@@ -240,8 +240,8 @@ shammah
 
 **No changes required!** The system works the same way:
 
-- Run `shammah` for interactive mode
-- Run `shammah query "..."` for single queries
+- Run `finch` for interactive mode
+- Run `finch query "..."` for single queries
 - Daemon management is automatic
 
 ### For Developers

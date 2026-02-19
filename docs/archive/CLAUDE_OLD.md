@@ -155,7 +155,7 @@ Confidence > threshold?
    - Tracks performance metrics
 
 7. **Configuration** (`src/config/`)
-   - Reads `~/.shammah/config.toml` for settings
+   - Reads `~/.finch/config.toml` for settings
    - API key management
    - Constitution path configuration
    - Streaming and UI preferences
@@ -173,7 +173,7 @@ Confidence > threshold?
   - Validator: ~1-3B parameters (quality assessment)
 - **Training**: Distillation from Claude's responses
 - **API**: Compatible with Claude API format
-- **Storage**: `~/.shammah/` for all data
+- **Storage**: `~/.finch/` for all data
 - **Async**: Tokio runtime
 - **HTTP**: Reqwest client
 - **CLI**: Clap for argument parsing
@@ -188,7 +188,7 @@ Confidence > threshold?
 
 ### 2. Storage Location
 
-**Decision**: Store everything in `~/.shammah/`
+**Decision**: Store everything in `~/.finch/`
 **Rationale**:
 - Simple, single directory for all Shammah data
 - Traditional Unix convention (dot-directory in home)
@@ -197,7 +197,7 @@ Confidence > threshold?
 
 **Structure**:
 ```
-~/.shammah/
+~/.finch/
 ├── config.toml              # API key and settings
 ├── metrics/                 # Daily JSONL logs for training
 │   ├── 2026-01-29.jsonl
@@ -211,7 +211,7 @@ Confidence > threshold?
 
 ### 3. Command Name
 
-**Decision**: Use `shammah` as the binary name
+**Decision**: Use `finch` as the binary name
 **Rationale**:
 - Distinct from `claude` command
 - Memorable and meaningful (Hebrew "watchman")
@@ -221,20 +221,20 @@ Confidence > threshold?
 
 **Interactive REPL**:
 ```bash
-shammah
+finch
 > How do I use lifetimes in Rust?
 ```
 
 **Daemon Mode** (background service):
 ```bash
-shammah daemon
+finch daemon
 # Runs HTTP server on localhost:8000
 # Claude Code connects via proxy settings
 ```
 
 **Single Query**:
 ```bash
-shammah query "What is the time complexity of quicksort?"
+finch query "What is the time complexity of quicksort?"
 ```
 
 ### 5. Learning Strategy
@@ -614,7 +614,7 @@ The threshold models provide **immediate value** from query 1, unlike neural net
 
 ### Constitution Support ✅ (Infrastructure)
 
-- ✅ **Configurable Path:** `~/.shammah/constitution.md` by default
+- ✅ **Configurable Path:** `~/.finch/constitution.md` by default
 - ✅ **Loaded on Startup:** Constitution file read if it exists
 - ✅ **Not Sent to API:** Keeps constitutional principles private
 - ⚠️ **Usage Pending:** Infrastructure complete, but not yet applied
@@ -644,7 +644,7 @@ Allows users to define custom constitutional principles for local generation wit
 - **Note:** These errors existed before the metrics fix and are part of ongoing development
 
 **Statistics Files:**
-- ✅ Corrupted metrics files deleted and backed up to `~/.shammah/models/*.backup`
+- ✅ Corrupted metrics files deleted and backed up to `~/.finch/models/*.backup`
 - ✅ Fresh statistics will be created on next successful run
 - Expected behavior: `total_queries >= total_local_attempts` (not equal)
 

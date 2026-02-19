@@ -159,8 +159,8 @@ cargo build --release
 ### Test 1: Background Rendering
 
 ```bash
-./target/release/shammah daemon --bind 127.0.0.1:11435 &
-./target/release/shammah
+./target/release/finch daemon --bind 127.0.0.1:11435 &
+./target/release/finch
 
 # Type a user message
 > hello

@@ -20,7 +20,7 @@ The only required configuration is your Claude API key:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
-shammah
+finch
 ```
 
 Or add to `~/.claude/settings.json`:
@@ -51,7 +51,7 @@ max_training_size = "5GB"
 EOF
 
 # 3. Run daemon mode
-shammah daemon
+finch daemon
 ```
 
 ## Configuration Reference
@@ -193,7 +193,7 @@ When `proxyEnabled` is true, Claude Code will route requests through Shammah.
 
 1. Start Shammah daemon:
    ```bash
-   shammah daemon
+   finch daemon
    ```
 
 2. Configure Claude Code to use proxy:
@@ -209,7 +209,7 @@ When `proxyEnabled` is true, Claude Code will route requests through Shammah.
    claude "What is Rust?"
    ```
 
-Requests will flow: `claude` → `shammah` → local or Claude API
+Requests will flow: `claude` → `finch` → local or Claude API
 
 ## Environment Variables
 
@@ -235,7 +235,7 @@ export SHAMMAH_PORT=8000
 
 # Logging
 export SHAMMAH_LOG_LEVEL="info"
-export RUST_LOG="shammah=debug"  # Rust-specific logging
+export RUST_LOG="finch=debug"  # Rust-specific logging
 ```
 
 ## Command-Line Arguments
@@ -244,22 +244,22 @@ Override any setting with CLI flags:
 
 ```bash
 # API key
-shammah --api-key "sk-ant-..."
+finch --api-key "sk-ant-..."
 
 # Router settings
-shammah --confidence 0.90 --target-forward-rate 0.10
+finch --confidence 0.90 --target-forward-rate 0.10
 
 # Daemon settings
-shammah daemon --host 0.0.0.0 --port 8080
+finch daemon --host 0.0.0.0 --port 8080
 
 # Logging
-shammah --log-level debug
+finch --log-level debug
 
 # Config file location
-shammah --config /path/to/config.toml
+finch --config /path/to/config.toml
 ```
 
-See `shammah --help` for complete list.
+See `finch --help` for complete list.
 
 ## Operating Modes
 
@@ -268,7 +268,7 @@ See `shammah --help` for complete list.
 Default mode for interactive use:
 
 ```bash
-shammah
+finch
 ```
 
 Configuration:
@@ -281,7 +281,7 @@ Configuration:
 Background service for proxy usage:
 
 ```bash
-shammah daemon
+finch daemon
 ```
 
 Configuration:
@@ -298,7 +298,7 @@ After=network.target
 [Service]
 Type=simple
 User=%i
-ExecStart=/usr/local/bin/shammah daemon
+ExecStart=/usr/local/bin/finch daemon
 Restart=on-failure
 
 [Install]
@@ -310,7 +310,7 @@ WantedBy=multi-user.target
 One-off queries:
 
 ```bash
-shammah query "What is Rust?"
+finch query "What is Rust?"
 ```
 
 Configuration:
@@ -335,7 +335,7 @@ In `~/.claude/settings.json`:
     },
     "read": {
       "enabled": true,
-      "allowedPaths": ["/Users/shammah/repos"]
+      "allowedPaths": ["/Users/finch/repos"]
     },
     "write": {
       "enabled": false
@@ -356,12 +356,12 @@ Shammah will enforce these permissions for local responses and pass through to C
 # macOS Keychain
 security add-generic-password \
   -a "$USER" \
-  -s "shammah-api-key" \
+  -s "finch-api-key" \
   -w "sk-ant-..."
 
 # Access in config
 [api]
-claude_api_key = "${KEYCHAIN:shammah-api-key}"
+claude_api_key = "${KEYCHAIN:finch-api-key}"
 ```
 
 **Alternative**: Environment variable
@@ -396,8 +396,8 @@ For production deployments with HTTPS:
 host = "0.0.0.0"
 port = 8443
 https = true
-tls_cert = "/etc/shammah/cert.pem"
-tls_key = "/etc/shammah/key.pem"
+tls_cert = "/etc/finch/cert.pem"
+tls_key = "/etc/finch/key.pem"
 ```
 
 Generate self-signed cert for testing:
@@ -473,13 +473,13 @@ Shammah tracks metrics in `~/.claude-proxy/stats.json`:
 View stats:
 
 ```bash
-shammah stats
+finch stats
 ```
 
 Reset stats:
 
 ```bash
-shammah stats --reset
+finch stats --reset
 ```
 
 ## Troubleshooting
@@ -489,13 +489,13 @@ shammah stats --reset
 View effective configuration:
 
 ```bash
-shammah config show
+finch config show
 ```
 
 Validate configuration:
 
 ```bash
-shammah config validate
+finch config validate
 ```
 
 ### Common Issues
@@ -504,19 +504,19 @@ shammah config validate
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 # or
-shammah --api-key "sk-ant-..."
+finch --api-key "sk-ant-..."
 ```
 
 **Model files missing**:
 ```bash
 # Download models (when available)
-shammah models download
+finch models download
 ```
 
 **Port already in use**:
 ```bash
 # Use different port
-shammah daemon --port 8001
+finch daemon --port 8001
 ```
 
 **Out of disk space**:
@@ -526,7 +526,7 @@ shammah daemon --port 8001
 max_training_size = "1GB"
 
 # Or clean old data
-shammah clean --keep-recent 30d
+finch clean --keep-recent 30d
 ```
 
 ## Advanced Configuration
@@ -563,7 +563,7 @@ confidence_threshold = 0.70
 Use profile:
 
 ```bash
-shammah --profile conservative
+finch --profile conservative
 ```
 
 ### Federation (Future)
@@ -573,7 +573,7 @@ Share anonymized training data (opt-in):
 ```toml
 [federation]
 enabled = false
-server = "https://federation.shammah.ai"
+server = "https://federation.finch.ai"
 anonymous_id = "uuid-generated-locally"
 ```
 

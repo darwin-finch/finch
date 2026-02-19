@@ -124,7 +124,7 @@ if let Ok(temp_config) = load_config() {
     }
 }
 
-// Set up file logging for daemon (append to ~/.shammah/daemon.log)
+// Set up file logging for daemon (append to ~/.finch/daemon.log)
 // ... (rest of logging setup)
 ```
 
@@ -149,7 +149,7 @@ cargo run -- setup
 
 **Test 2: Auto-approve flag OFF (default)**
 ```bash
-# Edit ~/.shammah/config.toml
+# Edit ~/.finch/config.toml
 # [features]
 # auto_approve_tools = false
 
@@ -161,7 +161,7 @@ cargo run
 
 **Test 3: Auto-approve flag ON**
 ```bash
-# Edit ~/.shammah/config.toml
+# Edit ~/.finch/config.toml
 # [features]
 # auto_approve_tools = true
 
@@ -172,7 +172,7 @@ cargo run
 
 **Test 4: Debug logging OFF (default)**
 ```bash
-# Edit ~/.shammah/config.toml
+# Edit ~/.finch/config.toml
 # [features]
 # debug_logging = false
 
@@ -183,7 +183,7 @@ cargo run
 
 **Test 5: Debug logging ON**
 ```bash
-# Edit ~/.shammah/config.toml
+# Edit ~/.finch/config.toml
 # [features]
 # debug_logging = true
 
@@ -234,7 +234,7 @@ All existing tests pass with no regressions.
 
 ## Configuration Example
 
-**~/.shammah/config.toml**:
+**~/.finch/config.toml**:
 ```toml
 streaming_enabled = true  # Deprecated, kept for backward compat
 tui_enabled = true
@@ -281,11 +281,11 @@ Phase 2 is complete! The next recommended phases are:
   - Config flag sets RUST_LOG env var before init_tracing()
   - Users can still override with their own RUST_LOG value
   - Works in both REPL and daemon modes
-- Daemon mode logs to `~/.shammah/daemon.log`, now with debug support
+- Daemon mode logs to `~/.finch/daemon.log`, now with debug support
 
 ## References
 
-- Plan file: `/Users/shammah/.claude/plans/streamed-launching-frost.md`
+- Plan file: `/Users/finch/.claude/plans/streamed-launching-frost.md`
 - Config module: `src/config/settings.rs`
 - Setup wizard: `src/cli/setup_wizard.rs`
 - Main entry point: `src/main.rs`

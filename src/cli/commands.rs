@@ -313,8 +313,8 @@ pub fn format_help() -> String {
          \x1b[31m  • Deny\x1b[0m                     Reject the action\n\n\
          Available tools: Read, Glob, Grep, WebFetch, Bash, Restart\n\n\
          \x1b[1;33m📚 Learn More:\x1b[0m\n\
-         \x1b[36m  GitHub:\x1b[0m   https://github.com/schancel/shammah\n\
-         \x1b[36m  Issues:\x1b[0m   https://github.com/schancel/shammah/issues\n\
+         \x1b[36m  GitHub:\x1b[0m   https://github.com/schancel/finch\n\
+         \x1b[36m  Issues:\x1b[0m   https://github.com/schancel/finch/issues\n\
          \x1b[36m  Docs:\x1b[0m     See README.md and docs/ folder\n\n\
          \x1b[1;33m💡 Quick Start:\x1b[0m\n\
          Just type your question! Examples:\n\

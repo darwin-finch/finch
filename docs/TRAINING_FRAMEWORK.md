@@ -626,12 +626,12 @@ fn clip_gradients(grads: &mut Gradients) {
 ```rust
 fn save_models() {
     // Save incrementally (not full checkpoint every time)
-    router_model.save("~/.shammah/models/router.safetensors");
-    generator_model.save("~/.shammah/models/generator.safetensors");
-    validator_model.save("~/.shammah/models/validator.safetensors");
+    router_model.save("~/.finch/models/router.safetensors");
+    generator_model.save("~/.finch/models/generator.safetensors");
+    validator_model.save("~/.finch/models/validator.safetensors");
 
     // Also save optimizer state (for Adam momentum)
-    optimizer.save("~/.shammah/models/optimizer_state.safetensors");
+    optimizer.save("~/.finch/models/optimizer_state.safetensors");
 }
 ```
 
@@ -640,7 +640,7 @@ fn save_models() {
 ```rust
 if query_count % 100 == 0 {
     // Create versioned checkpoint
-    let checkpoint_dir = format!("~/.shammah/checkpoints/query_{}", query_count);
+    let checkpoint_dir = format!("~/.finch/checkpoints/query_{}", query_count);
     save_checkpoint(checkpoint_dir);
 }
 ```
@@ -680,7 +680,7 @@ struct TrainingMetrics {
 }
 ```
 
-Log to `~/.shammah/metrics/training.jsonl`
+Log to `~/.finch/metrics/training.jsonl`
 
 ---
 

@@ -270,7 +270,7 @@ cargo run -- setup
 # Save configuration
 ```
 
-**Enable in config file** (`~/.shammah/config.toml`):
+**Enable in config file** (`~/.finch/config.toml`):
 ```toml
 [features]
 gui_automation = true

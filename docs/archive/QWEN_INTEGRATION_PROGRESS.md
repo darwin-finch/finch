@@ -108,7 +108,7 @@ Shows:
 
 **Automatic Selection:**
 ```rust
-use shammah::models::{GeneratorConfig, GeneratorModel, ModelSelector, ModelDownloader};
+use finch::models::{GeneratorConfig, GeneratorModel, ModelSelector, ModelDownloader};
 
 // 1. Select model based on system RAM
 let model_size = ModelSelector::select_model_for_system()?;
@@ -205,7 +205,7 @@ match *generator_state.read() {
 
 **User Experience:**
 ```
-$ shammah
+$ finch
 > How do I use lifetimes in Rust?
 ⏳ Downloading Qwen-2.5-3B (first time only)...
 [=====>    ] 45% (2.1GB / 4.7GB)

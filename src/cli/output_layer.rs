@@ -38,9 +38,9 @@ impl OutputManagerLayer {
     /// Format the log message (strip ugly module paths)
     fn format_message(&self, target: &str, message: &str) -> String {
         // Strip long module paths for cleaner output
-        let clean_target = if target.starts_with("shammah::") {
+        let clean_target = if target.starts_with("finch::") {
             // Our own logs: keep module name
-            target.strip_prefix("shammah::").unwrap_or(target)
+            target.strip_prefix("finch::").unwrap_or(target)
         } else if target.contains("::") {
             // External logs: just show crate name
             target.split("::").next().unwrap_or(target)
@@ -169,7 +169,7 @@ mod tests {
         let layer = OutputManagerLayer::new();
 
         // Our own logs
-        let msg = layer.format_message("shammah::models::loader", "Loading model");
+        let msg = layer.format_message("finch::models::loader", "Loading model");
         assert_eq!(msg, "[models::loader] Loading model");
 
         // External logs with long paths

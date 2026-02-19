@@ -1,14 +1,14 @@
-# Shammah
+# Darwin Finch 🐦
 
 <div align="center">
 
-**שָׁמָה** (Shammah) - Hebrew: "watchman" or "guardian"
+**AI that evolves with your code**
 
-[![CI](https://github.com/schancel/shammah/workflows/CI/badge.svg)](https://github.com/schancel/shammah/actions)
-[![Release](https://img.shields.io/github/v/release/schancel/shammah)](https://github.com/schancel/shammah/releases)
+[![CI](https://github.com/darwin-finch/finch/workflows/CI/badge.svg)](https://github.com/darwin-finch/finch/actions)
+[![Release](https://img.shields.io/github/v/release/darwin-finch/finch)](https://github.com/darwin-finch/finch/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 
-**A local-first AI coding assistant that actually works offline.**
+**A distributed AI coding assistant with hierarchical memory that adapts to your style**
 
 [Quick Start](#quick-start) •
 [Download](#installation) •
@@ -19,18 +19,23 @@
 
 ---
 
-## Why Shammah?
+## Why Darwin Finch?
+
+Just like Darwin's finches evolved to their environment, **Darwin Finch** adapts to your codebase through continuous learning.
 
 **Problem:** Cloud AI assistants require constant internet, cost money per query, and can't learn your specific coding patterns.
 
-**Solution:** Shammah runs entirely on your machine with:
+**Solution:** Darwin Finch runs on your machine with:
 - ✅ **Works offline** after initial setup
 - ✅ **Instant responses** from local models
-- ✅ **Learns your style** through weighted LoRA fine-tuning
-- ✅ **Privacy-first** - your code never leaves your machine
+- ✅ **Evolves with you** through weighted LoRA fine-tuning
+- ✅ **Hierarchical memory** (MemTree, not RAG) for context recall
+- ✅ **Multi-LLM flexibility** - any LLM as primary, others as tools
+- ✅ **Distributed architecture** - share GPU across machines
+- ✅ **Privacy-first** - your code stays on your machine
 - ✅ **Free to run** - no per-query costs
 
-Unlike training a model from scratch (months + expensive GPUs), Shammah uses pre-trained models that work great immediately and adapt to your needs over time.
+Unlike training from scratch (months + expensive GPUs), Darwin Finch uses pre-trained models that work great immediately and adapt to your needs over time.
 
 ## Quick Start
 
@@ -39,45 +44,45 @@ Unlike training a model from scratch (months + expensive GPUs), Shammah uses pre
 **Option 1: One-Liner Install** (Easiest)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/darwin-finch/finch/main/install.sh | bash
 ```
 
 This will:
 - Detect your platform automatically
 - Download the latest release
-- Install to `~/.local/bin/shammah`
+- Install to `~/.local/bin/finch`
 - Verify the installation
 
 **Option 2: Download Pre-Built Binary**
 
 ```bash
 # macOS (Apple Silicon)
-curl -L https://github.com/schancel/shammah/releases/latest/download/shammah-macos-aarch64.tar.gz | tar xz
-./shammah --version
+curl -L https://github.com/schancel/finch/releases/latest/download/finch-macos-aarch64.tar.gz | tar xz
+./finch --version
 
 # macOS (Intel)
-curl -L https://github.com/schancel/shammah/releases/latest/download/shammah-macos-x86_64.tar.gz | tar xz
-./shammah --version
+curl -L https://github.com/schancel/finch/releases/latest/download/finch-macos-x86_64.tar.gz | tar xz
+./finch --version
 
 # Linux
-curl -L https://github.com/schancel/shammah/releases/latest/download/shammah-linux-x86_64.tar.gz | tar xz
-./shammah --version
+curl -L https://github.com/schancel/finch/releases/latest/download/finch-linux-x86_64.tar.gz | tar xz
+./finch --version
 ```
 
 **Option 3: Build from Source**
 
 ```bash
-git clone https://github.com/schancel/shammah
-cd shammah
+git clone https://github.com/schancel/finch
+cd finch
 cargo build --release
-./target/release/shammah --version
+./target/release/finch --version
 ```
 
 ### First Run (30 seconds to working AI)
 
 ```bash
 # 1. Run setup wizard (interactive)
-./shammah setup
+./finch setup
 
 # Enter:
 # - Your Claude API key (from console.anthropic.com) - for fallback
@@ -85,7 +90,7 @@ cargo build --release
 # - Choose model size (auto-selected based on your RAM)
 
 # 2. Start using it!
-./shammah
+./finch
 
 # REPL appears instantly - you can start asking questions right away
 > How do I implement a binary search tree in Rust?
@@ -186,7 +191,7 @@ Run as an OpenAI-compatible API server:
 
 ```bash
 # Start daemon
-./shammah daemon --bind 127.0.0.1:11435
+./finch daemon --bind 127.0.0.1:11435
 
 # Use from any OpenAI-compatible client
 curl http://127.0.0.1:11435/v1/chat/completions \
@@ -230,7 +235,7 @@ Future responses incorporate learnings
 ### Interactive REPL
 
 ```bash
-./shammah
+./finch
 
 > How do I use lifetimes in Rust?
 > Read my src/main.rs and suggest improvements
@@ -244,28 +249,28 @@ Future responses incorporate learnings
 ### Single Query
 
 ```bash
-./shammah query "What's the best way to handle errors in Rust?"
+./finch query "What's the best way to handle errors in Rust?"
 
 # Or pipe input
-echo "Explain closures" | ./shammah
+echo "Explain closures" | ./finch
 ```
 
 ### HTTP Daemon
 
 ```bash
 # Start daemon
-./shammah daemon-start
+./finch daemon-start
 
 # Check status
-./shammah daemon-status
+./finch daemon-status
 
 # Stop daemon
-./shammah daemon-stop
+./finch daemon-stop
 ```
 
 ## Configuration
 
-Config file: `~/.shammah/config.toml`
+Config file: `~/.finch/config.toml`
 
 ```toml
 streaming_enabled = true
@@ -369,7 +374,7 @@ cat ~/.cache/huggingface/token
 
 ```bash
 # Switch to smaller model
-./shammah
+./finch
 > /model select 1.5B
 ```
 
@@ -388,10 +393,10 @@ cat ~/.cache/huggingface/token
 
 ```bash
 # Run setup again to reconfigure
-./shammah setup
+./finch setup
 
 # Or manually edit config
-vim ~/.shammah/config.toml
+vim ~/.finch/config.toml
 ```
 
 ## Documentation
@@ -403,8 +408,8 @@ vim ~/.shammah/config.toml
 
 ## Community & Support
 
-- **Issues**: https://github.com/schancel/shammah/issues
-- **Discussions**: https://github.com/schancel/shammah/discussions
+- **Issues**: https://github.com/schancel/finch/issues
+- **Discussions**: https://github.com/schancel/finch/discussions
 - **Discord**: [Coming soon]
 
 ## Contributing
@@ -428,9 +433,9 @@ MIT OR Apache-2.0
 
 **Shammah** - Your AI coding watchman that learns and improves with you. 🛡️
 
-[Download](https://github.com/schancel/shammah/releases) •
+[Download](https://github.com/schancel/finch/releases) •
 [Docs](#documentation) •
-[Report Bug](https://github.com/schancel/shammah/issues)
+[Report Bug](https://github.com/schancel/finch/issues)
 
 Made with ❤️ for developers who value privacy and local-first tools
 

@@ -64,10 +64,10 @@ pub enum InferenceBackend {
   - [ ] Show performance/battery tradeoffs
   - [ ] Get user selection
 - [ ] Save backend preference to config
-  - [ ] `~/.shammah/config.toml` → `[backend] type = "..."`
+  - [ ] `~/.finch/config.toml` → `[backend] type = "..."`
   - [ ] Allow manual editing for advanced users
 
-**Deliverable:** `shammah` runs setup wizard on first launch
+**Deliverable:** `finch` runs setup wizard on first launch
 
 ---
 
@@ -87,7 +87,7 @@ pub enum InferenceBackend {
   - [ ] Show download progress with `indicatif`
   - [ ] Estimate time remaining
 - [ ] Caching strategy
-  - [ ] Store models in `~/.cache/shammah/models/`
+  - [ ] Store models in `~/.cache/finch/models/`
   - [ ] Separate dirs per backend: `coreml/`, `metal/`, etc.
 
 **Deliverable:** Correct model downloaded based on user's backend choice
@@ -174,7 +174,7 @@ pub enum InferenceBackend {
 
 ## Configuration Schema
 
-### `~/.shammah/config.toml`
+### `~/.finch/config.toml`
 
 ```toml
 [backend]
@@ -183,7 +183,7 @@ type = "CoreML"
 
 # Model repository and path
 model_repo = "anemll/Qwen2.5-3B-Instruct"
-model_path = "~/.cache/shammah/models/coreml/qwen-3b.mlpackage"
+model_path = "~/.cache/finch/models/coreml/qwen-3b.mlpackage"
 
 # Preference order (fallback chain)
 prefer = ["CoreML", "Metal", "Cuda", "Cpu"]
@@ -217,7 +217,7 @@ Select device (1-3): 1
 [████████████████████████████████] 100% • 45s
 
 ✓ Model ready!
-✓ Configuration saved to ~/.shammah/config.toml
+✓ Configuration saved to ~/.finch/config.toml
 
 🎉 Setup complete! Starting Shammah...
 ```

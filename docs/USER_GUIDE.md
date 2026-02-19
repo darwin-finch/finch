@@ -5,7 +5,7 @@
 
 ## Table of Contents
 
-1. [What is Shammah?](#what-is-shammah)
+1. [What is Shammah?](#what-is-finch)
 2. [Quick Start](#quick-start)
 3. [Installation](#installation)
 4. [First-Time Setup](#first-time-setup)
@@ -41,7 +41,7 @@ Shammah is a **local-first AI coding assistant** that combines the power of:
 
 ```bash
 # Start interactive session
-shammah
+finch
 
 # Ask a question
 > How do I use lifetimes in Rust?
@@ -60,8 +60,8 @@ That's it! Shammah will guide you through setup on first run.
 
 ```bash
 # Clone repository
-git clone https://github.com/schancel/shammah.git
-cd shammah
+git clone https://github.com/schancel/finch.git
+cd finch
 
 # Build (requires Rust 1.70+)
 cargo build --release
@@ -70,7 +70,7 @@ cargo build --release
 cargo install --path .
 
 # Verify
-shammah --version
+finch --version
 ```
 
 ### System Requirements
@@ -84,7 +84,7 @@ shammah --version
 
 ## First-Time Setup
 
-When you run `shammah` for the first time, the setup wizard will guide you through:
+When you run `finch` for the first time, the setup wizard will guide you through:
 
 ### 1. Welcome Screen
 
@@ -137,10 +137,10 @@ Model size (based on your RAM):
 
 ### 4. Completion
 
-Setup is saved to `~/.shammah/config.toml`. You can edit it manually or re-run setup:
+Setup is saved to `~/.finch/config.toml`. You can edit it manually or re-run setup:
 
 ```bash
-shammah setup
+finch setup
 ```
 
 ---
@@ -150,7 +150,7 @@ shammah setup
 ### Interactive REPL
 
 ```bash
-shammah
+finch
 ```
 
 This starts an interactive session. You can:
@@ -175,7 +175,7 @@ Would you like to see examples?
 ### Single Query Mode
 
 ```bash
-shammah query "Explain async/await in Rust"
+finch query "Explain async/await in Rust"
 ```
 
 Runs a single query and exits - useful for scripts.
@@ -242,7 +242,7 @@ This allows:
 - `cargo test` in any user's projects directory
 - Any arguments (e.g., `--release`, `--bin foo`)
 
-Managed via `shammah tools` command.
+Managed via `finch tools` command.
 
 ---
 
@@ -252,7 +252,7 @@ Managed via `shammah tools` command.
 
 Press **Up/Down** arrows to navigate through previous queries.
 
-History is saved to `~/.shammah/history.txt` (last 1000 commands).
+History is saved to `~/.finch/history.txt` (last 1000 commands).
 
 ### Feedback System
 
@@ -265,7 +265,7 @@ Feedback is weighted:
 - Good: 1x weight
 - Bad: 10x weight (learns faster from mistakes)
 
-Data saved to `~/.shammah/feedback.jsonl` for LoRA training.
+Data saved to `~/.finch/feedback.jsonl` for LoRA training.
 
 ### Status Bar
 
@@ -285,7 +285,7 @@ Model: qwen-3b | Tokens: 234→156 | Latency: 1.2s | Speed: 130 tok/s | Memory: 
 Add additional teacher providers after initial setup:
 
 ```bash
-shammah setup
+finch setup
 # Navigate to teacher configuration
 # Press 'a' to add a new provider
 ```
@@ -300,7 +300,7 @@ For advanced users and integrations.
 
 ### Auto-Spawning Daemon
 
-The daemon starts automatically when you use `shammah`. It:
+The daemon starts automatically when you use `finch`. It:
 - Runs in background
 - Serves OpenAI-compatible HTTP API
 - Manages sessions and model loading
@@ -310,13 +310,13 @@ The daemon starts automatically when you use `shammah`. It:
 
 ```bash
 # Check daemon status
-shammah daemon-status
+finch daemon-status
 
 # Stop daemon
-shammah daemon-stop
+finch daemon-stop
 
 # Start daemon manually
-shammah daemon-start
+finch daemon-start
 ```
 
 ### HTTP API
@@ -338,7 +338,7 @@ Use this to integrate Shammah with other tools (VSCode extensions, etc.).
 
 ## Configuration
 
-Config file: `~/.shammah/config.toml`
+Config file: `~/.finch/config.toml`
 
 ### Example Configuration
 
@@ -384,13 +384,13 @@ max_tool_turns = 5
 
 ### Storage Locations
 
-- **Config:** `~/.shammah/config.toml`
+- **Config:** `~/.finch/config.toml`
 - **Models:** `~/.cache/huggingface/hub/`
-- **Adapters:** `~/.shammah/adapters/`
-- **Feedback:** `~/.shammah/feedback.jsonl`
-- **History:** `~/.shammah/history.txt`
-- **Tool Patterns:** `~/.shammah/tool_patterns.json`
-- **Daemon PID:** `~/.shammah/daemon.pid`
+- **Adapters:** `~/.finch/adapters/`
+- **Feedback:** `~/.finch/feedback.jsonl`
+- **History:** `~/.finch/history.txt`
+- **Tool Patterns:** `~/.finch/tool_patterns.json`
+- **Daemon PID:** `~/.finch/daemon.pid`
 
 ---
 
@@ -406,7 +406,7 @@ ls ~/.cache/huggingface/hub/
 
 # Re-download model
 rm -rf ~/.cache/huggingface/hub/models--*Qwen*
-shammah  # Will re-download on startup
+finch  # Will re-download on startup
 ```
 
 **Problem:** Not enough disk space
@@ -428,22 +428,22 @@ Free up space or use teacher-only mode (no local model).
 lsof -i :8000
 
 # Force stop any existing daemon
-shammah daemon-stop
-rm ~/.shammah/daemon.pid
+finch daemon-stop
+rm ~/.finch/daemon.pid
 
 # Start fresh
-shammah
+finch
 ```
 
 **Problem:** Connection refused errors
 
 ```bash
 # Check daemon status
-shammah daemon-status
+finch daemon-status
 
 # Restart daemon
-shammah daemon-stop
-shammah daemon-start
+finch daemon-stop
+finch daemon-start
 ```
 
 ### Memory Issues
@@ -452,7 +452,7 @@ shammah daemon-start
 
 1. Use a smaller model size in config
 2. Close other memory-intensive applications
-3. Check memory usage: `shammah memory`
+3. Check memory usage: `finch memory`
 4. Consider teacher-only mode (no local model)
 
 ### Performance Issues
@@ -476,7 +476,7 @@ This is normal during:
 
 1. Check tool permissions in config
 2. Ensure you're approving tools when prompted
-3. Check `~/.shammah/tool_patterns.json` for conflicting patterns
+3. Check `~/.finch/tool_patterns.json` for conflicting patterns
 
 **Problem:** Confirmation dialogs not showing
 
@@ -492,19 +492,19 @@ echo $LINES $COLUMNS
 
 ```bash
 # Show help
-shammah --help
+finch --help
 
 # Show tool status
-shammah tools
+finch tools
 
 # Show memory usage
-shammah memory
+finch memory
 
 # View logs
-tail -f ~/.shammah/logs/shammah.log  # if enabled
+tail -f ~/.finch/logs/finch.log  # if enabled
 ```
 
-**GitHub Issues:** https://github.com/schancel/shammah/issues
+**GitHub Issues:** https://github.com/schancel/finch/issues
 
 ---
 
@@ -556,7 +556,7 @@ Learn the shortcuts:
 
 Periodically review your approved patterns:
 ```bash
-shammah tools
+finch tools
 ```
 
 Remove overly permissive patterns for security.

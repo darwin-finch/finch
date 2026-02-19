@@ -19,7 +19,7 @@ TrainingCoordinator Buffer (accumulate examples)
     ↓
 Threshold Reached (10 examples)
     ↓
-Write to JSONL Queue (~/.shammah/training_queue.jsonl)
+Write to JSONL Queue (~/.finch/training_queue.jsonl)
     ↓
 Spawn Python Training Subprocess (background, non-blocking)
     ↓
@@ -30,7 +30,7 @@ train_lora.py
     ├─ Train (3 epochs, SGD/AdamW)
     └─ Export Adapter (safetensors format)
     ↓
-Adapter Saved (~/.shammah/adapters/latest.safetensors)
+Adapter Saved (~/.finch/adapters/latest.safetensors)
     ↓
 (Future) Rust Runtime Loads Adapter
     ↓
@@ -55,8 +55,8 @@ Complete LoRA training pipeline using PyTorch + PEFT.
 **Usage:**
 ```bash
 python3 scripts/train_lora.py \
-    ~/.shammah/training_queue.jsonl \
-    ~/.shammah/adapters/latest.safetensors \
+    ~/.finch/training_queue.jsonl \
+    ~/.finch/adapters/latest.safetensors \
     --base-model Qwen/Qwen2.5-1.5B-Instruct \
     --rank 16 \
     --alpha 32.0 \
@@ -122,7 +122,7 @@ impl TrainingCoordinator {
 - Buffer size: Unlimited (all examples kept until written)
 - Threshold: 10 examples (triggers queue write)
 - Auto-train: true (automatic triggering)
-- Queue path: `~/.shammah/training_queue.jsonl`
+- Queue path: `~/.finch/training_queue.jsonl`
 
 ### 4. Training Subprocess Manager (`src/training/lora_subprocess.rs`)
 
@@ -137,7 +137,7 @@ Spawns Python training script as background process.
 
 **Usage:**
 ```rust
-use shammah::training::{LoRATrainingConfig, LoRATrainingSubprocess};
+use finch::training::{LoRATrainingConfig, LoRATrainingSubprocess};
 
 let config = LoRATrainingConfig {
     script_path: PathBuf::from("scripts/train_lora.py"),
@@ -152,8 +152,8 @@ let subprocess = LoRATrainingSubprocess::new(config);
 
 // Spawn training (non-blocking)
 subprocess.train_async(
-    Path::new("~/.shammah/training_queue.jsonl"),
-    Path::new("~/.shammah/adapters/latest.safetensors"),
+    Path::new("~/.finch/training_queue.jsonl"),
+    Path::new("~/.finch/adapters/latest.safetensors"),
 ).await?;
 ```
 
@@ -226,11 +226,11 @@ ls -lh /tmp/test_adapter.safetensors
    - `/good [note]` - Good example (weight 1.0)
 4. **Examples accumulate** in TrainingCoordinator buffer
 5. **At threshold (10 examples):**
-   - Queue written to `~/.shammah/training_queue.jsonl`
+   - Queue written to `~/.finch/training_queue.jsonl`
    - Training subprocess spawned (background)
    - User notified: "🎓 Training scheduled (10 examples)"
 6. **Training runs** (~2-5 minutes for 10 examples)
-7. **Adapter saved** to `~/.shammah/adapters/latest.safetensors`
+7. **Adapter saved** to `~/.finch/adapters/latest.safetensors`
 8. **(Future) Adapter loaded** - model improves for future queries
 
 ### Example Session
@@ -253,10 +253,10 @@ let value = result.unwrap();
 ✅ Feedback recorded (normal, weight: 1.0)
 📊 Training buffer: 10/10 examples
 🎓 Training scheduled! Background subprocess started.
-   Logs: ~/.shammah/adapters/latest.training.log
+   Logs: ~/.finch/adapters/latest.training.log
 
 [2 minutes later]
-✅ LoRA training complete! Adapter saved: ~/.shammah/adapters/latest.safetensors
+✅ LoRA training complete! Adapter saved: ~/.finch/adapters/latest.safetensors
    The model will improve for future queries.
 ```
 
@@ -289,10 +289,10 @@ cargo test --test lora_training_test
 
 ```bash
 # Check queue file created
-ls -lh ~/.shammah/training_queue.jsonl
+ls -lh ~/.finch/training_queue.jsonl
 
 # View contents
-cat ~/.shammah/training_queue.jsonl
+cat ~/.finch/training_queue.jsonl
 
 # Should see JSON lines with query, response, weight, feedback
 ```
@@ -300,7 +300,7 @@ cat ~/.shammah/training_queue.jsonl
 ## File Structure
 
 ```
-shammah/
+finch/
 ├── scripts/
 │   ├── train_lora.py (NEW)         # Python training script
 │   └── requirements.txt (NEW)       # Python dependencies
@@ -313,7 +313,7 @@ shammah/
 └── tests/
     └── lora_training_test.rs (NEW)  # Integration tests
 
-~/.shammah/
+~/.finch/
 ├── training_queue.jsonl            # Active training queue
 ├── training_queue_archive_*.jsonl  # Archived queues
 └── adapters/
@@ -446,8 +446,8 @@ pip install peft safetensors
 # Error: Training script not found: scripts/train_lora.py
 
 # Solution: Run from repository root
-cd /path/to/shammah
-./target/release/shammah
+cd /path/to/finch
+./target/release/finch
 ```
 
 ### CUDA Out of Memory
@@ -465,10 +465,10 @@ python3 scripts/train_lora.py ... --batch-size 1
 ### Queue File Permission Denied
 
 ```bash
-# Error: Permission denied: ~/.shammah/training_queue.jsonl
+# Error: Permission denied: ~/.finch/training_queue.jsonl
 
 # Solution: Fix permissions
-chmod 644 ~/.shammah/training_queue.jsonl
+chmod 644 ~/.finch/training_queue.jsonl
 ```
 
 ## Success Metrics

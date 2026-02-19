@@ -168,7 +168,7 @@ cat output.txt | grep "finish_reason" | tail -1
 
 **Test:** Check daemon processing logs
 ```bash
-tail -50 ~/.shammah/daemon.log | grep -E "(streaming|DAEMON_RESPONSE)"
+tail -50 ~/.finch/daemon.log | grep -E "(streaming|DAEMON_RESPONSE)"
 ```
 
 **Result:**
@@ -219,7 +219,7 @@ INFO [DAEMON_RESPONSE] Complete response (361 chars)
 ### Compilation
 ```
 Finished `release` profile [optimized] target(s) in 3m 07s
-warning: `shammah` (bin "shammah") generated 4 warnings
+warning: `finch` (bin "finch") generated 4 warnings
 ```
 - ✅ Zero errors
 - ✅ Only pre-existing deprecation warnings
@@ -387,8 +387,8 @@ let cleaned = QwenAdapter::clean_output_static(&content);
 ### Step 3: Rebuild and Deploy (15 minutes)
 ```bash
 cargo build --release
-pkill -f "shammah daemon"
-./target/release/shammah daemon --bind 127.0.0.1:11435
+pkill -f "finch daemon"
+./target/release/finch daemon --bind 127.0.0.1:11435
 ```
 
 **Total Rollback Time:** ~30 minutes

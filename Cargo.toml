@@ -1,11 +1,11 @@
 [package]
-name = "shammah"
-version = "0.2.2"
+name = "finch"
+version = "0.3.0"
 edition = "2021"
-authors = ["Shammah"]
-description = "Local-first Constitutional AI proxy"
+authors = ["Darwin Finch Contributors"]
+description = "AI that evolves with your code - distributed assistant with hierarchical memory"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/shammah/claude-proxy"
+repository = "https://github.com/darwin-finch/finch"
 
 [dependencies]
 # CLI
@@ -122,7 +122,7 @@ cuda = []  # CUDA support (requires CUDA toolkit)
 all-providers = ["onnx", "candle"]  # Both inference providers
 
 [[bin]]
-name = "shammah"
+name = "finch"
 path = "src/main.rs"
 
 [profile.release]

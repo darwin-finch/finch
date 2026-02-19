@@ -260,7 +260,7 @@ This plan can be executed by Shammah working on itself. Each task is designed to
 
 **Solution:**
 - Implement training pipeline:
-  1. Load metrics data from `~/.shammah/metrics/*.jsonl`
+  1. Load metrics data from `~/.finch/metrics/*.jsonl`
   2. Train router model (query → forward/local decision)
   3. Train generator model (query → response, via distillation)
   4. Train validator model (query + response → quality score)
@@ -272,7 +272,7 @@ This plan can be executed by Shammah working on itself. Each task is designed to
 2. Implement data loading from JSONL metrics
 3. Implement training loop with early stopping
 4. Implement evaluation metrics (accuracy, F1, BLEU)
-5. Add `shammah train` command to CLI
+5. Add `finch train` command to CLI
 
 **Files to create:**
 - `src/models/training.rs`
@@ -280,7 +280,7 @@ This plan can be executed by Shammah working on itself. Each task is designed to
 
 **Test:**
 - Collect 100+ queries
-- Run `shammah train`
+- Run `finch train`
 - Models improve over epochs
 - Validation accuracy increases
 
@@ -338,7 +338,7 @@ This plan can be executed by Shammah working on itself. Each task is designed to
 **Impact:** Customization - users define principles
 
 **Solution:**
-- Interactive editor for `~/.shammah/constitution.md`
+- Interactive editor for `~/.finch/constitution.md`
 - Built-in command: `/constitution edit`
 - Test constitutional adherence
 
@@ -358,7 +358,7 @@ This plan can be executed by Shammah working on itself. Each task is designed to
 
 **Solution:**
 - Predefined profiles: `safe`, `development`, `admin`
-- User chooses: `shammah --profile safe`
+- User chooses: `finch --profile safe`
 - Safe profile: only Read, Glob, Grep
 - Admin profile: all tools including Bash
 

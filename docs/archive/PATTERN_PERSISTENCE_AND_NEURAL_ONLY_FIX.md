@@ -61,7 +61,7 @@ Ok(())
 ```
 
 ### Verification
-- Pattern written to `~/.shammah/tool_patterns.json` immediately after approval
+- Pattern written to `~/.finch/tool_patterns.json` immediately after approval
 - User can close app anytime without losing patterns
 - No more re-prompts after restart
 
@@ -161,7 +161,7 @@ Err(anyhow::anyhow!(
 ### Test 1: Pattern Persistence
 ```bash
 # Start REPL
-./target/release/shammah
+./target/release/finch
 
 # Approve pattern (e.g., via training tool)
 > generate_training_data with [{"query": "test", "response": "result"}]
@@ -171,10 +171,10 @@ Err(anyhow::anyhow!(
 ^C
 
 # Verify pattern saved
-cat ~/.shammah/tool_patterns.json
+cat ~/.finch/tool_patterns.json
 
 # Restart REPL
-./target/release/shammah
+./target/release/finch
 
 # Try same tool again - should NOT reprompt ✓
 > generate_training_data with [{"query": "test2", "response": "result2"}]
@@ -183,7 +183,7 @@ cat ~/.shammah/tool_patterns.json
 ### Test 2: No Template Responses
 ```bash
 # Start REPL
-./target/release/shammah
+./target/release/finch
 
 # Query local model
 > query_local_model with {"query": "What is Rust?"}
@@ -235,7 +235,7 @@ cat ~/.shammah/tool_patterns.json
 ⚠️ Existing test suite errors unrelated to these changes
 
 ```bash
-cargo build --bin shammah
+cargo build --bin finch
 # Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
 ```
 

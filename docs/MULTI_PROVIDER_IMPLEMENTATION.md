@@ -45,7 +45,7 @@ Successfully implemented multi-provider LLM support for Shammah, allowing users 
 - **Modified**: `src/config/loader.rs` - Parse provider config from TOML
 - **Created**: `src/providers/factory.rs` - Provider factory
 - **Key Features**:
-  - Multi-provider configuration in `~/.shammah/config.toml`
+  - Multi-provider configuration in `~/.finch/config.toml`
   - Backwards compatibility with old config format
   - Provider-specific settings (API key, model, base URL)
   - Factory pattern for creating providers

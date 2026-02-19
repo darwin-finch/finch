@@ -200,7 +200,7 @@ Since Grok uses `OpenAIProvider::new_grok()`, it inherits all the bugs from Open
 ### Real-World Example:
 ```bash
 # This FAILS with OpenAI/Grok:
-shammah
+finch
 > Read the file at src/main.rs    # Turn 1: Works (OpenAI calls Read)
 > Now read src/lib.rs              # Turn 2: FAILS (tool result lost!)
 ```

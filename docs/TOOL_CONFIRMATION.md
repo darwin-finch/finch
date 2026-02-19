@@ -11,7 +11,7 @@ The tool confirmation feature adds interactive prompts before executing tools in
 When Claude requests to use a tool in interactive mode:
 
 1. **Generate Signature**: A unique signature is created from the tool name and context
-2. **Check Persistent Patterns**: Check if signature matches any saved patterns in `~/.shammah/tool_patterns.json`
+2. **Check Persistent Patterns**: Check if signature matches any saved patterns in `~/.finch/tool_patterns.json`
 3. **Check Session Cache**: If not in persistent store, check if approved this session
 4. **Prompt User**: If not cached, display a confirmation prompt with six options:
    - **Option 1**: Approve once (execute now, ask again next time)
@@ -20,7 +20,7 @@ When Claude requests to use a tool in interactive mode:
    - **Option 4**: Approve exact match persistently (save to disk, remember forever)
    - **Option 5**: Approve pattern persistently (save to disk, match similar commands)
    - **Option 6**: Deny (skip tool execution and send error to Claude)
-5. **Save if Persistent**: If option 4 or 5 selected, save to `~/.shammah/tool_patterns.json`
+5. **Save if Persistent**: If option 4 or 5 selected, save to `~/.finch/tool_patterns.json`
 6. **Execute or Deny**: Proceed based on user choice
 
 ### Pattern-Based Confirmation
@@ -29,7 +29,7 @@ In addition to exact signature matching, Shammah supports **pattern-based approv
 
 **Session vs Persistent Patterns:**
 - **Session patterns** (options 2-3): Stored in memory, cleared on exit
-- **Persistent patterns** (options 4-5): Saved to `~/.shammah/tool_patterns.json`, survive restarts
+- **Persistent patterns** (options 4-5): Saved to `~/.finch/tool_patterns.json`, survive restarts
 
 **Pattern Priority (most specific to least specific):**
 1. **Exact match in persistent store** - highest priority
@@ -258,7 +258,7 @@ Each tool execution generates a context-specific signature that identifies the o
 
   Do you want to proceed?
   ❯ 1. Yes
-    2. Yes, and don't ask again for cargo fmt in /Users/shammah/repos/claude-proxy
+    2. Yes, and don't ask again for cargo fmt in /Users/finch/repos/claude-proxy
     3. No
 
   Choice [1-3]: _
@@ -270,11 +270,11 @@ Each tool execution generates a context-specific signature that identifies the o
   Tool Execution Request:
   ─────────────────────────
   Tool: read
-  File: /Users/shammah/repos/claude-proxy/src/main.rs
+  File: /Users/finch/repos/claude-proxy/src/main.rs
 
   Do you want to proceed?
   ❯ 1. Yes
-    2. Yes, and don't ask again for reading /Users/shammah/repos/claude-proxy/src/main.rs
+    2. Yes, and don't ask again for reading /Users/finch/repos/claude-proxy/src/main.rs
     3. No
 
   Choice [1-3]: _
@@ -401,7 +401,7 @@ When you select option 3:
 
 When you select option 4:
 - Tool executes immediately
-- **Exact signature** is saved to `~/.shammah/tool_patterns.json`
+- **Exact signature** is saved to `~/.finch/tool_patterns.json`
 - Future **identical** operations execute without prompting
 - Approval persists across restarts
 - Can be removed with `/patterns rm <id>`
@@ -418,7 +418,7 @@ When you select option 4:
 When you select option 5:
 - Tool executes immediately
 - You're prompted to choose a **pattern** that matches similar operations
-- Pattern is saved to `~/.shammah/tool_patterns.json`
+- Pattern is saved to `~/.finch/tool_patterns.json`
 - Future operations matching pattern execute without prompting
 - Approval persists across restarts
 - Can be removed with `/patterns rm <id>`
@@ -469,7 +469,7 @@ When you select option 6:
 - Option 5: Pattern rules (tool name + pattern string)
 
 **Storage:**
-- Saved to `~/.shammah/tool_patterns.json`
+- Saved to `~/.finch/tool_patterns.json`
 - Loaded on startup
 - Persists across restarts
 - Survives system reboots
@@ -699,7 +699,7 @@ pattern.matches(&sig_run)   // false for "cargo run"
 
 ### File Format
 
-**Location:** `~/.shammah/tool_patterns.json`
+**Location:** `~/.finch/tool_patterns.json`
 
 **Schema (v2):**
 ```json
@@ -897,7 +897,7 @@ cargo test --lib approval
 
 ### Completed Features ✅
 
-- ✅ **Persistent Cache**: Implemented as `~/.shammah/tool_patterns.json`
+- ✅ **Persistent Cache**: Implemented as `~/.finch/tool_patterns.json`
 - ✅ **Pattern-Based Rules**: Wildcard and regex patterns for categories of commands
 - ✅ **Regex Patterns**: Full Rust regex syntax support
 - ✅ **Review Mode**: `/patterns` command family to view/manage patterns
@@ -964,7 +964,7 @@ These improvements are not currently implemented but could be added:
 - Tool signature matches persistent pattern or exact approval
 
 **Solution**:
-- Check if stdout is a terminal: `shammah` (not `echo "query" | shammah`)
+- Check if stdout is a terminal: `finch` (not `echo "query" | finch`)
 - View active patterns: `/patterns list`
 - Clear session cache: restart Shammah
 - Clear persistent patterns: `/patterns clear`
@@ -1007,18 +1007,18 @@ These improvements are not currently implemented but could be added:
 
 **Symptom**: Error loading patterns on startup
 
-**Cause**: `~/.shammah/tool_patterns.json` is corrupted or has invalid JSON
+**Cause**: `~/.finch/tool_patterns.json` is corrupted or has invalid JSON
 
 **Solution**:
 ```bash
 # Backup existing file
-mv ~/.shammah/tool_patterns.json ~/.shammah/tool_patterns.json.bak
+mv ~/.finch/tool_patterns.json ~/.finch/tool_patterns.json.bak
 
 # Restart Shammah (creates fresh empty file)
-shammah
+finch
 
 # If backup had important patterns, manually inspect and fix JSON
-cat ~/.shammah/tool_patterns.json.bak | jq .
+cat ~/.finch/tool_patterns.json.bak | jq .
 ```
 
 ### Unwanted Pattern Matches
@@ -1059,7 +1059,7 @@ A: Yes, use `/patterns` or `/patterns list` to view all saved patterns and exact
 A: No. Daemon mode is non-interactive, so all tools execute automatically without prompts.
 
 **Q: Can I share patterns between machines?**
-A: Not directly, but you can copy `~/.shammah/tool_patterns.json` between machines. Future enhancement may add import/export.
+A: Not directly, but you can copy `~/.finch/tool_patterns.json` between machines. Future enhancement may add import/export.
 
 **Q: What's the difference between wildcard and regex patterns?**
 A: Wildcards are simpler (`*` for any text), regex is more powerful (alternation, character classes, lookahead). See [Pattern Types](#pattern-types) section.
@@ -1127,4 +1127,4 @@ Key takeaways:
 - ✓ Clear, context-specific signatures
 - ✓ Match statistics and timestamps
 - ✓ Non-interactive mode unaffected
-- ✓ Persistent storage in `~/.shammah/tool_patterns.json`
+- ✓ Persistent storage in `~/.finch/tool_patterns.json`

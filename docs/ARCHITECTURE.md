@@ -25,7 +25,7 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained loc
 ## Architecture Overview
 
 ```
-User runs shammah
+User runs finch
     ↓
 Daemon auto-spawns (if not running)
     ↓
@@ -85,7 +85,7 @@ REPL appears instantly (<100ms)
 ### 1. Daemon Architecture
 
 **Auto-Spawning Daemon:**
-- REPL client checks for running daemon (PID file at `~/.shammah/daemon.pid`)
+- REPL client checks for running daemon (PID file at `~/.finch/daemon.pid`)
 - If not running, spawns daemon process automatically
 - Health checks ensure daemon is responsive
 - Graceful restart on crashes
@@ -282,7 +282,7 @@ User Feedback (10x/3x/1x weight)
     ↓
 TrainingCoordinator collects examples
     ↓
-Write to JSONL queue (~/.shammah/training_queue.jsonl)
+Write to JSONL queue (~/.finch/training_queue.jsonl)
     ↓
 Spawn Python training script (background)
     ↓
@@ -433,11 +433,11 @@ Daemon: "Issue created: #123"
 
 **Configuration Example:**
 ```toml
-# ~/.shammah/config.toml
+# ~/.finch/config.toml
 
 [mcp_servers.filesystem]
 command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/shammah"]
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/finch"]
 transport = "stdio"
 enabled = true
 
@@ -521,7 +521,7 @@ Continue conversation with reduced token count
 ### REPL Session Flow
 
 ```
-1. User starts `shammah`
+1. User starts `finch`
 2. Check for running daemon (PID file)
 3. If not running, spawn daemon process
 4. Wait for daemon health check (up to 5s)
@@ -547,7 +547,7 @@ Continue conversation with reduced token count
    - Initialize KV cache
    - Load LoRA adapter (if exists)
 3. Start HTTP server (port 11435)
-4. Write PID file (~/.shammah/daemon.pid)
+4. Write PID file (~/.finch/daemon.pid)
 5. Accept client connections
 6. Handle queries concurrently
 7. On SIGTERM/SIGINT, gracefully shutdown
@@ -594,7 +594,7 @@ Every request logs:
 }
 ```
 
-Stored in: `~/.shammah/metrics/YYYY-MM-DD.jsonl`
+Stored in: `~/.finch/metrics/YYYY-MM-DD.jsonl`
 
 ### Training Data Format
 
@@ -610,12 +610,12 @@ Stored in: `~/.shammah/metrics/YYYY-MM-DD.jsonl`
 }
 ```
 
-Stored in: `~/.shammah/training_queue.jsonl`
+Stored in: `~/.finch/training_queue.jsonl`
 
 ## File Structure
 
 ```
-~/.shammah/
+~/.finch/
 ├── config.toml              # User configuration
 ├── daemon.pid               # Daemon process ID
 ├── daemon.sock              # IPC socket (unused, HTTP preferred)
@@ -703,7 +703,7 @@ Stored in: `~/.shammah/training_queue.jsonl`
 - All metrics hashed (SHA256) for privacy
 - Models train only on YOUR data
 - No telemetry, no cloud sync
-- Can delete `~/.shammah/` anytime
+- Can delete `~/.finch/` anytime
 
 ### Tool Safety
 - Permission system with approval dialogs

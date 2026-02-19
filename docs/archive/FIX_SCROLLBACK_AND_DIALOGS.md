@@ -143,7 +143,7 @@ A: Summary
 
 ## Verification
 
-✅ **Code compiles**: `cargo build --bin shammah` succeeds (warnings only)
+✅ **Code compiles**: `cargo build --bin finch` succeeds (warnings only)
 ✅ **Scrollback spacing**: Reduced from N+1 blank lines to N-1 blank lines
 ✅ **Tool registered**: AskUserQuestion available in tool definitions
 ✅ **Auto-approved**: Works in plan mode without confirmation
@@ -152,13 +152,13 @@ A: Summary
 
 ### Test Scrollback Fix
 
-1. **Start shammah**: `./target/debug/shammah`
+1. **Start finch**: `./target/debug/finch`
 2. **Generate multiple messages**: Ask several questions
 3. **Verify spacing**: Should see 1 blank line between messages, not excessive spacing
 
 ### Test AskUserQuestion Tool
 
-1. **Start shammah**: `./target/debug/shammah`
+1. **Start finch**: `./target/debug/finch`
 2. **Ask Claude to use a dialog**: "Please ask me a question via a dialog box about which approach to use"
 3. **Verify Claude uses tool**: Should see actual dialog UI, not text formatting
 4. **Test interactions**:

@@ -163,7 +163,7 @@ impl GeneratorModel {
     ///
     /// # Example (Future Usage)
     /// ```rust,ignore
-    /// use shammah::models::{GeneratorModel, LoRAConfig};
+    /// use finch::models::{GeneratorModel, LoRAConfig};
     ///
     /// let mut generator = GeneratorModel::new(config)?;
     ///

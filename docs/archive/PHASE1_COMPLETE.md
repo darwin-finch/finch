@@ -90,7 +90,7 @@ High confidence?
 6. **Metrics Logger** (`src/metrics/`)
    - ✅ JSONL daily logs
    - ✅ Privacy-preserving (SHA256 query hashing)
-   - ✅ Storage in `~/.local/share/shammah/metrics/`
+   - ✅ Storage in `~/.local/share/finch/metrics/`
    - ✅ Summary statistics
 
 7. **Interactive CLI** (`src/cli/`)
@@ -158,7 +158,7 @@ cargo fmt --check
 ## File Structure
 
 ```
-shammah/
+finch/
 ├── src/
 │   ├── main.rs              ✅ Entry point & initialization
 │   ├── lib.rs               ✅ Public exports
@@ -391,7 +391,7 @@ Try these queries:
 After running queries:
 
 ```bash
-cat ~/.local/share/shammah/metrics/$(date +%Y-%m-%d).jsonl
+cat ~/.local/share/finch/metrics/$(date +%Y-%m-%d).jsonl
 ```
 
 Expected: JSON lines with routing decisions

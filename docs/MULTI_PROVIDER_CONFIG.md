@@ -4,7 +4,7 @@ Shammah now supports multiple LLM providers for the fallback API (used when the 
 
 ## Configuration File Location
 
-Configuration is stored in `~/.shammah/config.toml`
+Configuration is stored in `~/.finch/config.toml`
 
 ## Configuration Format
 
@@ -175,7 +175,7 @@ Check that the `provider` field matches one of: `"claude"`, `"openai"`, `"grok"`
 Run a simple query to test your provider configuration:
 
 ```bash
-shammah query "What is 2+2?"
+finch query "What is 2+2?"
 ```
 
 Check the logs to see which provider was used.

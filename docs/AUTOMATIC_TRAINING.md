@@ -54,7 +54,7 @@ try_generate_with_tools() called
     ↓
 check_and_reload_adapter()
     ↓
-Find latest adapter in ~/.shammah/adapters/
+Find latest adapter in ~/.finch/adapters/
     ↓
 ⚠️  Log found adapter (reload not implemented yet)
     ↓
@@ -88,7 +88,7 @@ fn check_and_reload_adapter(&mut self) -> Result<()> {
 
 ```bash
 # 1. Start daemon
-shammah daemon --bind 127.0.0.1:8080
+finch daemon --bind 127.0.0.1:8080
 
 # 2. Use it (queries auto-collected)
 curl http://127.0.0.1:8080/v1/chat/completions -d '{
@@ -97,7 +97,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -d '{
 
 # 3. After 100 queries → training starts automatically!
 # Background: Python subprocess trains LoRA adapter
-# Saved to: ~/.shammah/adapters/adapter_<timestamp>.safetensors
+# Saved to: ~/.finch/adapters/adapter_<timestamp>.safetensors
 
 # 4. ⚠️  Adapter saved but not used yet
 # Need to manually restart daemon or implement hot-swap
@@ -120,7 +120,7 @@ POST /v1/feedback
 ## Configuration
 
 ```toml
-# ~/.shammah/config.toml
+# ~/.finch/config.toml
 [lora]
 enabled = true
 auto_train_threshold = 100  # Train every N examples
@@ -177,7 +177,7 @@ fn check_and_reload_adapter(&mut self) -> Result<()> {
 // Separate task watches filesystem
 tokio::spawn(async move {
     let mut watcher = notify::watcher()?;
-    watcher.watch("~/.shammah/adapters", Recursive)?;
+    watcher.watch("~/.finch/adapters", Recursive)?;
 
     for event in watcher {
         if event.kind == EventKind::Create {
@@ -210,7 +210,7 @@ tokio::spawn(async move {
 
 ```bash
 # Start daemon
-./target/release/shammah daemon --bind 127.0.0.1:8080
+./target/release/finch daemon --bind 127.0.0.1:8080
 
 # Send 100 queries (will trigger training)
 for i in {1..100}; do
@@ -220,14 +220,14 @@ for i in {1..100}; do
 done
 
 # Check training queue
-cat ~/.shammah/training_queue.jsonl | wc -l  # Should be 100
+cat ~/.finch/training_queue.jsonl | wc -l  # Should be 100
 
 # Check if adapter created
-ls -lt ~/.shammah/adapters/
+ls -lt ~/.finch/adapters/
 
 # Restart daemon to use new adapter (once loading is implemented)
-pkill shammah
-./target/release/shammah daemon --bind 127.0.0.1:8080
+pkill finch
+./target/release/finch daemon --bind 127.0.0.1:8080
 ```
 
 ## Files Modified
@@ -240,20 +240,20 @@ pkill shammah
 When auto-collection happens:
 
 ```
-DEBUG shammah::server::openai_handlers: Auto-collected query/response for training
+DEBUG finch::server::openai_handlers: Auto-collected query/response for training
 ```
 
 When adapter found:
 
 ```
-DEBUG shammah::local: Found adapter: /Users/user/.shammah/adapters/adapter_2026-02-11.safetensors (reload not yet implemented)
+DEBUG finch::local: Found adapter: /Users/user/.finch/adapters/adapter_2026-02-11.safetensors (reload not yet implemented)
 ```
 
 When training triggers:
 
 ```
-INFO shammah::server::training_worker: Batch threshold reached, triggering training count=100
-INFO shammah::server::training_worker: Starting LoRA training subprocess
+INFO finch::server::training_worker: Batch threshold reached, triggering training count=100
+INFO finch::server::training_worker: Starting LoRA training subprocess
 ```
 
 ---

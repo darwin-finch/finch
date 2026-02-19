@@ -22,7 +22,7 @@ impl RestartTool {
 impl Default for RestartTool {
     fn default() -> Self {
         let home = dirs::home_dir().expect("Could not determine home directory");
-        let session_state_file = home.join(".shammah/restart_state.json");
+        let session_state_file = home.join(".finch/restart_state.json");
         Self::new(session_state_file)
     }
 }
@@ -49,7 +49,7 @@ impl Tool for RestartTool {
             ),
             (
                 "binary_path",
-                "Path to new binary (default: ./target/release/shammah)",
+                "Path to new binary (default: ./target/release/finch)",
             ),
         ])
     }
@@ -61,7 +61,7 @@ impl Tool for RestartTool {
 
         let binary_path = input["binary_path"]
             .as_str()
-            .unwrap_or("./target/release/shammah");
+            .unwrap_or("./target/release/finch");
 
         // Verify new binary exists
         if !std::path::Path::new(binary_path).exists() {
@@ -151,7 +151,7 @@ mod tests {
             plan_content: None,
         };
         let input = serde_json::json!({
-            "binary_path": "./target/release/shammah"
+            "binary_path": "./target/release/finch"
         });
 
         let result = tool.execute(input, &context).await;

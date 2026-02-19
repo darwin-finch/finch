@@ -458,7 +458,7 @@ impl EventLoop {
         } else {
             // No daemon mode - show error
             self.output_manager.write_error("Error: /local requires daemon mode.");
-            self.output_manager.write_info("    Start the daemon: shammah daemon --bind 127.0.0.1:11435");
+            self.output_manager.write_info("    Start the daemon: finch daemon --bind 127.0.0.1:11435");
             self.render_tui().await?;
         }
 
@@ -484,7 +484,7 @@ impl EventLoop {
         } else {
             self.output_manager.write_info(
                 "MCP plugin system not configured.\n\
-                 Add MCP servers to ~/.shammah/config.toml to get started."
+                 Add MCP servers to ~/.finch/config.toml to get started."
             );
         }
 
@@ -539,7 +539,7 @@ impl EventLoop {
         } else {
             self.output_manager.write_info(
                 "MCP plugin system not configured.\n\
-                 Add MCP servers to ~/.shammah/config.toml to get started."
+                 Add MCP servers to ~/.finch/config.toml to get started."
             );
         }
 
@@ -1507,7 +1507,7 @@ impl EventLoop {
         // Create plans directory
         let plans_dir = dirs::home_dir()
             .context("Home directory not found")?
-            .join(".shammah")
+            .join(".finch")
             .join("plans");
         std::fs::create_dir_all(&plans_dir)?;
 

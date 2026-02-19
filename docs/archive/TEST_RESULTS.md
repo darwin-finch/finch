@@ -181,7 +181,7 @@ The cleaning logic looks for `<|im_start|>assistant` but the model isn't using C
 
 ```bash
 # Start daemon (if not running)
-./target/release/shammah daemon-start
+./target/release/finch daemon-start
 
 # Wait 1-2 minutes for model to load, then test:
 

@@ -74,7 +74,7 @@ SHAMMAH_LOG=1 cargo run -- daemon
 
 **Production mode:**
 ```bash
-SHAMMAH_LOG=1 SHAMMAH_LOG_JSON=1 SHAMMAH_LOG_FILE=/var/log/shammah/daemon.log cargo run -- daemon
+SHAMMAH_LOG=1 SHAMMAH_LOG_JSON=1 SHAMMAH_LOG_FILE=/var/log/finch/daemon.log cargo run -- daemon
 # Structured JSON logs to file
 ```
 

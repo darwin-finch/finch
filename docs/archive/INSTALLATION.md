@@ -11,11 +11,11 @@
 ### 1. Clone and Build
 
 ```bash
-cd /Users/shammah/repos/claude-proxy
+cd /Users/finch/repos/claude-proxy
 cargo build --release
 ```
 
-The binary will be at: `./target/release/shammah`
+The binary will be at: `./target/release/finch`
 
 ### 2. Configure API Key
 
@@ -64,7 +64,7 @@ Expected: Shows routing decisions for test queries.
 ```bash
 cargo run
 # or
-./target/release/shammah
+./target/release/finch
 ```
 
 Example session:
@@ -132,7 +132,7 @@ Goodbye!
    - Logs all decisions for metrics
 
 5. **Metrics Logging**
-   - Stores in `~/.local/share/shammah/metrics/YYYY-MM-DD.jsonl`
+   - Stores in `~/.local/share/finch/metrics/YYYY-MM-DD.jsonl`
    - Privacy-preserving (query hashing)
    - Daily rotation, keeps 30 days
    - Tracks local vs forward rates
@@ -208,7 +208,7 @@ ls data/patterns.json data/crisis_keywords.json
 
 ## Metrics Storage
 
-Metrics are stored in: `~/.local/share/shammah/metrics/`
+Metrics are stored in: `~/.local/share/finch/metrics/`
 
 Format: One JSONL file per day (e.g., `2026-01-30.jsonl`)
 

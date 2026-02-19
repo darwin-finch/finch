@@ -40,7 +40,7 @@
   - Step 2: HuggingFace token (optional)
   - Step 3: Device selection with descriptions
   - Step 4: Confirmation summary
-- ✅ Saves to `~/.shammah/config.toml`
+- ✅ Saves to `~/.finch/config.toml`
 - ✅ Persists across runs
 
 ### 4. Config Management
@@ -110,14 +110,14 @@ src/
 
 ### Config File Format
 ```toml
-# ~/.shammah/config.toml
+# ~/.finch/config.toml
 api_key = "sk-ant-..."
 streaming_enabled = true
 
 [backend]
 device = "CoreML"  # or "Metal", "Cuda", "Cpu"
 model_repo = "anemll/Qwen2.5-3B-Instruct"
-model_path = "~/.cache/shammah/models/coreml/qwen-3b.mlpackage"
+model_path = "~/.cache/finch/models/coreml/qwen-3b.mlpackage"
 fallback_chain = ["CoreML", "Metal", "Cpu"]
 ```
 

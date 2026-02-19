@@ -87,7 +87,7 @@ All methods return `anyhow::bail!("Not yet implemented")` with helpful messages 
 
 **Example Usage (Future):**
 ```rust
-use shammah::models::{GeneratorModel, LoRAConfig};
+use finch::models::{GeneratorModel, LoRAConfig};
 
 // Load pre-trained Qwen model
 let mut generator = GeneratorModel::new(qwen_config)?;
@@ -112,10 +112,10 @@ let lora_config = LoRAConfig {
 generator.fine_tune(&examples, lora_config, epochs: 3, 1e-4)?;
 
 // Save adapter
-generator.save_lora("~/.shammah/adapters/physics.safetensors")?;
+generator.save_lora("~/.finch/adapters/physics.safetensors")?;
 
 // Later: switch adapters
-generator.load_lora("~/.shammah/adapters/legal.safetensors")?;
+generator.load_lora("~/.finch/adapters/legal.safetensors")?;
 ```
 
 ## Use Cases

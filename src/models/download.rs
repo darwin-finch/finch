@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_cache_dir_creation() {
-        let temp_dir = std::env::temp_dir().join("shammah_test_cache");
+        let temp_dir = std::env::temp_dir().join("finch_test_cache");
         let downloader = ModelDownloader::with_cache_dir(temp_dir.clone());
         assert!(downloader.is_ok());
         assert!(temp_dir.exists());

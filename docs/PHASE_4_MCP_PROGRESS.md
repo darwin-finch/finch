@@ -107,7 +107,7 @@ Prefixed: "mcp_filesystem_read_file"
 ```toml
 [mcp_servers.filesystem]
 command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/shammah"]
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/finch"]
 transport = "stdio"
 enabled = true
 env = { }
@@ -280,7 +280,7 @@ match input.trim() {
 npm install -g @modelcontextprotocol/server-filesystem
 ```
 
-2. Configure in `~/.shammah/config.toml`:
+2. Configure in `~/.finch/config.toml`:
 ```toml
 [mcp_servers.filesystem]
 command = "npx"

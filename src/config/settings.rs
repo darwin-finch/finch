@@ -173,7 +173,7 @@ impl Config {
         if self.teachers.is_empty() {
             anyhow::bail!(errors::wrap_error_with_suggestion(
                 "No teacher providers configured",
-                "Run setup wizard to configure a provider:\n  shammah setup"
+                "Run setup wizard to configure a provider:\n  finch setup"
             ));
         }
 
@@ -187,7 +187,7 @@ impl Config {
                     &format!(
                         "Valid providers: {}\n\n\
                          Update your config:\n  \
-                         Edit ~/.shammah/config.toml",
+                         Edit ~/.finch/config.toml",
                         valid_providers.join(", ")
                     )
                 ));
@@ -301,8 +301,8 @@ impl Config {
         let home = dirs::home_dir().expect("Could not determine home directory");
         let project_dir = std::env::current_dir().expect("Could not determine current directory");
 
-        // Look for constitution in ~/.shammah/constitution.md
-        let constitution_path = home.join(".shammah/constitution.md");
+        // Look for constitution in ~/.finch/constitution.md
+        let constitution_path = home.join(".finch/constitution.md");
         let constitution_path = if constitution_path.exists() {
             Some(constitution_path)
         } else {
@@ -312,7 +312,7 @@ impl Config {
         let features = FeaturesConfig::default();
 
         Self {
-            metrics_dir: home.join(".shammah/metrics"),
+            metrics_dir: home.join(".finch/metrics"),
             streaming_enabled: features.streaming_enabled, // Deprecated, maintained for compat
             tui_enabled: true,       // TUI is the default for interactive terminals
             constitution_path,
@@ -332,12 +332,12 @@ impl Config {
         self.teachers.first()
     }
 
-    /// Save configuration to TOML file at ~/.shammah/config.toml
+    /// Save configuration to TOML file at ~/.finch/config.toml
     pub fn save(&self) -> anyhow::Result<()> {
         use std::fs;
 
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-        let config_dir = home.join(".shammah");
+        let config_dir = home.join(".finch");
         let config_path = config_dir.join("config.toml");
 
         // Create directory if it doesn't exist

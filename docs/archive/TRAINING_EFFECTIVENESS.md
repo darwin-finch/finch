@@ -84,9 +84,9 @@ Quality Signals:
 
 ### Storage Location
 
-Models are saved to `~/.shammah/models/`:
+Models are saved to `~/.finch/models/`:
 ```
-~/.shammah/
+~/.finch/
 ├── models/
 │   ├── threshold_router.json      # Router statistics
 │   └── threshold_validator.json   # Validator statistics
@@ -98,9 +98,9 @@ Models are saved to `~/.shammah/models/`:
 
 When you start Shammah, it automatically loads existing models:
 ```
-$ shammah
+$ finch
 Shammah v0.1.0 - Constitutional AI Proxy
-Using API key from: ~/.shammah/config.toml ✓
+Using API key from: ~/.finch/config.toml ✓
 Loaded 10 constitutional patterns ✓
 Loaded crisis detection keywords ✓
 ✓ Loaded router with 47 training queries
@@ -118,7 +118,7 @@ Models are saved:
 3. **Every 10 queries** (automatic checkpoints)
 
 ```
-$ shammah
+$ finch
 > What is Rust?
 > /quit
 Saving models... ✓
@@ -173,7 +173,7 @@ Models saved. Goodbye!
 ### Check Training Progress
 
 ```bash
-$ shammah
+$ finch
 > What is Rust?
 [Response...]
 
@@ -194,7 +194,7 @@ Training Statistics
 
 Session 1:
 ```bash
-$ shammah
+$ finch
 > Hello
 > What is Rust?
 > /quit
@@ -204,7 +204,7 @@ Models saved. Goodbye!
 
 Session 2:
 ```bash
-$ shammah
+$ finch
 ✓ Loaded router with 2 training queries
 ✓ Loaded validator with 2 validations
 > [Continue from where you left off]
@@ -257,22 +257,22 @@ This verifies:
 
 Check if files exist:
 ```bash
-ls -lh ~/.shammah/models/
+ls -lh ~/.finch/models/
 ```
 
 ### Models not saving
 
 Check directory permissions:
 ```bash
-mkdir -p ~/.shammah/models/
-chmod 755 ~/.shammah/models/
+mkdir -p ~/.finch/models/
+chmod 755 ~/.finch/models/
 ```
 
 ### Metrics missing comparison data
 
 Check a recent metrics file:
 ```bash
-cat ~/.shammah/metrics/$(date +%Y-%m-%d).jsonl | jq '.comparison'
+cat ~/.finch/metrics/$(date +%Y-%m-%d).jsonl | jq '.comparison'
 ```
 
 Should show:

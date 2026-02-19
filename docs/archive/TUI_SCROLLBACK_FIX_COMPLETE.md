@@ -191,8 +191,8 @@ New Message Created
 
 ### Build Status
 ```bash
-$ cargo build --bin shammah
-   Compiling shammah v0.1.0
+$ cargo build --bin finch
+   Compiling finch v0.1.0
    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.63s
 ```
 ✅ No compilation errors
@@ -201,7 +201,7 @@ $ cargo build --bin shammah
 
 1. **Test scrollback for new messages:**
    ```bash
-   ./target/debug/shammah
+   ./target/debug/finch
    > Send a query
    > Press Shift+PgUp to scroll up
    > Verify message appears immediately in scrollback
