@@ -84,6 +84,9 @@ pub struct Config {
 
     /// MCP (Model Context Protocol) server configurations
     pub mcp_servers: HashMap<String, crate::tools::mcp::McpServerConfig>,
+
+    /// Memory system configuration (Phase 4: Hierarchical Memory)
+    pub memory: crate::memory::MemoryConfig,
 }
 
 /// Server configuration for daemon mode
@@ -342,6 +345,7 @@ impl Config {
             teachers,
             features,
             mcp_servers: HashMap::new(), // No MCP servers by default
+            memory: crate::memory::MemoryConfig::default(), // Phase 4: Hierarchical Memory
         }
     }
 

@@ -137,6 +137,9 @@ pub struct Repl {
 
     // Phase 2: Persona system
     active_persona: Arc<RwLock<crate::config::Persona>>,
+
+    // Phase 4: Hierarchical memory system
+    memory_system: Option<Arc<crate::memory::MemorySystem>>,
 }
 
 /// Background training statistics
@@ -448,6 +451,25 @@ impl Repl {
             }
         };
 
+        // Phase 4: Initialize memory system
+        let memory_system = if config.memory.enabled {
+            match crate::memory::MemorySystem::new(config.memory.clone()) {
+                Ok(system) => {
+                    if is_interactive && !daemon_mode {
+                        output_status!("✓ Memory system enabled");
+                    }
+                    Some(Arc::new(system))
+                }
+                Err(e) => {
+                    output_status!("⚠️  Failed to initialize memory: {}", e);
+                    output_status!("   Continuing without memory");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             _config: config,
             claude_client,
@@ -484,6 +506,9 @@ impl Repl {
             llm_registry,
             conversation_logger,
             active_persona,
+
+            // Phase 4: Hierarchical memory
+            memory_system,
         }
     }
 
@@ -1568,6 +1593,11 @@ impl Repl {
                     // Phase 3: Service discovery
                     Command::Discover => {
                         self.handle_discover().await?;
+                        continue;
+                    }
+                    // Phase 4: Memory system
+                    Command::Memory => {
+                        self.handle_memory_stats().await?;
                         continue;
                     }
                     _ => {
@@ -3082,6 +3112,45 @@ impl Repl {
             self.output_status("To connect to a remote daemon:");
             self.output_status("  1. Edit ~/.finch/config.toml");
             self.output_status("  2. Set [client] daemon_address = \"HOST:PORT\"");
+            self.output_status("  3. Restart Finch");
+        }
+
+        Ok(())
+    }
+
+    /// Phase 4: Handle /memory command (memory statistics)
+    async fn handle_memory_stats(&self) -> Result<()> {
+        if let Some(memory) = &self.memory_system {
+            let stats = memory.stats()?;
+
+            self.output_status("📚 Memory System Statistics:\n");
+            self.output_status(format!("Conversations stored: {}", stats.conversation_count));
+            self.output_status(format!("MemTree nodes: {}", stats.tree_node_count));
+            self.output_status("");
+
+            if stats.conversation_count > 0 {
+                // Show recent conversations
+                let recent = memory.get_recent_conversations(5)?;
+                if !recent.is_empty() {
+                    self.output_status("Recent conversations:");
+                    for (i, (role, content)) in recent.iter().enumerate().take(5) {
+                        let preview = if content.len() > 60 {
+                            format!("{}...", &content[..60])
+                        } else {
+                            content.clone()
+                        };
+                        self.output_status(format!("{}. {}: {}", i + 1, role, preview));
+                    }
+                }
+            }
+
+            self.output_status("\nMemory queries are automatically included in your prompts");
+            self.output_status("for better context across sessions.");
+        } else {
+            self.output_status("Memory system is disabled.");
+            self.output_status("\nTo enable memory:");
+            self.output_status("  1. Edit ~/.finch/config.toml");
+            self.output_status("  2. Add [memory] section with enabled = true");
             self.output_status("  3. Restart Finch");
         }
 

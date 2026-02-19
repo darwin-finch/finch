@@ -39,6 +39,9 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }
 mdns-sd = "0.11"  # Cross-platform mDNS/DNS-SD for service advertisement
 hostname = "0.4"  # System hostname detection
 
+# Memory system (Phase 4: Hierarchical Memory)
+rusqlite = { version = "0.32", features = ["bundled"] }  # SQLite with bundled library
+
 # Session management
 dashmap = "5.5"
 
