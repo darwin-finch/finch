@@ -7,6 +7,10 @@ pub mod glob;
 pub mod grep;
 pub mod read;
 
+// File modification tools
+pub mod edit;
+pub mod write;
+
 // Network tools
 pub mod web_fetch;
 
@@ -42,6 +46,8 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use present_plan::PresentPlanTool;
 pub use read::ReadTool;
+pub use edit::EditTool;
+pub use write::WriteTool;
 pub use restart::RestartTool;
 pub use save_and_exec::SaveAndExecTool;
 pub use web_fetch::WebFetchTool;

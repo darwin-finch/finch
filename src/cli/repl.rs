@@ -28,8 +28,8 @@ use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
-    AskUserQuestionTool, BashTool, EnterPlanModeTool, GlobTool, GrepTool, PresentPlanTool,
-    ReadTool, RestartTool, SaveAndExecTool, WebFetchTool,
+    AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
+    PresentPlanTool, ReadTool, RestartTool, SaveAndExecTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
@@ -212,6 +212,8 @@ impl Repl {
         tool_registry.register(Box::new(GrepTool));
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
+        tool_registry.register(Box::new(EditTool));
+        tool_registry.register(Box::new(WriteTool));
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()

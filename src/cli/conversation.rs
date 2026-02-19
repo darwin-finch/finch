@@ -52,6 +52,26 @@ impl ConversationHistory {
         self.trim_if_needed();
     }
 
+    /// Add a user message with optional image attachments.
+    /// Each image is `(media_type, base64_data)`.
+    pub fn add_user_message_with_images(
+        &mut self,
+        text: String,
+        images: &[(String, String)],
+    ) {
+        let mut blocks: Vec<ContentBlock> = images
+            .iter()
+            .map(|(media_type, data)| ContentBlock::image(media_type.clone(), data.clone()))
+            .collect();
+        blocks.push(ContentBlock::Text { text });
+
+        self.messages.push(Message {
+            role: "user".to_string(),
+            content: blocks,
+        });
+        self.trim_if_needed();
+    }
+
     /// Add an assistant message to the conversation
     pub fn add_assistant_message(&mut self, content: String) {
         self.messages.push(Message {

@@ -3,6 +3,7 @@
 pub mod event_loop;
 pub mod events;
 pub mod query_state;
+pub mod tool_display;
 pub mod tool_execution;
 
 pub use event_loop::EventLoop;

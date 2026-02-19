@@ -9,7 +9,8 @@ use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
 use crate::cli::messages::{
-    Message, MessageRef, UserQueryMessage, StreamingResponseMessage, StaticMessage,
+    LiveToolMessage, Message, MessageRef, MessageStatus, UserQueryMessage,
+    StreamingResponseMessage, StaticMessage,
 };
 
 /// Maximum number of messages to keep in the circular buffer
@@ -157,6 +158,20 @@ impl OutputManager {
         let formatted = format!("[{}] {}", tool_name.into(), content.into());
         let msg = Arc::new(StaticMessage::plain(formatted));
         self.add_trait_message(msg);
+    }
+
+    /// Write pre-formatted tool output (Claude Code-style, with ANSI colors already embedded)
+    pub fn write_tool_raw(&self, content: impl Into<String>) {
+        let msg = Arc::new(StaticMessage::plain(content));
+        self.add_trait_message(msg);
+    }
+
+    /// Create and register a live tool message that supports streaming updates.
+    /// Returns the Arc so the caller can append content and mark complete.
+    pub fn start_live_tool(&self, header: impl Into<String>) -> Arc<LiveToolMessage> {
+        let msg = Arc::new(LiveToolMessage::new(header));
+        self.add_trait_message(Arc::clone(&msg) as MessageRef);
+        msg
     }
 
     /// Write status information (deprecated - use write_progress or write_info)

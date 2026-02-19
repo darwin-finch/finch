@@ -98,6 +98,9 @@ impl GeminiProvider {
                                 }),
                             },
                         },
+                        ContentBlock::Image { .. } => GeminiPart::Text {
+                            text: "[image content]".to_string(),
+                        },
                     })
                     .collect();
 

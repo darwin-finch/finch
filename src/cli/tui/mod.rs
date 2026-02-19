@@ -217,6 +217,12 @@ pub struct TuiRenderer {
     command_registry: crate::cli::command_autocomplete::CommandRegistry,
     /// Autocomplete dropdown state
     autocomplete_state: AutocompleteState,
+
+    /// Pasted images waiting to be sent with the next message.
+    /// Each entry: (display_index, base64_data, media_type e.g. "image/png")
+    pub pending_images: Vec<(usize, String, String)>,
+    /// Running counter for image numbering (Image #1, #2, ...)
+    image_counter: usize,
 }
 
 impl TuiRenderer {
@@ -462,6 +468,8 @@ impl TuiRenderer {
             ghost_text: None,
             command_registry: crate::cli::command_autocomplete::CommandRegistry::new(),
             autocomplete_state: AutocompleteState::new(),
+            pending_images: Vec::new(),
+            image_counter: 0,
         };
 
         // Initialize first-run suggestions

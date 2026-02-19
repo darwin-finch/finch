@@ -433,6 +433,120 @@ impl Message for ToolExecutionMessage {
 }
 
 // ============================================================================
+// LiveToolMessage - Streaming tool call display (Claude Code-style)
+// ============================================================================
+
+/// A live tool call message that shows:
+/// - "● Edit(src/foo.rs)" header immediately when tool starts
+/// - Diff/output lines streaming in as they arrive
+///
+/// The `content` field grows as lines are appended. The TUI re-renders
+/// automatically via the Arc<RwLock<>> update mechanism.
+pub struct LiveToolMessage {
+    id: MessageId,
+    /// Pre-formatted header including the ● bullet and tool label
+    header: String,
+    /// Accumulated output lines (diff, command output, etc.)
+    content: Arc<RwLock<String>>,
+    status: Arc<RwLock<MessageStatus>>,
+}
+
+impl LiveToolMessage {
+    pub fn new(header: impl Into<String>) -> Self {
+        Self {
+            id: MessageId::new(),
+            header: header.into(),
+            content: Arc::new(RwLock::new(String::new())),
+            status: Arc::new(RwLock::new(MessageStatus::InProgress)),
+        }
+    }
+
+    /// Append a line to the content (used for streaming diff lines)
+    pub fn append_line(&self, line: &str) {
+        if let Ok(mut c) = self.content.write() {
+            c.push_str(line);
+            c.push('\n');
+        }
+    }
+
+    /// Replace the full content (for immediate complete display)
+    pub fn set_content(&self, content: impl Into<String>) {
+        if let Ok(mut c) = self.content.write() {
+            *c = content.into();
+        }
+    }
+
+    /// Mark as complete (hides the running indicator)
+    pub fn set_complete(&self) {
+        if let Ok(mut s) = self.status.write() {
+            *s = MessageStatus::Complete;
+        }
+    }
+
+    /// Mark as failed
+    pub fn set_failed(&self) {
+        if let Ok(mut s) = self.status.write() {
+            *s = MessageStatus::Failed;
+        }
+    }
+
+    /// Get a clone of the Arc content for background streaming
+    pub fn content_arc(&self) -> Arc<RwLock<String>> {
+        Arc::clone(&self.content)
+    }
+
+    /// Get a clone of the Arc status for background streaming
+    pub fn status_arc(&self) -> Arc<RwLock<MessageStatus>> {
+        Arc::clone(&self.status)
+    }
+}
+
+const CYAN: &str = "\x1b[36m";
+const GRAY_DIM: &str = "\x1b[2;90m";
+
+impl Message for LiveToolMessage {
+    fn id(&self) -> MessageId {
+        self.id
+    }
+
+    fn format(&self, _colors: &crate::config::ColorScheme) -> String {
+        let content = self.content.read().map(|c| c.clone()).unwrap_or_default();
+        let status = self.status.read().map(|s| *s).unwrap_or(MessageStatus::InProgress);
+
+        match status {
+            MessageStatus::InProgress => {
+                if content.is_empty() {
+                    // Just started - show spinner
+                    format!("{}\n  {}⟳ Running…{}\n", self.header, GRAY_DIM, RESET)
+                } else {
+                    // Has some content already - show header + partial content
+                    format!("{}\n{}", self.header, content)
+                }
+            }
+            MessageStatus::Complete => {
+                // Full output
+                if content.is_empty() {
+                    format!("{}\n", self.header)
+                } else {
+                    format!("{}\n{}", self.header, content)
+                }
+            }
+            MessageStatus::Failed => {
+                format!("{}\n{}", self.header, content)
+            }
+        }
+    }
+
+    fn status(&self) -> MessageStatus {
+        self.status.read().map(|s| *s).unwrap_or(MessageStatus::InProgress)
+    }
+
+    fn content(&self) -> String {
+        format!("{}\n{}", self.header, self.content.read().map(|c| c.clone()).unwrap_or_default())
+    }
+}
+
+// ============================================================================
 // ProgressMessage - Message for download/upload progress
 // ============================================================================
 

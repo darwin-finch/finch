@@ -8,6 +8,36 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::TuiRenderer;
 
+/// Check the system clipboard for image data and return it as (base64, media_type) if found.
+/// Uses the `arboard` crate for cross-platform clipboard access.
+fn try_grab_clipboard_image() -> Option<(String, String)> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+
+    // Convert RGBA pixels to PNG bytes
+    let png_bytes = encode_rgba_to_png(img.width, img.height, img.bytes.as_ref())?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_bytes);
+    Some((b64, "image/png".to_string()))
+}
+
+/// Encode raw RGBA bytes to PNG format.
+fn encode_rgba_to_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Cursor;
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(
+            Cursor::new(&mut buf),
+            width as u32,
+            height as u32,
+        );
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(buf)
+}
+
 /// Sanitize pasted content to prevent TUI breakage
 /// Filters out:
 /// - Image escape sequences (kitty, iTerm2, sixel)
@@ -121,6 +151,35 @@ pub fn spawn_input_task(
                                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                                     // Ctrl+C: Cancel query
                                     tui.pending_cancellation = true;
+                                    Ok(None)
+                                }
+                                // Cmd+V on macOS / Ctrl+V: check clipboard for images
+                                (KeyCode::Char('v'), m)
+                                    if m.contains(KeyModifiers::SUPER)
+                                        || m.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    // Try to grab image from clipboard first
+                                    if let Some((b64, media_type)) = try_grab_clipboard_image() {
+                                        tui.image_counter += 1;
+                                        let idx = tui.image_counter;
+                                        tui.pending_images.push((idx, b64, media_type));
+
+                                        // Insert marker into textarea
+                                        let marker = format!("[Image #{}]", idx);
+                                        let current = tui.input_textarea.lines().join("\n");
+                                        let new_text = if current.trim().is_empty() {
+                                            marker
+                                        } else {
+                                            format!("{}\n{}", current, marker)
+                                        };
+                                        tui.input_textarea =
+                                            TuiRenderer::create_clean_textarea_with_text(&new_text);
+                                        first_event_modified_input = true;
+                                    } else {
+                                        // No image - pass V to textarea for text paste
+                                        tui.input_textarea.input(Event::Key(key));
+                                        first_event_modified_input = true;
+                                    }
                                     Ok(None)
                                 }
                                 (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {

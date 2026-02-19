@@ -84,6 +84,39 @@ enum TrainCommand {
     Setup,
 }
 
+/// Build a teacher list from well-known environment variables.
+/// Checked in priority order: Anthropic → OpenAI → Grok → Gemini → Mistral → Groq.
+fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
+    let mut teachers = Vec::new();
+
+    let candidates = [
+        ("ANTHROPIC_API_KEY", "claude"),
+        ("OPENAI_API_KEY",    "openai"),
+        ("GROK_API_KEY",      "grok"),
+        ("XAI_API_KEY",       "grok"),
+        ("GEMINI_API_KEY",    "gemini"),
+        ("MISTRAL_API_KEY",   "mistral"),
+        ("GROQ_API_KEY",      "groq"),
+    ];
+
+    for (env_var, provider) in &candidates {
+        if let Ok(key) = std::env::var(env_var) {
+            if !key.trim().is_empty() {
+                teachers.push(finch::config::TeacherEntry {
+                    provider: provider.to_string(),
+                    api_key: key.trim().to_string(),
+                    model: None,
+                    base_url: None,
+                    name: None,
+                });
+                break; // Use the first found provider as primary
+            }
+        }
+    }
+
+    teachers
+}
+
 /// Create a ClaudeClient with the configured provider
 ///
 /// This function creates a provider based on the teacher configuration
@@ -188,60 +221,76 @@ async fn main() -> Result<()> {
 
             // Run setup wizard
             use finch::cli::show_setup_wizard;
-            let result = show_setup_wizard()?;
+            match show_setup_wizard() {
+                Ok(result) => {
+                    // Create and save config from wizard results
+                    let backend_device = result.backend_device();
+                    let backend_enabled = result.backend_enabled;
+                    let inference_provider = result.inference_provider;
+                    let model_family = result.model_family;
+                    let model_size = result.model_size;
+                    let custom_model_repo = result.custom_model_repo;
+                    let active_theme = result.active_theme.clone();
+                    let default_persona = result.default_persona.clone();
+                    let daemon_only_mode = result.daemon_only_mode;
+                    let mdns_discovery = result.mdns_discovery;
 
-            // Create and save config
-            // Extract values before partial move
-            let backend_device = result.backend_device();
-            let backend_enabled = result.backend_enabled;
-            let inference_provider = result.inference_provider;
-            let model_family = result.model_family;
-            let model_size = result.model_size;
-            let custom_model_repo = result.custom_model_repo;
-            let active_theme = result.active_theme.clone();
-            let default_persona = result.default_persona.clone();
-            let daemon_only_mode = result.daemon_only_mode;
-            let mdns_discovery = result.mdns_discovery;
+                    let mut new_config = Config::new(result.teachers);
+                    new_config.backend = finch::config::BackendConfig {
+                        enabled: backend_enabled,
+                        inference_provider,
+                        execution_target: backend_device,
+                        model_family,
+                        model_size,
+                        model_repo: custom_model_repo,
+                        ..Default::default()
+                    };
+                    new_config.active_theme = active_theme;
+                    new_config.active_persona = default_persona;
+                    new_config.features = finch::config::FeaturesConfig {
+                        auto_approve_tools: result.auto_approve_tools,
+                        streaming_enabled: result.streaming_enabled,
+                        debug_logging: result.debug_logging,
+                        #[cfg(target_os = "macos")]
+                        gui_automation: result.gui_automation,
+                    };
+                    if daemon_only_mode {
+                        new_config.server.mode = "daemon-only".to_string();
+                    }
+                    if mdns_discovery {
+                        new_config.server.advertise = true;
+                        new_config.client.auto_discover = true;
+                    }
+                    new_config.streaming_enabled = new_config.features.streaming_enabled;
+                    new_config.save()?;
+                    eprintln!("\n\x1b[1;32m✓ Configuration saved!\x1b[0m\n");
+                    new_config
+                }
+                Err(wizard_err) if wizard_err.to_string().contains("Setup cancelled") => {
+                    // User pressed Escape/Ctrl+C — don't crash, fall back gracefully
+                    eprintln!("\n\x1b[33mSetup skipped. Detecting API keys from environment...\x1b[0m");
 
-            let mut new_config = Config::new(result.teachers);
-            new_config.backend = finch::config::BackendConfig {
-                enabled: backend_enabled,
-                inference_provider,
-                execution_target: backend_device,
-                model_family,
-                model_size,
-                model_repo: custom_model_repo,
-                ..Default::default()
-            };
+                    let teachers = build_teachers_from_env();
 
-            // Set theme and persona
-            new_config.active_theme = active_theme;
-            new_config.active_persona = default_persona;
+                    if teachers.is_empty() {
+                        eprintln!(
+                            "\x1b[33mNo API keys found. Set ANTHROPIC_API_KEY (or OPENAI_API_KEY / GROK_API_KEY)\x1b[0m"
+                        );
+                        eprintln!("\x1b[33mand re-run, or run `finch setup` to configure interactively.\x1b[0m\n");
+                    } else {
+                        let names: Vec<&str> = teachers.iter().map(|t| t.provider.as_str()).collect();
+                        eprintln!("\x1b[32m✓ Auto-configured: {}\x1b[0m\n", names.join(", "));
+                    }
 
-            // Save feature flags
-            new_config.features = finch::config::FeaturesConfig {
-                auto_approve_tools: result.auto_approve_tools,
-                streaming_enabled: result.streaming_enabled,
-                debug_logging: result.debug_logging,
-                #[cfg(target_os = "macos")]
-                gui_automation: result.gui_automation,
-            };
-
-            // Set server config for daemon-only mode and mDNS
-            if daemon_only_mode {
-                new_config.server.mode = "daemon-only".to_string();
+                    let cfg = Config::new(teachers);
+                    // Save so next launch doesn't show the wizard again
+                    if cfg.save().is_err() {
+                        // Non-fatal — we'll just show the wizard again next time
+                    }
+                    cfg
+                }
+                Err(e) => return Err(e),
             }
-            if mdns_discovery {
-                new_config.server.advertise = true;
-                new_config.client.auto_discover = true;
-            }
-
-            // Update deprecated streaming_enabled field for backward compat
-            new_config.streaming_enabled = new_config.features.streaming_enabled;
-            new_config.save()?;
-
-            eprintln!("\n\x1b[1;32m✓ Configuration saved!\x1b[0m\n");
-            new_config
         }
     };
 

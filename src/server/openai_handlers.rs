@@ -759,6 +759,9 @@ fn convert_response_to_openai(
                 // Tool results shouldn't appear in assistant responses
                 // They're in user messages
             }
+            ContentBlock::Image { .. } => {
+                // Image blocks: not applicable in this context
+            }
         }
     }
 

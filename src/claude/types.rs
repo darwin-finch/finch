@@ -6,12 +6,18 @@ use serde_json::Value;
 // Re-export tool types for convenience
 pub use crate::tools::types::ToolDefinition;
 
-/// Content block - supports text, tool_use, and tool_result
+/// Content block - supports text, image, tool_use, and tool_result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+
+    /// Base64-encoded image (for pasted images, screenshots, etc.)
+    #[serde(rename = "image")]
+    Image {
+        source: ImageSource,
+    },
 
     #[serde(rename = "tool_use")]
     ToolUse {
@@ -27,6 +33,15 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+}
+
+/// Source for an image content block
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub source_type: String,        // "base64"
+    pub media_type: String,         // "image/png", "image/jpeg", etc.
+    pub data: String,               // Base64-encoded image data
 }
 
 impl ContentBlock {
@@ -51,6 +66,17 @@ impl ContentBlock {
     /// Create a text content block
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
+    }
+
+    /// Create a base64 image content block
+    pub fn image(media_type: impl Into<String>, base64_data: impl Into<String>) -> Self {
+        Self::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: media_type.into(),
+                data: base64_data.into(),
+            },
+        }
     }
 
     /// Create a tool result content block

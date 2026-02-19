@@ -196,13 +196,8 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         use crate::errors;
 
-        // Validate teachers array is not empty
-        if self.teachers.is_empty() {
-            anyhow::bail!(errors::wrap_error_with_suggestion(
-                "No teacher providers configured",
-                "Run setup wizard to configure a provider:\n  finch setup"
-            ));
-        }
+        // Allow empty teachers — the app can start and will show an error
+        // only when an actual API call is attempted (better UX than crashing on startup).
 
         // Validate each teacher entry
         for (idx, teacher) in self.teachers.iter().enumerate() {

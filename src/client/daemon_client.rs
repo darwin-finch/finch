@@ -353,6 +353,9 @@ impl DaemonClient {
                             // This is a limitation - proper implementation would split messages
                             text_parts.push(format!("[Tool Result for {}]: {}", tool_use_id, content));
                         }
+                        ContentBlock::Image { .. } => {
+                            // Image blocks: not applicable in this context
+                        }
                     }
                 }
 

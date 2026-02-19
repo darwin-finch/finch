@@ -61,6 +61,15 @@ toml = "0.8"
 anyhow = "1.0"
 thiserror = "1.0"
 
+# Clipboard access (for image paste support)
+arboard = { version = "3.6", features = ["image-data"] }
+
+# Base64 encoding (for image data)
+base64 = "0.22"
+
+# PNG encoding (for clipboard image data → PNG bytes)
+png = "0.17"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

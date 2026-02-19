@@ -127,6 +127,12 @@ impl OpenAIProvider {
                         // Tool use blocks are in assistant messages, handled in response
                         // OpenAI includes them in the assistant message via tool_calls field
                     }
+                    ContentBlock::Image { source } => {
+                        // Convert image to OpenAI image_url format
+                        // Note: full vision support requires multipart content array
+                        text_parts.push("[image content]");
+                        let _ = source;
+                    }
                 }
             }
 

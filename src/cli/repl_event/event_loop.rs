@@ -25,6 +25,7 @@ use crate::tools::types::{ToolDefinition, ToolUse};
 
 use super::events::ReplEvent;
 use super::query_state::{QueryState, QueryStateManager};
+use super::tool_display::{format_tool_label, stream_tool_output_to_message};
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// Main event loop for concurrent REPL
@@ -99,6 +100,9 @@ pub struct EventLoop {
 
     /// Current view mode (List or Tree)
     view_mode: Arc<RwLock<ViewMode>>,
+
+    /// Active tool calls: tool_id -> (tool_name, input, live_message) for display lookup
+    active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::LiveToolMessage>)>>>,
 }
 
 /// View mode for the REPL
@@ -197,6 +201,7 @@ impl EventLoop {
             memtree_console,
             memtree_handler,
             view_mode: Arc::new(RwLock::new(ViewMode::List)), // Start in list view
+            active_tool_uses: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -434,6 +439,15 @@ impl EventLoop {
             return Ok(());
         }
 
+        // Drain any pending images from TUI (pasted before sending)
+        let pending_images: Vec<(String, String)> = {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.pending_images
+                .drain(..)
+                .map(|(_idx, b64, media_type)| (media_type, b64))
+                .collect()
+        };
+
         // Echo user input to output buffer
         self.output_manager.write_user(input.clone());
 
@@ -441,11 +455,18 @@ impl EventLoop {
         let conversation_snapshot = self.conversation.read().await.snapshot();
         let query_id = self.query_states.create_query(conversation_snapshot).await;
 
-        // Add user message to conversation
-        self.conversation
-            .write()
-            .await
-            .add_user_message(input.clone());
+        // Add user message to conversation (with images if any were pasted)
+        if pending_images.is_empty() {
+            self.conversation
+                .write()
+                .await
+                .add_user_message(input.clone());
+        } else {
+            self.conversation
+                .write()
+                .await
+                .add_user_message_with_images(input.clone(), &pending_images);
+        }
 
         // Update compaction percentage in status bar
         self.update_compaction_status().await;
@@ -646,6 +667,7 @@ impl EventLoop {
         let mode = Arc::clone(&self.mode);
         let output_manager = Arc::clone(&self.output_manager);
         let status_bar = Arc::clone(&self.status_bar);
+        let active_tool_uses = Arc::clone(&self.active_tool_uses);
 
         tokio::spawn(async move {
             Self::process_query_with_tools(
@@ -664,6 +686,7 @@ impl EventLoop {
                 mode,
                 output_manager,
                 status_bar,
+                active_tool_uses,
             )
             .await;
         });
@@ -687,6 +710,7 @@ impl EventLoop {
         mode: Arc<RwLock<ReplMode>>,
         output_manager: Arc<OutputManager>,
         status_bar: Arc<crate::cli::StatusBar>,
+        active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::LiveToolMessage>)>>>,
     ) {
         tracing::debug!("process_query_with_tools starting for query_id: {:?}", query_id);
 
@@ -863,6 +887,17 @@ impl EventLoop {
                                     });
                                     continue;
                                 }
+
+                                // Create live tool message - shows immediately with spinner,
+                                // then updates with result when tool completes
+                                let label = format_tool_label(&tool_use.name, &tool_use.input);
+                                let live_msg = output_manager.start_live_tool(&label);
+
+                                // Store metadata + live message for result lookup
+                                active_tool_uses.write().await.insert(
+                                    tool_use.id.clone(),
+                                    (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&live_msg)),
+                                );
 
                                 // Check if this is AskUserQuestion (handle specially)
                                 if let Some(result) = handle_ask_user_question(&tool_use, Arc::clone(&tui_renderer)).await {
@@ -1250,21 +1285,24 @@ impl EventLoop {
         tool_id: String,
         result: Result<String>,
     ) -> Result<()> {
-        // Display tool result
+        // Look up the tool's metadata and live message
+        let (_tool_name, _tool_input, live_msg) = {
+            let mut map = self.active_tool_uses.write().await;
+            map.remove(&tool_id).unwrap_or_else(|| {
+                // Fallback: create a new message if not tracked
+                let fallback = self.output_manager.start_live_tool(&tool_id);
+                (tool_id.clone(), serde_json::Value::Null, fallback)
+            })
+        };
+
+        // Stream the result into the live message line by line
+        // This creates the "streaming diff" visual effect
         match &result {
             Ok(content) => {
-                self.output_manager.write_tool(
-                    &tool_id,
-                    format!("✓ Success ({})", if content.len() > 100 {
-                        format!("{}...", &content[..100])
-                    } else {
-                        content.clone()
-                    }),
-                );
+                stream_tool_output_to_message(Arc::clone(&live_msg), content.clone(), false);
             }
             Err(e) => {
-                self.output_manager
-                    .write_tool(&tool_id, format!("✗ Error: {}", e));
+                stream_tool_output_to_message(Arc::clone(&live_msg), e.to_string(), true);
             }
         }
 
