@@ -707,21 +707,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     state.mark_completed(WizardSection::Models);
                     state.next_section();
                 }
-                KeyCode::Enter => {
-                    // Try to validate, but if it fails, show a helpful error
-                    if !primary_model.is_configured() {
-                        *error = Some("Primary model not configured. Press 'E' to edit or 'S' to skip.".to_string());
-                        return Ok(false);
-                    }
-
-                    // Validate API key format
-                    if let ModelConfig::Remote { provider, api_key, .. } = primary_model {
-                        if provider == "claude" && !api_key.starts_with("sk-ant-") {
-                            *error = Some("Invalid API key. Press 'E' to edit or 'S' to skip.".to_string());
-                            return Ok(false);
-                        }
-                    }
-
+                KeyCode::Enter | KeyCode::Tab => {
+                    // Always allow advancing — no key format validation
                     state.mark_completed(WizardSection::Models);
                     state.next_section();
                 }
