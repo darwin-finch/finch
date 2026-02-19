@@ -251,7 +251,8 @@ fn format_tool_description(tool_use: &crate::tools::types::ToolUse) -> String {
 mod tests {
     use super::*;
     use crate::memory::MemTree;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     #[test]
     fn test_user_input_creates_node() {

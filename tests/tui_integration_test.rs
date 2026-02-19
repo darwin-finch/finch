@@ -14,7 +14,7 @@ fn test_tui_initialization() {
     // This test should be run with expect or a PTY library
     // For now, we just verify the binary runs
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_shammah"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_finch"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -44,7 +44,7 @@ fn test_tui_module_exists() {
 fn test_output_manager() {
     use finch::cli::OutputManager;
 
-    let manager = OutputManager::new();
+    let manager = OutputManager::new(finch::config::ColorScheme::default());
 
     // Test stdout control
     manager.disable_stdout();
@@ -57,7 +57,7 @@ fn test_output_manager() {
 #[test]
 fn test_non_interactive_mode() {
     // When stdin is not a TTY, TUI should not be used
-    let output = Command::new(env!("CARGO_BIN_EXE_shammah"))
+    let output = Command::new(env!("CARGO_BIN_EXE_finch"))
         .arg("query")
         .arg("test")
         .output()

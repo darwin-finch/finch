@@ -367,6 +367,9 @@ mod tests {
         // Match /clear
         let matches = registry.match_prefix("/cl");
         assert!(matches.iter().any(|cmd| cmd.name == "/clear"));
+
+        // Match /compact (starts with /co, not /cl)
+        let matches = registry.match_prefix("/co");
         assert!(matches.iter().any(|cmd| cmd.name == "/compact"));
 
         // Match /model

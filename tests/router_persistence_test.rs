@@ -56,13 +56,14 @@ fn test_router_statistics_corruption_detection() -> Result<()> {
     assert_eq!(corrupted_stats.total_successes, 0);
     assert_eq!(corrupted_stats.success_rate, 0.0);
 
-    // Key assertion: Router should still try local with fresh queries
-    // even with 100% historical failure rate (optimistic default)
-    let should_try = corrupted_router.should_try_local("New query pattern");
+    // Key assertion: Router should still try local for queries in categories NOT in corrupted stats
+    // "What is Rust?" → Definition category (not in corrupted "Other" stats)
+    let should_try = corrupted_router.should_try_local("What is Rust?");
     assert!(should_try, "Router should try local for queries without category history");
 
-    // But should forward for categories with failure history
-    let should_forward = !corrupted_router.should_try_local("What is something?"); // "Other" category
+    // But should forward for "Other" category which has 100% failure in corrupted stats
+    // "New query pattern" → Other category (matches the corrupted "Other" stats)
+    let should_forward = !corrupted_router.should_try_local("New query pattern");
     assert!(should_forward, "Router should forward queries in failed categories");
 
     Ok(())

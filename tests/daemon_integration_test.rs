@@ -26,7 +26,7 @@ async fn is_daemon_running(port: u16) -> bool {
 
 /// Helper to start daemon in background
 fn start_daemon(port: u16) -> Result<std::process::Child> {
-    let child = Command::new(env!("CARGO_BIN_EXE_shammah"))
+    let child = Command::new(env!("CARGO_BIN_EXE_finch"))
         .arg("daemon")
         .arg("--bind")
         .arg(format!("127.0.0.1:{}", port))
@@ -39,7 +39,7 @@ fn start_daemon(port: u16) -> Result<std::process::Child> {
 
 /// Helper to run a query via CLI
 fn run_query(query: &str) -> Result<String> {
-    let output = Command::new(env!("CARGO_BIN_EXE_shammah"))
+    let output = Command::new(env!("CARGO_BIN_EXE_finch"))
         .arg("query")
         .arg(query)
         .output()?;

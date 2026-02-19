@@ -263,8 +263,8 @@ mod tests {
         let memory = Arc::new(MemorySystem::new(config)?);
 
         // Insert test data
-        memory.insert_conversation("user", "How do I use Rust lifetimes?", Some("test"), None)?;
-        memory.insert_conversation("assistant", "Lifetimes in Rust ensure references are valid...", Some("test"), None)?;
+        memory.insert_conversation("user", "How do I use Rust lifetimes?", Some("test"), None).await?;
+        memory.insert_conversation("assistant", "Lifetimes in Rust ensure references are valid...", Some("test"), None).await?;
 
         // Create tool and search
         let tool = SearchMemoryTool::new(memory);
@@ -317,7 +317,7 @@ mod tests {
         assert!(result.contains("Memory created"));
 
         // Verify it was stored
-        let stats = memory.stats()?;
+        let stats = memory.stats().await?;
         assert_eq!(stats.conversation_count, 1);
 
         Ok(())
@@ -335,7 +335,7 @@ mod tests {
 
         // Insert test data
         for i in 1..=5 {
-            memory.insert_conversation("user", &format!("Message {}", i), Some("test"), None)?;
+            memory.insert_conversation("user", &format!("Message {}", i), Some("test"), None).await?;
         }
 
         let tool = ListRecentTool::new(memory);

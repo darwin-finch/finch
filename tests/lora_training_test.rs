@@ -104,17 +104,13 @@ fn test_jsonl_queue_writing() {
         ))
         .expect("Failed to add");
 
-    // Write to queue (we'll manually specify path for testing)
-    // Note: The real implementation writes to ~/.shammah/training_queue.jsonl
+    // Write to queue
     let count = coordinator.write_training_queue().expect("Failed to write queue");
 
     assert_eq!(count, 3);
 
-    // Verify file was created in actual location
-    let actual_queue_path = dirs::home_dir()
-        .expect("No home dir")
-        .join(".shammah")
-        .join("training_queue.jsonl");
+    // Verify file was created at the coordinator's actual path
+    let actual_queue_path = coordinator.queue_path().to_path_buf();
 
     // Read and verify contents
     if actual_queue_path.exists() {

@@ -127,23 +127,17 @@ fn test_answer_submission() {
     let mut dialog = TabbedDialog::new(questions, None);
 
     // Select an option (already at index 0 by default)
-    // Press Enter to answer
+    // For single-tab dialog with pre-selected option, Enter immediately completes
     let result = dialog.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    // Should mark tab as answered but not complete (since we need to be on last tab)
-    assert!(result.is_none());
-
-    // For single tab, pressing Enter again should complete
-    let result = dialog.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-    // Should return completed result
+    // Should return completed result immediately (single tab + option already selected)
     match result {
         Some(TabbedDialogResult::Completed(answers)) => {
             assert_eq!(answers.len(), 1);
             assert_eq!(answers.get("Pick one?"), Some(&"Yes".to_string()));
             println!("✓ Answer submission works correctly");
         }
-        _ => panic!("Expected Completed result"),
+        _ => panic!("Expected Completed result on first Enter for single-tab dialog"),
     }
 }
 

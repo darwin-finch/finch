@@ -31,7 +31,7 @@ pub fn create_providers(teachers: &[TeacherEntry]) -> Result<Vec<Box<dyn LlmProv
 
 /// Create a single provider from a teacher entry
 pub fn create_provider_from_entry(entry: &TeacherEntry) -> Result<Box<dyn LlmProvider>> {
-    match entry.provider.as_str() {
+    match entry.provider.to_lowercase().as_str() {
         "claude" => {
             let mut provider = ClaudeProvider::new(entry.api_key.clone())?;
             if let Some(model) = &entry.model {

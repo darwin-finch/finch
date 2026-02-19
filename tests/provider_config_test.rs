@@ -17,6 +17,7 @@ fn test_gemini_invalid_model_name() {
         provider: "gemini".to_string(),
         api_key: "test-key".to_string(),
         model: Some("gemini-2.0-flash-exp".to_string()), // Invalid!
+        base_url: None,
         name: Some("Test".to_string()),
     };
 
@@ -38,6 +39,7 @@ fn test_provider_factory_creates_correct_types() -> Result<()> {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
         model: Some("claude-sonnet-4".to_string()),
+        base_url: None,
         name: Some("Claude".to_string()),
     };
 
@@ -45,6 +47,7 @@ fn test_provider_factory_creates_correct_types() -> Result<()> {
         provider: "gemini".to_string(),
         api_key: "test-key".to_string(),
         model: Some("gemini-2.5-flash".to_string()),
+        base_url: None,
         name: Some("Gemini".to_string()),
     };
 
@@ -71,12 +74,14 @@ fn test_provider_factory_creates_fallback_chain() -> Result<()> {
             provider: "gemini".to_string(),
             api_key: "key1".to_string(),
             model: Some("gemini-2.5-flash".to_string()),
+            base_url: None,
             name: Some("Gemini".to_string()),
         },
         TeacherEntry {
             provider: "claude".to_string(),
             api_key: "key2".to_string(),
             model: Some("claude-sonnet-4".to_string()),
+            base_url: None,
             name: Some("Claude".to_string()),
         },
     ];
@@ -100,6 +105,7 @@ fn test_provider_factory_single_teacher() -> Result<()> {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
         model: Some("claude-sonnet-4".to_string()),
+        base_url: None,
         name: Some("Claude".to_string()),
     }];
 
@@ -131,6 +137,7 @@ fn test_provider_requires_api_key() {
         provider: "claude".to_string(),
         api_key: "".to_string(), // Empty!
         model: Some("claude-sonnet-4".to_string()),
+        base_url: None,
         name: Some("Claude".to_string()),
     };
 
@@ -150,6 +157,7 @@ fn test_provider_model_defaults() -> Result<()> {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
         model: None, // No model specified
+        base_url: None,
         name: Some("Claude".to_string()),
     };
 
@@ -169,6 +177,7 @@ fn test_provider_names_case_insensitive() -> Result<()> {
         provider: "CLAUDE".to_string(),
         api_key: "test-key".to_string(),
         model: Some("claude-sonnet-4".to_string()),
+        base_url: None,
         name: Some("Claude".to_string()),
     };
 
@@ -176,6 +185,7 @@ fn test_provider_names_case_insensitive() -> Result<()> {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
         model: Some("claude-sonnet-4".to_string()),
+        base_url: None,
         name: Some("Claude".to_string()),
     };
 
@@ -197,6 +207,7 @@ fn test_unknown_provider_rejected() {
         provider: "unknown-provider".to_string(),
         api_key: "test-key".to_string(),
         model: Some("some-model".to_string()),
+        base_url: None,
         name: Some("Unknown".to_string()),
     };
 
@@ -213,6 +224,7 @@ fn test_provider_capabilities() -> Result<()> {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
         model: Some("claude-sonnet-4".to_string()),
+        base_url: None,
         name: Some("Claude".to_string()),
     };
 
