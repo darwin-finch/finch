@@ -99,20 +99,27 @@ mod tests {
     #[tokio::test]
     async fn test_execute() {
         let tool = EnterPlanModeTool;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        use crate::cli::ReplMode;
+
+        let repl_mode = Arc::new(RwLock::new(ReplMode::Normal));
+        let plan_content = Arc::new(RwLock::new(None));
+
         let context = ToolContext {
             conversation: None,
             save_models: None,
             batch_trainer: None,
             local_generator: None,
             tokenizer: None,
-            repl_mode: None,
-            plan_content: None,
+            repl_mode: Some(repl_mode),
+            plan_content: Some(plan_content),
         };
 
         let result = tool.execute(serde_json::json!({}), &context).await;
         assert!(result.is_ok());
         let message = result.unwrap();
-        assert!(message.contains("Entered plan mode"));
+        assert!(message.contains("Entered planning mode"));
         assert!(message.contains("Read"));
     }
 

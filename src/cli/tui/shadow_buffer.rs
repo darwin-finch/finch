@@ -373,13 +373,13 @@ mod tests {
         let mut buf = ShadowBuffer::new(10, 5);
 
         // Write a short line
-        let rows = buf.write_line(0, "hello");
+        let rows = buf.write_line(0, "hello", Style::default());
         assert_eq!(rows, 1);
         assert_eq!(buf.get(0, 0).unwrap().ch, 'h');
         assert_eq!(buf.get(4, 0).unwrap().ch, 'o');
 
         // Write a long line (should wrap)
-        let rows = buf.write_line(1, "this is a very long line that wraps");
+        let rows = buf.write_line(1, "this is a very long line that wraps", Style::default());
         assert!(rows > 1);
     }
 
@@ -388,8 +388,8 @@ mod tests {
         let mut buf1 = ShadowBuffer::new(5, 3);
         let mut buf2 = ShadowBuffer::new(5, 3);
 
-        buf1.write_line(0, "hello");
-        buf2.write_line(0, "hello");
+        buf1.write_line(0, "hello", Style::default());
+        buf2.write_line(0, "hello", Style::default());
 
         // No changes
         let changes = diff_buffers(&buf1, &buf2);

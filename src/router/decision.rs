@@ -127,7 +127,6 @@ mod tests {
 
     #[test]
     fn test_forward_reason_as_str() {
-        assert_eq!(ForwardReason::Crisis.as_str(), "crisis");
         assert_eq!(ForwardReason::NoMatch.as_str(), "no_match");
         assert_eq!(ForwardReason::LowConfidence.as_str(), "low_confidence");
         assert_eq!(ForwardReason::ModelNotReady.as_str(), "model_not_ready");

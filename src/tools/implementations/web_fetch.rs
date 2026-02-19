@@ -87,7 +87,17 @@ mod tests {
             "url": "https://www.google.com"
         });
 
-        let result = tool.execute(input).await;
+        let context = crate::tools::types::ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+        };
+
+        let result = tool.execute(input, &context).await;
         // This might fail without internet, so just check it doesn't panic
         if let Ok(content) = result {
             assert!(!content.is_empty());
@@ -101,7 +111,17 @@ mod tests {
             "url": "https://this-domain-definitely-does-not-exist-12345.com"
         });
 
-        let result = tool.execute(input).await;
+        let context = crate::tools::types::ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+        };
+
+        let result = tool.execute(input, &context).await;
         // Should fail with network error
         assert!(result.is_err());
     }

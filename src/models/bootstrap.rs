@@ -290,7 +290,7 @@ mod tests {
 
         // Transition to loading
         *state.write().await = GeneratorState::Loading {
-            model_size: QwenSize::Qwen1_5B,
+            model_name: "Qwen2.5-1.5B-Instruct".to_string(),
         };
         assert!(!state.read().await.is_ready());
 

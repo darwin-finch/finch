@@ -732,7 +732,7 @@ mod tests {
                     ContentBlock::ToolResult {
                         tool_use_id: "call1".to_string(),
                         content: "Old file contents".to_string(),
-                        is_error: false,
+                        is_error: Some(false),
                     },
                 ],
             },
@@ -753,7 +753,7 @@ mod tests {
                     ContentBlock::ToolResult {
                         tool_use_id: "call2".to_string(),
                         content: "Recent file contents".to_string(),
-                        is_error: false,
+                        is_error: Some(false),
                     },
                 ],
             },
@@ -811,7 +811,7 @@ mod tests {
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "old".to_string(),
                     content: "Old result".to_string(),
-                    is_error: false,
+                    is_error: Some(false),
                 }],
             },
             Message {
@@ -837,7 +837,7 @@ mod tests {
                 content: vec![ContentBlock::ToolResult {
                     tool_use_id: "recent".to_string(),
                     content: "Recent result".to_string(),
-                    is_error: false,
+                    is_error: Some(false),
                 }],
             },
         ];

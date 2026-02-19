@@ -305,28 +305,24 @@ mod tests {
 
     #[test]
     fn test_same_provider_different_models() {
-        let config = TeacherConfig {
-            provider: None,
-            settings: HashMap::new(),
-            teachers: vec![
-                TeacherEntry {
-                    provider: "openai".to_string(),
-                    api_key: "test-key".to_string(),
-                    model: Some("gpt-4o".to_string()),
-                    base_url: None,
-                    name: Some("GPT-4o (best)".to_string()),
-                },
-                TeacherEntry {
-                    provider: "openai".to_string(),
-                    api_key: "test-key".to_string(),
-                    model: Some("gpt-4o-mini".to_string()),
-                    base_url: None,
-                    name: Some("GPT-4o-mini (cheaper)".to_string()),
-                },
-            ],
-        };
+        let teachers = vec![
+            TeacherEntry {
+                provider: "openai".to_string(),
+                api_key: "test-key".to_string(),
+                model: Some("gpt-4o".to_string()),
+                base_url: None,
+                name: Some("GPT-4o (best)".to_string()),
+            },
+            TeacherEntry {
+                provider: "openai".to_string(),
+                api_key: "test-key".to_string(),
+                model: Some("gpt-4o-mini".to_string()),
+                base_url: None,
+                name: Some("GPT-4o-mini (cheaper)".to_string()),
+            },
+        ];
 
-        let providers = create_providers(&config).unwrap();
+        let providers = create_providers(&teachers).unwrap();
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].name(), "openai");
         assert_eq!(providers[1].name(), "openai");

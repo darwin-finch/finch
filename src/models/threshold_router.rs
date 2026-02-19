@@ -560,9 +560,10 @@ mod tests {
     fn test_learning() {
         let mut router = ThresholdRouter::new();
 
-        // First 10 queries: always forward
+        // With ONNX model, default is to try local
+        // First 10 queries: should try local by default (no statistics yet)
         for _ in 0..10 {
-            assert!(!router.should_try_local("test query"));
+            assert!(router.should_try_local("test query")); // Changed: now tries local by default
             router.learn_forwarded("test query");
         }
 

@@ -522,7 +522,10 @@ mod tests {
                 DialogOption::with_description("Option 2", "With description"),
             ],
             0,
-            &None,
+            false,      // allow_custom
+            &None,      // custom_input
+            false,      // custom_mode_active
+            &None,      // help
         );
 
         // Should have: 2 options + empty line + keybindings = 4 lines
@@ -548,7 +551,10 @@ mod tests {
             &[DialogOption::new("Option 1"), DialogOption::new("Option 2")],
             &selected,
             0,
-            &None,
+            false,      // allow_custom
+            &None,      // custom_input
+            false,      // custom_mode_active
+            &None,      // help
         );
 
         // Should have: 2 options + empty line + keybindings = 4 lines

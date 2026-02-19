@@ -133,10 +133,7 @@ fn try_load_from_shammah_config() -> Result<Option<Config>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_config_creation() {
-        let config = Config::new("test-key".to_string());
-        assert_eq!(config.api_key, "test-key");
-        // similarity_threshold removed (pattern system removed)
-    }
+    // Note: Config creation tests removed - Config structure changed to use
+    // teachers array instead of single api_key. Config is now loaded from
+    // ~/.shammah/config.toml via Config::load() or created via setup wizard.
 }

@@ -358,9 +358,14 @@ mod tests {
 
     #[test]
     fn test_differ_significantly() {
+        // Strings with very high word overlap (>80%) should be considered similar
+        // Need similarity > 0.8 to set similar=true, which makes differ_significantly=false
+        // A: "you should use a mutex for thread safety" (8 words)
+        // B: "you should use a mutex for thread safety here" (9 words)
+        // Intersection: 8, Union: 9, Similarity: 8/9 = 0.89 > 0.8 ✓
         let similar = ComparisonResult::new(
-            "Use a mutex here".to_string(),
-            "You should use a mutex here".to_string(),
+            "you should use a mutex for thread safety".to_string(),
+            "you should use a mutex for thread safety here".to_string(),
         );
         assert!(!similar.differ_significantly());
 

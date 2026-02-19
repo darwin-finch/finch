@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn test_daemon_config_default() {
         let config = DaemonConfig::default();
-        assert_eq!(config.bind_address, "127.0.0.1:11434");
+        assert_eq!(config.bind_address, "127.0.0.1:11435"); // Port 11435 to avoid Ollama conflict
         assert!(config.auto_spawn);
         assert_eq!(config.timeout_seconds, 120);
     }

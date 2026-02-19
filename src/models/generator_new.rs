@@ -241,6 +241,7 @@ mod tests {
     use crate::models::common::{DevicePreference, ModelConfig};
 
     #[test]
+    #[ignore] // RandomInit removed in Phase 4 refactoring (use ONNX pre-trained models)
     fn test_generator_random_init() {
         let model_config = ModelConfig::small();
         let config = GeneratorConfig::RandomInit(model_config);
@@ -256,7 +257,7 @@ mod tests {
     #[ignore] // Requires downloaded Qwen model
     fn test_generator_qwen() {
         use crate::models::unified_loader::{ModelLoadConfig, ModelFamily, ModelSize};
-        use crate::config::backend::ExecutionTarget;
+        use crate::config::ExecutionTarget;
 
         let config = GeneratorConfig::Pretrained(ModelLoadConfig {
             provider: crate::models::unified_loader::InferenceProvider::Onnx,

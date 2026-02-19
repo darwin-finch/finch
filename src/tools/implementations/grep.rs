@@ -92,7 +92,17 @@ mod tests {
             "path": "Cargo.toml"
         });
 
-        let result = tool.execute(input).await;
+        let context = crate::tools::types::ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+        };
+
+        let result = tool.execute(input, &context).await;
         assert!(result.is_ok());
         let content = result.unwrap();
         // Should find at least the package name
@@ -107,7 +117,17 @@ mod tests {
             "path": "."
         });
 
-        let result = tool.execute(input).await;
+        let context = crate::tools::types::ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+        };
+
+        let result = tool.execute(input, &context).await;
         assert!(result.is_err());
     }
 }

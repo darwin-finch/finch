@@ -632,7 +632,7 @@ mod tests {
     fn test_exact_approval_matches() {
         let sig = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo test in /project".to_string(),,
+            context_key: "cargo test in /project".to_string(),
             command: None,
             args: None,
             directory: None
@@ -644,7 +644,7 @@ mod tests {
 
         let different_sig = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo build in /project".to_string(),,
+            context_key: "cargo build in /project".to_string(),
             command: None,
             args: None,
             directory: None
@@ -659,7 +659,7 @@ mod tests {
 
         let sig = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo test in /project".to_string(),,
+            context_key: "cargo test in /project".to_string(),
             command: None,
             args: None,
             directory: None
@@ -722,7 +722,7 @@ mod tests {
 
         let sig = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo test in /project".to_string(),,
+            context_key: "cargo test in /project".to_string(),
             command: None,
             args: None,
             directory: None
@@ -748,7 +748,7 @@ mod tests {
 
         let sig1 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo test".to_string(),,
+            context_key: "cargo test".to_string(),
             command: None,
             args: None,
             directory: None
@@ -756,7 +756,7 @@ mod tests {
 
         let sig2 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo build".to_string(),,
+            context_key: "cargo build".to_string(),
             command: None,
             args: None,
             directory: None
@@ -764,7 +764,7 @@ mod tests {
 
         let sig3 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "cargo run".to_string(),,
+            context_key: "cargo run".to_string(),
             command: None,
             args: None,
             directory: None
@@ -786,7 +786,7 @@ mod tests {
 
         let sig1 = ToolSignature {
             tool_name: "read".to_string(),
-            context_key: "reading /project/src/main.rs".to_string(),,
+            context_key: "reading /project/src/main.rs".to_string(),
             command: None,
             args: None,
             directory: None
@@ -794,7 +794,7 @@ mod tests {
 
         let sig2 = ToolSignature {
             tool_name: "read".to_string(),
-            context_key: "reading /project/src/lib.rs".to_string(),,
+            context_key: "reading /project/src/lib.rs".to_string(),
             command: None,
             args: None,
             directory: None
@@ -802,7 +802,7 @@ mod tests {
 
         let sig3 = ToolSignature {
             tool_name: "read".to_string(),
-            context_key: "reading /project/src/test.txt".to_string(),,
+            context_key: "reading /project/src/test.txt".to_string(),
             command: None,
             args: None,
             directory: None
@@ -976,7 +976,7 @@ mod tests {
 
         let sig1 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "test123".to_string(),,
+            context_key: "test123".to_string(),
             command: None,
             args: None,
             directory: None
@@ -984,7 +984,7 @@ mod tests {
 
         let sig2 = ToolSignature {
             tool_name: "bash".to_string(),
-            context_key: "testABC".to_string(),,
+            context_key: "testABC".to_string(),
             command: None,
             args: None,
             directory: None

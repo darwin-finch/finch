@@ -66,7 +66,17 @@ mod tests {
             "pattern": "Cargo.toml"
         });
 
-        let result = tool.execute(input).await;
+        let context = crate::tools::types::ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+        };
+
+        let result = tool.execute(input, &context).await;
         assert!(result.is_ok());
         let content = result.unwrap();
         assert!(content.contains("Cargo.toml"));
@@ -79,7 +89,17 @@ mod tests {
             "pattern": "src/*.rs"
         });
 
-        let result = tool.execute(input).await;
+        let context = crate::tools::types::ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+        };
+
+        let result = tool.execute(input, &context).await;
         assert!(result.is_ok());
         let content = result.unwrap();
         // Should find at least main.rs or lib.rs

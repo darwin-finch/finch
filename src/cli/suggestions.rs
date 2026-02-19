@@ -457,7 +457,7 @@ mod tests {
         ];
 
         for context in contexts {
-            let mut test_manager = manager.clone();
+            let mut test_manager = SuggestionManager::new();
             test_manager.set_context(context);
             let suggestions = test_manager.get_suggestions();
 

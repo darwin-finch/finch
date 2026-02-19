@@ -649,6 +649,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -674,6 +676,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -690,6 +694,8 @@ mod tests {
                 &tool_use,
                 None,
                 None::<fn() -> Result<()>>,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -715,6 +721,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -737,6 +745,8 @@ mod tests {
                 tool_uses,
                 None,
                 None::<fn() -> Result<()>>,
+                None,
+                None,
                 None,
                 None,
                 None,

@@ -147,6 +147,15 @@ impl Message {
         self
     }
 
+    /// Extract text content from this message
+    pub fn text_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| block.as_text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Add tool result to this message
     pub fn add_tool_result(mut self, tool_use_id: String, result: String, is_error: bool) -> Self {
         self.content.push(ContentBlock::tool_result(

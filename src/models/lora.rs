@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn test_lora_adapter_creation() {
         let config = LoRAConfig::default();
-        let adapter = LoRATrainingAdapter::new(config);
+        let adapter = LoRATrainingAdapter::new(config, ()).unwrap();
 
         assert!(!adapter.is_enabled());
         assert_eq!(adapter.config().rank, 16);
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_lora_adapter_enable_disable() {
-        let mut adapter = LoRATrainingAdapter::default_config();
+        let mut adapter = LoRATrainingAdapter::default_config().unwrap();
 
         assert!(!adapter.is_enabled());
 
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_lora_train_not_implemented() {
-        let mut adapter = LoRATrainingAdapter::default_config();
+        let mut adapter = LoRATrainingAdapter::default_config().unwrap();
 
         let examples = vec![
             ("Hello".to_string(), "World".to_string()),
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_lora_save_not_implemented() {
-        let adapter = LoRATrainingAdapter::default_config();
+        let adapter = LoRATrainingAdapter::default_config().unwrap();
         let path = std::path::Path::new("/tmp/test.safetensors");
 
         let result = adapter.save(path);

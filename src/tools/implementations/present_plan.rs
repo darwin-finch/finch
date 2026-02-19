@@ -92,15 +92,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_plan() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        use crate::cli::ReplMode;
+        use std::path::PathBuf;
+
         let tool = PresentPlanTool;
+
+        // Set up repl_mode in Planning state
+        let plan_path = PathBuf::from("/tmp/test-plan.md");
+        let repl_mode = Arc::new(RwLock::new(ReplMode::Planning {
+            task: "Test task".to_string(),
+            plan_path: plan_path.clone(),
+            created_at: chrono::Utc::now(),
+        }));
+        let plan_content = Arc::new(RwLock::new(None));
+
         let context = ToolContext {
             conversation: None,
             save_models: None,
             batch_trainer: None,
             local_generator: None,
             tokenizer: None,
-            repl_mode: None,
-            plan_content: None,
+            repl_mode: Some(repl_mode),
+            plan_content: Some(plan_content),
         };
 
         let result = tool
