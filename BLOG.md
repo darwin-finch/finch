@@ -105,6 +105,60 @@ The key question is embeddings. The TF-IDF placeholder needs to become a real mo
 
 ---
 
+## Making It Feel Right: WorkUnit, the Edit Tool, and the Push to Daily Driver
+
+The core loop worked. The provider layer was clean. But using Finch for an hour as an actual coding tool surfaced a category of problem that functional tests don't catch: it didn't *feel* like a real agent.
+
+The response arrived character-by-character in the scrollback. Tool calls showed a bullet, a tree-branch character, and a spinning indicator on a separate line. Grok returned a 400 error if a tool call produced empty output (because we were sending `""` as the content, which Grok — unlike Claude — correctly rejects). Large screenshots got stuck in the conversation history and bloated every subsequent request. There was no sense that anything was *happening*.
+
+### The WorkUnit
+
+Claude Code has a distinctive rendering pattern. When it's working on something, you see:
+
+```
+✦ Channeling… (1m 12s · ↓ 9.9k tokens · thinking)
+```
+
+The icon pulses — small, large, small — while tokens arrive. When the response is complete, it collapses to:
+
+```
+⏺ Here's what I found…
+  ⎿  Read src/tools/executor.rs (445 lines)
+  ⎿  bash(cargo test) → 745 passed
+```
+
+The streaming indicator, the tool calls, and the final response are a single coherent unit. We wanted the same thing.
+
+The key insight: these are all part of one "generation turn" — one round of the model thinking, calling tools, and producing output. We built `WorkUnit`, a message type that owns the full lifecycle of a turn:
+
+1. **InProgress**: renders an animated header with time-driven throb (`elapsed.as_millis() / 200 % 4`) — no external counter, no thread, just math on elapsed time called at each blit tick
+2. **Tool rows**: `add_row("bash(cargo test)")` → `complete_row(idx, "745 passed")` — sub-items that appear as `⎿` entries below the header
+3. **Complete**: collapses to `⏺ response text` with the tool rows frozen below
+
+The animation is time-driven, not event-driven. Every 100ms when the blit cycle calls `format()`, the function computes which throb frame to show based on `started_at.elapsed()`. This means the animation runs correctly regardless of how fast tokens arrive, and requires zero state in the event loop.
+
+The WorkUnit replaces the combination of `StreamingResponseMessage` (which held the streaming text) and `OperationMessage` (which grouped tool calls). One type, one lifecycle, one place to read the code.
+
+There was an architectural constraint: the shadow buffer / insert_before system requires a message to exist in the output manager *before* streaming begins. If you add the message after, the terminal rows aren't reserved and the blitter writes into the wrong area. WorkUnit is created before the generate call, starts as an animated single-line header, grows as rows are added, and only shows the final response text when `set_complete()` is called. The shadow buffer handles the growth naturally — the diff-based blit just writes more rows on the next tick.
+
+### The Edit Tool and System Prompt
+
+The `edit` tool existed but its description wasn't directive enough to reliably steer the model toward it. A model that reaches for `bash` with `sed` for every file modification produces worse diffs, is harder to undo, and bypasses the permission system.
+
+The fix was two-pronged: update the description to say "ALWAYS use this tool to modify existing files — never use bash with sed/awk/echo", and rewrite the system prompt to be explicit about the edit-vs-write distinction, the read-before-edit workflow, and style matching. The system prompt is the highest-leverage thing in the whole system — every interaction goes through it — but it gets treated as an afterthought.
+
+The `write` tool had a quiet bug: when overwriting an existing file, it passed the entire original content as the `old_string` argument to `generate_edit_diff`, which produced a wall of red and green showing every line removed and every line added. For a 200-line file, that's 400 lines of diff output. We replaced it with a clean summary: `Updated src/foo.rs (180 → 215 lines, +35 lines)`.
+
+### Context Window and Iteration Limits
+
+The context window was set to 32,000 characters — about 8,000 tokens. Claude's context window is 200,000 tokens. For a real coding session that reads a few files, compaction would kick in almost immediately, summarizing recent context that the model still needs.
+
+We raised it to 600,000 characters (~150k tokens), bumped the message limit from 20 to 500, and raised the compaction threshold from 80% to 90%. The tool iteration cap went from 25 to 100 — 25 iterations is fine for small tasks but breaks down for anything involving multiple files across a real codebase.
+
+These felt like oversight numbers left over from early testing. A coding agent that compacts context every five minutes isn't useful for extended work.
+
+---
+
 ## What's Still Left to Build
 
 In rough priority order:
