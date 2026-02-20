@@ -33,8 +33,11 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Performs exact string replacements in files. Use old_string/new_string for targeted edits, \
-         replace_all to change every occurrence."
+        "Edit a file by replacing an exact string with new content. \
+         ALWAYS use this tool to modify existing files — never use bash with sed/awk/echo. \
+         old_string must match exactly (including whitespace). If it appears multiple times, \
+         include more context lines to make it unique, or set replace_all: true. \
+         Returns a colored diff showing what changed."
     }
 
     fn input_schema(&self) -> ToolInputSchema {

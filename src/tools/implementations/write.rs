@@ -22,8 +22,10 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Writes content to a file, creating it if it doesn't exist or overwriting it if it does. \
-         Always provide the complete file content."
+        "Write the complete content of a file (creates new or fully overwrites existing). \
+         Use for new files or when rewriting most of the content. \
+         For small targeted changes to an existing file, use the edit tool instead — \
+         it is safer and shows a precise diff."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -75,15 +77,25 @@ impl Tool for WriteTool {
                 if line_count == 1 { "" } else { "s" }
             ))
         } else {
-            // Existing file: read original, write new, show diff
+            // Existing file: read original, write new, show stats
             let original = fs::read_to_string(file_path)
                 .with_context(|| format!("Failed to read existing file: {}", file_path))?;
 
             fs::write(file_path, content)
                 .with_context(|| format!("Failed to write file: {}", file_path))?;
 
-            // Show diff between old and new content
-            Ok(generate_edit_diff(&original, &original, content, 1))
+            let old_lines = original.lines().count();
+            let new_lines = content.lines().count();
+            let delta: i64 = new_lines as i64 - old_lines as i64;
+            let delta_str = match delta.cmp(&0) {
+                std::cmp::Ordering::Greater => format!("+{} lines", delta),
+                std::cmp::Ordering::Less   => format!("{} lines", delta),
+                std::cmp::Ordering::Equal  => "unchanged line count".to_string(),
+            };
+            Ok(format!(
+                "Updated {} ({} → {} lines, {})\n",
+                file_path, old_lines, new_lines, delta_str
+            ))
         }
     }
 }
