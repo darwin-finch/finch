@@ -796,12 +796,13 @@ impl EventLoop {
             if caps.supports_streaming {
                 tracing::debug!("Generator supports streaming, attempting to stream");
 
-                // Create message BEFORE starting stream to avoid race condition
-                // This ensures the response appears in correct order even if user types quickly
-                status_bar.update_operation("⏺ Generating…");
+                // Don't add a message to scrollback yet — show live stats in the status bar
+                // instead. The full response is added to scrollback only when streaming ends.
                 use crate::cli::messages::StreamingResponseMessage;
-                let msg = Arc::new(StreamingResponseMessage::new());
-                output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
+                let stream_start = std::time::Instant::now();
+                let mut token_count: usize = 0;
+                let mut throb_idx: usize = 0;
+                status_bar.update_operation("✳ Channeling…");
 
                 match generator
                     .generate_stream(messages.clone(), Some((*tool_definitions).clone()))
@@ -820,16 +821,34 @@ impl EventLoop {
                                 Ok(StreamChunk::TextDelta(delta)) => {
                                     tracing::debug!("Received TextDelta: {} bytes", delta.len());
                                     text.push_str(&delta);
-                                    // Update message directly - no event needed
-                                    msg.append_chunk(&delta);
+                                    token_count += delta.split_whitespace().count();
+                                    // Throb animation + live stats (no scrollback writes during stream)
+                                    throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
+                                    let icon = THROB_FRAMES[throb_idx];
+                                    let secs = stream_start.elapsed().as_secs();
+                                    let elapsed_str = format_elapsed(secs);
+                                    let tokens_str = format_token_count(token_count);
+                                    status_bar.update_operation(format!(
+                                        "{} Channeling… ({} · ↓ {} tokens)",
+                                        icon, elapsed_str, tokens_str
+                                    ));
                                 }
                                 Ok(StreamChunk::ContentBlockComplete(block)) => {
                                     tracing::debug!("Received ContentBlockComplete: {:?}", block);
+                                    // Advance throb during thinking phase (before text arrives)
+                                    throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
+                                    if token_count == 0 {
+                                        let icon = THROB_FRAMES[throb_idx];
+                                        let secs = stream_start.elapsed().as_secs();
+                                        status_bar.update_operation(format!(
+                                            "{} Channeling… ({} · thinking)",
+                                            icon, format_elapsed(secs)
+                                        ));
+                                    }
                                     blocks.push(block);
                                 }
                                 Err(e) => {
                                     tracing::error!("Stream error in event loop: {}", e);
-                                    msg.set_failed();
                                     let _ = event_tx.send(ReplEvent::QueryFailed {
                                         query_id,
                                         error: format!("{}", e),
@@ -842,15 +861,20 @@ impl EventLoop {
                         tracing::debug!("[EVENT_LOOP] Stream receive loop ended, {} blocks received", blocks.len());
                         tracing::debug!("Stream receive loop ended");
 
-                        // Mark message as complete
+                        // Stream complete — add the full response to scrollback at once
+                        let msg = Arc::new(StreamingResponseMessage::new());
+                        if !text.is_empty() {
+                            msg.append_chunk(&text);
+                        }
                         msg.set_complete();
+                        output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
 
-                        // Send stats update with basic info (streaming doesn't provide token counts)
+                        // Send stats update
                         let _ = event_tx.send(ReplEvent::StatsUpdate {
-                            model: "streaming".to_string(),  // TODO: Get actual model name from generator
-                            input_tokens: None,  // Not available in streaming
-                            output_tokens: Some(text.split_whitespace().count() as u32),  // Rough estimate
-                            latency_ms: None,  // TODO: Track timing
+                            model: "streaming".to_string(),
+                            input_tokens: None,
+                            output_tokens: Some(token_count as u32),
+                            latency_ms: Some(stream_start.elapsed().as_millis() as u64),
                         });
 
                         tracing::debug!("[EVENT_LOOP] Streaming complete");
@@ -990,7 +1014,7 @@ impl EventLoop {
             }
 
             // Non-streaming path (for Qwen or fallback)
-            status_bar.update_operation("⏺ Generating…");
+            status_bar.update_operation("✳ Channeling…");
             match generator
                 .generate(messages, Some((*tool_definitions).clone()))
                 .await
@@ -1872,6 +1896,28 @@ async fn handle_present_plan(
 }
 
 /// Handle AskUserQuestion tool call specially (shows dialog instead of executing as tool)
+/// Pulsing animation frames for the streaming status indicator.
+/// Cycles from small → large → small to create a "throb" effect.
+const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
+
+/// Format elapsed seconds as "Xs" or "Xm Ys".
+pub fn format_elapsed(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Format a token count as "N" or "N.Nk".
+pub fn format_token_count(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
 /// Produce a compact one-line summary of tool output for display in an OperationMessage row.
 ///
 /// - Empty content → ""
@@ -1932,5 +1978,117 @@ async fn handle_ask_user_question(
         Err(e) => {
             Some(Err(anyhow::anyhow!("Failed to show LLM question: {}", e)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- format_elapsed ---
+
+    #[test]
+    fn test_format_elapsed_seconds() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(1), "1s");
+        assert_eq!(format_elapsed(59), "59s");
+    }
+
+    #[test]
+    fn test_format_elapsed_minutes() {
+        assert_eq!(format_elapsed(60), "1m 0s");
+        assert_eq!(format_elapsed(61), "1m 1s");
+        assert_eq!(format_elapsed(90), "1m 30s");
+        assert_eq!(format_elapsed(600), "10m 0s");
+        assert_eq!(format_elapsed(3661), "61m 1s");
+    }
+
+    // --- format_token_count ---
+
+    #[test]
+    fn test_format_token_count_small() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(1), "1");
+        assert_eq!(format_token_count(999), "999");
+    }
+
+    #[test]
+    fn test_format_token_count_thousands() {
+        assert_eq!(format_token_count(1000), "1.0k");
+        assert_eq!(format_token_count(1500), "1.5k");
+        assert_eq!(format_token_count(9900), "9.9k");
+        assert_eq!(format_token_count(10000), "10.0k");
+    }
+
+    // --- streaming status bar format ---
+
+    #[test]
+    fn test_streaming_status_format() {
+        // Verify the status bar message format used during streaming
+        let secs = 75u64;
+        let tokens = 1600usize;
+        let elapsed_str = format_elapsed(secs);
+        let tokens_str = format_token_count(tokens);
+        let icon = THROB_FRAMES[1]; // "✳"
+        let status = format!("{} Channeling… ({} · ↓ {} tokens)", icon, elapsed_str, tokens_str);
+        assert_eq!(status, "✳ Channeling… (1m 15s · ↓ 1.6k tokens)");
+    }
+
+    #[test]
+    fn test_streaming_status_format_short() {
+        let secs = 9u64;
+        let tokens = 42usize;
+        let icon = THROB_FRAMES[0]; // "✦"
+        let status = format!(
+            "{} Channeling… ({} · ↓ {} tokens)",
+            icon,
+            format_elapsed(secs),
+            format_token_count(tokens)
+        );
+        assert_eq!(status, "✦ Channeling… (9s · ↓ 42 tokens)");
+    }
+
+    #[test]
+    fn test_streaming_status_thinking() {
+        // While thinking (no text yet), status shows "· thinking" suffix
+        let secs = 15u64;
+        let icon = THROB_FRAMES[2]; // "✼"
+        let status = format!("{} Channeling… ({} · thinking)", icon, format_elapsed(secs));
+        assert_eq!(status, "✼ Channeling… (15s · thinking)");
+    }
+
+    #[test]
+    fn test_throb_frames_cycle() {
+        // Frames cycle without panicking
+        let mut idx = 0usize;
+        for _ in 0..100 {
+            idx = (idx + 1) % THROB_FRAMES.len();
+            assert!(!THROB_FRAMES[idx].is_empty());
+        }
+        // After 4 steps we're back to frame 0
+        assert_eq!(THROB_FRAMES.len(), 4);
+    }
+
+    // --- compact_tool_summary ---
+
+    #[test]
+    fn test_compact_tool_summary_empty() {
+        assert_eq!(compact_tool_summary(""), "");
+        assert_eq!(compact_tool_summary("   "), "");
+    }
+
+    #[test]
+    fn test_compact_tool_summary_single_line() {
+        assert_eq!(compact_tool_summary("hello"), "hello");
+        let long = "a".repeat(70);
+        let result = compact_tool_summary(&long);
+        assert!(result.ends_with('…'));
+        assert!(result.len() <= 61); // 57 chars + "…" (3 bytes) = max 60 visible
+    }
+
+    #[test]
+    fn test_compact_tool_summary_multi_line() {
+        let multi = "line1\nline2\nline3";
+        assert_eq!(compact_tool_summary(multi), "3 lines");
     }
 }

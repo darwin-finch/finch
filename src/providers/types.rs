@@ -158,6 +158,22 @@ impl ProviderRequest {
             }
             self.messages.remove(last_assistant_idx);
         }
+
+        // Strip images that exceed provider limits (Claude: 5 MB, Grok: unsupported).
+        // base64-encoded PNG from a Retina screenshot can easily be 7+ MB.
+        // Replace them with a text placeholder so the conversation stays valid.
+        const MAX_IMAGE_BASE64_BYTES: usize = 4_000_000; // ~3 MB raw — safe for all providers
+        for msg in &mut self.messages {
+            for block in &mut msg.content {
+                if let ContentBlock::Image { source } = block {
+                    if source.data.len() > MAX_IMAGE_BASE64_BYTES {
+                        *block = ContentBlock::Text {
+                            text: "[image omitted: too large to send]".to_string(),
+                        };
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -141,9 +141,16 @@ impl OpenAIProvider {
                         })
                         .collect();
 
+                    // Grok (and strict OpenAI) require at least one of content or tool_calls.
+                    // If both are absent, use a single space so the message is not empty.
+                    let content = match (text.is_empty(), tool_calls.is_empty()) {
+                        (false, _) => Some(text),
+                        (true, false) => None, // tool_calls present — content optional
+                        (true, true) => Some(" ".to_string()), // guard: never emit bare {"role":"assistant"}
+                    };
                     messages.push(OpenAIMessage::Assistant {
                         role: "assistant".to_string(),
-                        content: if text.is_empty() { None } else { Some(text) },
+                        content,
                         tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
                     });
                 }

@@ -79,12 +79,26 @@ where
             return;
         }
 
+        // Internal finch modules (cli, tools, generators, models, etc.) should not
+        // clutter the TUI with implementation details. Only surface provider/network
+        // warnings + errors that are genuinely user-relevant.
+        let target = metadata.target();
+        let is_internal = target.starts_with("finch::cli")
+            || target.starts_with("finch::tools")
+            || target.starts_with("finch::generators")
+            || target.starts_with("finch::models")
+            || target.starts_with("finch::local")
+            || target.starts_with("finch::scheduling")
+            || target.starts_with("finch::server");
+        if is_internal && *level <= Level::INFO {
+            return; // Suppress internal INFO/DEBUG from TUI; ERRORs still shown
+        }
+
         // Extract the message using a visitor
         let mut visitor = MessageVisitor::new();
         event.record(&mut visitor);
 
         if let Some(message) = visitor.message {
-            let target = metadata.target();
             let formatted = self.format_message(target, &message);
 
             // Route based on log level
