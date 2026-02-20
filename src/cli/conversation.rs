@@ -25,9 +25,9 @@ impl ConversationHistory {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
-            max_messages: 20, // Keep last 20 messages (10 user + 10 assistant turns)
-            max_tokens_estimate: 32_000, // ~8K tokens * 4 chars/token
-            compaction_threshold_percent: 0.8, // Compact at 80% of max tokens
+            max_messages: 500, // ~250 turns — plenty for a full coding session
+            max_tokens_estimate: 600_000, // ~150k tokens * 4 chars/token (Claude: 200k context)
+            compaction_threshold_percent: 0.9, // Compact at 90% of max
             auto_compact_enabled: true, // Auto-compaction enabled by default
         }
     }
@@ -230,9 +230,9 @@ impl ConversationHistory {
             serde_json::from_str(&json).context("Failed to parse conversation JSON")?;
 
         // Restore default config values (these are skipped during serialization)
-        history.max_messages = 20;
-        history.max_tokens_estimate = 32_000;
-        history.compaction_threshold_percent = 0.8;
+        history.max_messages = 500;
+        history.max_tokens_estimate = 600_000;
+        history.compaction_threshold_percent = 0.9;
         history.auto_compact_enabled = true;
 
         Ok(history)

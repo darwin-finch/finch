@@ -773,7 +773,7 @@ impl EventLoop {
             }
         };
 
-        const MAX_TOOL_ITERATIONS: usize = 25;
+        const MAX_TOOL_ITERATIONS: usize = 100;
         #[allow(unused_assignments)]
         let mut iteration = 0;
 
