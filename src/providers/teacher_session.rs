@@ -492,6 +492,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         session.send_message(&request1).await.unwrap();
@@ -532,6 +533,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         session.send_message(&request2).await.unwrap();
@@ -559,6 +561,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         session.send_message(&request).await.unwrap();
@@ -627,6 +630,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         let truncated = session.truncate_context(&request);
@@ -690,6 +694,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         let truncated = session.truncate_context(&request);
@@ -849,6 +854,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         let optimized = session.optimize_context(&request);

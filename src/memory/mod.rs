@@ -77,11 +77,30 @@ impl MemorySystem {
 
         tracing::info!("Memory system initialized: {}", config.db_path.display());
 
-        // Create MemTree
-        let tree = MemTree::new();
+        // Create MemTree and rehydrate from existing conversations in SQLite.
+        // This makes search_memory work across sessions: every stored conversation
+        // is re-embedded and re-inserted into the in-memory tree at startup.
+        let embedding_engine_init = TfIdfEmbedding::new();
+        let mut tree = MemTree::new();
 
-        // Load existing tree nodes from database
-        // (For now, start with empty tree - TODO: implement persistence)
+        {
+            let mut stmt = conn.prepare(
+                "SELECT content FROM conversations ORDER BY created_at ASC",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let count = rows.len();
+            for content in rows {
+                if let Ok(embedding) = embedding_engine_init.embed(&content) {
+                    let _ = tree.insert(content, embedding);
+                }
+            }
+            if count > 0 {
+                tracing::info!("Rehydrated MemTree with {} memories from database", count);
+            }
+        }
 
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),

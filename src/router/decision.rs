@@ -120,10 +120,14 @@ impl Router {
     }
 }
 
-// FIXME: Tests disabled - CrisisDetector was removed from the routing system
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ThresholdRouter;
+
+    fn make_router() -> Router {
+        Router::new(ThresholdRouter::new())
+    }
 
     #[test]
     fn test_forward_reason_as_str() {
@@ -132,13 +136,80 @@ mod tests {
         assert_eq!(ForwardReason::ModelNotReady.as_str(), "model_not_ready");
     }
 
-    // #[test]
-    // fn test_route_with_generator_check_not_ready() {
-    //     // FIXME: CrisisDetector no longer exists
-    // }
+    #[test]
+    fn test_route_returns_decision() {
+        let router = make_router();
+        // Default ThresholdRouter tries local — any decision is valid
+        match router.route("hello") {
+            RouteDecision::Local { .. } | RouteDecision::Forward { .. } => {}
+        }
+    }
 
-    // #[test]
-    // fn test_route_with_generator_check_ready() {
-    //     // FIXME: CrisisDetector no longer exists
-    // }
+    #[test]
+    fn test_route_with_generator_not_ready_always_forwards() {
+        let router = make_router();
+        // When generator isn't ready, ALL queries must forward
+        for query in &["hello", "what is Rust?", "how do I fix this error?", "explain ownership"] {
+            match router.route_with_generator_check(query, false) {
+                RouteDecision::Forward { reason: ForwardReason::ModelNotReady } => {}
+                other => panic!("Expected ModelNotReady forward for {:?}, got {:?}", query, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_route_with_generator_ready_uses_normal_routing() {
+        let router = make_router();
+        // When generator is ready, routing is driven by ThresholdRouter stats
+        // We just verify we get a valid decision — not ModelNotReady
+        match router.route_with_generator_check("hello", true) {
+            RouteDecision::Forward { reason: ForwardReason::ModelNotReady } => {
+                panic!("Should not return ModelNotReady when generator IS ready")
+            }
+            RouteDecision::Local { .. } | RouteDecision::Forward { .. } => {}
+        }
+    }
+
+    #[test]
+    fn test_learn_local_attempt_updates_stats() {
+        let mut router = make_router();
+        let before = router.stats().total_queries;
+        router.learn_local_attempt("hello world", true);
+        let after = router.stats().total_queries;
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn test_learn_forwarded_updates_stats() {
+        let mut router = make_router();
+        let before = router.stats().total_queries;
+        router.learn_forwarded("complex multi-part question about async Rust");
+        let after = router.stats().total_queries;
+        assert_eq!(after, before + 1);
+        // Forwarded queries don't increment local_attempts
+        assert_eq!(router.stats().total_local_attempts, 0);
+    }
+
+    #[test]
+    fn test_stats_returns_valid_rates() {
+        let router = make_router();
+        let stats = router.stats();
+        assert!(stats.forward_rate >= 0.0 && stats.forward_rate <= 1.0);
+        assert!(stats.success_rate >= 0.0 && stats.success_rate <= 1.0);
+        assert!(stats.confidence_threshold > 0.0 && stats.confidence_threshold <= 1.0);
+    }
+
+    #[test]
+    fn test_route_save_and_load_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut router = make_router();
+        router.learn_local_attempt("hello", true);
+        router.learn_forwarded("complex query");
+        router.save(tmp.path()).unwrap();
+
+        let loaded_threshold = Router::load_threshold(tmp.path()).unwrap();
+        let loaded_router = Router::new(loaded_threshold);
+        let stats = loaded_router.stats();
+        assert_eq!(stats.total_queries, 2);
+    }
 }

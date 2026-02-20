@@ -2,6 +2,7 @@
 // Library exports
 
 // Core modules
+pub mod agent; // Autonomous agent loop (task backlog, reflection, activity log)
 pub mod claude;
 pub mod cli;
 pub mod client; // HTTP client for daemon communication (Phase 8)
@@ -21,6 +22,7 @@ pub mod providers; // Multi-provider LLM support
 pub mod router;
 pub mod scheduling; // Autonomous task scheduling (Phase 5)
 pub mod server; // HTTP daemon mode (Phase 1)
+pub mod network; // Lotus Network device registration and membership
 pub mod node;    // Node identity and work statistics (distributed worker)
 pub mod service; // Service discovery (Phase 3)
 pub mod tools; // Tool execution system

@@ -10,79 +10,74 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Speed up CI builds (override Cargo.toml's lto=true / codegen-units=1)
   CARGO_PROFILE_RELEASE_LTO: "false"
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   build-release:
-    name: Build Release Binary
+    name: Build ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # Linux disabled - compilation issues (see GitHub issue)
-          # - os: ubuntu-latest
-          #   target: x86_64-unknown-linux-gnu
-          #   artifact_name: shammah
-          #   asset_name: shammah-linux-x86_64
-          # macOS Intel disabled - macos-13 runner unavailable
-          # - os: macos-13
-          #   target: x86_64-apple-darwin
-          #   artifact_name: shammah
-          #   asset_name: shammah-macos-x86_64
           - os: macos-14
             target: aarch64-apple-darwin
-            artifact_name: shammah
-            asset_name: shammah-macos-aarch64
+            asset_name: finch-macos-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset_name: finch-macos-x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset_name: finch-linux-x86_64
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev build-essential
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Check environment (Linux)
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
-          echo "=== System Info ==="
-          uname -a
-          echo "=== GCC Version ==="
-          gcc --version || echo "gcc not found"
-          echo "=== PKG_CONFIG ==="
-          pkg-config --version || echo "pkg-config not found"
-          echo "=== Available libraries ==="
-          ldconfig -p | grep -E "ssl|crypto" || echo "No SSL libraries found"
+          sudo apt-get update -qq
+          sudo apt-get install -y pkg-config libssl-dev
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Strip binary (Linux/macOS)
-        run: |
-          strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }} || true
+      - name: Strip binary (non-Windows)
+        run: strip target/${{ matrix.target }}/release/finch || true
 
       - name: Create tarball
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
-          mv ${{ matrix.asset_name }}.tar.gz ../../..
+          tar czf ../../../${{ matrix.asset_name }}.tar.gz finch
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}.tar.gz
+          if-no-files-found: error
 
   create-release:
-    name: Create Release
+    name: Create GitHub Release
     needs: build-release
     runs-on: ubuntu-latest
     steps:
@@ -94,44 +89,61 @@ jobs:
         with:
           path: artifacts
 
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ github.ref_name }}
         run: |
-          # Extract version from tag (remove 'v' prefix)
           version="${tag#v}"
 
-          # Generate release notes
-          cat > release_notes.md << EOF
-          Release v${version}
+          cat > release_notes.md << 'NOTES'
+          ## Finch VPLACEHOLDER
 
-          ## Installation
+          Local-first AI coding assistant. Works great in cloud-only mode
+          with Grok, Claude, GPT-4, or any other OpenAI-compatible API.
 
-          **One-liner install (recommended):**
-          \`\`\`bash
-          curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
-          \`\`\`
+          ## Install
 
-          **Or download manually:**
+          **macOS (Apple Silicon — M1/M2/M3/M4):**
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/TAGPLACEHOLDER/finch-macos-arm64.tar.gz | tar xz
+          sudo mv finch /usr/local/bin/
+          ```
 
-          - [macOS ARM64 (Apple Silicon)](https://github.com/${{ github.repository }}/releases/download/${tag}/shammah-macos-aarch64.tar.gz)
+          **macOS (Intel):**
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/TAGPLACEHOLDER/finch-macos-x86_64.tar.gz | tar xz
+          sudo mv finch /usr/local/bin/
+          ```
 
-          *Note: Linux and macOS Intel binaries coming soon*
+          **Linux (x86_64):**
+          ```bash
+          curl -L https://github.com/${{ github.repository }}/releases/download/TAGPLACEHOLDER/finch-linux-x86_64.tar.gz | tar xz
+          sudo mv finch /usr/local/bin/
+          ```
 
-          Extract and add to your PATH:
-          \`\`\`bash
-          tar xzf shammah-*.tar.gz
-          mv shammah ~/.local/bin/  # or /usr/local/bin
-          \`\`\`
+          ## First run
 
-          ## Changes
+          ```bash
+          finch setup          # interactive setup wizard (add your API key)
+          finch --cloud-only   # start chatting, no model download needed
+          ```
 
-          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
-          EOF
+          ## Grok via X Premium+
 
-          # Create release with macOS ARM64 binary
+          Get your API key at [console.x.ai](https://console.x.ai),
+          then run `finch setup` and select Grok.
+          NOTES
+
+          # Substitute version and tag placeholders
+          sed -i "s/VPLACEHOLDER/v${version}/g; s/TAGPLACEHOLDER/${tag}/g" release_notes.md
+
           gh release create "${tag}" \
-            --title "Shammah v${version}" \
+            --title "Finch v${version}" \
             --notes-file release_notes.md \
-            artifacts/shammah-macos-aarch64/shammah-macos-aarch64.tar.gz
+            artifacts/finch-macos-arm64/finch-macos-arm64.tar.gz \
+            artifacts/finch-macos-x86_64/finch-macos-x86_64.tar.gz \
+            artifacts/finch-linux-x86_64/finch-linux-x86_64.tar.gz

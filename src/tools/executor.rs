@@ -369,13 +369,11 @@ impl ToolExecutor {
             PermissionCheck::Allow => {
                 debug!("Tool execution allowed");
             }
-            PermissionCheck::AskUser(reason) => {
-                // For now, deny if ask required (will implement user prompts in Phase 2)
-                error!("Tool execution requires user confirmation: {}", reason);
-                return Ok(ToolResult::error(
-                    tool_use.id.clone(),
-                    format!("Permission required: {}", reason),
-                ));
+            PermissionCheck::AskUser(_reason) => {
+                // Confirmation was already handled by ToolExecutionCoordinator before
+                // execute_tool() is called. AskUser here means "needs confirmation",
+                // which has already been obtained — proceed with execution.
+                debug!("Tool requires confirmation (handled by coordinator)");
             }
             PermissionCheck::Deny(reason) => {
                 error!("Tool execution denied: {}", reason);

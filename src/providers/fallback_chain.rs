@@ -44,22 +44,25 @@ impl FallbackChain {
         let mut last_error = None;
 
         for (idx, provider) in self.providers.iter().enumerate() {
-            tracing::info!(
+            tracing::debug!(
                 "Trying provider {} ({}/{})",
                 provider.name(),
                 idx + 1,
                 self.providers.len()
             );
 
-            // Create a modified request with this provider's model ID
-            let provider_request = ProviderRequest {
+            // Create a modified request with this provider's model ID,
+            // sanitizing orphaned tool_use blocks from previous failed providers
+            let mut provider_request = ProviderRequest {
                 model: provider.default_model().to_string(),
                 messages: request.messages.clone(),
                 max_tokens: request.max_tokens,
                 tools: request.tools.clone(),
                 temperature: request.temperature,
                 stream: request.stream,
+                system: request.system.clone(),
             };
+            provider_request.sanitize_messages();
 
             match provider.send_message(&provider_request).await {
                 Ok(response) => {
@@ -105,22 +108,25 @@ impl FallbackChain {
         let mut last_error = None;
 
         for (idx, provider) in self.providers.iter().enumerate() {
-            tracing::info!(
+            tracing::debug!(
                 "Trying streaming with provider {} ({}/{})",
                 provider.name(),
                 idx + 1,
                 self.providers.len()
             );
 
-            // Create a modified request with this provider's model ID
-            let provider_request = ProviderRequest {
+            // Create a modified request with this provider's model ID,
+            // sanitizing orphaned tool_use blocks from previous failed providers
+            let mut provider_request = ProviderRequest {
                 model: provider.default_model().to_string(),
                 messages: request.messages.clone(),
                 max_tokens: request.max_tokens,
                 tools: request.tools.clone(),
                 temperature: request.temperature,
                 stream: request.stream,
+                system: request.system.clone(),
             };
+            provider_request.sanitize_messages();
 
             match provider.send_message_stream(&provider_request).await {
                 Ok(receiver) => {
@@ -281,6 +287,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -303,6 +310,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -325,6 +333,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: false,
+            system: None,
         };
 
         let result = chain.send_message_with_fallback(&request).await;
@@ -346,6 +355,7 @@ mod tests {
             temperature: None,
             tools: None,
             stream: true,
+            system: None,
         };
 
         let result = chain.send_message_stream_with_fallback(&request).await;

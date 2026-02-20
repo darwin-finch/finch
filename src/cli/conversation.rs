@@ -384,6 +384,7 @@ impl<'a> ConversationCompactor<'a> {
             tools: None,
             temperature: None,
             stream: false,
+            system: None,
         };
 
         let response = self

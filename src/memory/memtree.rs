@@ -50,7 +50,7 @@ impl MemTree {
             parent: None,
             children: Vec::new(),
             text: String::from("ROOT"),
-            embedding: vec![0.0; 384],  // Zero vector
+            embedding: vec![0.0; 2048],  // Zero vector — matches TfIdfEmbedding dimension
             level: 0,
             created_at: chrono::Utc::now().timestamp(),
         };

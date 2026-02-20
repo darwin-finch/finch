@@ -44,16 +44,30 @@ impl NodeIdentity {
     }
 
     fn generate() -> Result<Self> {
-        let id = Uuid::new_v4();
         let name = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| format!("finch-{}", &id.to_string()[..8]));
+            .unwrap_or_else(|| "finch-node".to_string());
+
+        // UUID v5: deterministic from a finch-specific namespace + hostname.
+        // Same machine always gets the same UUID, even across reinstalls.
+        let id = Self::device_uuid(&name);
         Ok(Self {
             id,
             name,
             version: env!("CARGO_PKG_VERSION").to_string(),
         })
+    }
+
+    /// Generate a deterministic UUID v5 for a device fingerprint string.
+    /// Uses a fixed finch namespace so the ID is stable and globally unique.
+    pub fn device_uuid(fingerprint: &str) -> Uuid {
+        // Fixed namespace UUID for finch (generated once, never changes)
+        const FINCH_NAMESPACE: Uuid = Uuid::from_bytes([
+            0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1,
+            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+        ]);
+        Uuid::new_v5(&FINCH_NAMESPACE, fingerprint.as_bytes())
     }
 
     fn save(&self) -> Result<()> {

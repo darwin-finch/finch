@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A persona defines how the AI should behave
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +52,14 @@ pub struct PersonaBehavior {
     /// Example interactions (for few-shot learning)
     #[serde(default)]
     pub examples: Vec<PersonaExample>,
+
+    /// Git author name used when agent commits changes autonomously
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_name: Option<String>,
+
+    /// Git author email used when agent commits changes autonomously
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_email: Option<String>,
 }
 
 /// Example interaction for few-shot learning
@@ -80,11 +88,25 @@ impl Persona {
             "analyst" => include_str!("../../data/personas/analyst.toml"),
             "creative" => include_str!("../../data/personas/creative.toml"),
             "researcher" => include_str!("../../data/personas/researcher.toml"),
+            "autonomous" => include_str!("../../data/personas/autonomous.toml"),
             _ => anyhow::bail!("Unknown builtin persona: {}", name),
         };
 
         toml::from_str(template)
             .with_context(|| format!("Failed to parse builtin persona: {}", name))
+    }
+
+    /// Load persona by name: checks ~/.finch/personas/<name>.toml first, then builtins
+    pub fn load_by_name(name: &str) -> Result<Self> {
+        if let Some(home) = dirs::home_dir() {
+            let user_path = home.join(".finch/personas").join(format!("{}.toml", name));
+            if user_path.exists() {
+                return Self::load(&user_path).with_context(|| {
+                    format!("Failed to load user persona from {}", user_path.display())
+                });
+            }
+        }
+        Self::load_builtin(name)
     }
 
     /// Get system prompt formatted for injection
@@ -124,7 +146,7 @@ impl Persona {
 
     /// List available builtin personas
     pub fn list_builtins() -> Vec<&'static str> {
-        vec!["default", "expert-coder", "teacher", "analyst", "creative", "researcher"]
+        vec!["default", "expert-coder", "teacher", "analyst", "creative", "researcher", "autonomous"]
     }
 }
 
@@ -142,6 +164,8 @@ impl Default for Persona {
                 verbosity: "Balanced".to_string(),
                 focus: "Helpfulness".to_string(),
                 examples: Vec::new(),
+                git_name: None,
+                git_email: None,
             },
         }
     }
@@ -150,19 +174,211 @@ impl Default for Persona {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn write_persona(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f
+    }
+
+    // ── default ───────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_default_persona() {
+    fn test_default_persona_name() {
         let persona = Persona::default();
         assert_eq!(persona.name(), "Default");
+    }
+
+    #[test]
+    fn test_default_persona_has_system_prompt() {
+        let persona = Persona::default();
         assert!(!persona.behavior.system_prompt.is_empty());
     }
 
     #[test]
-    fn test_builtin_personas() {
+    fn test_default_persona_has_no_git_identity() {
+        let persona = Persona::default();
+        assert!(persona.behavior.git_name.is_none());
+        assert!(persona.behavior.git_email.is_none());
+    }
+
+    // ── builtins ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_all_builtins_load_without_error() {
         for name in Persona::list_builtins() {
-            let persona = Persona::load_builtin(name);
-            assert!(persona.is_ok(), "Failed to load builtin persona: {}", name);
+            let result = Persona::load_builtin(name);
+            assert!(result.is_ok(), "Failed to load builtin persona: {}", name);
         }
+    }
+
+    #[test]
+    fn test_builtins_list_includes_autonomous() {
+        assert!(Persona::list_builtins().contains(&"autonomous"));
+    }
+
+    #[test]
+    fn test_autonomous_builtin_has_git_identity() {
+        let persona = Persona::load_builtin("autonomous").unwrap();
+        assert!(
+            persona.behavior.git_name.is_some(),
+            "autonomous persona should have git_name"
+        );
+        assert!(
+            persona.behavior.git_email.is_some(),
+            "autonomous persona should have git_email"
+        );
+    }
+
+    #[test]
+    fn test_autonomous_builtin_has_non_empty_system_prompt() {
+        let persona = Persona::load_builtin("autonomous").unwrap();
+        assert!(!persona.behavior.system_prompt.is_empty());
+    }
+
+    #[test]
+    fn test_unknown_builtin_returns_error() {
+        let result = Persona::load_builtin("nonexistent-persona-xyz");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Unknown builtin persona"));
+    }
+
+    // ── load from file ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_from_toml_file() {
+        let toml = r#"
+[persona]
+name = "Custom"
+description = "A custom persona"
+version = "2.0"
+
+[behavior]
+system_prompt = "You are a custom assistant."
+tone = "Casual"
+"#;
+        let f = write_persona(toml);
+        let persona = Persona::load(f.path()).unwrap();
+        assert_eq!(persona.name(), "Custom");
+        assert_eq!(persona.behavior.system_prompt, "You are a custom assistant.");
+        assert_eq!(persona.behavior.tone, "Casual");
+    }
+
+    #[test]
+    fn test_load_file_with_git_identity() {
+        let toml = r#"
+[persona]
+name = "Vesper"
+description = "Named agent"
+
+[behavior]
+system_prompt = "I am Vesper."
+git_name = "Vesper"
+git_email = "vesper@example.com"
+"#;
+        let f = write_persona(toml);
+        let persona = Persona::load(f.path()).unwrap();
+        assert_eq!(persona.behavior.git_name.as_deref(), Some("Vesper"));
+        assert_eq!(persona.behavior.git_email.as_deref(), Some("vesper@example.com"));
+    }
+
+    #[test]
+    fn test_load_file_without_git_identity_gives_none() {
+        let toml = r#"
+[persona]
+name = "Simple"
+description = "No git fields"
+
+[behavior]
+system_prompt = "Simple assistant."
+"#;
+        let f = write_persona(toml);
+        let persona = Persona::load(f.path()).unwrap();
+        assert!(persona.behavior.git_name.is_none());
+        assert!(persona.behavior.git_email.is_none());
+    }
+
+    #[test]
+    fn test_load_nonexistent_file_returns_error() {
+        let result = Persona::load(Path::new("/nonexistent/persona.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_invalid_toml_returns_error() {
+        let f = write_persona("not valid {{ toml at all");
+        let result = Persona::load(f.path());
+        assert!(result.is_err());
+    }
+
+    // ── load_by_name fallthrough ──────────────────────────────────────────────
+
+    #[test]
+    fn test_load_by_name_falls_through_to_builtin() {
+        // There is no ~/.finch/personas/default.toml in the test environment
+        // (or if there is, the test still passes since the builtin is valid)
+        let persona = Persona::load_by_name("default");
+        assert!(persona.is_ok(), "load_by_name should fall back to builtin");
+    }
+
+    #[test]
+    fn test_load_by_name_unknown_returns_error() {
+        let result = Persona::load_by_name("definitely-does-not-exist-xyz");
+        assert!(result.is_err());
+    }
+
+    // ── to_system_message ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_system_message_no_examples() {
+        let persona = Persona::default();
+        let msg = persona.to_system_message();
+        assert_eq!(msg, persona.behavior.system_prompt);
+    }
+
+    #[test]
+    fn test_to_system_message_with_examples_appends_them() {
+        let mut persona = Persona::default();
+        persona.behavior.examples.push(PersonaExample {
+            user: "What is 2+2?".to_string(),
+            assistant: "4".to_string(),
+        });
+        let msg = persona.to_system_message();
+        assert!(msg.contains("What is 2+2?"));
+        assert!(msg.contains("Example interactions"));
+    }
+
+    // ── accessor methods ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_accessors_return_correct_values() {
+        let persona = Persona::default();
+        assert_eq!(persona.tone(), "Professional");
+        assert_eq!(persona.verbosity(), "Balanced");
+        assert_eq!(persona.focus(), "Helpfulness");
+    }
+
+    // ── serde round-trip ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_git_fields_not_serialized_when_none() {
+        let persona = Persona::default();
+        // Serialize via toml and ensure git_name/git_email don't appear
+        let toml_str = toml::to_string(&persona).unwrap();
+        assert!(!toml_str.contains("git_name"), "git_name should be absent when None");
+        assert!(!toml_str.contains("git_email"), "git_email should be absent when None");
+    }
+
+    #[test]
+    fn test_git_fields_serialized_when_present() {
+        let mut persona = Persona::default();
+        persona.behavior.git_name = Some("Bot".to_string());
+        persona.behavior.git_email = Some("bot@finch".to_string());
+        let toml_str = toml::to_string(&persona).unwrap();
+        assert!(toml_str.contains("git_name"), "git_name should be present");
+        assert!(toml_str.contains("git_email"), "git_email should be present");
     }
 }

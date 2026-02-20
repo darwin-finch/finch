@@ -25,7 +25,7 @@ use crate::tools::types::{ToolDefinition, ToolUse};
 
 use super::events::ReplEvent;
 use super::query_state::{QueryState, QueryStateManager};
-use super::tool_display::{format_tool_label, stream_tool_output_to_message};
+use super::tool_display::format_tool_label;
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// Main event loop for concurrent REPL
@@ -101,8 +101,10 @@ pub struct EventLoop {
     /// Current view mode (List or Tree)
     view_mode: Arc<RwLock<ViewMode>>,
 
-    /// Active tool calls: tool_id -> (tool_name, input, live_message) for display lookup
-    active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::LiveToolMessage>)>>>,
+    /// Active tool calls: tool_id -> (tool_name, input, op_message, row_idx)
+    /// All tools in one generation turn share the same OperationMessage; each
+    /// tool occupies one row identified by its index.
+    active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::OperationMessage>, usize)>>>,
 }
 
 /// View mode for the REPL
@@ -208,6 +210,33 @@ impl EventLoop {
     /// Run the event loop
     pub async fn run(&mut self) -> Result<()> {
         tracing::debug!("Event loop starting");
+
+        // ── Startup header (Claude Code style) ───────────────────────────────
+        // Clear accumulated startup noise from the output manager, then print a
+        // clean header: finch version · primary model · working directory.
+        self.output_manager.clear();
+
+        let model_name = self.claude_gen.name().to_string();
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| {
+                // Shorten $HOME prefix to ~
+                if let Some(home) = dirs::home_dir() {
+                    if let Ok(rel) = p.strip_prefix(&home) {
+                        return format!("~/{}", rel.display());
+                    }
+                }
+                p.display().to_string()
+            })
+            .unwrap_or_else(|| "~".to_string());
+
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            if let Err(e) = tui.print_startup_header(&model_name, &cwd) {
+                tracing::warn!("Failed to print startup header: {}", e);
+            }
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         // Initialize compaction status display
         self.update_compaction_status().await;
@@ -710,7 +739,7 @@ impl EventLoop {
         mode: Arc<RwLock<ReplMode>>,
         output_manager: Arc<OutputManager>,
         status_bar: Arc<crate::cli::StatusBar>,
-        active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::LiveToolMessage>)>>>,
+        active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::OperationMessage>, usize)>>>,
     ) {
         tracing::debug!("process_query_with_tools starting for query_id: {:?}", query_id);
 
@@ -744,7 +773,7 @@ impl EventLoop {
             }
         };
 
-        const MAX_TOOL_ITERATIONS: usize = 10;
+        const MAX_TOOL_ITERATIONS: usize = 25;
         let mut iteration = 0;
 
         loop {
@@ -768,6 +797,7 @@ impl EventLoop {
 
                 // Create message BEFORE starting stream to avoid race condition
                 // This ensures the response appears in correct order even if user types quickly
+                status_bar.update_operation("⏺ Generating…");
                 use crate::cli::messages::StreamingResponseMessage;
                 let msg = Arc::new(StreamingResponseMessage::new());
                 output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
@@ -867,12 +897,19 @@ impl EventLoop {
                             conversation.write().await.add_message(assistant_message);
                             tracing::debug!("[EVENT_LOOP] Assistant message added, spawning tool executions");
 
+                            // One OperationMessage groups all tool calls for this turn.
+                            // Created lazily here (not at generation start) so text-only
+                            // turns leave no extra scrollback entry.
+                            let op_msg = output_manager.start_operation("Generating");
+
                             // Execute tools (check for AskUserQuestion first, then mode restrictions)
                             let current_mode = mode.read().await;
                             for tool_use in tool_uses {
                                 // Check if tool is allowed in current mode
                                 if !Self::is_tool_allowed_in_mode(&tool_use.name, &*current_mode) {
-                                    // Tool blocked by plan mode - send error result
+                                    // Tool blocked by plan mode - add error row and send result
+                                    let label = format_tool_label(&tool_use.name, &tool_use.input);
+                                    let row_idx = op_msg.add_row(label);
                                     let error_msg = format!(
                                         "Tool '{}' is not allowed in planning mode.\n\
                                          Reason: This tool can modify system state.\n\
@@ -880,6 +917,7 @@ impl EventLoop {
                                          Type /approve to execute your plan with all tools enabled.",
                                         tool_use.name
                                     );
+                                    op_msg.fail_row(row_idx, format!("blocked in plan mode"));
                                     let _ = event_tx.send(ReplEvent::ToolResult {
                                         query_id,
                                         tool_id: tool_use.id.clone(),
@@ -888,15 +926,14 @@ impl EventLoop {
                                     continue;
                                 }
 
-                                // Create live tool message - shows immediately with spinner,
-                                // then updates with result when tool completes
+                                // Add a running row for this tool to the shared OperationMessage
                                 let label = format_tool_label(&tool_use.name, &tool_use.input);
-                                let live_msg = output_manager.start_live_tool(&label);
+                                let row_idx = op_msg.add_row(&label);
 
-                                // Store metadata + live message for result lookup
+                                // Store (name, input, op_msg, row_idx) for result lookup
                                 active_tool_uses.write().await.insert(
                                     tool_use.id.clone(),
-                                    (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&live_msg)),
+                                    (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&op_msg), row_idx),
                                 );
 
                                 // Check if this is AskUserQuestion (handle specially)
@@ -952,6 +989,7 @@ impl EventLoop {
             }
 
             // Non-streaming path (for Qwen or fallback)
+            status_bar.update_operation("⏺ Generating…");
             match generator
                 .generate(messages, Some((*tool_definitions).clone()))
                 .await
@@ -1002,12 +1040,17 @@ impl EventLoop {
                         };
                         conversation.write().await.add_message(assistant_message);
 
+                        // One OperationMessage groups all tool calls for this turn.
+                        let op_msg = output_manager.start_operation("Generating");
+
                         // Execute tools (check for AskUserQuestion first, then mode restrictions)
                         let current_mode = mode.read().await;
                         for tool_use in tool_uses {
                             // Check if tool is allowed in current mode
                             if !Self::is_tool_allowed_in_mode(&tool_use.name, &*current_mode) {
-                                // Tool blocked by plan mode - send error result
+                                let label = format_tool_label(&tool_use.name, &tool_use.input);
+                                let row_idx = op_msg.add_row(label);
+                                op_msg.fail_row(row_idx, "blocked in plan mode");
                                 let error_msg = format!(
                                     "Tool '{}' is not allowed in planning mode.\n\
                                      Reason: This tool can modify system state.\n\
@@ -1022,6 +1065,14 @@ impl EventLoop {
                                 });
                                 continue;
                             }
+
+                            // Add a running row for this tool
+                            let label = format_tool_label(&tool_use.name, &tool_use.input);
+                            let row_idx = op_msg.add_row(&label);
+                            active_tool_uses.write().await.insert(
+                                tool_use.id.clone(),
+                                (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&op_msg), row_idx),
+                            );
 
                             // Check if this is AskUserQuestion (handle specially)
                             if let Some(result) = handle_ask_user_question(&tool_use, Arc::clone(&tui_renderer)).await {
@@ -1285,24 +1336,32 @@ impl EventLoop {
         tool_id: String,
         result: Result<String>,
     ) -> Result<()> {
-        // Look up the tool's metadata and live message
-        let (_tool_name, _tool_input, live_msg) = {
+        // Look up the tool's metadata and OperationMessage row
+        let (_tool_name, _tool_input, op_msg, row_idx) = {
             let mut map = self.active_tool_uses.write().await;
             map.remove(&tool_id).unwrap_or_else(|| {
-                // Fallback: create a new message if not tracked
-                let fallback = self.output_manager.start_live_tool(&tool_id);
-                (tool_id.clone(), serde_json::Value::Null, fallback)
+                // Fallback: create a standalone OperationMessage for untracked tools
+                let fallback = Arc::new(crate::cli::messages::OperationMessage::new("Tool"));
+                self.output_manager.add_trait_message(Arc::clone(&fallback) as crate::cli::messages::MessageRef);
+                let row_idx = fallback.add_row(&tool_id);
+                (tool_id.clone(), serde_json::Value::Null, fallback, row_idx)
             })
         };
 
-        // Stream the result into the live message line by line
-        // This creates the "streaming diff" visual effect
+        // Update the row in the OperationMessage with a compact summary
         match &result {
             Ok(content) => {
-                stream_tool_output_to_message(Arc::clone(&live_msg), content.clone(), false);
+                op_msg.complete_row(row_idx, compact_tool_summary(content));
             }
             Err(e) => {
-                stream_tool_output_to_message(Arc::clone(&live_msg), e.to_string(), true);
+                // Truncate very long error messages for the row display
+                let err_str = e.to_string();
+                let short_err = if err_str.len() > 60 {
+                    format!("{}…", &err_str[..57])
+                } else {
+                    err_str
+                };
+                op_msg.fail_row(row_idx, short_err);
             }
         }
 
@@ -1332,7 +1391,10 @@ impl EventLoop {
                     .unwrap_or(0);
 
                 if results_count >= tools_pending {
-                    // All tools completed, format results and add to conversation
+                    // All tools completed — mark the OperationMessage done so the
+                    // trailing "…" drops and the row summary is final.
+                    op_msg.set_complete();
+                    // format results and add to conversation
                     self.finalize_tool_execution(query_id).await?;
                 }
             }
@@ -1809,6 +1871,29 @@ async fn handle_present_plan(
 }
 
 /// Handle AskUserQuestion tool call specially (shows dialog instead of executing as tool)
+/// Produce a compact one-line summary of tool output for display in an OperationMessage row.
+///
+/// - Empty content → ""
+/// - Single line   → the line, truncated to 60 chars
+/// - Multi-line    → "<N> lines"
+fn compact_tool_summary(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() == 1 {
+        let line = lines[0].trim();
+        if line.len() > 60 {
+            format!("{}…", &line[..57])
+        } else {
+            line.to_string()
+        }
+    } else {
+        format!("{} lines", lines.len())
+    }
+}
+
 ///
 /// Returns Some(tool_result) if this is an AskUserQuestion call, None otherwise
 async fn handle_ask_user_question(

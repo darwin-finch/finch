@@ -62,11 +62,11 @@ impl Tool for BashTool {
             result.push_str(&format!("Exit code: {}", exit_code));
         }
 
-        // Limit to 5,000 chars
-        if result.len() > 5_000 {
+        // Limit to 20,000 chars
+        if result.len() > 20_000 {
             Ok(format!(
-                "{}\n\n[Output truncated - showing first 5,000 characters]",
-                &result[..5_000]
+                "{}\n\n[Output truncated - showing first 20,000 characters]",
+                &result[..20_000]
             ))
         } else {
             Ok(result)

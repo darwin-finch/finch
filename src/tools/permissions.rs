@@ -71,7 +71,7 @@ impl PermissionManager {
         Self {
             configs: HashMap::new(),
             default_rule: PermissionRule::Ask,
-            max_tool_turns: 3,
+            max_tool_turns: 25,
         }
     }
 
@@ -80,7 +80,7 @@ impl PermissionManager {
         Self {
             configs,
             default_rule: PermissionRule::Ask,
-            max_tool_turns: 3,
+            max_tool_turns: 25,
         }
     }
 

@@ -125,3 +125,74 @@ pub trait Saveable {
     where
         Self: Sized;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_config_default_values() {
+        let config = ModelConfig::default();
+        assert_eq!(config.vocab_size, 50_000);
+        assert_eq!(config.hidden_dim, 768);
+        assert_eq!(config.num_layers, 6);
+        assert_eq!(config.num_heads, 12);
+        assert_eq!(config.max_seq_len, 512);
+        assert_eq!(config.dropout, 0.1);
+    }
+
+    #[test]
+    fn test_model_config_small() {
+        let config = ModelConfig::small();
+        assert_eq!(config.vocab_size, 5000);
+        assert_eq!(config.hidden_dim, 128);
+        assert_eq!(config.num_layers, 2);
+        assert_eq!(config.num_heads, 4);
+        assert_eq!(config.max_seq_len, 256);
+        assert_eq!(config.dropout, 0.0);
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_model_config_for_apple_silicon_uses_metal() {
+        let config = ModelConfig::for_apple_silicon();
+        assert!(matches!(config.device_preference, DevicePreference::Metal));
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_device_preference_default_is_auto() {
+        assert!(matches!(DevicePreference::default(), DevicePreference::Auto));
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_device_info_stub_mentions_onnx() {
+        let info = device_info();
+        assert!(info.contains("ONNX"), "expected ONNX in: {info}");
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_get_device_with_preference_always_errors() {
+        let result = get_device_with_preference(DevicePreference::Auto);
+        assert!(result.is_err(), "Phase 4 stub should always error");
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_is_metal_available_returns_bool() {
+        // Just verify it doesn't panic; actual value is platform-dependent
+        let _ = is_metal_available();
+    }
+
+    #[test]
+    fn test_model_config_serde_roundtrip() {
+        let config = ModelConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ModelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.vocab_size, config.vocab_size);
+        assert_eq!(back.hidden_dim, config.hidden_dim);
+        assert_eq!(back.num_layers, config.num_layers);
+    }
+}

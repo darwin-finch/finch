@@ -316,3 +316,333 @@ impl TabbedDialog {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn make_question(text: &str, options: &[&str], multi: bool) -> Question {
+        Question {
+            question: text.to_string(),
+            header: text[..text.len().min(12)].to_string(),
+            options: options.iter().map(|&label| QuestionOption {
+                label: label.to_string(),
+                description: format!("{label} description"),
+            }).collect(),
+            multi_select: multi,
+        }
+    }
+
+    fn single_tab_dialog(options: &[&str]) -> TabbedDialog {
+        TabbedDialog::new(
+            vec![make_question("Pick one?", options, false)],
+            None,
+        )
+    }
+
+    fn multi_tab_dialog(options: &[&str]) -> TabbedDialog {
+        TabbedDialog::new(
+            vec![make_question("Pick many?", options, true)],
+            None,
+        )
+    }
+
+    // --- basic construction ---
+
+    #[test]
+    fn test_new_dialog_starts_at_tab_zero() {
+        let d = single_tab_dialog(&["A", "B", "C"]);
+        assert_eq!(d.current_tab_index(), 0);
+    }
+
+    #[test]
+    fn test_new_dialog_not_answered() {
+        let d = single_tab_dialog(&["A", "B"]);
+        assert!(!d.all_answered());
+    }
+
+    #[test]
+    fn test_title_stored_correctly() {
+        let d = TabbedDialog::new(vec![make_question("Q?", &["A"], false)], Some("My Title".to_string()));
+        assert_eq!(d.title(), Some("My Title"));
+    }
+
+    #[test]
+    fn test_no_title_is_none() {
+        let d = single_tab_dialog(&["A"]);
+        assert!(d.title().is_none());
+    }
+
+    // --- Esc cancels immediately ---
+
+    #[test]
+    fn test_esc_returns_cancelled() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        let result = d.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(result, Some(TabbedDialogResult::Cancelled));
+    }
+
+    // --- single-select navigation ---
+
+    #[test]
+    fn test_down_moves_selection_forward() {
+        let mut d = single_tab_dialog(&["A", "B", "C"]);
+        assert_eq!(d.current_tab().selected_index, 0);
+        d.handle_key_event(key(KeyCode::Down));
+        assert_eq!(d.current_tab().selected_index, 1);
+        d.handle_key_event(key(KeyCode::Down));
+        assert_eq!(d.current_tab().selected_index, 2);
+    }
+
+    #[test]
+    fn test_down_stops_at_last_option() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Down));
+        d.handle_key_event(key(KeyCode::Down)); // Can't go past last
+        assert_eq!(d.current_tab().selected_index, 1);
+    }
+
+    #[test]
+    fn test_up_moves_selection_backward() {
+        let mut d = single_tab_dialog(&["A", "B", "C"]);
+        d.handle_key_event(key(KeyCode::Down));
+        d.handle_key_event(key(KeyCode::Down));
+        assert_eq!(d.current_tab().selected_index, 2);
+        d.handle_key_event(key(KeyCode::Up));
+        assert_eq!(d.current_tab().selected_index, 1);
+    }
+
+    #[test]
+    fn test_up_stops_at_zero() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Up)); // Already at 0
+        assert_eq!(d.current_tab().selected_index, 0);
+    }
+
+    #[test]
+    fn test_number_key_selects_option() {
+        let mut d = single_tab_dialog(&["A", "B", "C"]);
+        d.handle_key_event(key(KeyCode::Char('2')));
+        assert_eq!(d.current_tab().selected_index, 1); // 0-indexed
+    }
+
+    #[test]
+    fn test_number_key_out_of_range_ignored() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('9'))); // Out of range
+        assert_eq!(d.current_tab().selected_index, 0); // No change
+    }
+
+    // --- Enter to submit single-tab ---
+
+    #[test]
+    fn test_enter_on_single_tab_completes_dialog() {
+        let mut d = single_tab_dialog(&["Alpha", "Beta"]);
+        let result = d.handle_key_event(key(KeyCode::Enter));
+        assert!(
+            matches!(result, Some(TabbedDialogResult::Completed(_))),
+            "Enter on answered single-tab should complete"
+        );
+    }
+
+    #[test]
+    fn test_enter_result_contains_correct_answer() {
+        let mut d = single_tab_dialog(&["Alpha", "Beta", "Gamma"]);
+        d.handle_key_event(key(KeyCode::Down)); // Select "Beta"
+        let result = d.handle_key_event(key(KeyCode::Enter)).unwrap();
+        match result {
+            TabbedDialogResult::Completed(answers) => {
+                let answer = answers.get("Pick one?").unwrap();
+                assert_eq!(answer, "Beta");
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    // --- multi-tab navigation ---
+
+    #[test]
+    fn test_right_arrow_switches_to_next_tab() {
+        let mut d = TabbedDialog::new(
+            vec![
+                make_question("Q1?", &["A", "B"], false),
+                make_question("Q2?", &["X", "Y"], false),
+            ],
+            None,
+        );
+        assert_eq!(d.current_tab_index(), 0);
+        d.handle_key_event(key(KeyCode::Right));
+        assert_eq!(d.current_tab_index(), 1);
+    }
+
+    #[test]
+    fn test_left_arrow_switches_to_previous_tab() {
+        let mut d = TabbedDialog::new(
+            vec![
+                make_question("Q1?", &["A", "B"], false),
+                make_question("Q2?", &["X", "Y"], false),
+            ],
+            None,
+        );
+        d.handle_key_event(key(KeyCode::Right)); // Go to tab 1
+        d.handle_key_event(key(KeyCode::Left));  // Back to tab 0
+        assert_eq!(d.current_tab_index(), 0);
+    }
+
+    #[test]
+    fn test_right_does_not_go_past_last_tab() {
+        let mut d = single_tab_dialog(&["A"]);
+        d.handle_key_event(key(KeyCode::Right)); // Already at last
+        assert_eq!(d.current_tab_index(), 0);
+    }
+
+    #[test]
+    fn test_enter_advances_to_next_tab_if_not_last() {
+        let mut d = TabbedDialog::new(
+            vec![
+                make_question("Q1?", &["A", "B"], false),
+                make_question("Q2?", &["X", "Y"], false),
+            ],
+            None,
+        );
+        let result = d.handle_key_event(key(KeyCode::Enter)); // Answer first tab
+        assert!(result.is_none(), "should advance to next tab, not complete yet");
+        assert_eq!(d.current_tab_index(), 1);
+    }
+
+    #[test]
+    fn test_multi_tab_completes_after_all_answered() {
+        let mut d = TabbedDialog::new(
+            vec![
+                make_question("Q1?", &["A", "B"], false),
+                make_question("Q2?", &["X", "Y"], false),
+            ],
+            None,
+        );
+        d.handle_key_event(key(KeyCode::Enter)); // Answer Q1, advance to Q2
+        let result = d.handle_key_event(key(KeyCode::Enter)); // Answer Q2
+        assert!(
+            matches!(result, Some(TabbedDialogResult::Completed(_))),
+            "second Enter should complete dialog"
+        );
+    }
+
+    // --- multi-select ---
+
+    #[test]
+    fn test_space_toggles_multi_select_option() {
+        let mut d = multi_tab_dialog(&["A", "B", "C"]);
+        d.handle_key_event(key(KeyCode::Char(' '))); // Select index 0
+        assert!(d.current_tab().selected_indices.contains(&0));
+        d.handle_key_event(key(KeyCode::Char(' '))); // Deselect index 0
+        assert!(!d.current_tab().selected_indices.contains(&0));
+    }
+
+    #[test]
+    fn test_multi_select_multiple_options() {
+        let mut d = multi_tab_dialog(&["A", "B", "C"]);
+        d.handle_key_event(key(KeyCode::Char(' '))); // Select A
+        d.handle_key_event(key(KeyCode::Down));       // Move to B
+        d.handle_key_event(key(KeyCode::Char(' '))); // Select B
+        assert_eq!(d.current_tab().selected_indices.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_select_enter_includes_all_selected() {
+        let mut d = multi_tab_dialog(&["A", "B", "C"]);
+        d.handle_key_event(key(KeyCode::Char(' '))); // Select A
+        d.handle_key_event(key(KeyCode::Down));
+        d.handle_key_event(key(KeyCode::Char(' '))); // Select B
+        let result = d.handle_key_event(key(KeyCode::Enter)).unwrap();
+        match result {
+            TabbedDialogResult::Completed(answers) => {
+                let answer = answers.get("Pick many?").unwrap();
+                // The answer should contain both A and B (order may vary)
+                assert!(answer.contains('A'), "answer should contain A: {answer}");
+                assert!(answer.contains('B'), "answer should contain B: {answer}");
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    // --- custom input mode ---
+
+    #[test]
+    fn test_o_key_activates_custom_mode() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('o')));
+        assert!(d.current_tab().custom_mode_active);
+    }
+
+    #[test]
+    fn test_custom_mode_chars_append_to_input() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('o'))); // Enter custom mode
+        d.handle_key_event(key(KeyCode::Char('h')));
+        d.handle_key_event(key(KeyCode::Char('i')));
+        assert_eq!(d.current_tab().custom_input.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn test_custom_mode_backspace_removes_char() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('o')));
+        d.handle_key_event(key(KeyCode::Char('h')));
+        d.handle_key_event(key(KeyCode::Char('i')));
+        d.handle_key_event(key(KeyCode::Backspace));
+        assert_eq!(d.current_tab().custom_input.as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn test_custom_mode_esc_exits_without_saving() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('o'))); // Enter custom mode
+        d.handle_key_event(key(KeyCode::Char('x')));
+        d.handle_key_event(key(KeyCode::Esc)); // Exit custom mode
+        assert!(!d.current_tab().custom_mode_active);
+        // Input should be cleared
+        assert_eq!(d.current_tab().custom_input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_custom_mode_enter_saves_and_completes() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('o')));
+        d.handle_key_event(key(KeyCode::Char('m')));
+        d.handle_key_event(key(KeyCode::Char('y')));
+        let result = d.handle_key_event(key(KeyCode::Enter)).unwrap();
+        match result {
+            TabbedDialogResult::Completed(answers) => {
+                let answer = answers.get("Pick one?").unwrap();
+                assert_eq!(answer, "my");
+            }
+            _ => panic!("Expected Completed"),
+        }
+    }
+
+    // --- collect_answers ---
+
+    #[test]
+    fn test_collect_answers_empty_before_any_answered() {
+        let d = single_tab_dialog(&["A"]);
+        assert!(d.collect_answers().is_empty());
+    }
+
+    #[test]
+    fn test_tabs_returns_all_tabs() {
+        let d = TabbedDialog::new(
+            vec![
+                make_question("Q1?", &["A"], false),
+                make_question("Q2?", &["B"], false),
+                make_question("Q3?", &["C"], false),
+            ],
+            None,
+        );
+        assert_eq!(d.tabs().len(), 3);
+    }
+}

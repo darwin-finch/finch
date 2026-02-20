@@ -301,3 +301,100 @@ impl<'de> Deserialize<'de> for PatternClassifier {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_pattern_as_str_all_variants() {
+        assert_eq!(QueryPattern::Greeting.as_str(), "greeting");
+        assert_eq!(QueryPattern::Definition.as_str(), "definition");
+        assert_eq!(QueryPattern::HowTo.as_str(), "how_to");
+        assert_eq!(QueryPattern::Explanation.as_str(), "explanation");
+        assert_eq!(QueryPattern::Code.as_str(), "code");
+        assert_eq!(QueryPattern::Debugging.as_str(), "debugging");
+        assert_eq!(QueryPattern::Comparison.as_str(), "comparison");
+        assert_eq!(QueryPattern::Opinion.as_str(), "opinion");
+        assert_eq!(QueryPattern::Complex.as_str(), "complex");
+        assert_eq!(QueryPattern::Other.as_str(), "other");
+    }
+
+    #[test]
+    fn test_query_pattern_from_str_roundtrip() {
+        let variants = [
+            QueryPattern::Greeting,
+            QueryPattern::Definition,
+            QueryPattern::HowTo,
+            QueryPattern::Explanation,
+            QueryPattern::Code,
+            QueryPattern::Debugging,
+            QueryPattern::Comparison,
+            QueryPattern::Opinion,
+            QueryPattern::Complex,
+            QueryPattern::Other,
+        ];
+        for variant in &variants {
+            let s = variant.as_str();
+            let parsed = QueryPattern::from_str(s);
+            assert_eq!(&parsed, variant, "from_str roundtrip failed for {:?}", variant);
+        }
+    }
+
+    #[test]
+    fn test_query_pattern_from_str_case_insensitive() {
+        assert_eq!(QueryPattern::from_str("GREETING"), QueryPattern::Greeting);
+        assert_eq!(QueryPattern::from_str("HowTo"), QueryPattern::HowTo);
+        assert_eq!(QueryPattern::from_str("HOWTO"), QueryPattern::HowTo);
+        assert_eq!(QueryPattern::from_str("CODE"), QueryPattern::Code);
+    }
+
+    #[test]
+    fn test_query_pattern_from_str_unknown_is_other() {
+        assert_eq!(QueryPattern::from_str("xyz_unknown"), QueryPattern::Other);
+        assert_eq!(QueryPattern::from_str(""), QueryPattern::Other);
+    }
+
+    #[test]
+    fn test_query_pattern_serde_roundtrip() {
+        let pattern = QueryPattern::Debugging;
+        let json = serde_json::to_string(&pattern).unwrap();
+        let decoded: QueryPattern = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, pattern);
+    }
+
+    #[test]
+    fn test_pattern_classifier_classify_greeting() {
+        let classifier = PatternClassifier::new();
+        let (pattern, confidence) = classifier.classify("hello there");
+        assert_eq!(pattern, QueryPattern::Greeting);
+        assert!(confidence > 0.0);
+    }
+
+    #[test]
+    fn test_pattern_classifier_classify_definition() {
+        let classifier = PatternClassifier::new();
+        let (pattern, _) = classifier.classify("what is Rust?");
+        assert_eq!(pattern, QueryPattern::Definition);
+    }
+
+    #[test]
+    fn test_pattern_classifier_classify_howto() {
+        let classifier = PatternClassifier::new();
+        let (pattern, _) = classifier.classify("how do i use lifetimes");
+        assert_eq!(pattern, QueryPattern::HowTo);
+    }
+
+    #[test]
+    fn test_pattern_classifier_classify_code() {
+        let classifier = PatternClassifier::new();
+        let (pattern, _) = classifier.classify("```rust\nfn main() {}\n```");
+        assert_eq!(pattern, QueryPattern::Code);
+    }
+
+    #[test]
+    fn test_pattern_classifier_total_classifications_zero_on_new() {
+        let classifier = PatternClassifier::new();
+        assert_eq!(classifier.total_classifications, 0);
+    }
+}

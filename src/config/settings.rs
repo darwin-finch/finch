@@ -407,3 +407,50 @@ struct TomlConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     features: Option<FeaturesConfig>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_features_config_safe_defaults() {
+        let f = FeaturesConfig::default();
+        // Safety-critical defaults
+        assert!(!f.auto_approve_tools, "auto_approve_tools must default to false");
+        assert!(f.streaming_enabled, "streaming should be on by default");
+        assert!(!f.debug_logging, "debug logging should be off by default");
+        #[cfg(target_os = "macos")]
+        assert!(!f.gui_automation, "gui automation should be off by default");
+    }
+
+    #[test]
+    fn test_features_config_serde_roundtrip() {
+        let original = FeaturesConfig::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: FeaturesConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.auto_approve_tools, original.auto_approve_tools);
+        assert_eq!(decoded.streaming_enabled, original.streaming_enabled);
+        assert_eq!(decoded.debug_logging, original.debug_logging);
+    }
+
+    #[test]
+    fn test_features_config_streaming_default_from_json_empty() {
+        // streaming_enabled has default = "default_true"
+        // When key is absent in JSON, it should default to true
+        let json = r#"{"auto_approve_tools": false, "debug_logging": false}"#;
+        let f: FeaturesConfig = serde_json::from_str(json).unwrap();
+        assert!(f.streaming_enabled);
+    }
+
+    #[test]
+    fn test_config_new_has_no_teachers() {
+        let config = Config::new(vec![]);
+        assert!(config.active_teacher().is_none());
+    }
+
+    #[test]
+    fn test_config_active_teacher_none_when_empty() {
+        let config = Config::new(vec![]);
+        assert!(config.active_teacher().is_none());
+    }
+}

@@ -478,6 +478,44 @@ impl TuiRenderer {
         Ok(renderer)
     }
 
+    /// Print the Claude Code-style startup header to terminal scrollback.
+    ///
+    /// Writes once on startup: app name/version, primary model, and working directory.
+    /// Uses ratatui's insert_before() so it lands in the terminal scrollback buffer
+    /// above the inline viewport — permanent and scrollable.
+    pub fn print_startup_header(&mut self, model: &str, cwd: &str) -> Result<()> {
+        use ratatui::style::{Color, Modifier, Style};
+
+        let version = env!("CARGO_PKG_VERSION");
+
+        // 5 lines: name, model, cwd, blank line, hint
+        self.terminal.insert_before(5, |buf| {
+            let bold_white = Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD);
+            let cyan = Style::default().fg(Color::Cyan);
+            let dark_gray = Style::default().fg(Color::DarkGray);
+            let hint_style = Style::default().fg(Color::DarkGray);
+
+            // "  finch v0.5.0"
+            buf.set_string(0, 0, format!("  finch v{}", version), bold_white);
+            // "  claude-sonnet-4-6 · primary"
+            buf.set_string(0, 1, format!("  {}", model), cyan);
+            // "  ~/repos/finch"
+            buf.set_string(0, 2, format!("  {}", cwd), dark_gray);
+            // blank
+            buf.set_string(0, 3, "", Style::default());
+            // "  /help for commands  ·  type to chat with Lotus"
+            buf.set_string(0, 4, "  /help for commands  ·  type to start", hint_style);
+        })?;
+
+        // insert_before() invalidates the diff buffer — force full re-blit
+        self.prev_frame_buffer.clear();
+        self.render()?;
+
+        Ok(())
+    }
+
     /// Record the last query-response pair for feedback
     pub fn record_interaction(&mut self, query: String, response: String) {
         self.last_interaction = Some((query, response));
@@ -988,10 +1026,12 @@ impl TuiRenderer {
 
             execute!(stdout, EndSynchronizedUpdate)?;
 
-            // CRITICAL: insert_before() changes terminal state in a way that invalidates
-            // our diff-based blitting. The prev_frame_buffer no longer matches the terminal,
-            // so we need to clear it to force a full re-blit on the next update.
-            self.prev_frame_buffer.clear();
+            // CRITICAL: Sync prev_frame_buffer to match what insert_before() placed on screen.
+            // Clearing would trigger a "full blit" that conflicts with insert_before's output.
+            // Instead, render the shadow buffer now and copy it so the next diff sees no changes.
+            let all_msgs_for_sync = self.scrollback.get_visible_messages();
+            self.shadow_buffer.render_messages(&all_msgs_for_sync, &self.colors);
+            self.prev_frame_buffer = self.shadow_buffer.clone_buffer();
 
             // CRITICAL: insert_before() may internally clear/redraw the viewport,
             // erasing the separator. Force a render to redraw the viewport immediately.
@@ -1475,11 +1515,12 @@ impl TuiRenderer {
         }
 
         for (row, _cells) in changes_by_row {
-            // Move to start of line (don't clear yet - preserves background)
+            // Clear the line first to prevent old chars bleeding through,
+            // then re-position the cursor at the start to write new content.
+            execute!(stdout, cursor::MoveTo(0, row as u16), Clear(ClearType::UntilNewLine))?;
             execute!(stdout, cursor::MoveTo(0, row as u16))?;
 
             use crossterm::style::{SetBackgroundColor, SetForegroundColor, ResetColor};
-            use ratatui::style::Color as RatatuiColor;
 
             let mut current_style = ratatui::style::Style::default();
 
@@ -1510,10 +1551,6 @@ impl TuiRenderer {
 
             // Reset colors at end of line
             execute!(stdout, ResetColor)?;
-
-            // Clear any remaining content beyond shadow buffer width
-            // (in case previous content was longer)
-            execute!(stdout, Clear(ClearType::UntilNewLine))?;
         }
 
         if use_sync {

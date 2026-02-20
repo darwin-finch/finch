@@ -33,13 +33,13 @@ enum AddProviderStep {
 }
 
 /// Cloud provider options shown in the add-provider overlay
-const CLOUD_PROVIDERS: &[(&str, &str, &str)] = &[
-    ("claude",  "Anthropic Claude", "claude-sonnet-4-6"),
-    ("openai",  "OpenAI GPT",       "gpt-4o"),
-    ("grok",    "xAI Grok",         "grok-2"),
-    ("gemini",  "Google Gemini",    "gemini-2.0-flash"),
-    ("mistral", "Mistral AI",       "mistral-large-latest"),
-    ("groq",    "Groq (fast)",      "llama-3.3-70b-versatile"),
+const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
+    ("grok",    "Grok (xAI)",        "grok-code-fast-1",           "get key at console.x.ai (X Premium+ included)"),
+    ("claude",  "Claude (Anthropic)", "claude-sonnet-4-6",          "get key at console.anthropic.com"),
+    ("openai",  "GPT-4 (OpenAI)",    "gpt-4o",                     "get key at platform.openai.com"),
+    ("gemini",  "Gemini (Google)",   "gemini-2.0-flash",           "get key at aistudio.google.com"),
+    ("mistral", "Mistral AI",        "mistral-large-latest",       "get key at console.mistral.ai"),
+    ("groq",    "Groq (fast cloud)", "llama-3.3-70b-versatile",    "get key at console.groq.com"),
 ];
 
 use crate::config::{ExecutionTarget, TeacherEntry};
@@ -768,7 +768,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 KeyCode::Down => {
                     match adding_provider {
                         Some(AddProviderStep::SelectAddType { selected }) => {
-                            if *selected < 2 { *selected += 1; }
+                            if *selected < CLOUD_PROVIDERS.len() + 1 { *selected += 1; }
                         }
                         Some(AddProviderStep::SelectProvider { selected }) => {
                             if *selected < CLOUD_PROVIDERS.len() - 1 { *selected += 1; }
@@ -815,11 +815,17 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 
                     let next_step = match adding_provider.take() {
                         // ── type selection ──────────────────────────────────────────────
-                        Some(AddProviderStep::SelectAddType { selected }) => match selected {
-                            0 => Some(AddProviderStep::SelectProvider { selected: 0 }),
-                            1 => Some(AddProviderStep::SelectLocalFamily { selected: 0 }),
-                            2 => {
-                                // Start background network scan
+                        Some(AddProviderStep::SelectAddType { selected }) => {
+                            let n_cloud = CLOUD_PROVIDERS.len();
+                            if selected < n_cloud {
+                                let (provider_id, _, _, _) = CLOUD_PROVIDERS[selected];
+                                Some(AddProviderStep::EnterApiKey {
+                                    provider: provider_id.to_string(),
+                                    api_key: String::new(),
+                                })
+                            } else if selected == n_cloud {
+                                Some(AddProviderStep::SelectLocalFamily { selected: 0 })
+                            } else {
                                 let results_arc: Arc<Mutex<Option<Vec<DiscoveredService>>>> =
                                     Arc::new(Mutex::new(None));
                                 let arc_clone = Arc::clone(&results_arc);
@@ -835,11 +841,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 });
                                 Some(AddProviderStep::Scanning { results: results_arc })
                             }
-                            _ => None,
-                        },
+                        }
                         // ── cloud AI path ────────────────────────────────────────────
                         Some(AddProviderStep::SelectProvider { selected }) => {
-                            let (provider_id, _, _) = CLOUD_PROVIDERS[selected];
+                            let (provider_id, _, _, _) = CLOUD_PROVIDERS[selected];
                             Some(AddProviderStep::EnterApiKey {
                                 provider: provider_id.to_string(),
                                 api_key: String::new(),
@@ -856,8 +861,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             let resolved_model = if model.is_empty() {
                                 CLOUD_PROVIDERS
                                     .iter()
-                                    .find(|(id, _, _)| *id == provider.as_str())
-                                    .map(|(_, _, def)| def.to_string())
+                                    .find(|(id, _, _, _)| *id == provider.as_str())
+                                    .map(|(_, _, def, _)| def.to_string())
                                     .unwrap_or_default()
                             } else {
                                 model
@@ -1066,6 +1071,15 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             if *selected_idx > tool_models.len() {
                                 *selected_idx = tool_models.len();
                             }
+                        }
+                    }
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    // Promote selected tool to primary (swap with current primary)
+                    if *selected_idx > 0 {
+                        let tool_idx = *selected_idx - 1;
+                        if tool_idx < tool_models.len() {
+                            std::mem::swap(primary_model, &mut tool_models[tool_idx]);
                         }
                     }
                 }
@@ -1807,7 +1821,7 @@ fn render_models_section(
                 _ => "",
             }
         };
-        let panel = Paragraph::new(format!("{}|", current_key))
+        let panel = Paragraph::new(format!("{}█", current_key))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -1816,7 +1830,7 @@ fn render_models_section(
             );
         f.render_widget(panel, chunks[3]);
     } else if editing_model_mode {
-        let panel = Paragraph::new(format!("{}|", model_input))
+        let panel = Paragraph::new(format!("{}█", model_input))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -1825,7 +1839,7 @@ fn render_models_section(
             );
         f.render_widget(panel, chunks[3]);
     } else {
-        let hint = Paragraph::new("Press E to edit API key · M to edit model name")
+        let hint = Paragraph::new("Press E to edit API key · M to edit model name · P to make primary")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         f.render_widget(hint, chunks[3]);
@@ -1837,7 +1851,7 @@ fn render_models_section(
     } else if editing_model_mode {
         "Type here | Enter/Esc: Save & return"
     } else {
-        "E: API key | M: Model name | A: Add provider | D: Remove | Tab: Next"
+        "E: API key | M: Model name | P: Make primary | A: Add | D: Remove | Tab: Next"
     };
     let instructions = Paragraph::new(instructions_text)
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
@@ -1884,17 +1898,13 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
     );
 
     match step {
-        // ── type selection ───────────────────────────────────────────────────────────
+        // ── type selection — shows all providers directly ────────────────────────────
         AddProviderStep::SelectAddType { selected } => {
-            const ADD_TYPES: &[(&str, &str)] = &[
-                ("Cloud AI provider", "Connect to Claude, GPT-4, Grok, Gemini, Mistral, or Groq"),
-                ("Local ONNX model", "Run a model on this machine (no internet after download)"),
-                ("Scan local network", "Discover other Finch instances running on your LAN"),
-            ];
-            let items: Vec<ListItem> = ADD_TYPES
+            let n_cloud = CLOUD_PROVIDERS.len();
+            let mut items: Vec<ListItem> = CLOUD_PROVIDERS
                 .iter()
                 .enumerate()
-                .map(|(i, (name, desc))| {
+                .map(|(i, (_, display_name, _, hint))| {
                     let is_sel = i == *selected;
                     let (prefix, suffix, style) = if is_sel {
                         (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
@@ -1902,29 +1912,56 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                         ("    ", "", Style::default().fg(Color::Cyan))
                     };
                     let lines = vec![
-                        Line::from(format!("{}{}{}", prefix, name, suffix)).style(style),
-                        Line::from(format!("        {}", desc)).style(Style::default().fg(Color::DarkGray)),
+                        Line::from(format!("{}{}{}", prefix, display_name, suffix)).style(style),
+                        Line::from(format!("        {}", hint)).style(Style::default().fg(Color::DarkGray)),
                     ];
                     ListItem::new(lines)
                 })
                 .collect();
+            {
+                let is_sel = *selected == n_cloud;
+                let (prefix, suffix, style) = if is_sel {
+                    (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                } else {
+                    ("    ", "", Style::default().fg(Color::Cyan))
+                };
+                items.push(ListItem::new(vec![
+                    Line::from(format!("{}Local ONNX model{}", prefix, suffix)).style(style),
+                    Line::from("        Run a model on this machine (no internet after download)").style(Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            {
+                let is_sel = *selected == n_cloud + 1;
+                let (prefix, suffix, style) = if is_sel {
+                    (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                } else {
+                    ("    ", "", Style::default().fg(Color::DarkGray))
+                };
+                items.push(ListItem::new(vec![
+                    Line::from(format!("{}Scan local network{}", prefix, suffix)).style(style),
+                    Line::from("        Discover other Finch instances running on your LAN").style(Style::default().fg(Color::DarkGray)),
+                ]));
+            }
             let list = List::new(items)
-                .block(Block::default().title("What do you want to add?  ↑/↓: Move | Enter: Select | Esc: Cancel"));
+                .block(Block::default().title("Add AI provider  ↑/↓: Move | Enter: Select | Esc: Cancel"));
             f.render_widget(list, inner);
         }
-        // ── cloud AI path ─────────────────────────────────────────────────────────────
+        // ── SelectProvider kept for back-compat but no longer reached ────────────────
         AddProviderStep::SelectProvider { selected } => {
             let items: Vec<ListItem> = CLOUD_PROVIDERS
                 .iter()
                 .enumerate()
-                .map(|(i, (_, display_name, default_model))| {
+                .map(|(i, (_, display_name, _, hint))| {
                     let is_sel = i == *selected;
                     let (prefix, suffix, style) = if is_sel {
                         (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
                     } else {
                         ("    ", "", Style::default().fg(Color::Cyan))
                     };
-                    ListItem::new(format!("{}{} (e.g. {}){}", prefix, display_name, default_model, suffix)).style(style)
+                    ListItem::new(vec![
+                        Line::from(format!("{}{}{}", prefix, display_name, suffix)).style(style),
+                        Line::from(format!("        {}", hint)).style(Style::default().fg(Color::DarkGray)),
+                    ])
                 })
                 .collect();
             let list = List::new(items)
@@ -1932,22 +1969,23 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
             f.render_widget(list, inner);
         }
         AddProviderStep::EnterApiKey { provider, api_key } => {
-            let hint = CLOUD_PROVIDERS.iter()
-                .find(|(id, _, _)| *id == provider.as_str())
-                .map(|(_, name, _)| format!("{} API key", name))
-                .unwrap_or_else(|| format!("{} API key", provider));
+            let (display_name, url_hint) = CLOUD_PROVIDERS.iter()
+                .find(|(id, _, _, _)| *id == provider.as_str())
+                .map(|(_, name, _, hint)| (format!("{} API key", name), hint.to_string()))
+                .unwrap_or_else(|| (format!("{} API key", provider), String::new()));
             let lines = vec![
                 Line::from(vec![
                     Span::styled("Provider: ", Style::default().add_modifier(Modifier::BOLD)),
                     Span::styled(provider.as_str(), Style::default().fg(Color::Cyan)),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled(&hint, Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(&display_name, Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(url_hint.as_str(), Style::default().fg(Color::DarkGray))),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("Key: ", Style::default().add_modifier(Modifier::BOLD)),
                     Span::raw(if api_key.is_empty() { "[type here]" } else { api_key.as_str() }),
-                    Span::styled("|", Style::default().fg(Color::Yellow)),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
                 ]),
                 Line::from(""),
                 Line::from(Span::styled("Enter: Next  Esc: Cancel", Style::default().fg(Color::Yellow))),
@@ -1957,8 +1995,8 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
         }
         AddProviderStep::EnterModel { provider, model, .. } => {
             let default_model = CLOUD_PROVIDERS.iter()
-                .find(|(id, _, _)| *id == provider.as_str())
-                .map(|(_, _, def)| *def)
+                .find(|(id, _, _, _)| *id == provider.as_str())
+                .map(|(_, _, def, _)| *def)
                 .unwrap_or("(default)");
             let lines = vec![
                 Line::from(vec![
@@ -1974,7 +2012,7 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                 Line::from(vec![
                     Span::styled("Model: ", Style::default().add_modifier(Modifier::BOLD)),
                     Span::raw(if model.is_empty() { "[type here or press Enter for default]" } else { model.as_str() }),
-                    Span::styled("|", Style::default().fg(Color::Yellow)),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
                 ]),
                 Line::from(""),
                 Line::from(Span::styled("Enter: Add  Esc: Cancel", Style::default().fg(Color::Yellow))),

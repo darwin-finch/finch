@@ -502,6 +502,8 @@ impl LiveToolMessage {
 }
 
 const CYAN: &str = "\x1b[36m";
+const GRAY: &str = "\x1b[90m";
+const RED_COLOR: &str = "\x1b[31m";
 const GRAY_DIM: &str = "\x1b[2;90m";
 
 impl Message for LiveToolMessage {
@@ -516,8 +518,8 @@ impl Message for LiveToolMessage {
         match status {
             MessageStatus::InProgress => {
                 if content.is_empty() {
-                    // Just started - show spinner
-                    format!("{}\n  {}⟳ Running…{}\n", self.header, GRAY_DIM, RESET)
+                    // Just started - show inline trailing ellipsis (Claude Code style)
+                    format!("{}{}…{}\n", self.header, GRAY_DIM, RESET)
                 } else {
                     // Has some content already - show header + partial content
                     format!("{}\n{}", self.header, content)
@@ -543,6 +545,133 @@ impl Message for LiveToolMessage {
 
     fn content(&self) -> String {
         format!("{}\n{}", self.header, self.content.read().map(|c| c.clone()).unwrap_or_default())
+    }
+}
+
+// ============================================================================
+// OperationMessage - Groups a generation turn's tool calls as a single row
+//
+// Appears in scrollback as:
+//   ⏺ Generating
+//     ⎿ bash(git push)…
+//     ⎿ read(src/foo.rs) 45 lines
+//
+// Created lazily (only when the first tool call starts in a turn) so
+// text-only turns produce no extra scrollback clutter.
+// ============================================================================
+
+/// Status of an individual row within an OperationMessage
+#[derive(Clone)]
+pub enum OperationRowStatus {
+    Running,
+    Complete(String), // compact one-line summary, may be empty
+    Error(String),
+}
+
+/// A single sub-row representing one tool call
+pub struct OperationRow {
+    pub label: String, // pre-formatted label, e.g. "bash(git push)"
+    pub status: OperationRowStatus,
+}
+
+/// Live operation message that groups tool calls for a generation turn.
+pub struct OperationMessage {
+    id: MessageId,
+    header: String,
+    rows: Arc<RwLock<Vec<OperationRow>>>,
+    status: Arc<RwLock<MessageStatus>>,
+}
+
+impl OperationMessage {
+    pub fn new(header: impl Into<String>) -> Self {
+        Self {
+            id: MessageId::new(),
+            header: header.into(),
+            rows: Arc::new(RwLock::new(Vec::new())),
+            status: Arc::new(RwLock::new(MessageStatus::InProgress)),
+        }
+    }
+
+    /// Append a running row and return its index for later updates.
+    pub fn add_row(&self, label: impl Into<String>) -> usize {
+        let mut rows = self.rows.write().unwrap_or_else(|p| p.into_inner());
+        let idx = rows.len();
+        rows.push(OperationRow {
+            label: label.into(),
+            status: OperationRowStatus::Running,
+        });
+        idx
+    }
+
+    /// Mark a row complete with an optional short summary.
+    pub fn complete_row(&self, idx: usize, summary: impl Into<String>) {
+        let mut rows = self.rows.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = rows.get_mut(idx) {
+            row.status = OperationRowStatus::Complete(summary.into());
+        }
+    }
+
+    /// Mark a row as failed with an error message.
+    pub fn fail_row(&self, idx: usize, error: impl Into<String>) {
+        let mut rows = self.rows.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = rows.get_mut(idx) {
+            row.status = OperationRowStatus::Error(error.into());
+        }
+    }
+
+    /// Mark the whole operation complete (all tools done).
+    pub fn set_complete(&self) {
+        *self.status.write().unwrap_or_else(|p| p.into_inner()) = MessageStatus::Complete;
+    }
+}
+
+impl Message for OperationMessage {
+    fn id(&self) -> MessageId {
+        self.id
+    }
+
+    fn format(&self, _colors: &crate::config::ColorScheme) -> String {
+        let rows = self.rows.read().unwrap_or_else(|p| p.into_inner());
+        let status = *self.status.read().unwrap_or_else(|p| p.into_inner());
+
+        let ellipsis = if status == MessageStatus::InProgress { "…" } else { "" };
+        let mut result = format!("{}⏺{} {}{}\n", CYAN, RESET, self.header, ellipsis);
+
+        for row in rows.iter() {
+            match &row.status {
+                OperationRowStatus::Running => {
+                    result.push_str(&format!(
+                        "  {}⎿{} {}{}…{}\n",
+                        GRAY, RESET, row.label, GRAY_DIM, RESET
+                    ));
+                }
+                OperationRowStatus::Complete(summary) if summary.is_empty() => {
+                    result.push_str(&format!("  {}⎿{} {}\n", GRAY, RESET, row.label));
+                }
+                OperationRowStatus::Complete(summary) => {
+                    result.push_str(&format!(
+                        "  {}⎿{} {} {}{}{}\n",
+                        GRAY, RESET, row.label, GRAY_DIM, summary, RESET
+                    ));
+                }
+                OperationRowStatus::Error(err) => {
+                    result.push_str(&format!(
+                        "  {}⎿{} {} {}error:{} {}\n",
+                        GRAY, RESET, row.label, RED_COLOR, RESET, err
+                    ));
+                }
+            }
+        }
+
+        result
+    }
+
+    fn status(&self) -> MessageStatus {
+        *self.status.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn content(&self) -> String {
+        self.header.clone()
     }
 }
 

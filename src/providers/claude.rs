@@ -65,14 +65,13 @@ impl ClaudeProvider {
             request.model.clone()
         };
 
-        let mut msg_req = MessageRequest {
+        MessageRequest {
             model,
             max_tokens: request.max_tokens,
             messages: request.messages.clone(),
+            system: request.system.clone(),
             tools: request.tools.clone(),
-        };
-
-        msg_req
+        }
     }
 
     /// Send a single message request (no retry)

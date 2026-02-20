@@ -791,29 +791,66 @@ fn convert_response_to_openai(
     Ok(response)
 }
 
-/// Convert OpenAI messages to internal format
-/// Handles text content, tool calls, and tool results
+/// Convert OpenAI messages to internal format.
+///
+/// Consecutive `role: "tool"` messages are batched into a single internal
+/// `role: "user"` message containing all `ToolResult` blocks, as required by
+/// the Claude API.
 fn convert_messages_to_internal(messages: &[ChatMessage]) -> anyhow::Result<Vec<Message>> {
-    let mut result = Vec::new();
+    let mut result: Vec<Message> = Vec::new();
 
     for msg in messages {
+        // --- tool role: collect results ---
+        if msg.role == "tool" {
+            if let (Some(tool_call_id), Some(content)) = (&msg.tool_call_id, &msg.content) {
+                let result_block = ContentBlock::ToolResult {
+                    tool_use_id: tool_call_id.clone(),
+                    content: content.clone(),
+                    is_error: None,
+                };
+
+                // Append to the previous user message if it already contains ToolResult
+                // blocks (batch all results from one turn into a single user message).
+                let appended = if let Some(last) = result.last_mut() {
+                    if last.role == "user"
+                        && last.content.iter().all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                    {
+                        last.content.push(result_block.clone());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !appended {
+                    result.push(Message {
+                        role: "user".to_string(),
+                        content: vec![result_block],
+                    });
+                }
+            }
+            continue;
+        }
+
+        // --- all other roles ---
         let mut content_blocks = Vec::new();
 
-        // Handle text content
+        // Text content
         if let Some(text) = &msg.content {
             if !text.is_empty() {
-                content_blocks.push(ContentBlock::Text {
-                    text: text.clone(),
-                });
+                content_blocks.push(ContentBlock::Text { text: text.clone() });
             }
         }
 
-        // Handle tool calls (assistant messages)
+        // Tool calls (assistant messages)
         if let Some(tool_calls) = &msg.tool_calls {
             for tool_call in tool_calls {
                 if tool_call.tool_type == "function" {
-                    let input: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
-                        .unwrap_or(serde_json::json!({}));
+                    let input: serde_json::Value =
+                        serde_json::from_str(&tool_call.function.arguments)
+                            .unwrap_or(serde_json::json!({}));
 
                     content_blocks.push(ContentBlock::ToolUse {
                         id: tool_call.id.clone(),
@@ -824,29 +861,9 @@ fn convert_messages_to_internal(messages: &[ChatMessage]) -> anyhow::Result<Vec<
             }
         }
 
-        // Handle tool results (tool role messages)
-        // In Claude API, tool results MUST be in user messages, not separate "tool" role
-        if msg.role == "tool" {
-            if let (Some(tool_call_id), Some(content)) = (&msg.tool_call_id, &msg.content) {
-                content_blocks.push(ContentBlock::ToolResult {
-                    tool_use_id: tool_call_id.clone(),
-                    content: content.clone(),
-                    is_error: None,
-                });
-            }
-        }
-
-        // Only add message if it has content
         if !content_blocks.is_empty() {
-            // Convert "tool" role to "user" for Claude API compatibility
-            let role = if msg.role == "tool" {
-                "user".to_string()
-            } else {
-                msg.role.clone()
-            };
-
             result.push(Message {
-                role,
+                role: msg.role.clone(),
                 content: content_blocks,
             });
         }

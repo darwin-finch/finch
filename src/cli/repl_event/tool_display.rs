@@ -39,9 +39,9 @@ pub fn format_tool_label(name: &str, input: &Value) -> String {
 /// Format the full tool call display (label + output)
 pub fn format_tool_result(label: &str, content: &str, is_error: bool) -> String {
     let bullet = if is_error {
-        format!("{}●{}", RED, RESET)
+        format!("{}⏺{}", RED, RESET)
     } else {
-        format!("{}●{}", CYAN, RESET)
+        format!("{}⏺{}", CYAN, RESET)
     };
 
     let mut result = format!("{} {}\n", bullet, label);
@@ -55,7 +55,7 @@ pub fn format_tool_result(label: &str, content: &str, is_error: bool) -> String 
 
     for (i, line) in lines.iter().take(shown).enumerate() {
         if i == 0 {
-            result.push_str(&format!("  {}└{} {}\n", GRAY, RESET, line));
+            result.push_str(&format!("  {}⎿{} {}\n", GRAY, RESET, line));
         } else {
             result.push_str(&format!("    {}{}{}\n", GRAY, line, RESET));
         }
@@ -201,9 +201,9 @@ fn build_result_content(content: &str, is_error: bool) -> String {
     for (i, line) in lines.iter().take(shown).enumerate() {
         if i == 0 {
             if is_error {
-                result.push_str(&format!("  {}└{} {}{}{}\n", GRAY, RESET, RED, line, RESET));
+                result.push_str(&format!("  {}⎿{} {}{}{}\n", GRAY, RESET, RED, line, RESET));
             } else {
-                result.push_str(&format!("  {}└{} {}\n", GRAY, RESET, line));
+                result.push_str(&format!("  {}⎿{} {}\n", GRAY, RESET, line));
             }
         } else {
             // Preserve existing ANSI colors in diff lines (don't add extra gray wrapping)

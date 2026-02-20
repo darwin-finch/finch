@@ -188,3 +188,123 @@ impl ChatMessage {
         Self::new("assistant", content)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_message_roles() {
+        let sys = ChatMessage::system("You are helpful.");
+        assert_eq!(sys.role, "system");
+        assert_eq!(sys.content.as_deref(), Some("You are helpful."));
+
+        let user = ChatMessage::user("Hello");
+        assert_eq!(user.role, "user");
+
+        let asst = ChatMessage::assistant("Hi there!");
+        assert_eq!(asst.role, "assistant");
+    }
+
+    #[test]
+    fn test_chat_message_optional_fields_default_none() {
+        let msg = ChatMessage::user("test");
+        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_call_id.is_none());
+        assert!(msg.name.is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_request_serde() {
+        let json = r#"{
+            "model": "qwen-local",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model, "qwen-local");
+        assert_eq!(req.messages.len(), 1);
+        assert!(!req.stream); // default is false
+        assert!(req.max_tokens.is_none());
+        assert!(req.local_only.is_none());
+    }
+
+    #[test]
+    fn test_chat_completion_request_with_options() {
+        let json = r#"{
+            "model": "gpt-4",
+            "messages": [
+                {"role": "system", "content": "Be concise"},
+                {"role": "user", "content": "2+2?"}
+            ],
+            "max_tokens": 100,
+            "temperature": 0.5,
+            "stream": false,
+            "local_only": true
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.max_tokens, Some(100));
+        assert_eq!(req.temperature, Some(0.5));
+        assert_eq!(req.local_only, Some(true));
+        assert_eq!(req.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_usage_fields() {
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+        };
+        assert_eq!(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
+    }
+
+    #[test]
+    fn test_chat_completion_response_serde_roundtrip() {
+        let response = ChatCompletionResponse {
+            id: "chatcmpl-123".to_string(),
+            object: "chat.completion".to_string(),
+            created: 1700000000,
+            model: "qwen-local".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage::assistant("4"),
+                finish_reason: "stop".to_string(),
+            }],
+            usage: Usage { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let decoded: ChatCompletionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, "chatcmpl-123");
+        assert_eq!(decoded.choices[0].finish_reason, "stop");
+        assert_eq!(decoded.usage.total_tokens, 6);
+    }
+
+    #[test]
+    fn test_tool_call_structure() {
+        let tc = ToolCall {
+            id: "call_abc".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: r#"{"path": "/tmp/foo"}"#.to_string(),
+            },
+        };
+        let json = serde_json::to_string(&tc).unwrap();
+        let decoded: ToolCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.function.name, "read_file");
+        assert_eq!(decoded.id, "call_abc");
+    }
+
+    #[test]
+    fn test_models_response_structure() {
+        let resp = ModelsResponse {
+            object: "list".to_string(),
+            data: vec![
+                Model { id: "qwen-local".to_string(), object: "model".to_string(), created: 0, owned_by: "finch".to_string() },
+                Model { id: "claude-3".to_string(), object: "model".to_string(), created: 0, owned_by: "anthropic".to_string() },
+            ],
+        };
+        assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.data[0].id, "qwen-local");
+    }
+}

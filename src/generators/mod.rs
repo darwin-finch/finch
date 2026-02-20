@@ -97,3 +97,163 @@ impl ToolUse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::ContentBlock;
+
+    fn make_tool_use(id: &str, name: &str) -> ToolUse {
+        ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: serde_json::json!({"file_path": "/tmp/test.txt"}),
+        }
+    }
+
+    // --- ToolUse ---
+
+    #[test]
+    fn test_tool_use_to_content_block_preserves_fields() {
+        let tu = make_tool_use("toolu_1", "read");
+        let block = tu.to_content_block();
+        match block {
+            ContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "read");
+                assert_eq!(input["file_path"], "/tmp/test.txt");
+            }
+            _ => panic!("Expected ToolUse ContentBlock"),
+        }
+    }
+
+    #[test]
+    fn test_tool_use_to_content_block_can_round_trip_via_clone() {
+        let tu = make_tool_use("toolu_2", "grep");
+        let block = tu.to_content_block();
+        // Verify the original ToolUse is still usable after to_content_block (it clones)
+        assert_eq!(tu.name, "grep");
+        assert!(matches!(block, ContentBlock::ToolUse { .. }));
+    }
+
+    // --- GeneratorCapabilities ---
+
+    #[test]
+    fn test_generator_capabilities_all_enabled() {
+        let caps = GeneratorCapabilities {
+            supports_streaming: true,
+            supports_tools: true,
+            supports_conversation: true,
+            max_context_messages: Some(100),
+        };
+        assert!(caps.supports_streaming);
+        assert!(caps.supports_tools);
+        assert!(caps.supports_conversation);
+        assert_eq!(caps.max_context_messages, Some(100));
+    }
+
+    #[test]
+    fn test_generator_capabilities_local_model_profile() {
+        // Typical local model: no streaming, no tools
+        let caps = GeneratorCapabilities {
+            supports_streaming: false,
+            supports_tools: false,
+            supports_conversation: true,
+            max_context_messages: Some(8),
+        };
+        assert!(!caps.supports_streaming);
+        assert!(!caps.supports_tools);
+        assert_eq!(caps.max_context_messages, Some(8));
+    }
+
+    #[test]
+    fn test_generator_capabilities_unlimited_context() {
+        let caps = GeneratorCapabilities {
+            supports_streaming: true,
+            supports_tools: true,
+            supports_conversation: true,
+            max_context_messages: None, // None = no limit
+        };
+        assert!(caps.max_context_messages.is_none());
+    }
+
+    // --- ResponseMetadata ---
+
+    #[test]
+    fn test_response_metadata_construction() {
+        let meta = ResponseMetadata {
+            generator: "claude".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            confidence: None,
+            stop_reason: Some("end_turn".to_string()),
+            input_tokens: Some(150),
+            output_tokens: Some(400),
+            latency_ms: Some(1200),
+        };
+        assert_eq!(meta.generator, "claude");
+        assert_eq!(meta.input_tokens, Some(150));
+        assert_eq!(meta.output_tokens, Some(400));
+        assert_eq!(meta.latency_ms, Some(1200));
+    }
+
+    #[test]
+    fn test_response_metadata_local_model_has_confidence() {
+        let meta = ResponseMetadata {
+            generator: "qwen".to_string(),
+            model: "Qwen2.5-3B".to_string(),
+            confidence: Some(0.87),
+            stop_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: Some(45),
+        };
+        assert_eq!(meta.confidence, Some(0.87));
+        assert!(meta.stop_reason.is_none());
+    }
+
+    // --- StreamChunk ---
+
+    #[test]
+    fn test_stream_chunk_text_delta() {
+        let chunk = StreamChunk::TextDelta("hello ".to_string());
+        match chunk {
+            StreamChunk::TextDelta(text) => assert_eq!(text, "hello "),
+            _ => panic!("Expected TextDelta"),
+        }
+    }
+
+    #[test]
+    fn test_stream_chunk_content_block_complete() {
+        let block = ContentBlock::text("final answer");
+        let chunk = StreamChunk::ContentBlockComplete(block);
+        match chunk {
+            StreamChunk::ContentBlockComplete(ContentBlock::Text { text }) => {
+                assert_eq!(text, "final answer");
+            }
+            _ => panic!("Expected ContentBlockComplete with Text"),
+        }
+    }
+
+    // --- GeneratorResponse ---
+
+    #[test]
+    fn test_generator_response_construction() {
+        let response = GeneratorResponse {
+            text: "The answer is 42".to_string(),
+            content_blocks: vec![ContentBlock::text("The answer is 42")],
+            tool_uses: vec![],
+            metadata: ResponseMetadata {
+                generator: "claude".to_string(),
+                model: "claude-sonnet-4-6".to_string(),
+                confidence: None,
+                stop_reason: Some("end_turn".to_string()),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                latency_ms: Some(500),
+            },
+        };
+        assert_eq!(response.text, "The answer is 42");
+        assert!(response.tool_uses.is_empty());
+        assert_eq!(response.content_blocks.len(), 1);
+    }
+}

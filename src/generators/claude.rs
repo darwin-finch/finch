@@ -12,14 +12,40 @@ use super::{
     Generator, GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk, ToolUse,
 };
 
+pub const CODING_SYSTEM_PROMPT: &str = "\
+You are Finch, an expert software engineering assistant. \
+You have access to tools for reading files, searching code, editing files, running commands, and fetching web content.
+
+When helping with coding tasks:
+- Read files before modifying them to understand existing code and context
+- Use glob/grep to locate relevant files before assuming their paths
+- Make targeted, minimal edits — don't rewrite code that doesn't need to change
+- Run tests or build commands after changes to verify correctness
+- If a task requires multiple steps, work through them systematically
+
+Available tools: read (supports offset/limit for line ranges), write, edit, glob, grep (supports context_lines), bash, web_fetch.";
+
+/// Build the full system prompt including working directory context.
+pub fn build_system_prompt(cwd: Option<&str>) -> String {
+    match cwd {
+        Some(dir) => format!("{}\n\nWorking directory: {}", CODING_SYSTEM_PROMPT, dir),
+        None => CODING_SYSTEM_PROMPT.to_string(),
+    }
+}
+
 /// Claude API generator implementation
 pub struct ClaudeGenerator {
     client: Arc<ClaudeClient>,
     capabilities: GeneratorCapabilities,
+    /// Working directory context injected into the system prompt.
+    cwd: Option<String>,
 }
 
 impl ClaudeGenerator {
     pub fn new(client: Arc<ClaudeClient>) -> Self {
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string());
         Self {
             client,
             capabilities: GeneratorCapabilities {
@@ -28,7 +54,12 @@ impl ClaudeGenerator {
                 supports_conversation: true,
                 max_context_messages: Some(50),
             },
+            cwd,
         }
+    }
+
+    fn system_prompt(&self) -> String {
+        build_system_prompt(self.cwd.as_deref())
     }
 
     /// Convert Claude MessageResponse to unified GeneratorResponse
@@ -36,7 +67,6 @@ impl ClaudeGenerator {
         &self,
         response: crate::claude::MessageResponse,
     ) -> GeneratorResponse {
-        // Extract text from content blocks
         let text = response
             .content
             .iter()
@@ -47,7 +77,6 @@ impl ClaudeGenerator {
             .collect::<Vec<_>>()
             .join("");
 
-        // Extract tool uses
         let tool_uses = response
             .content
             .iter()
@@ -70,9 +99,9 @@ impl ClaudeGenerator {
                 model: response.model,
                 confidence: None,
                 stop_reason: response.stop_reason,
-                input_tokens: None,  // TODO: Extract from response.usage when available
-                output_tokens: None, // TODO: Extract from response.usage when available
-                latency_ms: None,    // TODO: Track request timing
+                input_tokens: None,
+                output_tokens: None,
+                latency_ms: None,
             },
         }
     }
@@ -85,7 +114,8 @@ impl Generator for ClaudeGenerator {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<GeneratorResponse> {
-        let mut request = MessageRequest::with_context(messages);
+        let mut request = MessageRequest::with_context(messages)
+            .with_system(self.system_prompt());
         if let Some(tools) = tools {
             request = request.with_tools(tools);
         }
@@ -99,12 +129,12 @@ impl Generator for ClaudeGenerator {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
-        let mut request = MessageRequest::with_context(messages);
+        let mut request = MessageRequest::with_context(messages)
+            .with_system(self.system_prompt());
         if let Some(tools) = tools {
             request = request.with_tools(tools);
         }
 
-        // Get the streaming receiver from Claude client
         let rx = self.client.send_message_stream(&request).await?;
         Ok(Some(rx))
     }

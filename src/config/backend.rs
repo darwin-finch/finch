@@ -336,3 +336,59 @@ impl BackendConfig {
         self.execution_target
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_execution_target_cpu_always_available() {
+        assert!(ExecutionTarget::Cpu.is_available());
+        assert!(ExecutionTarget::Auto.is_available());
+    }
+
+    #[test]
+    fn test_execution_target_cpu_name() {
+        assert_eq!(ExecutionTarget::Cpu.name(), "CPU");
+        assert_eq!(ExecutionTarget::Auto.name(), "Auto");
+    }
+
+    #[test]
+    fn test_execution_target_cpu_description_non_empty() {
+        assert!(!ExecutionTarget::Cpu.description().is_empty());
+        assert!(!ExecutionTarget::Auto.description().is_empty());
+    }
+
+    #[test]
+    fn test_execution_target_serde_roundtrip() {
+        let original = ExecutionTarget::Cpu;
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: ExecutionTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_backend_config_default() {
+        let config = BackendConfig::default();
+        // CPU is always available; default should be something valid
+        assert!(config.execution_target.is_available());
+    }
+
+    #[test]
+    fn test_auto_select_returns_valid_target() {
+        let target = ExecutionTarget::auto_select();
+        assert!(target.is_available());
+        // auto_select should never return Auto itself
+        assert_ne!(target, ExecutionTarget::Auto);
+    }
+
+    #[test]
+    fn test_effective_target_resolves_auto() {
+        let mut config = BackendConfig::default();
+        config.execution_target = ExecutionTarget::Auto;
+        let effective = config.effective_target();
+        // Should resolve to a concrete target, not Auto
+        assert_ne!(effective, ExecutionTarget::Auto);
+        assert!(effective.is_available());
+    }
+}

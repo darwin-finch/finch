@@ -284,3 +284,64 @@ pub struct TrainingStats {
     pub last_training: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_training_example_new() {
+        let ex = TrainingExample::new(
+            "how do I use lifetimes?".to_string(),
+            "Lifetimes annotate how long references are valid...".to_string(),
+            true,
+        );
+        assert_eq!(ex.query, "how do I use lifetimes?");
+        assert!(ex.local_success);
+        assert!(ex.router_confidence.is_none());
+        assert!(ex.validator_score.is_none());
+    }
+
+    #[test]
+    fn test_training_example_builder_chain() {
+        let ex = TrainingExample::new("query".to_string(), "response".to_string(), false)
+            .with_confidence(0.85)
+            .with_quality(0.92);
+        assert_eq!(ex.router_confidence, Some(0.85));
+        assert_eq!(ex.validator_score, Some(0.92));
+        assert!(!ex.local_success);
+    }
+
+    #[test]
+    fn test_training_example_timestamp_is_recent() {
+        let before = chrono::Utc::now();
+        let ex = TrainingExample::new("q".to_string(), "r".to_string(), true);
+        let after = chrono::Utc::now();
+        assert!(ex.timestamp >= before);
+        assert!(ex.timestamp <= after);
+    }
+
+    #[test]
+    fn test_training_stats_initial_state() {
+        let stats = TrainingStats {
+            queue_size: 0,
+            total_trained: 0,
+            last_training: None,
+        };
+        assert_eq!(stats.queue_size, 0);
+        assert_eq!(stats.total_trained, 0);
+        assert!(stats.last_training.is_none());
+    }
+
+    #[test]
+    fn test_training_stats_with_data() {
+        let stats = TrainingStats {
+            queue_size: 5,
+            total_trained: 150,
+            last_training: Some(chrono::Utc::now()),
+        };
+        assert_eq!(stats.queue_size, 5);
+        assert_eq!(stats.total_trained, 150);
+        assert!(stats.last_training.is_some());
+    }
+}
+

@@ -316,60 +316,81 @@ impl DaemonClient {
         }
     }
 
-    /// Convert internal messages to OpenAI format
+    /// Convert internal messages to OpenAI format.
+    ///
+    /// Messages containing only ToolResult blocks are expanded into individual
+    /// `role: "tool"` messages (one per result) so the Claude API receives the
+    /// correct `tool_result` blocks immediately after the corresponding `tool_use`.
     fn convert_to_openai_messages(messages: &[Message]) -> Vec<ChatMessage> {
-        messages
-            .iter()
-            .map(|m| {
-                let mut openai_msg = ChatMessage {
-                    role: m.role.clone(),
-                    content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                };
+        let mut result = Vec::new();
 
-                let mut text_parts = Vec::new();
-                let mut tool_calls = Vec::new();
+        for m in messages {
+            // A "user" message whose content is entirely ToolResult blocks must be
+            // sent as one "tool" role message per result in OpenAI/Claude format.
+            let all_tool_results = !m.content.is_empty()
+                && m.content.iter().all(|b| matches!(b, ContentBlock::ToolResult { .. }));
 
+            if all_tool_results {
                 for block in &m.content {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            text_parts.push(text.clone());
-                        }
-                        ContentBlock::ToolUse { id, name, input } => {
-                            tool_calls.push(crate::server::openai_types::ToolCall {
-                                id: id.clone(),
-                                tool_type: "function".to_string(),
-                                function: crate::server::openai_types::FunctionCall {
-                                    name: name.clone(),
-                                    arguments: serde_json::to_string(input).unwrap_or_default(),
-                                },
-                            });
-                        }
-                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
-                            // For tool results, create a separate message with role "tool"
-                            // But for simplicity in batching, we'll encode it as text for now
-                            // This is a limitation - proper implementation would split messages
-                            text_parts.push(format!("[Tool Result for {}]: {}", tool_use_id, content));
-                        }
-                        ContentBlock::Image { .. } => {
-                            // Image blocks: not applicable in this context
-                        }
+                    if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                        result.push(ChatMessage {
+                            role: "tool".to_string(),
+                            content: Some(content.clone()),
+                            tool_calls: None,
+                            tool_call_id: Some(tool_use_id.clone()),
+                            name: None,
+                        });
                     }
                 }
+                continue;
+            }
 
-                if !text_parts.is_empty() {
-                    openai_msg.content = Some(text_parts.join("\n"));
+            // Normal message: text + optional tool_calls
+            let mut openai_msg = ChatMessage {
+                role: m.role.clone(),
+                content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            };
+
+            let mut text_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+
+            for block in &m.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        text_parts.push(text.clone());
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        tool_calls.push(crate::server::openai_types::ToolCall {
+                            id: id.clone(),
+                            tool_type: "function".to_string(),
+                            function: crate::server::openai_types::FunctionCall {
+                                name: name.clone(),
+                                arguments: serde_json::to_string(input).unwrap_or_default(),
+                            },
+                        });
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                        // Mixed ToolResult + text: encode as text (edge case)
+                        text_parts.push(format!("[Tool Result for {}]: {}", tool_use_id, content));
+                    }
+                    ContentBlock::Image { .. } => {}
                 }
+            }
 
-                if !tool_calls.is_empty() {
-                    openai_msg.tool_calls = Some(tool_calls);
-                }
+            if !text_parts.is_empty() {
+                openai_msg.content = Some(text_parts.join("\n"));
+            }
+            if !tool_calls.is_empty() {
+                openai_msg.tool_calls = Some(tool_calls);
+            }
 
-                openai_msg
-            })
-            .collect()
+            result.push(openai_msg);
+        }
+
+        result
     }
 
     /// Convert internal tools to OpenAI format
@@ -381,7 +402,11 @@ impl DaemonClient {
                 function: FunctionDefinition {
                     name: t.name.clone(),
                     description: Some(t.description.clone()),
-                    parameters: t.input_schema.properties.clone(),
+                    parameters: serde_json::json!({
+                        "type": t.input_schema.schema_type,
+                        "properties": t.input_schema.properties,
+                        "required": t.input_schema.required,
+                    }),
                 },
             })
             .collect()

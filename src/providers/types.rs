@@ -22,6 +22,11 @@ pub struct ProviderRequest {
     /// Maximum tokens to generate
     pub max_tokens: u32,
 
+    /// System prompt (provider-specific handling: sent as `system` for Claude,
+    /// prepended as a `{"role":"system"}` message for OpenAI-compatible providers)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+
     /// Tool definitions (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
@@ -42,6 +47,7 @@ impl ProviderRequest {
             messages,
             model: String::new(), // Will be set by provider
             max_tokens: 4096,
+            system: None,
             tools: None,
             temperature: None,
             stream: false,
@@ -57,6 +63,12 @@ impl ProviderRequest {
     /// Set max tokens
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set system prompt
+    pub fn with_system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
         self
     }
 
@@ -76,6 +88,76 @@ impl ProviderRequest {
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
+    }
+
+    /// Remove orphaned tool_use blocks from the end of the conversation.
+    ///
+    /// When a provider fails mid-agentic-loop (e.g. Grok 403), the conversation
+    /// may end with an assistant message containing ToolUse blocks that have no
+    /// corresponding ToolResult in the next message. Claude (and others) reject
+    /// such histories with a 400 error. This method trims those orphaned tail
+    /// messages so the fallback provider sees a clean conversation.
+    pub fn sanitize_messages(&mut self) {
+        use crate::claude::types::ContentBlock;
+
+        loop {
+            // Find the last assistant message index
+            let last_assistant = self.messages.iter().rposition(|m| m.role == "assistant");
+            let last_assistant_idx = match last_assistant {
+                Some(i) => i,
+                None => break,
+            };
+
+            // Check if it contains any ToolUse blocks
+            let has_tool_use = self.messages[last_assistant_idx]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+
+            if !has_tool_use {
+                break;
+            }
+
+            // Check if the very next message has ToolResult blocks for all tool uses
+            let tool_use_ids: Vec<String> = self.messages[last_assistant_idx]
+                .content
+                .iter()
+                .filter_map(|b| {
+                    if let ContentBlock::ToolUse { id, .. } = b {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let next_idx = last_assistant_idx + 1;
+            let all_matched = if next_idx < self.messages.len() {
+                tool_use_ids.iter().all(|id| {
+                    self.messages[next_idx].content.iter().any(|b| {
+                        matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id)
+                    })
+                })
+            } else {
+                false
+            };
+
+            if all_matched {
+                break;
+            }
+
+            // Orphaned — remove the assistant message (and any partial result after it)
+            if next_idx < self.messages.len()
+                && self.messages[next_idx].role == "user"
+                && self.messages[next_idx]
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            {
+                self.messages.remove(next_idx);
+            }
+            self.messages.remove(last_assistant_idx);
+        }
     }
 }
 
@@ -146,3 +228,57 @@ impl ProviderResponse {
 ///
 /// Re-export from generators module for convenience
 pub use crate::generators::StreamChunk;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::types::Message;
+
+    fn user_msg(text: &str) -> Message {
+        Message::user(text)
+    }
+
+    #[test]
+    fn test_provider_request_defaults() {
+        let req = ProviderRequest::new(vec![user_msg("Hello")]);
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.model, "");
+        assert_eq!(req.max_tokens, 4096);
+        assert!(req.tools.is_none());
+        assert!(req.temperature.is_none());
+        assert!(!req.stream);
+    }
+
+    #[test]
+    fn test_provider_request_builder_chain() {
+        let req = ProviderRequest::new(vec![user_msg("Hello")])
+            .with_model("claude-sonnet-4-6")
+            .with_max_tokens(1024)
+            .with_temperature(0.7)
+            .with_stream(true);
+
+        assert_eq!(req.model, "claude-sonnet-4-6");
+        assert_eq!(req.max_tokens, 1024);
+        assert_eq!(req.temperature, Some(0.7));
+        assert!(req.stream);
+    }
+
+    #[test]
+    fn test_provider_request_with_model_string_conversions() {
+        // with_model accepts &str and String
+        let req1 = ProviderRequest::new(vec![]).with_model("gpt-4");
+        let req2 = ProviderRequest::new(vec![]).with_model("gemini-pro".to_string());
+        assert_eq!(req1.model, "gpt-4");
+        assert_eq!(req2.model, "gemini-pro");
+    }
+
+    #[test]
+    fn test_provider_request_multiple_messages() {
+        let req = ProviderRequest::new(vec![
+            Message::user("first"),
+            Message::assistant("response"),
+            Message::user("second"),
+        ]);
+        assert_eq!(req.messages.len(), 3);
+    }
+}

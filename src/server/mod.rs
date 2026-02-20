@@ -10,8 +10,8 @@ mod session;
 mod training_worker;
 
 pub use feedback_handler::{handle_feedback, handle_training_status};
-pub use handlers::{create_router, health_check, metrics_endpoint};
-pub use middleware::auth_middleware;
+pub use handlers::{create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint};
+pub use middleware::{auth_middleware, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
 pub use openai_types::*;
 pub use session::{SessionManager, SessionState};
@@ -189,8 +189,11 @@ impl AgentServer {
         // Create application state
         let app_state = Arc::new(self);
 
-        // Build router
-        let app = create_router(app_state).layer(TraceLayer::new_for_http());
+        // Build router with a body size limit to guard against oversized foreign payloads.
+        // 4MB is generous for natural-language queries while blocking obvious DoS attempts.
+        let app = create_router(app_state)
+            .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)) // 4MB
+            .layer(TraceLayer::new_for_http());
 
         tracing::info!("Starting Shammah agent server on {}", addr);
 

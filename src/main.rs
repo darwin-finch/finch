@@ -44,6 +44,12 @@ struct Args {
     /// Direct mode - talk directly to teacher API, bypass daemon
     #[arg(long = "direct")]
     direct: bool,
+
+    /// Cloud-only mode - skip local model entirely, use teacher API directly.
+    /// No model download, no daemon. Great for machines without much RAM,
+    /// or when you only have a cloud API key (e.g. Grok via X Premium+).
+    #[arg(long = "cloud-only", alias = "teacher-only")]
+    cloud_only: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -90,6 +96,42 @@ enum Command {
     },
     /// Show this node's identity and capabilities
     NodeInfo,
+    /// Lotus Network device registration and account linking
+    Network {
+        #[command(subcommand)]
+        network_command: NetworkCommand,
+    },
+    /// Run as an autonomous agent, working through a task backlog
+    Agent {
+        /// Persona name (builtin or ~/.finch/personas/<name>.toml) or path to .toml
+        #[arg(long, default_value = "autonomous")]
+        persona: String,
+
+        /// Path to tasks.toml (default: ~/.finch/tasks.toml)
+        #[arg(long)]
+        tasks: Option<PathBuf>,
+
+        /// Number of completed tasks between self-reflections (0 = disable)
+        #[arg(long, default_value = "5")]
+        reflect_every: usize,
+
+        /// Complete one task then exit (for testing)
+        #[arg(long)]
+        once: bool,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum NetworkCommand {
+    /// Show this device's Lotus Network status
+    Status,
+    /// Register this device with the Lotus Network (no account required)
+    Register,
+    /// Link this device to a Lotus account using an invite code
+    Join {
+        /// Invite code from your Lotus account settings
+        invite_code: String,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -202,6 +244,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::NodeInfo) => {
             return run_node_info().await;
+        }
+        Some(Command::Network { network_command }) => {
+            return run_network_command(network_command).await;
+        }
+        Some(Command::Agent { persona, tasks, reflect_every, once }) => {
+            return run_agent(persona, tasks, reflect_every, once).await;
         }
         None => {
             // Fall through to REPL mode (check for piped input first)
@@ -380,9 +428,14 @@ async fn main() -> Result<()> {
         output_manager.enable_stdout();
     }
 
-    // Check for --direct flag (bypass daemon)
-    // In direct mode: no daemon connection, talk directly to teacher API
-    let use_daemon = !args.direct;
+    // --cloud-only / --teacher-only: skip local model and daemon entirely
+    if args.cloud_only {
+        config.backend.enabled = false;
+    }
+
+    // Check for --direct or --cloud-only flags (both bypass daemon)
+    // In direct/cloud-only mode: no daemon connection, talk directly to teacher API
+    let use_daemon = !args.direct && !args.cloud_only;
 
     // Load or create threshold router
     let models_dir = dirs::home_dir()
@@ -448,7 +501,9 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        if args.direct && io::stdout().is_terminal() {
+        if args.cloud_only && io::stdout().is_terminal() {
+            output_manager.write_status("☁️  Cloud-only mode - using teacher API (no local model)");
+        } else if args.direct && io::stdout().is_terminal() {
             output_manager.write_status("⚠️  Direct mode - bypassing daemon, using teacher API");
         }
         None
@@ -1059,8 +1114,42 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     Ok(())
 }
 
-/// Run a single query
-/// Run a single query (daemon-only mode)
+/// Build the standard tool registry + executor used for non-interactive query mode.
+/// Auto-approves all tools (no interactive prompting in non-interactive mode).
+async fn build_query_tool_executor() -> Result<(
+    Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
+    Vec<finch::tools::types::ToolDefinition>,
+)> {
+    use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
+    use finch::tools::implementations::{
+        BashTool, EditTool, GlobTool, GrepTool, ReadTool, WebFetchTool, WriteTool,
+    };
+
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ReadTool));
+    registry.register(Box::new(GlobTool));
+    registry.register(Box::new(GrepTool));
+    registry.register(Box::new(WebFetchTool::new()));
+    registry.register(Box::new(BashTool));
+    registry.register(Box::new(EditTool));
+    registry.register(Box::new(WriteTool));
+
+    // Auto-approve everything in non-interactive mode
+    let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
+    let patterns_path = dirs::home_dir()
+        .map(|h| h.join(".finch").join("tool_patterns.json"))
+        .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
+
+    let executor = ToolExecutor::new(registry, permissions, patterns_path)
+        .context("Failed to create tool executor")?;
+    let executor = Arc::new(tokio::sync::Mutex::new(executor));
+
+    let tool_definitions = executor.lock().await.list_all_tools().await;
+
+    Ok((executor, tool_definitions))
+}
+
+/// Run a single query with full tool support (agentic mode)
 async fn run_query(query: &str) -> Result<()> {
     use finch::client::DaemonClient;
     use finch::daemon::ensure_daemon_running;
@@ -1068,63 +1157,105 @@ async fn run_query(query: &str) -> Result<()> {
     // Load configuration
     let config = load_config()?;
 
+    // Build tool executor (same tools as the REPL)
+    let (executor, tool_definitions) = build_query_tool_executor().await?;
+
     // Ensure daemon is running (auto-spawn if needed)
     if let Err(e) = ensure_daemon_running(Some(&config.client.daemon_address)).await {
         eprintln!("⚠️  Daemon failed to start: {}", e);
         eprintln!("   Using teacher API directly (no local model)");
-        return run_query_teacher_only(query, &config).await;
+        return run_query_teacher_only(query, &config, executor, tool_definitions).await;
     }
 
-    // Create daemon client
+    // Create daemon client and run full tool loop
     let daemon_config = finch::client::DaemonConfig::from_client_config(&config.client);
     let client = DaemonClient::connect(daemon_config).await?;
 
-    // Send query to daemon
-    let response = client.query_text(query).await?;
+    let guard = executor.lock().await;
+    let response = client.query_with_tools(query, tool_definitions, &guard).await?;
     println!("{}", response);
 
     Ok(())
 }
 
-/// Run query using teacher API only (fallback when daemon fails)
-async fn run_query_teacher_only(query: &str, config: &Config) -> Result<()> {
-    use finch::claude::{MessageRequest, ContentBlock};
+/// Run query using teacher API only (fallback when daemon fails), with tool support
+async fn run_query_teacher_only(
+    query: &str,
+    config: &Config,
+    executor: Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
+    tool_definitions: Vec<finch::tools::types::ToolDefinition>,
+) -> Result<()> {
+    use finch::claude::{ContentBlock, Message, MessageRequest};
 
     eprintln!("⚠️  Running in teacher-only mode (no local model)");
 
-    // Create teacher client
     let claude_client = create_claude_client_with_provider(config)?;
+    let model = config
+        .active_teacher()
+        .and_then(|t| t.model.clone())
+        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
 
-    // Create simple request
-    let request = MessageRequest {
-        model: config.active_teacher()
-            .and_then(|t| t.model.clone())
-            .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string()),
-        max_tokens: 8000,
-        messages: vec![finch::claude::Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: query.to_string(),
-            }],
-        }],
-        tools: None,
-    };
+    let mut messages = vec![Message::user(query)];
 
-    // Send to teacher API
-    let response = claude_client.send_message(&request).await?;
+    const MAX_TURNS: usize = 25;
+    for _ in 0..MAX_TURNS {
+        let request = MessageRequest {
+            model: model.clone(),
+            max_tokens: 8000,
+            messages: messages.clone(),
+            system: Some(finch::generators::claude::CODING_SYSTEM_PROMPT.to_string()),
+            tools: Some(tool_definitions.clone()),
+        };
 
-    // Extract text from response
-    let text = response.content
-        .into_iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+        let response = claude_client.send_message(&request).await?;
 
-    println!("{}", text);
+        // If no tool use, print the final text and stop
+        if !response.has_tool_uses() {
+            println!("{}", response.text());
+            return Ok(());
+        }
 
+        // Execute tool calls and collect results
+        messages.push(response.to_message());
+
+        let tool_uses = response.tool_uses();
+        let mut result_blocks = Vec::new();
+        for tu in &tool_uses {
+            let tool_use = finch::tools::types::ToolUse {
+                id: tu.id.clone(),
+                name: tu.name.clone(),
+                input: tu.input.clone(),
+            };
+            let exec_result = {
+                let guard = executor.lock().await;
+                guard
+                    .execute_tool::<fn() -> anyhow::Result<()>>(
+                        &tool_use,
+                        None, // conversation
+                        None, // save_models_fn
+                        None, // batch_trainer
+                        None, // local_generator
+                        None, // tokenizer
+                        None, // repl_mode
+                        None, // plan_content
+                    )
+                    .await
+            };
+            let (content, is_error) = match exec_result {
+                Ok(result) => (result.content, result.is_error),
+                Err(e) => (format!("Error: {e}"), true),
+            };
+            result_blocks.push(ContentBlock::tool_result(
+                tu.id.clone(),
+                content,
+                if is_error { Some(true) } else { None },
+            ));
+        }
+
+        messages.push(Message::with_content("user", result_blocks));
+    }
+
+    eprintln!("⚠️  Reached max tool turns without a final answer");
     Ok(())
 }
 
@@ -1212,6 +1343,125 @@ async fn run_node_info() -> Result<()> {
     Ok(())
 }
 
+/// Handle `finch network` subcommands
+async fn run_network_command(cmd: NetworkCommand) -> Result<()> {
+    use finch::network::{DeviceMembership, LotusClient, MembershipStatus};
+    use finch::network::client::RegisterDeviceRequest;
+    use finch::node::identity::NodeIdentity;
+
+    let identity = NodeIdentity::load_or_create()?;
+    let mut membership = DeviceMembership::load_or_create(identity.id)?;
+
+    match cmd {
+        NetworkCommand::Status => {
+            println!("╔══════════════════════════════════════╗");
+            println!("║       Lotus Network Status           ║");
+            println!("╚══════════════════════════════════════╝");
+            println!("  Device ID  : {}", identity.id);
+            println!("  Name       : {}", identity.name);
+            println!("  Lotus URL  : {}", membership.lotus_url);
+            println!();
+            match &membership.status {
+                MembershipStatus::Unregistered => {
+                    println!("  Status     : Not registered");
+                    println!();
+                    println!("  To register this device with the Lotus Network:");
+                    println!("    finch network register");
+                }
+                MembershipStatus::Anonymous { device_token: _ } => {
+                    println!("  Status     : Registered (anonymous)");
+                    println!();
+                    println!("  To link this device to a Lotus account:");
+                    println!("    finch network join <invite-code>");
+                }
+                MembershipStatus::AccountMember { account_id, account_name, .. } => {
+                    let name = account_name.as_deref().unwrap_or("(unnamed)");
+                    println!("  Status     : Account member");
+                    println!("  Account    : {} ({})", name, account_id);
+                }
+            }
+        }
+
+        NetworkCommand::Register => {
+            if membership.status.is_registered() {
+                println!("This device is already registered with the Lotus Network.");
+                if let MembershipStatus::AccountMember { account_id, .. } = &membership.status {
+                    println!("Linked to account: {}", account_id);
+                }
+                return Ok(());
+            }
+
+            println!("Registering device {} with Lotus Network...", identity.short_id());
+            println!("  URL: {}", membership.lotus_url);
+
+            let client = LotusClient::new(&membership.lotus_url)?;
+            match client.register_device(RegisterDeviceRequest {
+                device_id: identity.id,
+                fingerprint: identity.name.clone(),
+                finch_version: identity.version.clone(),
+                os: std::env::consts::OS.to_string(),
+            }).await {
+                Ok(resp) => {
+                    membership.status = MembershipStatus::Anonymous {
+                        device_token: resp.device_token,
+                    };
+                    membership.save()?;
+
+                    println!("✓ Device registered successfully.");
+                    println!();
+                    println!("  To link to a Lotus account:");
+                    println!("    finch network join <invite-code>");
+                }
+                Err(e) => {
+                    // Registration failed — non-fatal. Finch works fine without it.
+                    println!("⚠  Could not reach Lotus Network: {}", e);
+                    println!();
+                    println!("  finch works fine offline — registration can be retried anytime.");
+                    println!("  Run `finch network register` again when the network is available.");
+                }
+            }
+        }
+
+        NetworkCommand::Join { invite_code } => {
+            let device_token = match membership.status.device_token() {
+                Some(t) => t.to_string(),
+                None => {
+                    anyhow::bail!(
+                        "This device is not yet registered. Run `finch network register` first."
+                    );
+                }
+            };
+
+            println!("Joining Lotus account with invite code {}...", &invite_code[..invite_code.len().min(6)]);
+
+            let client = LotusClient::new(&membership.lotus_url)?;
+            match client.join_account(&device_token, &invite_code).await {
+                Ok(resp) => {
+                    let account_name = resp.account_name.clone();
+                    membership.status = MembershipStatus::AccountMember {
+                        account_id: resp.account_id.clone(),
+                        device_token,
+                        account_name,
+                    };
+                    membership.save()?;
+
+                    println!("✓ Joined account: {} ({})",
+                        resp.account_name.as_deref().unwrap_or("(unnamed)"),
+                        resp.account_id);
+                }
+                Err(e) => {
+                    println!("⚠  Could not join account: {}", e);
+                    println!();
+                    println!("  Check that the invite code is valid and hasn't expired (15 min TTL).");
+                    println!("  Generate a new code at lotus.net and try again.");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Run as a network worker node — accepts queries from external machines
 async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     use finch::node::NodeInfo;
@@ -1245,4 +1495,60 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     println!("  Press Ctrl+C to stop.\n");
 
     run_daemon(bind_address).await
+}
+
+/// Run the autonomous agent loop
+async fn run_agent(
+    persona: String,
+    tasks: Option<PathBuf>,
+    reflect_every: usize,
+    once: bool,
+) -> Result<()> {
+    use finch::agent::{AgentConfig, AgentLoop};
+
+    // Load config (needs teacher API for the agentic loop)
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error loading config: {}", e);
+            eprintln!("Run `finch setup` to configure a teacher API key.");
+            return Err(e);
+        }
+    };
+
+    if config.active_teacher().is_none() {
+        anyhow::bail!(
+            "No teacher API configured.\n\
+             Agent mode requires a teacher API (Claude, GPT-4, etc.).\n\
+             Run `finch setup` to add one."
+        );
+    }
+
+    // Set up logging (stderr only, not TUI)
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let tasks_path = AgentConfig::resolve_tasks_path(tasks);
+
+    println!("finch agent");
+    println!("  Tasks file : {}", tasks_path.display());
+    println!("  Reflect every {} tasks", reflect_every);
+    if once {
+        println!("  Mode: --once (exit after first task)");
+    }
+    println!();
+
+    let agent_config = AgentConfig {
+        persona_spec: persona,
+        tasks_path,
+        reflect_every: reflect_every.max(1), // At least 1 to avoid div-by-zero
+        once,
+    };
+
+    let mut agent = AgentLoop::new(config, agent_config);
+    agent.run().await
 }

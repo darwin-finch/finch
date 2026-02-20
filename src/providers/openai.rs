@@ -46,7 +46,7 @@ impl OpenAIProvider {
         Self::new(
             api_key,
             "https://api.x.ai".to_string(),
-            "grok-beta".to_string(),
+            "grok-2".to_string(),
             "grok".to_string(),
         )
     }
@@ -102,60 +102,94 @@ impl OpenAIProvider {
             request.model.clone()
         };
 
-        // Convert messages to OpenAI format
-        // Need to handle mixed content (text + tool results) by creating separate messages
         let mut messages: Vec<OpenAIMessage> = Vec::new();
 
-        for msg in &request.messages {
-            // Separate text content from tool results
-            let mut text_parts = Vec::new();
-            let mut tool_results = Vec::new();
+        // Prepend system prompt as a {"role":"system"} message (OpenAI convention)
+        if let Some(system) = &request.system {
+            messages.push(OpenAIMessage::Regular {
+                role: "system".to_string(),
+                content: system.clone(),
+            });
+        }
 
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        text_parts.push(text.as_str());
+        for msg in &request.messages {
+            match msg.role.as_str() {
+                "assistant" => {
+                    // Collect text and tool_calls into a single assistant message.
+                    // The OpenAI API requires tool_calls to be in the assistant message
+                    // (not silently dropped), otherwise subsequent tool results are orphaned.
+                    let text: String = msg.content.iter()
+                        .filter_map(|b| b.as_text())
+                        .collect::<Vec<_>>()
+                        .join("");
+
+                    let tool_calls: Vec<OpenAIRequestToolCall> = msg.content.iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolUse { id, name, input } => {
+                                let arguments = serde_json::to_string(input)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                Some(OpenAIRequestToolCall {
+                                    id: id.clone(),
+                                    tool_type: "function".to_string(),
+                                    function: OpenAIRequestFunction {
+                                        name: name.clone(),
+                                        arguments,
+                                    },
+                                })
+                            }
+                            _ => None,
+                        })
+                        .collect();
+
+                    messages.push(OpenAIMessage::Assistant {
+                        role: "assistant".to_string(),
+                        content: if text.is_empty() { None } else { Some(text) },
+                        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    });
+                }
+                _ => {
+                    // user / system messages: separate text from tool results
+                    let mut text_parts: Vec<&str> = Vec::new();
+                    let mut tool_results: Vec<(String, String)> = Vec::new();
+
+                    for block in &msg.content {
+                        match block {
+                            ContentBlock::Text { text } => {
+                                text_parts.push(text.as_str());
+                            }
+                            ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                                tool_results.push((tool_use_id.clone(), content.clone()));
+                            }
+                            ContentBlock::Image { .. } => {
+                                text_parts.push("[image]");
+                            }
+                            ContentBlock::ToolUse { .. } => {}
+                        }
                     }
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        ..
-                    } => {
-                        tool_results.push((tool_use_id.clone(), content.clone()));
+
+                    if !text_parts.is_empty() {
+                        let content = text_parts.join("\n");
+                        if !content.trim().is_empty() {
+                            messages.push(OpenAIMessage::Regular {
+                                role: msg.role.clone(),
+                                content,
+                            });
+                        }
                     }
-                    ContentBlock::ToolUse { .. } => {
-                        // Tool use blocks are in assistant messages, handled in response
-                        // OpenAI includes them in the assistant message via tool_calls field
-                    }
-                    ContentBlock::Image { source } => {
-                        // Convert image to OpenAI image_url format
-                        // Note: full vision support requires multipart content array
-                        text_parts.push("[image content]");
-                        let _ = source;
+
+                    // One tool message per result (OpenAI requires separate messages)
+                    for (tool_call_id, content) in tool_results {
+                        messages.push(OpenAIMessage::Tool {
+                            role: "tool".to_string(),
+                            content: if content.trim().is_empty() {
+                                "(no output)".to_string()
+                            } else {
+                                content
+                            },
+                            tool_call_id,
+                        });
                     }
                 }
-            }
-
-            // Add regular message if there's text content
-            if !text_parts.is_empty() {
-                messages.push(OpenAIMessage::Regular {
-                    role: msg.role.clone(),
-                    content: text_parts.join("\n"),
-                });
-            }
-
-            // Add tool result messages (one per tool result)
-            for (tool_call_id, content) in tool_results {
-                // Extract function name from tool_call_id if possible
-                // Format is typically like "call_abc123" or could be our generated format
-                let name = tool_call_id.clone();
-
-                messages.push(OpenAIMessage::Tool {
-                    role: "tool".to_string(),
-                    content,
-                    tool_call_id,
-                    name,
-                });
             }
         }
 
@@ -456,22 +490,47 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// OpenAI message format - supports both regular messages and tool messages
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// OpenAI message format — request side only (we never deserialize this)
+///
+/// The untagged variants are ordered so serde tries the most-specific first:
+/// Tool (has tool_call_id), Assistant (has optional tool_calls), then Regular.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum OpenAIMessage {
-    /// Regular user/assistant/system message
+    /// Tool result message (one per tool invocation)
+    Tool {
+        role: String, // "tool"
+        content: String,
+        tool_call_id: String,
+    },
+    /// Assistant message — may contain text, tool_calls, or both
+    Assistant {
+        role: String, // "assistant"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_calls: Option<Vec<OpenAIRequestToolCall>>,
+    },
+    /// Plain user / system message
     Regular {
         role: String,
         content: String,
     },
-    /// Tool result message (from function execution)
-    Tool {
-        role: String, // Always "tool"
-        content: String,
-        tool_call_id: String,
-        name: String,
-    },
+}
+
+/// Tool call entry inside an assistant message (request format)
+#[derive(Debug, Clone, Serialize)]
+struct OpenAIRequestToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: OpenAIRequestFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAIRequestFunction {
+    name: String,
+    arguments: String, // JSON-encoded string
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

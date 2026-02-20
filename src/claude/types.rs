@@ -220,6 +220,8 @@ pub struct MessageRequest {
     pub max_tokens: u32,
     pub messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
@@ -229,6 +231,7 @@ impl MessageRequest {
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 4096,
             messages: vec![Message::user(user_query)],
+            system: None,
             tools: None,
         }
     }
@@ -239,8 +242,15 @@ impl MessageRequest {
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 4096,
             messages,
+            system: None,
             tools: None,
         }
+    }
+
+    /// Set a system prompt for the request
+    pub fn with_system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
     }
 
     /// Append a user message to existing conversation
@@ -303,5 +313,246 @@ impl MessageResponse {
             role: self.role.clone(),
             content: self.content.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    // --- ContentBlock helpers ---
+
+    #[test]
+    fn test_text_block_helpers() {
+        let block = ContentBlock::text("hello");
+        assert!(block.is_text());
+        assert!(!block.is_tool_use());
+        assert_eq!(block.as_text(), Some("hello"));
+    }
+
+    #[test]
+    fn test_image_block_helpers() {
+        let block = ContentBlock::image("image/png", "base64data");
+        assert!(!block.is_text());
+        assert!(!block.is_tool_use());
+        assert_eq!(block.as_text(), None);
+    }
+
+    #[test]
+    fn test_tool_use_block_helpers() {
+        let block = ContentBlock::ToolUse {
+            id: "id1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"path": "/tmp/test"}),
+        };
+        assert!(block.is_tool_use());
+        assert!(!block.is_text());
+        assert_eq!(block.as_text(), None);
+    }
+
+    #[test]
+    fn test_tool_result_block_helpers() {
+        let block = ContentBlock::tool_result("id1".to_string(), "file contents".to_string(), None);
+        assert!(!block.is_text());
+        assert!(!block.is_tool_use());
+        assert_eq!(block.as_text(), None);
+    }
+
+    #[test]
+    fn test_tool_result_with_error_flag() {
+        let block = ContentBlock::tool_result("id1".to_string(), "error msg".to_string(), Some(true));
+        match block {
+            ContentBlock::ToolResult { is_error, content, tool_use_id } => {
+                assert_eq!(is_error, Some(true));
+                assert_eq!(content, "error msg");
+                assert_eq!(tool_use_id, "id1");
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_content_block_text_serde_roundtrip() {
+        let block = ContentBlock::text("roundtrip");
+        let json = serde_json::to_string(&block).unwrap();
+        assert!(json.contains("\"type\":\"text\""));
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_text(), Some("roundtrip"));
+    }
+
+    #[test]
+    fn test_image_source_serde_roundtrip() {
+        let block = ContentBlock::image("image/jpeg", "abc123");
+        let json = serde_json::to_string(&block).unwrap();
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        match back {
+            ContentBlock::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type, "image/jpeg");
+                assert_eq!(source.data, "abc123");
+            }
+            _ => panic!("Expected Image"),
+        }
+    }
+
+    // --- Message construction ---
+
+    #[test]
+    fn test_message_user() {
+        let msg = Message::user("hello");
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.text_content(), "hello");
+        assert_eq!(msg.text(), "hello");
+    }
+
+    #[test]
+    fn test_message_assistant() {
+        let msg = Message::assistant("world");
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.text(), "world");
+    }
+
+    #[test]
+    fn test_message_text_content_joins_text_blocks_only() {
+        let msg = Message::with_content(
+            "user",
+            vec![
+                ContentBlock::text("first"),
+                ContentBlock::ToolUse {
+                    id: "id1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::text("second"),
+            ],
+        );
+        // text_content only concatenates text blocks, skipping ToolUse
+        assert_eq!(msg.text_content(), "first\nsecond");
+    }
+
+    #[test]
+    fn test_message_has_tool_results() {
+        let msg = Message::user("test");
+        assert!(!msg.has_tool_results());
+        let msg_with = msg.add_tool_result("id1".to_string(), "result".to_string(), false);
+        assert!(msg_with.has_tool_results());
+    }
+
+    #[test]
+    fn test_message_is_empty_text_no_text_blocks() {
+        let msg = Message::with_content(
+            "user",
+            vec![ContentBlock::ToolUse {
+                id: "id".to_string(),
+                name: "tool".to_string(),
+                input: serde_json::json!({}),
+            }],
+        );
+        assert!(msg.is_empty_text());
+    }
+
+    #[test]
+    fn test_message_is_empty_text_has_text() {
+        let msg = Message::user("not empty");
+        assert!(!msg.is_empty_text());
+    }
+
+    #[test]
+    fn test_message_add_content() {
+        let msg = Message::user("initial").add_content(ContentBlock::text("extra"));
+        assert_eq!(msg.content.len(), 2);
+    }
+
+    #[test]
+    fn test_message_add_tool_result_success() {
+        let msg = Message::user("query").add_tool_result("id1".to_string(), "output".to_string(), false);
+        assert!(msg.has_tool_results());
+        // is_error should be None when false (skipped by serde)
+        match &msg.content[1] {
+            ContentBlock::ToolResult { is_error, .. } => assert_eq!(*is_error, None),
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_message_add_tool_result_error() {
+        let msg = Message::user("query").add_tool_result("id1".to_string(), "oops".to_string(), true);
+        match &msg.content[1] {
+            ContentBlock::ToolResult { is_error, .. } => assert_eq!(*is_error, Some(true)),
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    // --- Message serde (custom content_serializer) ---
+
+    #[test]
+    fn test_message_serde_single_text_serializes_as_string() {
+        let msg = Message::user("hello world");
+        let json = serde_json::to_string(&msg).unwrap();
+        // Single text block → compact string, not array
+        assert!(json.contains("\"hello world\""));
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.text(), "hello world");
+    }
+
+    #[test]
+    fn test_message_serde_multi_block_serializes_as_array() {
+        let msg = Message::with_content(
+            "user",
+            vec![
+                ContentBlock::text("text part"),
+                ContentBlock::tool_result("id1".to_string(), "result".to_string(), None),
+            ],
+        );
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.content.len(), 2);
+    }
+
+    #[test]
+    fn test_message_deserialized_from_plain_string() {
+        // Claude API sometimes returns content as a plain string
+        let json = r#"{"role":"user","content":"plain string content"}"#;
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.text(), "plain string content");
+    }
+
+    // --- MessageRequest ---
+
+    #[test]
+    fn test_message_request_new_single_user_message() {
+        let req = MessageRequest::new("test query");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(req.messages[0].text(), "test query");
+        assert!(req.tools.is_none());
+    }
+
+    #[test]
+    fn test_message_request_append_user_message() {
+        let req = MessageRequest::new("first").append_user_message("second".to_string());
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[1].text(), "second");
+    }
+
+    #[test]
+    fn test_message_request_with_tools() {
+        use crate::tools::types::ToolInputSchema;
+        let tool = ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: ToolInputSchema::simple(vec![("file_path", "Path to read")]),
+        };
+        let req = MessageRequest::new("query").with_tools(vec![tool]);
+        assert!(req.tools.is_some());
+        assert_eq!(req.tools.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_message_request_with_context() {
+        let messages = vec![Message::user("hi"), Message::assistant("hello")];
+        let req = MessageRequest::with_context(messages);
+        assert_eq!(req.messages.len(), 2);
     }
 }

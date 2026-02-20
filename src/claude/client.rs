@@ -42,6 +42,10 @@ impl ClaudeClient {
             .with_model(request.model.clone())
             .with_max_tokens(request.max_tokens);
 
+        if let Some(system) = &request.system {
+            provider_req = provider_req.with_system(system.clone());
+        }
+
         if let Some(tools) = &request.tools {
             provider_req = provider_req.with_tools(tools.clone());
         }

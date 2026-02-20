@@ -84,3 +84,38 @@ impl TaskScheduler {
         self.running.store(false, Ordering::SeqCst);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduling::queue::TaskQueue;
+
+    fn make_scheduler() -> TaskScheduler {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let queue = Arc::new(TaskQueue::new(tmp.path().to_path_buf()).unwrap());
+        TaskScheduler::new(Arc::clone(&queue))
+    }
+
+    #[test]
+    fn test_scheduler_starts_not_running() {
+        let scheduler = make_scheduler();
+        // Before run() is called, running flag should be false
+        assert!(!scheduler.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_scheduler_stop_clears_running_flag() {
+        let scheduler = make_scheduler();
+        scheduler.running.store(true, Ordering::SeqCst);
+        scheduler.stop();
+        assert!(!scheduler.running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_scheduler_stop_is_idempotent() {
+        let scheduler = make_scheduler();
+        scheduler.stop(); // already false
+        scheduler.stop(); // still false
+        assert!(!scheduler.running.load(Ordering::SeqCst));
+    }
+}

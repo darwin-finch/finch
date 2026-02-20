@@ -72,3 +72,109 @@ impl TaskQueue {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_task(task: &str) -> ScheduledTask {
+        ScheduledTask {
+            id: None,
+            scheduled_time: Utc::now(),
+            task: task.to_string(),
+            context: "{}".to_string(),
+            recurring: None,
+            status: TaskStatus::Pending,
+            created_at: Utc::now(),
+            last_run: None,
+            retries: 0,
+        }
+    }
+
+    #[test]
+    fn test_task_status_equality() {
+        assert_eq!(TaskStatus::Pending, TaskStatus::Pending);
+        assert_ne!(TaskStatus::Pending, TaskStatus::Completed);
+        assert_ne!(TaskStatus::Running, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn test_task_status_serde_roundtrip() {
+        for status in [TaskStatus::Pending, TaskStatus::Running, TaskStatus::Completed, TaskStatus::Failed] {
+            let json = serde_json::to_string(&status).unwrap();
+            let decoded: TaskStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn test_scheduled_task_creation() {
+        let task = make_task("run_training");
+        assert_eq!(task.task, "run_training");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.retries, 0);
+        assert!(task.id.is_none());
+        assert!(task.last_run.is_none());
+        assert!(task.recurring.is_none());
+    }
+
+    #[test]
+    fn test_scheduled_task_recurring() {
+        let mut task = make_task("sync");
+        task.recurring = Some("daily".to_string());
+        task.id = Some(42);
+        assert_eq!(task.id, Some(42));
+        assert_eq!(task.recurring.as_deref(), Some("daily"));
+    }
+
+    #[test]
+    fn test_task_queue_creation() {
+        let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_queue.db")).unwrap();
+        // Queue created — stub stores path but doesn't open DB
+        drop(queue);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_returns_id() {
+        let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q2.db")).unwrap();
+        let task = make_task("test_task");
+        let id = queue.enqueue(task).await.unwrap();
+        assert_eq!(id, 1); // Stub always returns 1
+    }
+
+    #[tokio::test]
+    async fn test_get_ready_tasks_empty() {
+        let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q3.db")).unwrap();
+        let tasks = queue.get_ready_tasks().await.unwrap();
+        assert!(tasks.is_empty()); // Stub returns empty
+    }
+
+    #[tokio::test]
+    async fn test_mark_completed() {
+        let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q4.db")).unwrap();
+        assert!(queue.mark_completed(1).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed() {
+        let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q5.db")).unwrap();
+        assert!(queue.mark_failed(1, "timeout").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_increment_retry() {
+        let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q6.db")).unwrap();
+        assert!(queue.increment_retry(1).await.is_ok());
+    }
+
+    #[test]
+    fn test_scheduled_task_serde_roundtrip() {
+        let task = make_task("train_lora");
+        let json = serde_json::to_string(&task).unwrap();
+        let decoded: ScheduledTask = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.task, task.task);
+        assert_eq!(decoded.status, task.status);
+        assert_eq!(decoded.retries, task.retries);
+    }
+}

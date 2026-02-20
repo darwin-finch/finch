@@ -372,6 +372,126 @@ pub fn spawn_input_task(
     rx
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // --- sanitize_paste_char ---
+
+    #[test]
+    fn test_allows_printable_ascii() {
+        // All printable ASCII 0x20–0x7E should be allowed
+        for c in ' '..='~' {
+            assert!(sanitize_paste_char(c), "printable ASCII {c:?} should be allowed");
+        }
+    }
+
+    #[test]
+    fn test_allows_common_whitespace() {
+        assert!(sanitize_paste_char('\t'), "tab should be allowed");
+        assert!(sanitize_paste_char('\n'), "newline should be allowed");
+        assert!(sanitize_paste_char('\r'), "carriage return should be allowed");
+    }
+
+    #[test]
+    fn test_blocks_control_characters() {
+        // Control chars below 0x20 (except \t 0x09, \n 0x0A, \r 0x0D) should be blocked
+        let allowed_whitespace = ['\t', '\n', '\r'];
+        for byte in 0x00u8..0x20u8 {
+            let c = byte as char;
+            if allowed_whitespace.contains(&c) {
+                assert!(sanitize_paste_char(c), "whitespace {c:?} should be allowed");
+            } else {
+                assert!(!sanitize_paste_char(c), "control char {c:?} should be blocked");
+            }
+        }
+    }
+
+    #[test]
+    fn test_blocks_private_use_area_unicode() {
+        // Private use area E000–F8FF is used for image rendering
+        assert!(!sanitize_paste_char('\u{E000}'), "private use start should be blocked");
+        assert!(!sanitize_paste_char('\u{F8FF}'), "private use end should be blocked");
+        assert!(!sanitize_paste_char('\u{E100}'), "mid private use should be blocked");
+    }
+
+    #[test]
+    fn test_allows_normal_unicode_text() {
+        // Common international characters should be allowed
+        for c in ['é', 'ñ', 'ü', '中', '日', '한', '🦀'] {
+            // Note: emoji may or may not be in private use range — just check no panic
+            let _ = sanitize_paste_char(c);
+        }
+        assert!(sanitize_paste_char('é'));
+        assert!(sanitize_paste_char('ñ'));
+        assert!(sanitize_paste_char('中'));
+    }
+
+    #[test]
+    fn test_allows_del_char_as_printable() {
+        // 0x7E '~' is the last printable ASCII; 0x7F DEL is NOT in ' '..='~'
+        assert!(!sanitize_paste_char('\x7F'), "DEL should be blocked");
+    }
+
+    // --- should_accept_key_event ---
+
+    #[test]
+    fn test_accepts_printable_char_keys() {
+        // Normal alphanumeric keys should all be accepted
+        for c in 'a'..='z' {
+            let event = key(KeyCode::Char(c));
+            assert!(should_accept_key_event(&event), "char {c} should be accepted");
+        }
+    }
+
+    #[test]
+    fn test_accepts_non_char_key_codes() {
+        // Structural keys (Enter, Backspace, arrows) are always accepted
+        let enter = key(KeyCode::Enter);
+        let backspace = key(KeyCode::Backspace);
+        let up = key(KeyCode::Up);
+        let down = key(KeyCode::Down);
+        assert!(should_accept_key_event(&enter));
+        assert!(should_accept_key_event(&backspace));
+        assert!(should_accept_key_event(&up));
+        assert!(should_accept_key_event(&down));
+    }
+
+    #[test]
+    fn test_rejects_private_use_unicode_in_key_event() {
+        // A key event carrying a private-use-area character should be rejected
+        let event = key(KeyCode::Char('\u{E000}'));
+        assert!(!should_accept_key_event(&event));
+    }
+
+    // --- encode_rgba_to_png ---
+
+    #[test]
+    fn test_encode_rgba_to_png_produces_png_signature() {
+        // 2x2 red pixels (RGBA)
+        let rgba = vec![255u8, 0, 0, 255,  // pixel 0
+                        255,   0, 0, 255,  // pixel 1
+                        255,   0, 0, 255,  // pixel 2
+                        255,   0, 0, 255]; // pixel 3
+        let png = encode_rgba_to_png(2, 2, &rgba).unwrap();
+
+        // PNG files start with the 8-byte PNG signature
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "output should start with PNG signature");
+    }
+
+    #[test]
+    fn test_encode_rgba_to_png_nonempty_output() {
+        let rgba = vec![0u8; 4]; // 1x1 black pixel
+        let png = encode_rgba_to_png(1, 1, &rgba).unwrap();
+        assert!(!png.is_empty());
+    }
+}
+
 /// Helper to create a clean text area (needs to be accessible)
 fn create_clean_textarea() -> tui_textarea::TextArea<'static> {
     let mut textarea = tui_textarea::TextArea::default();

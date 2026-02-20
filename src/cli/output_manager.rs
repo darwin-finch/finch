@@ -9,8 +9,8 @@ use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
 use crate::cli::messages::{
-    LiveToolMessage, Message, MessageRef, MessageStatus, UserQueryMessage,
-    StreamingResponseMessage, StaticMessage,
+    LiveToolMessage, Message, MessageRef, MessageStatus, OperationMessage,
+    UserQueryMessage, StreamingResponseMessage, StaticMessage,
 };
 
 /// Maximum number of messages to keep in the circular buffer
@@ -170,6 +170,15 @@ impl OutputManager {
     /// Returns the Arc so the caller can append content and mark complete.
     pub fn start_live_tool(&self, header: impl Into<String>) -> Arc<LiveToolMessage> {
         let msg = Arc::new(LiveToolMessage::new(header));
+        self.add_trait_message(Arc::clone(&msg) as MessageRef);
+        msg
+    }
+
+    /// Create and register an OperationMessage that groups tool-call rows for
+    /// one generation turn.  Returns the Arc so callers can add rows and mark
+    /// the operation complete.
+    pub fn start_operation(&self, header: impl Into<String>) -> Arc<OperationMessage> {
+        let msg = Arc::new(OperationMessage::new(header));
         self.add_trait_message(Arc::clone(&msg) as MessageRef);
         msg
     }

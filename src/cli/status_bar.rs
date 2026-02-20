@@ -223,8 +223,7 @@ impl StatusBar {
 
     /// Update operation status line
     pub fn update_operation(&self, operation: impl Into<String>) {
-        let content = format!("Operation: {}", operation.into());
-        self.update_line(StatusLineType::OperationStatus, content);
+        self.update_line(StatusLineType::OperationStatus, operation.into());
     }
 
     /// Clear operation status (shorthand)

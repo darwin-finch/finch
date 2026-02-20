@@ -570,6 +570,7 @@ impl Repl {
             temperature: None,
             tools: request.tools.clone(),
             stream: false,
+            system: request.system.clone(),
         };
 
         // Send with Level 3 optimization (smart strategies)
@@ -592,6 +593,7 @@ impl Repl {
             temperature: None,
             tools: request.tools.clone(),
             stream: true,
+            system: request.system.clone(),
         };
 
         // Send with streaming (Level 1 tracking only, no truncation for streaming)
@@ -2430,13 +2432,36 @@ impl Repl {
     pub async fn process_query(&mut self, query: &str) -> Result<String> {
         let start_time = Instant::now();
 
-        // Phase 2: Inject persona system prompt if first message in conversation
+        // Phase 2: Inject persona system prompt + memory context if first message in conversation
         {
             let conv = self.conversation.read().await;
             if conv.get_messages().is_empty() {
                 drop(conv);
-                let persona = self.active_persona.read().await;
-                let system_prompt = persona.to_system_message();
+
+                let base_system = {
+                    let persona = self.active_persona.read().await;
+                    persona.to_system_message()
+                };
+
+                // Augment system prompt with semantically relevant memories from previous sessions
+                let system_prompt = if let Some(ref memory) = self.memory_system {
+                    match memory.query(query, Some(5)).await {
+                        Ok(memories) if !memories.is_empty() => {
+                            let memory_block = memories
+                                .iter()
+                                .map(|m| format!("• {}", m))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            format!(
+                                "{}\n\n## Memories from previous sessions\n{}",
+                                base_system, memory_block
+                            )
+                        }
+                        _ => base_system,
+                    }
+                } else {
+                    base_system
+                };
 
                 // Add as a Message with system role
                 use crate::claude::{Message, ContentBlock};
