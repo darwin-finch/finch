@@ -89,10 +89,10 @@ cargo test --test tui_integration_test -- --ignored
 ### Daemon Mode
 ```bash
 # 1. Start daemon
-shammah daemon --bind 127.0.0.1:11435 &
+finch daemon --bind 127.0.0.1:11435 &
 
 # 2. Run CLI (should connect to daemon)
-shammah
+finch
 # Expected: "✓ Connected to daemon"
 
 # 3. Run query
@@ -100,7 +100,7 @@ shammah
 # Expected: "→ Using daemon for query"
 
 # 4. Stop daemon
-pkill -f "shammah daemon"
+pkill -f "finch daemon"
 
 # 5. Try query again
 > What is 3+3?
@@ -110,7 +110,7 @@ pkill -f "shammah daemon"
 ### TUI Mode
 ```bash
 # 1. Run interactive REPL
-shammah
+finch
 
 # 2. Verify TUI elements visible:
 #    - Input area (bottom)
@@ -138,7 +138,7 @@ Example expect script:
 #!/usr/bin/expect -f
 set timeout 10
 
-spawn shammah
+spawn finch
 
 expect ">" { send "test query\r" }
 expect ">" { send "/exit\r" }

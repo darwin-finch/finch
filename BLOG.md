@@ -142,4 +142,4 @@ The Grok work made one thing clear: building for multiple providers forces you t
 
 ---
 
-*Finch is written in Rust. The current release supports macOS (Apple Silicon and Intel), with Linux support in progress. Source at [github.com/schancel/shammah](https://github.com/schancel/shammah).*
+*Finch is written in Rust. The current release supports macOS (Apple Silicon and Intel), with Linux support in progress. Source at [github.com/darwin-finch/finch](https://github.com/darwin-finch/finch).*

@@ -633,7 +633,7 @@ finch 2>&1 | grep -i "mcp\|jsonrpc"
 
 ## Getting Help
 
-**Issues**: https://github.com/schancel/finch/issues
+**Issues**: https://github.com/darwin-finch/finch/issues
 
 **Questions**: Create a GitHub discussion or issue
 

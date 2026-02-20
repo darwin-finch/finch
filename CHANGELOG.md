@@ -108,5 +108,5 @@ Initial release of Shammah - Local-first AI coding assistant.
 - Model caching (~/.cache/huggingface/hub/)
 - Adapter storage (~/.finch/adapters/)
 
-[0.2.0]: https://github.com/schancel/finch/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/schancel/finch/releases/tag/v0.1.0
+[0.2.0]: https://github.com/darwin-finch/finch/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/darwin-finch/finch/releases/tag/v0.1.0

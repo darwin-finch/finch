@@ -7,14 +7,14 @@ echo "Testing Shammah HTTP daemon mode..."
 echo
 
 # Check if binary exists
-if [ ! -f "target/release/shammah" ]; then
+if [ ! -f "target/release/finch" ]; then
     echo "Error: Binary not found. Run 'cargo build --release' first."
     exit 1
 fi
 
 # Start daemon in background
 echo "Starting daemon on port 18000..."
-./target/release/shammah daemon --bind 127.0.0.1:18000 &
+./target/release/finch daemon --bind 127.0.0.1:18000 &
 DAEMON_PID=$!
 
 echo "Daemon started with PID: $DAEMON_PID"

@@ -30,7 +30,7 @@ echo "----------------------------"
 if curl -s "$DAEMON_URL/health" > /dev/null; then
     echo "✅ Daemon is running"
 else
-    echo "❌ Daemon is not running. Start it with: shammah daemon"
+    echo "❌ Daemon is not running. Start it with: finch daemon"
     exit 1
 fi
 echo ""

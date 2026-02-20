@@ -57,24 +57,24 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run clippy (binary only, warnings allowed for now)
-      run: cargo clippy --bin shammah --all-features
+      run: cargo clippy --bin finch --all-features
       continue-on-error: true
 
     - name: Build binary (default features)
-      run: cargo build --bin shammah --verbose
+      run: cargo build --bin finch --verbose
 
     - name: Build binary (all features)
-      run: cargo build --bin shammah --all-features --verbose
+      run: cargo build --bin finch --all-features --verbose
 
     - name: Build binary (with candle)
-      run: cargo build --bin shammah --features candle --verbose
+      run: cargo build --bin finch --features candle --verbose
       if: matrix.os == 'macos-latest'
 
     - name: Verify binary exists
       run: |
-        if [ -f "target/debug/shammah" ]; then
+        if [ -f "target/debug/finch" ]; then
           echo "✓ Binary built successfully"
-          ./target/debug/shammah --version || echo "Binary exists but --version failed"
+          ./target/debug/finch --version || echo "Binary exists but --version failed"
         else
           echo "✗ Binary not found"
           exit 1
@@ -108,8 +108,8 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: shammah-${{ matrix.target }}
-        path: target/${{ matrix.target }}/release/shammah
+        name: finch-${{ matrix.target }}
+        path: target/${{ matrix.target }}/release/finch
 
   security:
     name: Security Audit

@@ -60,7 +60,7 @@ That's it! Shammah will guide you through setup on first run.
 
 ```bash
 # Clone repository
-git clone https://github.com/schancel/finch.git
+git clone https://github.com/darwin-finch/finch.git
 cd finch
 
 # Build (requires Rust 1.70+)
@@ -504,7 +504,7 @@ finch memory
 tail -f ~/.finch/logs/finch.log  # if enabled
 ```
 
-**GitHub Issues:** https://github.com/schancel/finch/issues
+**GitHub Issues:** https://github.com/darwin-finch/finch/issues
 
 ---
 

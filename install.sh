@@ -2,7 +2,7 @@
 set -e
 
 # Shammah Installation Script
-# Usage: curl -sSL https://raw.githubusercontent.com/schancel/shammah/main/install.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/darwin-finch/finch/main/install.sh | bash
 
 VERSION="${VERSION:-latest}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
@@ -47,14 +47,14 @@ case "$OS" in
                 ;;
             *)
                 echo -e "${RED}✗ Unsupported architecture: $ARCH${NC}"
-                echo -e "${YELLOW}Try building from source: https://github.com/schancel/shammah#installation${NC}"
+                echo -e "${YELLOW}Try building from source: https://github.com/darwin-finch/finch#installation${NC}"
                 exit 1
                 ;;
         esac
         ;;
     *)
         echo -e "${RED}✗ Unsupported OS: $OS${NC}"
-        echo -e "${YELLOW}Try building from source: https://github.com/schancel/shammah#installation${NC}"
+        echo -e "${YELLOW}Try building from source: https://github.com/darwin-finch/finch#installation${NC}"
         exit 1
         ;;
 esac
@@ -63,9 +63,9 @@ echo -e "${GREEN}✓${NC} Detected platform: ${GREEN}$PLATFORM${NC}"
 
 # Determine download URL
 if [ "$VERSION" = "latest" ]; then
-    DOWNLOAD_URL="https://github.com/schancel/shammah/releases/latest/download/shammah-$PLATFORM.tar.gz"
+    DOWNLOAD_URL="https://github.com/darwin-finch/finch/releases/latest/download/finch-$PLATFORM.tar.gz"
 else
-    DOWNLOAD_URL="https://github.com/schancel/shammah/releases/download/$VERSION/shammah-$PLATFORM.tar.gz"
+    DOWNLOAD_URL="https://github.com/darwin-finch/finch/releases/download/$VERSION/finch-$PLATFORM.tar.gz"
 fi
 
 echo -e "${GREEN}✓${NC} Download URL: $DOWNLOAD_URL"
@@ -80,9 +80,9 @@ cd "$TEMP_DIR"
 
 echo ""
 echo -e "${YELLOW}⏳${NC} Downloading Shammah..."
-if ! curl -sSL "$DOWNLOAD_URL" -o shammah.tar.gz; then
+if ! curl -sSL "$DOWNLOAD_URL" -o finch.tar.gz; then
     echo -e "${RED}✗ Failed to download Shammah${NC}"
-    echo -e "${YELLOW}Check if the release exists: https://github.com/schancel/shammah/releases${NC}"
+    echo -e "${YELLOW}Check if the release exists: https://github.com/darwin-finch/finch/releases${NC}"
     rm -rf "$TEMP_DIR"
     exit 1
 fi
@@ -90,11 +90,11 @@ fi
 echo -e "${GREEN}✓${NC} Downloaded"
 
 echo -e "${YELLOW}⏳${NC} Extracting..."
-tar -xzf shammah.tar.gz
+tar -xzf finch.tar.gz
 
 echo -e "${YELLOW}⏳${NC} Installing to $INSTALL_DIR..."
-mv shammah "$INSTALL_DIR/shammah"
-chmod +x "$INSTALL_DIR/shammah"
+mv finch "$INSTALL_DIR/finch"
+chmod +x "$INSTALL_DIR/finch"
 
 # Cleanup
 cd - > /dev/null
@@ -115,8 +115,8 @@ fi
 
 # Test installation
 echo -e "${GREEN}✓${NC} Testing installation..."
-if "$INSTALL_DIR/shammah" --version > /dev/null 2>&1; then
-    VERSION_OUTPUT="$($INSTALL_DIR/shammah --version)"
+if "$INSTALL_DIR/finch" --version > /dev/null 2>&1; then
+    VERSION_OUTPUT="$($INSTALL_DIR/finch --version)"
     echo -e "${GREEN}✓${NC} Shammah $VERSION_OUTPUT installed!"
 else
     echo -e "${RED}✗ Installation test failed${NC}"
@@ -130,8 +130,8 @@ echo -e "${GREEN}╚════════════════════
 echo ""
 echo "Next steps:"
 echo ""
-echo -e "1. Run setup wizard:     ${GREEN}shammah setup${NC}"
-echo -e "2. Start using it:       ${GREEN}shammah${NC}"
+echo -e "1. Run setup wizard:     ${GREEN}finch setup${NC}"
+echo -e "2. Start using it:       ${GREEN}finch${NC}"
 echo ""
-echo "Documentation: https://github.com/schancel/shammah"
+echo "Documentation: https://github.com/darwin-finch/finch"
 echo ""
