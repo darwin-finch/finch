@@ -796,9 +796,14 @@ impl EventLoop {
             if caps.supports_streaming {
                 tracing::debug!("Generator supports streaming, attempting to stream");
 
-                // Don't add a message to scrollback yet — show live stats in the status bar
-                // instead. The full response is added to scrollback only when streaming ends.
+                // Add placeholder message to scrollback NOW (before streaming) so the
+                // shadow-buffer / insert_before architecture stays consistent.
+                // The message starts empty (InProgress); we fill it after the stream ends
+                // so the response appears all at once via the normal blit path.
                 use crate::cli::messages::StreamingResponseMessage;
+                let msg = Arc::new(StreamingResponseMessage::new());
+                output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
+
                 let stream_start = std::time::Instant::now();
                 let mut token_count: usize = 0;
                 let mut throb_idx: usize = 0;
@@ -849,6 +854,7 @@ impl EventLoop {
                                 }
                                 Err(e) => {
                                     tracing::error!("Stream error in event loop: {}", e);
+                                    msg.set_failed();
                                     let _ = event_tx.send(ReplEvent::QueryFailed {
                                         query_id,
                                         error: format!("{}", e),
@@ -861,13 +867,12 @@ impl EventLoop {
                         tracing::debug!("[EVENT_LOOP] Stream receive loop ended, {} blocks received", blocks.len());
                         tracing::debug!("Stream receive loop ended");
 
-                        // Stream complete — add the full response to scrollback at once
-                        let msg = Arc::new(StreamingResponseMessage::new());
+                        // Stream complete — update the placeholder message with full content.
+                        // The blit will detect the change and render it all at once.
                         if !text.is_empty() {
                             msg.append_chunk(&text);
                         }
                         msg.set_complete();
-                        output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
 
                         // Send stats update
                         let _ = event_tx.send(ReplEvent::StatsUpdate {
