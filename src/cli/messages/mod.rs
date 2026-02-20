@@ -14,8 +14,10 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub mod concrete;
+pub mod work_unit;
 
 pub use concrete::*;
+pub use work_unit::{WorkUnit, WorkRow, WorkRowStatus};
 
 /// Unique identifier for messages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

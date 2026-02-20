@@ -1,0 +1,646 @@
+// WorkUnit - Unified message type for one AI generation turn
+//
+// A WorkUnit covers the full lifecycle of one AI response:
+//   1. Streaming phase  → animated "✦ Channeling… (Xs · thinking)" header
+//   2. Tool call phase  → sub-rows with "⎿ bash(cmd)…" / "⎿ bash(cmd) N lines"
+//   3. Complete phase   → "⏺ response text" with collapsed sub-rows
+//
+// WorkUnit replaces the combination of StreamingResponseMessage + OperationMessage.
+// It lives in the shadow buffer, rendered by the blit cycle (~100ms tick).
+// The throb animation is TIME-DRIVEN — no external counter required.
+
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+use super::{Message, MessageId, MessageStatus};
+use crate::config::ColorScheme;
+
+// Animation frames: small → large → small (creates a "throb" pulse effect)
+const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
+
+const RESET: &str = "\x1b[0m";
+const CYAN: &str = "\x1b[36m";
+const GRAY: &str = "\x1b[90m";
+const GRAY_DIM: &str = "\x1b[2;90m";
+const RED_COLOR: &str = "\x1b[31m";
+
+// ============================================================================
+// WorkRowStatus / WorkRow
+// ============================================================================
+
+/// Status of an individual tool-call sub-row within a WorkUnit
+#[derive(Clone, Debug)]
+pub enum WorkRowStatus {
+    /// Tool is currently running
+    Running,
+    /// Tool completed with an optional compact one-line summary
+    Complete(String),
+    /// Tool failed with an error description
+    Error(String),
+}
+
+/// A single tool-call sub-item rendered below the WorkUnit header
+#[derive(Clone, Debug)]
+pub struct WorkRow {
+    /// Pre-formatted label, e.g. "bash(git status)"
+    pub label: String,
+    pub status: WorkRowStatus,
+}
+
+// ============================================================================
+// WorkUnitInner (behind RwLock)
+// ============================================================================
+
+struct WorkUnitInner {
+    /// Final AI response text (empty while InProgress)
+    response_text: String,
+    /// Approximate token count (accumulated from text deltas)
+    token_count: usize,
+    /// True while in the "thinking" phase (before tokens arrive)
+    thinking: bool,
+    /// Sub-rows for tool calls
+    rows: Vec<WorkRow>,
+    /// Overall status of this unit
+    status: MessageStatus,
+}
+
+// ============================================================================
+// WorkUnit
+// ============================================================================
+
+/// A unified message covering one AI generation turn.
+///
+/// Created once per turn — before streaming begins.
+/// Blit cycle calls `format()` every ~100ms; the throb icon is computed
+/// purely from `started_at.elapsed()`, no external counter needed.
+pub struct WorkUnit {
+    id: MessageId,
+    /// Verb shown in the animated header: "Channeling", "Building", etc.
+    verb: String,
+    /// When this unit started — drives time-driven animation
+    started_at: Instant,
+    inner: Arc<RwLock<WorkUnitInner>>,
+}
+
+impl WorkUnit {
+    /// Create a new WorkUnit with the given verb (e.g. `"Channeling"`).
+    pub fn new(verb: impl Into<String>) -> Self {
+        Self {
+            id: MessageId::new(),
+            verb: verb.into(),
+            started_at: Instant::now(),
+            inner: Arc::new(RwLock::new(WorkUnitInner {
+                response_text: String::new(),
+                token_count: 0,
+                thinking: false,
+                rows: Vec::new(),
+                status: MessageStatus::InProgress,
+            })),
+        }
+    }
+
+    // ── Update API ──────────────────────────────────────────────────────────
+
+    /// Accumulate tokens from a text delta (approximate: counts whitespace words).
+    pub fn add_tokens(&self, text: &str) {
+        let count = text.split_whitespace().count();
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .token_count += count;
+    }
+
+    /// Set the "thinking" flag shown in the animated status line.
+    pub fn set_thinking(&self, thinking: bool) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .thinking = thinking;
+    }
+
+    /// Set the final response text (call after streaming ends).
+    pub fn set_response(&self, text: impl Into<String>) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .response_text = text.into();
+    }
+
+    /// Append a chunk to the response text (for partial updates).
+    pub fn append_response(&self, text: &str) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .response_text
+            .push_str(text);
+    }
+
+    /// Add a running tool-call sub-row; returns its index for later updates.
+    pub fn add_row(&self, label: impl Into<String>) -> usize {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        let idx = inner.rows.len();
+        inner.rows.push(WorkRow {
+            label: label.into(),
+            status: WorkRowStatus::Running,
+        });
+        idx
+    }
+
+    /// Mark a sub-row complete with an optional compact one-line summary.
+    pub fn complete_row(&self, idx: usize, summary: impl Into<String>) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = inner.rows.get_mut(idx) {
+            row.status = WorkRowStatus::Complete(summary.into());
+        }
+    }
+
+    /// Mark a sub-row as failed.
+    pub fn fail_row(&self, idx: usize, error: impl Into<String>) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = inner.rows.get_mut(idx) {
+            row.status = WorkRowStatus::Error(error.into());
+        }
+    }
+
+    /// Mark the whole WorkUnit complete (stops animation, shows final content).
+    pub fn set_complete(&self) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .status = MessageStatus::Complete;
+    }
+
+    /// Mark the whole WorkUnit failed.
+    pub fn set_failed(&self) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .status = MessageStatus::Failed;
+    }
+}
+
+// ============================================================================
+// Message trait impl
+// ============================================================================
+
+impl Message for WorkUnit {
+    fn id(&self) -> MessageId {
+        self.id
+    }
+
+    fn format(&self, _colors: &ColorScheme) -> String {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let elapsed = self.started_at.elapsed();
+
+        match inner.status {
+            MessageStatus::InProgress => {
+                // Time-driven throb: frame changes every 200 ms, no external counter
+                let frame_idx = (elapsed.as_millis() / 200) as usize % THROB_FRAMES.len();
+                let icon = THROB_FRAMES[frame_idx];
+                let secs = elapsed.as_secs();
+
+                let stats = if inner.token_count == 0 {
+                    format!("{} · thinking", fmt_elapsed(secs))
+                } else {
+                    format!(
+                        "{} · ↓ {} tokens",
+                        fmt_elapsed(secs),
+                        fmt_tokens(inner.token_count)
+                    )
+                };
+
+                let mut out = format!(
+                    "{}{}{}  {}… ({}){}",
+                    CYAN, icon, RESET, self.verb, stats, RESET
+                );
+
+                for row in &inner.rows {
+                    out.push('\n');
+                    out.push_str(&format_row(row));
+                }
+
+                out
+            }
+
+            MessageStatus::Complete | MessageStatus::Failed => {
+                // Show final response (bare bullet if no text)
+                let mut out = if inner.response_text.is_empty() {
+                    format!("{}⏺{}", CYAN, RESET)
+                } else {
+                    format!("{}⏺{} {}", CYAN, RESET, inner.response_text)
+                };
+
+                for row in &inner.rows {
+                    out.push('\n');
+                    out.push_str(&format_row(row));
+                }
+
+                out
+            }
+        }
+    }
+
+    fn status(&self) -> MessageStatus {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .status
+    }
+
+    fn content(&self) -> String {
+        self.inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .response_text
+            .clone()
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn format_row(row: &WorkRow) -> String {
+    match &row.status {
+        WorkRowStatus::Running => {
+            format!(
+                "  {}⎿{} {}{}…{}",
+                GRAY, RESET, row.label, GRAY_DIM, RESET
+            )
+        }
+        WorkRowStatus::Complete(summary) => {
+            if summary.is_empty() {
+                format!("  {}⎿{} {}", GRAY, RESET, row.label)
+            } else {
+                format!(
+                    "  {}⎿{} {} {}{}{}",
+                    GRAY, RESET, row.label, GRAY_DIM, summary, RESET
+                )
+            }
+        }
+        WorkRowStatus::Error(err) => {
+            format!(
+                "  {}⎿{} {} {}❌ {}{}",
+                GRAY, RESET, row.label, RED_COLOR, err, RESET
+            )
+        }
+    }
+}
+
+fn fmt_elapsed(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+fn fmt_tokens(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn colors() -> ColorScheme {
+        ColorScheme::default()
+    }
+
+    // ── Construction ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_new_defaults() {
+        let wu = WorkUnit::new("Channeling");
+        assert_eq!(wu.verb, "Channeling");
+        assert_eq!(wu.status(), MessageStatus::InProgress);
+        assert_eq!(wu.content(), "");
+    }
+
+    #[test]
+    fn test_ids_are_unique() {
+        let wu1 = WorkUnit::new("A");
+        let wu2 = WorkUnit::new("A");
+        assert_ne!(wu1.id(), wu2.id());
+    }
+
+    // ── Status transitions ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_complete() {
+        let wu = WorkUnit::new("Test");
+        assert_eq!(wu.status(), MessageStatus::InProgress);
+        wu.set_complete();
+        assert_eq!(wu.status(), MessageStatus::Complete);
+    }
+
+    #[test]
+    fn test_set_failed() {
+        let wu = WorkUnit::new("Test");
+        wu.set_failed();
+        assert_eq!(wu.status(), MessageStatus::Failed);
+    }
+
+    // ── Token / thinking ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_add_tokens_single_call() {
+        let wu = WorkUnit::new("X");
+        wu.add_tokens("hello world foo bar"); // 4 words
+        let inner = wu.inner.read().unwrap();
+        assert_eq!(inner.token_count, 4);
+    }
+
+    #[test]
+    fn test_add_tokens_accumulates() {
+        let wu = WorkUnit::new("X");
+        wu.add_tokens("a b c"); // 3
+        wu.add_tokens("d e"); // 2
+        let inner = wu.inner.read().unwrap();
+        assert_eq!(inner.token_count, 5);
+    }
+
+    #[test]
+    fn test_add_tokens_empty_string() {
+        let wu = WorkUnit::new("X");
+        wu.add_tokens("");
+        let inner = wu.inner.read().unwrap();
+        assert_eq!(inner.token_count, 0);
+    }
+
+    #[test]
+    fn test_set_thinking() {
+        let wu = WorkUnit::new("X");
+        wu.set_thinking(true);
+        assert!(wu.inner.read().unwrap().thinking);
+        wu.set_thinking(false);
+        assert!(!wu.inner.read().unwrap().thinking);
+    }
+
+    // ── Response text ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_response() {
+        let wu = WorkUnit::new("X");
+        wu.set_response("The answer is 42.");
+        assert_eq!(wu.content(), "The answer is 42.");
+    }
+
+    #[test]
+    fn test_append_response() {
+        let wu = WorkUnit::new("X");
+        wu.set_response("Hello");
+        wu.append_response(" world");
+        assert_eq!(wu.content(), "Hello world");
+    }
+
+    // ── Rows ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_add_row_returns_index() {
+        let wu = WorkUnit::new("X");
+        assert_eq!(wu.add_row("bash(ls)"), 0);
+        assert_eq!(wu.add_row("read(foo.rs)"), 1);
+        assert_eq!(wu.inner.read().unwrap().rows.len(), 2);
+    }
+
+    #[test]
+    fn test_complete_row() {
+        let wu = WorkUnit::new("X");
+        let idx = wu.add_row("bash(ls)");
+        wu.complete_row(idx, "3 files");
+        let inner = wu.inner.read().unwrap();
+        assert!(
+            matches!(&inner.rows[0].status, WorkRowStatus::Complete(s) if s == "3 files")
+        );
+    }
+
+    #[test]
+    fn test_complete_row_empty_summary() {
+        let wu = WorkUnit::new("X");
+        let idx = wu.add_row("bash(true)");
+        wu.complete_row(idx, "");
+        let inner = wu.inner.read().unwrap();
+        assert!(
+            matches!(&inner.rows[0].status, WorkRowStatus::Complete(s) if s.is_empty())
+        );
+    }
+
+    #[test]
+    fn test_fail_row() {
+        let wu = WorkUnit::new("X");
+        let idx = wu.add_row("bash(rm -rf /)");
+        wu.fail_row(idx, "permission denied");
+        let inner = wu.inner.read().unwrap();
+        assert!(
+            matches!(&inner.rows[0].status, WorkRowStatus::Error(e) if e == "permission denied")
+        );
+    }
+
+    #[test]
+    fn test_out_of_bounds_row_ops_do_not_panic() {
+        let wu = WorkUnit::new("X");
+        wu.complete_row(99, "summary"); // should not panic
+        wu.fail_row(99, "error");       // should not panic
+    }
+
+    // ── format() — InProgress ────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_in_progress_thinking_phase() {
+        let wu = WorkUnit::new("Channeling");
+        // token_count == 0 → shows "thinking"
+        let f = wu.format(&colors());
+        assert!(f.contains("Channeling"), "should contain verb: {}", f);
+        assert!(f.contains("thinking"), "should contain 'thinking': {}", f);
+        let has_throb = THROB_FRAMES.iter().any(|fr| f.contains(fr));
+        assert!(has_throb, "should contain a throb frame: {}", f);
+    }
+
+    #[test]
+    fn test_format_in_progress_with_tokens() {
+        let wu = WorkUnit::new("Channeling");
+        wu.add_tokens("hello world foo bar baz"); // 5 words
+        let f = wu.format(&colors());
+        assert!(f.contains("Channeling"));
+        assert!(f.contains("tokens"));
+        assert!(f.contains("5"));
+        assert!(!f.contains("thinking"));
+    }
+
+    #[test]
+    fn test_format_in_progress_with_running_row() {
+        let wu = WorkUnit::new("Channeling");
+        wu.add_row("bash(git status)");
+        let f = wu.format(&colors());
+        assert!(f.contains("⎿"));
+        assert!(f.contains("bash(git status)"));
+        assert!(f.contains("…")); // running indicator
+    }
+
+    // ── format() — Complete ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_complete_bare_bullet_when_no_text() {
+        let wu = WorkUnit::new("Channeling");
+        wu.set_complete();
+        let f = wu.format(&colors());
+        assert!(f.contains("⏺"), "should contain bullet: {}", f);
+        assert!(!f.contains("Channeling"), "verb should be gone in complete state");
+    }
+
+    #[test]
+    fn test_format_complete_with_response_text() {
+        let wu = WorkUnit::new("Channeling");
+        wu.set_response("The answer is 42.");
+        wu.set_complete();
+        let f = wu.format(&colors());
+        assert!(f.contains("⏺"));
+        assert!(f.contains("The answer is 42."));
+    }
+
+    #[test]
+    fn test_format_complete_with_rows() {
+        let wu = WorkUnit::new("Channeling");
+        let idx = wu.add_row("bash(ls)");
+        wu.complete_row(idx, "3 files");
+        wu.set_response("Done.");
+        wu.set_complete();
+        let f = wu.format(&colors());
+        assert!(f.contains("⏺"));
+        assert!(f.contains("Done."));
+        assert!(f.contains("⎿"));
+        assert!(f.contains("bash(ls)"));
+        assert!(f.contains("3 files"));
+    }
+
+    #[test]
+    fn test_format_failed_shows_bullet() {
+        let wu = WorkUnit::new("Channeling");
+        wu.set_failed();
+        let f = wu.format(&colors());
+        assert!(f.contains("⏺"));
+    }
+
+    // ── format_row helpers ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_row_running() {
+        let row = WorkRow {
+            label: "bash(echo hi)".into(),
+            status: WorkRowStatus::Running,
+        };
+        let f = format_row(&row);
+        assert!(f.contains("⎿"));
+        assert!(f.contains("bash(echo hi)"));
+        assert!(f.contains("…"));
+    }
+
+    #[test]
+    fn test_format_row_complete_with_summary() {
+        let row = WorkRow {
+            label: "read(foo.rs)".into(),
+            status: WorkRowStatus::Complete("42 lines".into()),
+        };
+        let f = format_row(&row);
+        assert!(f.contains("⎿"));
+        assert!(f.contains("read(foo.rs)"));
+        assert!(f.contains("42 lines"));
+    }
+
+    #[test]
+    fn test_format_row_complete_empty_summary() {
+        let row = WorkRow {
+            label: "bash(true)".into(),
+            status: WorkRowStatus::Complete(String::new()),
+        };
+        let f = format_row(&row);
+        assert!(f.contains("⎿"));
+        assert!(f.contains("bash(true)"));
+        // No trailing ellipsis when complete
+        assert!(!f.contains("…"));
+    }
+
+    #[test]
+    fn test_format_row_error() {
+        let row = WorkRow {
+            label: "bash(bad cmd)".into(),
+            status: WorkRowStatus::Error("exit 1".into()),
+        };
+        let f = format_row(&row);
+        assert!(f.contains("⎿"));
+        assert!(f.contains("bash(bad cmd)"));
+        assert!(f.contains("❌"));
+        assert!(f.contains("exit 1"));
+    }
+
+    // ── fmt_elapsed / fmt_tokens ─────────────────────────────────────────────
+
+    #[test]
+    fn test_fmt_elapsed_seconds_only() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(1), "1s");
+        assert_eq!(fmt_elapsed(59), "59s");
+    }
+
+    #[test]
+    fn test_fmt_elapsed_minutes() {
+        assert_eq!(fmt_elapsed(60), "1m 0s");
+        assert_eq!(fmt_elapsed(90), "1m 30s");
+        assert_eq!(fmt_elapsed(125), "2m 5s");
+    }
+
+    #[test]
+    fn test_fmt_tokens_small() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+    }
+
+    #[test]
+    fn test_fmt_tokens_thousands() {
+        assert_eq!(fmt_tokens(1000), "1.0k");
+        assert_eq!(fmt_tokens(1500), "1.5k");
+        assert_eq!(fmt_tokens(9900), "9.9k");
+    }
+
+    // ── Thread safety ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WorkUnit>();
+    }
+
+    #[test]
+    fn test_concurrent_updates() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let wu = Arc::new(WorkUnit::new("Parallel"));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let wu = Arc::clone(&wu);
+                thread::spawn(move || {
+                    wu.add_tokens("hello world");
+                    wu.add_row("bash(ls)");
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let inner = wu.inner.read().unwrap();
+        assert_eq!(inner.token_count, 16); // 8 threads × 2 tokens
+        assert_eq!(inner.rows.len(), 8);
+    }
+}

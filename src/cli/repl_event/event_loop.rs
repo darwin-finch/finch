@@ -101,10 +101,10 @@ pub struct EventLoop {
     /// Current view mode (List or Tree)
     view_mode: Arc<RwLock<ViewMode>>,
 
-    /// Active tool calls: tool_id -> (tool_name, input, op_message, row_idx)
-    /// All tools in one generation turn share the same OperationMessage; each
+    /// Active tool calls: tool_id -> (tool_name, input, work_unit, row_idx)
+    /// All tools in one generation turn share the same WorkUnit; each
     /// tool occupies one row identified by its index.
-    active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::OperationMessage>, usize)>>>,
+    active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::WorkUnit>, usize)>>>,
 }
 
 /// View mode for the REPL
@@ -739,7 +739,7 @@ impl EventLoop {
         mode: Arc<RwLock<ReplMode>>,
         output_manager: Arc<OutputManager>,
         status_bar: Arc<crate::cli::StatusBar>,
-        active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::OperationMessage>, usize)>>>,
+        active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::WorkUnit>, usize)>>>,
     ) {
         tracing::debug!("process_query_with_tools starting for query_id: {:?}", query_id);
 
@@ -796,13 +796,11 @@ impl EventLoop {
             if caps.supports_streaming {
                 tracing::debug!("Generator supports streaming, attempting to stream");
 
-                // Add placeholder message to scrollback NOW (before streaming) so the
-                // shadow-buffer / insert_before architecture stays consistent.
-                // The message starts empty (InProgress); we fill it after the stream ends
-                // so the response appears all at once via the normal blit path.
-                use crate::cli::messages::StreamingResponseMessage;
-                let msg = Arc::new(StreamingResponseMessage::new());
-                output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
+                // Create a WorkUnit for this generation turn BEFORE streaming begins.
+                // The shadow-buffer / insert_before architecture requires the message to
+                // exist in output_manager before any blit cycles run — the WorkUnit's
+                // time-driven animation will be visible during streaming.
+                let work_unit = output_manager.start_work_unit("Channeling");
 
                 let stream_start = std::time::Instant::now();
                 let mut token_count: usize = 0;
@@ -826,8 +824,11 @@ impl EventLoop {
                                 Ok(StreamChunk::TextDelta(delta)) => {
                                     tracing::debug!("Received TextDelta: {} bytes", delta.len());
                                     text.push_str(&delta);
-                                    token_count += delta.split_whitespace().count();
-                                    // Throb animation + live stats (no scrollback writes during stream)
+                                    let delta_tokens = delta.split_whitespace().count();
+                                    token_count += delta_tokens;
+                                    // WorkUnit accumulates tokens for its own animated display
+                                    work_unit.add_tokens(&delta);
+                                    // Status bar also shows throb animation
                                     throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
                                     let icon = THROB_FRAMES[throb_idx];
                                     let secs = stream_start.elapsed().as_secs();
@@ -854,7 +855,7 @@ impl EventLoop {
                                 }
                                 Err(e) => {
                                     tracing::error!("Stream error in event loop: {}", e);
-                                    msg.set_failed();
+                                    work_unit.set_failed();
                                     let _ = event_tx.send(ReplEvent::QueryFailed {
                                         query_id,
                                         error: format!("{}", e),
@@ -867,12 +868,12 @@ impl EventLoop {
                         tracing::debug!("[EVENT_LOOP] Stream receive loop ended, {} blocks received", blocks.len());
                         tracing::debug!("Stream receive loop ended");
 
-                        // Stream complete — update the placeholder message with full content.
-                        // The blit will detect the change and render it all at once.
+                        // Stream complete — set the final response text on the WorkUnit.
+                        // If tools follow, set_complete() will be called after all tools finish.
+                        // If no tools, set_complete() is called below.
                         if !text.is_empty() {
-                            msg.append_chunk(&text);
+                            work_unit.set_response(&text);
                         }
-                        msg.set_complete();
 
                         // Send stats update
                         let _ = event_tx.send(ReplEvent::StatsUpdate {
@@ -927,10 +928,8 @@ impl EventLoop {
                             conversation.write().await.add_message(assistant_message);
                             tracing::debug!("[EVENT_LOOP] Assistant message added, spawning tool executions");
 
-                            // One OperationMessage groups all tool calls for this turn.
-                            // Created lazily here (not at generation start) so text-only
-                            // turns leave no extra scrollback entry.
-                            let op_msg = output_manager.start_operation("Generating");
+                            // Tool calls share the WorkUnit that was created before streaming.
+                            // Each tool gets its own sub-row within the same WorkUnit.
 
                             // Execute tools (check for AskUserQuestion first, then mode restrictions)
                             let current_mode = mode.read().await;
@@ -939,7 +938,7 @@ impl EventLoop {
                                 if !Self::is_tool_allowed_in_mode(&tool_use.name, &*current_mode) {
                                     // Tool blocked by plan mode - add error row and send result
                                     let label = format_tool_label(&tool_use.name, &tool_use.input);
-                                    let row_idx = op_msg.add_row(label);
+                                    let row_idx = work_unit.add_row(label);
                                     let error_msg = format!(
                                         "Tool '{}' is not allowed in planning mode.\n\
                                          Reason: This tool can modify system state.\n\
@@ -947,7 +946,7 @@ impl EventLoop {
                                          Type /approve to execute your plan with all tools enabled.",
                                         tool_use.name
                                     );
-                                    op_msg.fail_row(row_idx, format!("blocked in plan mode"));
+                                    work_unit.fail_row(row_idx, "blocked in plan mode");
                                     let _ = event_tx.send(ReplEvent::ToolResult {
                                         query_id,
                                         tool_id: tool_use.id.clone(),
@@ -956,14 +955,14 @@ impl EventLoop {
                                     continue;
                                 }
 
-                                // Add a running row for this tool to the shared OperationMessage
+                                // Add a running row for this tool to the shared WorkUnit
                                 let label = format_tool_label(&tool_use.name, &tool_use.input);
-                                let row_idx = op_msg.add_row(&label);
+                                let row_idx = work_unit.add_row(&label);
 
-                                // Store (name, input, op_msg, row_idx) for result lookup
+                                // Store (name, input, work_unit, row_idx) for result lookup
                                 active_tool_uses.write().await.insert(
                                     tool_use.id.clone(),
-                                    (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&op_msg), row_idx),
+                                    (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&work_unit), row_idx),
                                 );
 
                                 // Check if this is AskUserQuestion (handle specially)
@@ -997,7 +996,10 @@ impl EventLoop {
                             return;
                         }
 
-                        // No tools - add assistant message to conversation
+                        // No tools — mark WorkUnit complete so blit shows final response
+                        work_unit.set_complete();
+
+                        // Add assistant message to conversation
                         tracing::debug!("[EVENT_LOOP] No tools found, adding assistant message to conversation");
                         conversation
                             .write()
@@ -1019,12 +1021,20 @@ impl EventLoop {
             }
 
             // Non-streaming path (for Qwen or fallback)
+            // Create WorkUnit before the blocking generate call so the animated
+            // header is visible during the wait (blit cycle runs every ~100ms).
+            let work_unit = output_manager.start_work_unit("Channeling");
             status_bar.update_operation("✳ Channeling…");
             match generator
                 .generate(messages, Some((*tool_definitions).clone()))
                 .await
             {
                 Ok(response) => {
+                    // Set response text on the WorkUnit
+                    if !response.text.is_empty() {
+                        work_unit.set_response(&response.text);
+                    }
+
                     // Send stats update
                     let _ = event_tx.send(ReplEvent::StatsUpdate {
                         model: response.metadata.model.clone(),
@@ -1070,8 +1080,7 @@ impl EventLoop {
                         };
                         conversation.write().await.add_message(assistant_message);
 
-                        // One OperationMessage groups all tool calls for this turn.
-                        let op_msg = output_manager.start_operation("Generating");
+                        // Tool calls share the WorkUnit created before generate().
 
                         // Execute tools (check for AskUserQuestion first, then mode restrictions)
                         let current_mode = mode.read().await;
@@ -1079,8 +1088,8 @@ impl EventLoop {
                             // Check if tool is allowed in current mode
                             if !Self::is_tool_allowed_in_mode(&tool_use.name, &*current_mode) {
                                 let label = format_tool_label(&tool_use.name, &tool_use.input);
-                                let row_idx = op_msg.add_row(label);
-                                op_msg.fail_row(row_idx, "blocked in plan mode");
+                                let row_idx = work_unit.add_row(label);
+                                work_unit.fail_row(row_idx, "blocked in plan mode");
                                 let error_msg = format!(
                                     "Tool '{}' is not allowed in planning mode.\n\
                                      Reason: This tool can modify system state.\n\
@@ -1098,10 +1107,10 @@ impl EventLoop {
 
                             // Add a running row for this tool
                             let label = format_tool_label(&tool_use.name, &tool_use.input);
-                            let row_idx = op_msg.add_row(&label);
+                            let row_idx = work_unit.add_row(&label);
                             active_tool_uses.write().await.insert(
                                 tool_use.id.clone(),
-                                (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&op_msg), row_idx),
+                                (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&work_unit), row_idx),
                             );
 
                             // Check if this is AskUserQuestion (handle specially)
@@ -1134,7 +1143,8 @@ impl EventLoop {
                         return;
                     }
 
-                    // No tools - StreamingComplete already handled conversation and state
+                    // No tools — mark WorkUnit complete
+                    work_unit.set_complete();
                     tracing::debug!("Query complete (no tools), non-streaming finished");
                     return;
                 }
@@ -1366,22 +1376,21 @@ impl EventLoop {
         tool_id: String,
         result: Result<String>,
     ) -> Result<()> {
-        // Look up the tool's metadata and OperationMessage row
-        let (_tool_name, _tool_input, op_msg, row_idx) = {
+        // Look up the tool's WorkUnit and row index
+        let (_tool_name, _tool_input, work_unit, row_idx) = {
             let mut map = self.active_tool_uses.write().await;
             map.remove(&tool_id).unwrap_or_else(|| {
-                // Fallback: create a standalone OperationMessage for untracked tools
-                let fallback = Arc::new(crate::cli::messages::OperationMessage::new("Tool"));
-                self.output_manager.add_trait_message(Arc::clone(&fallback) as crate::cli::messages::MessageRef);
+                // Fallback: create a standalone WorkUnit for untracked tools
+                let fallback = self.output_manager.start_work_unit("Tool");
                 let row_idx = fallback.add_row(&tool_id);
                 (tool_id.clone(), serde_json::Value::Null, fallback, row_idx)
             })
         };
 
-        // Update the row in the OperationMessage with a compact summary
+        // Update the row in the WorkUnit with a compact summary
         match &result {
             Ok(content) => {
-                op_msg.complete_row(row_idx, compact_tool_summary(content));
+                work_unit.complete_row(row_idx, compact_tool_summary(content));
             }
             Err(e) => {
                 // Truncate very long error messages for the row display
@@ -1391,7 +1400,7 @@ impl EventLoop {
                 } else {
                     err_str
                 };
-                op_msg.fail_row(row_idx, short_err);
+                work_unit.fail_row(row_idx, short_err);
             }
         }
 
@@ -1421,9 +1430,9 @@ impl EventLoop {
                     .unwrap_or(0);
 
                 if results_count >= tools_pending {
-                    // All tools completed — mark the OperationMessage done so the
-                    // trailing "…" drops and the row summary is final.
-                    op_msg.set_complete();
+                    // All tools completed — mark the WorkUnit complete so the
+                    // animation stops and the final content is shown.
+                    work_unit.set_complete();
                     // format results and add to conversation
                     self.finalize_tool_execution(query_id).await?;
                 }

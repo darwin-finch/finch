@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::cli::messages::{
     LiveToolMessage, MessageRef, OperationMessage,
-    UserQueryMessage, StreamingResponseMessage, StaticMessage,
+    UserQueryMessage, StreamingResponseMessage, StaticMessage, WorkUnit,
 };
 
 /// Maximum number of messages to keep in the circular buffer
@@ -171,6 +171,14 @@ impl OutputManager {
         let msg = Arc::new(OperationMessage::new(header));
         self.add_trait_message(Arc::clone(&msg) as MessageRef);
         msg
+    }
+
+    /// Create and register a WorkUnit for one AI generation turn.
+    /// Returns the Arc so callers can update tokens, add tool rows, and mark complete.
+    pub fn start_work_unit(&self, verb: impl Into<String>) -> Arc<WorkUnit> {
+        let wu = Arc::new(WorkUnit::new(verb));
+        self.add_trait_message(Arc::clone(&wu) as MessageRef);
+        wu
     }
 
     /// Write status information (deprecated - use write_progress or write_info)
