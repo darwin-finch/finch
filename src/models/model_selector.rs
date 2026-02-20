@@ -2,7 +2,7 @@
 // Automatically selects appropriate model size based on available system memory
 // Works on all platforms (macOS, Linux, Windows) via sysinfo crate.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Minimum RAM required to run any local model (GB).

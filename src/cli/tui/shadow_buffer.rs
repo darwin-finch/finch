@@ -152,7 +152,6 @@ impl ShadowBuffer {
         }
 
         // Calculate how many lines we need (with wrapping)
-        let mut total_rows_needed = 0;
         let mut line_row_counts: Vec<usize> = Vec::new();
 
         for (line, _style) in &all_lines {
@@ -163,7 +162,6 @@ impl ShadowBuffer {
                 (visible_len + self.width - 1) / self.width.max(1)
             };
             line_row_counts.push(rows);
-            total_rows_needed += rows;
         }
 
         // Bottom-align: determine which lines to render

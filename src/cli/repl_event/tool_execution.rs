@@ -1,6 +1,5 @@
 // Tool execution coordinator for concurrent tool execution in event loop
 
-use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
@@ -10,8 +9,7 @@ use crate::cli::ReplMode;
 use super::events::ConfirmationResult;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
-use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolExecutor, ToolSignature};
-use crate::tools::patterns::ToolPattern;
+use crate::tools::executor::{generate_tool_signature, ToolExecutor};
 use crate::tools::types::ToolUse;
 
 use super::events::ReplEvent;

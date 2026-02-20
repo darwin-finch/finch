@@ -7,7 +7,7 @@ use ort::{
     value::{Value, DynValue},
 };
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 

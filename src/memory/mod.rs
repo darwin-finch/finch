@@ -14,7 +14,7 @@ pub use memtree::{MemTree, TreeNode, NodeId};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 

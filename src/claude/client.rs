@@ -3,7 +3,7 @@
 // This client now acts as a facade over the provider system, allowing
 // different LLM providers (Claude, OpenAI, Grok, etc.) to be used interchangeably.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::sync::mpsc;
 
 use super::types::{MessageRequest, MessageResponse};

@@ -1,6 +1,6 @@
 // Batch training system for efficient GPU utilization
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -201,13 +201,13 @@ impl BatchTrainer {
     /// Internal training implementation
     async fn train_batch_internal(
         training_queue: Arc<Mutex<VecDeque<TrainingExample>>>,
-        router: Arc<RwLock<RouterModel>>,
-        generator: Arc<RwLock<GeneratorModel>>,
-        validator: Arc<RwLock<ValidatorModel>>,
+        _router: Arc<RwLock<RouterModel>>,
+        _generator: Arc<RwLock<GeneratorModel>>,
+        _validator: Arc<RwLock<ValidatorModel>>,
         total_trained: Arc<Mutex<usize>>,
         last_training: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
         batch_size: usize,
-        learning_rate: f64,
+        _learning_rate: f64,
     ) -> Result<TrainingResult> {
         let start_time = std::time::Instant::now();
 

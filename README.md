@@ -105,16 +105,20 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 
 ## Commands reference
 
-| Command / Key       | What it does                                           |
-|---------------------|--------------------------------------------------------|
-| `finch`             | Start the interactive REPL (with local model if ready) |
-| `finch setup`       | Run the interactive setup wizard                       |
-| `finch --cloud-only`| Start REPL using only cloud providers, no local model  |
-| `/teacher grok`     | Switch to Grok for the current session                 |
-| `/teacher claude`   | Switch to Claude for the current session               |
-| `Ctrl+C`            | Cancel the current query                               |
-| `Ctrl+G`            | Mark the last response as good (training signal)       |
-| `Ctrl+B`            | Mark the last response as bad (training signal)        |
+| Command / Key        | What it does                                           |
+|----------------------|--------------------------------------------------------|
+| `finch`              | Start the interactive REPL (with local model if ready) |
+| `finch setup`        | Run the interactive setup wizard                       |
+| `finch --cloud-only` | Start REPL using only cloud providers, no local model  |
+| `/teacher grok`      | Switch teacher to Grok for the current session         |
+| `/teacher claude`    | Switch teacher to Claude for the current session       |
+| `/teacher list`      | List all configured teacher providers                  |
+| `/model list`        | List available local models                            |
+| `/model <name>`      | Switch local model for the current session             |
+| `/help`              | Show available commands                                |
+| `Ctrl+C`             | Cancel the current query                               |
+| `Ctrl+G`             | Mark the last response as good (training signal)       |
+| `Ctrl+B`             | Mark the last response as bad (training signal)        |
 
 ---
 

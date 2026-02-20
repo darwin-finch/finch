@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 
 /// Helper to convert ColorSpec to ANSI escape code
 fn color_to_ansi(color: &ColorSpec) -> String {
-    use ratatui::style::Color;
+    
 
     match color {
         ColorSpec::Named(name) => {
@@ -197,25 +197,27 @@ impl Message for StreamingResponseMessage {
 
         match status {
             MessageStatus::InProgress if thinking => {
-                format!("🤔 [thinking...]\n{}", text)
+                format!("{}⏺{} {}[thinking…]{}\n{}", CYAN, RESET, GRAY, RESET, text)
             }
             MessageStatus::InProgress => {
-                // Regular streaming (not thinking)
                 if text.is_empty() {
-                    "⏳ [streaming...]".to_string()
+                    // Waiting for first token — show bare bullet
+                    format!("{}⏺{}", CYAN, RESET)
                 } else {
-                    format!("{}▸", text)  // Streaming indicator at end
+                    // Streaming — trailing block cursor
+                    format!("{}⏺{} {}▍", CYAN, RESET, text)
                 }
             }
             MessageStatus::Failed => {
                 format!(
-                    "{}❌ Response failed{}\n{}",
+                    "{}⏺{} {}❌ Response failed{}\n{}",
+                    CYAN, RESET,
                     color_to_ansi(&colors.messages.error),
                     RESET,
                     text
                 )
             }
-            MessageStatus::Complete => text,
+            MessageStatus::Complete => format!("{}⏺{} {}", CYAN, RESET, text),
         }
     }
 
@@ -974,8 +976,8 @@ mod tests {
 
         // Should recover and return some string (not panic)
         assert!(!result.is_empty());
-        // Should either be empty or show streaming indicator
-        assert!(result.contains("[streaming...]") || result.is_empty() || result.contains("▸"));
+        // Should show the ⏺ bullet (new streaming format)
+        assert!(result.contains("⏺") || result.is_empty());
     }
 
     #[test]

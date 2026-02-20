@@ -445,7 +445,7 @@ impl AgentLoop {
 
 /// Build the tool executor for agent mode (auto-approve all tools)
 async fn build_tool_executor(
-    config: &Config,
+    _config: &Config,
 ) -> Result<(Arc<tokio::sync::Mutex<ToolExecutor>>, Vec<ToolDefinition>)> {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadTool));

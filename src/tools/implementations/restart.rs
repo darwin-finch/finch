@@ -2,7 +2,7 @@
 
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
-use crate::{output_status, output_progress};
+use crate::output_status;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;

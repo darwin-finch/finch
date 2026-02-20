@@ -144,7 +144,7 @@ pub fn spawn_input_task(
                             } else {
                             // Priority 3: Handle other keys (feedback shortcuts, history, input)
                             // Check for feedback shortcuts when input is empty
-                            let input_empty = tui.input_textarea.lines().join("").trim().is_empty();
+                            let _input_empty = tui.input_textarea.lines().join("").trim().is_empty();
 
                             // Check for special shortcuts and navigation (Ctrl+C, Ctrl+G, Ctrl+B, Up/Down)
                             match (key.code, key.modifiers) {

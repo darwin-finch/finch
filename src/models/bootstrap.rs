@@ -6,12 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::download::{DownloadProgress, ModelDownloader};
 use super::generator_new::GeneratorModel;
-use super::model_selector::{ModelSelector, QwenSize};
 use crate::config::ExecutionTarget;
 use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
-use super::{DevicePreference, GeneratorConfig};
+use super::GeneratorConfig;
 use crate::cli::OutputManager;
 
 /// Generator loading state for progressive bootstrap
@@ -204,7 +202,7 @@ impl BootstrapLoader {
             let loader = UnifiedModelLoader::new()?;
 
             // This will download if not cached
-            let text_gen = loader.load(load_config)?;
+            let _text_gen = loader.load(load_config)?;
 
             // Wrap in GeneratorModel (currently we need to convert)
             // For now, we'll use the Pretrained variant

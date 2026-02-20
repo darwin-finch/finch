@@ -1,7 +1,6 @@
 // Context-Aware Sampling System
 // Samples 5% of queries to Claude with full conversation context for validation
 
-use anyhow::{Context, Result};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 

@@ -212,7 +212,7 @@ impl Default for PatternClassifier {
 }
 
 impl LearningModel for PatternClassifier {
-    fn update(&mut self, input: &str, expected: &ModelExpectation) -> Result<()> {
+    fn update(&mut self, _input: &str, expected: &ModelExpectation) -> Result<()> {
         // Extract pattern from expectation
         let pattern = match expected {
             ModelExpectation::PatternLabel { category, .. } => QueryPattern::from_str(category),

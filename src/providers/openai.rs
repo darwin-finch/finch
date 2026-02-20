@@ -353,6 +353,7 @@ impl OpenAIProvider {
             let mut stream = response.bytes_stream();
             let mut buffer = Vec::new();
             let mut accumulated_text = String::new();
+            #[allow(unused_assignments)]
             let mut done = false;
 
             while let Some(chunk) = stream.next().await {
@@ -427,7 +428,6 @@ impl OpenAIProvider {
                     Err(e) => {
                         tracing::error!("Stream error: {}", e);
                         let _ = tx.send(Err(e.into())).await;
-                        done = true;
                         break;
                     }
                 }

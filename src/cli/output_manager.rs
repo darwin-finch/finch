@@ -9,22 +9,12 @@ use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
 use crate::cli::messages::{
-    LiveToolMessage, Message, MessageRef, MessageStatus, OperationMessage,
+    LiveToolMessage, MessageRef, OperationMessage,
     UserQueryMessage, StreamingResponseMessage, StaticMessage,
 };
 
 /// Maximum number of messages to keep in the circular buffer
 const MAX_BUFFER_SIZE: usize = 1000;
-
-/// ANSI color codes for terminal output
-mod colors {
-    pub const CYAN: &str = "\x1b[36m";      // User prompts
-    pub const RED: &str = "\x1b[31m";       // Errors
-    pub const GREEN: &str = "\x1b[32m";     // Success messages
-    pub const YELLOW: &str = "\x1b[33m";    // Progress/status
-    pub const BLUE: &str = "\x1b[34m";      // Tool output
-    pub const RESET: &str = "\x1b[0m";      // Reset to default
-}
 
 // OutputMessage enum removed - now using trait-based messages only
 

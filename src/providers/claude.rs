@@ -164,6 +164,7 @@ impl ClaudeProvider {
 
             // Track blocks being built (index -> BlockBuilder)
             let mut blocks: HashMap<usize, BlockBuilder> = HashMap::new();
+            #[allow(unused_assignments)]
             let mut done = false;
 
             while let Some(chunk) = stream.next().await {
@@ -299,7 +300,6 @@ impl ClaudeProvider {
                     Err(e) => {
                         tracing::error!("Stream error: {}", e);
                         let _ = tx.send(Err(e.into())).await;
-                        done = true;
                         break;
                     }
                 }

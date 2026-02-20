@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use crate::cli::messages::{Message, MessageId, MessageRef};
+use crate::cli::messages::{MessageId, MessageRef};
 
 /// Calculate display height for a message (number of terminal lines needed)
 fn calculate_display_height(content: &str, terminal_width: usize) -> usize {

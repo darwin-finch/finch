@@ -2,7 +2,7 @@
 //
 // Tries providers in priority order until one succeeds
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 

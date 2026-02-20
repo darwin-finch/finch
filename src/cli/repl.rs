@@ -47,7 +47,7 @@ use super::status_bar::StatusBar;
 use super::tui::TuiRenderer;
 
 // Phase 3.5: Import output macros for global output routing
-use crate::{output_error, output_progress, output_status};
+use crate::{output_error, output_status};
 
 /// User's menu choice for tool confirmation
 #[derive(Debug, Clone)]
@@ -606,7 +606,7 @@ impl Repl {
         models_dir: Option<&PathBuf>,
         is_interactive: bool,
         batch_trainer: Arc<RwLock<BatchTrainer>>,
-        tokenizer: Arc<TextTokenizer>,
+        _tokenizer: Arc<TextTokenizer>,
     ) -> crate::local::LocalGenerator {
         use crate::local::LocalGenerator;
 

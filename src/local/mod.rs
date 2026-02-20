@@ -9,10 +9,11 @@ pub mod patterns;
 pub use generator::{GeneratedResponse, TemplateGenerator};
 pub use patterns::{PatternClassifier, QueryPattern};
 
+
 use crate::claude::Message;
-use crate::generators::{GeneratorResponse, Generator};
+use crate::generators::GeneratorResponse;
 use crate::models::adapters::LocalModelAdapter;
-use crate::models::{GeneratorModel, TextTokenizer};
+use crate::models::GeneratorModel;
 use crate::tools::types::ToolDefinition;
 use crate::training::batch_trainer::BatchTrainer;
 use anyhow::Result;
@@ -83,7 +84,7 @@ impl LocalGenerator {
         }
 
         // Classify the query
-        let (pattern, confidence) = self.pattern_classifier.classify(query);
+        let (_pattern, confidence) = self.pattern_classifier.classify(query);
 
         // Only try local generation if confidence is high enough
         if confidence < 0.7 {
@@ -134,7 +135,7 @@ impl LocalGenerator {
     pub fn try_generate_from_pattern_with_tools(
         &mut self,
         messages: &[Message],
-        tools: Option<Vec<ToolDefinition>>,
+        _tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<GeneratorResponse>> {
         // Check for newer adapter before generation
         self.check_and_reload_adapter()?;

@@ -3,8 +3,8 @@
 // Orchestrates the training pipeline, manages model versions, and coordinates
 // feedback loops between different models
 
-use super::learning::{LearningModel, ModelExpectation, ModelPrediction, ModelStats};
-use anyhow::{Context, Result};
+use super::learning::ModelPrediction;
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// Coordinates training and inference across all models
@@ -104,7 +104,7 @@ impl ModelManager {
     pub fn train_from_query_response(
         &mut self,
         query: &str,
-        response: &str,
+        _response: &str,
         routing_was_local: bool,
         was_successful: bool,
     ) -> Result<TrainingReport> {

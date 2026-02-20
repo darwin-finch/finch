@@ -722,7 +722,7 @@ async fn run_train_command(train_command: TrainCommand) -> Result<()> {
 
 /// Set up Python environment for LoRA training
 async fn run_train_setup() -> Result<()> {
-    use std::path::PathBuf;
+    
     use std::process::Command;
 
     println!("\x1b[1;36m🔧 Setting up Python environment for LoRA training\x1b[0m\n");
@@ -829,7 +829,7 @@ async fn run_train_setup() -> Result<()> {
 
 async fn run_daemon(bind_address: String) -> Result<()> {
     use finch::server::{AgentServer, ServerConfig};
-    use finch::models::{BootstrapLoader, GeneratorState, DevicePreference, TrainingCoordinator};
+    use finch::models::{BootstrapLoader, GeneratorState, TrainingCoordinator};
     use finch::local::LocalGenerator;
     use finch::daemon::DaemonLifecycle;
     use std::sync::Arc;
@@ -860,7 +860,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         .with_context(|| format!("Failed to open daemon log: {}", log_path.display()))?;
 
     // Create a file logger layer
-    use tracing_subscriber::fmt::writer::MakeWriter;
+    
     let file_writer = Arc::new(log_file);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(move || file_writer.clone())

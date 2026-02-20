@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::cli::memtree_console::{ConsoleNode, ConsoleNodeType, MemTreeConsole};
+use crate::cli::memtree_console::MemTreeConsole;
 use crate::cli::repl_event::ReplEvent;
 use crate::memory::NodeId;
 

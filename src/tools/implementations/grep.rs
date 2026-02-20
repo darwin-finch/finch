@@ -91,7 +91,7 @@ impl Tool for GrepTool {
             let total = all_lines.len();
 
             // Collect all matching line indices
-            let mut match_indices: Vec<usize> = all_lines
+            let match_indices: Vec<usize> = all_lines
                 .iter()
                 .enumerate()
                 .filter(|(_, line)| regex.is_match(line))

@@ -189,7 +189,7 @@ impl Default for DaemonLifecycle {
 /// - Windows: sysinfo crate to enumerate processes
 #[cfg(target_family = "unix")]
 fn process_exists(pid: u32) -> bool {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
     // kill with NULL signal checks existence without affecting process

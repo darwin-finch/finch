@@ -11,7 +11,6 @@ use crate::cli::ConversationHistory;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::training::batch_trainer::BatchTrainer;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 

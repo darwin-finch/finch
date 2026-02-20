@@ -8,7 +8,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response, sse::{Event, Sse}},
 };
-use futures::stream::{self, Stream};
+use futures::stream::{self};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;

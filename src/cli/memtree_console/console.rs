@@ -10,7 +10,6 @@ use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
@@ -303,7 +302,7 @@ impl MemTreeConsole {
     }
 
     /// Render a single node
-    fn render_node(&self, node: &ConsoleNode, is_selected: bool) -> ListItem {
+    fn render_node(&self, node: &ConsoleNode, is_selected: bool) -> ListItem<'_> {
         let indent = "  ".repeat(node.depth);
         let expand_marker = if !node.children.is_empty() {
             if node.expanded { "▼ " } else { "▶ " }
@@ -314,7 +313,7 @@ impl MemTreeConsole {
         let (icon, color) = match &node.node_type {
             ConsoleNodeType::UserMessage => ("❯", Color::Cyan),
             ConsoleNodeType::AssistantResponse => ("⏺", Color::Blue),
-            ConsoleNodeType::ToolCall { tool_name } => ("⏵", Color::Yellow),
+            ConsoleNodeType::ToolCall { tool_name: _ } => ("⏵", Color::Yellow),
             ConsoleNodeType::ToolResult { success } => {
                 if *success { ("✓", Color::Green) } else { ("✗", Color::Red) }
             }

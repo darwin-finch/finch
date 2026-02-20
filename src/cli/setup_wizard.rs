@@ -1276,7 +1276,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
 }
 
 /// Handle input for Review section
-fn handle_review_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
+fn handle_review_input(_state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => {
             // Confirm and exit
@@ -1367,7 +1367,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 *family,
                 *size,
             ),
-            ModelConfig::Remote { provider, api_key, .. } => {
+            ModelConfig::Remote { provider: _, api_key, .. } => {
                 // Remote API is primary - backend disabled
                 (
                     api_key.clone(),
@@ -2292,7 +2292,7 @@ fn render_features_section(
     let mut items: Vec<ListItem> = Vec::new();
     let mut list_idx = 0usize; // tracks which visual row we're building
 
-    for (feat_idx, (name, enabled, desc)) in bool_features.iter().enumerate() {
+    for (_feat_idx, (name, enabled, desc)) in bool_features.iter().enumerate() {
         // Insert HF token row before the appropriate bool feature
         if list_idx == hf_idx {
             let is_hf_selected = selected_idx == hf_idx;
@@ -2881,7 +2881,7 @@ fn run_wizard_loop(
                     }
                 }
 
-                WizardStep::CustomModelRepo(input, selected_device) => {
+                WizardStep::CustomModelRepo(input, _selected_device) => {
                     match key.code {
                         KeyCode::Char(c) => {
                             input.push(c);
@@ -3218,7 +3218,7 @@ fn render_wizard_step(
     model_families: &[ModelFamily],
     model_sizes: &[ModelSize],
     _custom_repo: &str,
-    selected_provider_idx: usize,
+    _selected_provider_idx: usize,
     selected_target_idx: usize,
     selected_family_idx: usize,
     selected_size_idx: usize,
@@ -3938,7 +3938,7 @@ fn render_edit_teacher(
     teachers: &[TeacherEntry],
     teacher_idx: usize,
     model_input: &str,
-    name_input: &str,
+    _name_input: &str,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)

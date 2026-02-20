@@ -3,7 +3,6 @@
 
 use anyhow::{anyhow, Context, Result};
 use hf_hub::{api::sync::Api, Repo, RepoType};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::sync::mpsc;
 

@@ -321,7 +321,7 @@ impl Config {
 
     pub fn new(teachers: Vec<TeacherEntry>) -> Self {
         let home = dirs::home_dir().expect("Could not determine home directory");
-        let project_dir = std::env::current_dir().expect("Could not determine current directory");
+        let _project_dir = std::env::current_dir().expect("Could not determine current directory");
 
         // Look for constitution in ~/.finch/constitution.md
         let constitution_path = home.join(".finch/constitution.md");

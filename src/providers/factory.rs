@@ -2,7 +2,7 @@
 //
 // Creates LLM providers based on teacher configuration
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 
 use super::claude::ClaudeProvider;
 use super::gemini::GeminiProvider;

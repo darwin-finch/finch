@@ -308,7 +308,7 @@ impl EventLoop {
                             let mut approvals = self.pending_approvals.write().await;
 
                             // Get the first pending approval (there should only be one active dialog at a time)
-                            if let Some((query_id, (tool_use, response_tx))) = approvals.iter().next() {
+                            if let Some((query_id, (_tool_use, _response_tx))) = approvals.iter().next() {
                                 let query_id = *query_id;
                                 let (tool_use, response_tx) = approvals.remove(&query_id).unwrap();
 
@@ -774,6 +774,7 @@ impl EventLoop {
         };
 
         const MAX_TOOL_ITERATIONS: usize = 25;
+        #[allow(unused_assignments)]
         let mut iteration = 0;
 
         loop {

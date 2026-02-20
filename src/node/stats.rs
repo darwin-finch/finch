@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Aggregate statistics for this node's work
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

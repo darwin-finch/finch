@@ -56,7 +56,7 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
     }
 
     let contents = fs::read_to_string(&config_path)
-        .map_err(|e| {
+        .map_err(|_e| {
             anyhow::anyhow!(errors::file_not_found_error(
                 &config_path.display().to_string(),
                 "Configuration file"
@@ -98,7 +98,7 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
     let mut config = Config::new(toml_config.teachers);
 
     // Migrate streaming_enabled to features if not present
-    if let Some(mut features) = toml_config.features {
+    if let Some(features) = toml_config.features {
         config.features = features;
     } else {
         // Old config without features section - migrate streaming_enabled

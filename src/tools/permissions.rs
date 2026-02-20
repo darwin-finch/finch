@@ -3,7 +3,6 @@
 // Implements constitutional constraints: "Would 1000 users do this?"
 // Multi-layer defense: Allow, Ask, or Deny tool execution
 
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;

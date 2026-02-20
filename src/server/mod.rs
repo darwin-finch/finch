@@ -84,7 +84,7 @@ pub struct AgentServer {
 impl AgentServer {
     /// Create a new agent server
     pub fn new(
-        config: Config,
+        _config: Config,
         server_config: ServerConfig,
         claude_client: ClaudeClient,
         router: Router,

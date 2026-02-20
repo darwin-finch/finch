@@ -434,7 +434,7 @@ impl TuiRenderer {
         execute!(stdout, EndSynchronizedUpdate)?;
         stdout.flush()?;
 
-        let mut renderer = Self {
+        let renderer = Self {
             terminal,
             output_manager,
             status_bar,
@@ -488,25 +488,37 @@ impl TuiRenderer {
 
         let version = env!("CARGO_PKG_VERSION");
 
-        // 5 lines: name, model, cwd, blank line, hint
-        self.terminal.insert_before(5, |buf| {
-            let bold_white = Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD);
-            let cyan = Style::default().fg(Color::Cyan);
-            let dark_gray = Style::default().fg(Color::DarkGray);
-            let hint_style = Style::default().fg(Color::DarkGray);
+        // 7-line bird ASCII art header (⟵ art | text ⟶ aligned at col 11):
+        //
+        //     ✦
+        //     │
+        //    ▗█▖     finch v0.5.0
+        // ▗▟█████▙▖  claude-sonnet-4-6 · cloud
+        // ▝▜█████▛▘  ~/repos/finch
+        //    ▐▌
+        //   /help for commands  ·  type to chat
+        self.terminal.insert_before(7, |buf| {
+            let art   = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+            let spark = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            let dim   = Style::default().fg(Color::DarkGray);
+            let name  = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+            let model_style = Style::default().fg(Color::Cyan);
 
-            // "  finch v0.5.0"
-            buf.set_string(0, 0, format!("  finch v{}", version), bold_white);
-            // "  claude-sonnet-4-6 · primary"
-            buf.set_string(0, 1, format!("  {}", model), cyan);
-            // "  ~/repos/finch"
-            buf.set_string(0, 2, format!("  {}", cwd), dark_gray);
-            // blank
-            buf.set_string(0, 3, "", Style::default());
-            // "  /help for commands  ·  type to chat with Lotus"
-            buf.set_string(0, 4, "  /help for commands  ·  type to start", hint_style);
+            // Bird art (left column)
+            buf.set_string(4, 0, "✦", spark);
+            buf.set_string(4, 1, "│", dim);
+            buf.set_string(3, 2, "▗█▖", art);
+            buf.set_string(0, 3, "▗▟█████▙▖", art);
+            buf.set_string(0, 4, "▝▜█████▛▘", art);
+            buf.set_string(3, 5, "▐▌", dim);
+
+            // Info text aligned at x=11
+            buf.set_string(11, 2, format!("finch v{}", version), name);
+            buf.set_string(11, 3, model, model_style);
+            buf.set_string(11, 4, cwd, dim);
+
+            // Hint
+            buf.set_string(2, 6, "/help for commands  ·  type to chat", dim);
         })?;
 
         // insert_before() invalidates the diff buffer — force full re-blit
@@ -768,8 +780,8 @@ impl TuiRenderer {
                 if has_dialog {
                     // Dialog mode: Show scrollback context + dialog at bottom
                     if let Some(dialog) = &active_dialog {
-                        use ratatui::text::{Line, Span};
-                        use ratatui::style::{Color, Style};
+                        use ratatui::text::Line;
+                        
                         use ratatui::widgets::Paragraph;
 
                         let total_area = frame.area();
@@ -804,7 +816,7 @@ impl TuiRenderer {
                         let dialog_height = base_dialog_height.min(max_dialog_height).max(8); // At least 8 lines
 
                         let status_height = 4u16;
-                        let separator_height = 1u16;
+                        let _separator_height = 1u16;
 
                         // Remaining space for scrollback
                         // Don't render separator when dialog is active (dialog has its own border)
@@ -998,7 +1010,7 @@ impl TuiRenderer {
 
             // Calculate where inline viewport starts (first row after scrollback)
             let (_term_width, term_height) = crossterm::terminal::size()?;
-            let insert_row = term_height.saturating_sub(self.current_inline_viewport_size);
+            let _insert_row = term_height.saturating_sub(self.current_inline_viewport_size);
 
             // Revert to using ratatui's insert_before for now
             // Direct crossterm approach caused terminal scrolling issues

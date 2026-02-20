@@ -31,7 +31,7 @@ impl Tool for EnterPlanModeTool {
 
     async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
         use chrono::Utc;
-        use std::path::PathBuf;
+        
 
         let reason = input["reason"].as_str().unwrap_or("Planning session");
 
