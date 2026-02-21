@@ -72,7 +72,7 @@ pub fn shutdown_global_tui() -> anyhow::Result<()> {
     loop {
         match GLOBAL_TUI_RENDERER.try_lock() {
             Ok(mut tui_lock) => {
-                if let Some(tui) = tui_lock.take() {
+                if let Some(mut tui) = tui_lock.take() {
                     tui.shutdown()?;
                 }
                 return Ok(());

@@ -1,1774 +1,793 @@
-// TUI Renderer - Ratatui-based terminal user interface
+// TuiRenderer — crossterm-based terminal UI
 //
-// This module provides a Claude Code-like TUI with:
-// - Scrollable output area (top)
-// - Fixed input line (middle)
-// - Multi-line status area (bottom)
+// Architecture
+// ────────────
+// Permanent area:  completed messages are printed once with ANSI colours and
+//                  scroll naturally into the terminal's own scrollback buffer.
+//
+// Live area:       the bottom N rows showing the current in-progress WorkUnit
+//                  (if any), a separator, the input textarea, and a status
+//                  line.  On every render() call we erase those N rows (cursor
+//                  up + clear-from-cursor-down) and reprint them.
+//
+// Dialogs:         tool-approval dialogs are drawn inline with crossterm.
+//                  The setup wizard uses ratatui in an alternate screen so it
+//                  gets the whole terminal and restores it cleanly.
+//
+// Note: shadow_buffer.rs is retained — it provides ColorScheme re-exports and
+//       may be used for flicker-free live-area diffing in a future pass.
 
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags},
+    event::{
+        self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    style::{Print, ResetColor},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType,
+        BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    },
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    text::Line,
-    widgets::{Paragraph, Widget},
-    Terminal, TerminalOptions, Viewport,
-};
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar};
-use crate::cli::messages::{MessageId, MessageRef};
-
+use crate::cli::messages::{MessageId, MessageRef, MessageStatus};
+// Sub-modules
 mod async_input;
 mod dialog;
 mod dialog_widget;
 mod tabbed_dialog;
 mod tabbed_dialog_widget;
-mod input_widget;
-mod scrollback;
-mod shadow_buffer;
-mod status_widget;
 mod autocomplete_widget;
+mod input_widget;    // kept, used by wizard helpers
+mod scrollback;      // kept for future use
+mod shadow_buffer;   // kept – good architecture for future diffing
+mod status_widget;   // kept for wizard helpers
 
 pub use async_input::spawn_input_task;
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
-pub use input_widget::render_input_widget;
-pub use scrollback::ScrollbackBuffer;
-pub use shadow_buffer::{ShadowBuffer, diff_buffers, visible_length, extract_visible_chars};
-pub use status_widget::StatusWidget;
-pub use autocomplete_widget::{AutocompleteState, render_autocomplete_dropdown};
+pub use autocomplete_widget::AutocompleteState;
+pub use shadow_buffer::visible_length;
+// Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
+pub use crate::config::ColorScheme;
 
-// Import DialogType for internal use
-use dialog::DialogType as DType;
+// ─── ANSI helpers ─────────────────────────────────────────────────────────────
 
-// Note: input_handler (TuiInputHandler) removed - we now use integrated tui-textarea
+const RESET:    &str = "\x1b[0m";
+const CYAN:     &str = "\x1b[36m";
+const DIM_GRAY: &str = "\x1b[90m";
 
-/// Convert ratatui Color to crossterm Color
-fn ratatui_to_crossterm_color(color: ratatui::style::Color) -> crossterm::style::Color {
-    use ratatui::style::Color as RColor;
-    use crossterm::style::Color as CColor;
+// ─── TuiRenderer ──────────────────────────────────────────────────────────────
 
-    match color {
-        RColor::Black => CColor::Black,
-        RColor::Red => CColor::Red,
-        RColor::Green => CColor::Green,
-        RColor::Yellow => CColor::Yellow,
-        RColor::Blue => CColor::Blue,
-        RColor::Magenta => CColor::Magenta,
-        RColor::Cyan => CColor::Cyan,
-        RColor::Gray => CColor::Grey,
-        RColor::DarkGray => CColor::DarkGrey,
-        RColor::LightRed => CColor::Red,
-        RColor::LightGreen => CColor::Green,
-        RColor::LightYellow => CColor::Yellow,
-        RColor::LightBlue => CColor::Blue,
-        RColor::LightMagenta => CColor::Magenta,
-        RColor::LightCyan => CColor::Cyan,
-        RColor::White => CColor::White,
-        RColor::Rgb(r, g, b) => CColor::Rgb { r, g, b },
-        RColor::Indexed(i) => CColor::AnsiValue(i),
-        RColor::Reset => CColor::Reset,
-    }
-}
-
-/// Strip ANSI escape codes from a string
-fn strip_ansi_codes(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip ANSI escape sequence
-            if chars.peek() == Some(&'[') {
-                chars.next(); // consume '['
-                // Skip until 'm' (end of SGR sequence)
-                while let Some(ch) = chars.next() {
-                    if ch == 'm' {
-                        break;
-                    }
-                }
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-/// Execute a crossterm command with retry logic for transient IO errors
-fn execute_with_retry<T>(command: T) -> Result<()>
-where
-    T: crossterm::Command + Clone,
-{
-    const MAX_ATTEMPTS: usize = 3;
-    const RETRY_DELAY_MS: u64 = 10;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match crossterm::execute!(io::stdout(), command.clone()) {
-            Ok(_) => return Ok(()),
-            Err(e) if attempt < MAX_ATTEMPTS - 1 => {
-                tracing::warn!(
-                    "Terminal IO failed (attempt {}/{}): {}",
-                    attempt + 1,
-                    MAX_ATTEMPTS,
-                    e
-                );
-                // Small delay to let terminal state stabilize
-                std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
-                continue;
-            }
-            Err(e) => {
-                // All retries exhausted
-                return Err(anyhow::anyhow!("Terminal IO failed after {} attempts: {}", MAX_ATTEMPTS, e));
-            }
-        }
-    }
-    unreachable!()
-}
-
-/// Calculate viewport height dynamically based on terminal size
-fn calculate_viewport_height(terminal_size: (u16, u16)) -> usize {
-    let (_, term_height) = terminal_size;
-
-    // Reserve space for TUI components:
-    // - Separator: 1 line
-    // - Input area: 1-3 lines (depends on content)
-    // - Status bar: 1 line
-    let tui_reserved = 3; // Minimum
-
-    let viewport_height = term_height.saturating_sub(tui_reserved) as usize;
-    viewport_height.max(5) // Minimum 5 lines
-}
-
-/// TUI renderer for Ratatui-based interface
 pub struct TuiRenderer {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
     output_manager: Arc<OutputManager>,
-    status_bar: Arc<StatusBar>,
-    /// Whether TUI is currently active (for suspend/resume)
-    is_active: bool,
-    /// Active dialog being displayed (if any)
-    pub active_dialog: Option<Dialog>,
-    /// Active tabbed dialog being displayed (if any)
-    pub active_tabbed_dialog: Option<TabbedDialog>,
-    /// Text input area for integrated TUI input
-    input_textarea: TextArea<'static>,
-    /// Command history for up/down arrow navigation
-    command_history: Vec<String>,
-    /// Current position in history (None = not navigating)
-    history_index: Option<usize>,
-    /// Saved draft when navigating history (restored when returning to None)
-    history_draft: Option<String>,
-    /// Internal scrollback buffer with structured messages
-    scrollback: ScrollbackBuffer,
-    /// Dynamic viewport height (updated on resize)
-    viewport_height: usize,
-    /// Current inline viewport size (1 + input_lines + 4)
-    current_inline_viewport_size: u16,
-    /// Shadow buffer for rendering (2D character array)
-    shadow_buffer: ShadowBuffer,
-    /// Previous frame buffer (for diff-based updates)
-    prev_frame_buffer: ShadowBuffer,
-    /// Whether full refresh is needed
-    pub(crate) needs_full_refresh: bool,
-    /// Last render error (for recovery)
-    pub(crate) last_render_error: Option<String>,
-    /// Pending feedback rating from user ('g' or 'b' key press)
-    pub pending_feedback: Option<crate::feedback::FeedbackRating>,
-    /// Pending cancellation request (Ctrl+C pressed)
-    pub pending_cancellation: bool,
-    /// Pending dialog result (completed but not yet processed)
-    pub pending_dialog_result: Option<crate::cli::tui::DialogResult>,
-    /// Last query-response pair for feedback
-    last_interaction: Option<(String, String)>,
-    /// Last refresh timestamp
-    last_refresh: std::time::Instant,
-    /// Refresh interval during streaming
-    refresh_interval: Duration,
-    /// Last blit timestamp (for rate limiting)
-    last_blit: std::time::Instant,
-    /// Blit rate limit (min interval between blits)
-    blit_interval: Duration,
-    /// Previous input text (for change detection)
-    prev_input_text: String,
-    /// Previous cursor position (for change detection)
-    prev_cursor_pos: (usize, usize),
-    /// Previous status bar content (for change detection)
-    prev_status_content: String,
-    /// Color scheme for TUI elements
-    colors: crate::config::ColorScheme,
-    /// Suggestion manager for contextual prompts
-    suggestions: crate::cli::SuggestionManager,
-    /// Inline ghost text suggestion (shown after cursor)
-    ghost_text: Option<String>,
-    /// Command autocomplete registry
-    command_registry: crate::cli::command_autocomplete::CommandRegistry,
-    /// Autocomplete dropdown state
-    autocomplete_state: AutocompleteState,
+    status_bar:     Arc<StatusBar>,
+    colors:         ColorScheme,
 
-    /// Pasted images waiting to be sent with the next message.
-    /// Each entry: (display_index, base64_data, media_type e.g. "image/png")
+    // Input — tui-textarea manages multi-line state; we render it manually.
+    pub(crate) input_textarea:  TextArea<'static>,
+    pub(crate) command_history: Vec<String>,
+    pub(crate) history_index:   Option<usize>,
+    pub(crate) history_draft:   Option<String>,
+
+    // How many rows the live area currently occupies at the bottom of the
+    // terminal (WorkUnit + separator + input + status).  Cleared before each
+    // redraw.
+    active_rows: usize,
+
+    // Messages already committed to permanent scrollback.
+    printed_ids: HashSet<MessageId>,
+
+    // Dialog state — tool-approval dialogs shown in the live area.
+    pub active_dialog:        Option<Dialog>,
+    pub active_tabbed_dialog: Option<TabbedDialog>,
+
+    // Generic flags
+    is_active: bool,
+    pub(crate) needs_full_refresh: bool,
+    pub(crate) last_render_error:  Option<String>,
+    pub pending_feedback:           Option<crate::feedback::FeedbackRating>,
+    pub pending_cancellation:       bool,
+    pub pending_dialog_result:      Option<DialogResult>,
+
+    // Autocomplete / suggestions
+    pub(crate) ghost_text:    Option<String>,
+    suggestions:              crate::cli::suggestions::SuggestionManager,
+    command_registry:         crate::cli::command_autocomplete::CommandRegistry,
+    pub autocomplete_state:   AutocompleteState,
+
+    // Image paste support
     pub pending_images: Vec<(usize, String, String)>,
-    /// Running counter for image numbering (Image #1, #2, ...)
-    image_counter: usize,
+    pub(crate) image_counter: usize,
+
+    // Rate limiting
+    last_render:     Instant,
+    render_interval: Duration,
 }
+
+// ─── Construction ─────────────────────────────────────────────────────────────
 
 impl TuiRenderer {
-    /// Helper method to create a clean text area with no default styling
-    pub(super) fn create_clean_textarea() -> TextArea<'static> {
-        let mut textarea = TextArea::default();
-        textarea.set_placeholder_text("Type your message...");
-
-        use ratatui::style::{Modifier, Style};
-
-        // Set style properties to remove unwanted defaults
-        // TextArea defaults to underlined cursor line and blue selection
-        let clean_style = Style::default();
-
-        textarea.set_style(clean_style);                    // General text style
-        textarea.set_cursor_line_style(clean_style);        // Remove underline on cursor line
-        textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED)); // Block cursor
-        textarea.set_selection_style(clean_style);          // Remove blue selection background
-        textarea.set_placeholder_style(clean_style);        // Clean placeholder style
-
-        textarea
-    }
-
-    /// Helper to create a clean text area with initial text
-    pub(super) fn create_clean_textarea_with_text(text: &str) -> TextArea<'static> {
-        let mut textarea = TextArea::from([text]);
-
-        use ratatui::style::{Modifier, Style};
-        let clean_style = Style::default();
-
-        textarea.set_style(clean_style);
-        textarea.set_cursor_line_style(clean_style);
-        textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED)); // Block cursor
-        textarea.set_selection_style(clean_style);
-        textarea.set_placeholder_style(clean_style);
-
-        textarea
-    }
-
-    /// Helper function to create a centered rect for dialog overlay
-    ///
-    /// # Arguments
-    /// * `percent_width` - Width as percentage of parent area (e.g., 60 = 60%)
-    /// * `percent_height` - Height as percentage of parent area (e.g., 80 = 80%)
-    /// * `area` - The parent area to center within
-    fn centered_rect(percent_width: u16, percent_height: u16, area: Rect) -> Rect {
-        let popup_layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage((100 - percent_height) / 2),
-                Constraint::Percentage(percent_height),
-                Constraint::Percentage((100 - percent_height) / 2),
-            ])
-            .split(area);
-
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage((100 - percent_width) / 2),
-                Constraint::Percentage(percent_width),
-                Constraint::Percentage((100 - percent_width) / 2),
-            ])
-            .split(popup_layout[1])[1]
-    }
-
-    /// Update ghost text suggestion and autocomplete dropdown based on current input
-    ///
-    /// Generates inline autocomplete suggestions for common commands and patterns.
-    /// Ghost text appears after the cursor and can be accepted with Tab.
-    /// Autocomplete dropdown shows all matching commands when typing /.
-    pub(super) fn update_ghost_text(&mut self) {
-        let current_input = self.input_textarea.lines().join("\n");
-        let trimmed = current_input.trim();
-
-        // Only suggest on single-line inputs
-        if self.input_textarea.lines().len() > 1 {
-            self.ghost_text = None;
-            self.autocomplete_state.hide();
-            return;
-        }
-
-        // Don't suggest if input is empty
-        if trimmed.is_empty() {
-            self.ghost_text = None;
-            self.autocomplete_state.hide();
-            return;
-        }
-
-        // Check if we're typing a command (starts with /)
-        if trimmed.starts_with('/') {
-            // Get matching commands from registry
-            let matches = self.command_registry.match_prefix(trimmed);
-
-            if !matches.is_empty() {
-                // Show autocomplete dropdown
-                self.autocomplete_state.show_matches(matches);
-
-                // Set ghost text to first match (for Tab completion)
-                if let Some(selected) = self.autocomplete_state.get_selected() {
-                    if selected.name.starts_with(trimmed) && selected.name != trimmed {
-                        self.ghost_text = Some(selected.name[trimmed.len()..].to_string());
-                    } else {
-                        self.ghost_text = None;
-                    }
-                } else {
-                    self.ghost_text = None;
-                }
-                return;
-            } else {
-                // No matches - hide autocomplete
-                self.autocomplete_state.hide();
-            }
-        } else {
-            // Not a command - hide autocomplete
-            self.autocomplete_state.hide();
-        }
-
-        // Common query patterns (for non-command input)
-        let patterns = vec![
-            ("Can you help", " me with..."),
-            ("How do I", " ..."),
-            ("What is", " ..."),
-            ("Why does", " ..."),
-            ("Fix", " this code"),
-            ("Explain", " this code"),
-            ("Refactor", " this code"),
-            ("Write", " a function that..."),
-        ];
-
-        for (prefix, completion) in patterns {
-            if current_input.starts_with(prefix) && current_input.len() < prefix.len() + 3 {
-                self.ghost_text = Some(completion.to_string());
-                return;
-            }
-        }
-
-        // No suggestion found
-        self.ghost_text = None;
-    }
-
-    /// Create a new TUI renderer with inline viewport
     pub fn new(
         output_manager: Arc<OutputManager>,
-        status_bar: Arc<StatusBar>,
-        colors: crate::config::ColorScheme,
+        status_bar:     Arc<StatusBar>,
+        colors:         ColorScheme,
     ) -> Result<Self> {
-        // Setup terminal with inline viewport - preserves terminal scrollback
         enable_raw_mode().context("Failed to enable raw mode")?;
-        let mut stdout = io::stdout();
 
-        // Enable keyboard enhancement flags for better modifier key support (Shift+Enter, etc.)
-        execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        ).context("Failed to enable keyboard enhancements")?;
+        // Enhanced keyboard support (shift-enter, etc.) — not fatal if missing.
+        let _ = execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            )
+        );
 
-        // Ensure cursor is visible
-        execute!(stdout, cursor::Show).context("Failed to show cursor")?;
+        execute!(io::stdout(), cursor::Show)?;
 
-        let backend = CrosstermBackend::new(stdout);
-
-        // Use Inline viewport - DYNAMIC size based on input (starts at 6 lines minimum)
-        // Messages will be written above this using insert_before()
-        // Size: 1 separator + input (1-10 lines) + 4 status = 6-15 lines
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(6), // Start with minimum size
-            },
-        ).context("Failed to create terminal with inline viewport")?;
-
-        // Get terminal size for scrollback buffer
-        let term_size = crossterm::terminal::size()
-            .context("Failed to get terminal size")?;
-        let (term_width, _term_height) = term_size;
-
-        // Calculate dynamic viewport height
-        let viewport_height = calculate_viewport_height(term_size);
-
-        // ScrollbackBuffer tracks all messages (not for rendering, for structure)
-        // We'll use insert_before() to write to terminal scrollback
-        let scrollback = ScrollbackBuffer::new(viewport_height, term_width as usize);
-
-        // Calculate visible scrollback area (above inline viewport)
-        // Inline viewport starts at 6 lines: 1 (separator) + 1 (input) + 4 (status)
-        // Will resize dynamically up to 15 lines as input grows
-        let initial_viewport_size = 6u16;
-        let visible_scrollback_rows = _term_height.saturating_sub(initial_viewport_size) as usize;
-
-        // Initialize shadow buffers for diff-based rendering
-        let shadow_buffer = ShadowBuffer::new(term_width as usize, visible_scrollback_rows);
-        let prev_frame_buffer = ShadowBuffer::new(term_width as usize, visible_scrollback_rows);
-
-        // Ensure stdout is disabled - we'll write via insert_before() instead
-        // (Already disabled in main.rs, but double-check for safety)
+        // Suppress OutputManager's own stdout writes — we own the terminal.
         output_manager.disable_stdout();
 
-        // Clear the visible scrollback area to prevent ghosting from previous output
-        let mut stdout = io::stdout();
-        use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-        execute!(stdout, BeginSynchronizedUpdate)?;
-        for row in 0..visible_scrollback_rows {
-            execute!(
-                stdout,
-                cursor::MoveTo(0, row as u16),
-                Clear(ClearType::UntilNewLine)
-            )?;
+        let command_history = Self::load_history();
+
+        Ok(TuiRenderer {
+            output_manager,
+            status_bar,
+            colors,
+
+            input_textarea:  Self::create_clean_textarea(),
+            command_history,
+            history_index:   None,
+            history_draft:   None,
+
+            active_rows:  0,
+            printed_ids:  HashSet::new(),
+
+            active_dialog:        None,
+            active_tabbed_dialog: None,
+
+            is_active:            true,
+            needs_full_refresh:   false,
+            last_render_error:    None,
+            pending_feedback:     None,
+            pending_cancellation: false,
+            pending_dialog_result: None,
+
+            ghost_text:       None,
+            suggestions:      crate::cli::suggestions::SuggestionManager::new(),
+            command_registry: crate::cli::command_autocomplete::CommandRegistry::new(),
+            autocomplete_state: AutocompleteState::default(),
+
+            pending_images: Vec::new(),
+            image_counter:  0,
+
+            last_render:     Instant::now(),
+            render_interval: Duration::from_millis(100),
+        })
+    }
+
+    // ── TextArea factories (also called from async_input) ─────────────────────
+
+    pub fn create_clean_textarea() -> TextArea<'static> {
+        use ratatui::style::{Modifier, Style};
+        let mut ta = TextArea::default();
+        ta.set_placeholder_text("Type your message…");
+        let plain = Style::default();
+        ta.set_style(plain);
+        ta.set_cursor_line_style(plain);
+        ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        ta.set_selection_style(plain);
+        ta.set_placeholder_style(plain);
+        ta
+    }
+
+    pub fn create_clean_textarea_with_text(text: &str) -> TextArea<'static> {
+        let mut ta = Self::create_clean_textarea();
+        for (i, line) in text.lines().enumerate() {
+            if i > 0 {
+                ta.insert_newline();
+            }
+            ta.insert_str(line);
         }
+        ta
+    }
+}
+
+// ─── Raw-mode printing helpers ────────────────────────────────────────────────
+
+impl TuiRenderer {
+    /// Print a multi-line string to the terminal scrollback.
+    /// In raw mode every `\n` needs an accompanying `\r`.
+    fn raw_println(text: &str) -> Result<()> {
+        let mut stdout = io::stdout();
+        for line in text.split('\n') {
+            let line = line.trim_end_matches('\r');
+            execute!(stdout, Print(line), Print("\r\n"))?;
+        }
+        Ok(())
+    }
+
+    fn raw_blank_line() -> Result<()> {
+        execute!(io::stdout(), Print("\r\n")).map_err(anyhow::Error::from)
+    }
+}
+
+// ─── Live area management ─────────────────────────────────────────────────────
+
+impl TuiRenderer {
+    /// Move the cursor up to the top of the live area and clear everything
+    /// below it, ready for a fresh draw.
+    fn erase_live_area(&mut self) -> Result<()> {
+        if self.active_rows == 0 {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        execute!(stdout, cursor::MoveToColumn(0))?;
+        if self.active_rows > 1 {
+            execute!(stdout, cursor::MoveUp((self.active_rows - 1) as u16))?;
+        }
+        execute!(stdout, Clear(ClearType::FromCursorDown))?;
+        self.active_rows = 0;
+        Ok(())
+    }
+
+    /// Draw the live area from scratch and track `active_rows`.
+    fn draw_live_area(&mut self) -> Result<()> {
+        let mut stdout = io::stdout();
+        execute!(stdout, BeginSynchronizedUpdate)?;
+
+        let mut rows: usize = 0;
+
+        // ── 1. Active WorkUnit ────────────────────────────────────────────────
+        let live_msg = self.find_live_message();
+        if let Some(msg) = &live_msg {
+            let formatted = msg.format(&self.colors);
+            for line in formatted.split('\n') {
+                let line = line.trim_end_matches('\r');
+                execute!(stdout, Print(line), Print("\r\n"))?;
+                rows += 1;
+            }
+        }
+
+        // ── 2. Separator ──────────────────────────────────────────────────────
+        let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+        let sep: String = "─".repeat(term_width);
+        execute!(stdout, Print(format!("{}{}{}\r\n", DIM_GRAY, sep, RESET)))?;
+        rows += 1;
+
+        // ── 3. Dialog or input ────────────────────────────────────────────────
+        if self.active_dialog.is_some() {
+            let dialog_rows = Self::draw_dialog_inline_static(
+                &mut stdout,
+                self.active_dialog.as_ref().unwrap(),
+            )?;
+            rows += dialog_rows;
+        } else {
+            // ── 4. Input area ─────────────────────────────────────────────────
+            let (cursor_row, cursor_col) = self.input_textarea.cursor();
+            let lines = self.input_textarea.lines().to_vec();
+            let input_line_count = lines.len().max(1);
+
+            let prompt = format!("{}❯{} ", CYAN, RESET);
+            let prompt_vis_len: usize = 2; // visible chars: "❯ "
+            let continuation = "  ";
+
+            if lines.is_empty() {
+                execute!(stdout, Print(&prompt))?;
+                rows += 1;
+            } else {
+                for (i, line) in lines.iter().enumerate() {
+                    if i == 0 {
+                        execute!(stdout, Print(format!("{}{}", prompt, line)))?;
+                    } else {
+                        execute!(stdout, Print(format!("{}{}", continuation, line)))?;
+                    }
+                    if i < lines.len() - 1 {
+                        execute!(stdout, Print("\r\n"))?;
+                    }
+                    rows += 1;
+                }
+            }
+
+            // ── 5. Status line ────────────────────────────────────────────────
+            let status = self.status_bar.get_status();
+            if !status.is_empty() {
+                execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, status, RESET)))?;
+                rows += 1;
+            }
+
+            // ── 6. Reposition cursor inside the input area ────────────────────
+            let rows_below_cursor = {
+                let input_below = input_line_count.saturating_sub(cursor_row + 1);
+                let status_rows  = if status.is_empty() { 0 } else { 1 };
+                input_below + status_rows
+            };
+            if rows_below_cursor > 0 {
+                execute!(stdout, cursor::MoveUp(rows_below_cursor as u16))?;
+            }
+            let col = if cursor_row == 0 {
+                prompt_vis_len + cursor_col
+            } else {
+                continuation.len() + cursor_col
+            };
+            execute!(stdout, cursor::MoveToColumn(col as u16))?;
+        }
+
         execute!(stdout, EndSynchronizedUpdate)?;
         stdout.flush()?;
 
-        let renderer = Self {
-            terminal,
-            output_manager,
-            status_bar,
-            is_active: true,
-            active_dialog: None,
-            active_tabbed_dialog: None,
-            input_textarea: Self::create_clean_textarea(),
-            command_history: Self::load_history(), // Load history from disk
-            history_index: None,
-            history_draft: None,
-            scrollback,
-            viewport_height,
-            current_inline_viewport_size: 6, // Initial: 1 separator + 1 input + 4 status
-            shadow_buffer,
-            prev_frame_buffer,
-            needs_full_refresh: false,
-            last_render_error: None,
-            last_refresh: std::time::Instant::now(),
-            refresh_interval: Duration::from_millis(100), // 10 FPS - blit to overwrite visible area
-            last_blit: std::time::Instant::now(),
-            blit_interval: Duration::from_millis(50), // 20 FPS max for blitting
-            prev_input_text: String::new(),
-            prev_cursor_pos: (0, 0),
-            prev_status_content: String::new(),
-            pending_feedback: None,
-            pending_cancellation: false,
-            pending_dialog_result: None,
-            last_interaction: None,
-            colors,
-            suggestions: crate::cli::SuggestionManager::new(),
-            ghost_text: None,
-            command_registry: crate::cli::command_autocomplete::CommandRegistry::new(),
-            autocomplete_state: AutocompleteState::new(),
-            pending_images: Vec::new(),
-            image_counter: 0,
-        };
-
-        // Initialize first-run suggestions
-        renderer.update_suggestion_status();
-
-        Ok(renderer)
-    }
-
-    /// Print the Claude Code-style startup header to terminal scrollback.
-    ///
-    /// Writes once on startup: app name/version, primary model, and working directory.
-    /// Uses ratatui's insert_before() so it lands in the terminal scrollback buffer
-    /// above the inline viewport — permanent and scrollable.
-    pub fn print_startup_header(&mut self, model: &str, cwd: &str) -> Result<()> {
-        use ratatui::style::{Color, Modifier, Style};
-
-        let version = env!("CARGO_PKG_VERSION");
-
-        // 7-line bird ASCII art header (⟵ art | text ⟶ aligned at col 11):
-        //
-        //     ✦
-        //     │
-        //    ▗█▖     finch v0.5.0
-        // ▗▟█████▙▖  claude-sonnet-4-6 · cloud
-        // ▝▜█████▛▘  ~/repos/finch
-        //    ▐▌
-        //   /help for commands  ·  type to chat
-        self.terminal.insert_before(7, |buf| {
-            let art   = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
-            let spark = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
-            let dim   = Style::default().fg(Color::DarkGray);
-            let name  = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
-            let model_style = Style::default().fg(Color::Cyan);
-
-            // Bird art (left column)
-            buf.set_string(4, 0, "✦", spark);
-            buf.set_string(4, 1, "│", dim);
-            buf.set_string(3, 2, "▗█▖", art);
-            buf.set_string(0, 3, "▗▟█████▙▖", art);
-            buf.set_string(0, 4, "▝▜█████▛▘", art);
-            buf.set_string(3, 5, "▐▌", dim);
-
-            // Info text aligned at x=11
-            buf.set_string(11, 2, format!("finch v{}", version), name);
-            buf.set_string(11, 3, model, model_style);
-            buf.set_string(11, 4, cwd, dim);
-
-            // Hint
-            buf.set_string(2, 6, "/help for commands  ·  type to chat", dim);
-        })?;
-
-        // insert_before() invalidates the diff buffer — force full re-blit
-        self.prev_frame_buffer.clear();
-        self.render()?;
-
+        self.active_rows = rows;
         Ok(())
     }
 
-    /// Record the last query-response pair for feedback
-    pub fn record_interaction(&mut self, query: String, response: String) {
-        self.last_interaction = Some((query, response));
-        // Update suggestion context: query just completed
-        self.suggestions.set_context(crate::cli::SuggestionContext::QueryComplete);
-        self.suggestions.increment_query_count();
-        self.update_suggestion_status();
+    /// Return the most recent InProgress message for the live area.
+    fn find_live_message(&self) -> Option<MessageRef> {
+        self.output_manager
+            .get_messages()
+            .into_iter()
+            .filter(|m| !self.printed_ids.contains(&m.id()))
+            .find(|m| matches!(m.status(), MessageStatus::InProgress))
     }
+}
 
-    /// Update the status bar with current suggestions
-    fn update_suggestion_status(&self) {
-        if let Some(suggestion_line) = self.suggestions.get_suggestion_line() {
-            self.status_bar.update_line(
-                crate::cli::StatusLineType::Suggestions,
-                suggestion_line,
-            );
-        } else {
-            self.status_bar.remove_line(&crate::cli::StatusLineType::Suggestions);
-        }
-    }
+// ─── flush_output_safe / render ───────────────────────────────────────────────
 
-    /// Update suggestion context based on TUI state
-    pub fn update_suggestion_context(&mut self, context: crate::cli::SuggestionContext) {
-        self.suggestions.set_context(context);
-        self.update_suggestion_status();
-    }
+impl TuiRenderer {
+    /// Called from the event loop on every tick.
+    /// Commits newly-completed messages to permanent scrollback, then redraws.
+    pub fn flush_output_safe(&mut self, _output_manager: &OutputManager) -> Result<()> {
+        let messages = self.output_manager.get_messages();
 
-    /// Check and process pending feedback
-    pub fn process_pending_feedback(&mut self) -> Result<()> {
-        if let Some(rating) = self.pending_feedback.take() {
-            if let Some((query, response)) = &self.last_interaction {
-                // Create feedback logger
-                let logger = crate::feedback::FeedbackLogger::new()
-                    .context("Failed to create feedback logger")?;
-
-                // Create feedback entry
-                let entry = crate::feedback::FeedbackEntry::new(
-                    query.clone(),
-                    response.clone(),
-                    rating,
-                );
-
-                // Log feedback
-                logger.log(&entry)
-                    .context("Failed to log feedback")?;
-
-                // Show confirmation message
-                let confirmation = format!(
-                    "\n{} Feedback recorded: {} (weight: {:.1}x)\n",
-                    match rating {
-                        crate::feedback::FeedbackRating::Good => "✓",
-                        crate::feedback::FeedbackRating::Bad => "⚠",
-                    },
-                    rating.display_str(),
-                    rating.training_weight()
-                );
-
-                self.output_manager.write_info(&confirmation);
-            } else {
-                self.output_manager.write_info("\n⚠ No recent interaction to provide feedback on\n");
+        let mut to_commit: Vec<MessageRef> = Vec::new();
+        for msg in &messages {
+            let id = msg.id();
+            if self.printed_ids.contains(&id) {
+                continue;
+            }
+            match msg.status() {
+                MessageStatus::Complete | MessageStatus::Failed => {
+                    to_commit.push(msg.clone());
+                    self.printed_ids.insert(id);
+                }
+                MessageStatus::InProgress => {}
             }
         }
 
-        Ok(())
-    }
-
-    /// Load command history from disk
-    fn load_history() -> Vec<String> {
-        use std::io::BufRead;
-
-        let history_file = match dirs::home_dir() {
-            Some(home) => home.join(".finch").join("history.txt"),
-            None => return Vec::new(),
-        };
-
-        if !history_file.exists() {
-            return Vec::new();
-        }
-
-        match std::fs::File::open(&history_file) {
-            Ok(file) => {
-                let reader = std::io::BufReader::new(file);
-                reader
-                    .lines()
-                    .filter_map(|line| line.ok())
-                    .filter(|line| !line.trim().is_empty())
-                    .collect()
-            }
-            Err(_) => Vec::new(),
-        }
-    }
-
-    /// Save command history to disk
-    pub fn save_history(&self) -> Result<()> {
-        use std::io::Write;
-
-        let history_file = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-            .join(".finch")
-            .join("history.txt");
-
-        // Ensure parent directory exists
-        if let Some(parent) = history_file.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
-        }
-
-        // Write history (limit to last 1000 commands)
-        let history_to_save: Vec<&String> = self
-            .command_history
-            .iter()
-            .rev()
-            .take(1000)
-            .rev()
-            .collect();
-
-        let mut file = std::fs::File::create(&history_file)
-            .with_context(|| format!("Failed to create history file: {}", history_file.display()))?;
-
-        for cmd in history_to_save {
-            writeln!(file, "{}", cmd)
-                .context("Failed to write to history file")?;
-        }
-
-        Ok(())
-    }
-
-    /// Resize viewport if needed based on input lines and dialog presence
-    fn resize_viewport_if_needed(&mut self, input_lines: u16, has_dialog: bool) -> Result<()> {
-        // Calculate needed viewport size
-        let needed_size = if has_dialog {
-            // Dialog mode: need more space (will calculate exact size later)
-            15 // Use max size for dialogs
-        } else {
-            // Normal mode: 1 separator + input lines + 4 status
-            1 + input_lines + 4
-        };
-
-        // Only recreate if size changed
-        if needed_size != self.current_inline_viewport_size {
-            eprintln!("[DEBUG resize] Viewport: {} → {} lines",
-                self.current_inline_viewport_size, needed_size);
-
-            // Clear BOTH old and new viewport areas to prevent artifacts
-            use crossterm::terminal::{Clear, ClearType};
-            let term_size = crossterm::terminal::size()?;
-            let old_viewport_start = term_size.1.saturating_sub(self.current_inline_viewport_size);
-            let new_viewport_start = term_size.1.saturating_sub(needed_size);
-
-            // Clear from the new viewport start to the end (covers both old and new)
-            let clear_start = old_viewport_start.min(new_viewport_start);
-            for row in clear_start..term_size.1 {
-                execute!(
-                    io::stdout(),
-                    cursor::MoveTo(0, row),
-                    Clear(ClearType::UntilNewLine)
-                )?;
-            }
-
-            let backend = CrosstermBackend::new(io::stdout());
-            self.terminal = Terminal::with_options(
-                backend,
-                TerminalOptions {
-                    viewport: Viewport::Inline(needed_size),
-                },
-            ).context("Failed to recreate terminal with new viewport size")?;
-
-            self.current_inline_viewport_size = needed_size;
-
-            // Update shadow buffer size to match new viewport
-            let term_size = crossterm::terminal::size()?;
-            let visible_scrollback_rows = term_size.1.saturating_sub(needed_size) as usize;
-
-            // Preserve styles from old buffers when resizing
-            let old_shadow = &self.shadow_buffer;
-            let old_prev = &self.prev_frame_buffer;
-
-            let mut new_shadow = ShadowBuffer::new(term_size.0 as usize, visible_scrollback_rows);
-            let mut new_prev = ShadowBuffer::new(term_size.0 as usize, visible_scrollback_rows);
-
-            // Copy cells from old buffers where possible (preserves background styles)
-            for y in 0..old_shadow.height.min(new_shadow.height) {
-                for x in 0..old_shadow.width.min(new_shadow.width) {
-                    if let Some(old_cell) = old_shadow.get(x, y) {
-                        new_shadow.set(x, y, old_cell.clone());
-                    }
+        if !to_commit.is_empty() {
+            self.erase_live_area()?;
+            for (i, msg) in to_commit.iter().enumerate() {
+                Self::raw_println(&msg.format(&self.colors))?;
+                if i < to_commit.len() - 1 {
+                    Self::raw_blank_line()?;
                 }
             }
-
-            for y in 0..old_prev.height.min(new_prev.height) {
-                for x in 0..old_prev.width.min(new_prev.width) {
-                    if let Some(old_cell) = old_prev.get(x, y) {
-                        new_prev.set(x, y, old_cell.clone());
-                    }
-                }
-            }
-
-            self.shadow_buffer = new_shadow;
-            self.prev_frame_buffer = new_prev;
-
-            // Force full refresh after viewport resize
-            self.needs_full_refresh = true;
-
-            // Clear double-buffering state to force re-render of everything
-            self.prev_input_text.clear();
-            self.prev_cursor_pos = (0, 0);
-            self.prev_status_content.clear();
+            self.draw_live_area()?;
+        } else if self.last_render.elapsed() >= self.render_interval {
+            // Periodic redraw for animation / status updates.
+            self.erase_live_area()?;
+            self.draw_live_area()?;
         }
 
+        self.last_render = Instant::now();
         Ok(())
     }
 
-    /// Render the TUI inline viewport (dynamic size: 6-15 lines)
-    /// Messages are written to terminal scrollback via insert_before()
+    /// Redraw the live area.  Called by the event loop and by async_input.
     pub fn render(&mut self) -> Result<()> {
+        self.erase_live_area()?;
+        self.draw_live_area()
+    }
+
+    /// Kept for API compatibility.  Forces a redraw if flagged.
+    pub fn check_and_refresh(&mut self) -> Result<()> {
+        if self.needs_full_refresh {
+            self.needs_full_refresh = false;
+            self.erase_live_area()?;
+            self.draw_live_area()?;
+        }
+        Ok(())
+    }
+
+    pub fn trigger_refresh(&mut self) {
+        self.needs_full_refresh = true;
+    }
+}
+
+// ─── Startup header ───────────────────────────────────────────────────────────
+
+impl TuiRenderer {
+    pub fn print_startup_header(&mut self, model: &str, cwd: &str) -> Result<()> {
+        let w = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+        let sep = "─".repeat(w.min(60));
+
+        execute!(
+            io::stdout(),
+            Print(format!("{}{}{}\r\n", DIM_GRAY, sep, RESET)),
+            Print(format!(
+                "  {}finch{}  ·  {}  ·  {}{}{}\r\n",
+                "\x1b[1;37m", RESET, model, DIM_GRAY, cwd, RESET
+            )),
+            Print(format!("{}{}{}\r\n", DIM_GRAY, sep, RESET)),
+            Print("\r\n"),
+        )?;
+
+        self.draw_live_area()
+    }
+}
+
+// ─── Shutdown ─────────────────────────────────────────────────────────────────
+
+impl TuiRenderer {
+    pub fn shutdown(&mut self) -> Result<()> {
         if !self.is_active {
             return Ok(());
         }
-
-        // Calculate input lines for viewport sizing
-        let input_lines = self.input_textarea.lines().len().max(1).min(10) as u16;
-        let has_dialog = self.active_dialog.is_some() || self.active_tabbed_dialog.is_some();
-
-        // Resize viewport if needed BEFORE rendering
-        self.resize_viewport_if_needed(input_lines, has_dialog)?;
-
-        // Update previous state for double buffering (used for debugging/logging)
-        let current_input_text = self.input_textarea.lines().join("\n");
-        let current_cursor = self.input_textarea.cursor();
-        let current_status_content = self.status_bar.get_status();
-
-        self.prev_input_text = current_input_text;
-        self.prev_cursor_pos = current_cursor;
-        self.prev_status_content = current_status_content.clone();
-
-        // Always render when called (optimization removed for reliability)
-        // render() is only called when needed (events, new messages, etc.)
-
-        let active_dialog = self.active_dialog.clone();
-        let active_tabbed_dialog = self.active_tabbed_dialog.clone();
-        let status_bar = Arc::clone(&self.status_bar);
-        let input_textarea = self.input_textarea.clone();
-
-        // Wrap in synchronized update to prevent tearing
-        use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-        execute_with_retry(BeginSynchronizedUpdate)?;
-
-        self.terminal
-            .draw(|frame| {
-                if has_dialog {
-                    // Dialog mode: Show scrollback context + dialog at bottom
-                    if let Some(dialog) = &active_dialog {
-                        use ratatui::text::Line;
-                        
-                        use ratatui::widgets::Paragraph;
-
-                        let total_area = frame.area();
-
-                        // Calculate dialog height (title + options + help + borders)
-                        let num_options = match &dialog.dialog_type {
-                            DType::Select { options, .. } => options.len(),
-                            DType::MultiSelect { options, .. } => options.len(),
-                            DType::Confirm { .. } => 2, // Yes/No
-                            DType::TextInput { .. } => 1, // Single input line
-                        };
-
-                        // Calculate wrapped title height (account for long titles like JSON inputs)
-                        let title_width = total_area.width.saturating_sub(4) as usize; // -4 for borders and padding
-                        let title_lines = if title_width > 0 {
-                            let mut line_count = 0;
-                            for line in dialog.title.lines() {
-                                let visible_len = visible_length(line);
-                                line_count += (visible_len + title_width - 1) / title_width; // Ceiling division
-                            }
-                            line_count.max(1) as u16
-                        } else {
-                            1
-                        };
-
-                        // Calculate total dialog height: title + options + help + borders
-                        // +3 for help line, borders, and padding
-                        let base_dialog_height = num_options as u16 + title_lines + 3;
-
-                        // Allow dialog to use most of the terminal (leave just 6 lines for status/input)
-                        let max_dialog_height = total_area.height.saturating_sub(10); // Leave 10 lines for context
-                        let dialog_height = base_dialog_height.min(max_dialog_height).max(8); // At least 8 lines
-
-                        let status_height = 4u16;
-                        let _separator_height = 1u16;
-
-                        // Remaining space for scrollback
-                        // Don't render separator when dialog is active (dialog has its own border)
-                        let scrollback_height = total_area.height
-                            .saturating_sub(dialog_height)
-                            .saturating_sub(status_height);
-
-                        // Layout: scrollback (top) + dialog (bottom) + status (no separator)
-                        let chunks = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(scrollback_height), // Scrollback context
-                                Constraint::Length(dialog_height),      // Dialog
-                                Constraint::Length(status_height),      // Status
-                            ])
-                            .split(total_area);
-
-                        // Render recent scrollback messages for context
-                        let scrollback_messages = self.scrollback.get_visible_messages();
-                        let context_lines: Vec<Line> = scrollback_messages
-                            .iter()
-                            .rev()
-                            .take(scrollback_height as usize)
-                            .rev()
-                            .flat_map(|msg| {
-                                let formatted = msg.format(&self.colors);
-                                formatted.lines().map(|line| Line::raw(line.to_string())).collect::<Vec<_>>()
-                            })
-                            .collect();
-
-                        let scrollback_widget = Paragraph::new(context_lines);
-                        frame.render_widget(scrollback_widget, chunks[0]);
-
-                        // Render dialog
-                        let dialog_widget = DialogWidget::new(dialog, &self.colors);
-                        frame.render_widget(dialog_widget, chunks[1]);
-
-                        // Render status
-                        let status_widget = StatusWidget::new(&status_bar, &self.colors);
-                        frame.render_widget(status_widget, chunks[2]);
-                    } else if let Some(tabbed_dialog) = &active_tabbed_dialog {
-                        // Tabbed dialog mode: Show scrollback context + tabbed dialog
-                        use ratatui::text::Line;
-                        use ratatui::widgets::Paragraph;
-
-                        let total_area = frame.area();
-
-                        // Tabbed dialogs need more space (tabs + question + options + help)
-                        // Estimate: 3 lines (tabs) + 2 lines (question) + N options + 2 (help) + 3 (borders)
-                        let num_options = tabbed_dialog.current_tab().question.options.len();
-                        let base_dialog_height = (3 + 2 + num_options + 2 + 3) as u16;
-
-                        let max_dialog_height = total_area.height.saturating_sub(10);
-                        let dialog_height = base_dialog_height.min(max_dialog_height).max(12);
-
-                        let status_height = 4u16;
-                        let scrollback_height = total_area.height
-                            .saturating_sub(dialog_height)
-                            .saturating_sub(status_height);
-
-                        // Layout: scrollback + tabbed dialog + status
-                        let chunks = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(scrollback_height),
-                                Constraint::Length(dialog_height),
-                                Constraint::Length(status_height),
-                            ])
-                            .split(total_area);
-
-                        // Render scrollback context
-                        let scrollback_messages = self.scrollback.get_visible_messages();
-                        let context_lines: Vec<Line> = scrollback_messages
-                            .iter()
-                            .rev()
-                            .take(scrollback_height as usize)
-                            .rev()
-                            .flat_map(|msg| {
-                                let formatted = msg.format(&self.colors);
-                                formatted.lines().map(|line| Line::raw(line.to_string())).collect::<Vec<_>>()
-                            })
-                            .collect();
-
-                        let scrollback_widget = Paragraph::new(context_lines);
-                        frame.render_widget(scrollback_widget, chunks[0]);
-
-                        // Render tabbed dialog
-                        let tabbed_dialog_widget = TabbedDialogWidget::new(tabbed_dialog, &self.colors);
-                        frame.render_widget(tabbed_dialog_widget, chunks[1]);
-
-                        // Render status
-                        let status_widget = StatusWidget::new(&status_bar, &self.colors);
-                        frame.render_widget(status_widget, chunks[2]);
-                    }
-                } else {
-                    // Normal mode: Render inline viewport (separator + input + status)
-                    // Calculate dynamic input height based on textarea lines (min 1, max 10)
-                    let input_lines = input_textarea.lines().len().max(1).min(10) as u16;
-
-                    // Layout: separator + input + status (NO SPACER)
-                    // The viewport size itself should match this dynamically
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(1),           // Separator line
-                            Constraint::Length(input_lines), // Input area (dynamic)
-                            Constraint::Length(4),           // Status area
-                        ])
-                        .split(frame.area());
-
-                    // Render separator line
-                    use ratatui::text::{Line, Span};
-                    use ratatui::widgets::Paragraph;
-                    use ratatui::style::{Color, Style};
-
-                    let separator_char = '─'; // Unicode box-drawing (U+2500)
-                    let separator_line = separator_char.to_string().repeat(chunks[0].width as usize);
-                    let separator_widget = Paragraph::new(Line::from(Span::styled(
-                        separator_line,
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    frame.render_widget(separator_widget, chunks[0]);
-
-                    // Render input with ghost text
-                    render_input_widget(frame, &input_textarea, chunks[1], "❯", &self.colors, self.ghost_text.as_deref());
-
-                    // Render autocomplete dropdown (if visible)
-                    if self.autocomplete_state.visible {
-                        render_autocomplete_dropdown(frame, &self.autocomplete_state, chunks[1], &self.colors);
-                    }
-
-                    // Render status
-                    let status_widget = StatusWidget::new(&status_bar, &self.colors);
-                    frame.render_widget(status_widget, chunks[2]);
-                }
-            })
-            .context("Failed to draw frame")?;
-
-        execute_with_retry(EndSynchronizedUpdate)?;
-
+        self.is_active = false;
+        let _ = self.erase_live_area();
+        let _ = execute!(io::stdout(), cursor::Show, ResetColor);
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = disable_raw_mode();
+        Self::save_history(&self.command_history);
+        self.output_manager.enable_stdout();
         Ok(())
     }
 
-    // Messages are rendered to terminal scrollback via insert_before() in flush_output_safe()
-
-    /// Check if the TUI is currently active
     pub fn is_active(&self) -> bool {
         self.is_active
     }
+}
 
-    /// Flush pending output to terminal scrollback using insert_before() for complete messages
-    /// and shadow buffer for visible area updates
-    pub fn flush_output_safe(&mut self, output_manager: &OutputManager) -> Result<()> {
-        // Track new messages to write to terminal scrollback
-        let mut new_messages: Vec<MessageRef> = Vec::new();
+// ─── read_line (blocking, used outside the async event loop) ──────────────────
 
-        // Get all trait-based messages from OutputManager
-        let messages = output_manager.get_messages();
+impl TuiRenderer {
+    pub fn read_line(&mut self) -> Result<Option<String>> {
+        use crossterm::event::{KeyCode, KeyModifiers};
 
-        for msg in &messages {
-            let msg_id = msg.id();
-
-            // If message not in scrollback yet, it's NEW - add and write to terminal
-            if self.scrollback.get_message(msg_id).is_none() {
-                self.scrollback.add_message(msg.clone());
-                new_messages.push(msg.clone());
-                self.needs_full_refresh = true;
-            }
-            // Otherwise it's an UPDATE - message already in scrollback
-            // Updates happen via Arc<RwLock<>>, shadow buffer sees them automatically
-        }
-
-        // Write new messages to terminal scrollback using direct crossterm commands
-        // This gives us full control and eliminates background flickering
-        if !new_messages.is_empty() {
-            // Format messages with their styles (keep ANSI codes for foreground colors)
-            let mut lines: Vec<(String, ratatui::style::Style)> = Vec::new();
-            for (idx, msg) in new_messages.iter().enumerate() {
-                let formatted = msg.format(&self.colors);  // Keep ANSI codes!
-                let style = msg.background_style().unwrap_or_default();
-                for line in formatted.lines() {
-                    lines.push((line.to_string(), style));
-                }
-                // Add blank line between messages (not after the last one)
-                if idx < new_messages.len() - 1 {
-                    lines.push((String::new(), ratatui::style::Style::default()));
-                }
-            }
-
-            let num_lines = lines.len().min(u16::MAX as usize) as u16;
-
-            // Calculate where inline viewport starts (first row after scrollback)
-            let (_term_width, term_height) = crossterm::terminal::size()?;
-            let _insert_row = term_height.saturating_sub(self.current_inline_viewport_size);
-
-            // Revert to using ratatui's insert_before for now
-            // Direct crossterm approach caused terminal scrolling issues
-            // TODO: Investigate scroll region support for cleaner implementation
-
-            // Strip ANSI codes for ratatui (it expects plain text + Style)
-            let mut plain_lines: Vec<(String, ratatui::style::Style)> = Vec::new();
-            for (line, style) in lines.iter() {
-                let plain_text = strip_ansi_codes(line);
-                plain_lines.push((plain_text, *style));
-            }
-
-            use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-            let mut stdout = io::stdout();
-            execute!(stdout, BeginSynchronizedUpdate)?;
-
-            // Use ratatui's insert_before
-            self.terminal.insert_before(num_lines, |buf| {
-                for (i, (line, style)) in plain_lines.iter().enumerate() {
-                    if i < buf.area.height as usize {
-                        buf.set_string(0, i as u16, line, *style);
-                    }
-                }
-            })?;
-
-            execute!(stdout, EndSynchronizedUpdate)?;
-
-            // CRITICAL: Sync prev_frame_buffer to match what insert_before() placed on screen.
-            // Clearing would trigger a "full blit" that conflicts with insert_before's output.
-            // Instead, render the shadow buffer now and copy it so the next diff sees no changes.
-            let all_msgs_for_sync = self.scrollback.get_visible_messages();
-            self.shadow_buffer.render_messages(&all_msgs_for_sync, &self.colors);
-            self.prev_frame_buffer = self.shadow_buffer.clone_buffer();
-
-            // CRITICAL: insert_before() may internally clear/redraw the viewport,
-            // erasing the separator. Force a render to redraw the viewport immediately.
+        loop {
+            let om = Arc::clone(&self.output_manager);
+            self.flush_output_safe(&om)?;
             self.render()?;
 
-            // Update blit timestamp
-            self.last_blit = std::time::Instant::now();
-        } else if !messages.is_empty() && self.last_blit.elapsed() >= self.blit_interval {
-            // Blit updates to visible area with rate limiting (for message updates)
-            // This is the reactive part - messages update via Arc<RwLock<>>, we just re-render
-            // Rate limited to 20 FPS (50ms interval) to avoid excessive CPU
-            self.blit_visible_area()?;
-            self.last_blit = std::time::Instant::now();
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(key) => match (key.code, key.modifiers) {
+                        (KeyCode::Enter, KeyModifiers::SHIFT) => {
+                            self.input_textarea.input(Event::Key(key));
+                        }
+                        (KeyCode::Enter, _) => {
+                            let input = self.input_textarea.lines().join("\n");
+                            if input.trim().is_empty() {
+                                continue;
+                            }
+                            self.command_history.push(input.clone());
+                            self.history_index = None;
+                            self.input_textarea = Self::create_clean_textarea();
+                            self.render()?;
+                            return Ok(Some(input));
+                        }
+                        (KeyCode::Esc, _)
+                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            return Ok(None);
+                        }
+                        _ => {
+                            self.input_textarea.input(Event::Key(key));
+                        }
+                    },
+                    Event::Resize(_, _) => {
+                        self.active_rows = 0;
+                    }
+                    _ => {}
+                }
+            }
         }
+    }
+}
 
+// ─── Message helpers ──────────────────────────────────────────────────────────
+
+impl TuiRenderer {
+    pub fn add_trait_message(&mut self, message: MessageRef) -> MessageId {
+        let id = message.id();
+        self.output_manager.add_trait_message(message);
+        id
+    }
+
+    pub fn handle_resize(&mut self, _w: u16, _h: u16) -> Result<()> {
+        self.active_rows = 0;
         Ok(())
     }
+}
 
-    /// Add a trait-based message directly to scrollback (for live updates)
-    pub fn add_trait_message(&mut self, message: MessageRef) -> MessageId {
-        self.scrollback.add_message(message)
+// ─── Ghost text / suggestions ─────────────────────────────────────────────────
+
+impl TuiRenderer {
+    pub fn update_ghost_text(&mut self) {
+        let current = self.input_textarea.lines().join("\n");
+        if current.trim().is_empty() || !current.starts_with('/') {
+            self.ghost_text = None;
+            return;
+        }
+        // Find first command that starts with what the user typed
+        let matches = self.command_registry.match_prefix(&current);
+        self.ghost_text = matches.first().and_then(|spec| {
+            if spec.name.len() > current.len() {
+                Some(spec.name[current.len()..].to_string())
+            } else {
+                None
+            }
+        });
+    }
+}
+
+// ─── Crossterm dialog rendering ───────────────────────────────────────────────
+
+impl TuiRenderer {
+    /// Draw a `Dialog` inline using crossterm box-drawing characters.
+    /// Returns the number of terminal rows consumed.
+    fn draw_dialog_inline_static(stdout: &mut io::Stdout, dialog: &Dialog) -> Result<usize> {
+        let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+        let box_width  = term_width.min(72);
+        let inner      = box_width.saturating_sub(4); // 2 borders + 2 padding
+
+        let mut rows = 0;
+
+        let top = format!("┌{}┐", "─".repeat(box_width - 2));
+        let div = format!("├{}┤", "─".repeat(box_width - 2));
+        let bot = format!("└{}┘", "─".repeat(box_width - 2));
+
+        // Top border
+        execute!(stdout, Print(format!("{}\r\n", top)))?;
+        rows += 1;
+
+        // Title
+        for line in wrap_text(&dialog.title, inner) {
+            execute!(stdout, Print(format!("│  {:<w$}  │\r\n", line, w = inner)))?;
+            rows += 1;
+        }
+
+        // Help message (from dialog field)
+        if let Some(ref help) = dialog.help_message {
+            execute!(stdout, Print(format!("│  {}{:<w$}{}  │\r\n",
+                DIM_GRAY, help, RESET, w = inner)))?;
+            rows += 1;
+        }
+
+        execute!(stdout, Print(format!("{}\r\n", div)))?;
+        rows += 1;
+
+        // Options
+        match &dialog.dialog_type {
+            DialogType::Select { options, selected_index, .. } => {
+                for (i, opt) in options.iter().enumerate() {
+                    let marker  = if i == *selected_index { "●" } else { "○" };
+                    let on  = if i == *selected_index { "\x1b[1;36m" } else { "" };
+                    let off = if i == *selected_index { RESET } else { "" };
+                    let label = format!("  {} {}", marker, opt.label);
+                    execute!(stdout, Print(format!("│  {}{:<w$}{}  │\r\n",
+                        on, label, off, w = inner)))?;
+                    rows += 1;
+                }
+            }
+            DialogType::MultiSelect { options, selected_indices, cursor_index, .. } => {
+                for (i, opt) in options.iter().enumerate() {
+                    let checked = if selected_indices.contains(&i) { "☑" } else { "☐" };
+                    let on  = if i == *cursor_index { "\x1b[1;36m" } else { "" };
+                    let off = if i == *cursor_index { RESET } else { "" };
+                    let label = format!("  {} {}", checked, opt.label);
+                    execute!(stdout, Print(format!("│  {}{:<w$}{}  │\r\n",
+                        on, label, off, w = inner)))?;
+                    rows += 1;
+                }
+            }
+            DialogType::Confirm { prompt, selected, .. } => {
+                execute!(stdout, Print(format!("│  {:<w$}  │\r\n", prompt, w = inner)))?;
+                rows += 1;
+                let yes_style = if *selected { "\x1b[1;36m" } else { DIM_GRAY };
+                let no_style  = if !selected { "\x1b[1;36m" } else { DIM_GRAY };
+                execute!(stdout, Print(format!("│  {}Yes{}   {}No{}  {:<w$}  │\r\n",
+                    yes_style, RESET, no_style, RESET, "", w = inner.saturating_sub(12))))?;
+                rows += 1;
+            }
+            DialogType::TextInput { prompt, input, .. } => {
+                execute!(stdout, Print(format!("│  {:<w$}  │\r\n", prompt, w = inner)))?;
+                execute!(stdout, Print(format!("│  > {:<w$}  │\r\n", input, w = inner.saturating_sub(2))))?;
+                rows += 2;
+            }
+        }
+
+        execute!(stdout, Print(format!("{}\r\n", div)))?;
+        let help = "↑/↓ Navigate  Enter Select  Esc Cancel";
+        execute!(stdout, Print(format!("│  {}{:<w$}{}  │\r\n",
+            DIM_GRAY, help, RESET, w = inner)))?;
+        execute!(stdout, Print(&bot))?;
+        rows += 3;
+
+        Ok(rows)
     }
 
-    /// Get a message by ID from scrollback
-    pub fn get_message(&self, id: MessageId) -> Option<MessageRef> {
-        self.scrollback.get_message(id)
-    }
-
-    // Scrolling is handled by terminal (mouse wheel, shift+pgup/pgdn, etc.)
-    // ScrollbackBuffer still tracks messages for structure, search, export
-
-    /// Check if flush is needed
-    pub fn should_flush(&self, output_manager: &OutputManager) -> bool {
-        // Check if there are new messages to sync
-        let messages = output_manager.get_messages();
-        let current_count = self.scrollback.message_count();
-        messages.len() > current_count
-    }
-
-    /// Show a dialog and block until the user responds
+    /// Show a blocking dialog (used when no async event loop is running).
+    /// Returns `DialogResult::Cancelled` if Esc is pressed.
     pub fn show_dialog(&mut self, dialog: Dialog) -> Result<DialogResult> {
-        if !self.is_active {
-            anyhow::bail!("Cannot show dialog when TUI is not active");
-        }
+        use crossterm::event::{KeyCode, KeyModifiers};
 
-        // Validate terminal size
-        let (_width, height) = crossterm::terminal::size()
-            .context("Failed to get terminal size")?;
-
-        if height < 15 {
-            anyhow::bail!(
-                "Terminal too small for dialog (need 15+ lines, have {}). Please resize terminal.",
-                height
-            );
-        }
-
-        // Set active dialog (will be rendered as overlay)
         self.active_dialog = Some(dialog);
+        self.erase_live_area()?;
+        self.draw_live_area()?;
+
+        loop {
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Esc, _)
+                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            self.active_dialog = None;
+                            self.erase_live_area()?;
+                            self.draw_live_area()?;
+                            return Ok(DialogResult::Cancelled);
+                        }
+                        _ => {
+                            let result = self.active_dialog.as_mut()
+                                .and_then(|d| d.handle_key_event(key));
+
+                            if let Some(r) = result {
+                                self.active_dialog = None;
+                                self.erase_live_area()?;
+                                self.draw_live_area()?;
+                                return Ok(r);
+                            } else {
+                                // Redraw with updated state.
+                                self.erase_live_area()?;
+                                self.draw_live_area()?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Show the setup wizard using ratatui in an alternate screen.
+    pub fn show_tabbed_dialog(&mut self, mut dialog: TabbedDialog) -> Result<TabbedDialogResult> {
+        use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+        use ratatui::{backend::CrosstermBackend, Terminal};
+        use ratatui::widgets::Widget;
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        let backend  = CrosstermBackend::new(io::stdout());
+        let mut term = Terminal::new(backend).context("Failed to create wizard terminal")?;
 
         let result = loop {
-            // Render with dialog overlay
-            self.render()?;
+            term.draw(|frame| {
+                TabbedDialogWidget::new(&dialog, &self.colors)
+                    .render(frame.area(), frame.buffer_mut());
+            })?;
 
-            // Poll for key events (100ms timeout)
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    // Handle the key event
-                    let dialog = self
-                        .active_dialog
-                        .as_mut()
-                        .expect("dialog should exist in show_dialog loop");
-
-                    if let Some(dialog_result) = dialog.handle_key_event(key) {
-                        // Dialog returned a result, exit loop
-                        break dialog_result;
+                    if let Some(r) = dialog.handle_key_event(key) {
+                        break r;
                     }
-
-                    // Render to show dialog state changes
-                    self.render()?;
                 }
             }
         };
 
-        // Clean up: remove dialog
-        self.active_dialog = None;
-
-        // Trigger a render to restore normal layout
-        self.render()?;
-
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        self.active_rows = 0;
         Ok(result)
     }
 
-    /// Show a tabbed dialog and wait for user completion
-    ///
-    /// Displays multiple questions simultaneously with tab navigation.
-    /// Returns TabbedDialogResult (Completed with answers or Cancelled).
-    pub fn show_tabbed_dialog(&mut self, tabbed_dialog: TabbedDialog) -> Result<TabbedDialogResult> {
-        if !self.is_active {
-            anyhow::bail!("Cannot show tabbed dialog when TUI is not active");
-        }
-
-        // Validate terminal size
-        let (_width, height) = crossterm::terminal::size()
-            .context("Failed to get terminal size")?;
-
-        if height < 20 {
-            anyhow::bail!(
-                "Terminal too small for tabbed dialog (need 20+ lines, have {}). Please resize terminal.",
-                height
-            );
-        }
-
-        // Set active tabbed dialog
-        self.active_tabbed_dialog = Some(tabbed_dialog);
-
-        let result = loop {
-            // Render with tabbed dialog overlay
-            self.render()?;
-
-            // Poll for key events (100ms timeout)
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    // Handle the key event
-                    let dialog = self
-                        .active_tabbed_dialog
-                        .as_mut()
-                        .expect("tabbed dialog should exist in show_tabbed_dialog loop");
-
-                    if let Some(dialog_result) = dialog.handle_key_event(key) {
-                        // Dialog returned a result, exit loop
-                        break dialog_result;
-                    }
-
-                    // Render to show dialog state changes
-                    self.render()?;
-                }
-            }
-        };
-
-        // Clean up: remove tabbed dialog
-        self.active_tabbed_dialog = None;
-
-        // Trigger a render to restore normal layout
-        self.render()?;
-
-        Ok(result)
+    /// Convenience wrapper for the tool-approval flow.
+    pub fn render_ask_user_dialog(
+        &mut self,
+        title: &str,
+        options: Vec<DialogOption>,
+    ) -> Result<DialogResult> {
+        self.show_dialog(Dialog::select(title, options))
     }
 
-    /// Show LLM-prompted questions and collect answers
-    ///
-    /// Uses tabbed dialog for multiple questions or single dialog for one question.
-    /// Returns AskUserQuestionOutput with all answers.
+    /// Show structured questions from the LLM (AskUserQuestion tool).
     pub fn show_llm_question(
         &mut self,
         input: &crate::cli::AskUserQuestionInput,
     ) -> Result<crate::cli::AskUserQuestionOutput> {
         use crate::cli::llm_dialogs;
-
-        // Validate input
-        llm_dialogs::validate_input(input)
-            .context("Invalid AskUserQuestion input")?;
-
-        // Use tabbed dialog for multiple questions
-        if input.questions.len() > 1 {
-            // Create tabbed dialog
-            let tabbed_dialog = TabbedDialog::new(
-                input.questions.clone(),
-                None, // No title for now
-            );
-
-            // Show tabbed dialog and wait for result
-            let result = self.show_tabbed_dialog(tabbed_dialog)
-                .context("Failed to show tabbed dialog")?;
-
-            // Check for cancellation
-            match result {
-                TabbedDialogResult::Completed(answers) => {
-                    Ok(crate::cli::AskUserQuestionOutput {
-                        questions: input.questions.clone(),
-                        answers,
-                    })
-                }
-                TabbedDialogResult::Cancelled => {
-                    anyhow::bail!("User cancelled dialog")
-                }
-            }
-        } else {
-            // Single question: use regular dialog (fallback)
-            use std::collections::HashMap;
-            let mut answers = HashMap::new();
-
-            for question in &input.questions {
-                // Convert to Dialog
-                let dialog = llm_dialogs::question_to_dialog(question);
-
-                // Show dialog and wait for answer
-                let result = self.show_dialog(dialog)
-                    .with_context(|| format!("Failed to show question: {}", question.question))?;
-
-                // Check for cancellation
-                if result.is_cancelled() {
-                    anyhow::bail!("User cancelled dialog");
-                }
-
-                // Extract answer
-                if let Some(answer) = llm_dialogs::extract_answer(question, &result) {
-                    answers.insert(question.question.clone(), answer);
-                } else {
-                    anyhow::bail!("Failed to extract answer from dialog result");
-                }
-            }
-
-            Ok(crate::cli::AskUserQuestionOutput {
-                questions: input.questions.clone(),
-                answers,
-            })
-        }
-    }
-
-    /// Read a line of input from the integrated text area
-    pub fn read_line(&mut self) -> Result<Option<String>> {
-        use crossterm::event::{KeyCode, KeyModifiers};
-
-        loop {
-            // Check for pending output BEFORE rendering
-            let output_mgr = self.output_manager.clone();
-            if output_mgr.has_pending() {
-                self.flush_output_safe(&output_mgr)?;
-            }
-
-            // Render current state
-            self.render()?;
-
-            // Poll for events (100ms timeout)
-            if event::poll(Duration::from_millis(100))? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        match (key.code, key.modifiers) {
-                            (KeyCode::Enter, KeyModifiers::SHIFT) => {
-                                // Shift+Enter: Insert newline (multi-line input)
-                                self.input_textarea.input(Event::Key(key));
-                            }
-                            (KeyCode::Enter, KeyModifiers::NONE) => {
-                                // Enter: Submit input
-                                let lines = self.input_textarea.lines();
-                                let input = lines.join("\n");
-
-                                if input.trim().is_empty() {
-                                    continue; // Don't submit empty input
-                                }
-
-                                // Add to history
-                                self.command_history.push(input.clone());
-                                self.history_index = None;
-
-                                // Clear input immediately before returning
-                                self.input_textarea = Self::create_clean_textarea();
-
-                                // Render once to show cleared input
-                                self.render()?;
-
-                                return Ok(Some(input));
-                            }
-                            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                                // Cancel (Ctrl+C or Esc)
-                                return Ok(None);
-                            }
-                            (KeyCode::Up, KeyModifiers::NONE) => {
-                                // Navigate history backwards
-                                if let Some(idx) = self.history_index {
-                                    if idx > 0 {
-                                        self.history_index = Some(idx - 1);
-                                        let cmd = &self.command_history[idx - 1];
-                                        self.input_textarea = Self::create_clean_textarea_with_text(cmd);
-                                    }
-                                } else if !self.command_history.is_empty() {
-                                    self.history_index = Some(self.command_history.len() - 1);
-                                    let cmd = &self.command_history[self.command_history.len() - 1];
-                                    self.input_textarea = Self::create_clean_textarea_with_text(cmd);
-                                }
-                            }
-                            (KeyCode::Down, KeyModifiers::NONE) => {
-                                // Navigate history forwards
-                                if let Some(idx) = self.history_index {
-                                    if idx < self.command_history.len() - 1 {
-                                        self.history_index = Some(idx + 1);
-                                        let cmd = &self.command_history[idx + 1];
-                                        self.input_textarea = Self::create_clean_textarea_with_text(cmd);
-                                    } else {
-                                        self.history_index = None;
-                                        self.input_textarea = Self::create_clean_textarea();
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Let tui-textarea handle the input
-                                self.input_textarea.input(Event::Key(key));
-                            }
-                        }
-                    }
-                    _ => {
-                        // Mouse events handled by terminal (scrolls terminal buffer)
-                    }
-                }
-            }
-
-            // Check again after polling
-            let output_mgr = self.output_manager.clone();
-            if output_mgr.has_pending() {
-                self.flush_output_safe(&output_mgr)?;
-            }
-        }
-    }
-
-    /// Non-blocking input poll - shows typing to user without blocking
-    /// Returns true if events were processed
-    pub fn poll_input(&mut self) -> Result<bool> {
-        use crossterm::event;
-
-        let mut had_events = false;
-
-        // Poll with very short timeout (10ms)
-        while event::poll(std::time::Duration::from_millis(10))? {
-            if let Ok(event_data) = event::read() {
-                // Update textarea with keystrokes
-                self.input_textarea.input(event_data);
-                had_events = true;
-
-                // Render to show typing immediately
-                self.render()?;
-            }
-        }
-
-        Ok(had_events)
-    }
-
-    /// Shutdown the TUI and restore terminal state
-    pub fn shutdown(mut self) -> Result<()> {
-        if self.is_active {
-            // Re-enable direct stdout writes for non-TUI mode
-            self.output_manager.disable_buffering();
-            self.output_manager.enable_stdout();
-
-            let mut stdout = io::stdout();
-
-            // Clear the inline viewport area and restore cursor
-            // Move to column 0, clear from cursor down, show cursor, add newline
-            execute!(
-                stdout,
-                cursor::MoveToColumn(0),
-                Clear(ClearType::FromCursorDown),
-                cursor::Show
-            ).context("Failed to clear terminal")?;
-
-            // Add newline to move past cleared area
-            writeln!(stdout).context("Failed to write newline")?;
-
-            stdout.flush().context("Failed to flush stdout")?;
-
-            // Save command history to disk
-            if let Err(e) = self.save_history() {
-                eprintln!("Warning: Failed to save command history: {}", e);
-            }
-
-            // Disable keyboard enhancement flags
-            execute!(stdout, PopKeyboardEnhancementFlags)
-                .context("Failed to disable keyboard enhancements")?;
-
-            // Disable raw mode
-            disable_raw_mode().context("Failed to disable raw mode")?;
-
-            self.is_active = false;
-        }
-        Ok(())
-    }
-
-    /// Full refresh of viewport using shadow buffer
-    /// Renders all messages to shadow buffer, then updates terminal
-    fn full_refresh_viewport(&mut self) -> Result<()> {
-        use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-        use crossterm::style::Print;
-
-        // Get terminal size
-        let (_term_width, term_height) = crossterm::terminal::size()?;
-
-        // Calculate visible scrollback area (above inline viewport)
-        let visible_rows = term_height.saturating_sub(self.current_inline_viewport_size);
-
-        if visible_rows == 0 {
-            return Ok(()); // Terminal too small
-        }
-
-        // Render all messages to shadow buffer (with proper wrapping)
-        let all_messages = self.scrollback.get_visible_messages();
-        self.shadow_buffer.render_messages(&all_messages, &self.colors);
-
-        // Clear terminal and render entire shadow buffer
-        let mut stdout = io::stdout();
-        execute_with_retry(BeginSynchronizedUpdate)?;
-
-        // Clear the entire visible area
-        for row in 0..visible_rows {
-            execute!(
-                stdout,
-                cursor::MoveTo(0, row),
-                Clear(ClearType::UntilNewLine)
-            )?;
-        }
-
-        // Render shadow buffer to terminal (row by row for efficiency)
-        for y in 0..self.shadow_buffer.height {
-            let mut line_content = String::new();
-            for x in 0..self.shadow_buffer.width {
-                if let Some(cell) = self.shadow_buffer.get(x, y) {
-                    line_content.push(cell.ch);
-                }
-            }
-
-            // Write entire line at once (already cleared above)
-            if !line_content.trim().is_empty() {
-                execute!(
-                    stdout,
-                    cursor::MoveTo(0, y as u16),
-                    Print(line_content)
-                )?;
-            }
-        }
-
-        execute_with_retry(EndSynchronizedUpdate)?;
-        stdout.flush()?;
-
-        // Update previous frame buffer
-        self.prev_frame_buffer = self.shadow_buffer.clone_buffer();
-
-        Ok(())
-    }
-
-    /// Blit only changed cells to visible area using diff-based updates
-    /// More efficient than full_refresh_viewport() for streaming updates
-    fn blit_visible_area(&mut self) -> Result<()> {
-        self.blit_visible_area_internal(true)
-    }
-
-    fn blit_visible_area_internal(&mut self, use_sync: bool) -> Result<()> {
-        use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-        use crossterm::style::Print;
         use std::collections::HashMap;
 
-        // Get terminal size
-        let (_term_width, term_height) = crossterm::terminal::size()?;
-        let visible_rows = term_height.saturating_sub(self.current_inline_viewport_size);
+        let mut answers: HashMap<String, String> = HashMap::new();
 
-        if visible_rows == 0 {
-            return Ok(()); // Terminal too small
-        }
-
-        // Render all visible messages to shadow buffer
-        let all_messages = self.scrollback.get_visible_messages();
-        self.shadow_buffer.render_messages(&all_messages, &self.colors);
-
-        // Diff with previous frame to find changes
-        let changes = diff_buffers(&self.shadow_buffer, &self.prev_frame_buffer);
-
-        if changes.is_empty() {
-            return Ok(()); // No changes to apply
-        }
-
-        // Group changes by row for efficient line-based clearing
-        let mut changes_by_row: HashMap<usize, Vec<(usize, char)>> = HashMap::new();
-
-        for (x, y, cell) in changes {
-            if (y as u16) < visible_rows {
-                changes_by_row.entry(y).or_insert_with(Vec::new).push((x, cell.ch));
+        for question in &input.questions {
+            let dialog  = llm_dialogs::question_to_dialog(question);
+            let result  = self.show_dialog(dialog)?;
+            if let Some(answer) = llm_dialogs::extract_answer(question, &result) {
+                answers.insert(question.question.clone(), answer);
             }
         }
 
-        // Apply changes to terminal
-        let mut stdout = io::stdout();
-        if use_sync {
-            execute_with_retry(BeginSynchronizedUpdate)?;
-        }
-
-        for (row, _cells) in changes_by_row {
-            // Clear the line first to prevent old chars bleeding through,
-            // then re-position the cursor at the start to write new content.
-            execute!(stdout, cursor::MoveTo(0, row as u16), Clear(ClearType::UntilNewLine))?;
-            execute!(stdout, cursor::MoveTo(0, row as u16))?;
-
-            use crossterm::style::{SetBackgroundColor, SetForegroundColor, ResetColor};
-
-            let mut current_style = ratatui::style::Style::default();
-
-            // Write entire row with styles (overwrites previous content)
-            for x in 0..self.shadow_buffer.width {
-                if let Some(cell) = self.shadow_buffer.get(x, row) {
-                    // Apply style changes if needed
-                    if cell.style != current_style {
-                        // Reset colors first if transitioning away from styled cell
-                        if current_style != ratatui::style::Style::default() {
-                            execute!(stdout, ResetColor)?;
-                        }
-
-                        // Convert ratatui colors to crossterm colors
-                        if let Some(bg) = cell.style.bg {
-                            let crossterm_color = ratatui_to_crossterm_color(bg);
-                            execute!(stdout, SetBackgroundColor(crossterm_color))?;
-                        }
-                        if let Some(fg) = cell.style.fg {
-                            let crossterm_color = ratatui_to_crossterm_color(fg);
-                            execute!(stdout, SetForegroundColor(crossterm_color))?;
-                        }
-                        current_style = cell.style;
-                    }
-                    execute!(stdout, Print(cell.ch))?;
-                }
-            }
-
-            // Reset colors at end of line
-            execute!(stdout, ResetColor)?;
-        }
-
-        if use_sync {
-            execute_with_retry(EndSynchronizedUpdate)?;
-        }
-        stdout.flush()?;
-
-        // Update previous frame buffer
-        self.prev_frame_buffer = self.shadow_buffer.clone_buffer();
-
-        Ok(())
-    }
-
-    // Old approach (kept for reference, commented out):
-    // fn full_refresh_viewport_old(&mut self) -> Result<()> {
-    //     use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-    //     use crossterm::style::Print;
-    //
-    //     let mut stdout = io::stdout();
-    //
-    //     // Get lines to render from ring buffer
-    //     let viewport_lines = self.scrollback.get_viewport_lines();
-    //
-    //     if viewport_lines.is_empty() {
-    //         return Ok(()); // Nothing to render
-    //     }
-    //
-    //     // Synchronized update for tear-free rendering
-    //     execute!(stdout, BeginSynchronizedUpdate)?;
-    //
-    //     // Render each line in viewport
-    //     for (line_idx, (message_id, line_offset)) in viewport_lines.iter().enumerate() {
-    //         let row = line_idx as u16;
-    //
-    //         // Get message from scrollback
-    //         if let Some(message) = self.scrollback.get_message(*message_id) {
-    //             // Extract specific line from formatted message
-    //             let formatted = message.format();
-    //             let line_content = formatted
-    //                 .lines()
-    //                 .nth(*line_offset)
-    //                 .unwrap_or("");
-    //
-    //             // Move cursor, clear line, write content
-    //             execute!(
-    //                 stdout,
-    //                 cursor::MoveTo(0, row),
-    //                 Clear(ClearType::UntilNewLine),
-    //                 Print(line_content)
-    //             )?;
-    //         } else {
-    //             // Message not found, clear line
-    //             execute!(
-    //                 stdout,
-    //                 cursor::MoveTo(0, row),
-    //                 Clear(ClearType::UntilNewLine)
-    //             )?;
-    //         }
-    //     }
-    //
-    //     execute!(stdout, EndSynchronizedUpdate)?;
-    //     stdout.flush()?;
-    //
-    //     Ok(())
-    // }
-
-    /// Update a streaming message (mark for refresh)
-    // NOTE: With trait-based messages, updates happen directly through Arc<RwLock<>>
-    // Example:
-    //   let msg = Arc::new(StreamingResponseMessage::new());
-    //   self.add_trait_message(msg.clone());
-    //   msg.append_chunk("more text");  // Updates automatically
-    //   msg.set_complete();
-    //
-    // The TUI will see the changes on next render cycle.
-
-    /// Trigger a full refresh of the viewport (for reactive message updates)
-    pub fn trigger_refresh(&mut self) {
-        self.needs_full_refresh = true;
-    }
-
-    /// Check if full refresh is needed and perform it
-    /// Blit overwrites visible area with current shadow buffer state
-    pub fn check_and_refresh(&mut self) -> Result<()> {
-        if self.needs_full_refresh {
-            // Render current shadow buffer to visible area (overwrites existing content)
-            self.full_refresh_viewport()?;
-            self.needs_full_refresh = false;
-        }
-
-        Ok(())
-    }
-
-    /// Handle terminal resize event
-    pub fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
-        // Update viewport dimensions
-        let new_viewport_height = calculate_viewport_height((width, height));
-        self.viewport_height = new_viewport_height;
-        self.scrollback.update_viewport(new_viewport_height, width as usize);
-
-        // Resize shadow buffers
-        let visible_rows = height.saturating_sub(6) as usize; // -6 for inline viewport
-        self.shadow_buffer.resize(width as usize, visible_rows);
-        self.prev_frame_buffer.resize(width as usize, visible_rows);
-
-        // Rebuild ring buffer with new line counts
-        self.scrollback.rebuild_ring_buffer();
-
-        // Force full refresh after resize
-        self.needs_full_refresh = true;
-
-        Ok(())
-    }
-
-    /// Append a complete message to terminal scrollback
-    // NOTE: The following methods are commented out during trait migration.
-    // With the trait-based system, messages are added via add_trait_message()
-    // and updated directly through Arc<RwLock<>>.
-    //
-    // pub fn append_message_to_scrollback(&mut self, message: &MessageRef) -> Result<()> { ... }
-    // pub fn add_user_query(&mut self, query: String) -> Result<MessageId> { ... }
-    // pub fn add_claude_response(&mut self, initial_content: String) -> MessageId { ... }
-    // pub fn complete_claude_response(&mut self, message_id: MessageId) -> Result<()> { ... }
-
-    /// Show dialog at bottom with scrollback context above
-    pub fn show_centered_dialog(&mut self, dialog: Dialog) -> Result<()> {
-        // Calculate how many extra lines we need for scrollback context
-        let num_options = match &dialog.dialog_type {
-            DType::Select { options, .. } => options.len(),
-            DType::MultiSelect { options, .. } => options.len(),
-            DType::Confirm { .. } => 2, // Yes/No
-            DType::TextInput { .. } => 1, // Single input line
-        };
-        let dialog_height = num_options + 4; // title + options + help + borders
-        let status_height = 4;
-        let separator_height = 1;
-        let scrollback_context_lines = 10; // Show last 10 lines of scrollback
-
-        let total_needed = scrollback_context_lines + separator_height + dialog_height + status_height;
-        let current_viewport = 6; // Our inline viewport size
-
-        // If we need more space, insert blank lines to push viewport down
-        if total_needed > current_viewport {
-            let extra_lines = (total_needed - current_viewport) as u16;
-
-            // Insert blank lines using insert_before to expand visible area
-            self.terminal.insert_before(extra_lines, |buf| {
-                // Render recent scrollback in these blank lines
-                let scrollback_messages = self.scrollback.get_visible_messages();
-                let context_lines: Vec<Line> = scrollback_messages
-                    .iter()
-                    .rev()
-                    .take(extra_lines as usize)
-                    .rev()
-                    .flat_map(|msg| {
-                        let formatted = msg.format(&self.colors);
-                        formatted.lines().map(|line| Line::raw(line.to_string())).collect::<Vec<_>>()
-                    })
-                    .collect();
-
-                let scrollback_paragraph = Paragraph::new(context_lines);
-                scrollback_paragraph.render(buf.area, buf);
-            })?;
-        }
-
-        // Store dialog
-        self.active_dialog = Some(dialog);
-
-        // Render dialog
-        self.render()?;
-
-        Ok(())
-    }
-
-    /// Hide dialog and return to normal mode
-    pub fn hide_dialog(&mut self) -> Result<()> {
-        // Clear dialog
-        self.active_dialog = None;
-
-        // Re-render TUI (will show normal mode now)
-        self.render()?;
-
-        Ok(())
+        Ok(crate::cli::AskUserQuestionOutput {
+            questions: input.questions.clone(),
+            answers,
+        })
     }
 }
 
-impl Drop for TuiRenderer {
-    fn drop(&mut self) {
-        // Ensure terminal is restored on drop
-        if self.is_active {
-            let mut stdout = io::stdout();
+// ─── History persistence ──────────────────────────────────────────────────────
 
-            // Save command history (best effort)
-            let _ = self.save_history();
+impl TuiRenderer {
+    fn history_path() -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|h| h.join(".finch").join("history"))
+    }
 
-            // Show cursor
-            let _ = execute!(stdout, cursor::Show);
-            let _ = stdout.flush();
+    fn load_history() -> Vec<String> {
+        let path = match Self::history_path() {
+            Some(p) => p,
+            None    => return Vec::new(),
+        };
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .take(1000)
+            .map(|l| l.to_string())
+            .collect()
+    }
 
-            // Disable keyboard enhancements
-            let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    fn save_history(history: &[String]) {
+        let path = match Self::history_path() {
+            Some(p) => p,
+            None    => return,
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content: String = history
+            .iter()
+            .rev()
+            .take(1000)
+            .rev()
+            .map(|l| format!("{}\n", l))
+            .collect();
+        let _ = std::fs::write(path, content);
+    }
+}
 
-            // Disable raw mode
-            let _ = disable_raw_mode();
+// ─── Text wrapping ────────────────────────────────────────────────────────────
 
-            self.is_active = false;
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in para.split_whitespace() {
+            if cur.is_empty() {
+                cur.push_str(word);
+            } else if cur.len() + 1 + word.len() <= width {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                out.push(cur.clone());
+                cur = word.to_string();
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
         }
     }
+    out
 }
