@@ -122,4 +122,60 @@ mod tests {
         assert_eq!(id.short_id(), "550e8400");
         assert_eq!(id.short_id().len(), 8);
     }
+
+    #[test]
+    fn test_device_uuid_is_deterministic() {
+        // Same fingerprint must always produce the same UUID
+        let u1 = NodeIdentity::device_uuid("my-laptop");
+        let u2 = NodeIdentity::device_uuid("my-laptop");
+        assert_eq!(u1, u2);
+    }
+
+    #[test]
+    fn test_device_uuid_differs_for_different_fingerprints() {
+        let u1 = NodeIdentity::device_uuid("machine-a");
+        let u2 = NodeIdentity::device_uuid("machine-b");
+        assert_ne!(u1, u2);
+    }
+
+    #[test]
+    fn test_device_uuid_is_v5() {
+        let u = NodeIdentity::device_uuid("any-host");
+        // UUID v5 has version nibble = 5
+        assert_eq!(u.get_version_num(), 5);
+    }
+
+    #[test]
+    fn test_short_id_is_always_8_chars() {
+        let id = NodeIdentity {
+            id: NodeIdentity::device_uuid("some-host"),
+            name: "n".to_string(),
+            version: "0.1.0".to_string(),
+        };
+        assert_eq!(id.short_id().len(), 8);
+    }
+
+    #[test]
+    fn test_identity_version_preserved_in_roundtrip() {
+        let original = NodeIdentity {
+            id: Uuid::new_v4(),
+            name: "x".to_string(),
+            version: "1.2.3".to_string(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: NodeIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, "1.2.3");
+    }
+
+    #[test]
+    fn test_identity_name_preserved_in_roundtrip() {
+        let original = NodeIdentity {
+            id: Uuid::new_v4(),
+            name: "my-dev-machine".to_string(),
+            version: "0.5.0".to_string(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: NodeIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "my-dev-machine");
+    }
 }

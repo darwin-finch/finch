@@ -579,4 +579,275 @@ mod tests {
         assert_eq!(result, Some(DialogResult::Cancelled));
         assert!(result.unwrap().is_cancelled());
     }
+
+    // ─── select navigation wrapping ──────────────────────────────────────────
+
+    #[test]
+    fn test_select_up_at_top_stays_at_zero() {
+        let mut dialog = Dialog::select("T", vec![DialogOption::new("A"), DialogOption::new("B")]);
+        // Already at 0, pressing up should not underflow
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Up));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::Selected(0)));
+    }
+
+    #[test]
+    fn test_select_down_at_bottom_stays() {
+        let mut dialog = Dialog::select("T", vec![DialogOption::new("A"), DialogOption::new("B")]);
+        // Move past the end — should cap at last index
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::Selected(1)));
+    }
+
+    #[test]
+    fn test_select_vim_keys_j_and_k() {
+        let mut dialog = Dialog::select("T", vec![
+            DialogOption::new("A"),
+            DialogOption::new("B"),
+            DialogOption::new("C"),
+        ]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('j')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('j')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('k')));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::Selected(1)));
+    }
+
+    #[test]
+    fn test_select_number_zero_is_ignored() {
+        let mut dialog = Dialog::select("T", vec![DialogOption::new("A")]);
+        // '0' is out of range for 1-indexed selection
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('0')));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_select_number_out_of_range_ignored() {
+        let mut dialog = Dialog::select("T", vec![DialogOption::new("A")]);
+        // '9' > options.len() (1) — should be ignored
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('9')));
+        assert!(result.is_none());
+    }
+
+    // ─── multiselect ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_multiselect_empty_confirm() {
+        let mut dialog = Dialog::multiselect("T", vec![DialogOption::new("A")]);
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::MultiSelected(vec![])));
+    }
+
+    #[test]
+    fn test_multiselect_toggle_deselect() {
+        let mut dialog = Dialog::multiselect("T", vec![DialogOption::new("A")]);
+        // Select then deselect
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::MultiSelected(vec![])));
+    }
+
+    #[test]
+    fn test_multiselect_result_is_sorted() {
+        let mut dialog = Dialog::multiselect("T", vec![
+            DialogOption::new("A"),
+            DialogOption::new("B"),
+            DialogOption::new("C"),
+        ]);
+        // Select C then B (reverse order)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' '))); // select C (index 2)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('k'))); // move up to B
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' '))); // select B (index 1)
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        if let Some(DialogResult::MultiSelected(indices)) = result {
+            // Result must be sorted ascending
+            assert_eq!(indices, vec![1, 2]);
+        } else {
+            panic!("Expected MultiSelected");
+        }
+    }
+
+    #[test]
+    fn test_multiselect_cancel() {
+        let mut dialog = Dialog::multiselect("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(result, Some(DialogResult::Cancelled));
+    }
+
+    // ─── text input editing ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_text_input_left_right_cursor() {
+        let mut dialog = Dialog::text_input("T", Some("ab".to_string()));
+        // Cursor at end (2). Move left twice, then type 'X'
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Left));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Left));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('X')));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::TextEntered("Xab".to_string())));
+    }
+
+    #[test]
+    fn test_text_input_delete_key() {
+        let mut dialog = Dialog::text_input("T", Some("abc".to_string()));
+        // Cursor at end. Move to position 1, press Delete to remove 'b'
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Home));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Right));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Delete));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::TextEntered("ac".to_string())));
+    }
+
+    #[test]
+    fn test_text_input_home_end() {
+        let mut dialog = Dialog::text_input("T", Some("hello".to_string()));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Home));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('!')));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::TextEntered("!hello".to_string())));
+    }
+
+    #[test]
+    fn test_text_input_backspace_at_start_noop() {
+        let mut dialog = Dialog::text_input("T", None);
+        // Already empty, backspace should be a no-op
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::TextEntered("".to_string())));
+    }
+
+    #[test]
+    fn test_text_input_cursor_cant_go_past_end() {
+        let mut dialog = Dialog::text_input("T", Some("ab".to_string()));
+        // Press right multiple times past end
+        for _ in 0..5 {
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Right));
+        }
+        // Should still produce "ab" without panic
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::TextEntered("ab".to_string())));
+    }
+
+    // ─── confirm dialog ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_confirm_yes_key() {
+        let mut dialog = Dialog::confirm("Sure?", false);
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(result, Some(DialogResult::Confirmed(true)));
+    }
+
+    #[test]
+    fn test_confirm_uppercase_y() {
+        let mut dialog = Dialog::confirm("Sure?", false);
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('Y')));
+        assert_eq!(result, Some(DialogResult::Confirmed(true)));
+    }
+
+    #[test]
+    fn test_confirm_enter_uses_current_selected() {
+        let mut dialog = Dialog::confirm("Sure?", true);
+        // Default is true; press Enter immediately
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::Confirmed(true)));
+    }
+
+    #[test]
+    fn test_confirm_right_key_toggles() {
+        let mut dialog = Dialog::confirm("Sure?", true);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Right));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::Confirmed(false)));
+    }
+
+    // ─── DialogResult helpers ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_dialog_result_ok_or_cancelled_err_on_cancel() {
+        let result = DialogResult::Cancelled;
+        assert!(result.ok_or_cancelled().is_err());
+    }
+
+    #[test]
+    fn test_dialog_result_ok_or_cancelled_ok_on_select() {
+        let result = DialogResult::Selected(0);
+        assert!(result.ok_or_cancelled().is_ok());
+    }
+
+    #[test]
+    fn test_dialog_result_is_cancelled_false_for_others() {
+        assert!(!DialogResult::Selected(0).is_cancelled());
+        assert!(!DialogResult::Confirmed(true).is_cancelled());
+        assert!(!DialogResult::TextEntered("x".to_string()).is_cancelled());
+        assert!(!DialogResult::MultiSelected(vec![]).is_cancelled());
+        assert!(!DialogResult::CustomText("x".to_string()).is_cancelled());
+    }
+
+    // ─── custom text mode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_custom_text_mode_activation() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(dialog.custom_mode_active);
+    }
+
+    #[test]
+    fn test_custom_text_mode_input_and_submit() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        for c in "myvalue".chars() {
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::CustomText("myvalue".to_string())));
+    }
+
+    #[test]
+    fn test_custom_text_mode_esc_exits_mode() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(dialog.custom_mode_active);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        assert!(!dialog.custom_mode_active);
+    }
+
+    #[test]
+    fn test_custom_text_empty_does_not_submit() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        // Press enter with empty custom input — should not submit
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_normal_select_ignores_o_without_allow_custom() {
+        let mut dialog = Dialog::select("T", vec![DialogOption::new("A")]);
+        // 'o' key with allow_custom=false should not activate custom mode
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(!dialog.custom_mode_active);
+    }
+
+    // ─── help message ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dialog_with_help_message() {
+        let dialog = Dialog::select("T", vec![DialogOption::new("A")])
+            .with_help("Press Enter to confirm");
+        assert_eq!(dialog.help_message.as_deref(), Some("Press Enter to confirm"));
+    }
+
+    #[test]
+    fn test_dialog_no_help_message_by_default() {
+        let dialog = Dialog::select("T", vec![DialogOption::new("A")]);
+        assert!(dialog.help_message.is_none());
+    }
 }

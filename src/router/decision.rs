@@ -212,4 +212,51 @@ mod tests {
         let stats = loaded_router.stats();
         assert_eq!(stats.total_queries, 2);
     }
+
+    #[test]
+    fn test_all_forward_reasons_have_unique_strings() {
+        let reasons = [
+            ForwardReason::NoMatch.as_str(),
+            ForwardReason::LowConfidence.as_str(),
+            ForwardReason::ModelNotReady.as_str(),
+        ];
+        // All reason strings are non-empty and distinct
+        assert!(reasons.iter().all(|s| !s.is_empty()));
+        let unique: std::collections::HashSet<_> = reasons.iter().collect();
+        assert_eq!(unique.len(), reasons.len());
+    }
+
+    #[test]
+    fn test_multiple_local_attempts_accumulate() {
+        let mut router = make_router();
+        for i in 0..5 {
+            router.learn_local_attempt(&format!("query {}", i), i % 2 == 0);
+        }
+        assert_eq!(router.stats().total_local_attempts, 5);
+        assert_eq!(router.stats().total_queries, 5);
+    }
+
+    #[test]
+    fn test_multiple_forwarded_queries_accumulate() {
+        let mut router = make_router();
+        for i in 0..3 {
+            router.learn_forwarded(&format!("complex query {}", i));
+        }
+        assert_eq!(router.stats().total_queries, 3);
+        assert_eq!(router.stats().total_local_attempts, 0);
+    }
+
+    #[test]
+    fn test_route_decision_debug_format() {
+        let reason = ForwardReason::NoMatch;
+        let debug = format!("{:?}", reason);
+        assert!(!debug.is_empty());
+    }
+
+    #[test]
+    fn test_route_decision_clone() {
+        let reason = ForwardReason::ModelNotReady;
+        let cloned = reason.clone();
+        assert_eq!(cloned.as_str(), reason.as_str());
+    }
 }

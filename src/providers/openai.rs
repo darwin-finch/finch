@@ -650,4 +650,157 @@ mod tests {
         let grok = OpenAIProvider::new_grok("test-key".to_string()).unwrap();
         assert_eq!(grok.name(), "grok");
     }
+
+    #[test]
+    fn test_default_models() {
+        let openai = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        assert!(!openai.default_model().is_empty());
+
+        let grok = OpenAIProvider::new_grok("key".to_string()).unwrap();
+        assert!(grok.default_model().contains("grok"));
+    }
+
+    #[test]
+    fn test_to_openai_request_system_prompt() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::providers::types::ProviderRequest;
+        use crate::claude::types::Message;
+        let req = ProviderRequest::new(vec![Message::user("hello")])
+            .with_system("You are helpful.");
+        let openai_req = provider.to_openai_request(&req);
+        // System message should be first
+        assert!(matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "system"));
+        if let OpenAIMessage::Regular { content, .. } = &openai_req.messages[0] {
+            assert_eq!(content, "You are helpful.");
+        }
+    }
+
+    #[test]
+    fn test_to_openai_request_no_system_prompt() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::providers::types::ProviderRequest;
+        use crate::claude::types::Message;
+        let req = ProviderRequest::new(vec![Message::user("hello")]);
+        let openai_req = provider.to_openai_request(&req);
+        // No system message — first message is user
+        assert!(matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "user"));
+    }
+
+    #[test]
+    fn test_to_openai_request_tool_calls_included() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::providers::types::ProviderRequest;
+        use crate::claude::types::{Message, ContentBlock};
+        let req = ProviderRequest::new(vec![
+            Message::user("run ls"),
+            Message::with_content("assistant", vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+            ]),
+        ]);
+        let openai_req = provider.to_openai_request(&req);
+        // Assistant message should have tool_calls
+        let assistant_msg = openai_req.messages.iter().find(|m| matches!(m, OpenAIMessage::Assistant { .. }));
+        assert!(assistant_msg.is_some());
+        if let Some(OpenAIMessage::Assistant { tool_calls, .. }) = assistant_msg {
+            let calls = tool_calls.as_ref().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].id, "call_1");
+            assert_eq!(calls[0].function.name, "bash");
+        }
+    }
+
+    #[test]
+    fn test_to_openai_request_tool_result_becomes_tool_role() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::providers::types::ProviderRequest;
+        use crate::claude::types::{Message, ContentBlock};
+        let req = ProviderRequest::new(vec![
+            Message::user("run ls"),
+            Message::with_content("assistant", vec![
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ]),
+            Message::with_content("user", vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "file.txt".to_string(),
+                    is_error: None,
+                },
+            ]),
+        ]);
+        let openai_req = provider.to_openai_request(&req);
+        // There should be a "tool" role message
+        let tool_msg = openai_req.messages.iter().find(|m| matches!(m, OpenAIMessage::Tool { .. }));
+        assert!(tool_msg.is_some());
+        if let Some(OpenAIMessage::Tool { tool_call_id, content, .. }) = tool_msg {
+            assert_eq!(tool_call_id, "call_1");
+            assert_eq!(content, "file.txt");
+        }
+    }
+
+    #[test]
+    fn test_empty_tool_result_gets_placeholder() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::providers::types::ProviderRequest;
+        use crate::claude::types::{Message, ContentBlock};
+        let req = ProviderRequest::new(vec![
+            Message::with_content("user", vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: "  ".to_string(), // whitespace-only
+                    is_error: None,
+                },
+            ]),
+        ]);
+        let openai_req = provider.to_openai_request(&req);
+        if let Some(OpenAIMessage::Tool { content, .. }) = openai_req.messages.iter().find(|m| matches!(m, OpenAIMessage::Tool { .. })) {
+            assert_eq!(content, "(no output)");
+        } else {
+            panic!("Expected a tool message");
+        }
+    }
+
+    #[test]
+    fn test_to_openai_request_empty_user_text_skipped() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::providers::types::ProviderRequest;
+        use crate::claude::types::{Message, ContentBlock};
+        // A user message with only whitespace text should not generate a "user" message
+        let req = ProviderRequest::new(vec![
+            Message::with_content("user", vec![
+                ContentBlock::Text { text: "   ".to_string() },
+            ]),
+        ]);
+        let openai_req = provider.to_openai_request(&req);
+        assert!(openai_req.messages.is_empty());
+    }
+
+    #[test]
+    fn test_to_openai_request_uses_fallback_model() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::providers::types::ProviderRequest;
+        // Request with empty model — should fall back to provider default
+        let req = ProviderRequest::new(vec![]);
+        let openai_req = provider.to_openai_request(&req);
+        assert!(!openai_req.model.is_empty());
+    }
+
+    #[test]
+    fn test_provider_supports_streaming() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        assert!(provider.supports_streaming());
+    }
+
+    #[test]
+    fn test_provider_supports_tools() {
+        let provider = OpenAIProvider::new_grok("key".to_string()).unwrap();
+        assert!(provider.supports_tools());
+    }
 }

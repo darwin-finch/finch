@@ -401,4 +401,168 @@ mod tests {
         assert_eq!(changes[0].1, 0); // y
         assert_eq!(changes[0].2.ch, 'x');
     }
+
+    // ─── visible_length edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn test_visible_length_with_bold_and_color() {
+        // Bold + color code + text + reset
+        let s = "\x1b[1m\x1b[32mbold green\x1b[0m";
+        assert_eq!(visible_length(s), 10); // "bold green"
+    }
+
+    #[test]
+    fn test_visible_length_with_cursor_movement_codes() {
+        // Cursor-movement CSI sequences should be zero-width
+        let s = "\x1b[2Jhello\x1b[H"; // clear-screen + text + home
+        assert_eq!(visible_length(s), 5);
+    }
+
+    #[test]
+    fn test_visible_length_carriage_return_excluded() {
+        let s = "hello\rworld";
+        // \r doesn't add to visible length
+        assert_eq!(visible_length(s), 10);
+    }
+
+    #[test]
+    fn test_visible_length_pure_ansi() {
+        let s = "\x1b[0m\x1b[1m\x1b[32m";
+        assert_eq!(visible_length(s), 0);
+    }
+
+    #[test]
+    fn test_visible_length_unicode_counts_chars() {
+        // Each Unicode character counts as 1 (codepoint, not byte)
+        assert_eq!(visible_length("café"), 4);
+        assert_eq!(visible_length("🦀"), 1);
+    }
+
+    // ─── extract_visible_chars ───────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_visible_chars_empty() {
+        let (chars, positions) = extract_visible_chars("");
+        assert!(chars.is_empty());
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_extract_visible_chars_ansi_only() {
+        let (chars, positions) = extract_visible_chars("\x1b[31m\x1b[0m");
+        assert!(chars.is_empty());
+        assert!(!positions.is_empty()); // ansi positions recorded
+    }
+
+    #[test]
+    fn test_extract_visible_chars_preserves_order() {
+        let (chars, _) = extract_visible_chars("\x1b[1ma\x1b[0mb\x1b[1mc");
+        assert_eq!(chars, vec!['a', 'b', 'c']);
+    }
+
+    // ─── ShadowBuffer ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_shadow_buffer_new_is_all_spaces() {
+        let buf = ShadowBuffer::new(5, 3);
+        for y in 0..3 {
+            for x in 0..5 {
+                assert_eq!(buf.get(x, y).unwrap().ch, ' ');
+            }
+        }
+    }
+
+    #[test]
+    fn test_shadow_buffer_out_of_bounds_returns_none() {
+        let buf = ShadowBuffer::new(5, 3);
+        assert!(buf.get(5, 0).is_none()); // x == width
+        assert!(buf.get(0, 3).is_none()); // y == height
+    }
+
+    #[test]
+    fn test_shadow_buffer_clear_resets_to_spaces() {
+        let mut buf = ShadowBuffer::new(5, 3);
+        buf.write_line(0, "hello", Style::default());
+        buf.clear();
+        assert_eq!(buf.get(0, 0).unwrap().ch, ' ');
+        assert_eq!(buf.get(4, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn test_shadow_buffer_set_and_get() {
+        let mut buf = ShadowBuffer::new(5, 3);
+        buf.set(2, 1, Cell::new('Z'));
+        assert_eq!(buf.get(2, 1).unwrap().ch, 'Z');
+    }
+
+    #[test]
+    fn test_shadow_buffer_resize_clears_content() {
+        let mut buf = ShadowBuffer::new(5, 3);
+        buf.write_line(0, "hello", Style::default());
+        buf.resize(10, 6);
+        assert_eq!(buf.width, 10);
+        assert_eq!(buf.height, 6);
+        // After resize everything is empty
+        assert_eq!(buf.get(0, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn test_shadow_buffer_write_line_wraps_correctly() {
+        let mut buf = ShadowBuffer::new(5, 10);
+        let rows = buf.write_line(0, "abcdefghij", Style::default()); // 10 chars, width 5
+        assert_eq!(rows, 2);
+        assert_eq!(buf.get(0, 0).unwrap().ch, 'a');
+        assert_eq!(buf.get(4, 0).unwrap().ch, 'e');
+        assert_eq!(buf.get(0, 1).unwrap().ch, 'f');
+        assert_eq!(buf.get(4, 1).unwrap().ch, 'j');
+    }
+
+    #[test]
+    fn test_shadow_buffer_write_ansi_line_strips_codes() {
+        let mut buf = ShadowBuffer::new(10, 5);
+        // "red" with ANSI color code — should write 3 visible chars
+        let rows = buf.write_line(0, "\x1b[31mred\x1b[0m", Style::default());
+        assert_eq!(rows, 1);
+        assert_eq!(buf.get(0, 0).unwrap().ch, 'r');
+        assert_eq!(buf.get(2, 0).unwrap().ch, 'd');
+    }
+
+    #[test]
+    fn test_shadow_buffer_clone_is_independent() {
+        let mut buf = ShadowBuffer::new(5, 3);
+        buf.write_line(0, "hello", Style::default());
+        let clone = buf.clone_buffer();
+        buf.clear();
+        // Clone should still have 'h'
+        assert_eq!(clone.get(0, 0).unwrap().ch, 'h');
+    }
+
+    // ─── diff_buffers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_diff_identical_buffers_no_changes() {
+        let buf = ShadowBuffer::new(5, 3);
+        let clone = buf.clone_buffer();
+        assert_eq!(diff_buffers(&buf, &clone).len(), 0);
+    }
+
+    #[test]
+    fn test_diff_dimension_mismatch_returns_all_cells() {
+        let buf5x3 = ShadowBuffer::new(5, 3);
+        let buf3x2 = ShadowBuffer::new(3, 2);
+        let changes = diff_buffers(&buf5x3, &buf3x2);
+        // When dimensions differ, all cells of current buffer returned
+        assert_eq!(changes.len(), 5 * 3);
+    }
+
+    #[test]
+    fn test_diff_multiple_changed_cells() {
+        let mut current = ShadowBuffer::new(5, 3);
+        let prev = ShadowBuffer::new(5, 3);
+        current.set(0, 0, Cell::new('A'));
+        current.set(1, 0, Cell::new('B'));
+        current.set(2, 2, Cell::new('C'));
+        let changes = diff_buffers(&current, &prev);
+        assert_eq!(changes.len(), 3);
+    }
 }
