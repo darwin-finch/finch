@@ -654,6 +654,104 @@ mod tests {
         assert_eq!(fmt_tokens(9900), "9.9k");
     }
 
+    // ── Timing (elapsed_at_finish) ───────────────────────────────────────────
+
+    #[test]
+    fn test_set_complete_captures_elapsed() {
+        let wu = WorkUnit::new("X");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        wu.set_complete();
+        let inner = wu.inner.read().unwrap();
+        assert!(
+            inner.elapsed_at_finish.is_some(),
+            "elapsed_at_finish should be set after set_complete"
+        );
+        assert!(
+            inner.elapsed_at_finish.unwrap().as_millis() >= 5,
+            "elapsed should be at least 5ms"
+        );
+    }
+
+    #[test]
+    fn test_set_failed_captures_elapsed() {
+        let wu = WorkUnit::new("X");
+        wu.set_failed();
+        let inner = wu.inner.read().unwrap();
+        assert!(inner.elapsed_at_finish.is_some());
+    }
+
+    #[test]
+    fn test_complete_row_captures_elapsed() {
+        let wu = WorkUnit::new("X");
+        let idx = wu.add_row("bash(sleep 0)");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        wu.complete_row(idx, "ok");
+        let inner = wu.inner.read().unwrap();
+        assert!(
+            inner.rows[0].elapsed_at_finish.is_some(),
+            "row elapsed should be captured at complete_row"
+        );
+    }
+
+    #[test]
+    fn test_fail_row_captures_elapsed() {
+        let wu = WorkUnit::new("X");
+        let idx = wu.add_row("bash(bad)");
+        wu.fail_row(idx, "error");
+        let inner = wu.inner.read().unwrap();
+        assert!(inner.rows[0].elapsed_at_finish.is_some());
+    }
+
+    #[test]
+    fn test_format_complete_shows_bullet() {
+        let wu = WorkUnit::new("Channeling");
+        wu.set_response("Done.");
+        wu.set_complete();
+        let f = wu.format(&colors());
+        // Complete format always has the bullet
+        assert!(f.contains("⏺"), "complete format should show bullet: {}", f);
+        assert!(f.contains("Done."), "complete format should show response: {}", f);
+    }
+
+    #[test]
+    fn test_format_complete_with_tokens_shows_token_count() {
+        let wu = WorkUnit::new("Channeling");
+        wu.add_tokens("hello world foo"); // 3 tokens
+        wu.set_response("Done.");
+        wu.set_complete();
+        let f = wu.format(&colors());
+        assert!(f.contains("tokens"), "complete format with tokens should say 'tokens': {}", f);
+        assert!(f.contains("3"), "complete format should show token count: {}", f);
+    }
+
+    #[test]
+    fn test_format_complete_row_timing_hidden_under_1s() {
+        // A row that completes in < 1s should NOT show timing like "(0s)"
+        let row = WorkRow {
+            label: "bash(true)".into(),
+            status: WorkRowStatus::Complete("ok".into()),
+            started_at: Instant::now(),
+            elapsed_at_finish: Some(std::time::Duration::from_millis(800)),
+        };
+        let f = format_row(&row);
+        // The label contains "(true)" but timing should NOT appear as "(0s)" pattern
+        assert!(!f.contains("(0s)"), "sub-second row should hide timing: {}", f);
+        assert!(!f.contains("(800"), "sub-second row should hide timing: {}", f);
+    }
+
+    #[test]
+    fn test_format_complete_row_timing_shown_over_1s() {
+        // A row that completes in >= 1s SHOULD show timing
+        let row = WorkRow {
+            label: "bash(slow)".into(),
+            status: WorkRowStatus::Complete("done".into()),
+            started_at: Instant::now(),
+            elapsed_at_finish: Some(std::time::Duration::from_secs(3)),
+        };
+        let f = format_row(&row);
+        assert!(f.contains("3s"), "3-second row should show timing: {}", f);
+    }
+
     // ── Thread safety ────────────────────────────────────────────────────────
 
     #[test]
