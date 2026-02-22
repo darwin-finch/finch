@@ -15,6 +15,7 @@ use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::{spawn_input_task, TuiRenderer};
 use crate::claude::ContentBlock;
+use crate::feedback::{FeedbackEntry, FeedbackLogger, FeedbackRating};
 use crate::generators::{Generator, StreamChunk};
 use crate::local::LocalGenerator;
 use crate::models::bootstrap::GeneratorState;
@@ -105,6 +106,9 @@ pub struct EventLoop {
     /// All tools in one generation turn share the same WorkUnit; each
     /// tool occupies one row identified by its index.
     active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::WorkUnit>, usize)>>>,
+
+    /// Feedback logger — writes rated responses to ~/.finch/feedback.jsonl
+    feedback_logger: Option<FeedbackLogger>,
 }
 
 /// View mode for the REPL
@@ -204,6 +208,7 @@ impl EventLoop {
             memtree_handler,
             view_mode: Arc::new(RwLock::new(ViewMode::List)), // Start in list view
             active_tool_uses: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            feedback_logger: FeedbackLogger::new().ok(),
         }
     }
 
@@ -323,6 +328,22 @@ impl EventLoop {
                         }
                     }
 
+                    // Check for pending feedback (Ctrl+G / Ctrl+B quick rating)
+                    {
+                        let rating = {
+                            let mut tui = self.tui_renderer.lock().await;
+                            tui.pending_feedback.take()
+                        };
+                        if let Some(rating) = rating {
+                            let (weight, label) = match rating {
+                                FeedbackRating::Good => (1.0_f64, "👍 Good"),
+                                FeedbackRating::Bad  => (10.0_f64, "👎 Bad"),
+                            };
+                            self.handle_feedback_command(weight, rating, None).await?;
+                            tracing::debug!("[EVENT_LOOP] Quick feedback recorded: {}", label);
+                        }
+                    }
+
                     // Don't spam logs, but good to know the loop is alive
                     // tracing::debug!("[EVENT_LOOP] Render tick");
                     if let Err(e) = self.render_tui().await {
@@ -439,6 +460,15 @@ impl EventLoop {
                         // Reconnect to all servers
                         self.handle_mcp_reload().await?;
                     }
+                    Command::FeedbackCritical(note) => {
+                        self.handle_feedback_command(10.0, FeedbackRating::Bad, note).await?;
+                    }
+                    Command::FeedbackMedium(note) => {
+                        self.handle_feedback_command(3.0, FeedbackRating::Bad, note).await?;
+                    }
+                    Command::FeedbackGood(note) => {
+                        self.handle_feedback_command(1.0, FeedbackRating::Good, note).await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -506,6 +536,95 @@ impl EventLoop {
         // Spawn query processing task
         self.spawn_query_task(query_id, input).await;
 
+        Ok(())
+    }
+
+    /// Handle feedback commands (/critical, /medium, /good) and Ctrl+G/Ctrl+B quick ratings.
+    ///
+    /// Finds the last user query and assistant response from conversation history,
+    /// logs a `FeedbackEntry` to `~/.finch/feedback.jsonl`, and prints a confirmation.
+    async fn handle_feedback_command(
+        &mut self,
+        weight: f64,
+        rating: FeedbackRating,
+        note: Option<String>,
+    ) -> Result<()> {
+        // Walk conversation history backwards to find last query + response pair
+        let messages = self.conversation.read().await.get_messages();
+
+        let mut last_response = String::new();
+        let mut last_query = String::new();
+
+        // Scan in reverse: find the latest assistant message, then the user message before it
+        let mut found_response = false;
+        for msg in messages.iter().rev() {
+            if !found_response && msg.role == "assistant" {
+                for block in &msg.content {
+                    if let ContentBlock::Text { text } = block {
+                        if !text.trim().is_empty() {
+                            last_response = text.clone();
+                            found_response = true;
+                            break;
+                        }
+                    }
+                }
+            } else if found_response && msg.role == "user" {
+                for block in &msg.content {
+                    if let ContentBlock::Text { text } = block {
+                        if !text.trim().is_empty() {
+                            last_query = text.clone();
+                            break;
+                        }
+                    }
+                }
+                break; // Found the user message preceding the response
+            }
+        }
+
+        if last_response.is_empty() {
+            self.output_manager.write_info(
+                "No recent response to rate. Ask a question first.",
+            );
+            self.render_tui().await?;
+            return Ok(());
+        }
+
+        // Build and log the entry
+        let (emoji, label) = match (weight as u64, &rating) {
+            (10, _) => ("🔴", "critical (10×)"),
+            (3, _)  => ("🟡", "medium (3×)"),
+            _       => ("🟢", "good (1×)"),
+        };
+
+        let mut entry = FeedbackEntry::new(last_query, last_response, rating);
+        entry.weight = weight; // Override to support medium (3×)
+        if let Some(ref n) = note {
+            entry = entry.with_note(n.clone());
+        }
+
+        if let Some(ref logger) = self.feedback_logger {
+            match logger.log(&entry) {
+                Ok(()) => {
+                    let msg = if let Some(n) = &note {
+                        format!("{} Feedback recorded: {} — {}", emoji, label, n)
+                    } else {
+                        format!("{} Feedback recorded: {}", emoji, label)
+                    };
+                    self.output_manager.write_info(msg);
+                }
+                Err(e) => {
+                    self.output_manager.write_info(format!(
+                        "⚠️  Failed to log feedback: {}", e
+                    ));
+                }
+            }
+        } else {
+            self.output_manager.write_info(
+                "⚠️  Feedback logger unavailable (could not open ~/.finch/feedback.jsonl).",
+            );
+        }
+
+        self.render_tui().await?;
         Ok(())
     }
 
