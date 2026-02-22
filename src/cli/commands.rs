@@ -306,7 +306,7 @@ pub fn handle_command(
 pub fn format_help() -> String {
     format!(
         "\x1b[1;36m╔═══════════════════════════════════════════════════════════════════════╗\x1b[0m\n\
-         \x1b[1;36m║\x1b[0m                  \x1b[1;32mShammah Help - Commands & Shortcuts\x1b[0m                  \x1b[1;36m║\x1b[0m\n\
+         \x1b[1;36m║\x1b[0m                   \x1b[1;32mFinch Help - Commands & Shortcuts\x1b[0m                   \x1b[1;36m║\x1b[0m\n\
          \x1b[1;36m╚═══════════════════════════════════════════════════════════════════════╝\x1b[0m\n\n\
          \x1b[1;33m📋 Basic Commands:\x1b[0m\n\
          \x1b[36m  /help\x1b[0m              Show this help message\n\
@@ -378,6 +378,7 @@ pub fn format_help() -> String {
          \x1b[36m  Ctrl+D\x1b[0m             Exit REPL (same as /quit)\n\
          \x1b[36m  Ctrl+G\x1b[0m             Mark last response as \x1b[32mgood\x1b[0m (1x training weight)\n\
          \x1b[36m  Ctrl+B\x1b[0m             Mark last response as \x1b[31mbad\x1b[0m (10x training weight)\n\
+         \x1b[36m  Tab\x1b[0m                Complete /command (accepts ghost text)\n\
          \x1b[36m  Shift+Tab\x1b[0m          Toggle plan mode on/off\n\
          \x1b[36m  Shift+Enter\x1b[0m        Multi-line input (insert newline)\n\
          \x1b[36m  Shift+PgUp\x1b[0m         Scroll up in history\n\

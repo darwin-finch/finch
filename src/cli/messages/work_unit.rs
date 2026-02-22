@@ -45,6 +45,10 @@ pub struct WorkRow {
     /// Pre-formatted label, e.g. "bash(git status)"
     pub label: String,
     pub status: WorkRowStatus,
+    /// When this row started — used for the Running animation
+    started_at: Instant,
+    /// Elapsed time captured at the moment the row completed (not recalculated)
+    elapsed_at_finish: Option<std::time::Duration>,
 }
 
 // ============================================================================
@@ -62,6 +66,8 @@ struct WorkUnitInner {
     rows: Vec<WorkRow>,
     /// Overall status of this unit
     status: MessageStatus,
+    /// Elapsed time captured when the unit completed (stable for scrollback display)
+    elapsed_at_finish: Option<std::time::Duration>,
 }
 
 // ============================================================================
@@ -95,6 +101,7 @@ impl WorkUnit {
                 thinking: false,
                 rows: Vec::new(),
                 status: MessageStatus::InProgress,
+                elapsed_at_finish: None,
             })),
         }
     }
@@ -142,6 +149,8 @@ impl WorkUnit {
         inner.rows.push(WorkRow {
             label: label.into(),
             status: WorkRowStatus::Running,
+            started_at: Instant::now(),
+            elapsed_at_finish: None,
         });
         idx
     }
@@ -150,6 +159,7 @@ impl WorkUnit {
     pub fn complete_row(&self, idx: usize, summary: impl Into<String>) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
+            row.elapsed_at_finish = Some(row.started_at.elapsed());
             row.status = WorkRowStatus::Complete(summary.into());
         }
     }
@@ -158,24 +168,25 @@ impl WorkUnit {
     pub fn fail_row(&self, idx: usize, error: impl Into<String>) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
+            row.elapsed_at_finish = Some(row.started_at.elapsed());
             row.status = WorkRowStatus::Error(error.into());
         }
     }
 
     /// Mark the whole WorkUnit complete (stops animation, shows final content).
     pub fn set_complete(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .status = MessageStatus::Complete;
+        let elapsed = self.started_at.elapsed();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.elapsed_at_finish = Some(elapsed);
+        inner.status = MessageStatus::Complete;
     }
 
     /// Mark the whole WorkUnit failed.
     pub fn set_failed(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .status = MessageStatus::Failed;
+        let elapsed = self.started_at.elapsed();
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        inner.elapsed_at_finish = Some(elapsed);
+        inner.status = MessageStatus::Failed;
     }
 }
 
@@ -223,11 +234,26 @@ impl Message for WorkUnit {
             }
 
             MessageStatus::Complete | MessageStatus::Failed => {
+                // Use captured elapsed (stable), fall back to live elapsed before first commit
+                let secs = inner.elapsed_at_finish
+                    .unwrap_or(elapsed)
+                    .as_secs();
+                let timing = if inner.token_count > 0 {
+                    format!(
+                        " {}({} · {} tokens){}",
+                        GRAY_DIM, fmt_elapsed(secs), fmt_tokens(inner.token_count), RESET
+                    )
+                } else if secs > 0 {
+                    format!(" {}({}){}", GRAY_DIM, fmt_elapsed(secs), RESET)
+                } else {
+                    String::new()
+                };
+
                 // Show final response (bare bullet if no text)
                 let mut out = if inner.response_text.is_empty() {
-                    format!("{}⏺{}", CYAN, RESET)
+                    format!("{}⏺{}{}", CYAN, RESET, timing)
                 } else {
-                    format!("{}⏺{} {}", CYAN, RESET, inner.response_text)
+                    format!("{}⏺{} {}{}", CYAN, RESET, inner.response_text, timing)
                 };
 
                 for row in &inner.rows {
@@ -269,19 +295,28 @@ fn format_row(row: &WorkRow) -> String {
             )
         }
         WorkRowStatus::Complete(summary) => {
+            // Use captured elapsed time (not recalculated) so scrollback timing is stable
+            let timing = row.elapsed_at_finish
+                .filter(|d| d.as_secs() >= 1)
+                .map(|d| format!(" {}({}){}", GRAY_DIM, fmt_elapsed(d.as_secs()), RESET))
+                .unwrap_or_default();
             if summary.is_empty() {
-                format!("  {}⎿{} {}", GRAY, RESET, row.label)
+                format!("  {}⎿{} {}{}", GRAY, RESET, row.label, timing)
             } else {
                 format!(
-                    "  {}⎿{} {} {}{}{}",
-                    GRAY, RESET, row.label, GRAY_DIM, summary, RESET
+                    "  {}⎿{} {} {}{}{}{}",
+                    GRAY, RESET, row.label, GRAY_DIM, summary, RESET, timing
                 )
             }
         }
         WorkRowStatus::Error(err) => {
+            let timing = row.elapsed_at_finish
+                .filter(|d| d.as_secs() >= 1)
+                .map(|d| format!(" {}({}){}", GRAY_DIM, fmt_elapsed(d.as_secs()), RESET))
+                .unwrap_or_default();
             format!(
-                "  {}⎿{} {} {}❌ {}{}",
-                GRAY, RESET, row.label, RED_COLOR, err, RESET
+                "  {}⎿{} {} {}❌ {}{}{}",
+                GRAY, RESET, row.label, RED_COLOR, err, RESET, timing
             )
         }
     }
@@ -537,6 +572,8 @@ mod tests {
         let row = WorkRow {
             label: "bash(echo hi)".into(),
             status: WorkRowStatus::Running,
+            started_at: Instant::now(),
+            elapsed_at_finish: None,
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -549,6 +586,8 @@ mod tests {
         let row = WorkRow {
             label: "read(foo.rs)".into(),
             status: WorkRowStatus::Complete("42 lines".into()),
+            started_at: Instant::now(),
+            elapsed_at_finish: None,
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -561,6 +600,8 @@ mod tests {
         let row = WorkRow {
             label: "bash(true)".into(),
             status: WorkRowStatus::Complete(String::new()),
+            started_at: Instant::now(),
+            elapsed_at_finish: None,
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -574,6 +615,8 @@ mod tests {
         let row = WorkRow {
             label: "bash(bad cmd)".into(),
             status: WorkRowStatus::Error("exit 1".into()),
+            started_at: Instant::now(),
+            elapsed_at_finish: None,
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));

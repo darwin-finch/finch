@@ -300,18 +300,49 @@ impl TuiRenderer {
                 }
             }
 
-            // ── 5. Status line ────────────────────────────────────────────────
-            let status = self.status_bar.get_status();
-            if !status.is_empty() {
-                execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, status, RESET)))?;
-                rows += 1;
+            // ── 4b. Ghost text (dim suffix for command completions) ───────────
+            if let Some(ref ghost) = self.ghost_text {
+                execute!(stdout, Print(format!("{}{}{}", DIM_GRAY, ghost, RESET)))?;
+                // ghost text is on the same row as the last input line — no extra row
             }
+
+            // ── 5. Status line (smart: command hint > live stats > idle hint) ─
+            //
+            // Priority:
+            //   1. While typing a /command with ghost text → show its description
+            //   2. Live stats / operation are set         → show those
+            //   3. Idle (nothing set)                     → show keyboard shortcuts
+            let raw_status = self.status_bar.get_status();
+            let effective_status: String = if let Some(_) = &self.ghost_text {
+                // Compute description for the first matching command
+                let current = self.input_textarea.lines().join("\n");
+                let desc = self.command_registry.match_prefix(&current)
+                    .into_iter()
+                    .next()
+                    .map(|spec| {
+                        if let Some(params) = spec.params {
+                            format!("  {} {} — {}", spec.name, params, spec.description)
+                        } else {
+                            format!("  {} — {}", spec.name, spec.description)
+                        }
+                    })
+                    .unwrap_or_default();
+                if desc.is_empty() { raw_status } else { desc }
+            } else if !raw_status.is_empty() {
+                raw_status
+            } else {
+                // Idle hint — reminds users of the most common shortcuts
+                "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel"
+                    .to_string()
+            };
+
+            execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, effective_status, RESET)))?;
+            rows += 1;
 
             // ── 6. Reposition cursor inside the input area ────────────────────
             let rows_below_cursor = {
                 let input_below = input_line_count.saturating_sub(cursor_row + 1);
-                let status_rows  = if status.is_empty() { 0 } else { 1 };
-                input_below + status_rows
+                input_below + 1 // status line always present now
             };
             if rows_below_cursor > 0 {
                 execute!(stdout, cursor::MoveUp(rows_below_cursor as u16))?;
@@ -409,7 +440,7 @@ impl TuiRenderer {
 impl TuiRenderer {
     pub fn print_startup_header(&mut self, model: &str, cwd: &str) -> Result<()> {
         let w = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let sep = "─".repeat(w.min(60));
+        let sep = "─".repeat(w);
 
         execute!(
             io::stdout(),
@@ -480,8 +511,19 @@ impl TuiRenderer {
                         | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             return Ok(None);
                         }
+                        (KeyCode::Tab, KeyModifiers::NONE) => {
+                            if let Some(ghost) = self.ghost_text.take() {
+                                let current = self.input_textarea.lines().join("\n");
+                                let completed = format!("{}{}", current, ghost);
+                                self.input_textarea = Self::create_clean_textarea_with_text(&completed);
+                            } else {
+                                self.input_textarea.input(Event::Key(key));
+                            }
+                            self.update_ghost_text();
+                        }
                         _ => {
                             self.input_textarea.input(Event::Key(key));
+                            self.update_ghost_text();
                         }
                     },
                     Event::Resize(_, _) => {
