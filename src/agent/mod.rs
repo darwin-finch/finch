@@ -246,7 +246,7 @@ impl AgentLoop {
         for _ in 0..MAX_TURNS {
             let request = MessageRequest {
                 model: model.clone(),
-                max_tokens: 8000,
+                max_tokens: crate::config::constants::DEFAULT_MAX_TOKENS,
                 messages: messages.clone(),
                 system: Some(system.clone()),
                 tools: Some(tool_defs.clone()),

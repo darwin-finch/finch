@@ -11,8 +11,7 @@ use tracing::{debug, info, warn};
 use super::lifecycle::DaemonLifecycle;
 use crate::errors;
 
-/// Default daemon bind address
-const DEFAULT_BIND: &str = "127.0.0.1:11435";
+use crate::config::constants::DEFAULT_DAEMON_ADDR as DEFAULT_BIND;
 
 /// Ensure daemon is running, spawning if necessary
 ///

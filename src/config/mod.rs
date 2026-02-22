@@ -3,6 +3,7 @@
 
 mod backend;
 mod colors;
+pub mod constants;
 mod loader;
 pub mod persona;
 mod settings;

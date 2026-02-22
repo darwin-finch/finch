@@ -1049,4 +1049,125 @@ mod tests {
         assert!(result.contains("["));
         assert!(result.contains("]"));
     }
+
+    // ── LiveToolMessage format state tests ─────────────────────────────────
+
+    #[test]
+    fn test_live_tool_message_inprogress_empty_shows_ellipsis() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = LiveToolMessage::new("⏺ bash(echo hi)");
+        let formatted = msg.format(&colors);
+        // InProgress + empty content → header with trailing "…" on same line
+        assert!(formatted.contains("bash(echo hi)"));
+        assert!(formatted.contains('…'), "expected ellipsis '…' in: {:?}", formatted);
+        // Must NOT contain old spinner symbol
+        assert!(!formatted.contains('⟳'), "unexpected '⟳' in: {:?}", formatted);
+    }
+
+    #[test]
+    fn test_live_tool_message_inprogress_with_content() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = LiveToolMessage::new("⏺ bash(echo hi)");
+        msg.append_line("hello world");
+        let formatted = msg.format(&colors);
+        // InProgress + content → both header and content present
+        assert!(formatted.contains("bash(echo hi)"), "header missing in: {:?}", formatted);
+        assert!(formatted.contains("hello world"), "content missing in: {:?}", formatted);
+    }
+
+    #[test]
+    fn test_live_tool_message_complete_with_output() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = LiveToolMessage::new("⏺ bash(echo hi)");
+        msg.set_content("  ⎿ hello world\n");
+        msg.set_complete();
+        let formatted = msg.format(&colors);
+        // Complete with output → shows output, no spinner
+        assert!(formatted.contains("hello world"), "output missing in: {:?}", formatted);
+        assert!(!formatted.contains('⟳'), "unexpected '⟳' in: {:?}", formatted);
+    }
+
+    #[test]
+    fn test_live_tool_message_complete_no_output() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = LiveToolMessage::new("⏺ bash(true)");
+        msg.set_complete();
+        let formatted = msg.format(&colors);
+        // Complete with no output → just header, no garbage
+        assert!(formatted.contains("bash(true)"), "header missing in: {:?}", formatted);
+        assert!(!formatted.contains('⟳'), "unexpected '⟳' in: {:?}", formatted);
+        // Should not have a bare "…" (that would indicate still InProgress display)
+        assert!(!formatted.contains('…'), "unexpected '…' in complete state: {:?}", formatted);
+    }
+
+    #[test]
+    fn test_live_tool_message_failed_state() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = LiveToolMessage::new("⏺ bash(bad_cmd)");
+        msg.set_content("command not found\n");
+        msg.set_failed();
+        let formatted = msg.format(&colors);
+        assert!(formatted.contains("bash(bad_cmd)"), "header missing in: {:?}", formatted);
+        assert!(formatted.contains("command not found"), "error content missing in: {:?}", formatted);
+    }
+
+    // ── OperationMessage format state tests ────────────────────────────────
+
+    #[test]
+    fn test_operation_message_uses_correct_unicode() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = OperationMessage::new("Generating");
+        let idx = msg.add_row("bash(echo hi)");
+        msg.complete_row(idx, "hi");
+        msg.set_complete();
+        let formatted = msg.format(&colors);
+        // Must use ⏺ (U+23FA), not ● (U+25CF)
+        assert!(formatted.contains('⏺'), "Expected ⏺ (U+23FA), got: {:?}", formatted);
+        assert!(!formatted.contains('●'), "Found old ● (U+25CF) in: {:?}", formatted);
+        // Must use ⎿ (U+23BF), not └ (U+2514)
+        assert!(formatted.contains('⎿'), "Expected ⎿ (U+23BF), got: {:?}", formatted);
+        assert!(!formatted.contains('└'), "Found old └ (U+2514) in: {:?}", formatted);
+    }
+
+    #[test]
+    fn test_operation_message_inprogress_shows_ellipsis() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = OperationMessage::new("Generating");
+        let formatted = msg.format(&colors);
+        // InProgress: header ends with ellipsis
+        assert!(formatted.contains("Generating…"), "expected 'Generating…' in: {:?}", formatted);
+    }
+
+    #[test]
+    fn test_operation_message_complete_no_ellipsis() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = OperationMessage::new("Generating");
+        msg.set_complete();
+        let formatted = msg.format(&colors);
+        // Complete: no trailing ellipsis
+        assert!(!formatted.contains("Generating…"), "unexpected '…' in complete state: {:?}", formatted);
+        assert!(formatted.contains("Generating"), "header missing in: {:?}", formatted);
+    }
+
+    #[test]
+    fn test_operation_message_row_running_shows_ellipsis() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = OperationMessage::new("Generating");
+        msg.add_row("bash(ls)");
+        let formatted = msg.format(&colors);
+        // Running row: label + "…"
+        assert!(formatted.contains("bash(ls)"), "row label missing in: {:?}", formatted);
+        assert!(formatted.contains('⎿'), "expected ⎿ prefix in: {:?}", formatted);
+    }
+
+    #[test]
+    fn test_operation_message_row_error_shows_error() {
+        let colors = crate::config::ColorScheme::default();
+        let msg = OperationMessage::new("Generating");
+        let idx = msg.add_row("bash(bad)");
+        msg.fail_row(idx, "permission denied");
+        let formatted = msg.format(&colors);
+        assert!(formatted.contains("bash(bad)"), "row label missing in: {:?}", formatted);
+        assert!(formatted.contains("permission denied"), "error message missing in: {:?}", formatted);
+    }
 }

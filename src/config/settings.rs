@@ -158,7 +158,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             use_daemon: true, // Enabled by default (daemon-only mode)
-            daemon_address: "127.0.0.1:11435".to_string(), // Port 11435 (11434 is used by Ollama)
+            daemon_address: crate::config::constants::DEFAULT_DAEMON_ADDR.to_string(),
             auto_spawn: true,
             timeout_seconds: 120,
             auto_discover: false, // Disabled by default (use explicit daemon_address)

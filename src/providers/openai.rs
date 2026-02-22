@@ -48,6 +48,56 @@ fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
     format!("API error {}{}: {}", status, hint, msg)
 }
 
+// ─── Streaming tool-call helpers ─────────────────────────────────────────────
+//
+// OpenAI streams tool calls as *fragments* across multiple SSE deltas.
+// We accumulate them into a Vec<(id, name, args_so_far)> and then convert
+// them to ContentBlock::ToolUse when the [DONE] marker arrives.
+
+/// Merge one streaming `OpenAIToolCallDelta` into the accumulator.
+/// The accumulator is indexed by `delta.index` (default 0).
+fn accumulate_tool_call_delta(
+    acc: &mut Vec<(String, String, String)>,
+    delta: &OpenAIToolCallDelta,
+) {
+    let idx = delta.index.unwrap_or(0);
+    while acc.len() <= idx {
+        acc.push((String::new(), String::new(), String::new()));
+    }
+    if let Some(id) = &delta.id {
+        acc[idx].0.push_str(id);
+    }
+    if let Some(func) = &delta.function {
+        if let Some(name) = &func.name {
+            acc[idx].1.push_str(name);
+        }
+        if let Some(args) = &func.arguments {
+            acc[idx].2.push_str(args);
+        }
+    }
+}
+
+/// Convert the final accumulator into `ContentBlock::ToolUse` blocks.
+///
+/// Each entry is `(id, name, json_arguments_string)`.
+/// Invalid JSON in the arguments is replaced with an empty object.
+fn finalize_tool_calls(acc: &[(String, String, String)]) -> Vec<ContentBlock> {
+    acc.iter()
+        .filter(|(id, name, _)| !id.is_empty() || !name.is_empty())
+        .map(|(id, name, args_str)| {
+            let input = serde_json::from_str::<serde_json::Value>(args_str)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            ContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input,
+            }
+        })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// OpenAI API provider
 ///
 /// Supports both OpenAI and Grok APIs (they use the same format).
@@ -382,6 +432,10 @@ impl OpenAIProvider {
             let mut stream = response.bytes_stream();
             let mut buffer = Vec::new();
             let mut accumulated_text = String::new();
+            // Tool call accumulator: indexed by tool_call.index.
+            // Each entry: (call_id, function_name, arguments_so_far).
+            // Converted to ContentBlock::ToolUse when [DONE] arrives.
+            let mut tool_call_acc: Vec<(String, String, String)> = Vec::new();
             #[allow(unused_assignments)]
             let mut done = false;
 
@@ -421,6 +475,20 @@ impl OpenAIProvider {
                                         }
                                     }
 
+                                    // Convert accumulated tool call deltas to ToolUse blocks
+                                    for block in finalize_tool_calls(&tool_call_acc) {
+                                        if let ContentBlock::ToolUse { ref name, ref id, .. } = block {
+                                            tracing::debug!("[STREAM] Sending tool call: {} ({})", name, id);
+                                        }
+                                        if tx
+                                            .send(Ok(StreamChunk::ContentBlockComplete(block)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+
                                     done = true;
                                     break;
                                 }
@@ -439,14 +507,12 @@ impl OpenAIProvider {
                                             }
                                         }
 
-                                        // Check for tool calls in delta
-                                        if let Some(tool_calls) = choice.delta.tool_calls {
-                                            for tool_call in tool_calls {
-                                                if let Some(function) = tool_call.function {
-                                                    // For now, we'll accumulate tool calls and send them complete
-                                                    // A more sophisticated implementation would stream tool arguments
-                                                    tracing::debug!("Tool call: {:?}", function.name);
-                                                }
+                                        // Accumulate tool call deltas — OpenAI sends them piecemeal.
+                                        // Each delta may contain partial id/name/arguments fragments
+                                        // for each tool call (identified by index).
+                                        if let Some(tc_deltas) = choice.delta.tool_calls {
+                                            for tc in tc_deltas {
+                                                accumulate_tool_call_delta(&mut tool_call_acc, &tc);
                                             }
                                         }
                                     }
@@ -824,5 +890,167 @@ mod tests {
     fn test_provider_supports_tools() {
         let provider = OpenAIProvider::new_grok("key".to_string()).unwrap();
         assert!(provider.supports_tools());
+    }
+
+    // ── Streaming tool-call accumulation ─────────────────────────────────────
+
+    #[test]
+    fn test_accumulate_single_complete_delta() {
+        // A single delta that has the full id, name, and arguments.
+        let mut acc: Vec<(String, String, String)> = Vec::new();
+        let delta = OpenAIToolCallDelta {
+            index: Some(0),
+            id: Some("call_abc".to_string()),
+            tool_type: Some("function".to_string()),
+            function: Some(OpenAIFunctionDelta {
+                name: Some("bash".to_string()),
+                arguments: Some(r#"{"command":"echo hi"}"#.to_string()),
+            }),
+        };
+        accumulate_tool_call_delta(&mut acc, &delta);
+        assert_eq!(acc.len(), 1);
+        assert_eq!(acc[0].0, "call_abc");
+        assert_eq!(acc[0].1, "bash");
+        assert_eq!(acc[0].2, r#"{"command":"echo hi"}"#);
+    }
+
+    #[test]
+    fn test_accumulate_fragmented_arguments() {
+        // OpenAI often sends the arguments JSON in multiple fragments.
+        let mut acc: Vec<(String, String, String)> = Vec::new();
+        // First delta: has id and name
+        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
+            index: Some(0),
+            id: Some("call_1".to_string()),
+            tool_type: None,
+            function: Some(OpenAIFunctionDelta {
+                name: Some("read".to_string()),
+                arguments: Some(r#"{"file_"#.to_string()),
+            }),
+        });
+        // Second delta: continues arguments
+        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
+            index: Some(0),
+            id: None,
+            tool_type: None,
+            function: Some(OpenAIFunctionDelta {
+                name: None,
+                arguments: Some(r#"path":"src/main.rs"}"#.to_string()),
+            }),
+        });
+        assert_eq!(acc.len(), 1);
+        assert_eq!(acc[0].0, "call_1");
+        assert_eq!(acc[0].1, "read");
+        assert_eq!(acc[0].2, r#"{"file_path":"src/main.rs"}"#);
+    }
+
+    #[test]
+    fn test_accumulate_multiple_tool_calls() {
+        // Two tool calls with different indices.
+        let mut acc: Vec<(String, String, String)> = Vec::new();
+        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
+            index: Some(0),
+            id: Some("call_0".to_string()),
+            tool_type: None,
+            function: Some(OpenAIFunctionDelta {
+                name: Some("bash".to_string()),
+                arguments: Some(r#"{}"#.to_string()),
+            }),
+        });
+        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
+            index: Some(1),
+            id: Some("call_1".to_string()),
+            tool_type: None,
+            function: Some(OpenAIFunctionDelta {
+                name: Some("read".to_string()),
+                arguments: Some(r#"{"file_path":"x"}"#.to_string()),
+            }),
+        });
+        assert_eq!(acc.len(), 2);
+        assert_eq!(acc[0].1, "bash");
+        assert_eq!(acc[1].1, "read");
+    }
+
+    #[test]
+    fn test_finalize_tool_calls_parses_json() {
+        let acc = vec![
+            ("call_1".to_string(), "bash".to_string(), r#"{"command":"ls"}"#.to_string()),
+        ];
+        let blocks = finalize_tool_calls(&acc);
+        assert_eq!(blocks.len(), 1);
+        if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
+            assert_eq!(id, "call_1");
+            assert_eq!(name, "bash");
+            assert_eq!(input["command"].as_str().unwrap(), "ls");
+        } else {
+            panic!("Expected ToolUse block");
+        }
+    }
+
+    #[test]
+    fn test_finalize_tool_calls_invalid_json_falls_back_to_empty_object() {
+        let acc = vec![
+            ("call_x".to_string(), "glob".to_string(), "NOT_VALID_JSON".to_string()),
+        ];
+        let blocks = finalize_tool_calls(&acc);
+        assert_eq!(blocks.len(), 1);
+        if let crate::claude::types::ContentBlock::ToolUse { input, .. } = &blocks[0] {
+            assert!(input.is_object(), "Invalid JSON should yield empty object");
+        } else {
+            panic!("Expected ToolUse block");
+        }
+    }
+
+    #[test]
+    fn test_finalize_tool_calls_empty_acc() {
+        let acc: Vec<(String, String, String)> = Vec::new();
+        let blocks = finalize_tool_calls(&acc);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_accumulate_default_index_zero() {
+        // Delta without an explicit index should go to slot 0.
+        let mut acc: Vec<(String, String, String)> = Vec::new();
+        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
+            index: None, // no index — should default to 0
+            id: Some("call_no_idx".to_string()),
+            tool_type: None,
+            function: Some(OpenAIFunctionDelta {
+                name: Some("grep".to_string()),
+                arguments: Some(r#"{"pattern":"TODO"}"#.to_string()),
+            }),
+        });
+        assert_eq!(acc.len(), 1);
+        assert_eq!(acc[0].0, "call_no_idx");
+        assert_eq!(acc[0].1, "grep");
+    }
+
+    #[test]
+    fn test_streaming_tool_calls_end_to_end_simulation() {
+        // Simulate a full streaming sequence: two deltas for one tool call followed by finalize.
+        // This replicates the exact pattern Grok/OpenAI uses in the wild.
+        let mut acc: Vec<(String, String, String)> = Vec::new();
+
+        // Delta 1: id + function name + start of arguments
+        let delta1_json = r#"{"index":0,"id":"call_xyz","type":"function","function":{"name":"bash","arguments":"{\"comm"}}"#;
+        let delta1: OpenAIToolCallDelta = serde_json::from_str(delta1_json).unwrap();
+        accumulate_tool_call_delta(&mut acc, &delta1);
+
+        // Delta 2: continuation of arguments only
+        let delta2_json = r#"{"index":0,"function":{"arguments":"and\": \"echo test\"}"}}"#;
+        let delta2: OpenAIToolCallDelta = serde_json::from_str(delta2_json).unwrap();
+        accumulate_tool_call_delta(&mut acc, &delta2);
+
+        // Finalize
+        let blocks = finalize_tool_calls(&acc);
+        assert_eq!(blocks.len(), 1);
+        if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
+            assert_eq!(id, "call_xyz");
+            assert_eq!(name, "bash");
+            assert_eq!(input["command"].as_str().unwrap(), "echo test");
+        } else {
+            panic!("Expected ToolUse block, got {:?}", blocks[0]);
+        }
     }
 }

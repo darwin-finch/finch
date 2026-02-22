@@ -674,7 +674,7 @@ async fn run_daemon_status() -> Result<()> {
 
     // Query health endpoint
     let client = reqwest::Client::new();
-    let daemon_url = format!("http://127.0.0.1:11435/health");
+    let daemon_url = format!("http://{}/health", finch::config::constants::DEFAULT_DAEMON_ADDR);
 
     let response = client
         .get(&daemon_url)
@@ -707,7 +707,7 @@ async fn run_daemon_status() -> Result<()> {
     println!("  PID:             {}", pid);
     println!("  Uptime:          {}s", health.uptime_seconds);
     println!("  Active Sessions: {}", health.active_sessions);
-    println!("  Bind Address:    127.0.0.1:11435");
+    println!("  Bind Address:    {}", finch::config::constants::DEFAULT_DAEMON_ADDR);
     println!();
 
     Ok(())
@@ -1053,7 +1053,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                     .split(':')
                     .last()
                     .and_then(|p| p.parse::<u16>().ok())
-                    .unwrap_or(11435);
+                    .unwrap_or(finch::config::constants::DEFAULT_DAEMON_PORT);
 
                 match discovery.advertise(port) {
                     Ok(_) => {
@@ -1201,7 +1201,7 @@ async fn run_query_teacher_only(
     for _ in 0..MAX_TURNS {
         let request = MessageRequest {
             model: model.clone(),
-            max_tokens: 8000,
+            max_tokens: finch::config::constants::DEFAULT_MAX_TOKENS,
             messages: messages.clone(),
             system: Some(finch::generators::claude::CODING_SYSTEM_PROMPT.to_string()),
             tools: Some(tool_definitions.clone()),

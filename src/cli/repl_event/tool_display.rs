@@ -252,4 +252,63 @@ mod tests {
         let result = format_tool_result("Bash(ls)", &content, false);
         assert!(result.contains("+12 lines"));
     }
+
+    // ── Unicode character correctness ──────────────────────────────────────
+
+    #[test]
+    fn test_format_tool_result_uses_correct_bullet() {
+        let result = format_tool_result("bash(echo hi)", "hi", false);
+        // Must use ⏺ (U+23FA), not ● (U+25CF)
+        assert!(result.contains('⏺'), "Expected ⏺ (U+23FA), got: {:?}", result);
+        assert!(!result.contains('●'), "Found old ● (U+25CF) in: {:?}", result);
+    }
+
+    #[test]
+    fn test_format_tool_result_uses_correct_corner() {
+        let result = format_tool_result("bash(echo hi)", "hi\nline2", false);
+        // Must use ⎿ (U+23BF), not └ (U+2514)
+        assert!(result.contains('⎿'), "Expected ⎿ (U+23BF), got: {:?}", result);
+        assert!(!result.contains('└'), "Found old └ (U+2514) in: {:?}", result);
+    }
+
+    #[test]
+    fn test_format_tool_result_empty_output_no_corner() {
+        let result = format_tool_result("bash(true)", "", false);
+        // Empty output: header shown, no ⎿ (no output lines)
+        assert!(result.contains("bash(true)"), "header missing in: {:?}", result);
+        assert!(!result.contains('⎿'), "unexpected ⎿ for empty output in: {:?}", result);
+    }
+
+    #[test]
+    fn test_format_tool_result_error_uses_red_bullet() {
+        let result = format_tool_result("bash(bad)", "error message", true);
+        // Error: ⏺ in red (still ⏺, not ●)
+        assert!(result.contains('⏺'), "Expected ⏺ in error result, got: {:?}", result);
+        assert!(!result.contains('●'), "Found old ● in error result: {:?}", result);
+    }
+
+    #[test]
+    fn test_build_result_content_uses_correct_corner() {
+        let result = build_result_content("output line", false);
+        assert!(result.contains('⎿'), "Expected ⎿ (U+23BF), got: {:?}", result);
+        assert!(!result.contains('└'), "Found old └ (U+2514) in: {:?}", result);
+    }
+
+    #[test]
+    fn test_build_result_content_empty_returns_empty() {
+        let result = build_result_content("", false);
+        assert!(result.is_empty(), "Expected empty string for empty content, got: {:?}", result);
+        let result = build_result_content("   ", false);
+        assert!(result.is_empty(), "Expected empty for whitespace-only content, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_build_result_content_multiline() {
+        let content = "line1\nline2\nline3";
+        let result = build_result_content(content, false);
+        assert!(result.contains('⎿'), "Expected ⎿ prefix on first line");
+        assert!(result.contains("line1"), "line1 missing");
+        assert!(result.contains("line2"), "line2 missing");
+        assert!(result.contains("line3"), "line3 missing");
+    }
 }

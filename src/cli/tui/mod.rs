@@ -20,10 +20,7 @@
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{
-        self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
-    },
+    event::{self, Event},
     execute,
     style::{Print, ResetColor},
     terminal::{
@@ -67,7 +64,54 @@ const RESET:    &str = "\x1b[0m";
 const CYAN:     &str = "\x1b[36m";
 const DIM_GRAY: &str = "\x1b[90m";
 
+// ─── CWD helper ───────────────────────────────────────────────────────────────
+
+/// Return the current working directory with `$HOME` replaced by `~`.
+/// Falls back to `"."` if the CWD cannot be determined.
+fn tilde_cwd() -> String {
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p.display().to_string(),
+        Err(_) => return ".".to_string(),
+    };
+    let home = dirs::home_dir()
+        .map(|h| h.display().to_string())
+        .unwrap_or_default();
+    if !home.is_empty() && cwd.starts_with(&home) {
+        format!("~{}", &cwd[home.len()..])
+    } else {
+        cwd
+    }
+}
+
 // ─── Pure logic helpers (testable without a terminal) ─────────────────────────
+
+/// Count the number of terminal rows an `effective_status` string will occupy.
+///
+/// Each `\n` in the string produces an additional row.  An empty string still
+/// occupies exactly one row (the idle hint is always shown).
+pub(crate) fn count_status_lines(status: &str) -> usize {
+    status.lines().count().max(1)
+}
+
+/// Compute the 0-based row index (from the top of the live area) where the
+/// cursor will be parked after draw_live_area() finishes repositioning it into
+/// the input area.
+///
+/// Parameters:
+/// - `total_rows`: total rows drawn in the live area (WorkUnit + sep + input + status)
+/// - `input_line_count`: number of input lines (≥ 1)
+/// - `cursor_row`: which input line the cursor is on (0-based)
+/// - `status_line_count`: number of status lines drawn (≥ 1)
+pub(crate) fn compute_cursor_row_from_top(
+    total_rows: usize,
+    input_line_count: usize,
+    cursor_row: usize,
+    status_line_count: usize,
+) -> usize {
+    let input_below = input_line_count.saturating_sub(cursor_row + 1);
+    let rows_below_cursor = input_below + status_line_count;
+    total_rows.saturating_sub(1 + rows_below_cursor)
+}
 
 /// Compute the ghost-text suffix to append after the user's current input.
 ///
@@ -142,6 +186,12 @@ pub struct TuiRenderer {
     // redraw.
     active_rows: usize,
 
+    // Row index (0-based from top of live area) where the cursor is parked
+    // after draw_live_area().  erase_live_area() uses this to correctly reach
+    // the top regardless of where the cursor was repositioned (e.g. inside the
+    // input area vs. bottom of a dialog box).
+    cursor_row_from_top: usize,
+
     // Messages already committed to permanent scrollback.
     printed_ids: HashSet<MessageId>,
 
@@ -182,14 +232,21 @@ impl TuiRenderer {
     ) -> Result<Self> {
         enable_raw_mode().context("Failed to enable raw mode")?;
 
-        // Enhanced keyboard support (shift-enter, etc.) — not fatal if missing.
-        let _ = execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
-            )
-        );
+        // We intentionally do NOT push any KeyboardEnhancementFlags.
+        //
+        // The kitty keyboard enhancement protocol (DISAMBIGUATE_ESCAPE_CODES /
+        // REPORT_ALL_KEYS_AS_ESCAPE_CODES) corrupts the terminal if the pop
+        // sequence is not received before the shell takes over — which happens
+        // on panic, SIGKILL, or any non-clean exit.  The user then sees raw
+        // escape-sequence numeric fragments (e.g. "442;5u") for every keypress
+        // and cannot type until they kill the terminal window.
+        //
+        // Everything finch needs works without enhancement:
+        //   • Shift+Enter  → standard terminals send Enter + SHIFT modifier
+        //   • Shift+Tab    → standard \x1b[Z (BackTab)
+        //   • Ctrl+keys    → sent as-is in standard raw mode
+        // The only real loss is disambiguation of Esc vs Alt+key, which is not
+        // a use-case finch currently handles.
 
         execute!(io::stdout(), cursor::Show)?;
 
@@ -208,8 +265,9 @@ impl TuiRenderer {
             history_index:   None,
             history_draft:   None,
 
-            active_rows:  0,
-            printed_ids:  HashSet::new(),
+            active_rows:          0,
+            cursor_row_from_top:  0,
+            printed_ids:          HashSet::new(),
 
             active_dialog:        None,
             active_tabbed_dialog: None,
@@ -285,17 +343,22 @@ impl TuiRenderer {
 impl TuiRenderer {
     /// Move the cursor up to the top of the live area and clear everything
     /// below it, ready for a fresh draw.
+    ///
+    /// After draw_live_area() the cursor is parked at `cursor_row_from_top`
+    /// (not necessarily at the bottom row), so we must use that field — not
+    /// `active_rows - 1` — to reach the top correctly.
     fn erase_live_area(&mut self) -> Result<()> {
         if self.active_rows == 0 {
             return Ok(());
         }
         let mut stdout = io::stdout();
         execute!(stdout, cursor::MoveToColumn(0))?;
-        if self.active_rows > 1 {
-            execute!(stdout, cursor::MoveUp((self.active_rows - 1) as u16))?;
+        if self.cursor_row_from_top > 0 {
+            execute!(stdout, cursor::MoveUp(self.cursor_row_from_top as u16))?;
         }
         execute!(stdout, Clear(ClearType::FromCursorDown))?;
         self.active_rows = 0;
+        self.cursor_row_from_top = 0;
         Ok(())
     }
 
@@ -317,19 +380,31 @@ impl TuiRenderer {
             }
         }
 
-        // ── 2. Separator ──────────────────────────────────────────────────────
+        // ── 2. Separator with embedded CWD ───────────────────────────────────
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let sep: String = "─".repeat(term_width);
-        execute!(stdout, Print(format!("{}{}{}\r\n", DIM_GRAY, sep, RESET)))?;
+        let cwd_label = tilde_cwd();
+        // Format: "─── ~/repos/finch ──────────────..."
+        // Leave 2 dashes on the left and fill the rest on the right.
+        let label_with_spaces = format!(" {} ", cwd_label);
+        let prefix = "── ";
+        let prefix_vis = 3_usize;
+        let label_vis = label_with_spaces.len();
+        let suffix_len = term_width.saturating_sub(prefix_vis + label_vis);
+        let suffix: String = "─".repeat(suffix_len);
+        execute!(stdout, Print(format!("{}{}{}{}{}\r\n",
+            DIM_GRAY, prefix, label_with_spaces, suffix, RESET)))?;
         rows += 1;
 
         // ── 3. Dialog or input ────────────────────────────────────────────────
+        let cursor_row_from_top;
         if self.active_dialog.is_some() {
             let dialog_rows = Self::draw_dialog_inline_static(
                 &mut stdout,
                 self.active_dialog.as_ref().unwrap(),
             )?;
             rows += dialog_rows;
+            // Dialog drawing leaves the cursor at the last drawn row (no reposition).
+            cursor_row_from_top = rows.saturating_sub(1);
         } else {
             // ── 4. Input area ─────────────────────────────────────────────────
             let (cursor_row, cursor_col) = self.input_textarea.cursor();
@@ -363,12 +438,17 @@ impl TuiRenderer {
                 // ghost text is on the same row as the last input line — no extra row
             }
 
-            // ── 5. Status line (smart: command hint > live stats > idle hint) ─
+            // ── 5. Status line(s) (smart: command hint > live stats > idle hint)
             //
             // Priority:
             //   1. While typing a /command with ghost text → show its description
             //   2. Live stats / operation are set         → show those
             //   3. Idle (nothing set)                     → show keyboard shortcuts
+            //
+            // effective_status may contain multiple lines (joined with '\n') when
+            // the status bar has several active entries (e.g. operation + compaction
+            // + plan-mode indicator).  Each must be printed with \r\n so that raw
+            // mode does not leave the cursor at the wrong column.
             let raw_status = self.status_bar.get_status();
             let current_input = self.input_textarea.lines().join("\n");
             let effective_status = compute_effective_status(
@@ -378,13 +458,21 @@ impl TuiRenderer {
                 &self.command_registry,
             );
 
-            execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, effective_status, RESET)))?;
-            rows += 1;
+            // Thin separator between input area and status line(s)
+            let status_sep_width = term_width.min(40);
+            let status_sep: String = "─".repeat(status_sep_width);
+            execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, status_sep, RESET)))?;
+
+            let status_line_count = count_status_lines(&effective_status) + 1; // +1 for separator
+            for line in effective_status.lines() {
+                execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, line, RESET)))?;
+            }
+            rows += status_line_count;
 
             // ── 6. Reposition cursor inside the input area ────────────────────
             let rows_below_cursor = {
                 let input_below = input_line_count.saturating_sub(cursor_row + 1);
-                input_below + 1 // status line always present now
+                input_below + status_line_count
             };
             if rows_below_cursor > 0 {
                 execute!(stdout, cursor::MoveUp(rows_below_cursor as u16))?;
@@ -395,12 +483,15 @@ impl TuiRenderer {
                 continuation.len() + cursor_col
             };
             execute!(stdout, cursor::MoveToColumn(col as u16))?;
+
+            cursor_row_from_top = compute_cursor_row_from_top(rows, input_line_count, cursor_row, status_line_count);
         }
 
         execute!(stdout, EndSynchronizedUpdate)?;
         stdout.flush()?;
 
         self.active_rows = rows;
+        self.cursor_row_from_top = cursor_row_from_top;
         Ok(())
     }
 
@@ -439,11 +530,11 @@ impl TuiRenderer {
 
         if !to_commit.is_empty() {
             self.erase_live_area()?;
-            for (i, msg) in to_commit.iter().enumerate() {
+            for msg in &to_commit {
                 Self::raw_println(&msg.format(&self.colors))?;
-                if i < to_commit.len() - 1 {
-                    Self::raw_blank_line()?;
-                }
+                // Blank line after every committed message so the output area
+                // stays readable (issue #15 — remove clutter between work items).
+                Self::raw_blank_line()?;
             }
             self.draw_live_area()?;
         } else if self.last_render.elapsed() >= self.render_interval {
@@ -484,6 +575,17 @@ impl TuiRenderer {
         let w = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let sep = "─".repeat(w);
 
+        // Clear the visible terminal so we start from a clean slate.
+        execute!(
+            io::stdout(),
+            Clear(ClearType::All),
+            cursor::MoveTo(0, 0),
+        )?;
+
+        // Print exactly one separator + the header line.
+        // draw_live_area() will add the second separator that borders the input
+        // area, so we must NOT add sep2/blank here — that would produce three
+        // separators total.
         execute!(
             io::stdout(),
             Print(format!("{}{}{}\r\n", DIM_GRAY, sep, RESET)),
@@ -491,8 +593,6 @@ impl TuiRenderer {
                 "  {}finch{}  ·  {}  ·  {}{}{}\r\n",
                 "\x1b[1;37m", RESET, model, DIM_GRAY, cwd, RESET
             )),
-            Print(format!("{}{}{}\r\n", DIM_GRAY, sep, RESET)),
-            Print("\r\n"),
         )?;
 
         self.draw_live_area()
@@ -508,8 +608,14 @@ impl TuiRenderer {
         }
         self.is_active = false;
         let _ = self.erase_live_area();
+        // Reset terminal state: show cursor, reset colours, move to a clean line.
+        // The `\r\n` ensures the shell prompt lands on its own fresh line rather
+        // than overwriting content from the erased live area.
         let _ = execute!(io::stdout(), cursor::Show, ResetColor);
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = print!("\r\n");
+        // Flush pending output BEFORE leaving raw mode — otherwise some terminals
+        // silently discard buffered bytes after the mode switch.
+        let _ = io::stdout().flush();
         let _ = disable_raw_mode();
         Self::save_history(&self.command_history);
         self.output_manager.enable_stdout();
@@ -870,6 +976,65 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
+
+    // ── count_status_lines ────────────────────────────────────────────────────
+
+    #[test]
+    fn status_lines_single() {
+        assert_eq!(count_status_lines("idle hint"), 1);
+    }
+
+    #[test]
+    fn status_lines_empty_counts_as_one() {
+        assert_eq!(count_status_lines(""), 1, "empty string = 1 row (idle hint always shown)");
+    }
+
+    #[test]
+    fn status_lines_two_lines() {
+        assert_eq!(count_status_lines("⏺ Generating…\nContext left: 90%"), 2);
+    }
+
+    #[test]
+    fn status_lines_three_lines() {
+        assert_eq!(count_status_lines("op\ncompact\nplan_mode"), 3);
+    }
+
+    // ── compute_cursor_row_from_top ───────────────────────────────────────────
+
+    #[test]
+    fn cursor_row_single_input_single_status() {
+        // Layout: sep(0), input(1), status(2) — 3 rows total
+        // cursor at input row 0 → cursor_row_from_top = 1
+        assert_eq!(compute_cursor_row_from_top(3, 1, 0, 1), 1);
+    }
+
+    #[test]
+    fn cursor_row_two_input_lines_cursor_at_top() {
+        // Layout: sep(0), input0(1), input1(2), status(3) — 4 rows total
+        // cursor at input row 0 → cursor_row_from_top = 1
+        assert_eq!(compute_cursor_row_from_top(4, 2, 0, 1), 1);
+    }
+
+    #[test]
+    fn cursor_row_two_input_lines_cursor_at_bottom() {
+        // Layout: sep(0), input0(1), input1(2), status(3) — 4 rows total
+        // cursor at input row 1 → cursor_row_from_top = 2
+        assert_eq!(compute_cursor_row_from_top(4, 2, 1, 1), 2);
+    }
+
+    #[test]
+    fn cursor_row_multiline_status() {
+        // Layout: sep(0), input(1), status0(2), status1(3), status2(4) — 5 rows
+        // cursor at input row 0, 3-line status → cursor_row_from_top = 1
+        assert_eq!(compute_cursor_row_from_top(5, 1, 0, 3), 1);
+    }
+
+    #[test]
+    fn cursor_row_with_workunit() {
+        // Layout: wu0(0), wu1(1), sep(2), input(3), status(4) — 5 rows
+        // cursor at input row 0 → cursor_row_from_top = 3
+        assert_eq!(compute_cursor_row_from_top(5, 1, 0, 1), 3);
+    }
 
     // ── compute_ghost_text ────────────────────────────────────────────────────
 

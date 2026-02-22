@@ -984,7 +984,7 @@ impl EventLoop {
 
                         // Send stats update
                         let _ = event_tx.send(ReplEvent::StatsUpdate {
-                            model: "streaming".to_string(),
+                            model: generator.name().to_string(),
                             input_tokens: None,
                             output_tokens: Some(token_count as u32),
                             latency_ms: Some(stream_start.elapsed().as_millis() as u64),
@@ -1447,10 +1447,13 @@ impl EventLoop {
         }
 
         tui.flush_output_safe(&self.output_manager)?;
-        // Check if full refresh needed (for InProgress streaming messages)
+        // check_and_refresh handles the needs_full_refresh flag.
+        // We do NOT call tui.render() here: flush_output_safe() already draws
+        // when messages are committed or when the 100 ms animation interval
+        // elapses.  Calling render() afterwards would erase the live area a
+        // second time from the wrong cursor position, causing the "stacking
+        // Channeling…" visual glitch.
         tui.check_and_refresh()?;
-        // Actually render the TUI after flushing output
-        tui.render()?;
         Ok(())
     }
 

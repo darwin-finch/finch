@@ -159,6 +159,6 @@ impl Generator for ClaudeGenerator {
     }
 
     fn name(&self) -> &str {
-        "Claude API"
+        self.client.provider_name()
     }
 }
