@@ -25,9 +25,6 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset_name: finch-macos-arm64
-          - os: macos-14
-            target: x86_64-apple-darwin
-            asset_name: finch-macos-x86_64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset_name: finch-linux-x86_64
@@ -113,12 +110,6 @@ jobs:
           sudo mv finch /usr/local/bin/
           ```
 
-          **macOS (Intel):**
-          ```bash
-          curl -L https://github.com/${{ github.repository }}/releases/download/TAGPLACEHOLDER/finch-macos-x86_64.tar.gz | tar xz
-          sudo mv finch /usr/local/bin/
-          ```
-
           **Linux (x86_64):**
           ```bash
           curl -L https://github.com/${{ github.repository }}/releases/download/TAGPLACEHOLDER/finch-linux-x86_64.tar.gz | tar xz
@@ -145,5 +136,4 @@ jobs:
             --title "Finch v${version}" \
             --notes-file release_notes.md \
             artifacts/finch-macos-arm64/finch-macos-arm64.tar.gz \
-            artifacts/finch-macos-x86_64/finch-macos-x86_64.tar.gz \
             artifacts/finch-linux-x86_64/finch-linux-x86_64.tar.gz

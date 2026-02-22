@@ -131,6 +131,11 @@ impl ExecutionProvider {
             vec![ExecutionProvider::CUDA, ExecutionProvider::CPU]
         }
 
+        #[cfg(all(target_os = "linux", not(feature = "cuda")))]
+        {
+            vec![ExecutionProvider::CPU]
+        }
+
         #[cfg(target_os = "windows")]
         {
             vec![ExecutionProvider::DirectML, ExecutionProvider::CPU]

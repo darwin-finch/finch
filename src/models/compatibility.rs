@@ -97,6 +97,7 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
     ModelCompatibility {
         family: ModelFamily::Qwen2,
         supported_targets: &[
+            #[cfg(target_os = "macos")]
             ExecutionTarget::CoreML,
             ExecutionTarget::Cpu,
             #[cfg(feature = "cuda")]
@@ -133,6 +134,7 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
     ModelCompatibility {
         family: ModelFamily::Llama3,
         supported_targets: &[
+            #[cfg(target_os = "macos")]
             ExecutionTarget::CoreML,
             ExecutionTarget::Cpu,
             #[cfg(feature = "cuda")]
@@ -169,6 +171,7 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
     ModelCompatibility {
         family: ModelFamily::Gemma2,
         supported_targets: &[
+            #[cfg(target_os = "macos")]
             ExecutionTarget::CoreML,
             ExecutionTarget::Cpu,
             #[cfg(feature = "cuda")]
@@ -204,6 +207,7 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
     ModelCompatibility {
         family: ModelFamily::Mistral,
         supported_targets: &[
+            #[cfg(target_os = "macos")]
             ExecutionTarget::CoreML,
             ExecutionTarget::Cpu,
             #[cfg(feature = "cuda")]
@@ -233,6 +237,7 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
     ModelCompatibility {
         family: ModelFamily::Phi,
         supported_targets: &[
+            #[cfg(target_os = "macos")]
             ExecutionTarget::CoreML,
             ExecutionTarget::Cpu,
             #[cfg(feature = "cuda")]
@@ -267,6 +272,7 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
     ModelCompatibility {
         family: ModelFamily::DeepSeek,
         supported_targets: &[
+            #[cfg(target_os = "macos")]
             ExecutionTarget::CoreML,
             ExecutionTarget::Cpu,
             #[cfg(feature = "cuda")]
