@@ -6,9 +6,9 @@ This document provides context for AI assistants (like Claude Code) working on t
 
 **Project Name**: Shammah (שָׁמָה - "watchman/guardian")
 **Purpose**: Local-first AI coding assistant with continuous improvement
-**Core Innovation**: Pre-trained local models + weighted LoRA fine-tuning for domain adaptation
-**Supported Models**: Qwen, Llama, Mistral, Phi (via ONNX)
-**Teacher Backends**: Claude (Anthropic), GPT-4 (OpenAI), Gemini (Google), Grok (xAI)
+**Core Innovation**: Local ONNX inference across 6 model families, ANE acceleration on Apple Silicon, cloud fallback during bootstrap
+**Supported Models**: Qwen, Llama, Gemma, Mistral, Phi, DeepSeek (via ONNX)
+**Teacher Backends**: Claude (Anthropic), GPT-4 (OpenAI), Gemini (Google), Grok (xAI), Mistral, Groq
 
 ### The Problem
 
@@ -21,94 +21,59 @@ Traditional AI coding assistants require:
 
 ### The Solution
 
-Shammah provides **immediate quality** with **continuous improvement**:
+Shammah provides **immediate quality** at **low cost**:
 1. Uses pre-trained local models (works well from day 1)
 2. Loads instantly with progressive bootstrap (<100ms startup)
-3. Learns from weighted feedback via LoRA fine-tuning
-4. Adapts to your coding style, frameworks, and patterns
-5. Works offline after initial model download
-6. Preserves privacy (code stays on your machine)
-7. Falls back to teacher models (Claude/GPT-4/etc.) when needed
+3. Runs queries locally after first model download — near-zero marginal cost
+4. Works offline after initial model download
+5. Preserves privacy (code stays on your machine)
+6. Falls back to cloud providers (Claude/GPT-4/etc.) while the local model is loading
+7. LoRA fine-tuning planned — feedback collection infrastructure is in place
 
 ### Key Metrics
 
 - **Startup Time**: <100ms (instant REPL)
 - **First-Run Experience**: 0ms blocked (background download)
 - **Quality Day 1**: High (pre-trained models)
-- **Quality Month 1**: Specialized (LoRA adapted to your domain)
+- **Quality Month 1**: Same as day 1 (LoRA adaptation is planned, not yet implemented)
 - **System Support**: 8GB to 64GB+ RAM (adaptive model selection)
 
 ## Architecture Overview
 
-### Design: Pre-trained Local Models + LoRA Adaptation
+### Design: Local ONNX Inference with Cloud Bootstrap Fallback
 
-Shammah uses **pre-trained local models** with **weighted LoRA fine-tuning** instead of training from scratch:
+Shammah uses **pre-trained local models** served via ONNX Runtime, with an optional cloud fallback while the model loads for the first time:
 
 ```
 User Request
     ↓
 ┌─────────────────────────────────────┐
-│ Router with Model Check              │
-│ - Crisis detection (safety)          │
-│ - Local model ready? Use local      │
-│ - Model loading? Forward to teacher │
+│ Router — Model Ready Check           │
+│  Local model ready? → use local      │
+│  Still loading?     → fallback       │
 └──────────┬──────────────────────────┘
            │
     Model Ready?
            │
-    ├─ NO  → Forward to Teacher API (Claude/GPT-4/Gemini/Grok)
+    ├─ NO  → Forward to Teacher API (Claude/GPT-4/Gemini/Grok/Mistral/Groq)
     └─ YES → Continue
            │
            v
-    ┌──────────────────────────────────┐
-    │ Pre-trained Local Model          │
-    │ (Qwen/Llama/Mistral/Phi)        │
-    │ (1.5B / 3B / 7B / 14B)          │
-    │ + LoRA Adapters                  │
-    │   (your learned patterns)        │
-    └──────────┬───────────────────────┘
+    ┌──────────────────────────────────────┐
+    │ ONNX Local Model                      │
+    │ Qwen · Llama · Gemma · Mistral        │
+    │ Phi · DeepSeek                        │
+    │ ANE via CoreML on Apple Silicon       │
+    │ CPU on Linux                          │
+    └──────────┬───────────────────────────┘
            │
            v
     ┌──────────────────────────────────┐
     │ Response to User                 │
-    └──────────┬───────────────────────┘
-           │
-           v
-    User Feedback?
-           │
-    ├─ 🔴 High-weight (10x)
-    ├─ 🟡 Medium-weight (3x)
-    └─ 🟢 Normal-weight (1x)
-           │
-           v
-    ┌──────────────────────────────────┐
-    │ Background LoRA Fine-Tuning      │
-    │ - Collects weighted examples     │
-    │ - Trains in batches (non-blocking)│
-    │ - Saves adapters incrementally   │
     └──────────────────────────────────┘
 ```
 
-### Why This Approach?
-
-**Pre-trained Qwen vs. Training from Scratch:**
-- ✅ **Immediate quality** - Works well from day 1
-- ✅ **No cold start** - No months of data collection
-- ✅ **Proven performance** - Qwen models are battle-tested
-- ✅ **Broad knowledge** - Trained on diverse coding data
-
-**LoRA vs. Full Fine-Tuning:**
-- ✅ **Efficient** - Trains only 0.1-1% of parameters
-- ✅ **Fast** - Minutes instead of hours
-- ✅ **Low memory** - Works on consumer hardware
-- ✅ **Multiple adapters** - Switch between domains easily
-- ✅ **No degradation** - Base model quality preserved
-
-**Weighted Examples vs. Uniform Training:**
-- ✅ **Prioritize critical feedback** - Strategy errors get 10x weight
-- ✅ **Faster adaptation** - Learn from mistakes more quickly
-- ✅ **User control** - You decide what's important
-- ✅ **Efficient learning** - Focus on what matters
+**Note:** LoRA fine-tuning (adapting the model to your coding style via feedback) is **planned but not yet implemented**. The feedback collection infrastructure (`Ctrl+G`/`Ctrl+B`, weighted JSONL logging) is in place. Loading LoRA adapters into ONNX Runtime at inference time is the next major milestone (GitHub Issue #1).
 
 ### Core Components
 
@@ -151,11 +116,10 @@ User Request
 - 64GB+ Mac → Qwen-2.5-14B (14GB RAM, maximum)
 
 **Features:**
-- Uses ONNX Runtime with CoreML execution provider
-- Full KV cache support (56+ dynamic inputs for 28 layers)
-- Autoregressive generation with cache reuse
-- Metal acceleration on Apple Silicon via CoreML
-- Graceful CPU fallback
+- Uses ONNX Runtime with pluggable execution providers
+- ANE acceleration on Apple Silicon via CoreML execution provider
+- CUDA/ROCm/DirectML on Linux/Windows if available; CPU fallback everywhere
+- Full KV cache support for autoregressive generation
 - Automatic tokenizer loading (tokenizer.json)
 
 **Key Files:**
@@ -164,68 +128,37 @@ User Request
 - `src/models/adapters/qwen.rs` - QwenAdapter with output cleaning
 - `src/models/loaders/onnx_config.rs` - Configuration types
 
-#### 3. **LoRA Fine-Tuning** (`src/models/lora.rs`)
+#### 3. **Feedback Collection / LoRA Infrastructure** (`src/models/lora.rs`)
 
-**Purpose:** Efficient domain-specific adaptation with weighted examples
+**Status: Infrastructure in place, training not yet implemented.**
 
-**LoRAConfig:**
-```rust
-pub struct LoRAConfig {
-    rank: usize,              // Low-rank dimension (4-64)
-    alpha: f64,               // Scaling factor (1.0-32.0)
-    dropout: f64,             // Regularization (0.0-0.3)
-    target_modules: Vec<String>, // Layers to adapt
+The feedback collection pipeline is wired and working:
+- `Ctrl+G` (good) / `Ctrl+B` (bad) on any response records a weighted example
+- Examples are stored to `~/.finch/training_queue.jsonl` as JSONL
+- Three weight tiers exist: high (10x), medium (3x), normal (1x)
 
-    // Weighted training
-    high_weight: f64,         // Critical issues (10x)
-    medium_weight: f64,       // Improvements (3x)
-    normal_weight: f64,       // Good examples (1x)
-}
-```
+The `LoRAConfig` and `LoRAAdapter` structs exist in `src/models/lora.rs` as placeholder infrastructure. The `train()` method returns `anyhow::bail!("LoRA fine-tuning not yet implemented")`. Loading adapters into ONNX Runtime at inference time is tracked as **GitHub Issue #1** (40-80h effort).
 
-**Weighted Training:**
-- **High-weight (10x)**: Critical strategy errors
-  - Example: "Never use .unwrap() in production"
-  - Example: "This algorithm is O(n²), use O(n log n)"
-  - Impact: Model strongly learns to avoid this
+**What works today:**
+- Feedback keypresses logged with weight
+- JSONL queue written to `~/.finch/training_queue.jsonl`
+- Config fields (`rank`, `alpha`, `learning_rate`, etc.) accepted and stored
 
-- **Medium-weight (3x)**: Style preferences
-  - Example: "Prefer iterator chains over manual loops"
-  - Example: "Use library X instead of library Y"
-  - Impact: Model learns your preferred approach
-
-- **Normal-weight (1x)**: Good examples
-  - Example: "This is exactly right"
-  - Example: "Remember this pattern"
-  - Impact: Model learns normally
-
-**Training Flow:**
-```rust
-1. User provides feedback with weight
-2. Example stored in training buffer
-3. Buffer reaches threshold (e.g., 10 examples)
-4. Background training triggered (non-blocking)
-5. LoRA adapter trained for N epochs
-6. Adapter saved to ~/.finch/adapters/
-7. Adapter loaded for future queries
-8. Process repeats continuously
-```
+**What is not yet implemented:**
+- Actual LoRA training (no Python subprocess, no in-process training)
+- Adapter saving to `~/.finch/adapters/`
+- Adapter loading at ONNX inference time
 
 **Key Files:**
-- `src/models/lora.rs` - LoRAAdapter, LoRAConfig, weighted training
-- `src/models/generator_new.rs` - fine_tune(), save_lora(), load_lora()
+- `src/models/lora.rs` - LoRAAdapter, LoRAConfig, WeightedExample, ExampleBuffer (all placeholder)
+- `src/training/batch_trainer.rs` - Returns fake loss; not wired to real training
 
-#### 4. **Router with Graceful Degradation** (`src/router/decision.rs`)
+#### 4. **Router** (`src/router/decision.rs`)
 
-**Purpose:** Decide when to use local vs. Claude, handle model loading
+**Purpose:** Route queries to local model or teacher API based on model readiness.
 
-**ForwardReasons:**
-- `Crisis` - Safety issue detected
-- `ModelNotReady` - Model still loading (progressive bootstrap)
-- `NoMatch` - No local pattern match
-- `LowConfidence` - Threshold router uncertain
+The primary routing decision is simple: if the local model is ready, use it; if it is still loading (first run / bootstrap), optionally forward to a configured teacher API.
 
-**New Method:**
 ```rust
 fn route_with_generator_check(
     query: &str,
@@ -233,15 +166,14 @@ fn route_with_generator_check(
 ) -> RouteDecision
 ```
 
-**Behavior:**
-- Checks if generator loaded before considering local
-- Forwards to Claude gracefully during bootstrap
-- Enables seamless transition: Claude → local
-- No blocking or errors during model load
+A threshold-based statistics router (`src/models/threshold_router.rs`) also exists and tracks per-category success rates, but the dominant routing decision in practice is the model-ready check above.
+
+**ForwardReasons:**
+- `ModelNotReady` - Model still loading; forward to teacher if configured
+- `NoMatch` / `LowConfidence` - Threshold router below confidence; forward to teacher
 
 **Key Files:**
 - `src/router/decision.rs` - Router, RouteDecision, route_with_generator_check()
-- `src/router/hybrid_router.rs` - Hybrid threshold + neural routing
 
 #### 5. **TUI Renderer System** (`src/cli/tui/`)
 
@@ -889,11 +821,19 @@ tests/                   # Integration tests
   command_integration_test.rs
 ```
 
+**Regression Test Requirement** (mandatory):
+- **Every bug fix must have a regression test** that fails before the fix and passes after. No exceptions. This prevents the bug from silently returning during refactoring.
+- **Every behavior agreed upon** (e.g., "Candle generates correctly", "ONNX tokenize works") must be covered by a unit test. If a behavior is worth discussing, it is worth testing.
+- Tests live in the same file as the code they test (`#[cfg(test)] mod tests { ... }` at the bottom of the module).
+- Name regression tests descriptively: `test_<thing>_<behavior>` e.g. `test_candle_qwen_kv_cache_reuses_seqlen_offset`.
+- Use mocks (not real models) to test trait contracts and routing logic — real-model tests go under `#[ignore]`.
+
 **Test Coverage Goals**:
 - All public APIs have tests
 - Critical paths have integration tests
 - Error handling paths tested
 - Edge cases documented with tests
+- Stubs must have tests confirming they return errors (not panic)
 
 **Running Tests**:
 ```bash

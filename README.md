@@ -25,12 +25,6 @@ curl -L https://github.com/darwin-finch/finch/releases/latest/download/finch-mac
 sudo mv finch /usr/local/bin/finch
 ```
 
-**Intel Mac:**
-```bash
-curl -L https://github.com/darwin-finch/finch/releases/latest/download/finch-macos-x86_64.tar.gz | tar xz
-sudo mv finch /usr/local/bin/finch
-```
-
 **Linux (x86_64):**
 ```bash
 curl -L https://github.com/darwin-finch/finch/releases/latest/download/finch-linux-x86_64.tar.gz | tar xz
