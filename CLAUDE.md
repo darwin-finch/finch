@@ -911,137 +911,49 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
 
 ## Current Project Status
 
-**Phase**: Core Infrastructure + Runtime Switching + MemTree Console 🚧
-**Version**: 0.5.0-dev (Runtime Model Switching + Tree Console Infrastructure)
-**Recent Work** (Feb 19, 2026):
-  - ✅ Runtime model/teacher switching with memory preservation
-  - ✅ MemTree console infrastructure (event handler + tree state)
-  - 🚧 Tree view TUI rendering (in progress)
-**Previous Work**: Phases 1-4 of Setup Wizard Redesign (Feb 2026)
-  - Phase 1: Tabbed setup wizard with section navigation
-  - Phase 2: Feature flags configuration system
-  - Phase 3: macOS GUI automation tools (infrastructure)
-  - Phase 4: MCP plugin system (config + module structure)
-**Next**: Complete tree view rendering, keyboard navigation
+**Version**: 0.5.2-dev
+**Last updated**: Feb 2026
 
-### What's Done
+Core infrastructure is complete and production-ready. The project is a fully functional local-first AI coding assistant with ONNX Runtime inference, multi-turn tool execution, daemon architecture, LoRA fine-tuning infrastructure, and a professional TUI.
 
-**Setup Wizard Redesign (Feb 2026):**
-- ✅ **Tabbed Navigation** - Jump between sections with Tab/arrows, edit any section
-- ✅ **Feature Flags** - Auto-approve tools, streaming, debug logging, GUI automation
-- ✅ **GUI Automation** - GuiClick, GuiType, GuiInspect tools (macOS, infrastructure ready)
-- 🚧 **MCP Plugin System** - Configuration complete, connection layer in progress
-- ✅ **TUI Refactoring** - Removed double-buffering optimization for reliability
+### Capabilities Summary
 
+- **Local inference** — ONNX Runtime with Qwen 2.5 (1.5B/3B/7B/14B), Metal acceleration on Apple Silicon
+- **6 model families** — Qwen, Llama, Mistral, Gemma, Phi, DeepSeek adapters
+- **6 teacher providers** — Claude, GPT-4, Gemini, Grok, Mistral, Groq
+- **6 tools** — Read, Glob, Grep, WebFetch, Bash, Restart (with permission system)
+- **Daemon** — Auto-spawning, OpenAI-compatible API, tool pass-through, session management
+- **TUI** — Scrollback, streaming, ghost text, plan mode, feedback (Ctrl+G/B), history
+- **LoRA** — Weighted feedback collection + Python training pipeline (adapter loading pending)
+- **Runtime switching** — `/model` and `/teacher` commands mid-session
+- **Setup wizard** — Auto-detects API keys, tabbed UI, model preview, ONNX config
 
+### Open Issues
 
-**ONNX Runtime Integration (Complete):**
-- ✅ **ONNX Model Loading** - Load models from onnx-community repos
-- ✅ **KV Cache Support** - 56+ dynamic inputs for efficient generation
-- ✅ **Autoregressive Generation** - Multi-token generation with cache reuse
-- ✅ **Output Cleaning** - Production-quality response formatting
-- ✅ **CoreML Acceleration** - Metal backend on Apple Silicon
-- ✅ **Model Selection** - RAM-based automatic selection (1.5B/3B/7B/14B)
+Tracked as GitHub Issues: **https://github.com/darwin-finch/finch/issues**
 
-**Tool Execution (Complete):**
-- ✅ **Local Model Tool Use** - XML + JSON format, multi-turn execution
-- ✅ **Tool Call Parser** - Regex-based extraction from model output
-- ✅ **6 Working Tools** - Read, Glob, Grep, WebFetch, Bash, Restart
-- ✅ **Permission System** - Session and persistent approval patterns
-- ✅ **Tool Pass-Through** - Client-side execution in daemon mode
-
-**Daemon Architecture (Complete):**
-- ✅ **Auto-Spawning Daemon** - PID management, health checks
-- ✅ **OpenAI-Compatible API** - Drop-in replacement for GPT/Claude APIs
-- ✅ **Session Management** - Automatic cleanup, concurrent clients
-- ✅ **Prometheus Metrics** - Monitoring endpoint
-- ✅ **Tool Pass-Through** - Execute tools on client side
-
-**LoRA Fine-Tuning Infrastructure (Complete):**
-- ✅ **Weighted Example Collection** - JSONL export with 10x/3x/1x weights
-- ✅ **Training Coordinator** - Queue management, batch processing
-- ✅ **Python Training Script** - PyTorch + PEFT implementation
-- ✅ **Subprocess Spawner** - Non-blocking background training
-- ✅ **Integration Tests** - 5/5 tests passing
-
-**TUI & UX (Complete):**
-- ✅ **Professional Terminal UI** - Scrollback, shadow buffer, diff-based updates
-- ✅ **Multi-line Input** - Shift+Enter support, dynamic height (1-10 lines)
-- ✅ **Command History** - Up/down navigation, persistent to disk (1000 commands)
-- ✅ **Live Status Bar** - Tokens, latency, model info, speed stats
-- ✅ **Query Cancellation** - Ctrl+C to stop in-progress queries
-- ✅ **Feedback System** - Ctrl+G (good), Ctrl+B (bad), weighted training data
-- ✅ **Tool Confirmation Dialogs** - Non-blocking approval UI with 6 options
-- ✅ **Streaming Responses** - Real-time output with rate limiting
-
-**Multi-Provider Support (Complete):**
-- ✅ **Teacher APIs** - Claude, GPT-4, Gemini, Grok, Mistral, Groq
-- ✅ **Setup Wizard** - Add/remove multiple providers, configure API keys
-- ✅ **Adaptive Routing** - Tries local by default, graceful fallback
-- ✅ **Crash Recovery** - Auto-restart daemon on connection errors
-- ✅ **Generic Terminology** - Local/teacher (no brand-specific terms)
-
-**System Reliability (Complete):**
-- ✅ **Progressive Bootstrap** - Instant startup with background loading
-- ✅ **Memory Monitoring** - Track system and process RAM usage
-- ✅ **Daemon Management** - Auto-spawn, stop, start, status commands
-- ✅ **Config Validation** - Helpful error messages on startup
-- ✅ **Download Progress** - Visual progress bars in TUI
-
-**Runtime Model Switching (Feb 19, 2026):**
-- ✅ `/model` and `/teacher` commands for runtime provider switching
-- ✅ Switch between Claude, Grok, GPT-4, Gemini, Mistral, Groq mid-session
-- ✅ Memory tree preservation across switches (nodes maintained)
-- ✅ Conversation history preserved during transitions
-- ✅ List, show, and switch by name or index
-
-**MemTree Console Infrastructure (Feb 19, 2026):**
-- ✅ Tree-structured conversation view architecture
-- ✅ Event handler for REPL event → tree node translation
-- ✅ Console state management with expand/collapse support
-- ✅ ViewMode enum (List vs Tree) for future mode switching
-- ✅ ConsoleNode types: UserMessage, AssistantResponse, ToolCall, ToolResult
-- 🚧 TUI rendering with ratatui widgets (in progress)
-- 🚧 Keyboard navigation for tree view (in progress)
-
-### What's Next
-
-**Progress: 17/23 TODO items complete (74%)**
-
-See **STATUS.md** for detailed TODO list with effort estimates.
-
-**Remaining High-Priority Items:**
-- [ ] Multi-model setup wizard (let users choose specific model variants)
-- [ ] Test Mistral model support with LlamaAdapter
-- [ ] LoRA adapter loading in ONNX runtime
-
-**Phase 5 - Complex (8-20 hours each):**
-- [ ] Additional model adapters (Phi, DeepSeek, etc.)
-- [ ] Color scheme customization (accessibility)
-- [ ] Plan mode redesign (match Claude Code quality)
-
-**Documentation:**
-- [ ] Create USER_GUIDE.md with setup and usage instructions
-- [ ] Update ARCHITECTURE.md with daemon mode details
-
-**Long-term (Future):**
-- [ ] Quantization for lower memory usage
-- [ ] Multi-GPU support
-- [ ] Custom domain-specific tools
-- [ ] CoreML export optimization
+Key open items:
+- [#1](https://github.com/darwin-finch/finch/issues/1) LoRA adapter loading at ONNX runtime (40-80h, complex)
+- [#2](https://github.com/darwin-finch/finch/issues/2) Mistral ONNX support (blocked on onnx-community publishing models)
+- [#3](https://github.com/darwin-finch/finch/issues/3) Additional model adapters (CodeLlama, Yi, StarCoder)
+- [#4](https://github.com/darwin-finch/finch/issues/4) Update ARCHITECTURE.md
+- [#5](https://github.com/darwin-finch/finch/issues/5) Integration tests (daemon, LoRA, multi-provider, tool pass-through)
+- [#6](https://github.com/darwin-finch/finch/issues/6) Remove unused Candle imports (good first issue)
+- [#7](https://github.com/darwin-finch/finch/issues/7) LoRA training memory efficiency
 
 ## Reference Documents
 
 **Current Documentation:**
 - **README.md**: User-facing documentation
 - **CLAUDE.md**: This file (AI assistant context)
-- **STATUS.md**: Current project status and TODO list
+- **CHANGELOG.md**: Version history
 - **docs/ROADMAP.md**: Detailed future work planning
 - **docs/ARCHITECTURE.md**: System architecture overview
 - **docs/DAEMON_MODE.md**: Daemon architecture details
 - **docs/TOOL_CONFIRMATION.md**: Tool permission system
 - **docs/TUI_ARCHITECTURE.md**: Terminal UI rendering system
 - **docs/MODEL_BACKEND_STATUS.md**: Model backend comparison
+- **docs/USER_GUIDE.md**: Setup and usage guide
 
 **Archived Documentation:**
 - **docs/archive/**: Completed phase documentation (PHASE_4-8, ONNX migration, tool pass-through)

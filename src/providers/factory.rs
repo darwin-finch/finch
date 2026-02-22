@@ -104,204 +104,118 @@ pub fn create_provider(teachers: &[TeacherEntry]) -> Result<Box<dyn LlmProvider>
 #[cfg(test)]
 mod tests {
     use super::*;
-    // FIXME: ProviderSettings doesn't exist in config module
-    // use crate::config::{ProviderSettings, TeacherEntry};
     use crate::config::TeacherEntry;
-    use std::collections::HashMap;
 
-    // FIXME: Test disabled due to missing ProviderSettings type
-    // #[test]
-    // fn test_create_claude_provider() {
-    //     let mut settings = HashMap::new();
-    //     settings.insert(
-    //         "claude".to_string(),
-    //         ProviderSettings {
-    //             api_key: "test-key".to_string(),
-    //             model: None,
-    //             base_url: None,
-    //         },
-    //     );
+    fn entry(provider: &str, api_key: &str) -> TeacherEntry {
+        TeacherEntry {
+            provider: provider.to_string(),
+            api_key: api_key.to_string(),
+            model: None,
+            base_url: None,
+            name: None,
+        }
+    }
 
-    //     let config = TeacherConfig {
-    //         provider: Some("claude".to_string()),
-    //         settings,
-    //         teachers: vec![],
-    //     };
+    fn entry_with_model(provider: &str, api_key: &str, model: &str) -> TeacherEntry {
+        TeacherEntry {
+            provider: provider.to_string(),
+            api_key: api_key.to_string(),
+            model: Some(model.to_string()),
+            base_url: None,
+            name: None,
+        }
+    }
 
-    //     let provider = create_provider(&config);
-    //     assert!(provider.is_ok());
-    //     assert_eq!(provider.unwrap().name(), "claude");
-    // }
+    #[test]
+    fn test_create_claude_provider() {
+        let provider = create_provider_from_entry(&entry("claude", "test-key"));
+        assert!(provider.is_ok());
+        assert_eq!(provider.unwrap().name(), "claude");
+    }
 
-    // FIXME: Test disabled due to missing ProviderSettings type
-    // #[test]
-    // fn test_create_openai_provider() {
-    //     let mut settings = HashMap::new();
-    //     settings.insert(
-    //         "openai".to_string(),
-    //         ProviderSettings {
-    //             api_key: "test-key".to_string(),
-    //             model: None,
-    //             base_url: None,
-    //         },
-    //     );
+    #[test]
+    fn test_create_openai_provider() {
+        let provider = create_provider_from_entry(&entry("openai", "test-key"));
+        assert!(provider.is_ok());
+        assert_eq!(provider.unwrap().name(), "openai");
+    }
 
-    //     let config = TeacherConfig {
-    //         provider: Some("openai".to_string()),
-    //         settings,
-    //         teachers: vec![],
-    //     };
+    #[test]
+    fn test_create_grok_provider() {
+        let provider = create_provider_from_entry(&entry("grok", "test-key"));
+        assert!(provider.is_ok());
+        assert_eq!(provider.unwrap().name(), "grok");
+    }
 
-    //     let provider = create_provider(&config);
-    //     assert!(provider.is_ok());
-    //     assert_eq!(provider.unwrap().name(), "openai");
-    // }
+    #[test]
+    fn test_create_gemini_provider() {
+        let provider = create_provider_from_entry(&entry("gemini", "test-key"));
+        assert!(provider.is_ok());
+        assert_eq!(provider.unwrap().name(), "gemini");
+    }
 
-    // FIXME: Test disabled due to missing ProviderSettings type
-    // #[test]
-    // fn test_create_grok_provider() {
-    //     let mut settings = HashMap::new();
-    //     settings.insert(
-    //         "grok".to_string(),
-    //         ProviderSettings {
-    //             api_key: "test-key".to_string(),
-    //             model: None,
-    //             base_url: None,
-    //         },
-    //     );
+    #[test]
+    fn test_create_mistral_provider() {
+        let provider = create_provider_from_entry(&entry("mistral", "test-key"));
+        assert!(provider.is_ok());
+        assert_eq!(provider.unwrap().name(), "mistral");
+    }
 
-    //     let config = TeacherConfig {
-    //         provider: Some("grok".to_string()),
-    //         settings,
-    //         teachers: vec![],
-    //     };
+    #[test]
+    fn test_create_groq_provider() {
+        let provider = create_provider_from_entry(&entry("groq", "test-key"));
+        assert!(provider.is_ok());
+        assert_eq!(provider.unwrap().name(), "groq");
+    }
 
-    //     let provider = create_provider(&config);
-    //     assert!(provider.is_ok());
-    //     assert_eq!(provider.unwrap().name(), "grok");
-    // }
+    #[test]
+    fn test_unknown_provider_returns_error() {
+        let result = create_provider_from_entry(&entry("unknown_provider_xyz", "test-key"));
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("Unknown provider"));
+    }
 
-    // FIXME: Test disabled due to missing ProviderSettings type
-    // #[test]
-    // fn test_create_gemini_provider() {
-    //     let mut settings = HashMap::new();
-    //     settings.insert(
-    //         "gemini".to_string(),
-    //         ProviderSettings {
-    //             api_key: "test-key".to_string(),
-    //             model: None,
-    //             base_url: None,
-    //         },
-    //     );
+    #[test]
+    fn test_empty_teachers_returns_error() {
+        let result = create_providers(&[]);
+        assert!(result.is_err());
+    }
 
-    //     let config = TeacherConfig {
-    //         provider: Some("gemini".to_string()),
-    //         settings,
-    //         teachers: vec![],
-    //     };
+    #[test]
+    fn test_multiple_teachers() {
+        let teachers = vec![
+            entry("openai", "key-1"),
+            entry("claude", "key-2"),
+        ];
+        let providers = create_providers(&teachers).unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].name(), "openai");
+        assert_eq!(providers[1].name(), "claude");
+    }
 
-    //     let provider = create_provider(&config);
-    //     assert!(provider.is_ok());
-    //     assert_eq!(provider.unwrap().name(), "gemini");
-    // }
+    #[test]
+    fn test_single_teacher_returns_direct_provider_not_fallback() {
+        // Single provider should NOT be wrapped in a FallbackChain
+        let teachers = vec![entry("claude", "key-1")];
+        let provider = create_provider(&teachers).unwrap();
+        assert_eq!(provider.name(), "claude");
+    }
 
-    // FIXME: Test disabled due to missing TeacherConfig type (replaced by Config)
-    // #[test]
-    // fn test_unknown_provider() {
-    //     let config = TeacherConfig {
-    //         provider: Some("unknown".to_string()),
-    //         settings: HashMap::new(),
-    //         teachers: vec![],
-    //     };
-    //
-    //     let provider = create_provider(&config);
-    //     assert!(provider.is_err());
-    // }
+    #[test]
+    fn test_custom_model_is_applied() {
+        let e = entry_with_model("openai", "key", "gpt-4o-mini");
+        let provider = create_provider_from_entry(&e).unwrap();
+        assert_eq!(provider.default_model(), "gpt-4o-mini");
+    }
 
-    // FIXME: Test disabled due to missing TeacherConfig type (replaced by Config)
-    // #[test]
-    // fn test_multiple_teachers() {
-    //     let config = TeacherConfig {
-    //         provider: None,
-    //         settings: HashMap::new(),
-    //         teachers: vec![
-    //             TeacherEntry {
-    //                 provider: "openai".to_string(),
-    //                 api_key: "test-key-1".to_string(),
-    //                 model: Some("gpt-4o".to_string()),
-    //                 base_url: None,
-    //                 name: Some("GPT-4o".to_string()),
-    //             },
-    //             TeacherEntry {
-    //                 provider: "claude".to_string(),
-    //                 api_key: "test-key-2".to_string(),
-    //                 model: None,
-    //                 base_url: None,
-    //                 name: Some("Claude Sonnet".to_string()),
-    //             },
-    //         ],
-    //     };
-    //
-    //     let providers = create_providers(&config).unwrap();
-    //     assert_eq!(providers.len(), 2);
-    //     assert_eq!(providers[0].name(), "openai");
-    //     assert_eq!(providers[1].name(), "claude");
-    // }
-
-    // FIXME: Test disabled due to missing TeacherConfig type (replaced by Config)
-    // #[test]
-    // fn test_active_teacher() {
-    //     let config = TeacherConfig {
-    //         provider: None,
-    //         settings: HashMap::new(),
-    //         teachers: vec![
-    //             TeacherEntry {
-    //                 provider: "openai".to_string(),
-    //                 api_key: "test-key-1".to_string(),
-    //                 model: Some("gpt-4o".to_string()),
-    //                 base_url: None,
-    //                 name: Some("GPT-4o (active)".to_string()),
-    //             },
-    //             TeacherEntry {
-    //                 provider: "claude".to_string(),
-    //                 api_key: "test-key-2".to_string(),
-    //                 model: None,
-    //                 base_url: None,
-    //                 name: Some("Claude (backup)".to_string()),
-    //             },
-    //         ],
-    //     };
-    //
-    //     // create_provider should return the FIRST teacher (active one)
-    //     let provider = create_provider(&config).unwrap();
-    //     assert_eq!(provider.name(), "openai");
-    //     assert_eq!(provider.default_model(), "gpt-4o");
-    // }
-
-    // FIXME: Test disabled due to missing ProviderSettings type
-    // #[test]
-    // fn test_legacy_config_compatibility() {
-    //     let mut settings = HashMap::new();
-    //     settings.insert(
-    //         "claude".to_string(),
-    //         ProviderSettings {
-    //             api_key: "test-key".to_string(),
-    //             model: Some("claude-opus-4-6".to_string()),
-    //             base_url: None,
-    //         },
-    //     );
-
-    //     let config = TeacherConfig {
-    //         provider: Some("claude".to_string()),
-    //         settings,
-    //         teachers: vec![],
-    //     };
-
-    //     let entries = config.get_teachers();
-    //     assert_eq!(entries.len(), 1);
-    //     assert_eq!(entries[0].provider, "claude");
-    //     assert_eq!(entries[0].model, Some("claude-opus-4-6".to_string()));
-    // }
+    #[test]
+    fn test_case_insensitive_provider_name() {
+        let mut e = entry("claude", "key");
+        e.provider = "Claude".to_string();
+        let provider = create_provider_from_entry(&e);
+        assert!(provider.is_ok());
+        assert_eq!(provider.unwrap().name(), "claude");
+    }
 
     #[test]
     fn test_same_provider_different_models() {
