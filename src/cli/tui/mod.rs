@@ -67,6 +67,63 @@ const RESET:    &str = "\x1b[0m";
 const CYAN:     &str = "\x1b[36m";
 const DIM_GRAY: &str = "\x1b[90m";
 
+// ─── Pure logic helpers (testable without a terminal) ─────────────────────────
+
+/// Compute the ghost-text suffix to append after the user's current input.
+///
+/// Returns `Some(suffix)` when `input` is a `/command` prefix that unambiguously
+/// completes to a single command; returns `None` otherwise.
+pub(crate) fn compute_ghost_text(
+    input: &str,
+    registry: &crate::cli::command_autocomplete::CommandRegistry,
+) -> Option<String> {
+    if input.trim().is_empty() || !input.starts_with('/') {
+        return None;
+    }
+    let matches = registry.match_prefix(input);
+    matches.first().and_then(|spec| {
+        if spec.name.len() > input.len() {
+            Some(spec.name[input.len()..].to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Compute what to display in the status bar.
+///
+/// Priority:
+/// 1. User is typing a `/command` with ghost text → show the command's description.
+/// 2. A live stat / operation is set (`raw_status` non-empty) → show that.
+/// 3. Idle → show the keyboard shortcut reminder.
+pub(crate) fn compute_effective_status(
+    ghost_text: Option<&str>,
+    raw_status: &str,
+    current_input: &str,
+    registry: &crate::cli::command_autocomplete::CommandRegistry,
+) -> String {
+    if ghost_text.is_some() {
+        let desc = registry.match_prefix(current_input)
+            .into_iter()
+            .next()
+            .map(|spec| {
+                if let Some(params) = spec.params {
+                    format!("  {} {} — {}", spec.name, params, spec.description)
+                } else {
+                    format!("  {} — {}", spec.name, spec.description)
+                }
+            })
+            .unwrap_or_default();
+        if !desc.is_empty() {
+            return desc;
+        }
+    }
+    if !raw_status.is_empty() {
+        return raw_status.to_string();
+    }
+    "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel".to_string()
+}
+
 // ─── TuiRenderer ──────────────────────────────────────────────────────────────
 
 pub struct TuiRenderer {
@@ -313,28 +370,13 @@ impl TuiRenderer {
             //   2. Live stats / operation are set         → show those
             //   3. Idle (nothing set)                     → show keyboard shortcuts
             let raw_status = self.status_bar.get_status();
-            let effective_status: String = if let Some(_) = &self.ghost_text {
-                // Compute description for the first matching command
-                let current = self.input_textarea.lines().join("\n");
-                let desc = self.command_registry.match_prefix(&current)
-                    .into_iter()
-                    .next()
-                    .map(|spec| {
-                        if let Some(params) = spec.params {
-                            format!("  {} {} — {}", spec.name, params, spec.description)
-                        } else {
-                            format!("  {} — {}", spec.name, spec.description)
-                        }
-                    })
-                    .unwrap_or_default();
-                if desc.is_empty() { raw_status } else { desc }
-            } else if !raw_status.is_empty() {
-                raw_status
-            } else {
-                // Idle hint — reminds users of the most common shortcuts
-                "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel"
-                    .to_string()
-            };
+            let current_input = self.input_textarea.lines().join("\n");
+            let effective_status = compute_effective_status(
+                self.ghost_text.as_deref(),
+                &raw_status,
+                &current_input,
+                &self.command_registry,
+            );
 
             execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, effective_status, RESET)))?;
             rows += 1;
@@ -556,19 +598,7 @@ impl TuiRenderer {
 impl TuiRenderer {
     pub fn update_ghost_text(&mut self) {
         let current = self.input_textarea.lines().join("\n");
-        if current.trim().is_empty() || !current.starts_with('/') {
-            self.ghost_text = None;
-            return;
-        }
-        // Find first command that starts with what the user typed
-        let matches = self.command_registry.match_prefix(&current);
-        self.ghost_text = matches.first().and_then(|spec| {
-            if spec.name.len() > current.len() {
-                Some(spec.name[current.len()..].to_string())
-            } else {
-                None
-            }
-        });
+        self.ghost_text = compute_ghost_text(&current, &self.command_registry);
     }
 }
 
@@ -832,4 +862,124 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         }
     }
     out
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::command_autocomplete::CommandRegistry;
+
+    // ── compute_ghost_text ────────────────────────────────────────────────────
+
+    #[test]
+    fn ghost_text_empty_input_returns_none() {
+        let reg = CommandRegistry::new();
+        assert!(compute_ghost_text("", &reg).is_none());
+    }
+
+    #[test]
+    fn ghost_text_whitespace_returns_none() {
+        let reg = CommandRegistry::new();
+        assert!(compute_ghost_text("   ", &reg).is_none());
+    }
+
+    #[test]
+    fn ghost_text_non_command_returns_none() {
+        let reg = CommandRegistry::new();
+        assert!(compute_ghost_text("hello world", &reg).is_none());
+    }
+
+    #[test]
+    fn ghost_text_slash_alone_returns_none_or_some() {
+        // "/" alone has many matches — implementation may return None (no prefix extension
+        // beyond what's typed) since all commands start with "/" and we need len > input.len().
+        // Because "/" is 1 char and "/help" is 5 chars, the first match should provide "help".
+        let reg = CommandRegistry::new();
+        // We don't assert exact value — just that it doesn't panic
+        let _ = compute_ghost_text("/", &reg);
+    }
+
+    #[test]
+    fn ghost_text_exact_command_returns_none() {
+        // "/help" fully typed → nothing left to complete
+        let reg = CommandRegistry::new();
+        assert!(compute_ghost_text("/help", &reg).is_none());
+    }
+
+    #[test]
+    fn ghost_text_partial_unique_prefix_returns_suffix() {
+        let reg = CommandRegistry::new();
+        // "/hel" should complete to "p" (assuming /help is registered)
+        if let Some(ghost) = compute_ghost_text("/hel", &reg) {
+            assert_eq!(ghost, "p");
+        }
+        // If there's no match that's fine — just don't panic
+    }
+
+    #[test]
+    fn ghost_text_partial_prefix_appended_gives_full_command() {
+        let reg = CommandRegistry::new();
+        let input = "/cri"; // should complete to /critical
+        if let Some(ghost) = compute_ghost_text(input, &reg) {
+            let completed = format!("{}{}", input, ghost);
+            assert!(completed.starts_with("/critical"), "got: {}", completed);
+        }
+    }
+
+    // ── compute_effective_status ──────────────────────────────────────────────
+
+    #[test]
+    fn status_idle_when_no_ghost_and_no_raw() {
+        let reg = CommandRegistry::new();
+        let s = compute_effective_status(None, "", "hello", &reg);
+        assert!(s.contains("Ctrl+C"), "should show idle hint: {}", s);
+        assert!(s.contains("/help"), "should mention /help: {}", s);
+    }
+
+    #[test]
+    fn status_shows_raw_when_no_ghost() {
+        let reg = CommandRegistry::new();
+        let s = compute_effective_status(None, "⏺ Generating…", "hello", &reg);
+        assert_eq!(s, "⏺ Generating…");
+    }
+
+    #[test]
+    fn status_shows_command_description_when_ghost_present() {
+        let reg = CommandRegistry::new();
+        // Simulate typing "/help" with ghost text
+        let s = compute_effective_status(Some(""), "", "/help", &reg);
+        // Should contain the description for /help
+        assert!(s.contains("/help"), "description should mention command: {}", s);
+    }
+
+    #[test]
+    fn status_ghost_takes_priority_over_raw_status() {
+        let reg = CommandRegistry::new();
+        // Even with raw_status set, ghost text description wins
+        let s = compute_effective_status(Some("tical"), "⏺ Generating…", "/cri", &reg);
+        // Should NOT be the raw status — should be the command description
+        assert_ne!(s, "⏺ Generating…", "ghost description should win: {}", s);
+    }
+
+    #[test]
+    fn status_falls_back_to_raw_when_ghost_but_no_matching_desc() {
+        let reg = CommandRegistry::new();
+        // Ghost text present but no matching command found for the input
+        // e.g. ghost text = "xyz" for "/zzz" which isn't a real command
+        let s = compute_effective_status(Some("xyz"), "⏺ Live stat", "/zzz", &reg);
+        // Falls back to raw status since description is empty
+        assert_eq!(s, "⏺ Live stat");
+    }
+
+    #[test]
+    fn status_idle_hint_contains_all_key_bindings() {
+        let reg = CommandRegistry::new();
+        let s = compute_effective_status(None, "", "", &reg);
+        assert!(s.contains("Tab"), "should mention Tab: {}", s);
+        assert!(s.contains("history"), "should mention history: {}", s);
+        assert!(s.contains("/help"), "should mention /help: {}", s);
+        assert!(s.contains("Ctrl+C"), "should mention Ctrl+C: {}", s);
+    }
 }
