@@ -5,6 +5,41 @@ All notable changes to Shammah will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-02-22
+
+### Added
+- **Unified `[[providers]]` config format** (`src/config/provider.rs`): new `ProviderEntry` tagged
+  enum (claude/openai/grok/gemini/mistral/groq/local) replaces legacy `TeacherEntry` system;
+  backwards-compatible loader, save always writes new format
+- **Candle backend as default feature**: `default = ["onnx", "candle"]`; Qwen 2.5 KV cache enabled
+  so generation time no longer grows with conversation length; setup wizard filters to Qwen-only
+  when Candle is selected
+- **`Patch` tool** (`src/tools/implementations/patch.rs`): native unified-diff applier for
+  targeted file edits — parses `@@ -start,count +start,count @@` hunks, verifies context lines,
+  applies back-to-front; registered in REPL, agent, and daemon tool registries
+- **Full cursor movement in `AskUserQuestion` custom text input**: Left/Right, Home/End, Delete,
+  and char insertion at cursor position (Unicode-safe); block cursor rendered at correct offset
+  in both `Dialog` and `TabState`
+- **Tabbed multi-question dialog**: `show_llm_question` now calls `show_tabbed_dialog` when
+  2+ questions are present, so all questions are visible simultaneously with ←/→ tab navigation
+- **`DEFAULT_HTTP_ADDR`/`DEFAULT_WORKER_ADDR`/`DEFAULT_HTTP_PORT` constants** in
+  `src/config/constants.rs`; `ServerConfig::default()` uses them instead of string literals
+
+### Fixed
+- Scheduling stubs (`queue.rs`, `scheduler.rs`) now return explicit errors instead of silent
+  `Ok(fake_value)`; callers can detect that work was not performed (closes #8)
+- `batch_trainer::train_batch_internal` returns `bail!` instead of hardcoded loss values;
+  prevents callers from believing training succeeded when it did not (closes #11)
+- Removed `.unwrap()` panic risks in `event_loop.rs`, `dialog_widget.rs`, `memtree.rs`,
+  `repl.rs`, `tui/mod.rs`, `factory.rs`; replaced with `.expect("reason")` or `ok_or_else()`
+  error propagation (closes #9)
+- Char-index cursor rendering in `render_text_input` no longer panics on multi-byte Unicode
+
+### Changed
+- Block cursor `█` used consistently in setup wizard persona editor and all dialog custom-input
+  fields; insert cursor `│` removed (terminal convention)
+- `CLAUDE.md` documents mandatory regression test requirement for every bug fix
+
 ## [0.5.1] - 2026-02-22
 
 ### Added

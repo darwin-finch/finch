@@ -981,7 +981,7 @@ git push origin vX.Y.Z
 
 ## Current Project Status
 
-**Version**: 0.5.2-dev
+**Version**: 0.5.2
 **Last updated**: Feb 2026
 
 Core infrastructure is complete and production-ready. The project is a fully functional local-first AI coding assistant with ONNX Runtime inference, multi-turn tool execution, daemon architecture, LoRA fine-tuning infrastructure, and a professional TUI.
@@ -1010,10 +1010,10 @@ Key open items:
 - [#5](https://github.com/darwin-finch/finch/issues/5) Integration tests (daemon, LoRA, multi-provider, tool pass-through)
 - [#6](https://github.com/darwin-finch/finch/issues/6) Remove unused Candle imports (good first issue)
 - [#7](https://github.com/darwin-finch/finch/issues/7) LoRA training memory efficiency
-- [#8](https://github.com/darwin-finch/finch/issues/8) src/scheduling/ stubs — not wired to real code
-- [#9](https://github.com/darwin-finch/finch/issues/9) .unwrap() panic risks in production paths
-- [#10](https://github.com/darwin-finch/finch/issues/10) Hardcoded ports / max_tokens duplicated across files
-- [#11](https://github.com/darwin-finch/finch/issues/11) src/training/batch_trainer.rs returns fake loss (no real training)
+- [#8](https://github.com/darwin-finch/finch/issues/8) src/scheduling/ stubs — **CLOSED** (return honest errors in 0.5.2)
+- [#9](https://github.com/darwin-finch/finch/issues/9) .unwrap() panics — **CLOSED** (replaced in 0.5.2)
+- [#10](https://github.com/darwin-finch/finch/issues/10) Hardcoded ports — **CLOSED** (constants in 0.5.2)
+- [#11](https://github.com/darwin-finch/finch/issues/11) batch_trainer fake loss — **CLOSED** (honest error in 0.5.2)
 - [#21](https://github.com/darwin-finch/finch/issues/21) CLAUDE.md/FINCH.md auto-loading — **CLOSED** (implemented in 6353f3b)
 
 ## Reference Documents
