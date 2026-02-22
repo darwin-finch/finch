@@ -48,7 +48,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1:8000".to_string(),
+            bind_address: crate::config::constants::DEFAULT_HTTP_ADDR.to_string(),
             max_sessions: 100,
             session_timeout_minutes: 30,
             auth_enabled: false,

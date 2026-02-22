@@ -59,6 +59,7 @@ enum Command {
     /// Run HTTP daemon server
     Daemon {
         /// Bind address (default: 127.0.0.1:8000)
+        // constant: crate::config::constants::DEFAULT_HTTP_ADDR
         #[arg(long, default_value = "127.0.0.1:8000")]
         bind: String,
     },
@@ -88,6 +89,7 @@ enum Command {
     /// delegate work to this node. Shows node identity and capabilities.
     Worker {
         /// Bind address (default: 0.0.0.0:8000 — accepts external connections)
+        // constant: crate::config::constants::DEFAULT_WORKER_ADDR
         #[arg(long, default_value = "0.0.0.0:8000")]
         bind: String,
         /// Show node info and exit without starting server
