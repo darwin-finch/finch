@@ -97,9 +97,13 @@ impl QwenGenerator {
             })
             .ok_or_else(|| anyhow::anyhow!("No user message found"))?;
 
+        // Estimate input tokens (words * ~1.3 tokens/word is a common BPE heuristic)
+        let input_token_estimate = (query.split_whitespace().count() as f32 * 1.3) as u32;
+
         // Generate (blocking, so spawn_blocking)
         let local_generator = Arc::clone(&self.local_generator);
         let query = query.to_string();
+        let t0 = std::time::Instant::now();
 
         let generated = tokio::task::spawn_blocking(move || -> Result<_> {
             // Get write lock synchronously
@@ -118,6 +122,9 @@ impl QwenGenerator {
         .await
         .context("Failed to spawn blocking task for Qwen generation")??;
 
+        let latency_ms = t0.elapsed().as_millis() as u64;
+        let output_token_estimate = (generated.text.split_whitespace().count() as f32 * 1.3) as u32;
+
         Ok(GeneratorResponse {
             text: generated.text.clone(),
             content_blocks: vec![ContentBlock::Text {
@@ -129,9 +136,9 @@ impl QwenGenerator {
                 model: "Qwen2.5-3B".to_string(),
                 confidence: Some(generated.confidence),
                 stop_reason: None,
-                input_tokens: None,  // TODO: Track ONNX tokenizer input length
-                output_tokens: Some(generated.text.split_whitespace().count() as u32), // Rough estimate
-                latency_ms: None,    // TODO: Track generation timing
+                input_tokens: Some(input_token_estimate),
+                output_tokens: Some(output_token_estimate),
+                latency_ms: Some(latency_ms),
             },
         })
     }
