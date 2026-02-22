@@ -33,6 +33,7 @@ impl<'a> DialogWidget<'a> {
         allow_custom: bool,
         custom_input: &Option<String>,
         custom_mode_active: bool,
+        custom_cursor_pos: usize,
         help: &Option<String>,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -99,12 +100,9 @@ impl<'a> DialogWidget<'a> {
         if custom_mode_active {
             if let Some(input_text) = custom_input {
                 lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled("> ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
-                    // Use dialog option color (cyan) instead of ui.input which might be white
-                    Span::styled(input_text.clone(), Style::default().fg(self.colors.dialog.option.to_color())),
-                    Span::styled("█", Style::default().fg(self.colors.ui.cursor.to_color())),
-                ]));
+                lines.push(Line::from(
+                    Self::render_custom_input_spans(input_text, custom_cursor_pos, self.colors),
+                ));
             }
         }
 
@@ -121,7 +119,7 @@ impl<'a> DialogWidget<'a> {
         lines.push(Line::from(""));
         if custom_mode_active {
             lines.push(Line::from(Span::styled(
-                "Type your response | Enter: Submit | Esc: Cancel custom input",
+                "Type | ←/→: Move cursor | Home/End | Del | Enter: Submit | Esc: Cancel",
                 Style::default().fg(self.colors.ui.separator.to_color()),
             )));
         } else {
@@ -148,6 +146,7 @@ impl<'a> DialogWidget<'a> {
         allow_custom: bool,
         custom_input: &Option<String>,
         custom_mode_active: bool,
+        custom_cursor_pos: usize,
         help: &Option<String>,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -215,12 +214,9 @@ impl<'a> DialogWidget<'a> {
         if custom_mode_active {
             if let Some(input_text) = custom_input {
                 lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled("> ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
-                    // Use dialog option color (cyan) instead of ui.input which might be white
-                    Span::styled(input_text.clone(), Style::default().fg(self.colors.dialog.option.to_color())),
-                    Span::styled("█", Style::default().fg(self.colors.ui.cursor.to_color())),
-                ]));
+                lines.push(Line::from(
+                    Self::render_custom_input_spans(input_text, custom_cursor_pos, self.colors),
+                ));
             }
         }
 
@@ -237,7 +233,7 @@ impl<'a> DialogWidget<'a> {
         lines.push(Line::from(""));
         if custom_mode_active {
             lines.push(Line::from(Span::styled(
-                "Type your response | Enter: Submit | Esc: Cancel custom input",
+                "Type | ←/→: Move cursor | Home/End | Del | Enter: Submit | Esc: Cancel",
                 Style::default().fg(self.colors.ui.separator.to_color()),
             )));
         } else {
@@ -253,6 +249,56 @@ impl<'a> DialogWidget<'a> {
         }
 
         lines
+    }
+
+    /// Build the spans for a custom "Other" input line, placing the block cursor
+    /// at `cursor_pos` (char index).  Same 3-span approach as `render_text_input`.
+    fn render_custom_input_spans(
+        input: &str,
+        cursor_pos: usize,
+        colors: &ColorScheme,
+    ) -> Vec<Span<'static>> {
+        let mut spans = vec![Span::styled(
+            "> ",
+            Style::default()
+                .fg(colors.ui.cursor.to_color())
+                .add_modifier(Modifier::BOLD),
+        )];
+
+        if cursor_pos > 0 {
+            let before: String = input.chars().take(cursor_pos).collect();
+            spans.push(Span::styled(
+                before,
+                Style::default().fg(colors.dialog.option.to_color()),
+            ));
+        }
+
+        if let Some(cursor_ch) = input.chars().nth(cursor_pos) {
+            spans.push(Span::styled(
+                cursor_ch.to_string(),
+                Style::default()
+                    .fg(colors.dialog.selected_fg.to_color())
+                    .bg(colors.ui.cursor.to_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let after: String = input.chars().skip(cursor_pos + 1).collect();
+            if !after.is_empty() {
+                spans.push(Span::styled(
+                    after,
+                    Style::default().fg(colors.dialog.option.to_color()),
+                ));
+            }
+        } else {
+            // Cursor at end — show blank block
+            spans.push(Span::styled(
+                " ",
+                Style::default()
+                    .bg(colors.ui.cursor.to_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        spans
     }
 
     /// Render a text input dialog
@@ -428,6 +474,7 @@ impl<'a> Widget for DialogWidget<'a> {
                 *allow_custom,
                 &self.dialog.custom_input,
                 self.dialog.custom_mode_active,
+                self.dialog.custom_cursor_pos,
                 &self.dialog.help_message
             ),
 
@@ -443,6 +490,7 @@ impl<'a> Widget for DialogWidget<'a> {
                 *allow_custom,
                 &self.dialog.custom_input,
                 self.dialog.custom_mode_active,
+                self.dialog.custom_cursor_pos,
                 &self.dialog.help_message,
             ),
 
@@ -526,6 +574,7 @@ mod tests {
             false,      // allow_custom
             &None,      // custom_input
             false,      // custom_mode_active
+            0,          // custom_cursor_pos
             &None,      // help
         );
 
@@ -555,6 +604,7 @@ mod tests {
             false,      // allow_custom
             &None,      // custom_input
             false,      // custom_mode_active
+            0,          // custom_cursor_pos
             &None,      // help
         );
 

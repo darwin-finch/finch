@@ -29,6 +29,8 @@ pub struct TabState {
     pub custom_input: Option<String>,
     /// Whether custom input mode is active
     pub custom_mode_active: bool,
+    /// Char-index cursor position inside `custom_input`
+    pub custom_cursor_pos: usize,
     /// Whether this question has been answered
     pub answered: bool,
     /// The answer provided (if answered)
@@ -43,9 +45,18 @@ impl TabState {
             selected_indices: HashSet::new(),
             custom_input: Some(String::new()),
             custom_mode_active: false,
+            custom_cursor_pos: 0,
             answered: false,
             answer: None,
         }
+    }
+
+    /// Convert a char-index to its byte offset in `s`.
+    fn char_to_byte_offset(s: &str, char_pos: usize) -> usize {
+        s.char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len())
     }
 
     /// Get the current answer (either selected option or custom text)
@@ -273,16 +284,53 @@ impl TabbedDialog {
 
         match key.code {
             KeyCode::Char(c) => {
-                // Insert character
                 if let Some(ref mut input) = tab.custom_input {
-                    input.push(c);
+                    let byte_pos = TabState::char_to_byte_offset(input, tab.custom_cursor_pos);
+                    input.insert(byte_pos, c);
+                    tab.custom_cursor_pos += 1;
                 }
                 None
             }
             KeyCode::Backspace => {
-                // Delete last character
+                if tab.custom_cursor_pos > 0 {
+                    if let Some(ref mut input) = tab.custom_input {
+                        tab.custom_cursor_pos -= 1;
+                        let byte_pos = TabState::char_to_byte_offset(input, tab.custom_cursor_pos);
+                        input.remove(byte_pos);
+                    }
+                }
+                None
+            }
+            KeyCode::Delete => {
                 if let Some(ref mut input) = tab.custom_input {
-                    input.pop();
+                    let char_count = input.chars().count();
+                    if tab.custom_cursor_pos < char_count {
+                        let byte_pos = TabState::char_to_byte_offset(input, tab.custom_cursor_pos);
+                        input.remove(byte_pos);
+                    }
+                }
+                None
+            }
+            KeyCode::Left => {
+                tab.custom_cursor_pos = tab.custom_cursor_pos.saturating_sub(1);
+                None
+            }
+            KeyCode::Right => {
+                if let Some(ref input) = tab.custom_input {
+                    let char_count = input.chars().count();
+                    if tab.custom_cursor_pos < char_count {
+                        tab.custom_cursor_pos += 1;
+                    }
+                }
+                None
+            }
+            KeyCode::Home => {
+                tab.custom_cursor_pos = 0;
+                None
+            }
+            KeyCode::End => {
+                if let Some(ref input) = tab.custom_input {
+                    tab.custom_cursor_pos = input.chars().count();
                 }
                 None
             }
@@ -292,6 +340,7 @@ impl TabbedDialog {
                     tab.answer = Some(answer);
                     tab.answered = true;
                     tab.custom_mode_active = false;
+                    tab.custom_cursor_pos = 0;
 
                     // Move to next tab or submit if last
                     if self.current_tab == self.tabs.len() - 1 {
@@ -310,6 +359,7 @@ impl TabbedDialog {
                 if let Some(ref mut input) = tab.custom_input {
                     input.clear();
                 }
+                tab.custom_cursor_pos = 0;
                 None
             }
             _ => None,
@@ -607,6 +657,46 @@ mod tests {
         assert!(!d.current_tab().custom_mode_active);
         // Input should be cleared
         assert_eq!(d.current_tab().custom_input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_custom_mode_cursor_movement() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('o'))); // enter custom mode
+        d.handle_key_event(key(KeyCode::Char('a')));
+        d.handle_key_event(key(KeyCode::Char('c')));
+        // cursor is at 2. Move left and insert 'b' between 'a' and 'c'
+        d.handle_key_event(key(KeyCode::Home));
+        assert_eq!(d.current_tab().custom_cursor_pos, 0);
+        d.handle_key_event(key(KeyCode::Right));
+        d.handle_key_event(key(KeyCode::Char('b')));
+        assert_eq!(d.current_tab().custom_input.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn test_custom_mode_delete_key() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('o')));
+        d.handle_key_event(key(KeyCode::Char('a')));
+        d.handle_key_event(key(KeyCode::Char('b')));
+        d.handle_key_event(key(KeyCode::Char('c')));
+        // Move to pos 1, delete 'b'
+        d.handle_key_event(key(KeyCode::Home));
+        d.handle_key_event(key(KeyCode::Right));
+        d.handle_key_event(key(KeyCode::Delete));
+        assert_eq!(d.current_tab().custom_input.as_deref(), Some("ac"));
+    }
+
+    #[test]
+    fn test_custom_mode_esc_resets_cursor() {
+        let mut d = single_tab_dialog(&["A", "B"]);
+        d.handle_key_event(key(KeyCode::Char('o')));
+        d.handle_key_event(key(KeyCode::Char('x')));
+        d.handle_key_event(key(KeyCode::Char('y')));
+        assert_eq!(d.current_tab().custom_cursor_pos, 2);
+        d.handle_key_event(key(KeyCode::Esc));
+        assert_eq!(d.current_tab().custom_cursor_pos, 0);
+        assert!(!d.current_tab().custom_mode_active);
     }
 
     #[test]

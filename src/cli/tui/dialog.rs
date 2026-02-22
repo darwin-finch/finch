@@ -71,6 +71,7 @@ pub struct Dialog {
     pub help_message: Option<String>,
     pub custom_input: Option<String>,  // Stores custom text if "Other" is being entered
     pub custom_mode_active: bool,       // Whether user is currently typing custom text
+    pub custom_cursor_pos: usize,       // Char-index cursor in custom_input
 }
 
 impl Dialog {
@@ -86,6 +87,7 @@ impl Dialog {
             help_message: None,
             custom_input: None,
             custom_mode_active: false,
+            custom_cursor_pos: 0,
         }
     }
 
@@ -101,6 +103,7 @@ impl Dialog {
             help_message: None,
             custom_input: Some(String::new()),
             custom_mode_active: false,
+            custom_cursor_pos: 0,
         }
     }
 
@@ -117,6 +120,7 @@ impl Dialog {
             help_message: None,
             custom_input: None,
             custom_mode_active: false,
+            custom_cursor_pos: 0,
         }
     }
 
@@ -133,6 +137,7 @@ impl Dialog {
             help_message: None,
             custom_input: Some(String::new()),
             custom_mode_active: false,
+            custom_cursor_pos: 0,
         }
     }
 
@@ -150,6 +155,7 @@ impl Dialog {
             help_message: None,
             custom_input: None,
             custom_mode_active: false,
+            custom_cursor_pos: 0,
         }
     }
 
@@ -166,6 +172,7 @@ impl Dialog {
             help_message: None,
             custom_input: None,
             custom_mode_active: false,
+            custom_cursor_pos: 0,
         }
     }
 
@@ -221,20 +228,65 @@ impl Dialog {
         }
     }
 
+    /// Convert a char-index to its byte offset in `s`.
+    fn char_to_byte_offset(s: &str, char_pos: usize) -> usize {
+        s.char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len())
+    }
+
     /// Handle key events when in custom text input mode
     fn handle_custom_input_key(&mut self, key: KeyEvent) -> Option<DialogResult> {
         match key.code {
             KeyCode::Char(c) => {
-                // Insert character
                 if let Some(ref mut input) = self.custom_input {
-                    input.push(c);
+                    let byte_pos = Self::char_to_byte_offset(input, self.custom_cursor_pos);
+                    input.insert(byte_pos, c);
+                    self.custom_cursor_pos += 1;
                 }
                 None
             }
             KeyCode::Backspace => {
-                // Delete last character
+                if self.custom_cursor_pos > 0 {
+                    if let Some(ref mut input) = self.custom_input {
+                        self.custom_cursor_pos -= 1;
+                        let byte_pos = Self::char_to_byte_offset(input, self.custom_cursor_pos);
+                        input.remove(byte_pos);
+                    }
+                }
+                None
+            }
+            KeyCode::Delete => {
                 if let Some(ref mut input) = self.custom_input {
-                    input.pop();
+                    let char_count = input.chars().count();
+                    if self.custom_cursor_pos < char_count {
+                        let byte_pos = Self::char_to_byte_offset(input, self.custom_cursor_pos);
+                        input.remove(byte_pos);
+                    }
+                }
+                None
+            }
+            KeyCode::Left => {
+                self.custom_cursor_pos = self.custom_cursor_pos.saturating_sub(1);
+                None
+            }
+            KeyCode::Right => {
+                if let Some(ref input) = self.custom_input {
+                    let char_count = input.chars().count();
+                    if self.custom_cursor_pos < char_count {
+                        self.custom_cursor_pos += 1;
+                    }
+                }
+                None
+            }
+            KeyCode::Home => {
+                self.custom_cursor_pos = 0;
+                None
+            }
+            KeyCode::End => {
+                if let Some(ref input) = self.custom_input {
+                    self.custom_cursor_pos = input.chars().count();
                 }
                 None
             }
@@ -256,6 +308,7 @@ impl Dialog {
                 if let Some(ref mut input) = self.custom_input {
                     input.clear();
                 }
+                self.custom_cursor_pos = 0;
                 None
             }
             _ => None,
@@ -834,6 +887,102 @@ mod tests {
         // 'o' key with allow_custom=false should not activate custom mode
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
         assert!(!dialog.custom_mode_active);
+    }
+
+    // ─── custom text cursor movement ──────────────────────────────────────────
+
+    #[test]
+    fn test_custom_text_cursor_insert_at_position() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o'))); // enter custom mode
+        // Type "ac"
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('c')));
+        // Move to position 1 (between 'a' and 'c'), insert 'b'
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Home));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Right));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('b')));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::CustomText("abc".to_string())));
+    }
+
+    #[test]
+    fn test_custom_text_cursor_left_right_movement() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('y')));
+        // cursor is at 2 (end). Left moves to 1, Right brings back to 2.
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Left));
+        assert_eq!(dialog.custom_cursor_pos, 1);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Right));
+        assert_eq!(dialog.custom_cursor_pos, 2);
+        // Right at end should not exceed char_count
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Right));
+        assert_eq!(dialog.custom_cursor_pos, 2);
+    }
+
+    #[test]
+    fn test_custom_text_home_end_keys() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        for c in "hello".chars() {
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert_eq!(dialog.custom_cursor_pos, 5);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Home));
+        assert_eq!(dialog.custom_cursor_pos, 0);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::End));
+        assert_eq!(dialog.custom_cursor_pos, 5);
+    }
+
+    #[test]
+    fn test_custom_text_delete_key() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('b')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('c')));
+        // Move to position 1 and delete 'b' (the char at cursor)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Home));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Right)); // pos 1
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Delete));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::CustomText("ac".to_string())));
+    }
+
+    #[test]
+    fn test_custom_text_esc_resets_cursor() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('h')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('i')));
+        assert_eq!(dialog.custom_cursor_pos, 2);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(dialog.custom_cursor_pos, 0);
+        assert!(!dialog.custom_mode_active);
+    }
+
+    #[test]
+    fn test_custom_text_backspace_moves_cursor() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('b')));
+        assert_eq!(dialog.custom_cursor_pos, 2);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(dialog.custom_cursor_pos, 1);
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::CustomText("a".to_string())));
+    }
+
+    #[test]
+    fn test_custom_text_left_at_start_noop() {
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        // cursor already at 0
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Left));
+        assert_eq!(dialog.custom_cursor_pos, 0);
     }
 
     // ─── help message ─────────────────────────────────────────────────────────

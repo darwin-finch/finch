@@ -920,6 +920,9 @@ impl TuiRenderer {
     }
 
     /// Show structured questions from the LLM (AskUserQuestion tool).
+    ///
+    /// - 1 question  → single inline `show_dialog` (same as before)
+    /// - 2+ questions → `show_tabbed_dialog` so all questions are visible at once
     pub fn show_llm_question(
         &mut self,
         input: &crate::cli::AskUserQuestionInput,
@@ -927,9 +930,22 @@ impl TuiRenderer {
         use crate::cli::llm_dialogs;
         use std::collections::HashMap;
 
-        let mut answers: HashMap<String, String> = HashMap::new();
+        if input.questions.len() > 1 {
+            let tabbed = TabbedDialog::new(input.questions.clone(), None);
+            let result = self.show_tabbed_dialog(tabbed)?;
+            let answers = match result {
+                TabbedDialogResult::Completed(answers) => answers,
+                TabbedDialogResult::Cancelled => HashMap::new(),
+            };
+            return Ok(crate::cli::AskUserQuestionOutput {
+                questions: input.questions.clone(),
+                answers,
+            });
+        }
 
-        for question in &input.questions {
+        // Single question — inline dialog path
+        let mut answers: HashMap<String, String> = HashMap::new();
+        if let Some(question) = input.questions.first() {
             let dialog  = llm_dialogs::question_to_dialog(question);
             let result  = self.show_dialog(dialog)?;
             if let Some(answer) = llm_dialogs::extract_answer(question, &result) {

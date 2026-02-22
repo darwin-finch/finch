@@ -161,13 +161,36 @@ impl<'a> TabbedDialogWidget<'a> {
 
         // Render custom input field inline (always visible)
         if tab_state.custom_mode_active {
-            // Show custom text input with cursor
+            // Show custom text input with cursor at custom_cursor_pos
             let input_text = tab_state.custom_input.as_ref().map(|s| s.as_str()).unwrap_or("");
-            lines.push(Line::from(vec![
-                Span::styled("❯ ", Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD)),
-                Span::styled(input_text.to_string(), Style::default().fg(self.colors.dialog.option.to_color())),
-                Span::styled("█", Style::default().fg(self.colors.ui.cursor.to_color())),
-            ]));
+            let cursor_pos = tab_state.custom_cursor_pos;
+            let mut spans = vec![Span::styled(
+                "❯ ",
+                Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD),
+            )];
+            if cursor_pos > 0 {
+                let before: String = input_text.chars().take(cursor_pos).collect();
+                spans.push(Span::styled(before, Style::default().fg(self.colors.dialog.option.to_color())));
+            }
+            if let Some(cursor_ch) = input_text.chars().nth(cursor_pos) {
+                spans.push(Span::styled(
+                    cursor_ch.to_string(),
+                    Style::default()
+                        .fg(self.colors.dialog.selected_fg.to_color())
+                        .bg(self.colors.ui.cursor.to_color())
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let after: String = input_text.chars().skip(cursor_pos + 1).collect();
+                if !after.is_empty() {
+                    spans.push(Span::styled(after, Style::default().fg(self.colors.dialog.option.to_color())));
+                }
+            } else {
+                spans.push(Span::styled(
+                    " ",
+                    Style::default().bg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::from(spans));
 
             // Show "Submit" option if there's custom text
             if !input_text.trim().is_empty() {
@@ -191,7 +214,7 @@ impl<'a> TabbedDialogWidget<'a> {
     /// Render help text / keybindings
     fn render_help(&self, tab_state: &super::tabbed_dialog::TabState) -> Vec<Line<'static>> {
         let help_text = if tab_state.custom_mode_active {
-            "Type custom response | Enter: Submit | Esc: Cancel | Backspace: Delete"
+            "Type | ←/→: Move cursor | Home/End | Del | Enter: Submit | Esc: Cancel"
         } else if tab_state.question.multi_select {
             "←/→: Switch tabs | ↑/↓: Navigate | Space: Toggle | Enter: Submit | o: Other | Esc: Cancel"
         } else {
