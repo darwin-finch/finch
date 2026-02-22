@@ -374,9 +374,34 @@ Each provider has an adapter that handles:
 4. Graceful degradation ensures user always gets response
 ```
 
+**Unified `[[providers]]` Config Format:**
+
+```toml
+[[providers]]
+type = "claude"
+api_key = "sk-ant-..."
+
+[[providers]]
+type = "grok"
+api_key = "xai-..."
+model = "grok-code-fast-1"
+
+[[providers]]
+type = "local"
+inference_provider = "onnx"
+execution_target = "coreml"
+model_family = "qwen2"
+model_size = "medium"
+enabled = true
+```
+
+The `ProviderEntry` enum (`src/config/provider.rs`) has variants for each cloud provider plus `Local`. The factory (`src/providers/factory.rs`) converts entries to `Arc<dyn LlmProvider>` instances. The old `[[teachers]]` format is still accepted and auto-migrated on save.
+
 **Key Files:**
 - `src/providers/` - Provider-specific adapters
-- `src/config/settings.rs` - TeacherEntry configuration
+- `src/config/provider.rs` - `ProviderEntry` tagged enum
+- `src/config/settings.rs` - `TeacherEntry` (legacy, kept for internal use)
+- `src/providers/factory.rs` - `create_provider_from_entry()`, `create_providers_from_entries()`
 - `src/cli/setup_wizard.rs` - Multi-provider setup UI
 
 ### 8. MCP (Model Context Protocol) Plugin System
@@ -489,7 +514,54 @@ The `rust-mcp-sdk` crate has private internal types (`ClientRuntime`) that can't
 - MCP Specification: https://modelcontextprotocol.io/specification/2025-11-25/
 - MCP Servers: https://github.com/modelcontextprotocol/servers
 
-### 9. Conversation Management
+### 9. Context Assembly (`src/context/`)
+
+**Purpose:** Automatically discover and inject project-level AI instructions (`CLAUDE.md` / `FINCH.md`) into the system prompt at startup, without any user configuration.
+
+**Load Order (outermost → highest priority):**
+
+```
+~/.claude/CLAUDE.md           ← user-level (Claude Code convention)
+~/.finch/FINCH.md             ← user-level (Finch convention)
+/CLAUDE.md                    ← filesystem root
+/Users/CLAUDE.md
+/Users/alice/projects/CLAUDE.md
+/Users/alice/projects/myapp/CLAUDE.md   ← cwd (highest priority)
+```
+
+Within the same directory, `CLAUDE.md` is loaded before `FINCH.md`. All non-empty sections are joined with `\n\n---\n\n` and injected into the system prompt under `## Project Instructions`.
+
+**`FINCH.md` — Vendor-Neutral Convention:**
+
+`FINCH.md` is supported as a tool-agnostic alternative to the Anthropic-specific `CLAUDE.md` name. Teams can use `FINCH.md` for AI instructions that should work across multiple tools (Finch, Cursor, etc.).
+
+**System Prompt Injection:**
+
+```
+[CODING_SYSTEM_PROMPT]
+
+Working directory: /Users/alice/projects/myapp
+
+## Project Instructions
+
+# Project-level CLAUDE.md content here
+Always prefer iterator chains.
+Never use .unwrap() in production.
+
+---
+
+# Project-level FINCH.md content here
+Match the code style in src/lib.rs.
+```
+
+**Integration point:** `ClaudeGenerator::new()` calls `collect_claude_md_context(cwd)` and stores the result in `self.claude_md_context`. `build_system_prompt(cwd, claude_md)` injects it.
+
+**Key Files:**
+- `src/context/claude_md.rs` - `collect_claude_md_context()` with 6 unit tests
+- `src/context/mod.rs` - public re-export
+- `src/generators/claude.rs` - `ClaudeGenerator`, `build_system_prompt()`
+
+### 10. Conversation Management
 
 **Purpose:** Manage multi-turn conversation history with context window limits.
 
@@ -755,5 +827,5 @@ Stored in: `~/.finch/training_queue.jsonl`
 
 ---
 
-**Current Version:** 0.4.0 (Production-Ready with Tool Confirmations)
-**Last Updated:** 2026-02-14
+**Current Version:** 0.5.0-dev
+**Last Updated:** 2026-02-22

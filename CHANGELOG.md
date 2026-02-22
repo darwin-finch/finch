@@ -5,6 +5,29 @@ All notable changes to Shammah will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 0.5.0-dev
+
+### Added
+- **Context auto-loading**: Finch now automatically discovers and injects `CLAUDE.md` / `FINCH.md`
+  project instructions into the system prompt on startup (matching Claude Code behavior)
+  - `~/.claude/CLAUDE.md` — user-level Claude Code defaults
+  - `~/.finch/FINCH.md` — user-level Finch defaults
+  - `CLAUDE.md` / `FINCH.md` found walking upward from cwd to filesystem root (outermost first)
+  - `FINCH.md` supported as a vendor-neutral, tool-agnostic naming convention
+  - New module: `src/context/claude_md.rs` with 6 unit tests
+  - New module: `src/context/mod.rs`
+- **Unified `[[providers]]` config format**: New `ProviderEntry` tagged enum replaces the legacy
+  `[fallback]` / `TeacherEntry` system for configuring cloud providers and local models
+  - Supports Claude, OpenAI, Grok, Gemini, Mistral, Groq, and Local as first-class entries
+  - Backwards-compatible: old `[[teachers]]` format auto-migrates on load
+  - Save always writes the new `[[providers]]` format
+- **Darwin finch ASCII bird banner** at REPL startup
+
+### Changed
+- `build_system_prompt(cwd, claude_md)` — added `claude_md: Option<&str>` parameter; injects
+  collected context under `## Project Instructions` header
+- Linux CI runner bumped to ubuntu-24.04 (glibc 2.39) for prebuilt ONNX Runtime compatibility
+
 ## [0.2.2] - 2026-02-18
 
 ### Fixed

@@ -534,19 +534,64 @@ See `TUI_SCROLLBACK_FIX_COMPLETE.md` for:
 - `src/claude/client.rs` - ClaudeClient, send_message(), send_message_stream()
 - `src/claude/types.rs` - API request/response types
 
-#### 8. **Configuration** (`src/config/`)
+#### 8. **Context Assembly** (`src/context/`)
+
+**Purpose:** Discover and inject project-level AI instructions into the system prompt at startup, matching Claude Code behavior.
+
+**How It Works:**
+
+On startup, `ClaudeGenerator::new()` calls `collect_claude_md_context(cwd)` which:
+
+1. Reads `~/.claude/CLAUDE.md` — user-level Claude Code defaults
+2. Reads `~/.finch/FINCH.md` — user-level Finch defaults
+3. Walks from filesystem root down to `cwd`, loading any `CLAUDE.md` then `FINCH.md` found in each directory (outermost first; cwd wins)
+4. Joins non-empty sections with `\n\n---\n\n`
+5. Injects the result into the system prompt under `## Project Instructions`
+
+**FINCH.md as an Open Standard:**
+
+`FINCH.md` is supported as a vendor-neutral alternative to the Anthropic-specific `CLAUDE.md` name. Teams that want their AI-assistant instructions to work across multiple tools (Finch, Cursor, other assistants) can use `FINCH.md` instead. When both exist in the same directory, both are loaded (`CLAUDE.md` first).
+
+**Example project instruction file (`~/myproject/FINCH.md`):**
+```markdown
+Always prefer iterator chains over manual loops.
+Never use .unwrap() in production code.
+Follow the patterns in docs/ARCHITECTURE.md.
+```
+
+**Key Files:**
+- `src/context/claude_md.rs` - `collect_claude_md_context()`, `read_non_empty()`
+- `src/context/mod.rs` - public re-export
+- `src/generators/claude.rs` - `build_system_prompt(cwd, claude_md)`, `ClaudeGenerator`
+
+#### 9. **Configuration** (`src/config/`)
 
 **Purpose:** User preferences and API key management
 
-**Config File (`~/.finch/config.toml`):**
-```toml
-api_key = "your_anthropic_api_key"
-streaming_enabled = true
+**Config File (`~/.finch/config.toml`) — Unified `[[providers]]` format:**
 
-[model]
-# Optional: Force specific model size
-# size = "3B"
-device = "auto"  # "auto", "metal", "cpu"
+```toml
+# One entry per provider (cloud or local).
+# Use `finch setup` to generate this interactively.
+
+[[providers]]
+type = "claude"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"   # optional, overrides default
+
+[[providers]]
+type = "grok"
+api_key = "xai-..."
+model = "grok-code-fast-1"
+name = "Grok (coding)"        # optional display name
+
+[[providers]]
+type = "local"
+inference_provider = "onnx"
+execution_target = "coreml"   # "coreml" | "cpu"
+model_family = "qwen2"
+model_size = "medium"         # "small"=1.5B "medium"=3B "large"=7B "xlarge"=14B
+enabled = true
 
 [lora]
 rank = 16
@@ -555,17 +600,21 @@ learning_rate = 1e-4
 batch_size = 4
 auto_train = true
 auto_train_threshold = 10
-
-# Weighted feedback
 high_weight = 10.0
 medium_weight = 3.0
 normal_weight = 1.0
-
 adapters_dir = "~/.finch/adapters"
 ```
 
+**Supported `type` values:** `claude`, `openai`, `grok`, `gemini`, `mistral`, `groq`, `local`
+
+**Backwards-compatible:** The old `[[teachers]]` format still loads correctly; the file is
+automatically rewritten to `[[providers]]` format on next save.
+
 **Key Files:**
-- `src/config/mod.rs` - Config loading and validation
+- `src/config/mod.rs` - Config loading, validation, migration
+- `src/config/provider.rs` - `ProviderEntry` tagged enum, conversion helpers
+- `src/config/settings.rs` - `TeacherEntry` (kept for internal/legacy use)
 
 ### Technology Stack
 
@@ -909,6 +958,42 @@ Changes:
 Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
 ```
 
+### Release Process
+
+**How to publish a new release:**
+
+```bash
+# 1. Bump version in Cargo.toml
+#    [package] version = "X.Y.Z"
+
+# 2. Commit the version bump
+git add Cargo.toml
+git commit -m "chore: bump version to vX.Y.Z"
+
+# 3. Tag and push — this triggers the release workflow automatically
+git tag vX.Y.Z
+git push origin main
+git push origin vX.Y.Z
+```
+
+The GitHub Actions release workflow (`.github/workflows/release.yml`) will:
+- Build `finch-macos-arm64.tar.gz` (macOS Apple Silicon, `macos-14` runner)
+- Build `finch-linux-x86_64.tar.gz` (Linux x86_64, `ubuntu-24.04` runner)
+- Create the GitHub Release with both binaries attached
+
+**Re-releasing the same tag** (e.g. to fix a broken release before anyone installs it):
+```bash
+git tag -d vX.Y.Z
+git push origin :refs/tags/vX.Y.Z
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+**Platform notes (as of Feb 2026):**
+- Intel macOS (`x86_64-apple-darwin`) is **not supported** — `ort` has no prebuilt binaries for it and GitHub deprecated Intel Mac runners (June 2025)
+- Linux runner must be `ubuntu-24.04`+ — the prebuilt ONNX Runtime binary requires glibc 2.38+ (`__isoc23_strtoll` etc.); Ubuntu 22.04 only has glibc 2.35
+- `CoreML`/macOS-only deps in `Cargo.toml` must stay **above** `[target.'cfg(target_os = "macos")'.dependencies]` — TOML scopes everything after a section header until the next one
+
 ## Current Project Status
 
 **Version**: 0.5.2-dev
@@ -940,6 +1025,11 @@ Key open items:
 - [#5](https://github.com/darwin-finch/finch/issues/5) Integration tests (daemon, LoRA, multi-provider, tool pass-through)
 - [#6](https://github.com/darwin-finch/finch/issues/6) Remove unused Candle imports (good first issue)
 - [#7](https://github.com/darwin-finch/finch/issues/7) LoRA training memory efficiency
+- [#8](https://github.com/darwin-finch/finch/issues/8) src/scheduling/ stubs — not wired to real code
+- [#9](https://github.com/darwin-finch/finch/issues/9) .unwrap() panic risks in production paths
+- [#10](https://github.com/darwin-finch/finch/issues/10) Hardcoded ports / max_tokens duplicated across files
+- [#11](https://github.com/darwin-finch/finch/issues/11) src/training/batch_trainer.rs returns fake loss (no real training)
+- [#21](https://github.com/darwin-finch/finch/issues/21) CLAUDE.md/FINCH.md auto-loading — **CLOSED** (implemented in 6353f3b)
 
 ## Reference Documents
 

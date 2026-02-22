@@ -1,148 +1,139 @@
-# Multi-Provider LLM Configuration
+# Multi-Provider Configuration
 
-Shammah now supports multiple LLM providers for the fallback API (used when the local Qwen model is not ready or not confident). You can choose between Claude, OpenAI, Grok, and more.
+Finch supports multiple cloud AI providers (Claude, OpenAI, Grok, Gemini, Mistral, Groq) and the
+local ONNX model, all configured through a unified `[[providers]]` array in `~/.finch/config.toml`.
 
-## Configuration File Location
+The easiest way to configure providers is the interactive setup wizard:
 
-Configuration is stored in `~/.finch/config.toml`
+```bash
+finch setup
+```
 
 ## Configuration Format
 
-### Using Claude (Default)
-
-```toml
-api_key = "sk-ant-..."  # Kept for backwards compatibility
-streaming_enabled = true
-
-[fallback]
-provider = "claude"
-
-[fallback.claude]
-api_key = "sk-ant-api03-..."
-model = "claude-sonnet-4-20250514"  # Optional: override default model
-```
-
-### Using OpenAI
-
-```toml
-api_key = "sk-ant-..."  # For backwards compatibility (ignored if fallback is configured)
-streaming_enabled = true
-
-[fallback]
-provider = "openai"
-
-[fallback.openai]
-api_key = "sk-proj-..."
-model = "gpt-4o"  # Optional: defaults to gpt-4o
-```
-
-### Using Grok (X.AI)
-
-```toml
-streaming_enabled = true
-
-[fallback]
-provider = "grok"
-
-[fallback.grok]
-api_key = "xai-..."
-model = "grok-beta"  # Optional: defaults to grok-beta
-```
-
-### Using Gemini (Google)
-
-```toml
-streaming_enabled = true
-
-[fallback]
-provider = "gemini"
-
-[fallback.gemini]
-api_key = "AIza..."
-model = "gemini-2.0-flash-exp"  # Optional: defaults to gemini-2.0-flash-exp
-```
-
-## Multi-Provider Configuration
-
-You can configure multiple providers and switch between them by changing the `provider` field:
-
-```toml
-streaming_enabled = true
-
-[fallback]
-provider = "claude"  # Change to "openai", "grok", "gemini", etc.
-
-# Configure all your providers
-[fallback.claude]
-api_key = "sk-ant-..."
-model = "claude-sonnet-4-20250514"
-
-[fallback.openai]
-api_key = "sk-proj-..."
-model = "gpt-4o"
-
-[fallback.grok]
-api_key = "xai-..."
-model = "grok-beta"
-
-[fallback.gemini]
-api_key = "AIza..."
-model = "gemini-2.0-flash-exp"
-```
-
-## Provider Details
+Providers are declared as a TOML array of tables. Each entry has a `type` field that identifies
+the provider, plus provider-specific fields.
 
 ### Claude (Anthropic)
 
-- **API Key**: Get from https://console.anthropic.com/
-- **Default Model**: `claude-sonnet-4-20250514`
-- **Supports**: Streaming, tool calling
-- **Cost**: $3/MTok input, $15/MTok output (Sonnet 4)
+```toml
+[[providers]]
+type = "claude"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"   # optional — default: claude-sonnet-4-6
+name = "Claude"               # optional display name
+```
+
+Get an API key: https://console.anthropic.com/
 
 ### OpenAI
 
-- **API Key**: Get from https://platform.openai.com/
-- **Default Model**: `gpt-4o`
-- **Supports**: Streaming, tool calling
-- **Cost**: $2.50/MTok input, $10/MTok output (GPT-4o)
+```toml
+[[providers]]
+type = "openai"
+api_key = "sk-proj-..."
+model = "gpt-4o"              # optional — default: gpt-4o
+```
 
-### Grok (X.AI)
+Get an API key: https://platform.openai.com/
 
-- **API Key**: Get from https://console.x.ai/
-- **Default Model**: `grok-beta`
-- **Supports**: Streaming, tool calling
-- **Cost**: Check X.AI pricing
+### Grok (xAI)
+
+```toml
+[[providers]]
+type = "grok"
+api_key = "xai-..."
+model = "grok-code-fast-1"    # optional — default: grok-beta
+```
+
+Get an API key: https://console.x.ai/
+Also available via X Premium+ subscription.
 
 ### Gemini (Google)
 
-- **API Key**: Get from https://aistudio.google.com/apikey
-- **Default Model**: `gemini-2.0-flash-exp`
-- **Supports**: Streaming, tool calling (function declarations)
-- **Cost**: Free tier available, check Google AI Studio pricing
-- **Note**: Experimental models may have rate limits
+```toml
+[[providers]]
+type = "gemini"
+api_key = "AIza..."
+model = "gemini-2.0-flash-exp"  # optional
+```
+
+Get an API key: https://aistudio.google.com/apikey
+
+### Mistral
+
+```toml
+[[providers]]
+type = "mistral"
+api_key = "..."
+model = "mistral-large-latest"  # optional
+```
+
+### Groq
+
+```toml
+[[providers]]
+type = "groq"
+api_key = "gsk_..."
+model = "llama-3.3-70b-versatile"  # optional
+```
+
+### Local Model (ONNX)
+
+```toml
+[[providers]]
+type = "local"
+inference_provider = "onnx"
+execution_target = "coreml"   # "coreml" (Apple Silicon) | "cpu"
+model_family = "qwen2"
+model_size = "medium"         # "small"=1.5B "medium"=3B "large"=7B "xlarge"=14B
+enabled = true
+```
+
+## Multi-Provider Example
+
+You can list multiple cloud providers. The first one in the array is the active provider;
+use `/teacher <name>` in the REPL or re-run `finch setup` to switch.
+
+```toml
+[[providers]]
+type = "claude"
+api_key = "sk-ant-..."
+model = "claude-sonnet-4-6"
+
+[[providers]]
+type = "grok"
+api_key = "xai-..."
+model = "grok-code-fast-1"
+name = "Grok (fast)"
+
+[[providers]]
+type = "openai"
+api_key = "sk-proj-..."
+
+[[providers]]
+type = "local"
+inference_provider = "onnx"
+execution_target = "coreml"
+model_family = "qwen2"
+model_size = "medium"
+enabled = true
+```
 
 ## How Provider Selection Works
 
-1. **Startup**: Shammah reads the configuration file
-2. **Provider Creation**: Creates the configured provider (Claude, OpenAI, Grok, etc.)
-3. **Routing**: When local model is not ready or not confident, routes to the configured provider
-4. **Tool Execution**: All providers support tool calling, so tools work regardless of provider
+1. **Startup**: Finch reads all `[[providers]]` entries.
+2. **Active provider**: The first cloud entry with a non-empty `api_key` is the default teacher.
+3. **Local model**: The `local` entry runs in the background; the REPL routes to it when ready.
+4. **Runtime switching**: `/model list` and `/model <name>` change the active provider mid-session.
+5. **Tool execution**: All providers support tool calling.
 
-## Migration Guide
+## Migration from the Old `[fallback]` Format
 
-### From Old Config (Claude Only)
+The old format is still accepted and migrates transparently:
 
-**Old format:**
 ```toml
-api_key = "sk-ant-..."
-streaming_enabled = true
-```
-
-**New format (equivalent):**
-```toml
-api_key = "sk-ant-..."  # Kept for backwards compatibility
-streaming_enabled = true
-
+# Old format (still works, auto-migrated on save)
 [fallback]
 provider = "claude"
 
@@ -150,60 +141,49 @@ provider = "claude"
 api_key = "sk-ant-..."
 ```
 
-The old format still works! If no `[fallback]` section is present, Shammah will use the `api_key` field for Claude.
-
-## Troubleshooting
-
-### Error: "No settings found for provider"
-
-Make sure you have a `[fallback.{provider}]` section with an `api_key` field:
+This is equivalent to:
 
 ```toml
-[fallback]
-provider = "openai"
-
-[fallback.openai]
-api_key = "sk-proj-..."  # Don't forget this!
+# New format
+[[providers]]
+type = "claude"
+api_key = "sk-ant-..."
 ```
 
-### Error: "Unknown provider"
+The file is rewritten to the new format the next time config is saved (e.g. after `finch setup`).
 
-Check that the `provider` field matches one of: `"claude"`, `"openai"`, `"grok"`, `"gemini"`.
+## Provider Capabilities
 
-### Testing Provider Configuration
-
-Run a simple query to test your provider configuration:
-
-```bash
-finch query "What is 2+2?"
-```
-
-Check the logs to see which provider was used.
-
-## Future Providers
-
-Potential additions:
-- Custom OpenAI-compatible endpoints (e.g., local LLMs with OpenAI API)
-- Azure OpenAI
-- Anthropic Claude via AWS Bedrock
-- Cohere Command models
+| Provider | Streaming | Tool Calling | Notes |
+|----------|-----------|--------------|-------|
+| Claude   | ✅        | ✅           | Primary; best tool use quality |
+| OpenAI   | ✅        | ✅           | GPT-4o default |
+| Grok     | ✅        | ✅           | Fast; good for code |
+| Gemini   | ✅        | ✅           | Free tier available |
+| Mistral  | ✅        | ✅           | EU-hosted option |
+| Groq     | ✅        | ✅           | Very fast inference |
+| Local    | ✅        | ✅ (limited) | No API cost; requires download |
 
 ## Architecture
 
-Under the hood, Shammah uses a provider abstraction layer:
+All providers implement the `LlmProvider` trait. The factory in `src/providers/factory.rs`
+converts `ProviderEntry` values into provider instances:
 
 ```
-User Request
+[[providers]] entries in config.toml
     ↓
-Local Qwen Model (if ready and confident)
-    ↓ (fallback)
-Provider Factory
+Config::with_providers(Vec<ProviderEntry>)
     ↓
-ClaudeProvider / OpenAIProvider / GrokProvider
+create_providers_from_entries(&[ProviderEntry])
     ↓
-LLM API
+Vec<Arc<dyn LlmProvider>>
     ↓
-Response to User
+Active provider selected by index
+    ↓
+ClaudeClient::with_provider(provider)
 ```
 
-All providers implement the same `LlmProvider` trait, ensuring consistent behavior across different APIs.
+**Key files:**
+- `src/config/provider.rs` — `ProviderEntry` tagged enum with conversion helpers
+- `src/providers/factory.rs` — `create_provider_from_entry()`, `create_providers_from_entries()`
+- `src/providers/mod.rs` — `LlmProvider` trait
