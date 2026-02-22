@@ -710,7 +710,7 @@ tokio::spawn(async move {
 - Meaningful (Hebrew "watchman")
 - Easy to type and remember
 
-### 6. Three Operating Modes
+### 6. Operating Modes
 
 **Interactive REPL:**
 ```bash
@@ -718,15 +718,50 @@ finch
 > How do I use lifetimes in Rust?
 ```
 
-**Single Query:**
+**Single query / pipe:**
 ```bash
-finch query "What is 2+2?"
+finch query "What is a Rust lifetime?"
+echo "Explain this code" | finch
+cat error.log | finch "what went wrong here?"
 ```
 
-**HTTP Daemon:**
+**Background daemon (auto-spawned, OpenAI-compatible API):**
+
+The daemon is spawned automatically in the background when finch starts, or can be run explicitly:
 ```bash
-finch daemon --bind 127.0.0.1:8000
+finch daemon --bind 127.0.0.1:11435
 ```
+
+The daemon exposes an OpenAI-compatible HTTP API, which means:
+- **VS Code extensions** (e.g. Continue.dev) can connect to it as an LLM provider by pointing at `http://localhost:11435`
+- **Other tools** that speak the OpenAI API protocol work out of the box
+- **Cross-machine use**: run the daemon on a powerful machine (desktop, server) and access it from laptops/thin clients on the same network
+
+**mDNS / Bonjour advertising:**
+
+When enabled, the daemon advertises itself over mDNS (Bonjour) so other devices on the local network can discover it automatically — no manual IP configuration needed. This allows a single machine with a large local model to serve the whole network.
+
+```bash
+finch daemon --bind 0.0.0.0:11435 --mdns
+# Other machines on LAN see: finch.local:11435
+```
+
+**VS Code integration example (Continue.dev config):**
+```json
+{
+  "models": [{
+    "title": "Finch (local)",
+    "provider": "openai",
+    "model": "local",
+    "apiBase": "http://localhost:11435",
+    "apiKey": "none"
+  }]
+}
+```
+
+**Key files:**
+- `src/cli/commands.rs` - Daemon subcommand, bind address, mDNS flag
+- `docs/DAEMON_MODE.md` - Full daemon architecture docs
 
 ## Development Guidelines
 
@@ -957,7 +992,7 @@ Core infrastructure is complete and production-ready. The project is a fully fun
 - **6 model families** — Qwen, Llama, Mistral, Gemma, Phi, DeepSeek adapters
 - **6 teacher providers** — Claude, GPT-4, Gemini, Grok, Mistral, Groq
 - **6 tools** — Read, Glob, Grep, WebFetch, Bash, Restart (with permission system)
-- **Daemon** — Auto-spawning, OpenAI-compatible API, tool pass-through, session management
+- **Daemon** — Auto-spawning, OpenAI-compatible API, mDNS/Bonjour discovery, VS Code integration, cross-machine local model sharing
 - **TUI** — Scrollback, streaming, ghost text, plan mode, feedback (Ctrl+G/B), history
 - **LoRA** — Weighted feedback collection + Python training pipeline (adapter loading pending)
 - **Runtime switching** — `/model` and `/teacher` commands mid-session
