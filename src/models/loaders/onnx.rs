@@ -198,12 +198,6 @@ impl OnnxLoader {
         Ok((model_dir, progress_rx))
     }
 
-    // TODO Phase 3: Implement ONNX Runtime session creation
-    // This will require:
-    // 1. Creating ort::Session from model file
-    // 2. Configuring execution providers (CoreML/CUDA/CPU)
-    // 3. Setting optimization levels and threading
-
     /// Load tokenizer from model directory
     fn load_tokenizer(&self, model_dir: &Path) -> Result<Tokenizer> {
         let tokenizer_path = model_dir.join("tokenizer.json");
