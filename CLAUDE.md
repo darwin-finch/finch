@@ -122,11 +122,13 @@ User Request
 - Full KV cache support for autoregressive generation
 - Automatic tokenizer loading (tokenizer.json)
 
+**Why ONNX is primary (not Candle):** Candle works well on Linux CPU/CUDA and was the original backend. `candle-metal` (Candle's macOS GPU path) doesn't work reliably, so ONNX + CoreML is used for Apple Silicon. ONNX also supports all 6 model families vs. Candle's Qwen2-only support.
+
 **Key Files:**
 - `src/models/loaders/onnx.rs` - OnnxLoader, LoadedOnnxModel, KV cache
-- `src/generators/qwen.rs` - QwenGenerator with multi-turn tool execution
-- `src/models/adapters/qwen.rs` - QwenAdapter with output cleaning
+- `src/models/loaders/candle.rs` - Candle backend (Linux/CPU, Qwen2 only)
 - `src/models/loaders/onnx_config.rs` - Configuration types
+- `src/models/unified_loader.rs` - Dispatches to ONNX or Candle based on config
 
 #### 3. **Feedback Collection / LoRA Infrastructure** (`src/models/lora.rs`)
 
@@ -555,17 +557,25 @@ automatically rewritten to `[[providers]]` format on next save.
 - High performance
 - Excellent Apple Silicon support
 
-**ML Framework:** ONNX Runtime
+**Primary ML Framework:** ONNX Runtime
 - Cross-platform inference engine
-- CoreML execution provider for Apple Silicon (Metal acceleration)
-- CPU fallback for maximum compatibility
+- CoreML execution provider for Apple Silicon — uses ANE (Apple Neural Engine) automatically
+- CUDA/ROCm/DirectML on Linux/Windows if available; CPU fallback everywhere
 - KV cache support for efficient autoregressive generation
 - ONNX format (optimized, portable)
+- Supports all 6 model families (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek)
+
+**Why ONNX over Candle on macOS:** Candle is also available as an optional backend (`--features candle`) and works well on Linux CPU/CUDA. However, `candle-metal` (Candle's Metal GPU path on macOS) doesn't work reliably, so ONNX + CoreML became the primary backend to get stable Apple Silicon acceleration. Candle on macOS is opt-in only; `candle-metal` requires Xcode and is not built by default.
+
+**Alternative backend:** Candle (`src/models/loaders/candle.rs`)
+- Works on Linux (CPU, CUDA via candle-cuda)
+- Supports Qwen2 only (not all 6 ONNX families)
+- macOS: CPU works; Metal opt-in but unreliable
 
 **Models:**
-- Base: Qwen-2.5-1.5B/3B/7B/14B (ONNX format, pre-trained)
+- 6 families: Qwen 2.5, Llama 3, Gemma 2, Mistral, Phi, DeepSeek Coder (ONNX format)
 - Source: onnx-community on HuggingFace
-- Adapters: LoRA (domain-specific, ~5MB each, via Python training)
+- LoRA adapters: planned (see issue #1)
 
 **Storage:**
 - Models: `~/.cache/huggingface/hub/` (standard HF cache)
@@ -943,7 +953,7 @@ Core infrastructure is complete and production-ready. The project is a fully fun
 
 ### Capabilities Summary
 
-- **Local inference** — ONNX Runtime with Qwen 2.5 (1.5B/3B/7B/14B), Metal acceleration on Apple Silicon
+- **Local inference** — ONNX Runtime (primary) + Candle (Linux/CPU alt); ANE via CoreML on Apple Silicon; CUDA/ROCm on Linux
 - **6 model families** — Qwen, Llama, Mistral, Gemma, Phi, DeepSeek adapters
 - **6 teacher providers** — Claude, GPT-4, Gemini, Grok, Mistral, Groq
 - **6 tools** — Read, Glob, Grep, WebFetch, Bash, Restart (with permission system)
