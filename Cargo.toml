@@ -99,15 +99,6 @@ indicatif = "0.17"  # Progress bars for download tracking
 rand = "0.8"  # Random number generation for sampling
 safetensors = "0.4"  # Model weight loading (used by Candle)
 
-# CoreML/Metal support (macOS only)
-[target.'cfg(target_os = "macos")'.dependencies]
-# ONNX Runtime uses CoreML execution provider
-# Candle uses Metal (requires candle feature flag)
-candle-metal-kernels = { version = "0.8", optional = true }
-# GUI automation (Phase 3: Accessibility tools)
-core-graphics = "0.23"  # Mouse/keyboard events for GUI automation
-core-foundation = "0.10"  # Foundation types (required by core-graphics)
-
 # For web tools (Phase 3)
 scraper = "0.18"
 
@@ -120,6 +111,15 @@ regex = "1.10"
 glob = "0.3"
 walkdir = "2.4"
 fs2 = "0.4"  # File locking for concurrent weight updates
+
+# CoreML/Metal support (macOS only)
+[target.'cfg(target_os = "macos")'.dependencies]
+# ONNX Runtime uses CoreML execution provider
+# Candle uses Metal (requires candle feature flag)
+candle-metal-kernels = { version = "0.8", optional = true }
+# GUI automation (Phase 3: Accessibility tools)
+core-graphics = "0.23"  # Mouse/keyboard events for GUI automation
+core-foundation = "0.10"  # Foundation types (required by core-graphics)
 
 # Unix signal handling (for daemon process checks)
 [target.'cfg(unix)'.dependencies]
