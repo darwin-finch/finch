@@ -566,37 +566,8 @@ impl EventLoop {
         rating: FeedbackRating,
         note: Option<String>,
     ) -> Result<()> {
-        // Walk conversation history backwards to find last query + response pair
         let messages = self.conversation.read().await.get_messages();
-
-        let mut last_response = String::new();
-        let mut last_query = String::new();
-
-        // Scan in reverse: find the latest assistant message, then the user message before it
-        let mut found_response = false;
-        for msg in messages.iter().rev() {
-            if !found_response && msg.role == "assistant" {
-                for block in &msg.content {
-                    if let ContentBlock::Text { text } = block {
-                        if !text.trim().is_empty() {
-                            last_response = text.clone();
-                            found_response = true;
-                            break;
-                        }
-                    }
-                }
-            } else if found_response && msg.role == "user" {
-                for block in &msg.content {
-                    if let ContentBlock::Text { text } = block {
-                        if !text.trim().is_empty() {
-                            last_query = text.clone();
-                            break;
-                        }
-                    }
-                }
-                break; // Found the user message preceding the response
-            }
-        }
+        let (last_query, last_response) = find_last_exchange(&messages);
 
         if last_response.is_empty() {
             self.output_manager.write_info(
@@ -2131,6 +2102,44 @@ async fn handle_ask_user_question(
     }
 }
 
+/// Find the most recent (query, response) pair from conversation history.
+///
+/// Scans messages in reverse: finds the latest non-empty assistant message,
+/// then finds the user message that immediately preceded it.
+///
+/// Returns `("", "")` if no assistant response is found.
+pub(crate) fn find_last_exchange(messages: &[crate::claude::Message]) -> (String, String) {
+    let mut last_response = String::new();
+    let mut last_query = String::new();
+    let mut found_response = false;
+
+    for msg in messages.iter().rev() {
+        if !found_response && msg.role == "assistant" {
+            for block in &msg.content {
+                if let ContentBlock::Text { text } = block {
+                    if !text.trim().is_empty() {
+                        last_response = text.clone();
+                        found_response = true;
+                        break;
+                    }
+                }
+            }
+        } else if found_response && msg.role == "user" {
+            for block in &msg.content {
+                if let ContentBlock::Text { text } = block {
+                    if !text.trim().is_empty() {
+                        last_query = text.clone();
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    (last_query, last_response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2240,5 +2249,84 @@ mod tests {
     fn test_compact_tool_summary_multi_line() {
         let multi = "line1\nline2\nline3";
         assert_eq!(compact_tool_summary(multi), "3 lines");
+    }
+
+    // --- find_last_exchange ---
+
+    fn user_msg(text: &str) -> crate::claude::Message {
+        crate::claude::Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text { text: text.to_string() }],
+        }
+    }
+
+    fn assistant_msg(text: &str) -> crate::claude::Message {
+        crate::claude::Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text { text: text.to_string() }],
+        }
+    }
+
+    #[test]
+    fn find_last_exchange_empty_returns_empty_pair() {
+        let (q, r) = find_last_exchange(&[]);
+        assert!(q.is_empty());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn find_last_exchange_only_user_messages() {
+        let msgs = vec![user_msg("hello"), user_msg("world")];
+        let (q, r) = find_last_exchange(&msgs);
+        assert!(r.is_empty(), "no assistant msg → response should be empty: {:?}", r);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn find_last_exchange_single_turn() {
+        let msgs = vec![user_msg("What is 2+2?"), assistant_msg("4")];
+        let (q, r) = find_last_exchange(&msgs);
+        assert_eq!(q, "What is 2+2?");
+        assert_eq!(r, "4");
+    }
+
+    #[test]
+    fn find_last_exchange_picks_latest_turn() {
+        let msgs = vec![
+            user_msg("First question"),
+            assistant_msg("First answer"),
+            user_msg("Second question"),
+            assistant_msg("Second answer"),
+        ];
+        let (q, r) = find_last_exchange(&msgs);
+        assert_eq!(q, "Second question");
+        assert_eq!(r, "Second answer");
+    }
+
+    #[test]
+    fn find_last_exchange_skips_empty_assistant_text() {
+        let msgs = vec![
+            user_msg("Real question"),
+            assistant_msg("Real answer"),
+            user_msg("Ignored"),
+            // Assistant message with empty text (e.g., tool-only response)
+            crate::claude::Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::Text { text: "   ".to_string() }],
+            },
+        ];
+        let (q, r) = find_last_exchange(&msgs);
+        // Should skip the whitespace-only assistant msg and find the earlier real one
+        assert_eq!(r, "Real answer");
+        assert_eq!(q, "Real question");
+    }
+
+    #[test]
+    fn find_last_exchange_assistant_only_no_preceding_user() {
+        let msgs = vec![assistant_msg("Unprompted response")];
+        let (q, r) = find_last_exchange(&msgs);
+        assert_eq!(r, "Unprompted response");
+        // No user message precedes it
+        assert!(q.is_empty(), "query should be empty: {:?}", q);
     }
 }
