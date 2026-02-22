@@ -400,7 +400,7 @@ impl TuiRenderer {
         if self.active_dialog.is_some() {
             let dialog_rows = Self::draw_dialog_inline_static(
                 &mut stdout,
-                self.active_dialog.as_ref().unwrap(),
+                self.active_dialog.as_ref().expect("active_dialog is Some — guarded above"),
             )?;
             rows += dialog_rows;
             // Dialog drawing leaves the cursor at the last drawn row (no reposition).
@@ -458,9 +458,8 @@ impl TuiRenderer {
                 &self.command_registry,
             );
 
-            // Thin separator between input area and status line(s)
-            let status_sep_width = term_width.min(40);
-            let status_sep: String = "─".repeat(status_sep_width);
+            // Thin separator between input area and status line(s) — full terminal width
+            let status_sep: String = "─".repeat(term_width);
             execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, status_sep, RESET)))?;
 
             let status_line_count = count_status_lines(&effective_status) + 1; // +1 for separator
@@ -762,7 +761,7 @@ impl TuiRenderer {
     fn draw_dialog_inline_static(stdout: &mut io::Stdout, dialog: &Dialog) -> Result<usize> {
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let box_width  = term_width.min(72);
-        let inner      = box_width.saturating_sub(4); // 2 borders + 2 padding
+        let inner      = box_width.saturating_sub(6); // │ + 2 spaces on each side + │ = 6
 
         let mut rows = 0;
 

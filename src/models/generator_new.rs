@@ -17,7 +17,6 @@ pub trait TextGeneration: Send + Sync {
 
     /// Generate text with token-by-token callback for streaming
     ///
-    /// The callback receives each generated token ID and its decoded text.
     /// Default implementation just calls regular generate (no streaming support).
     fn generate_stream(
         &mut self,
@@ -25,9 +24,14 @@ pub trait TextGeneration: Send + Sync {
         max_new_tokens: usize,
         _token_callback: TokenCallback,
     ) -> Result<Vec<u32>> {
-        // Default implementation: just call regular generate (no streaming)
         self.generate(input_ids, max_new_tokens)
     }
+
+    /// Encode a text prompt into token IDs
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>>;
+
+    /// Decode token IDs back into a text string
+    fn decode_tokens(&self, tokens: &[u32]) -> Result<String>;
 
     /// Get model name/description
     fn name(&self) -> &str;
@@ -90,49 +94,14 @@ impl GeneratorModel {
         self.backend.generate(input_ids, max_new_tokens)
     }
 
-    /// Generate text response from text input (handles tokenization internally)
+    /// Generate a text response from a text prompt.
     ///
-    /// This is a convenience method that:
-    /// 1. Tokenizes the input text
-    /// 2. Calls generate() on the backend
-    /// 3. Detokenizes the output
-    ///
-    /// For ONNX models, this uses the model's built-in tokenizer.
+    /// Tokenizes the prompt, calls generate(), and decodes the result.
+    /// Works with any backend (ONNX, Candle, etc.) via the TextGeneration trait.
     pub fn generate_text(&mut self, prompt: &str, max_new_tokens: usize) -> Result<String> {
-        // Downcast to LoadedOnnxModel to access tokenizer
-        // This is safe because we only support ONNX models in Phase 5
-        use super::loaders::onnx::LoadedOnnxModel;
-
-        // Tokenize input (scope the borrow)
-        let input_ids: Vec<u32> = {
-            let onnx_model = self.backend
-                .as_any()
-                .downcast_ref::<LoadedOnnxModel>()
-                .ok_or_else(|| anyhow::anyhow!("Backend is not an ONNX model"))?;
-
-            let encoding = onnx_model.tokenizer()
-                .encode(prompt, true)
-                .map_err(|e| anyhow::anyhow!("Failed to encode prompt: {}", e))?;
-
-            encoding.get_ids().to_vec()
-        }; // onnx_model borrow ends here
-
-        // Generate tokens (requires mutable borrow of self)
+        let input_ids = self.backend.tokenize(prompt)?;
         let output_ids = self.generate(&input_ids, max_new_tokens)?;
-
-        // Decode output (scope the borrow again)
-        let response = {
-            let onnx_model = self.backend
-                .as_any()
-                .downcast_ref::<LoadedOnnxModel>()
-                .ok_or_else(|| anyhow::anyhow!("Backend is not an ONNX model"))?;
-
-            onnx_model.tokenizer()
-                .decode(&output_ids, true)
-                .map_err(|e| anyhow::anyhow!("Failed to decode output: {}", e))?
-        }; // onnx_model borrow ends here
-
-        Ok(response)
+        self.backend.decode_tokens(&output_ids)
     }
 
     /// Get generator backend name
@@ -239,9 +208,96 @@ impl Saveable for GeneratorModel {
 mod tests {
     use super::*;
 
+    // --- Regression: TextGeneration trait must expose tokenize + decode_tokens ---
+    //
+    // These tests use a mock backend to verify the trait contract without
+    // downloading any real model. If you add methods to TextGeneration, add
+    // corresponding assertions here.
+
+    struct MockBackend;
+
+    impl TextGeneration for MockBackend {
+        fn generate(&mut self, input_ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+            // Echo back input for testing
+            Ok(input_ids.to_vec())
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+            // Simple mock: return byte values
+            Ok(text.bytes().map(|b| b as u32).collect())
+        }
+
+        fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+            // Reverse of above mock
+            let bytes: Vec<u8> = tokens.iter().map(|&t| t as u8).collect();
+            String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("{}", e))
+        }
+
+        fn name(&self) -> &str { "mock" }
+
+        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    }
+
+    #[test]
+    fn test_text_generation_trait_has_tokenize_and_decode() {
+        // Verify the trait methods exist and work correctly via a mock
+        let backend = MockBackend;
+        let ids = backend.tokenize("hi").unwrap();
+        assert!(!ids.is_empty());
+        let decoded = backend.decode_tokens(&ids).unwrap();
+        assert_eq!(decoded, "hi");
+    }
+
+    #[test]
+    fn test_generate_text_uses_trait_not_downcast() {
+        // Regression: generate_text() must work via trait methods, not downcast to
+        // LoadedOnnxModel. A non-ONNX backend should succeed here.
+        use crate::models::GeneratorConfig;
+        use crate::models::unified_loader::ModelLoadConfig;
+
+        struct EchoBackend;
+        impl TextGeneration for EchoBackend {
+            fn generate(&mut self, _ids: &[u32], _max: usize) -> Result<Vec<u32>> {
+                Ok(vec![104, 105]) // "hi"
+            }
+            fn tokenize(&self, _text: &str) -> Result<Vec<u32>> { Ok(vec![104, 105]) }
+            fn decode_tokens(&self, _tokens: &[u32]) -> Result<String> { Ok("hi".into()) }
+            fn name(&self) -> &str { "echo" }
+            fn as_any(&self) -> &dyn std::any::Any { self }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+        }
+
+        // We can't call GeneratorModel::new() without a model file, but we can
+        // construct one directly to test generate_text() routing.
+        let mut gen = GeneratorModel {
+            backend: Box::new(EchoBackend),
+            config: GeneratorConfig::Pretrained(ModelLoadConfig {
+                provider: crate::models::unified_loader::InferenceProvider::Onnx,
+                family: crate::models::unified_loader::ModelFamily::Qwen2,
+                size: crate::models::unified_loader::ModelSize::Small,
+                target: crate::config::ExecutionTarget::Cpu,
+                repo_override: None,
+            }),
+        };
+
+        let result = gen.generate_text("test", 10).unwrap();
+        assert_eq!(result, "hi");
+    }
+
+    #[test]
+    fn test_random_init_config_returns_error() {
+        // RandomInit config was removed in Phase 4 — must return a clear error.
+        use crate::models::common::ModelConfig;
+        let config = GeneratorConfig::RandomInit(ModelConfig::default());
+        let result = GeneratorModel::new(config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("RandomInit"));
+    }
+
     #[test]
     #[ignore] // Requires downloaded Qwen model
-    fn test_generator_qwen() {
+    fn test_generator_qwen_onnx() {
         use crate::models::unified_loader::{ModelLoadConfig, ModelFamily, ModelSize};
         use crate::config::ExecutionTarget;
 
@@ -253,15 +309,7 @@ mod tests {
             repo_override: None,
         });
 
-        let generator = GeneratorModel::new(config);
-        match generator {
-            Ok(gen) => {
-                println!("Created generator: {}", gen.name());
-                assert!(gen.name().contains("Qwen"));
-            }
-            Err(e) => {
-                println!("Failed to create generator: {}", e);
-            }
-        }
+        let gen = GeneratorModel::new(config).expect("Should load Qwen ONNX model");
+        assert!(gen.name().contains("Qwen"));
     }
 }

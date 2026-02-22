@@ -290,29 +290,30 @@ impl<'a> DialogWidget<'a> {
                 .add_modifier(Modifier::BOLD),
         )];
 
-        // Add text before cursor
+        // Add text before cursor (char-based to avoid byte-index panic on multi-byte chars)
         if cursor_pos > 0 {
+            let before: String = input.chars().take(cursor_pos).collect();
             input_spans.push(Span::styled(
-                input[..cursor_pos].to_string(),
+                before,
                 Style::default().fg(self.colors.ui.input.to_color()),
             ));
         }
 
-        // Add cursor
-        if cursor_pos < input.len() {
-            // Cursor on a character
+        // Add cursor (guard uses char count, not byte len, to avoid panic on multi-byte chars)
+        if let Some(cursor_ch) = input.chars().nth(cursor_pos) {
             input_spans.push(Span::styled(
-                input.chars().nth(cursor_pos).unwrap().to_string(),
+                cursor_ch.to_string(),
                 Style::default()
                     .fg(self.colors.dialog.selected_fg.to_color())
                     .bg(self.colors.ui.cursor.to_color())
                     .add_modifier(Modifier::BOLD),
             ));
 
-            // Add text after cursor
-            if cursor_pos + 1 < input.len() {
+            // Add text after cursor (use char-based skip to avoid byte-index panic)
+            let after: String = input.chars().skip(cursor_pos + 1).collect();
+            if !after.is_empty() {
                 input_spans.push(Span::styled(
-                    input[cursor_pos + 1..].to_string(),
+                    after,
                     Style::default().fg(self.colors.ui.input.to_color()),
                 ));
             }
@@ -587,5 +588,44 @@ mod tests {
 
         // Should have: prompt + empty line + options + empty line + keybindings = 5 lines
         assert!(lines.len() >= 4);
+    }
+
+    // --- Regression: cursor rendering must not panic on multi-byte chars ---
+    //
+    // Previously, input[cursor_pos + 1..] used cursor_pos as a byte index, which
+    // panics on multi-byte characters. Also, `chars().nth(cursor_pos).unwrap()`
+    // would panic if cursor_pos was at-or-past the char count.
+
+    #[test]
+    fn test_text_input_cursor_at_end_does_not_panic() {
+        use crate::config::ColorScheme;
+
+        let dialog = Dialog::select("Test", vec![DialogOption::new("Option 1")]);
+        let colors = ColorScheme::default();
+        let widget = DialogWidget::new(&dialog, &colors);
+
+        // cursor_pos == input.chars().count() (end of string)
+        let input = "hello";
+        let lines = widget.render_text_input("Prompt", input, input.chars().count(), &None, &None);
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn test_text_input_cursor_with_unicode_does_not_panic() {
+        use crate::config::ColorScheme;
+
+        let dialog = Dialog::select("Test", vec![DialogOption::new("Option 1")]);
+        let colors = ColorScheme::default();
+        let widget = DialogWidget::new(&dialog, &colors);
+
+        // Multi-byte chars: "héllo" — 5 chars, 6 bytes
+        let input = "héllo";
+        // cursor in the middle (char index 2, which is byte index 3)
+        let lines = widget.render_text_input("Prompt", input, 2, &None, &None);
+        assert!(!lines.is_empty());
+
+        // cursor at end
+        let lines = widget.render_text_input("Prompt", input, input.chars().count(), &None, &None);
+        assert!(!lines.is_empty());
     }
 }

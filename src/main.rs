@@ -325,47 +325,38 @@ async fn main() -> Result<()> {
             use finch::cli::show_setup_wizard;
             match show_setup_wizard() {
                 Ok(result) => {
-                    // Create and save config from wizard results
-                    let backend_device = result.backend_device();
-                    let backend_enabled = result.backend_enabled;
-                    let inference_provider = result.inference_provider;
-                    let model_family = result.model_family;
-                    let model_size = result.model_size;
-                    let custom_model_repo = result.custom_model_repo;
+                    // Create config from unified providers list (new format)
                     let active_theme = result.active_theme.clone();
                     let default_persona = result.default_persona.clone();
                     let daemon_only_mode = result.daemon_only_mode;
                     let mdns_discovery = result.mdns_discovery;
 
-                    // Patch any empty API keys with auto-detected values
-                    let mut teachers = result.teachers;
+                    // Patch any empty API keys in the providers list with
+                    // auto-detected values from environment variables.
+                    let mut providers = result.providers;
                     let auto = build_teachers_from_env();
-                    for teacher in &mut teachers {
-                        if teacher.api_key.is_empty() {
-                            if let Some(detected) = auto.iter().find(|t| t.provider == teacher.provider) {
-                                teacher.api_key = detected.api_key.clone();
-                            } else if let Some(first) = auto.first() {
-                                // If provider doesn't match, use whatever key we found
-                                teacher.api_key = first.api_key.clone();
-                                teacher.provider = first.provider.clone();
+                    for p in &mut providers {
+                        if let Some(key) = p.api_key() {
+                            if key.is_empty() {
+                                let ptype = p.provider_type().to_string();
+                                if let Some(detected) = auto.iter().find(|t| t.provider == ptype) {
+                                    // Replace the empty-key entry with a filled one
+                                    *p = finch::config::ProviderEntry::from_teacher_entry(detected);
+                                }
                             }
                         }
                     }
-                    // If still no teachers with keys, add auto-detected ones
-                    if teachers.iter().all(|t| t.api_key.is_empty()) {
-                        teachers = auto;
+                    // If still no cloud providers with keys, add auto-detected ones
+                    let has_keys = providers.iter().any(|p| {
+                        p.api_key().map(|k| !k.is_empty()).unwrap_or(false)
+                    });
+                    if !has_keys && !auto.is_empty() {
+                        for t in &auto {
+                            providers.insert(0, finch::config::ProviderEntry::from_teacher_entry(t));
+                        }
                     }
 
-                    let mut new_config = Config::new(teachers);
-                    new_config.backend = finch::config::BackendConfig {
-                        enabled: backend_enabled,
-                        inference_provider,
-                        execution_target: backend_device,
-                        model_family,
-                        model_size,
-                        model_repo: custom_model_repo,
-                        ..Default::default()
-                    };
+                    let mut new_config = Config::with_providers(providers);
                     new_config.active_theme = active_theme;
                     new_config.active_persona = default_persona;
                     if let Some(hf_tok) = result.hf_token {
@@ -387,7 +378,10 @@ async fn main() -> Result<()> {
                         new_config.server.advertise = true;
                         new_config.client.auto_discover = true;
                     }
-                    new_config.streaming_enabled = new_config.features.streaming_enabled;
+                    #[allow(deprecated)]
+                    {
+                        new_config.streaming_enabled = new_config.features.streaming_enabled;
+                    }
                     new_config.save()?;
                     eprintln!("\n\x1b[1;32m✓ Configuration saved!\x1b[0m\n");
                     new_config
@@ -1122,7 +1116,7 @@ async fn build_query_tool_executor() -> Result<(
 )> {
     use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
     use finch::tools::implementations::{
-        BashTool, EditTool, GlobTool, GrepTool, ReadTool, WebFetchTool, WriteTool,
+        BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
     };
 
     let mut registry = ToolRegistry::new();
@@ -1132,6 +1126,7 @@ async fn build_query_tool_executor() -> Result<(
     registry.register(Box::new(WebFetchTool::new()));
     registry.register(Box::new(BashTool));
     registry.register(Box::new(EditTool));
+    registry.register(Box::new(PatchTool));
     registry.register(Box::new(WriteTool));
 
     // Auto-approve everything in non-interactive mode
@@ -1262,45 +1257,28 @@ async fn run_query_teacher_only(
 /// Run interactive setup wizard
 async fn run_setup() -> Result<()> {
     use finch::cli::show_setup_wizard;
-    use finch::config::{BackendConfig, Config};
+    use finch::config::Config;
 
     println!("Starting Shammah setup wizard...\n");
 
     // Run the wizard
     let result = show_setup_wizard()?;
 
-    // Extract values before partial move
-    let backend_device = result.backend_device();
-    let backend_enabled = result.backend_enabled;
-    let inference_provider = result.inference_provider;
-    let model_family = result.model_family;
-    let model_size = result.model_size;
-    let custom_model_repo = result.custom_model_repo;
+    // Create config from unified providers list
+    let mut config = Config::with_providers(result.providers);
 
-    // Create config from wizard results
-    let mut config = Config::new(result.teachers);
-
-    // Update backend config with selected provider, device, model family, and size
-    config.backend = BackendConfig {
-        enabled: backend_enabled,
-        inference_provider,
-        execution_target: backend_device,
-        model_family,
-        model_size,
-        model_repo: custom_model_repo,
-        ..Default::default()
-    };
-
-    // Update feature flags
+    // Apply feature flags
     config.features = finch::config::FeaturesConfig {
         auto_approve_tools: result.auto_approve_tools,
         streaming_enabled: result.streaming_enabled,
         debug_logging: result.debug_logging,
         #[cfg(target_os = "macos")]
-        gui_automation: false, // Not yet implemented in wizard
+        gui_automation: false,
     };
-    // Update deprecated streaming_enabled field for backward compat
-    config.streaming_enabled = config.features.streaming_enabled;
+    #[allow(deprecated)]
+    {
+        config.streaming_enabled = config.features.streaming_enabled;
+    }
 
     // Save configuration
     config.save()?;

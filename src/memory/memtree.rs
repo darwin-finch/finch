@@ -79,7 +79,9 @@ impl MemTree {
         let mut current = self.root;
 
         loop {
-            let node = self.nodes.get(&current).unwrap().clone();
+            let node = self.nodes.get(&current)
+                .ok_or_else(|| anyhow::anyhow!("memtree: node {} not found during insert", current))?
+                .clone();
 
             // Compute similarity with current node
             let similarity = if node.id == self.root {
@@ -96,7 +98,8 @@ impl MemTree {
                 let mut best_similarity = 0.0;
 
                 for &child_id in &node.children {
-                    let child = self.nodes.get(&child_id).unwrap();
+                    let child = self.nodes.get(&child_id)
+                        .ok_or_else(|| anyhow::anyhow!("memtree: child node {} not found", child_id))?;
                     let child_sim = cosine_similarity(&embedding, &child.embedding);
                     if child_sim > best_similarity {
                         best_similarity = child_sim;
@@ -123,7 +126,8 @@ impl MemTree {
                 self.nodes.insert(new_id, new_node);
 
                 // Update parent's children list
-                let parent = self.nodes.get_mut(&current).unwrap();
+                let parent = self.nodes.get_mut(&current)
+                    .ok_or_else(|| anyhow::anyhow!("memtree: parent node {} not found during insert", current))?;
                 parent.children.push(new_id);
 
                 // Update parent's aggregated embedding
@@ -136,7 +140,8 @@ impl MemTree {
 
     /// Update parent node's embedding to be average of children
     fn update_parent_aggregation(&mut self, node_id: NodeId) -> Result<()> {
-        let node = self.nodes.get(&node_id).unwrap();
+        let node = self.nodes.get(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("memtree: node {} not found during aggregation", node_id))?;
 
         if node.children.is_empty() {
             return Ok(());
@@ -158,7 +163,8 @@ impl MemTree {
         let aggregated = average_embeddings(&child_embeddings);
 
         // Update parent embedding
-        let parent = self.nodes.get_mut(&node_id).unwrap();
+        let parent = self.nodes.get_mut(&node_id)
+            .ok_or_else(|| anyhow::anyhow!("memtree: node {} not found for embedding update", node_id))?;
         parent.embedding = aggregated;
 
         // Recursively update ancestors
@@ -296,5 +302,37 @@ mod tests {
 
         // Nodes should have different levels
         assert_ne!(node1.level, node2.level);
+    }
+
+    // --- Regression: node lookup uses ? not .unwrap() ---
+    //
+    // These tests verify that inserting many nodes succeeds without panicking
+    // and that get_node returns None for unknown IDs instead of crashing.
+
+    #[test]
+    fn test_memtree_unknown_node_returns_none_not_panic() {
+        let tree = MemTree::new();
+        // Arbitrary IDs that don't exist in the tree (root is node 0, so skip it)
+        assert!(tree.get_node(9999).is_none());
+        assert!(tree.get_node(1000).is_none());
+        // Root node (ID 0) always exists
+        assert!(tree.get_node(0).is_some());
+    }
+
+    #[test]
+    fn test_memtree_insert_many_does_not_panic() {
+        // Previously, node-not-found during tree traversal would panic.
+        // This test inserts enough nodes to exercise the traversal path.
+        let mut tree = MemTree::new();
+        let engine = TfIdfEmbedding::new();
+        let texts = [
+            "alpha", "beta", "gamma", "delta", "epsilon",
+            "alpha variant", "beta variant", "gamma coding",
+        ];
+        for text in &texts {
+            let emb = engine.embed(text).unwrap();
+            tree.insert(text.to_string(), emb).unwrap();
+        }
+        assert_eq!(tree.size(), texts.len());
     }
 }

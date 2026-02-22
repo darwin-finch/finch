@@ -9,6 +9,7 @@ pub mod read;
 
 // File modification tools
 pub mod edit;
+pub mod patch;
 pub mod write;
 
 // Network tools
@@ -47,6 +48,7 @@ pub use grep::GrepTool;
 pub use present_plan::PresentPlanTool;
 pub use read::ReadTool;
 pub use edit::EditTool;
+pub use patch::PatchTool;
 pub use write::WriteTool;
 pub use restart::RestartTool;
 pub use save_and_exec::SaveAndExecTool;

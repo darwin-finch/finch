@@ -17,7 +17,7 @@ use crate::claude::types::{ContentBlock, Message, MessageRequest};
 use crate::config::{persona::Persona, Config};
 use crate::generators::claude::CODING_SYSTEM_PROMPT;
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
-use crate::tools::implementations::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WebFetchTool, WriteTool};
+use crate::tools::implementations::{BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool};
 use crate::tools::types::ToolDefinition;
 
 use activity_log::{ActivityLogger, AgentEvent};
@@ -454,6 +454,7 @@ async fn build_tool_executor(
     registry.register(Box::new(WebFetchTool::new()));
     registry.register(Box::new(BashTool));
     registry.register(Box::new(EditTool));
+    registry.register(Box::new(PatchTool));
     registry.register(Box::new(WriteTool));
 
     // In agent mode, auto-approve everything by default

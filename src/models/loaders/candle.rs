@@ -41,28 +41,15 @@ impl CandleLoader {
         size: ModelSize,
         target: ExecutionTarget,
     ) -> Result<Box<dyn TextGeneration>> {
-        // Determine device based on execution target
         let device = Self::get_device(target)?;
 
         match family {
-            ModelFamily::Qwen2 => {
-                self.load_qwen(model_path, size, device)
-            }
-            ModelFamily::Llama3 => {
-                self.load_llama(model_path, size, device)
-            }
-            ModelFamily::Gemma2 => {
-                self.load_gemma(model_path, size, device)
-            }
-            ModelFamily::Mistral => {
-                self.load_mistral(model_path, size, device)
-            }
-            ModelFamily::Phi => {
-                self.load_phi(model_path, size, device)
-            }
-            ModelFamily::DeepSeek => {
-                self.load_deepseek(model_path, size, device)
-            }
+            ModelFamily::Qwen2 => self.load_qwen(model_path, size, device),
+            ModelFamily::Llama3 => self.load_llama(size),
+            ModelFamily::Gemma2 => self.load_gemma(size),
+            ModelFamily::Mistral => self.load_mistral(size),
+            ModelFamily::Phi => self.load_phi(size),
+            ModelFamily::DeepSeek => self.load_deepseek(size),
         }
     }
 
@@ -71,7 +58,7 @@ impl CandleLoader {
         match target {
             #[cfg(target_os = "macos")]
             ExecutionTarget::CoreML => {
-                // On macOS, use Metal for Candle (CoreML is ONNX-specific)
+                // CoreML is ONNX-specific; use Metal for Candle on macOS
                 Device::new_metal(0).context("Failed to initialize Metal device")
             }
 
@@ -80,13 +67,11 @@ impl CandleLoader {
                 Device::new_cuda(0).context("Failed to initialize CUDA device")
             }
 
-            ExecutionTarget::Cpu | ExecutionTarget::Auto => {
-                Ok(Device::Cpu)
-            }
+            ExecutionTarget::Cpu | ExecutionTarget::Auto => Ok(Device::Cpu),
         }
     }
 
-    /// Load Qwen model
+    /// Load Qwen 2.5 model (the only family currently implemented for Candle)
     fn load_qwen(
         &self,
         model_path: &Path,
@@ -95,91 +80,56 @@ impl CandleLoader {
     ) -> Result<Box<dyn TextGeneration>> {
         tracing::info!("Loading Qwen {:?} model with Candle", size);
 
-        // Load tokenizer
         let tokenizer_path = model_path.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
-        // Load model config
         let config_path = model_path.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)
             .context("Failed to read config.json")?;
         let config: models::qwen2::Config = serde_json::from_str(&config_str)
             .context("Failed to parse config.json")?;
 
-        // Load model weights
         let weights_path = model_path.join("model.safetensors");
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], candle_core::DType::F32, &device)
-                .context("Failed to load model weights")?
+            VarBuilder::from_mmaped_safetensors(
+                &[weights_path],
+                candle_core::DType::F32,
+                &device,
+            )
+            .context("Failed to load model weights")?
         };
 
-        // Build model
         let model = models::qwen2::Model::new(&config, vb)
             .context("Failed to build Qwen model")?;
 
-        // Wrap in LoadedCandleModel
         Ok(Box::new(LoadedCandleModel {
             model: CandleModel::Qwen(model),
             tokenizer,
             device,
-            config: config.into(),
         }))
     }
 
-    /// Load Llama model
-    fn load_llama(
-        &self,
-        model_path: &Path,
-        size: ModelSize,
-        device: Device,
-    ) -> Result<Box<dyn TextGeneration>> {
-        tracing::info!("Loading Llama {:?} model with Candle", size);
-        anyhow::bail!("Llama model loading not yet implemented for Candle")
+    // --- Stubs for families not yet implemented ---
+
+    fn load_llama(&self, size: ModelSize) -> Result<Box<dyn TextGeneration>> {
+        anyhow::bail!("Llama {:?} not yet implemented for Candle", size)
     }
 
-    /// Load Gemma model
-    fn load_gemma(
-        &self,
-        model_path: &Path,
-        size: ModelSize,
-        device: Device,
-    ) -> Result<Box<dyn TextGeneration>> {
-        tracing::info!("Loading Gemma {:?} model with Candle", size);
-        anyhow::bail!("Gemma model loading not yet implemented for Candle")
+    fn load_gemma(&self, size: ModelSize) -> Result<Box<dyn TextGeneration>> {
+        anyhow::bail!("Gemma {:?} not yet implemented for Candle", size)
     }
 
-    /// Load Mistral model
-    fn load_mistral(
-        &self,
-        model_path: &Path,
-        size: ModelSize,
-        device: Device,
-    ) -> Result<Box<dyn TextGeneration>> {
-        tracing::info!("Loading Mistral {:?} model with Candle", size);
-        anyhow::bail!("Mistral model loading not yet implemented for Candle")
+    fn load_mistral(&self, size: ModelSize) -> Result<Box<dyn TextGeneration>> {
+        anyhow::bail!("Mistral {:?} not yet implemented for Candle", size)
     }
 
-    /// Load Phi model
-    fn load_phi(
-        &self,
-        model_path: &Path,
-        size: ModelSize,
-        device: Device,
-    ) -> Result<Box<dyn TextGeneration>> {
-        tracing::info!("Loading Phi {:?} model with Candle", size);
-        anyhow::bail!("Phi model loading not yet implemented for Candle")
+    fn load_phi(&self, size: ModelSize) -> Result<Box<dyn TextGeneration>> {
+        anyhow::bail!("Phi {:?} not yet implemented for Candle", size)
     }
 
-    /// Load DeepSeek model
-    fn load_deepseek(
-        &self,
-        model_path: &Path,
-        size: ModelSize,
-        device: Device,
-    ) -> Result<Box<dyn TextGeneration>> {
-        tracing::info!("Loading DeepSeek {:?} model with Candle", size);
-        anyhow::bail!("DeepSeek model loading not yet implemented for Candle")
+    fn load_deepseek(&self, size: ModelSize) -> Result<Box<dyn TextGeneration>> {
+        anyhow::bail!("DeepSeek {:?} not yet implemented for Candle", size)
     }
 }
 
@@ -187,38 +137,15 @@ impl CandleLoader {
 #[cfg(feature = "candle")]
 enum CandleModel {
     Qwen(models::qwen2::Model),
-    // Llama(models::llama::Llama),
-    // Gemma(models::gemma::Model),
-    // Mistral(models::mistral::Model),
-    // Phi(models::phi::Model),
+    // More families will be added here as they are implemented
 }
 
-/// Generic model config (simplified)
-#[cfg(feature = "candle")]
-struct CandleConfig {
-    vocab_size: usize,
-    hidden_size: usize,
-    num_layers: usize,
-}
-
-#[cfg(feature = "candle")]
-impl From<models::qwen2::Config> for CandleConfig {
-    fn from(config: models::qwen2::Config) -> Self {
-        Self {
-            vocab_size: config.vocab_size,
-            hidden_size: config.hidden_size,
-            num_layers: config.num_hidden_layers,
-        }
-    }
-}
-
-/// Loaded Candle model implementing TextGeneration trait
+/// Loaded Candle model implementing the TextGeneration trait
 #[cfg(feature = "candle")]
 pub struct LoadedCandleModel {
     model: CandleModel,
     tokenizer: tokenizers::Tokenizer,
     device: Device,
-    config: CandleConfig,
 }
 
 #[cfg(feature = "candle")]
@@ -229,60 +156,85 @@ impl LoadedCandleModel {
             CandleModel::Qwen(_) => "Qwen (Candle)",
         }
     }
-
-    /// Get tokenizer reference
-    pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
-        &self.tokenizer
-    }
 }
 
 #[cfg(feature = "candle")]
 impl TextGeneration for LoadedCandleModel {
     fn generate(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
-        // Convert input_ids to tensor
-        let input_tensor = Tensor::new(input_ids, &self.device)
-            .context("Failed to create input tensor")?
-            .unsqueeze(0)?; // Add batch dimension
+        use candle_core::IndexOp;
+
+        // Qwen EOS tokens: <|endoftext|> = 151643, <|im_end|> = 151645
+        let eos_id = self.tokenizer
+            .token_to_id("<|endoftext|>")
+            .or_else(|| self.tokenizer.token_to_id("<|im_end|>"))
+            .unwrap_or(151643);
 
         let mut output_ids = input_ids.to_vec();
 
-        // Autoregressive generation loop
-        for _ in 0..max_new_tokens {
-            // Forward pass
-            let logits = match &mut self.model {
-                CandleModel::Qwen(model) => {
-                    model.forward(&input_tensor, 0, None)
-                        .context("Forward pass failed")?
-                }
-            };
+        // Clear internal KV cache from any previous call
+        match &mut self.model {
+            CandleModel::Qwen(model) => model.clear_kv_cache(),
+        }
 
-            // Get last token logits
-            use candle_core::IndexOp;
-            let last_token_logits = logits.i((0, logits.dim(1)? - 1))?;
+        // Initial forward pass with the full prompt (seqlen_offset = 0)
+        let prompt_tensor = Tensor::new(input_ids, &self.device)
+            .context("Failed to create prompt tensor")?
+            .unsqueeze(0)?;
 
-            // Sample next token (greedy for now)
-            let next_token = last_token_logits
-                .argmax(0)?
-                .to_vec1::<u32>()?[0];
+        let logits = match &mut self.model {
+            CandleModel::Qwen(model) => model
+                .forward(&prompt_tensor, 0, None)
+                .context("Initial forward pass failed")?,
+        };
 
-            // Check for EOS
-            if next_token == self.tokenizer.token_to_id("<|endoftext|>").unwrap_or(0) {
-                break;
-            }
+        // Pick the next token from the last prompt position
+        let last_logits = logits.i((0, logits.dim(1)? - 1))?;
+        let first_token = last_logits.argmax(0)?.to_scalar::<u32>()?;
 
-            output_ids.push(next_token);
+        if first_token == eos_id {
+            return Ok(output_ids);
+        }
+        output_ids.push(first_token);
 
-            // Update input for next iteration (append new token)
-            let new_input = vec![next_token];
-            let new_tensor = Tensor::new(new_input.as_slice(), &self.device)?
+        // Autoregressive loop — one new token per step, KV cache accumulates internally
+        let mut seqlen_offset = input_ids.len();
+        let mut prev_token = first_token;
+
+        for _ in 1..max_new_tokens {
+            let token_tensor = Tensor::new(&[prev_token], &self.device)?
                 .unsqueeze(0)?;
 
-            // Concatenate along sequence dimension
-            // input_tensor = Tensor::cat(&[&input_tensor, &new_tensor], 1)?;
-            // For simplicity, just use the new token (no KV cache yet)
+            let logits = match &mut self.model {
+                CandleModel::Qwen(model) => model
+                    .forward(&token_tensor, seqlen_offset, None)
+                    .context("Forward pass failed")?,
+            };
+            seqlen_offset += 1;
+
+            let step_logits = logits.i((0, 0))?;
+            let next_token = step_logits.argmax(0)?.to_scalar::<u32>()?;
+
+            if next_token == eos_id {
+                break;
+            }
+            output_ids.push(next_token);
+            prev_token = next_token;
         }
 
         Ok(output_ids)
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        let encoding = self.tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+        self.tokenizer
+            .decode(tokens, true)
+            .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))
     }
 
     fn name(&self) -> &str {
@@ -298,7 +250,7 @@ impl TextGeneration for LoadedCandleModel {
     }
 }
 
-// Placeholder implementations when candle feature is disabled
+// Placeholder when candle feature is disabled
 #[cfg(not(feature = "candle"))]
 pub struct CandleLoader;
 
@@ -306,5 +258,73 @@ pub struct CandleLoader;
 impl CandleLoader {
     pub fn new() -> Self {
         Self
+    }
+}
+
+#[cfg(all(test, feature = "candle"))]
+mod tests {
+    use super::*;
+    use crate::models::unified_loader::{ModelFamily, ModelSize};
+    use crate::config::ExecutionTarget;
+
+    // --- Regression: unimplemented families must return errors, not panic ---
+    //
+    // These verify that selecting a non-Qwen family with the Candle backend gives
+    // a clear error at load time rather than silently doing nothing or panicking.
+
+    fn loader_with_dummy_path() -> (CandleLoader, std::path::PathBuf) {
+        (CandleLoader::new(), std::path::PathBuf::from("/nonexistent"))
+    }
+
+    #[test]
+    fn test_candle_llama_stub_returns_error() {
+        let (loader, path) = loader_with_dummy_path();
+        let result = loader.load(&path, ModelFamily::Llama3, ModelSize::Small, ExecutionTarget::Cpu);
+        assert!(result.is_err());
+        let msg = result.err().expect("expected an error").to_string();
+        assert!(msg.contains("not yet implemented"), "Expected stub error, got: {}", msg);
+    }
+
+    #[test]
+    fn test_candle_gemma_stub_returns_error() {
+        let (loader, path) = loader_with_dummy_path();
+        let result = loader.load(&path, ModelFamily::Gemma2, ModelSize::Small, ExecutionTarget::Cpu);
+        assert!(result.is_err());
+        assert!(result.err().expect("expected an error").to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_candle_mistral_stub_returns_error() {
+        let (loader, path) = loader_with_dummy_path();
+        let result = loader.load(&path, ModelFamily::Mistral, ModelSize::Small, ExecutionTarget::Cpu);
+        assert!(result.is_err());
+        assert!(result.err().expect("expected an error").to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_candle_phi_stub_returns_error() {
+        let (loader, path) = loader_with_dummy_path();
+        let result = loader.load(&path, ModelFamily::Phi, ModelSize::Small, ExecutionTarget::Cpu);
+        assert!(result.is_err());
+        assert!(result.err().expect("expected an error").to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_candle_deepseek_stub_returns_error() {
+        let (loader, path) = loader_with_dummy_path();
+        let result = loader.load(&path, ModelFamily::DeepSeek, ModelSize::Small, ExecutionTarget::Cpu);
+        assert!(result.is_err());
+        assert!(result.err().expect("expected an error").to_string().contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_candle_qwen_missing_files_returns_error() {
+        // Qwen IS implemented; loading from a nonexistent path must fail gracefully
+        let (loader, path) = loader_with_dummy_path();
+        let result = loader.load(&path, ModelFamily::Qwen2, ModelSize::Small, ExecutionTarget::Cpu);
+        assert!(result.is_err());
+        // Should fail on tokenizer/config/weights load, not a stub error
+        let msg = result.err().expect("expected an error").to_string();
+        assert!(!msg.contains("not yet implemented"), "Qwen should attempt to load, not stub: {}", msg);
     }
 }

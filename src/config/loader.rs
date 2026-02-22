@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use std::fs;
 
+use super::provider::ProviderEntry;
 use super::settings::Config;
 use crate::errors;
 
@@ -17,14 +18,13 @@ pub fn load_config() -> Result<Config> {
     // Fall back to environment variable
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         if !api_key.is_empty() {
-            let teachers = vec![super::TeacherEntry {
-                provider: "claude".to_string(),
+            let providers = vec![ProviderEntry::Claude {
                 api_key,
                 model: None,
                 base_url: None,
                 name: Some("Claude (Environment)".to_string()),
             }];
-            return Ok(Config::new(teachers));
+            return Ok(Config::with_providers(providers));
         }
     }
 
@@ -45,8 +45,7 @@ pub fn load_config() -> Result<Config> {
 fn try_load_from_finch_config() -> Result<Option<Config>> {
     use super::backend::BackendConfig;
     use super::colors::ColorScheme;
-    use super::settings::{ClientConfig, FeaturesConfig};
-    use super::TeacherEntry;
+    use super::settings::{ClientConfig, FeaturesConfig, TeacherEntry};
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let config_path = home.join(".finch/config.toml");
@@ -63,15 +62,19 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
             ))
         })?;
 
-    // Parse TOML directly into a temp struct
+    // Parse TOML into a struct that accepts both the old and new formats.
     #[derive(serde::Deserialize)]
     struct TomlConfig {
         #[serde(default)]
-        streaming_enabled: bool, // Old location (deprecated)
+        streaming_enabled: bool,
         #[serde(default = "default_tui_enabled")]
         tui_enabled: bool,
+        // New unified format
         #[serde(default)]
-        backend: BackendConfig,
+        providers: Vec<ProviderEntry>,
+        // Legacy fields — kept for reading old configs
+        #[serde(default)]
+        backend: Option<BackendConfig>,
         #[serde(default)]
         client: Option<ClientConfig>,
         #[serde(default)]
@@ -82,6 +85,10 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
         features: Option<FeaturesConfig>,
         #[serde(default)]
         mcp_servers: Option<std::collections::HashMap<String, crate::tools::mcp::McpServerConfig>>,
+        #[serde(default)]
+        active_theme: Option<String>,
+        #[serde(default)]
+        huggingface_token: Option<String>,
     }
 
     fn default_tui_enabled() -> bool {
@@ -91,24 +98,43 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
     let toml_config: TomlConfig = toml::from_str(&contents)
         .map_err(|e| anyhow::anyhow!(errors::config_parse_error(&e.to_string())))?;
 
-    if toml_config.teachers.is_empty() {
-        bail!("Config is missing teachers array. Please run 'finch setup' to configure.");
+    // Determine providers: prefer new format; fall back to legacy teachers/backend.
+    let providers = if !toml_config.providers.is_empty() {
+        toml_config.providers
+    } else if !toml_config.teachers.is_empty() || toml_config.backend.is_some() {
+        // Legacy format: convert to providers
+        let mut providers: Vec<ProviderEntry> = toml_config
+            .teachers
+            .iter()
+            .map(ProviderEntry::from_teacher_entry)
+            .collect();
+        if let Some(ref backend) = toml_config.backend {
+            if backend.enabled {
+                providers.push(ProviderEntry::from_backend_config(backend, None));
+            }
+        }
+        providers
+    } else {
+        bail!("Config has no providers or teachers. Please run 'finch setup' to configure.");
+    };
+
+    if providers.is_empty() {
+        bail!("Config has no providers configured. Please run 'finch setup' to configure.");
     }
 
-    let mut config = Config::new(toml_config.teachers);
+    let mut config = Config::with_providers(providers);
 
-    // Migrate streaming_enabled to features if not present
+    // Apply scalar overrides
     if let Some(features) = toml_config.features {
         config.features = features;
     } else {
-        // Old config without features section - migrate streaming_enabled
         config.features.streaming_enabled = toml_config.streaming_enabled;
     }
-
-    // Keep deprecated field in sync for backward compatibility
-    config.streaming_enabled = config.features.streaming_enabled;
+    #[allow(deprecated)]
+    {
+        config.streaming_enabled = config.features.streaming_enabled;
+    }
     config.tui_enabled = toml_config.tui_enabled;
-    config.backend = toml_config.backend;
 
     if let Some(client) = toml_config.client {
         config.client = client;
@@ -116,14 +142,19 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
     if let Some(colors) = toml_config.colors {
         config.colors = colors;
     }
-
-    // Set MCP servers configuration
+    if let Some(theme) = toml_config.active_theme {
+        config.active_theme = theme;
+    }
+    if let Some(token) = toml_config.huggingface_token {
+        config.huggingface_token = Some(token);
+    }
     if let Some(mcp_servers) = toml_config.mcp_servers {
         config.mcp_servers = mcp_servers;
     }
 
     // Validate configuration
-    config.validate()
+    config
+        .validate()
         .context("Configuration validation failed")?;
 
     Ok(Some(config))
@@ -131,9 +162,5 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    // Note: Config creation tests removed - Config structure changed to use
-    // teachers array instead of single api_key. Config is now loaded from
-    // ~/.finch/config.toml via Config::load() or created via setup wizard.
+    // Config loading tests rely on filesystem state; see integration tests.
 }

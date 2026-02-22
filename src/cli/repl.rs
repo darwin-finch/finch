@@ -29,7 +29,7 @@ use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
     AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
-    PresentPlanTool, ReadTool, RestartTool, SaveAndExecTool, WebFetchTool, WriteTool,
+    PatchTool, PresentPlanTool, ReadTool, RestartTool, SaveAndExecTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
@@ -94,8 +94,10 @@ pub struct Repl {
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
     // Teacher session with context optimization
     teacher_session: Arc<RwLock<TeacherSession>>,
-    // Teacher management (for runtime switching)
+    // Provider management (for runtime switching)
+    available_providers: Vec<crate::config::ProviderEntry>,
     available_teachers: Vec<crate::config::TeacherEntry>,
+    active_provider_index: usize,
     active_teacher_index: usize,
     router: Router, // Now contains ThresholdRouter
     metrics_logger: MetricsLogger,
@@ -213,6 +215,7 @@ impl Repl {
         tool_registry.register(Box::new(WebFetchTool::new()));
         tool_registry.register(Box::new(BashTool));
         tool_registry.register(Box::new(EditTool));
+        tool_registry.register(Box::new(PatchTool));
         tool_registry.register(Box::new(WriteTool));
 
         // Self-improvement tools
@@ -429,7 +432,8 @@ impl Repl {
             prompt_caching_enabled: true,
         };
 
-        // Store teachers for runtime switching
+        // Store providers and teachers for runtime switching
+        let available_providers = config.providers.clone();
         let available_teachers = config.teachers.clone();
 
         let teacher_provider = match crate::providers::create_provider(&config.teachers) {
@@ -494,7 +498,9 @@ impl Repl {
             claude_client,
             daemon_client,
             teacher_session,
+            available_providers,
             available_teachers,
+            active_provider_index: 0,
             active_teacher_index: 0, // First teacher is active by default
             router, // Contains ThresholdRouter now
             metrics_logger,
@@ -1484,7 +1490,7 @@ impl Repl {
                 }
 
                 let prompt = self.get_prompt();
-                let handler = self.input_handler.as_mut().unwrap();
+                let handler = self.input_handler.as_mut().expect("input_handler is Some — guarded by is_some() above");
                 let line = handler.read_line(&prompt)?;
 
                 match line {
@@ -3138,19 +3144,32 @@ impl Repl {
 
     /// Handle /model list command
     async fn handle_model_list(&self) -> Result<()> {
-        self.output_status("📋 Available Models/Teachers:\n");
+        self.output_status("📋 Available Providers:\n");
 
-        for (idx, teacher) in self.available_teachers.iter().enumerate() {
-            let marker = if idx == self.active_teacher_index { "→ " } else { "  " };
-            let model_name = teacher.model.as_ref().unwrap_or(&teacher.provider);
-            let label = teacher.name.as_ref().unwrap_or(model_name);
+        for (idx, provider) in self.available_providers.iter().enumerate() {
+            let marker = if idx == self.active_provider_index { "→ " } else { "  " };
+            let tag = if provider.is_local() { "[local]" } else { "[cloud]" };
+            let name = provider.display_name();
+            let ptype = provider.provider_type();
+
+            let detail = if provider.is_local() {
+                if let crate::config::ProviderEntry::Local { model_family, model_size, execution_target, .. } = provider {
+                    format!("{:?} {:?} on {:?}", model_family, model_size, execution_target)
+                } else {
+                    String::new()
+                }
+            } else {
+                provider.model().unwrap_or("(default model)").to_string()
+            };
 
             self.output_status(format!(
-                "{}{}. {} ({})",
+                "{}{}. {} {} ({}) — {}",
                 marker,
                 idx + 1,
-                label,
-                teacher.provider
+                tag,
+                name,
+                ptype,
+                detail,
             ));
         }
 
@@ -3163,87 +3182,120 @@ impl Repl {
     async fn handle_model_switch(&mut self, name: &str) -> Result<()> {
         // Try to parse as number first (1-indexed)
         let target_index = if let Ok(num) = name.parse::<usize>() {
-            if num == 0 || num > self.available_teachers.len() {
-                self.output_error(format!("Invalid model number: {}. Use 1-{}", num, self.available_teachers.len()));
+            if num == 0 || num > self.available_providers.len() {
+                self.output_error(format!(
+                    "Invalid model number: {}. Use 1-{}",
+                    num,
+                    self.available_providers.len()
+                ));
                 return Ok(());
             }
-            num - 1 // Convert to 0-indexed
+            num - 1
         } else {
-            // Try to find by provider name or label
-            match self.available_teachers.iter().position(|t| {
-                t.provider.eq_ignore_ascii_case(name) ||
-                t.name.as_ref().map(|l| l.eq_ignore_ascii_case(name)).unwrap_or(false)
+            // Find by provider type or display name
+            match self.available_providers.iter().position(|p| {
+                p.provider_type().eq_ignore_ascii_case(name)
+                    || p.display_name().eq_ignore_ascii_case(name)
             }) {
                 Some(idx) => idx,
                 None => {
-                    self.output_error(format!("Teacher '{}' not found", name));
-                    self.output_status("Use '/model list' to see available teachers");
+                    self.output_error(format!("Provider '{}' not found", name));
+                    self.output_status("Use '/model list' to see available providers");
                     return Ok(());
                 }
             }
         };
 
-        // Check if already active
-        if target_index == self.active_teacher_index {
-            self.output_status("Already using this teacher");
+        if target_index == self.active_provider_index {
+            self.output_status("Already using this provider");
             return Ok(());
         }
 
-        // Create new provider
-        let new_teacher = &self.available_teachers[target_index];
-        let new_provider = match crate::providers::create_provider_from_entry(new_teacher) {
-            Ok(provider) => provider,
-            Err(e) => {
-                self.output_error(format!("Failed to create provider: {}", e));
-                return Ok(());
-            }
-        };
+        let new_entry = self.available_providers[target_index].clone();
+        let old_name = self.available_providers[self.active_provider_index]
+            .display_name()
+            .to_string();
 
-        // Get old teacher name
-        let old_teacher = &self.available_teachers[self.active_teacher_index];
-        let old_name = old_teacher.name.as_ref().unwrap_or(&old_teacher.provider);
-
-        // Update teacher session
-        let teacher_config = TeacherContextConfig {
-            max_context_turns: 15,
-            tool_result_retention_turns: 5,
-            prompt_caching_enabled: true,
-        };
-
-        *self.teacher_session.write().await = TeacherSession::with_config(
-            new_provider,
-            teacher_config,
-        );
-
-        // Update active index
-        self.active_teacher_index = target_index;
-
-        // Get new teacher name
-        let new_name = new_teacher.name.as_ref().unwrap_or(&new_teacher.provider);
-
-        // Get memory node count
-        let memory_info = if let Some(ref memory) = self.memory_system {
-            let stats = memory.stats().await?;
-            format!(" (💾 {} nodes in memory)", stats.tree_node_count)
+        if new_entry.is_local() {
+            // Local provider — just update the index; the event loop uses the
+            // local generator for queries, not the teacher session.
+            self.active_provider_index = target_index;
+            // Keep active_teacher_index pointing at the first cloud provider
+            // for when we fall back to the cloud path.
+            self.output_status(format!(
+                "✓ Switched provider: {} → {} (local inference)",
+                old_name,
+                new_entry.display_name()
+            ));
         } else {
-            String::new()
-        };
+            // Cloud provider — create a new teacher session.
+            let llm_provider = match crate::providers::create_provider_from_entry(&new_entry) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.output_error(format!("Failed to create provider: {}", e));
+                    return Ok(());
+                }
+            };
 
-        self.output_status(format!("✓ Switched teacher: {} → {}{}", old_name, new_name, memory_info));
+            let teacher_config = TeacherContextConfig {
+                max_context_turns: 15,
+                tool_result_retention_turns: 5,
+                prompt_caching_enabled: true,
+            };
+
+            *self.teacher_session.write().await =
+                TeacherSession::with_config(llm_provider, teacher_config);
+
+            // Keep available_teachers index in sync
+            if let Some(new_teacher_idx) = self
+                .available_teachers
+                .iter()
+                .position(|t| t.provider.eq_ignore_ascii_case(new_entry.provider_type()))
+            {
+                self.active_teacher_index = new_teacher_idx;
+            }
+            self.active_provider_index = target_index;
+
+            let new_name = new_entry.display_name().to_string();
+            let memory_info = if let Some(ref memory) = self.memory_system {
+                let stats = memory.stats().await?;
+                format!(" (💾 {} nodes in memory)", stats.tree_node_count)
+            } else {
+                String::new()
+            };
+            self.output_status(format!(
+                "✓ Switched provider: {} → {}{}",
+                old_name, new_name, memory_info
+            ));
+        }
 
         Ok(())
     }
 
     /// Handle /model show command
     async fn handle_model_show(&self) -> Result<()> {
-        let active_teacher = &self.available_teachers[self.active_teacher_index];
-        let name = active_teacher.name.as_ref().unwrap_or(&active_teacher.provider);
-        let default_model = "(default)".to_string();
-        let model = active_teacher.model.as_ref().unwrap_or(&default_model);
+        let active = &self.available_providers[self.active_provider_index];
+        self.output_status(format!("📖 Current Provider: {}", active.display_name()));
+        self.output_status(format!("Type: {}", active.provider_type()));
 
-        self.output_status(format!("📖 Current Model/Teacher: {}", name));
-        self.output_status(format!("Provider: {}", active_teacher.provider));
-        self.output_status(format!("Model: {}", model));
+        if active.is_local() {
+            if let crate::config::ProviderEntry::Local {
+                model_family,
+                model_size,
+                inference_provider,
+                execution_target,
+                ..
+            } = active
+            {
+                self.output_status(format!("Family: {:?}", model_family));
+                self.output_status(format!("Size: {:?}", model_size));
+                self.output_status(format!("Backend: {:?}", inference_provider));
+                self.output_status(format!("Device: {:?}", execution_target));
+            }
+        } else {
+            let model = active.model().unwrap_or("(provider default)");
+            self.output_status(format!("Model: {}", model));
+        }
 
         // Get conversation stats
         let conv = self.conversation.read().await;

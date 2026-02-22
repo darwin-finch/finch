@@ -683,6 +683,19 @@ impl TextGeneration for LoadedOnnxModel {
         self.generate_autoregressive_with_callback(input_ids, max_new_tokens, Some(token_callback))
     }
 
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        let encoding = self.tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
+        self.tokenizer
+            .decode(tokens, true)
+            .map_err(|e| anyhow::anyhow!("Decode failed: {}", e))
+    }
+
     fn name(&self) -> &str {
         &self.model_name
     }

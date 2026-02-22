@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 
 use super::generator_new::GeneratorModel;
 use crate::config::ExecutionTarget;
-use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
+use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
 use super::GeneratorConfig;
 use crate::cli::OutputManager;
 
@@ -194,30 +194,12 @@ impl BootstrapLoader {
         let output_clone = self.output.clone();
 
         let generator = tokio::task::spawn_blocking(move || {
-            // Output progress
             if let Some(output) = &output_clone {
                 output.write_progress(format!("  └─ Initializing {}...", model_name_clone));
             }
 
-            let loader = UnifiedModelLoader::new()?;
-
-            // This will download if not cached
-            let _text_gen = loader.load(load_config)?;
-
-            // Wrap in GeneratorModel (currently we need to convert)
-            // For now, we'll use the Pretrained variant
-            let config = GeneratorConfig::Pretrained(ModelLoadConfig {
-                provider,
-                family: model_family,
-                size: model_size,
-                target: execution_target,
-                repo_override: model_repo.clone(),
-            });
-
-            // Actually, UnifiedModelLoader.load() returns Box<dyn TextGeneration>
-            // We need to create a GeneratorModel from this
-            // This is a bit awkward - we're loading twice
-            // Let me just use GeneratorModel::new() with Pretrained config
+            // GeneratorModel::new() handles download + loading internally
+            let config = GeneratorConfig::Pretrained(load_config);
             GeneratorModel::new(config)
         })
         .await??;

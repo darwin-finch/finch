@@ -2,6 +2,7 @@
 
 use super::backend::BackendConfig;
 use super::colors::ColorScheme;
+use super::provider::ProviderEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -78,6 +79,12 @@ pub struct Config {
 
     /// Client configuration (connecting to daemon)
     pub client: ClientConfig,
+
+    /// Unified provider list — source of truth for config I/O.
+    /// Cloud providers here are also mirrored in `teachers`; local providers
+    /// are also mirrored in `backend`. Use `with_providers()` to construct
+    /// from this list, or `new()` to construct from the legacy fields.
+    pub providers: Vec<ProviderEntry>,
 
     /// Teacher LLM provider configuration (array of teachers in priority order)
     pub teachers: Vec<TeacherEntry>,
@@ -190,6 +197,156 @@ pub struct TeacherEntry {
     pub name: Option<String>,
 }
 
+
+// ---------------------------------------------------------------------------
+// Conversion helpers between ProviderEntry and legacy types
+// (Defined here to avoid circular imports — TeacherEntry lives in this file)
+// ---------------------------------------------------------------------------
+
+impl ProviderEntry {
+    /// Convert this cloud provider to a `TeacherEntry` for backward compat.
+    /// Returns `None` for `Local` variants.
+    pub fn to_teacher_entry(&self) -> Option<TeacherEntry> {
+        match self {
+            Self::Claude { api_key, model, base_url, name } => Some(TeacherEntry {
+                provider: "claude".to_string(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+                name: name.clone(),
+            }),
+            Self::Openai { api_key, model, base_url, name } => Some(TeacherEntry {
+                provider: "openai".to_string(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+                name: name.clone(),
+            }),
+            Self::Grok { api_key, model, name } => Some(TeacherEntry {
+                provider: "grok".to_string(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: None,
+                name: name.clone(),
+            }),
+            Self::Gemini { api_key, model, name } => Some(TeacherEntry {
+                provider: "gemini".to_string(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: None,
+                name: name.clone(),
+            }),
+            Self::Mistral { api_key, model, base_url, name } => Some(TeacherEntry {
+                provider: "mistral".to_string(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+                name: name.clone(),
+            }),
+            Self::Groq { api_key, model, name } => Some(TeacherEntry {
+                provider: "groq".to_string(),
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: None,
+                name: name.clone(),
+            }),
+            Self::Local { .. } => None,
+        }
+    }
+
+    /// Build a `ProviderEntry` from a `TeacherEntry`.
+    pub fn from_teacher_entry(entry: &TeacherEntry) -> Self {
+        match entry.provider.to_lowercase().as_str() {
+            "claude" => Self::Claude {
+                api_key: entry.api_key.clone(),
+                model: entry.model.clone(),
+                base_url: entry.base_url.clone(),
+                name: entry.name.clone(),
+            },
+            "openai" => Self::Openai {
+                api_key: entry.api_key.clone(),
+                model: entry.model.clone(),
+                base_url: entry.base_url.clone(),
+                name: entry.name.clone(),
+            },
+            "grok" => Self::Grok {
+                api_key: entry.api_key.clone(),
+                model: entry.model.clone(),
+                name: entry.name.clone(),
+            },
+            "gemini" => Self::Gemini {
+                api_key: entry.api_key.clone(),
+                model: entry.model.clone(),
+                name: entry.name.clone(),
+            },
+            "mistral" => Self::Mistral {
+                api_key: entry.api_key.clone(),
+                model: entry.model.clone(),
+                base_url: entry.base_url.clone(),
+                name: entry.name.clone(),
+            },
+            "groq" => Self::Groq {
+                api_key: entry.api_key.clone(),
+                model: entry.model.clone(),
+                name: entry.name.clone(),
+            },
+            _ => {
+                // Unknown provider — treat as Claude (safest fallback)
+                Self::Claude {
+                    api_key: entry.api_key.clone(),
+                    model: entry.model.clone(),
+                    base_url: entry.base_url.clone(),
+                    name: entry.name.clone(),
+                }
+            }
+        }
+    }
+
+    /// Extract a `BackendConfig` from a `Local` variant. Returns `None` for
+    /// cloud variants.
+    pub fn to_backend_config(&self) -> Option<BackendConfig> {
+        if let Self::Local {
+            inference_provider,
+            execution_target,
+            model_family,
+            model_size,
+            model_repo,
+            model_path,
+            enabled,
+            ..
+        } = self
+        {
+            Some(BackendConfig {
+                enabled: *enabled,
+                inference_provider: *inference_provider,
+                execution_target: *execution_target,
+                model_family: *model_family,
+                model_size: *model_size,
+                model_repo: model_repo.clone(),
+                model_path: model_path.clone(),
+                fallback_chain: BackendConfig::default().fallback_chain,
+                #[allow(deprecated)]
+                device: None,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Build a `Local` `ProviderEntry` from a `BackendConfig`.
+    pub fn from_backend_config(cfg: &BackendConfig, name: Option<String>) -> Self {
+        Self::Local {
+            inference_provider: cfg.inference_provider,
+            execution_target: cfg.execution_target,
+            model_family: cfg.model_family,
+            model_size: cfg.model_size,
+            model_repo: cfg.model_repo.clone(),
+            model_path: cfg.model_path.clone(),
+            enabled: cfg.enabled,
+            name,
+        }
+    }
+}
 
 impl Config {
     /// Validate configuration and return helpful errors
@@ -320,8 +477,36 @@ impl Config {
     }
 
     pub fn new(teachers: Vec<TeacherEntry>) -> Self {
+        // Derive providers from teachers (no local backend by default)
+        let providers: Vec<ProviderEntry> = teachers
+            .iter()
+            .map(ProviderEntry::from_teacher_entry)
+            .collect();
+        Self::new_with_all(teachers, BackendConfig::default(), providers)
+    }
+
+    /// Construct from a unified providers list.
+    ///
+    /// Automatically derives the legacy `teachers` and `backend` fields so
+    /// existing code continues to work without changes.
+    pub fn with_providers(providers: Vec<ProviderEntry>) -> Self {
+        let teachers: Vec<TeacherEntry> = providers
+            .iter()
+            .filter_map(ProviderEntry::to_teacher_entry)
+            .collect();
+        let backend = providers
+            .iter()
+            .find_map(ProviderEntry::to_backend_config)
+            .unwrap_or_default();
+        Self::new_with_all(teachers, backend, providers)
+    }
+
+    fn new_with_all(
+        teachers: Vec<TeacherEntry>,
+        backend: BackendConfig,
+        providers: Vec<ProviderEntry>,
+    ) -> Self {
         let home = dirs::home_dir().expect("Could not determine home directory");
-        let _project_dir = std::env::current_dir().expect("Could not determine current directory");
 
         // Look for constitution in ~/.finch/constitution.md
         let constitution_path = home.join(".finch/constitution.md");
@@ -335,26 +520,44 @@ impl Config {
 
         Self {
             metrics_dir: home.join(".finch/metrics"),
-            streaming_enabled: features.streaming_enabled, // Deprecated, maintained for compat
-            tui_enabled: true,       // TUI is the default for interactive terminals
+            streaming_enabled: features.streaming_enabled,
+            tui_enabled: true,
             constitution_path,
             active_persona: "default".to_string(),
-            active_theme: "dark".to_string(), // Default to dark theme
-            huggingface_token: None, // No HF token by default
-            backend: BackendConfig::default(),
+            active_theme: "dark".to_string(),
+            huggingface_token: None,
+            backend,
             server: ServerConfig::default(),
             client: ClientConfig::default(),
             colors: ColorScheme::default(),
             teachers,
+            providers,
             features,
-            mcp_servers: HashMap::new(), // No MCP servers by default
-            memory: crate::memory::MemoryConfig::default(), // Phase 4: Hierarchical Memory
+            mcp_servers: HashMap::new(),
+            memory: crate::memory::MemoryConfig::default(),
         }
     }
 
-    /// Get the active teacher (first in priority list)
+    /// Get the active provider (first in the unified providers list).
+    pub fn active_provider(&self) -> Option<&ProviderEntry> {
+        self.providers.first()
+    }
+
+    /// Get the active teacher (first cloud provider in priority list).
+    ///
+    /// Deprecated: prefer `active_provider()` for new code.
     pub fn active_teacher(&self) -> Option<&TeacherEntry> {
         self.teachers.first()
+    }
+
+    /// All cloud providers (excludes Local entries).
+    pub fn cloud_providers(&self) -> Vec<&ProviderEntry> {
+        self.providers.iter().filter(|p| !p.is_local()).collect()
+    }
+
+    /// All local providers (only Local entries).
+    pub fn local_providers(&self) -> Vec<&ProviderEntry> {
+        self.providers.iter().filter(|p| p.is_local()).collect()
     }
 
     /// Save configuration to TOML file at ~/.finch/config.toml
@@ -368,15 +571,32 @@ impl Config {
         // Create directory if it doesn't exist
         fs::create_dir_all(&config_dir)?;
 
-        // Create serializable config
+        // Build the providers list — prefer the explicit providers field; fall
+        // back to deriving from teachers+backend for configs constructed via
+        // the legacy Config::new(teachers) path.
+        let providers = if !self.providers.is_empty() {
+            self.providers.clone()
+        } else {
+            // Derive from legacy fields
+            let mut p: Vec<ProviderEntry> = self
+                .teachers
+                .iter()
+                .map(ProviderEntry::from_teacher_entry)
+                .collect();
+            if self.backend.enabled {
+                p.push(ProviderEntry::from_backend_config(&self.backend, None));
+            }
+            p
+        };
+
+        // Create serializable config (new [[providers]] format)
         let toml_config = TomlConfig {
-            streaming_enabled: self.features.streaming_enabled, // Use features value
+            streaming_enabled: self.features.streaming_enabled,
             tui_enabled: self.tui_enabled,
             active_theme: Some(self.active_theme.clone()),
             huggingface_token: self.huggingface_token.clone(),
-            backend: self.backend.clone(),
             client: Some(self.client.clone()),
-            teachers: self.teachers.clone(),
+            providers,
             colors: Some(self.colors.clone()),
             features: Some(self.features.clone()),
         };
@@ -389,19 +609,19 @@ impl Config {
     }
 }
 
-/// TOML-serializable config (subset of Config)
+/// TOML-serializable config (new [[providers]] format).
 #[derive(Serialize, Deserialize)]
 struct TomlConfig {
-    streaming_enabled: bool, // Deprecated, kept for backward compat
+    streaming_enabled: bool,
     tui_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     huggingface_token: Option<String>,
-    backend: BackendConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     client: Option<ClientConfig>,
-    teachers: Vec<TeacherEntry>,
+    #[serde(default)]
+    providers: Vec<ProviderEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     colors: Option<ColorScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -446,11 +666,83 @@ mod tests {
     fn test_config_new_has_no_teachers() {
         let config = Config::new(vec![]);
         assert!(config.active_teacher().is_none());
+        assert!(config.active_provider().is_none());
     }
 
     #[test]
     fn test_config_active_teacher_none_when_empty() {
         let config = Config::new(vec![]);
         assert!(config.active_teacher().is_none());
+    }
+
+    #[test]
+    fn test_with_providers_derives_teachers() {
+        use crate::config::ProviderEntry;
+        let providers = vec![
+            ProviderEntry::Claude {
+                api_key: "sk-ant-test".to_string(),
+                model: None,
+                base_url: None,
+                name: Some("Claude".to_string()),
+            },
+        ];
+        let config = Config::with_providers(providers);
+        assert_eq!(config.teachers.len(), 1);
+        assert_eq!(config.teachers[0].provider, "claude");
+        assert_eq!(config.providers.len(), 1);
+        assert!(config.active_provider().is_some());
+        assert!(config.active_teacher().is_some());
+    }
+
+    #[test]
+    fn test_with_providers_derives_backend_from_local() {
+        use crate::config::ProviderEntry;
+        use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+        use crate::config::ExecutionTarget;
+        let providers = vec![
+            ProviderEntry::Local {
+                inference_provider: InferenceProvider::Onnx,
+                execution_target: ExecutionTarget::Auto,
+                model_family: ModelFamily::Qwen2,
+                model_size: ModelSize::Medium,
+                model_repo: None,
+                model_path: None,
+                enabled: true,
+                name: None,
+            },
+        ];
+        let config = Config::with_providers(providers);
+        assert!(config.teachers.is_empty()); // no cloud providers
+        assert!(config.backend.enabled);
+        assert_eq!(config.providers.len(), 1);
+        assert!(config.active_provider().is_some());
+        assert!(config.active_provider().unwrap().is_local());
+    }
+
+    #[test]
+    fn test_cloud_providers_filters_local() {
+        use crate::config::ProviderEntry;
+        use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+        use crate::config::ExecutionTarget;
+        let providers = vec![
+            ProviderEntry::Grok {
+                api_key: "xai-key".to_string(),
+                model: None,
+                name: None,
+            },
+            ProviderEntry::Local {
+                inference_provider: InferenceProvider::Onnx,
+                execution_target: ExecutionTarget::Auto,
+                model_family: ModelFamily::Qwen2,
+                model_size: ModelSize::Medium,
+                model_repo: None,
+                model_path: None,
+                enabled: true,
+                name: None,
+            },
+        ];
+        let config = Config::with_providers(providers);
+        assert_eq!(config.cloud_providers().len(), 1);
+        assert_eq!(config.local_providers().len(), 1);
     }
 }
