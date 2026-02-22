@@ -406,7 +406,7 @@ pub fn format_help() -> String {
     )
 }
 
-fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
+pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
     let summary = metrics_logger.get_today_summary()?;
 
     let local_pct = if summary.total > 0 {
@@ -456,7 +456,7 @@ fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
     ))
 }
 
-fn format_training(
+pub fn format_training(
     router: Option<&Router>, // CHANGED: Router instead of ThresholdRouter
     validator: Option<&ThresholdValidator>,
 ) -> Result<String> {

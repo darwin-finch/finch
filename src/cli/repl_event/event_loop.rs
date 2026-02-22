@@ -109,6 +109,9 @@ pub struct EventLoop {
 
     /// Feedback logger — writes rated responses to ~/.finch/feedback.jsonl
     feedback_logger: Option<FeedbackLogger>,
+
+    /// Metrics logger — reads from ~/.finch/metrics/ for /metrics command
+    metrics_logger: Option<crate::metrics::MetricsLogger>,
 }
 
 /// View mode for the REPL
@@ -209,6 +212,9 @@ impl EventLoop {
             view_mode: Arc::new(RwLock::new(ViewMode::List)), // Start in list view
             active_tool_uses: Arc::new(RwLock::new(std::collections::HashMap::new())),
             feedback_logger: FeedbackLogger::new().ok(),
+            metrics_logger: dirs::home_dir()
+                .map(|h| h.join(".finch").join("metrics"))
+                .and_then(|p| crate::metrics::MetricsLogger::new(p).ok()),
         }
     }
 
@@ -386,17 +392,28 @@ impl EventLoop {
                         self.render_tui().await?;
                     }
                     Command::Metrics => {
-                        // TODO: Pass actual metrics logger when available
-                        self.output_manager.write_info(
-                            "Metrics command not yet fully integrated in event loop."
-                        );
+                        use crate::cli::commands::format_metrics;
+                        let text = if let Some(ref logger) = self.metrics_logger {
+                            match format_metrics(logger) {
+                                Ok(s) => s,
+                                Err(e) => format!("⚠️  Failed to read metrics: {}", e),
+                            }
+                        } else {
+                            "⚠️  Metrics logger unavailable.".to_string()
+                        };
+                        self.output_manager.write_info(text);
                         self.render_tui().await?;
                     }
                     Command::Training => {
-                        // TODO: Pass actual router/validator when available
-                        self.output_manager.write_info(
-                            "Training command not yet fully integrated in event loop."
-                        );
+                        use crate::cli::commands::format_training;
+                        let router = Arc::clone(&self.router);
+                        let router_ref = router.as_ref();
+                        match format_training(Some(router_ref), None) {
+                            Ok(s) => self.output_manager.write_info(s),
+                            Err(e) => self.output_manager.write_info(
+                                format!("⚠️  Failed to read training stats: {}", e)
+                            ),
+                        }
                         self.render_tui().await?;
                     }
                     Command::Memory => {

@@ -18,6 +18,33 @@ const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 
+/// Parse an Anthropic API error body and return a human-friendly message with hints.
+fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
+    // Anthropic errors look like: {"type":"error","error":{"type":"...","message":"..."}}
+    let extracted = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        });
+
+    let msg = extracted.as_deref().unwrap_or(body.trim());
+
+    let hint = match status.as_u16() {
+        401 => " — Check that your ANTHROPIC_API_KEY or api_key in ~/.finch/config.toml is correct",
+        403 => " — Your API key may lack permissions",
+        429 => " — You've hit a rate limit; wait a moment before retrying",
+        400 => " — The request was malformed (this may be a finch bug; please report it)",
+        404 => " — Model not found; check the model name in your config",
+        500 | 502 | 503 => " — Anthropic is having issues; try again in a moment",
+        _ => "",
+    };
+
+    format!("Claude API error {}{}: {}", status, hint, msg)
+}
+
 /// Helper struct for building blocks during streaming
 struct BlockBuilder {
     block_type: String,
@@ -95,11 +122,7 @@ impl ClaudeProvider {
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Claude API request failed\n\nStatus: {}\nBody: {}",
-                status,
-                error_body
-            );
+            anyhow::bail!("{}", friendly_api_error(status, &error_body));
         }
 
         let message_response: crate::claude::types::MessageResponse = response
@@ -149,11 +172,7 @@ impl ClaudeProvider {
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Claude API streaming request failed\n\nStatus: {}\nBody: {}",
-                status,
-                error_body
-            );
+            anyhow::bail!("{}", friendly_api_error(status, &error_body));
         }
 
         // Spawn task to parse SSE stream with block tracking

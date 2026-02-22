@@ -18,6 +18,36 @@ use crate::claude::types::ContentBlock;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 
+/// Parse an API error body and return a human-friendly message with hints.
+///
+/// Most providers return `{"error": {"message": "...", "type": "...", "code": "..."}}`.
+fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
+    // Try to extract the inner message from standard JSON error format
+    let extracted = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        });
+
+    let msg = extracted.as_deref().unwrap_or(body.trim());
+
+    // Provide actionable hints based on status code
+    let hint = match status.as_u16() {
+        401 => " — Check that your API key is correct in ~/.finch/config.toml",
+        403 => " — Your API key may lack permissions for this model",
+        429 => " — You've hit a rate limit; wait a moment before retrying",
+        400 => " — The request was malformed (this may be a finch bug; please report it)",
+        404 => " — Model not found; check the model name in your config",
+        500 | 502 | 503 => " — The provider is having issues; try again in a moment",
+        _ => "",
+    };
+
+    format!("API error {}{}: {}", status, hint, msg)
+}
+
 /// OpenAI API provider
 ///
 /// Supports both OpenAI and Grok APIs (they use the same format).
@@ -303,11 +333,7 @@ impl OpenAIProvider {
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "OpenAI API request failed\n\nStatus: {}\nBody: {}",
-                status,
-                error_body
-            );
+            anyhow::bail!("{}", friendly_api_error(status, &error_body));
         }
 
         let openai_response: OpenAIResponse = response
@@ -347,11 +373,7 @@ impl OpenAIProvider {
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "OpenAI API streaming request failed\n\nStatus: {}\nBody: {}",
-                status,
-                error_body
-            );
+            anyhow::bail!("{}", friendly_api_error(status, &error_body));
         }
 
         // Spawn task to parse SSE stream
