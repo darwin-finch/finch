@@ -78,7 +78,7 @@ impl Generator for QwenGenerator {
     }
 
     fn name(&self) -> &str {
-        "Qwen Local"
+        "Local"
     }
 }
 
@@ -125,6 +125,12 @@ impl QwenGenerator {
         let latency_ms = t0.elapsed().as_millis() as u64;
         let output_token_estimate = (generated.text.split_whitespace().count() as f32 * 1.3) as u32;
 
+        // Read the actual model name from LocalGenerator (reflects configured family)
+        let model_display_name = {
+            let gen = self.local_generator.read().await;
+            gen.model_name().to_string()
+        };
+
         Ok(GeneratorResponse {
             text: generated.text.clone(),
             content_blocks: vec![ContentBlock::Text {
@@ -132,8 +138,8 @@ impl QwenGenerator {
             }],
             tool_uses: vec![],
             metadata: ResponseMetadata {
-                generator: "qwen".to_string(),
-                model: "Qwen2.5-3B".to_string(),
+                generator: "local".to_string(),
+                model: model_display_name,
                 confidence: Some(generated.confidence),
                 stop_reason: None,
                 input_tokens: Some(input_token_estimate),
@@ -170,13 +176,17 @@ impl QwenGenerator {
                 let text = ToolCallParser::extract_text(&output);
                 tracing::info!("No tool calls found, returning final answer");
 
+                let model_display_name = {
+                    let gen = self.local_generator.read().await;
+                    gen.model_name().to_string()
+                };
                 return Ok(GeneratorResponse {
                     text: text.clone(),
                     content_blocks: vec![ContentBlock::Text { text: text.clone() }],
                     tool_uses: all_tool_uses,
                     metadata: ResponseMetadata {
-                        generator: "qwen".to_string(),
-                        model: "Qwen2.5-3B".to_string(),
+                        generator: "local".to_string(),
+                        model: model_display_name,
                         confidence: Some(0.8),
                         stop_reason: Some("end_turn".to_string()),
                         input_tokens: None,

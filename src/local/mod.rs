@@ -25,6 +25,8 @@ pub struct LocalGenerator {
     pattern_classifier: PatternClassifier,
     response_generator: TemplateGenerator,
     enabled: bool,
+    /// Display name of the loaded model (e.g. "Qwen 2.5", "Llama 3", "Gemma 2")
+    model_name: String,
 }
 
 impl LocalGenerator {
@@ -57,11 +59,18 @@ impl LocalGenerator {
         let response_generator =
             TemplateGenerator::with_models(pattern_classifier.clone(), neural_generator, &model_name);
 
+        let model_name = model_name; // capture before move
         Self {
             pattern_classifier,
             response_generator,
             enabled: true,
+            model_name,
         }
+    }
+
+    /// Return the name of the currently-configured local model.
+    pub fn model_name(&self) -> &str {
+        &self.model_name
     }
 
     /// Extract model family name from config file
@@ -291,6 +300,7 @@ impl LocalGenerator {
             pattern_classifier,
             response_generator,
             enabled: true,
+            model_name: Self::extract_model_name_from_config(),
         })
     }
 }
