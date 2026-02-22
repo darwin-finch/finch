@@ -22,7 +22,7 @@ use crossterm::{
     cursor,
     event::{self, Event},
     execute,
-    style::{Print, ResetColor},
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
         disable_raw_mode, enable_raw_mode, Clear, ClearType,
         BeginSynchronizedUpdate, EndSynchronizedUpdate,
@@ -572,27 +572,73 @@ impl TuiRenderer {
 
 impl TuiRenderer {
     pub fn print_startup_header(&mut self, model: &str, cwd: &str) -> Result<()> {
-        let w = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let sep = "─".repeat(w);
+        let version = env!("CARGO_PKG_VERSION");
 
         // Clear the visible terminal so we start from a clean slate.
-        execute!(
-            io::stdout(),
-            Clear(ClearType::All),
-            cursor::MoveTo(0, 0),
-        )?;
+        execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
 
-        // Print exactly one separator + the header line.
-        // draw_live_area() will add the second separator that borders the input
-        // area, so we must NOT add sep2/blank here — that would produce three
-        // separators total.
+        // Darwin finch ASCII bird — 6 lines.
+        // Columns 0-14: bird art.  Column 15+: info text.
+        //
+        //   Line 1:       ▄▄▄▄▄▄              (head top — art only)
+        //   Line 2:     ▗▟█●██▙►  finch v…    (head + beak + version)
+        //   Line 3:   ▐████████▌  <model>      (upper body + model name)
+        //   Line 4:   ▝▜██████▛▘  <cwd>        (lower body + cwd)
+        //   Line 5:      ╥  ╥                  (legs)
+        //   Line 6:     ╱    ╲                 (perch)
         execute!(
             io::stdout(),
-            Print(format!("{}{}{}\r\n", DIM_GRAY, sep, RESET)),
-            Print(format!(
-                "  {}finch{}  ·  {}  ·  {}{}{}\r\n",
-                "\x1b[1;37m", RESET, model, DIM_GRAY, cwd, RESET
-            )),
+            // Line 1 — head top
+            Print("      "),
+            SetForegroundColor(Color::DarkYellow),
+            Print("▄▄▄▄▄▄"),
+            ResetColor,
+            Print("\r\n"),
+            // Line 2 — head with eye, beak, version
+            Print("    "),
+            SetForegroundColor(Color::DarkYellow),
+            Print("▗▟█"),
+            SetForegroundColor(Color::White),
+            Print("●"),
+            SetForegroundColor(Color::DarkYellow),
+            Print("██▙"),
+            SetForegroundColor(Color::Yellow),
+            SetAttribute(Attribute::Bold),
+            Print("►"),
+            ResetColor,
+            Print("  "),
+            SetAttribute(Attribute::Bold),
+            Print(format!("finch v{}", version)),
+            SetAttribute(Attribute::Reset),
+            Print("\r\n"),
+            // Line 3 — upper body + model name
+            Print("  "),
+            SetForegroundColor(Color::DarkYellow),
+            Print("▐████████▌"),
+            ResetColor,
+            Print(format!("   {}\r\n", model)),
+            // Line 4 — lower body + cwd
+            Print("  "),
+            SetForegroundColor(Color::DarkYellow),
+            Print("▝▜██████▛▘"),
+            ResetColor,
+            Print("   "),
+            SetForegroundColor(Color::DarkGrey),
+            Print(cwd),
+            ResetColor,
+            Print("\r\n"),
+            // Line 5 — legs
+            Print("     "),
+            SetForegroundColor(Color::DarkGrey),
+            Print("╥  ╥"),
+            ResetColor,
+            Print("\r\n"),
+            // Line 6 — perch
+            Print("    "),
+            SetForegroundColor(Color::DarkGrey),
+            Print("╱    ╲"),
+            ResetColor,
+            Print("\r\n"),
         )?;
 
         self.draw_live_area()
