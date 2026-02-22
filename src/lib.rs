@@ -4,6 +4,7 @@
 // Core modules
 pub mod agent; // Autonomous agent loop (task backlog, reflection, activity log)
 pub mod claude;
+pub mod context; // Project context (CLAUDE.md / FINCH.md auto-loading)
 pub mod cli;
 pub mod client; // HTTP client for daemon communication (Phase 8)
 pub mod config;

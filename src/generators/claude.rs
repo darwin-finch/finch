@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::claude::{ClaudeClient, ContentBlock, Message, MessageRequest};
+use crate::context::collect_claude_md_context;
 use crate::tools::types::ToolDefinition;
 
 use super::{
@@ -40,12 +41,16 @@ Don't add comments unless the logic is genuinely non-obvious.
 Work through multi-step tasks systematically, verifying each step.
 Be direct. If something is unclear, ask one focused question rather than guessing.";
 
-/// Build the full system prompt including working directory context.
-pub fn build_system_prompt(cwd: Option<&str>) -> String {
-    match cwd {
-        Some(dir) => format!("{}\n\nWorking directory: {}", CODING_SYSTEM_PROMPT, dir),
-        None => CODING_SYSTEM_PROMPT.to_string(),
+/// Build the full system prompt including working directory and project context.
+pub fn build_system_prompt(cwd: Option<&str>, claude_md: Option<&str>) -> String {
+    let mut prompt = CODING_SYSTEM_PROMPT.to_string();
+    if let Some(dir) = cwd {
+        prompt.push_str(&format!("\n\nWorking directory: {}", dir));
     }
+    if let Some(md) = claude_md {
+        prompt.push_str(&format!("\n\n## Project Instructions\n\n{}", md));
+    }
+    prompt
 }
 
 /// Claude API generator implementation
@@ -54,13 +59,17 @@ pub struct ClaudeGenerator {
     capabilities: GeneratorCapabilities,
     /// Working directory context injected into the system prompt.
     cwd: Option<String>,
+    /// Concatenated contents of any CLAUDE.md / FINCH.md files found at startup.
+    claude_md_context: Option<String>,
 }
 
 impl ClaudeGenerator {
     pub fn new(client: Arc<ClaudeClient>) -> Self {
-        let cwd = std::env::current_dir()
-            .ok()
-            .map(|p| p.display().to_string());
+        let cwd = std::env::current_dir().ok();
+        let claude_md_context = cwd
+            .as_deref()
+            .and_then(collect_claude_md_context);
+        let cwd_str = cwd.map(|p| p.display().to_string());
         Self {
             client,
             capabilities: GeneratorCapabilities {
@@ -69,12 +78,13 @@ impl ClaudeGenerator {
                 supports_conversation: true,
                 max_context_messages: Some(50),
             },
-            cwd,
+            cwd: cwd_str,
+            claude_md_context,
         }
     }
 
     fn system_prompt(&self) -> String {
-        build_system_prompt(self.cwd.as_deref())
+        build_system_prompt(self.cwd.as_deref(), self.claude_md_context.as_deref())
     }
 
     /// Convert Claude MessageResponse to unified GeneratorResponse
