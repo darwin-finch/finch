@@ -139,6 +139,20 @@ cargo build --release
 
 ---
 
+## Sponsors
+
+finch is MIT-licensed and free to use. If it saves you API costs or you want to support continued development, sponsorships are appreciated.
+
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/darwin-finch?label=Sponsor&logo=GitHub&color=ea4aaa)](https://github.com/sponsors/darwin-finch)
+
+Sponsorships help cover:
+- API costs during development (~$1,000 spent so far building finch with AI assistance)
+- Time to work on the big open milestones (LoRA adapter loading, broader model support, VS Code integration)
+
+Available for **consulting and contract work** — open an issue or reach out via GitHub if interested.
+
+---
+
 ## License
 
 MIT OR Apache-2.0
