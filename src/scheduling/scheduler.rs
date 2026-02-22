@@ -71,12 +71,16 @@ impl TaskScheduler {
         Ok(())
     }
 
-    /// Execute a single task
-    async fn execute_task(&self, _task: &crate::scheduling::queue::ScheduledTask) -> Result<String> {
-        // TODO: Reconstruct conversation context
-        // TODO: Execute via generator
-        // TODO: Return response
-        Ok("Task executed".to_string())
+    /// Execute a single task.
+    ///
+    /// **Not yet implemented** — task execution requires wiring the generator
+    /// into the scheduler, which is tracked as GitHub Issue #8.
+    async fn execute_task(&self, task: &crate::scheduling::queue::ScheduledTask) -> Result<String> {
+        anyhow::bail!(
+            "Task execution not yet implemented (GitHub Issue #8). \
+             Cannot execute scheduled task: '{}'",
+            task.task
+        )
     }
 
     /// Stop scheduler

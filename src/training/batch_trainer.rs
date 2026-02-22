@@ -225,32 +225,22 @@ impl BatchTrainer {
 
         tracing::info!(examples = batch.len(), "Starting batch training");
 
-        // TODO: Actual training implementation
-        // For now, return placeholder results
-        // Real implementation will:
-        // 1. Tokenize all examples
-        // 2. Create batched tensors
-        // 3. Forward pass through models
-        // 4. Compute losses
-        // 5. Backward pass and update weights
-        // 6. Compute new losses
-
-        let result = TrainingResult {
-            examples_count: batch.len(),
-            router_old_loss: 0.5,
-            router_new_loss: 0.45,
-            generator_old_loss: 1.2,
-            generator_new_loss: 1.1,
-            validator_old_loss: 0.4,
-            validator_new_loss: 0.35,
-            duration_secs: start_time.elapsed().as_secs_f64(),
-        };
-
-        // Update statistics
-        *total_trained.lock().await += batch.len();
-        *last_training.lock().await = Some(chrono::Utc::now());
-
-        Ok(result)
+        // Batch training is not yet implemented.
+        //
+        // The current inference stack uses ONNX Runtime; injecting LoRA adapter
+        // weights into a running ONNX session at inference time is tracked as
+        // GitHub Issue #1. Until that is resolved, in-process batch training
+        // has no effect on the served model.
+        //
+        // Feedback is collected (src/models/lora.rs, ~/.finch/training_queue.jsonl)
+        // and a Python-based offline training pipeline is available via
+        // src/training/lora_subprocess.rs.
+        anyhow::bail!(
+            "Batch training not yet implemented (see GitHub Issue #1). \
+             {} examples were collected but not trained on. \
+             Use the offline LoRA pipeline (src/training/lora_subprocess.rs) instead.",
+            batch.len()
+        )
     }
 
     /// Get training statistics
@@ -342,6 +332,36 @@ mod tests {
         assert_eq!(stats.queue_size, 5);
         assert_eq!(stats.total_trained, 150);
         assert!(stats.last_training.is_some());
+    }
+
+    // --- Regression: train_batch_internal must return an error, not fake losses ---
+    //
+    // Previously the function returned hardcoded loss values (0.5, 0.45, etc.),
+    // silently telling callers training had succeeded. Now it returns an explicit error.
+    //
+    // We can't call train_batch_internal directly (private, requires model Arcs),
+    // but we can verify the public API path via train_async: since BatchTrainer
+    // requires models, it can only be constructed in an integration test.
+    // This unit test documents the regression and verifies the TrainingResult
+    // type is preserved for when training is eventually implemented.
+
+    #[test]
+    fn test_training_result_type_exists_with_correct_fields() {
+        // Regression: TrainingResult must keep its fields so that when real
+        // training is implemented, callers don't need to update their code.
+        let result = TrainingResult {
+            examples_count: 10,
+            router_old_loss: 0.0,
+            router_new_loss: 0.0,
+            generator_old_loss: 0.0,
+            generator_new_loss: 0.0,
+            validator_old_loss: 0.0,
+            validator_new_loss: 0.0,
+            duration_secs: 0.0,
+        };
+        assert_eq!(result.examples_count, 10);
+        // Improvement field (used by callers to check if training helped):
+        assert_eq!(result.router_old_loss - result.router_new_loss, 0.0);
     }
 }
 

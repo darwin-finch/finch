@@ -35,40 +35,46 @@ pub struct TaskQueue {
 
 impl TaskQueue {
     /// Create new task queue
+    ///
+    /// The SQLite backend is not yet implemented (GitHub Issue #8).
+    /// Tasks enqueued will not be persisted.
     pub fn new(db_path: PathBuf) -> Result<Self> {
-        // TODO: Initialize SQLite database
-        // TODO: Create tasks table with schema
         Ok(Self { db_path })
     }
 
-    /// Enqueue a new task
+    /// Enqueue a new task.
+    ///
+    /// **Not yet implemented** — the SQLite backend is missing.
+    /// Returns an error so callers know the task was not stored,
+    /// rather than silently discarding it.
     pub async fn enqueue(&self, _task: ScheduledTask) -> Result<i64> {
-        // TODO: INSERT into tasks table
-        // TODO: Return task ID
-        Ok(1) // Placeholder
+        anyhow::bail!(
+            "Task scheduling not yet implemented (GitHub Issue #8). \
+             The SQLite backend for the task queue has not been built. \
+             Task was not persisted."
+        )
     }
 
-    /// Get ready tasks (scheduled_time <= now, status = Pending)
+    /// Get ready tasks (scheduled_time <= now, status = Pending).
+    ///
+    /// Returns empty while the backend is unimplemented — the scheduler
+    /// loop runs but finds no work to do, which is harmless.
     pub async fn get_ready_tasks(&self) -> Result<Vec<ScheduledTask>> {
-        // TODO: SELECT from tasks WHERE scheduled_time <= now AND status = 'pending'
-        Ok(Vec::new()) // Placeholder
+        Ok(Vec::new())
     }
 
-    /// Mark task as completed
+    /// Mark task as completed (no-op while backend is unimplemented).
     pub async fn mark_completed(&self, _task_id: i64) -> Result<()> {
-        // TODO: UPDATE tasks SET status = 'completed'
         Ok(())
     }
 
-    /// Mark task as failed
+    /// Mark task as failed (no-op while backend is unimplemented).
     pub async fn mark_failed(&self, _task_id: i64, _error: &str) -> Result<()> {
-        // TODO: UPDATE tasks SET status = 'failed', error = ?
         Ok(())
     }
 
-    /// Increment retry count
+    /// Increment retry count (no-op while backend is unimplemented).
     pub async fn increment_retry(&self, _task_id: i64) -> Result<()> {
-        // TODO: UPDATE tasks SET retries = retries + 1
         Ok(())
     }
 }
@@ -135,12 +141,14 @@ mod tests {
         drop(queue);
     }
 
+    // --- Regression: enqueue must return an error, not silently discard tasks ---
     #[tokio::test]
-    async fn test_enqueue_returns_id() {
+    async fn test_enqueue_returns_error_not_implemented() {
         let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q2.db")).unwrap();
         let task = make_task("test_task");
-        let id = queue.enqueue(task).await.unwrap();
-        assert_eq!(id, 1); // Stub always returns 1
+        let result = queue.enqueue(task).await;
+        assert!(result.is_err(), "enqueue should return an error until SQLite backend is implemented");
+        assert!(result.unwrap_err().to_string().contains("not yet implemented"));
     }
 
     #[tokio::test]
