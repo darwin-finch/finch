@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`/provider <name>` switching now works in TUI mode.** Previously, the command updated
+  `teacher_session` in `repl.rs` but `event_loop.rs` called `claude_gen` directly and never
+  read the updated session — so the switch was silently ignored. The active cloud generator is
+  now wrapped in `Arc<RwLock<Arc<dyn Generator>>>` (`cloud_gen`) and swapped atomically when
+  `/provider` is called. `ModelShow`, `ModelList`, and `ModelSwitch` commands are handled
+  explicitly instead of falling through to the "not yet implemented" catch-all.
+- **Acronym fix: IMCPD → IMPCPD throughout codebase.** The methodology is *Iterative
+  Multi-**P**erspective Code Plan Debugging* — two Ps. All identifiers, file names, and prose
+  references corrected: `ImcpdConfig` → `ImpcpdConfig`, `imcpd_methodology.md` →
+  `impcpd_methodology.md`, test file renamed, user-visible strings updated.
+
 ### Added
+- **`AgentServer` multi-provider pool** (`src/server/mod.rs`): holds
+  `Vec<Arc<dyn LlmProvider>>` built from the full `[[providers]]` config. Daemon handler
+  (`openai_handlers.rs`) selects the provider via `x-finch-provider` request header, falling
+  back to the first configured cloud provider (or the legacy `ClaudeClient` when the pool is
+  empty). 5 new unit tests in `server::tests`.
+
+### Changed
 - **Universal alignment prompt** (`src/providers/alignment.rs`): `UNIVERSAL_ALIGNMENT_PROMPT`
   constant and `with_alignment(system)` helper enforce consistent JSON output, numbered-format
   adherence, and schema fidelity across all LLM providers — the key enabler for safely swapping

@@ -46,11 +46,14 @@ pub struct EventLoop {
     /// Query state manager
     query_states: Arc<QueryStateManager>,
 
-    /// Claude generator (unified interface)
-    claude_gen: Arc<dyn Generator>,
+    /// Active cloud generator (swappable via /provider command)
+    cloud_gen: Arc<RwLock<Arc<dyn Generator>>>,
 
     /// Qwen generator (unified interface)
     qwen_gen: Arc<dyn Generator>,
+
+    /// Available providers from config (for /provider list + switching)
+    available_providers: Vec<crate::config::ProviderEntry>,
 
     /// Router for deciding between generators
     router: Arc<Router>,
@@ -129,7 +132,7 @@ impl EventLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         conversation: Arc<RwLock<ConversationHistory>>,
-        claude_gen: Arc<dyn Generator>,
+        cloud_gen: Arc<dyn Generator>,
         qwen_gen: Arc<dyn Generator>,
         router: Arc<Router>,
         generator_state: Arc<RwLock<GeneratorState>>,
@@ -144,6 +147,7 @@ impl EventLoop {
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
         mode: Arc<RwLock<ReplMode>>,
         memory_tree: Option<Arc<RwLock<crate::memory::MemTree>>>,
+        available_providers: Vec<crate::config::ProviderEntry>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -192,8 +196,9 @@ impl EventLoop {
             input_rx,
             conversation,
             query_states: Arc::new(QueryStateManager::new()),
-            claude_gen,
+            cloud_gen: Arc::new(RwLock::new(cloud_gen)),
             qwen_gen,
+            available_providers,
             router,
             generator_state,
             tool_definitions: Arc::new(tool_definitions),
@@ -228,7 +233,7 @@ impl EventLoop {
         // clean header: finch version · primary model · working directory.
         self.output_manager.clear();
 
-        let model_name = self.claude_gen.name().to_string();
+        let model_name = self.cloud_gen.read().await.name().to_string();
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| {
@@ -491,6 +496,32 @@ impl EventLoop {
                     Command::FeedbackGood(note) => {
                         self.handle_feedback_command(1.0, FeedbackRating::Good, note).await?;
                     }
+                    Command::ModelShow => {
+                        let name = self.cloud_gen.read().await.name().to_string();
+                        self.output_manager.write_info(format!("Active cloud provider: {}", name));
+                        self.render_tui().await?;
+                    }
+                    Command::ModelList => {
+                        use crate::providers::create_provider_from_entry;
+                        let current = self.cloud_gen.read().await.name().to_string();
+                        let mut lines = vec!["Available providers:".to_string()];
+                        for entry in &self.available_providers {
+                            let marker = if entry.provider_type() == current { "→" } else { " " };
+                            let tag = if entry.is_local() { "local" } else { "cloud" };
+                            // Show availability: cloud entries are available if we can build a provider
+                            let available = !entry.is_local() && create_provider_from_entry(entry).is_ok();
+                            let avail_tag = if entry.is_local() || available { "" } else { " (no API key)" };
+                            lines.push(format!("{} [{}] {}{}", marker, tag, entry.display_name(), avail_tag));
+                        }
+                        if self.available_providers.is_empty() {
+                            lines.push("  (none configured — add [[providers]] to ~/.finch/config.toml)".to_string());
+                        }
+                        self.output_manager.write_info(lines.join("\n"));
+                        self.render_tui().await?;
+                    }
+                    Command::ModelSwitch(name) => {
+                        self.handle_provider_switch(name).await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -668,6 +699,53 @@ impl EventLoop {
         Ok(())
     }
 
+    /// Handle `/provider <name>` — switch the active cloud generator.
+    async fn handle_provider_switch(&mut self, name: String) -> Result<()> {
+        use crate::generators::claude::ClaudeGenerator;
+        use crate::providers::create_provider_from_entry;
+
+        let target = self
+            .available_providers
+            .iter()
+            .find(|p| {
+                p.provider_type().eq_ignore_ascii_case(&name)
+                    || p.display_name().eq_ignore_ascii_case(&name)
+            })
+            .cloned();
+
+        match target {
+            None => {
+                self.output_manager.write_info(format!(
+                    "⚠️  Unknown provider '{}'. Run /provider list to see available providers.",
+                    name
+                ));
+            }
+            Some(ref entry) if entry.is_local() => {
+                self.output_manager.write_info(
+                    "⚠️  Local providers are selected automatically. Use /provider <cloud-name>."
+                        .to_string(),
+                );
+            }
+            Some(entry) => match create_provider_from_entry(&entry) {
+                Err(e) => {
+                    self.output_manager
+                        .write_info(format!("⚠️  Failed to create provider '{}': {}", name, e));
+                }
+                Ok(provider) => {
+                    let client = crate::claude::ClaudeClient::with_provider(provider);
+                    let new_gen: Arc<dyn Generator> =
+                        Arc::new(ClaudeGenerator::new(Arc::new(client)));
+                    *self.cloud_gen.write().await = new_gen;
+                    self.output_manager.write_info(format!(
+                        "✓ Switched to provider: {}",
+                        entry.provider_type()
+                    ));
+                }
+            },
+        }
+        self.render_tui().await
+    }
+
     /// Handle /mcp list command - list connected MCP servers
     async fn handle_mcp_list(&mut self) -> Result<()> {
         let tool_executor = self.tool_coordinator.tool_executor();
@@ -796,7 +874,7 @@ impl EventLoop {
     /// Spawn a background task to process a query
     async fn spawn_query_task(&self, query_id: Uuid, query: String) {
         let event_tx = self.event_tx.clone();
-        let claude_gen = Arc::clone(&self.claude_gen);
+        let claude_gen = self.cloud_gen.read().await.clone();
         let qwen_gen = Arc::clone(&self.qwen_gen);
         let router = Arc::clone(&self.router);
         let generator_state = Arc::clone(&self.generator_state);
@@ -1909,7 +1987,7 @@ impl EventLoop {
 
         // ── Run the IMPCPD loop ────────────────────────────────────────────────
         let plan_loop = PlanLoop::new(
-            Arc::clone(&self.claude_gen),
+            self.cloud_gen.read().await.clone(),
             Arc::clone(&self.output_manager),
             ImpcpdConfig::default(),
         );

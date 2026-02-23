@@ -1365,6 +1365,7 @@ impl Repl {
             self.daemon_client.clone(),
             mode,
             None, // memory_tree - will be added in future when memory system is integrated
+            self.available_providers.clone(),
         );
 
         // Run the event loop
