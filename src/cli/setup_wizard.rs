@@ -231,6 +231,8 @@ enum SectionState {
         gui_automation: bool,
         daemon_only_mode: bool,
         mdns_discovery: bool,
+        /// Total status-strip context lines (🧠 + summaries); range 1–8
+        memory_context_lines: usize,
         selected_idx: usize, // For arrow key navigation
     },
     Review,
@@ -466,6 +468,9 @@ impl WizardState {
                     .map(|c| c.server.mode == "daemon-only")
                     .unwrap_or(false),
                 mdns_discovery: existing_config.map(|c| c.server.advertise).unwrap_or(false),
+                memory_context_lines: existing_config
+                    .map(|c| c.features.memory_context_lines)
+                    .unwrap_or(4),
                 selected_idx: 0,
             },
         );
@@ -542,6 +547,7 @@ pub struct SetupResult {
     pub gui_automation: bool,
     pub daemon_only_mode: bool,
     pub mdns_discovery: bool,
+    pub memory_context_lines: usize,
 }
 
 impl SetupResult {
@@ -1594,6 +1600,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         gui_automation,
         daemon_only_mode,
         mdns_discovery,
+        memory_context_lines,
         selected_idx,
     }) = state.sections.get_mut(&WizardSection::Features)
     {
@@ -1614,11 +1621,17 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
             return Ok(false);
         }
 
-        // 6 features: 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon_only, 5=mdns
+        // non-macOS: 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=ctx_lines
+        // macOS:     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=ctx_lines
         #[cfg(target_os = "macos")]
-        let num_features = 7; // +1 for gui_automation at index 3, hf_token at 4, daemon at 5, mdns at 6
+        let num_features = 8;
         #[cfg(not(target_os = "macos"))]
-        let num_features = 6;
+        let num_features = 7;
+
+        #[cfg(target_os = "macos")]
+        let ctx_idx = 7usize;
+        #[cfg(not(target_os = "macos"))]
+        let ctx_idx = 6usize;
 
         match key.code {
             KeyCode::Up => {
@@ -1631,8 +1644,20 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     *selected_idx += 1;
                 }
             }
+            KeyCode::Left => {
+                // Decrement context_lines spinner (min 1)
+                if *selected_idx == ctx_idx && *memory_context_lines > 1 {
+                    *memory_context_lines -= 1;
+                }
+            }
+            KeyCode::Right => {
+                // Increment context_lines spinner (max 8)
+                if *selected_idx == ctx_idx && *memory_context_lines < 8 {
+                    *memory_context_lines += 1;
+                }
+            }
             KeyCode::Char(' ') => {
-                // Toggle selected feature (all except hf_token index)
+                // Toggle selected feature (all except hf_token and ctx_lines)
                 #[cfg(target_os = "macos")]
                 match *selected_idx {
                     0 => *streaming = !*streaming,
@@ -1642,6 +1667,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     // index 4 = hf_token (no toggle)
                     5 => *daemon_only_mode = !*daemon_only_mode,
                     6 => *mdns_discovery = !*mdns_discovery,
+                    // index 7 = ctx_lines (use ◀/▶)
                     _ => {}
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -1652,6 +1678,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     // index 3 = hf_token (no toggle)
                     4 => *daemon_only_mode = !*daemon_only_mode,
                     5 => *mdns_discovery = !*mdns_discovery,
+                    // index 6 = ctx_lines (use ◀/▶)
                     _ => {}
                 }
             }
@@ -1729,7 +1756,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract features
-    let (auto_approve, streaming, debug, hf_token_val, daemon_only, mdns) =
+    let (auto_approve, streaming, debug, hf_token_val, daemon_only, mdns, memory_ctx_lines) =
         if let Some(SectionState::Features {
             auto_approve,
             streaming,
@@ -1737,6 +1764,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
             hf_token,
             daemon_only_mode,
             mdns_discovery,
+            memory_context_lines,
             ..
         }) = state.sections.get(&WizardSection::Features)
         {
@@ -1751,9 +1779,10 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 },
                 *daemon_only_mode,
                 *mdns_discovery,
+                *memory_context_lines,
             )
         } else {
-            (false, true, false, None, false, false)
+            (false, true, false, None, false, false, 4)
         };
 
     #[cfg(target_os = "macos")]
@@ -1895,6 +1924,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         gui_automation,
         daemon_only_mode: daemon_only,
         mdns_discovery: mdns,
+        memory_context_lines: memory_ctx_lines,
     })
 }
 
@@ -2026,6 +2056,7 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             gui_automation,
             daemon_only_mode,
             mdns_discovery,
+            memory_context_lines,
             selected_idx,
         }) => render_features_section(
             f,
@@ -2039,6 +2070,7 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *gui_automation,
             *daemon_only_mode,
             *mdns_discovery,
+            *memory_context_lines,
             *selected_idx,
         ),
         Some(SectionState::Review) => render_review_section(f, area, state),
@@ -2919,6 +2951,7 @@ fn render_features_section(
     #[cfg(target_os = "macos")] gui_automation: bool,
     daemon_only_mode: bool,
     mdns_discovery: bool,
+    memory_context_lines: usize,
     selected_idx: usize,
 ) {
     let chunks = Layout::default()
@@ -2939,9 +2972,9 @@ fn render_features_section(
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    // Build feature list: toggle-able booleans + HF token text field
-    // Index mapping (non-macOS): 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns
-    // Index mapping (macOS):     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns
+    // Build feature list: toggle-able booleans + HF token text field + numeric spinner
+    // Index mapping (non-macOS): 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=ctx_lines
+    // Index mapping (macOS):     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=ctx_lines
 
     #[cfg(not(target_os = "macos"))]
     let bool_features: Vec<(&str, bool, &str)> = vec![
@@ -3145,13 +3178,52 @@ fn render_features_section(
         items.push(ListItem::new(hf_lines));
     }
 
+    // Context-lines spinner row (always last)
+    #[cfg(not(target_os = "macos"))]
+    let ctx_idx = 6usize;
+    #[cfg(target_os = "macos")]
+    let ctx_idx = 7usize;
+    {
+        let is_selected = selected_idx == ctx_idx;
+        let (prefix, suffix, label_style) = if is_selected {
+            (
+                ">>> ",
+                " <<<",
+                Style::default()
+                    .bg(Color::Black)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("    ", "", Style::default().fg(Color::Blue))
+        };
+        let ctx_lines = vec![
+            Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(
+                    format!("◀ Context lines: {} ▶", memory_context_lines),
+                    label_style,
+                ),
+                Span::styled(suffix, label_style),
+            ]),
+            Line::from(vec![
+                Span::raw("        "),
+                Span::styled(
+                    "Status-strip summary lines shown below the prompt (1–8)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ];
+        items.push(ListItem::new(ctx_lines));
+    }
+
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Options"));
     f.render_widget(list, chunks[1]);
 
     let instructions_text = if editing_hf_token {
         "Type HuggingFace token | Enter/Esc: Done"
     } else {
-        "↑/↓: Move | Space: Toggle | E: Edit HF token | Enter: Continue"
+        "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit HF token | Enter: Continue"
     };
     let instructions = Paragraph::new(instructions_text)
         .style(

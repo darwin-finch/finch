@@ -227,6 +227,9 @@ pub struct TuiRenderer {
     // Rate limiting
     last_render: Instant,
     render_interval: Duration,
+
+    // Session task list (set after construction via set_todo_list)
+    todo_list: Option<Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>>,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -296,7 +299,17 @@ impl TuiRenderer {
 
             last_render: Instant::now(),
             render_interval: Duration::from_millis(100),
+
+            todo_list: None,
         })
+    }
+
+    /// Attach the session task list so the live area can display it.
+    pub fn set_todo_list(
+        &mut self,
+        todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
+    ) {
+        self.todo_list = Some(todo_list);
     }
 
     // ── TextArea factories (also called from async_input) ─────────────────────
@@ -384,6 +397,41 @@ impl TuiRenderer {
                 let line = line.trim_end_matches('\r');
                 execute!(stdout, Print(line), Print("\r\n"))?;
                 rows += 1;
+            }
+        }
+
+        // ── 1b. Session task list (active items only) ─────────────────────────
+        if let Some(ref todo_arc) = self.todo_list {
+            if let Ok(todo) = todo_arc.try_read() {
+                let active = todo.active_items();
+                if !active.is_empty() {
+                    let term_w =
+                        crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                    for item in &active {
+                        let (symbol, color) = match item.status {
+                            crate::tools::todo::TodoStatus::InProgress => ("●", CYAN),
+                            crate::tools::todo::TodoStatus::Pending => ("○", DIM_GRAY),
+                            crate::tools::todo::TodoStatus::Completed => unreachable!(),
+                        };
+                        let priority_tag = match item.priority {
+                            crate::tools::todo::TodoPriority::High => " [!]",
+                            _ => "",
+                        };
+                        // Truncate: "● " prefix (2 chars) + optional " [!]" suffix
+                        let max_content =
+                            term_w.saturating_sub(2 + priority_tag.len());
+                        let content: String =
+                            item.content.chars().take(max_content).collect();
+                        execute!(
+                            stdout,
+                            Print(format!(
+                                "{}{} {}{}{}\r\n",
+                                color, symbol, content, priority_tag, RESET
+                            ))
+                        )?;
+                        rows += 1;
+                    }
+                }
             }
         }
 
@@ -805,6 +853,8 @@ impl TuiRenderer {
     }
 
     pub fn handle_resize(&mut self, _w: u16, _h: u16) -> Result<()> {
+        // Clear the entire screen on resize to prevent ghosts from old layout
+        execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
         self.active_rows = 0;
         Ok(())
     }

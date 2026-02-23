@@ -149,6 +149,9 @@ pub struct Repl {
 
     // Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
+
+    // Number of context-summary lines to display in the status strip
+    memory_context_lines: usize,
 }
 
 /// Adjectives used for session labels
@@ -384,6 +387,7 @@ impl Repl {
         }
 
         let streaming_enabled = config.features.streaming_enabled;
+        let memory_context_lines = config.features.memory_context_lines;
 
         // Generate tool definitions from registry (includes built-in + MCP tools)
         let tool_definitions: Vec<ToolDefinition> =
@@ -579,6 +583,7 @@ impl Repl {
 
             // Session identity
             session_label: generate_session_label(),
+            memory_context_lines,
         }
     }
 
@@ -1494,6 +1499,7 @@ impl Repl {
             self.memory_system.clone(),
             self.session_label.clone(),
             self.available_providers.clone(),
+            self.memory_context_lines,
         );
 
         // Run the event loop

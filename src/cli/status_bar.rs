@@ -21,6 +21,9 @@ pub enum StatusLineType {
     ConversationTopic,
     /// Conversation focus derived from MemTree recency centroid ("   └─ now: <focus>")
     ConversationFocus,
+    /// N-th depth-sliced context line (0 = broadest/overall … last = most recent).
+    /// Replaces ConversationTopic + ConversationFocus when context_lines > 1.
+    ContextLine(usize),
     /// Live query statistics (tokens, latency, model)
     LiveStats,
     /// Training statistics (queries, local%, quality)
@@ -112,6 +115,27 @@ impl StatusBar {
             result.push(StatusLine {
                 line_type: StatusLineType::ConversationFocus,
                 content: content.clone(),
+            });
+        }
+
+        // ContextLine(N) — depth-sliced context summary lines, sorted by index.
+        // These replace ConversationTopic + ConversationFocus in new code; both
+        // can coexist without collision since they use distinct map keys.
+        let mut ctx_entries: Vec<(usize, String)> = lines
+            .iter()
+            .filter_map(|(k, v)| {
+                if let StatusLineType::ContextLine(n) = k {
+                    Some((*n, v.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ctx_entries.sort_by_key(|(n, _)| *n);
+        for (n, content) in ctx_entries {
+            result.push(StatusLine {
+                line_type: StatusLineType::ContextLine(n),
+                content,
             });
         }
 

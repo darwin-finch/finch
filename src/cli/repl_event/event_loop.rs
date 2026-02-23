@@ -30,8 +30,12 @@ use super::query_state::{QueryState, QueryStateManager};
 use super::tool_display::format_tool_label;
 use super::tool_execution::ToolExecutionCoordinator;
 
-/// Update the ConversationTopic / ConversationFocus status lines and the terminal
-/// window/tab title from the latest MemTree centroids.
+/// Refresh the ContextLine status-strip entries and the terminal window/tab title.
+///
+/// `context_lines` is the total number of lines to show including the 🧠 stats
+/// line, so `depth = context_lines - 1` centroid lines are requested from the
+/// MemTree.  Stale `ContextLine(N)` entries beyond the result are removed so
+/// the strip shrinks cleanly when history is short.
 ///
 /// This is a free function (not `&self`) so it can be called from the static
 /// `process_query_with_tools` closure.
@@ -40,48 +44,52 @@ async fn refresh_context_strip(
     session_label: &str,
     cwd: &str,
     status_bar: &StatusBar,
+    context_lines: usize,
 ) {
-    let Ok(summary) = memory_system.conversation_summary().await else {
+    let depth = context_lines.saturating_sub(1); // 🧠 takes one slot
+    let Ok(summary) = memory_system.conversation_summary(depth).await else {
         return;
     };
 
-    // Only update lines when we have content; never erase existing values.
-    // This prevents the strip from going blank between queries (e.g. when the
-    // tree has only one leaf, summary returns None/None but we don't want to
-    // erase the value that was already there).
-    if let Some(topic) = &summary.overall {
-        if !topic.trim().is_empty() {
-            status_bar.update_line(
-                crate::cli::status_bar::StatusLineType::ConversationTopic,
-                format!("📋 {}", topic),
-            );
-        }
+    let n = summary.lines.len();
+
+    // Format each line with an appropriate prefix:
+    //   single line                → "   └─ now: <text>"
+    //   first of multiple          → "📋 <text>"
+    //   middle lines               → "   ├─ <text>"
+    //   last of multiple           → "   └─ now: <text>"
+    for (i, text) in summary.lines.iter().enumerate() {
+        let label = if n == 1 {
+            format!("   └─ now: {}", text)
+        } else if i == 0 {
+            format!("📋 {}", text)
+        } else if i == n - 1 {
+            format!("   └─ now: {}", text)
+        } else {
+            format!("   ├─ {}", text)
+        };
+        status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::ContextLine(i),
+            label,
+        );
     }
-    if let Some(focus) = &summary.current {
-        if !focus.trim().is_empty() {
-            status_bar.update_line(
-                crate::cli::status_bar::StatusLineType::ConversationFocus,
-                format!("   └─ now: {}", focus),
-            );
-        }
+
+    // Remove stale slots beyond what we just wrote (depth change or short history)
+    for i in n..8 {
+        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::ContextLine(i));
     }
 
     // OSC 0 — set terminal window title + tab title
-    let title_topic = summary
-        .overall
-        .as_deref()
-        .map(|s| {
-            // Truncate to 35 chars for the title
-            if s.chars().count() <= 35 {
-                s.to_string()
-            } else {
-                format!("{}…", s.chars().take(34).collect::<String>())
-            }
-        })
-        .filter(|s| !s.is_empty());
+    let title_topic = summary.lines.first().map(|s| {
+        if s.chars().count() <= 35 {
+            s.to_string()
+        } else {
+            format!("{}…", s.chars().take(34).collect::<String>())
+        }
+    });
     let title = match title_topic.as_deref() {
-        Some(t) => format!("finch · {} · {} · {}", session_label, cwd, t),
-        None => format!("finch · {} · {}", session_label, cwd),
+        Some(t) if !t.is_empty() => format!("finch · {} · {} · {}", session_label, cwd, t),
+        _ => format!("finch · {} · {}", session_label, cwd),
     };
     {
         use std::io::Write as _;
@@ -208,6 +216,10 @@ pub struct EventLoop {
 
     /// Working directory at startup (for terminal title)
     cwd: String,
+
+    /// Total number of status-strip lines (🧠 + context summaries).
+    /// Comes from config.features.memory_context_lines (default 4).
+    context_lines: usize,
 }
 
 /// View mode for the REPL
@@ -241,6 +253,7 @@ impl EventLoop {
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
         session_label: String,
         available_providers: Vec<crate::config::ProviderEntry>,
+        context_lines: usize,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -309,6 +322,7 @@ impl EventLoop {
             memory_system,
             session_label,
             cwd: String::new(), // populated at the start of run()
+            context_lines,
         }
     }
 
@@ -409,7 +423,7 @@ impl EventLoop {
 
         // Attempt initial summary — populates on restart from previous memory
         if let Some(ref mem) = self.memory_system {
-            refresh_context_strip(mem, &self.session_label, &cwd, &self.status_bar).await;
+            refresh_context_strip(mem, &self.session_label, &cwd, &self.status_bar, self.context_lines).await;
         }
 
         // Render interval (100ms) - blit overwrites visible area with shadow buffer
@@ -1136,6 +1150,7 @@ impl EventLoop {
         let memory_system = self.memory_system.clone();
         let session_label = self.session_label.clone();
         let cwd = self.cwd.clone();
+        let context_lines = self.context_lines;
 
         tokio::spawn(async move {
             Self::process_query_with_tools(
@@ -1158,6 +1173,7 @@ impl EventLoop {
                 memory_system,
                 session_label,
                 cwd,
+                context_lines,
             )
             .await;
         });
@@ -1197,6 +1213,7 @@ impl EventLoop {
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
         session_label: String,
         cwd: String,
+        context_lines: usize,
     ) {
         tracing::debug!(
             "process_query_with_tools starting for query_id: {:?}",
@@ -1534,10 +1551,15 @@ impl EventLoop {
                             }
                         }
                         drop(current_mode);
-                        // Refresh the context strip even on tool-calling turns so the
-                        // ConversationTopic / ConversationFocus lines stay up-to-date.
+                        // Resolve "querying…" and refresh context even on tool-calling turns.
                         if let Some(ref mem) = memory_system {
-                            refresh_context_strip(mem, &session_label, &cwd, &status_bar).await;
+                            if let Ok(stats) = mem.stats().await {
+                                status_bar.update_line(
+                                    crate::cli::status_bar::StatusLineType::MemoryContext,
+                                    format!("🧠 recalled {}  ·  {} memories", memory_recall_count, stats.conversation_count),
+                                );
+                            }
+                            refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
                         }
                         tracing::debug!("[EVENT_LOOP] Tool executions spawned, returning");
                         return;
@@ -1583,7 +1605,7 @@ impl EventLoop {
                                 ),
                             );
                         }
-                        refresh_context_strip(mem, &session_label, &cwd, &status_bar).await;
+                        refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
                     }
 
                     // Update context usage indicator now that the message is committed
@@ -1745,9 +1767,15 @@ impl EventLoop {
                         }
                     }
                     drop(current_mode);
-                    // Refresh the context strip even on tool-calling turns.
+                    // Resolve "querying…" and refresh context even on tool-calling turns.
                     if let Some(ref mem) = memory_system {
-                        refresh_context_strip(mem, &session_label, &cwd, &status_bar).await;
+                        if let Ok(stats) = mem.stats().await {
+                            status_bar.update_line(
+                                crate::cli::status_bar::StatusLineType::MemoryContext,
+                                format!("🧠 recalled {}  ·  {} memories", memory_recall_count, stats.conversation_count),
+                            );
+                        }
+                        refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
                     }
                     return;
                 }
@@ -1784,7 +1812,7 @@ impl EventLoop {
                             ),
                         );
                     }
-                    refresh_context_strip(mem, &session_label, &cwd, &status_bar).await;
+                    refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
                 }
             }
             Err(e) => {

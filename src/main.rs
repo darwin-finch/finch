@@ -405,6 +405,7 @@ async fn main() -> Result<()> {
                             debug_logging: result.debug_logging,
                             #[cfg(target_os = "macos")]
                             gui_automation: result.gui_automation,
+                            memory_context_lines: result.memory_context_lines,
                         };
                         if daemon_only_mode {
                             new_config.server.mode = "daemon-only".to_string();
@@ -1337,6 +1338,7 @@ async fn run_setup() -> Result<()> {
         debug_logging: result.debug_logging,
         #[cfg(target_os = "macos")]
         gui_automation: false,
+        memory_context_lines: result.memory_context_lines,
     };
     #[allow(deprecated)]
     {

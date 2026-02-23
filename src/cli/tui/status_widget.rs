@@ -76,6 +76,10 @@ impl<'a> StatusWidget<'a> {
                 // Compaction percentage: subtle gray
                 Style::default().fg(Color::DarkGray)
             }
+            StatusLineType::ContextLine(_) => {
+                // Context line: de-emphasised like ConversationFocus
+                Style::default().fg(Color::DarkGray)
+            }
             StatusLineType::Custom(_) => {
                 // Custom status lines: readable dark gray
                 Style::default().fg(Color::DarkGray)

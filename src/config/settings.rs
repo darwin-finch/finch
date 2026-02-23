@@ -23,6 +23,12 @@ pub struct FeaturesConfig {
     #[serde(default)]
     pub debug_logging: bool,
 
+    /// Number of context-summary lines shown in the status strip.
+    /// 1 = 🧠 stats only; 2 = stats + "now"; 3 = stats + overall + "now";
+    /// 4 (default) = stats + overall + mid + "now"; max 8.
+    #[serde(default = "default_context_lines")]
+    pub memory_context_lines: usize,
+
     /// Enable GUI automation tools (macOS only)
     #[cfg(target_os = "macos")]
     #[serde(default)]
@@ -32,17 +38,22 @@ pub struct FeaturesConfig {
 impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
-            auto_approve_tools: false, // Safe default: require confirmations
-            streaming_enabled: true,   // Enable by default for better UX
-            debug_logging: false,      // Disabled by default
+            auto_approve_tools: false,
+            streaming_enabled: true,
+            debug_logging: false,
+            memory_context_lines: 4,
             #[cfg(target_os = "macos")]
-            gui_automation: false, // Disabled by default (requires permissions)
+            gui_automation: false,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_context_lines() -> usize {
+    4
 }
 
 #[derive(Debug, Clone)]

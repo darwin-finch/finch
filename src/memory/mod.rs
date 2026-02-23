@@ -264,12 +264,22 @@ impl MemorySystem {
     /// - `overall` → representative turn for the whole session
     /// - `current` → representative turn among the 5 most recent turns
     ///
-    /// Returns `None`/`None` when no turns have been recorded yet.
+    /// Returns `depth` context-summary lines by querying the MemTree at
+    /// increasingly fine-grained time windows (broadest → most recent).
     ///
-    /// With a single turn, `overall` and `current` both point to that turn's
-    /// text, giving the status strip something to show after the very first
-    /// assistant response.
-    pub async fn conversation_summary(&self) -> Result<ConversationSummaryLines> {
+    /// - `depth` = 0   → empty result
+    /// - `depth` = 1   → one line: most-recent centroid
+    /// - `depth` = 2   → \[overall, recent\]
+    /// - `depth` = N   → overall + (N-2) intermediate windows + most-recent
+    ///
+    /// Returns an empty `lines` vec when no turns have been recorded yet.
+    /// Consecutive identical lines are de-duplicated so a short session
+    /// (few leaves) produces compact, non-redundant output.
+    pub async fn conversation_summary(&self, depth: usize) -> Result<ConversationSummaryLines> {
+        if depth == 0 {
+            return Ok(ConversationSummaryLines::default());
+        }
+
         let tree = self.tree.lock().await;
         let nodes = tree.all_nodes();
 
@@ -284,38 +294,77 @@ impl MemorySystem {
             return Ok(ConversationSummaryLines::default());
         }
 
-        // Overall centroid → most representative turn for the whole session
-        let all_embeddings: Vec<&Vec<f32>> = leaves.iter().map(|(_, e, _)| *e).collect();
-        let overall_centroid = average_embeddings(&all_embeddings);
-        let overall = tree
-            .retrieve(&overall_centroid, 1)
-            .into_iter()
-            .next()
-            .map(|(_, text, _)| truncate_str(&text, 70))
-            .filter(|s| !s.trim().is_empty());
+        // Sort most-recent first for window slicing
+        leaves.sort_by(|a, b| b.0.cmp(&a.0));
+        let num_leaves = leaves.len();
 
-        // Recency centroid → most representative turn among the 5 most recent
-        leaves.sort_by(|a, b| b.0.cmp(&a.0)); // desc by created_at
-        let recent: Vec<&Vec<f32>> = leaves.iter().take(5).map(|(_, e, _)| *e).collect();
-        let recency_centroid = average_embeddings(&recent);
-        let current = tree
-            .retrieve(&recency_centroid, 1)
-            .into_iter()
-            .next()
-            .map(|(_, text, _)| truncate_str(&text, 64))
-            .filter(|s| !s.trim().is_empty());
+        // Compute the window sizes for the requested depth
+        let windows = context_windows(depth, num_leaves);
 
-        Ok(ConversationSummaryLines { overall, current })
+        let mut lines: Vec<String> = Vec::new();
+        for window in &windows {
+            let slice: Vec<&Vec<f32>> = leaves
+                .iter()
+                .take(*window)
+                .map(|(_, e, _)| *e)
+                .collect();
+            let centroid = average_embeddings(&slice);
+            if let Some((_, text, _)) = tree.retrieve(&centroid, 1).into_iter().next() {
+                let s = truncate_str(&text, 70);
+                if !s.trim().is_empty() {
+                    lines.push(s);
+                }
+            }
+        }
+
+        // De-duplicate consecutive identical lines (happens with few leaves)
+        lines.dedup();
+
+        Ok(ConversationSummaryLines { lines })
     }
 }
 
 /// Summary of conversation topics derived from MemTree centroid queries.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationSummaryLines {
-    /// Most representative turn for the whole session (overall centroid query).
-    pub overall: Option<String>,
-    /// Most representative turn among the 5 most recent (recency centroid query).
-    pub current: Option<String>,
+    /// Context lines ordered from broadest (overall session) to most recent.
+    /// Length equals the `depth` passed to `conversation_summary`, minus any
+    /// de-duplicated consecutive matches.
+    pub lines: Vec<String>,
+}
+
+/// Compute the leaf-count window sizes for the given display depth.
+///
+/// `depth` = number of context-summary lines requested (excluding the 🧠 stats line).
+/// `num_leaves` caps window sizes so we never ask for more leaves than exist.
+///
+/// Window layout:
+/// - depth 1  → \[3\]                                 (just "now")
+/// - depth 2  → \[all, 3\]                            (overall + now)
+/// - depth 3  → \[all, 5, 3\]
+/// - depth 4  → \[all, 7, 5, 3\]
+/// - depth 5  → \[all, 10, 7, 5, 3\]
+/// - depth 6+ → \[all, 20, 10, 7, 5, 3\] (capped at 6 levels)
+fn context_windows(depth: usize, num_leaves: usize) -> Vec<usize> {
+    // Intermediate window sizes available between "all" and "now=3"
+    const INTERMEDIATES: &[usize] = &[20, 10, 7, 5];
+    let cap = |w: usize| w.min(num_leaves).max(1);
+
+    match depth {
+        0 => vec![],
+        1 => vec![cap(3)],
+        n => {
+            let num_mid = n.saturating_sub(2);
+            let avail = INTERMEDIATES.len().min(num_mid);
+            let start = INTERMEDIATES.len().saturating_sub(avail);
+            let mut ws = vec![cap(num_leaves)]; // overall = all leaves
+            for &w in &INTERMEDIATES[start..] {
+                ws.push(cap(w));
+            }
+            ws.push(cap(3)); // most recent
+            ws
+        }
+    }
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
@@ -423,15 +472,13 @@ mod tests {
             ..Default::default()
         };
         let memory = MemorySystem::new(config)?;
-        let summary = memory.conversation_summary().await?;
-        assert!(summary.overall.is_none());
-        assert!(summary.current.is_none());
+        let summary = memory.conversation_summary(3).await?;
+        assert!(summary.lines.is_empty(), "empty tree → no context lines");
         Ok(())
     }
 
-    /// Regression: with threshold lowered from 2 to 1, a single turn must
-    /// produce Some (not None) so the status strip populates after the first
-    /// assistant response.
+    /// Regression: a single turn must produce at least one non-empty line so
+    /// the status strip populates after the first assistant response.
     #[tokio::test]
     async fn test_conversation_summary_single_turn_shows_content() -> Result<()> {
         let temp = NamedTempFile::new()?;
@@ -443,19 +490,14 @@ mod tests {
         memory
             .insert_conversation("user", "How do Rust lifetimes work?", Some("local"), None)
             .await?;
-        // 1 leaf ≥ threshold of 1 → Some/Some
-        let summary = memory.conversation_summary().await?;
+        let summary = memory.conversation_summary(3).await?;
         assert!(
-            summary.overall.is_some(),
-            "single turn should produce Some(overall)"
+            !summary.lines.is_empty(),
+            "single turn should produce at least one context line"
         );
         assert!(
-            summary.current.is_some(),
-            "single turn should produce Some(current)"
-        );
-        assert!(
-            !summary.overall.as_deref().unwrap_or("").is_empty(),
-            "overall text must not be empty"
+            !summary.lines[0].is_empty(),
+            "context line text must not be empty"
         );
         Ok(())
     }
@@ -477,12 +519,53 @@ mod tests {
                 .insert_conversation("user", content, Some("local"), None)
                 .await?;
         }
-        let summary = memory.conversation_summary().await?;
-        assert!(summary.overall.is_some(), "overall should be Some with 3 turns");
-        assert!(summary.current.is_some(), "current should be Some with 3 turns");
-        assert!(!summary.overall.as_deref().unwrap_or("").is_empty());
-        assert!(!summary.current.as_deref().unwrap_or("").is_empty());
+        let summary = memory.conversation_summary(3).await?;
+        assert!(
+            !summary.lines.is_empty(),
+            "should have context lines with 3 turns"
+        );
+        assert!(
+            summary.lines.iter().all(|l| !l.is_empty()),
+            "all lines must be non-empty"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn test_context_windows_depth_zero_is_empty() {
+        assert!(context_windows(0, 10).is_empty());
+    }
+
+    #[test]
+    fn test_context_windows_depth_one_is_single_window() {
+        let ws = context_windows(1, 10);
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0], 3); // capped at 3
+    }
+
+    #[test]
+    fn test_context_windows_depth_two_has_overall_and_recent() {
+        let ws = context_windows(2, 100);
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0], 100); // all leaves = overall
+        assert_eq!(ws[1], 3);   // most recent
+    }
+
+    #[test]
+    fn test_context_windows_depth_four_has_four_slots() {
+        let ws = context_windows(4, 100);
+        assert_eq!(ws.len(), 4);
+        assert_eq!(ws[0], 100); // overall
+        assert_eq!(*ws.last().unwrap(), 3); // most recent always last
+    }
+
+    #[test]
+    fn test_context_windows_caps_to_num_leaves() {
+        // Only 2 leaves — all windows should be capped at 2
+        let ws = context_windows(4, 2);
+        for w in &ws {
+            assert!(*w <= 2, "window {} > num_leaves 2", w);
+        }
     }
 
     #[tokio::test]
