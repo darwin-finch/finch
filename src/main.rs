@@ -1018,6 +1018,13 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         api_keys: config.server.api_keys.clone(),
     };
 
+    // Build the multi-provider pool from [[providers]] config (cloud providers only).
+    // Falls back gracefully to the legacy ClaudeClient path when empty.
+    let providers: Vec<Box<dyn finch::providers::LlmProvider>> = {
+        use finch::providers::create_providers_from_entries;
+        create_providers_from_entries(&config.providers).unwrap_or_default()
+    };
+
     // Create and start agent server (with LocalGenerator support)
     let server = AgentServer::new(
         config.clone(),
@@ -1029,6 +1036,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         bootstrap_loader,
         generator_state,
         training_coordinator,
+        providers,
     )?;
 
     // Set up mDNS service advertisement if enabled

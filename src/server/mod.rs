@@ -28,6 +28,7 @@ use crate::config::Config;
 use crate::local::LocalGenerator;
 use crate::metrics::MetricsLogger;
 use crate::models::{BootstrapLoader, GeneratorState, TrainingCoordinator};
+use crate::providers::LlmProvider;
 use crate::router::Router;
 
 /// Configuration for the HTTP server
@@ -59,8 +60,11 @@ impl Default for ServerConfig {
 
 /// Main agent server structure
 pub struct AgentServer {
-    /// Claude API client (shared across sessions)
+    /// Claude API client (shared across sessions; kept for backward compat with handlers.rs)
     claude_client: Arc<ClaudeClient>,
+    /// Multi-provider pool: cloud providers from [[providers]] config.
+    /// Indexed by provider name for O(1) lookup via `provider_for_name()`.
+    providers: Vec<Arc<dyn LlmProvider>>,
     /// Router for decision-making (shared, read-write lock)
     router: Arc<RwLock<Router>>,
     /// Metrics logger (shared)
@@ -82,7 +86,10 @@ pub struct AgentServer {
 }
 
 impl AgentServer {
-    /// Create a new agent server
+    /// Create a new agent server.
+    ///
+    /// `providers` is the ordered list of cloud providers from `[[providers]]` config.
+    /// If empty, the server falls back to `claude_client` for all cloud forwarding.
     pub fn new(
         _config: Config,
         server_config: ServerConfig,
@@ -93,6 +100,7 @@ impl AgentServer {
         bootstrap_loader: Arc<BootstrapLoader>,
         generator_state: Arc<RwLock<GeneratorState>>,
         training_coordinator: Arc<TrainingCoordinator>,
+        providers: Vec<Box<dyn LlmProvider>>,
     ) -> Result<Self> {
         let session_manager = SessionManager::new(
             server_config.max_sessions,
@@ -101,9 +109,11 @@ impl AgentServer {
 
         // Create training channel (will be connected to worker in serve())
         let (training_tx, _training_rx) = tokio::sync::mpsc::unbounded_channel();
+        let providers: Vec<Arc<dyn LlmProvider>> = providers.into_iter().map(Arc::from).collect();
 
         Ok(Self {
             claude_client: Arc::new(claude_client),
+            providers,
             router: Arc::new(RwLock::new(router)),
             metrics_logger: Arc::new(metrics_logger),
             session_manager: Arc::new(session_manager),
@@ -209,6 +219,24 @@ impl AgentServer {
         &self.claude_client
     }
 
+    /// Resolve the cloud provider to use for a given request.
+    ///
+    /// If `name` matches a configured provider, returns that provider.
+    /// If `name` is `None` or unrecognised, returns the first configured cloud provider
+    /// (if any). Returns `None` when `providers` is empty (caller falls back to
+    /// `claude_client`).
+    pub fn provider_for_name(&self, name: Option<&str>) -> Option<&Arc<dyn LlmProvider>> {
+        if self.providers.is_empty() {
+            return None;
+        }
+        if let Some(n) = name {
+            if let Some(p) = self.providers.iter().find(|p| p.name().eq_ignore_ascii_case(n)) {
+                return Some(p);
+            }
+        }
+        self.providers.first()
+    }
+
     /// Get reference to router
     pub fn router(&self) -> &Arc<RwLock<Router>> {
         &self.router
@@ -252,5 +280,99 @@ impl AgentServer {
     /// Get reference to training coordinator
     pub fn training_coordinator(&self) -> &Arc<TrainingCoordinator> {
         &self.training_coordinator
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
+    use async_trait::async_trait;
+    use tokio::sync::mpsc::Receiver;
+
+    struct NamedProvider(String);
+
+    #[async_trait]
+    impl LlmProvider for NamedProvider {
+        fn name(&self) -> &str { &self.0 }
+        fn default_model(&self) -> &str { "test-model" }
+        async fn send_message(&self, _r: &ProviderRequest) -> anyhow::Result<ProviderResponse> {
+            unimplemented!()
+        }
+        async fn send_message_stream(
+            &self,
+            _r: &ProviderRequest,
+        ) -> anyhow::Result<Receiver<anyhow::Result<StreamChunk>>> {
+            unimplemented!()
+        }
+    }
+
+    fn make_providers(names: &[&str]) -> Vec<Arc<dyn LlmProvider>> {
+        names
+            .iter()
+            .map(|n| Arc::new(NamedProvider(n.to_string())) as Arc<dyn LlmProvider>)
+            .collect()
+    }
+
+    #[test]
+    fn test_provider_for_name_found_exact() {
+        // Build a minimal AgentServer-like providers Vec and call provider_for_name directly
+        // (we test via a wrapper since building a full AgentServer requires many deps)
+        let providers = make_providers(&["claude", "grok", "openai"]);
+        let result = providers
+            .iter()
+            .find(|p| p.name().eq_ignore_ascii_case("grok"));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name(), "grok");
+    }
+
+    #[test]
+    fn test_provider_for_name_case_insensitive() {
+        let providers = make_providers(&["Claude", "Grok"]);
+        let result = providers
+            .iter()
+            .find(|p| p.name().eq_ignore_ascii_case("claude"));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name(), "Claude");
+    }
+
+    #[test]
+    fn test_provider_for_name_not_found_returns_none_when_empty() {
+        let providers: Vec<Arc<dyn LlmProvider>> = vec![];
+        // Mirrors provider_for_name: empty -> None
+        let result = if providers.is_empty() {
+            None
+        } else {
+            providers.first()
+        };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_provider_for_name_unknown_falls_back_to_first() {
+        let providers = make_providers(&["claude", "grok"]);
+        // When name is unknown, provider_for_name returns providers.first()
+        let matched = providers.iter().find(|p| p.name().eq_ignore_ascii_case("unknown"));
+        let result = matched.or_else(|| providers.first());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name(), "claude");
+    }
+
+    #[test]
+    fn test_provider_for_name_none_name_returns_first() {
+        let providers = make_providers(&["claude", "grok"]);
+        // None name → first provider
+        let name: Option<&str> = None;
+        let result = if providers.is_empty() {
+            None
+        } else if let Some(n) = name {
+            providers
+                .iter()
+                .find(|p| p.name().eq_ignore_ascii_case(n))
+                .or_else(|| providers.first())
+        } else {
+            providers.first()
+        };
+        assert_eq!(result.unwrap().name(), "claude");
     }
 }

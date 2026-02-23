@@ -365,12 +365,47 @@ async fn handle_chat_completions_streaming(
     Ok(Sse::new(stream).into_response())
 }
 
+/// Resolve the cloud provider to use, preferring the multi-provider pool.
+///
+/// Falls back to `claude_client` (wrapped in a throw-away `ClaudeClient`) when
+/// `providers` is empty. Returns `None` only when the fallback also fails.
+async fn forward_to_cloud(
+    server: &AgentServer,
+    provider_name: Option<&str>,
+    messages: Vec<crate::claude::Message>,
+    tools: Option<Vec<InternalToolDefinition>>,
+) -> anyhow::Result<Vec<crate::claude::ContentBlock>> {
+    if let Some(provider) = server.provider_for_name(provider_name) {
+        let mut req = crate::providers::ProviderRequest::new(messages);
+        if let Some(tools) = tools {
+            req = req.with_tools(tools);
+        }
+        let resp = provider.send_message(&req).await?;
+        Ok(resp.content)
+    } else {
+        // No providers configured — fall back to legacy ClaudeClient
+        let mut claude_request = crate::claude::MessageRequest::with_context(messages);
+        if let Some(tools) = tools {
+            claude_request = claude_request.with_tools(tools);
+        }
+        let resp = server.claude_client().send_message(&claude_request).await?;
+        Ok(resp.content)
+    }
+}
+
 /// Handle POST /v1/chat/completions - OpenAI-compatible chat endpoint
 pub async fn handle_chat_completions(
     State(server): State<Arc<AgentServer>>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     let start_time = Instant::now();
+
+    // Extract optional provider name from request header
+    let provider_name: Option<String> = headers
+        .get("x-finch-provider")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     // Validate request
     if request.messages.is_empty() {
@@ -421,24 +456,19 @@ pub async fn handle_chat_completions(
 
     let (content_blocks, routing_decision) = match decision {
         RouteDecision::Forward { reason } => {
-            info!("☁️  ROUTING TO TEACHER API (reason: {:?})", reason);
+            info!("☁️  ROUTING TO TEACHER API (reason: {:?}, provider: {:?})", reason, provider_name);
 
-            // Forward to Claude with tools
-            let mut claude_request = crate::claude::MessageRequest::with_context(internal_messages.clone());
-            if let Some(tools) = internal_tools.clone() {
-                claude_request = claude_request.with_tools(tools);
-            }
-
-            let response = match server
-                .claude_client()
-                .send_message(&claude_request)
-                .await
+            match forward_to_cloud(
+                &server,
+                provider_name.as_deref(),
+                internal_messages.clone(),
+                internal_tools.clone(),
+            )
+            .await
             {
-                Ok(resp) => resp,
+                Ok(blocks) => (blocks, "forward"),
                 Err(e) => return error_response(&e.to_string(), "api_error"),
-            };
-
-            (response.content, "forward")
+            }
         }
         RouteDecision::Local { .. } => {
             info!("🤖 ROUTING TO LOCAL MODEL");
@@ -459,72 +489,51 @@ pub async fn handle_chat_completions(
                             (response.content_blocks, "local")
                         }
                         Ok(None) => {
-                            // Fall back to teacher
                             drop(generator);
                             warn!("❌ Local generation returned None, falling back to teacher");
-
-                            let mut claude_request =
-                                crate::claude::MessageRequest::with_context(internal_messages.clone());
-                            if let Some(tools) = internal_tools.clone() {
-                                claude_request = claude_request.with_tools(tools);
-                            }
-
-                            let response = match server
-                                .claude_client()
-                                .send_message(&claude_request)
-                                .await
+                            match forward_to_cloud(
+                                &server,
+                                provider_name.as_deref(),
+                                internal_messages.clone(),
+                                internal_tools.clone(),
+                            )
+                            .await
                             {
-                                Ok(resp) => resp,
+                                Ok(blocks) => (blocks, "fallback"),
                                 Err(e) => return error_response(&e.to_string(), "api_error"),
-                            };
-
-                            (response.content, "fallback")
+                            }
                         }
                         Err(e) => {
-                            // Fall back to teacher
                             drop(generator);
                             warn!("❌ Local generation error: {}, falling back to teacher", e);
-
-                            let mut claude_request =
-                                crate::claude::MessageRequest::with_context(internal_messages.clone());
-                            if let Some(tools) = internal_tools.clone() {
-                                claude_request = claude_request.with_tools(tools);
-                            }
-
-                            let response = match server
-                                .claude_client()
-                                .send_message(&claude_request)
-                                .await
+                            match forward_to_cloud(
+                                &server,
+                                provider_name.as_deref(),
+                                internal_messages.clone(),
+                                internal_tools,
+                            )
+                            .await
                             {
-                                Ok(resp) => resp,
-                                Err(e) => return error_response(&e.to_string(), "api_error"),
-                            };
-
-                            (response.content, "fallback")
+                                Ok(blocks) => (blocks, "fallback"),
+                                Err(e2) => return error_response(&e2.to_string(), "api_error"),
+                            }
                         }
                     }
                 }
                 _ => {
-                    // Model not ready, forward to Claude
                     drop(state);
-                    info!("Model not ready, forwarding to Claude");
-
-                    let mut claude_request =
-                        crate::claude::MessageRequest::with_context(internal_messages.clone());
-                    if let Some(tools) = internal_tools {
-                        claude_request = claude_request.with_tools(tools);
-                    }
-
-                    let response = match server
-                        .claude_client()
-                        .send_message(&claude_request)
-                        .await
+                    info!("Model not ready, forwarding to cloud provider");
+                    match forward_to_cloud(
+                        &server,
+                        provider_name.as_deref(),
+                        internal_messages.clone(),
+                        internal_tools,
+                    )
+                    .await
                     {
-                        Ok(resp) => resp,
+                        Ok(blocks) => (blocks, "forward"),
                         Err(e) => return error_response(&e.to_string(), "api_error"),
-                    };
-
-                    (response.content, "forward")
+                    }
                 }
             }
         }
