@@ -6,19 +6,21 @@ This document describes the technical architecture of Shammah, a local-first AI 
 
 Shammah provides **immediate, high-quality AI assistance** using pre-trained local models (Qwen via ONNX Runtime) or cloud fallback (Claude, GPT-4, Gemini, Grok), then continuously improves through weighted LoRA fine-tuning to adapt to your specific coding patterns.
 
-**Current State (v0.5.0-dev):**
+**Current State (v0.5.2):**
 - ✅ ONNX Runtime with KV cache support
-- ✅ Pre-trained Qwen models (1.5B/3B/7B/14B)
+- ✅ Pre-trained Qwen models (1.5B/3B/7B/14B) + 5 other families
 - ✅ Daemon architecture with auto-spawn
 - ✅ OpenAI-compatible HTTP API
 - ✅ Tool execution with pass-through
 - ✅ SSE streaming for local and remote
-- ✅ LoRA training infrastructure (Python-based)
-- ✅ Multi-provider teacher support
-- ✅ Tabbed setup wizard (Phase 1)
-- ✅ Feature flags system (Phase 2)
-- ✅ macOS GUI automation (Phase 3 - infrastructure)
-- 🚧 MCP plugin system (Phase 4 - partial)
+- ✅ LoRA fine-tuning infrastructure (feedback collection + JSONL queue)
+- ✅ Multi-provider teacher support (6 providers)
+- ✅ Unified `[[providers]]` config with transparent migration
+- ✅ Tabbed setup wizard with ONNX model selection
+- ✅ IMCPD iterative planning loop (`/plan` command)
+- ✅ Universal alignment prompt (JSON normalization across providers)
+- ✅ Live LLM test suite (gated by `FINCH_LIVE_TESTS=1`)
+- 🚧 MCP plugin system (partial)
 
 **Key Innovation:** Pre-trained models + weighted LoRA fine-tuning = immediate quality + continuous improvement.
 
@@ -55,7 +57,7 @@ REPL appears instantly (<100ms)
     │ ONNX Runtime Inference           │
     │ (Qwen 1.5B/3B/7B/14B)           │
     │ + LoRA Adapters (optional)       │
-    │ Device: Metal/CPU                │
+    │ Device: CoreML/CPU               │
     └──────────┬───────────────────────┘
            │
            v
@@ -232,7 +234,74 @@ Repeat up to 5 iterations
 - `src/tools/permissions.rs` - PermissionManager, approval patterns
 - `src/cli/repl_event/tool_execution.rs` - Client-side execution
 
-### 4. SSE Streaming Implementation
+### 4. IMCPD Planning Loop
+
+**Purpose:** Generate high-quality implementation plans through an iterative adversarial critique loop before any code is written.
+
+**Command:** `/plan <task>` — initiates the loop. The REPL transitions to `ReplMode::Planning` during execution, then `ReplMode::Executing` after approval.
+
+**Three-Iteration Loop:**
+```
+Iteration 1–3:
+    generate_plan(task, previous_steering)
+        ↓
+    critique_plan(plan) → Vec<CritiqueItem>
+        ↓
+    Check convergence:
+      delta_pct < 15% AND no must-address items? → converged
+      Hard cap at iteration 3
+        ↓
+    (if not converged) steer → next iteration
+        ↓
+    Present plan to user (approve / steer / cancel)
+        ↓
+    Approved → ReplMode::Executing, cleared conversation context
+```
+
+**Seven Adversarial Personas** (defined in `imcpd_methodology.md`, sent verbatim to LLM):
+- Always-active: Regression, Edge Cases, Completeness, Tests & Docs, Repo Hygiene, Git Discipline
+- Keyword-activated: Security, Architecture, Scope Creep
+
+**Key Types:**
+- `PlanLoop` — orchestrates the loop; `PlanLoop::run(task, tui)` is the entry point
+- `CritiqueItem` — `{ severity: Critical|Major|Minor, persona, description, must_address: bool }`
+- `ImcpdConfig` — iteration cap, convergence threshold, persona activation keywords
+- `PersonaSelector` — activates keyword-triggered personas based on task text
+
+**Integration:**
+- `Command::Plan(task)` in `event_loop.rs` → `handle_plan_task()` → `PlanLoop::run()`
+- `Command::PlanModeToggle` → old simple toggle (unchanged)
+- Alignment prompt injected into both `generate_plan` and `critique_plan` calls
+
+**Key Files:**
+- `src/planning/mod.rs` — public API
+- `src/planning/loop_runner.rs` — `PlanLoop`, `generate_plan()`, `critique_plan()`
+- `src/planning/types.rs` — `CritiqueItem`, `ImcpdConfig`, `PlanIteration`
+- `src/planning/personas.rs` — `PersonaSelector`, persona definitions
+- `src/planning/imcpd_methodology.md` — full methodology spec (embedded via `include_str!`)
+
+### 5. Universal Alignment Prompt
+
+**Purpose:** Normalize LLM output format (JSON structure, numbered lists, schema fidelity) across all six providers so the planning loop — and any structured caller — can safely swap to the cheapest available provider without format drift.
+
+**How It Works:**
+
+`UNIVERSAL_ALIGNMENT_PROMPT` (`src/providers/alignment.rs`) is a short system-prompt fragment that instructs the model to:
+- Return valid JSON when a JSON schema is requested
+- Use consistent numbered list format for critique items
+- Include all required fields (`severity`, `persona`, `description`, `must_address`)
+- Avoid wrapping JSON in markdown fences
+
+`with_alignment(system_prompt)` prepends the fragment to any system prompt. The planning loop calls it on both `generate_plan` and `critique_plan` requests.
+
+**Why It's Needed:**
+Different providers (Claude vs. Gemini vs. Groq vs. Grok) have subtly different defaults for structured output. Without normalization, the critique parser would need per-provider special-casing. The alignment prompt provides a single, provider-agnostic contract.
+
+**Key Files:**
+- `src/providers/alignment.rs` — `UNIVERSAL_ALIGNMENT_PROMPT`, `with_alignment()`
+- `src/planning/loop_runner.rs` — alignment wired into `generate_plan` and `critique_plan`
+
+### 6. SSE Streaming Implementation
 
 **Purpose:** Provide real-time token-by-token response streaming for both local and remote models.
 
@@ -272,7 +341,7 @@ Repeat up to 5 iterations
 - `src/cli/tui/mod.rs` - TUI streaming response handling
 - `src/generators/qwen.rs` - Token callbacks
 
-### 5. LoRA Fine-Tuning Infrastructure
+### 7. LoRA Fine-Tuning Infrastructure
 
 **Purpose:** Efficient domain-specific adaptation with weighted examples.
 
@@ -312,7 +381,7 @@ ONNX Runtime is inference-only (no training APIs). Adapters are trained in Pytho
 - `src/training/lora_subprocess.rs` - Python subprocess spawner
 - `scripts/train_lora.py` - PyTorch LoRA training script
 
-### 6. TUI Renderer System
+### 8. TUI Renderer System
 
 **Purpose:** Professional terminal UI with scrollback, streaming, and efficient updates.
 
@@ -347,7 +416,7 @@ Message updates → Diff-based blitting to visible area only
 - `src/cli/tui/input_widget.rs` - Input area rendering
 - `src/cli/tui/status_widget.rs` - Status bar rendering
 
-### 7. Multi-Provider Teacher Support
+### 9. Multi-Provider Teacher Support
 
 **Purpose:** Flexible fallback to multiple cloud AI providers.
 
@@ -404,7 +473,7 @@ The `ProviderEntry` enum (`src/config/provider.rs`) has variants for each cloud 
 - `src/providers/factory.rs` - `create_provider_from_entry()`, `create_providers_from_entries()`
 - `src/cli/setup_wizard.rs` - Multi-provider setup UI
 
-### 8. MCP (Model Context Protocol) Plugin System
+### 10. MCP (Model Context Protocol) Plugin System
 
 **Status:** 🚧 Infrastructure complete, connection layer in progress
 
@@ -514,7 +583,7 @@ The `rust-mcp-sdk` crate has private internal types (`ClientRuntime`) that can't
 - MCP Specification: https://modelcontextprotocol.io/specification/2025-11-25/
 - MCP Servers: https://github.com/modelcontextprotocol/servers
 
-### 9. Context Assembly (`src/context/`)
+### 11. Context Assembly (`src/context/`)
 
 **Purpose:** Automatically discover and inject project-level AI instructions (`CLAUDE.md` / `FINCH.md`) into the system prompt at startup, without any user configuration.
 
@@ -561,7 +630,7 @@ Match the code style in src/lib.rs.
 - `src/context/mod.rs` - public re-export
 - `src/generators/claude.rs` - `ClaudeGenerator`, `build_system_prompt()`
 
-### 10. Conversation Management
+### 12. Conversation Management
 
 **Purpose:** Manage multi-turn conversation history with context window limits.
 
@@ -745,7 +814,7 @@ Stored in: `~/.finch/training_queue.jsonl`
 
 ## Performance Targets
 
-### Current Performance (v0.4.0)
+### Current Performance (v0.5.2)
 
 **Startup:**
 - REPL available: <100ms (instant)
@@ -827,5 +896,5 @@ Stored in: `~/.finch/training_queue.jsonl`
 
 ---
 
-**Current Version:** 0.5.0-dev
+**Current Version:** 0.5.2
 **Last Updated:** 2026-02-22
