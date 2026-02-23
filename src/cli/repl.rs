@@ -1314,15 +1314,17 @@ impl Repl {
         use crate::cli::global_output::get_global_tui_renderer;
         use crate::cli::repl_event::EventLoop;
 
-        // Check if TUI is available (required for event loop)
-        let tui_renderer = {
+        // Check if TUI is available (required for event loop).
+        // Lock scope ends at the closing brace — tui_lock is NOT in scope at the await below.
+        let tui_renderer_opt = {
             let mut tui_lock = get_global_tui_renderer().lock().unwrap();
-            match tui_lock.take() {
-                Some(renderer) => renderer,
-                None => {
-                    // TUI not available (raw mode), fall back to traditional REPL
-                    return self.run_with_initial_prompt(initial_prompt).await;
-                }
+            tui_lock.take()
+        };
+        let tui_renderer = match tui_renderer_opt {
+            Some(renderer) => renderer,
+            None => {
+                // TUI not available (raw mode), fall back to traditional REPL
+                return self.run_with_initial_prompt(initial_prompt).await;
             }
         };
 
@@ -1448,41 +1450,42 @@ impl Repl {
                 use crate::cli::global_output::get_global_tui_renderer;
                 let tui_renderer = get_global_tui_renderer();
 
-                let line = if let Ok(mut tui_lock) = tui_renderer.lock() {
-                    if let Some(ref mut tui) = *tui_lock {
-                        match tui.read_line()? {
-                            Some(text) => Some(text),
-                            None => {
-                                // Ctrl+C or Esc - exit gracefully
-
-                                // CRITICAL: Disable raw mode FIRST so Ctrl+C works if shutdown hangs
-                                drop(tui_lock); // Release lock BEFORE disabling raw mode
-                                let _ = crossterm::terminal::disable_raw_mode();
-
-                                eprintln!();
-                                eprintln!("Shutting down gracefully...");
-                                eprintln!("(Press Ctrl+C again to force quit if it hangs)");
-
-                                self.save_models().await?;
-                                eprintln!("Models saved.");
-
-                                // Shutdown TUI
-                                use crate::cli::global_output::shutdown_global_tui;
-                                let _ = shutdown_global_tui();
-                                eprintln!("Goodbye!");
-                                break;
-                            }
-                        }
+                // Acquire lock, read a line, then release lock before any async work.
+                // Distinguishing None (Ctrl+C) from None (lock failed) via Option<Option<_>>.
+                let line_result: Option<Option<String>> = if let Ok(mut tui_lock) = tui_renderer.lock() {
+                    let result = if let Some(ref mut tui) = *tui_lock {
+                        tui.read_line()?
                     } else {
                         None
-                    }
+                    };
+                    drop(tui_lock); // Release lock before any async work below
+                    Some(result)
                 } else {
                     None
                 };
 
-                match line {
-                    Some(text) => text,
-                    None => continue, // Fallback if TUI lock fails
+                match line_result {
+                    Some(Some(text)) => text,
+                    Some(None) => {
+                        // Ctrl+C or Esc - exit gracefully
+
+                        // CRITICAL: Disable raw mode FIRST so Ctrl+C works if shutdown hangs
+                        let _ = crossterm::terminal::disable_raw_mode();
+
+                        eprintln!();
+                        eprintln!("Shutting down gracefully...");
+                        eprintln!("(Press Ctrl+C again to force quit if it hangs)");
+
+                        self.save_models().await?;
+                        eprintln!("Models saved.");
+
+                        // Shutdown TUI
+                        use crate::cli::global_output::shutdown_global_tui;
+                        let _ = shutdown_global_tui();
+                        eprintln!("Goodbye!");
+                        break;
+                    }
+                    None => continue, // Lock failed - skip this iteration
                 }
             } else if self.input_handler.is_some() {
                 // RAW MODE: use rustyline (traditional CLI)
