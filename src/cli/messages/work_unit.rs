@@ -9,8 +9,48 @@
 // It lives in the shadow buffer, rendered by the blit cycle (~100ms tick).
 // The throb animation is TIME-DRIVEN — no external counter required.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+
+/// Curated word list for the thinking spinner verb.
+const SPINNER_WORDS: &[&str] = &[
+    "Analyzing",
+    "Brainstorming",
+    "Building",
+    "Calculating",
+    "Channeling",
+    "Cogitating",
+    "Considering",
+    "Crafting",
+    "Deliberating",
+    "Envisioning",
+    "Evaluating",
+    "Exploring",
+    "Formulating",
+    "Generating",
+    "Ideating",
+    "Meditating",
+    "Mulling",
+    "Pondering",
+    "Processing",
+    "Reasoning",
+    "Reflecting",
+    "Ruminating",
+    "Sifting",
+    "Synthesizing",
+    "Thinking",
+    "Weighing",
+    "Working",
+];
+
+/// Pick the next spinner verb in round-robin order.
+/// Uses a global atomic counter — no `rand` dependency needed.
+pub fn random_spinner_verb() -> &'static str {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let idx = COUNTER.fetch_add(1, Ordering::Relaxed) % SPINNER_WORDS.len();
+    SPINNER_WORDS[idx]
+}
 
 use super::{Message, MessageId, MessageStatus};
 use crate::config::ColorScheme;
@@ -766,6 +806,42 @@ mod tests {
         };
         let f = format_row(&row);
         assert!(f.contains("3s"), "3-second row should show timing: {}", f);
+    }
+
+    // ── random_spinner_verb ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_random_spinner_verb_is_non_empty() {
+        let v = random_spinner_verb();
+        assert!(!v.is_empty());
+    }
+
+    #[test]
+    fn test_random_spinner_verb_is_in_word_list() {
+        // Call it several times; every result must be in the curated list.
+        for _ in 0..SPINNER_WORDS.len() * 2 {
+            let v = random_spinner_verb();
+            assert!(
+                SPINNER_WORDS.contains(&v),
+                "unexpected verb not in SPINNER_WORDS: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_random_spinner_verb_cycles_through_all_words() {
+        // Round-robin counter means after N calls we should have seen N distinct words
+        // (assuming we start fresh, which we cannot guarantee in test, but we can at
+        // least verify the set grows — call it 2×N times and check we get ≥ N/2 unique).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..SPINNER_WORDS.len() * 3 {
+            seen.insert(random_spinner_verb());
+        }
+        assert!(
+            seen.len() >= SPINNER_WORDS.len() / 2,
+            "expected to see at least half the word list; saw {}",
+            seen.len()
+        );
     }
 
     // ── Thread safety ────────────────────────────────────────────────────────

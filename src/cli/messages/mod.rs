@@ -17,7 +17,7 @@ pub mod concrete;
 pub mod work_unit;
 
 pub use concrete::*;
-pub use work_unit::{WorkRow, WorkRowStatus, WorkUnit};
+pub use work_unit::{random_spinner_verb, WorkRow, WorkRowStatus, WorkUnit};
 
 /// Unique identifier for messages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

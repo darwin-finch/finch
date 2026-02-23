@@ -1279,12 +1279,13 @@ impl EventLoop {
             // The shadow-buffer / insert_before architecture requires the message to
             // exist in output_manager before any blit cycles run — the WorkUnit's
             // time-driven animation will be visible during streaming.
-            let work_unit = output_manager.start_work_unit("Channeling");
+            let verb = crate::cli::messages::random_spinner_verb();
+            let work_unit = output_manager.start_work_unit(verb);
 
             let stream_start = std::time::Instant::now();
             let mut token_count: usize = 0;
             let mut throb_idx: usize = 0;
-            status_bar.update_operation("✳ Channeling…");
+            status_bar.update_operation(format!("✳ {}…", verb));
             {
                 use std::io::Write as _;
                 print!(
@@ -1322,8 +1323,8 @@ impl EventLoop {
                                 let elapsed_str = format_elapsed(secs);
                                 let tokens_str = format_token_count(token_count);
                                 status_bar.update_operation(format!(
-                                    "{} Channeling… ({} · ↓ {} tokens)",
-                                    icon, elapsed_str, tokens_str
+                                    "{} {}… ({} · ↓ {} tokens)",
+                                    icon, verb, elapsed_str, tokens_str
                                 ));
                             }
                             Ok(StreamChunk::ContentBlockComplete(block)) => {
@@ -1334,8 +1335,9 @@ impl EventLoop {
                                     let icon = THROB_FRAMES[throb_idx];
                                     let secs = stream_start.elapsed().as_secs();
                                     status_bar.update_operation(format!(
-                                        "{} Channeling… ({} · thinking)",
+                                        "{} {}… ({} · thinking)",
                                         icon,
+                                        verb,
                                         format_elapsed(secs)
                                     ));
                                 }
@@ -1580,8 +1582,9 @@ impl EventLoop {
         // Non-streaming path (for Qwen or fallback)
         // Create WorkUnit before the blocking generate call so the animated
         // header is visible during the wait (blit cycle runs every ~100ms).
-        let work_unit = output_manager.start_work_unit("Channeling");
-        status_bar.update_operation("✳ Channeling…");
+        let verb = crate::cli::messages::random_spinner_verb();
+        let work_unit = output_manager.start_work_unit(verb);
+        status_bar.update_operation(format!("✳ {}…", verb));
         match generator
             .generate(messages, Some((*tool_definitions).clone()))
             .await
@@ -2964,39 +2967,40 @@ mod tests {
     #[test]
     fn test_streaming_status_format() {
         // Verify the status bar message format used during streaming
+        let verb = "Thinking"; // representative word; actual value comes from random_spinner_verb()
         let secs = 75u64;
         let tokens = 1600usize;
         let elapsed_str = format_elapsed(secs);
         let tokens_str = format_token_count(tokens);
         let icon = THROB_FRAMES[1]; // "✳"
-        let status = format!(
-            "{} Channeling… ({} · ↓ {} tokens)",
-            icon, elapsed_str, tokens_str
-        );
-        assert_eq!(status, "✳ Channeling… (1m 15s · ↓ 1.6k tokens)");
+        let status = format!("{} {}… ({} · ↓ {} tokens)", icon, verb, elapsed_str, tokens_str);
+        assert_eq!(status, "✳ Thinking… (1m 15s · ↓ 1.6k tokens)");
     }
 
     #[test]
     fn test_streaming_status_format_short() {
+        let verb = "Thinking";
         let secs = 9u64;
         let tokens = 42usize;
         let icon = THROB_FRAMES[0]; // "✦"
         let status = format!(
-            "{} Channeling… ({} · ↓ {} tokens)",
+            "{} {}… ({} · ↓ {} tokens)",
             icon,
+            verb,
             format_elapsed(secs),
             format_token_count(tokens)
         );
-        assert_eq!(status, "✦ Channeling… (9s · ↓ 42 tokens)");
+        assert_eq!(status, "✦ Thinking… (9s · ↓ 42 tokens)");
     }
 
     #[test]
     fn test_streaming_status_thinking() {
         // While thinking (no text yet), status shows "· thinking" suffix
+        let verb = "Thinking";
         let secs = 15u64;
         let icon = THROB_FRAMES[2]; // "✼"
-        let status = format!("{} Channeling… ({} · thinking)", icon, format_elapsed(secs));
-        assert_eq!(status, "✼ Channeling… (15s · thinking)");
+        let status = format!("{} {}… ({} · thinking)", icon, verb, format_elapsed(secs));
+        assert_eq!(status, "✼ Thinking… (15s · thinking)");
     }
 
     #[test]
