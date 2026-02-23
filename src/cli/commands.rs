@@ -44,10 +44,10 @@ pub enum Command {
     PersonaList,              // List available personas
     PersonaSelect(String),    // Switch to a different persona
     PersonaShow,              // Show current persona and system prompt
-    // Model/Teacher switching (Runtime provider switching)
-    ModelList,                // List all configured teachers/models
-    ModelSwitch(String),      // Switch to a specific teacher (e.g., /model grok)
-    ModelShow,                // Show current active teacher
+    // Provider switching (/provider is canonical; /model and /teacher are silent aliases)
+    ModelList,                // /provider list
+    ModelSwitch(String),      // /provider <name>  e.g. /provider grok
+    ModelShow,                // /provider  (show current active provider)
     // Service discovery (Phase 3)
     Discover,                 // Discover Finch daemons on local network
 }
@@ -73,9 +73,9 @@ impl Command {
             // Persona commands
             "/persona" | "/persona list" => return Some(Command::PersonaList),
             "/persona show" => return Some(Command::PersonaShow),
-            // Model/Teacher commands
-            "/model" | "/model show" | "/teacher" | "/teacher show" => return Some(Command::ModelShow),
-            "/model list" | "/teacher list" => return Some(Command::ModelList),
+            // Provider commands (/provider canonical; /model and /teacher are aliases)
+            "/provider" | "/provider show" | "/model" | "/model show" | "/teacher" | "/teacher show" => return Some(Command::ModelShow),
+            "/provider list" | "/model list" | "/teacher list" => return Some(Command::ModelList),
             // Service discovery
             "/discover" => return Some(Command::Discover),
             _ => {}
@@ -89,8 +89,8 @@ impl Command {
             }
         }
 
-        // Handle /model <name> or /teacher <name>
-        if let Some(rest) = trimmed.strip_prefix("/model ").or_else(|| trimmed.strip_prefix("/teacher ")) {
+        // Handle /provider <name> (canonical), /model <name>, /teacher <name> (aliases)
+        if let Some(rest) = trimmed.strip_prefix("/provider ").or_else(|| trimmed.strip_prefix("/model ")).or_else(|| trimmed.strip_prefix("/teacher ")) {
             let teacher_name = rest.trim();
             // Filter out subcommands
             if teacher_name != "list" && teacher_name != "show" && !teacher_name.is_empty() {
@@ -317,16 +317,17 @@ pub fn format_help() -> String {
          \x1b[36m  /metrics\x1b[0m           Display usage statistics\n\
          \x1b[36m  /memory\x1b[0m            Show memory usage (system and process)\n\
          \x1b[36m  /training\x1b[0m          Show detailed training statistics\n\n\
-         \x1b[1;33m🤖 Model Commands:\x1b[0m\n\
-         \x1b[36m  /model\x1b[0m             Show current active model/teacher\n\
-         \x1b[36m  /model list\x1b[0m        List all configured teachers (Claude, Grok, etc.)\n\
-         \x1b[36m  /model <name>\x1b[0m      Switch to a specific teacher\n\
-         \x1b[0m                     Example: /model grok\n\
-         \x1b[36m  /local <query>\x1b[0m     Query local model directly (bypass routing)\n\
+         \x1b[1;33m🤖 Provider Commands:\x1b[0m\n\
+         \x1b[36m  /provider\x1b[0m          Show current active provider\n\
+         \x1b[36m  /provider list\x1b[0m     List all configured providers (Claude, Grok, etc.)\n\
+         \x1b[36m  /provider <name>\x1b[0m   Switch to a specific provider mid-session\n\
+         \x1b[0m                     Example: /provider grok\n\
+         \x1b[36m  /local <query>\x1b[0m     Query local ONNX model directly (bypass routing)\n\
          \x1b[0m                     Example: /local What is 2+2?\n\
          \x1b[0m\n\
-         \x1b[90m  What is model switching?\x1b[0m Switch between Claude, Grok, GPT-4, etc.\n\
-         \x1b[90m  while keeping your conversation memory intact.\x1b[0m\n\n\
+         \x1b[90m  Aliases: /model and /teacher also work (kept for compatibility)\x1b[0m\n\
+         \x1b[90m  Switch between Claude, Grok, GPT-4, local ONNX, etc.\x1b[0m\n\
+         \x1b[90m  Conversation history is preserved across switches.\x1b[0m\n\n\
          \x1b[1;33m🔌 MCP Plugin Commands:\x1b[0m\n\
          \x1b[36m  /mcp list\x1b[0m          List connected MCP servers\n\
          \x1b[36m  /mcp tools\x1b[0m         List all MCP tools from all servers\n\
@@ -606,6 +607,31 @@ mod tests {
         // Test empty ID returns None
         assert!(matches!(Command::parse("/patterns remove "), None));
         assert!(matches!(Command::parse("/patterns rm "), None));
+    }
+
+    #[test]
+    fn test_parse_provider_commands() {
+        // /provider is canonical
+        assert!(matches!(Command::parse("/provider"), Some(Command::ModelShow)));
+        assert!(matches!(Command::parse("/provider show"), Some(Command::ModelShow)));
+        assert!(matches!(Command::parse("/provider list"), Some(Command::ModelList)));
+        // switch
+        match Command::parse("/provider grok") {
+            Some(Command::ModelSwitch(name)) => assert_eq!(name, "grok"),
+            _ => panic!("Expected ModelSwitch(grok)"),
+        }
+        match Command::parse("/provider claude") {
+            Some(Command::ModelSwitch(name)) => assert_eq!(name, "claude"),
+            _ => panic!("Expected ModelSwitch(claude)"),
+        }
+        // Legacy aliases still work
+        assert!(matches!(Command::parse("/model"), Some(Command::ModelShow)));
+        assert!(matches!(Command::parse("/teacher"), Some(Command::ModelShow)));
+        assert!(matches!(Command::parse("/teacher list"), Some(Command::ModelList)));
+        match Command::parse("/teacher grok") {
+            Some(Command::ModelSwitch(name)) => assert_eq!(name, "grok"),
+            _ => panic!("Expected ModelSwitch(grok) via /teacher alias"),
+        }
     }
 
     #[test]
