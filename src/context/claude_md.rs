@@ -1,27 +1,27 @@
-// Auto-loading of CLAUDE.md / FINCH.md files into the system prompt
+// Auto-loading of CLAUDE.md / FINCH.md / CONTEXT.md files into the system prompt
 //
 // Matches Claude Code behavior: load ~/.claude/CLAUDE.md (user-level) first,
-// then walk upward from cwd to root collecting any CLAUDE.md or FINCH.md found,
-// and concatenate them outermost-first so project-specific instructions win.
+// then walk upward from cwd to root collecting any CLAUDE.md, FINCH.md, or
+// CONTEXT.md found, and concatenate them outermost-first so project-specific
+// instructions win.
 //
 // FINCH.md is supported as an open, tool-agnostic alternative to CLAUDE.md.
-// Projects that want their AI-assistant instructions to work across multiple
-// tools (Finch, Cursor, etc.) can use FINCH.md instead of a vendor-specific name.
-// When both exist in the same directory, both are loaded (CLAUDE.md first).
+// CONTEXT.md is a neutral name that works across any AI assistant.
+// When multiple files exist in the same directory, all are loaded in order.
 
 use std::path::Path;
 use tracing::{debug, info};
 
 /// Filenames we look for, in the order they are loaded within a single directory.
-const CONTEXT_FILENAMES: &[&str] = &["CLAUDE.md", "FINCH.md"];
+const CONTEXT_FILENAMES: &[&str] = &["CLAUDE.md", "FINCH.md", "CONTEXT.md"];
 
-/// Collect all CLAUDE.md / FINCH.md context visible from `cwd`.
+/// Collect all CLAUDE.md / FINCH.md / CONTEXT.md context visible from `cwd`.
 ///
 /// Load order (lowest → highest priority):
 /// 1. `~/.claude/CLAUDE.md` — user-level defaults (Claude Code convention)
 /// 2. `~/.finch/FINCH.md`   — user-level defaults (Finch-specific)
-/// 3. Each `CLAUDE.md` / `FINCH.md` found walking from root down to `cwd`
-///    (outermost first, CLAUDE.md before FINCH.md within the same directory)
+/// 3. Each `CLAUDE.md` / `FINCH.md` / `CONTEXT.md` found walking from root
+///    down to `cwd` (outermost first, in filename order within the same dir)
 ///
 /// Returns `None` if no files were found or all were empty.
 pub fn collect_claude_md_context(cwd: &Path) -> Option<String> {
@@ -136,23 +136,38 @@ mod tests {
     }
 
     #[test]
-    fn loads_both_names_in_same_directory() {
+    fn loads_context_md_from_cwd() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "CONTEXT.md",
+            "# Context\nPrefer functional style.",
+        );
+
+        let result = collect_claude_md_context(tmp.path());
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Prefer functional style."));
+    }
+
+    #[test]
+    fn loads_all_names_in_same_directory() {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "CLAUDE.md", "claude instructions");
         write(tmp.path(), "FINCH.md", "finch instructions");
+        write(tmp.path(), "CONTEXT.md", "context instructions");
 
         let result = collect_claude_md_context(tmp.path());
         assert!(result.is_some());
         let text = result.unwrap();
         assert!(text.contains("claude instructions"));
         assert!(text.contains("finch instructions"));
-        // CLAUDE.md comes before FINCH.md within the same directory
+        assert!(text.contains("context instructions"));
+        // Load order: CLAUDE.md → FINCH.md → CONTEXT.md
         let claude_pos = text.find("claude instructions").unwrap();
         let finch_pos = text.find("finch instructions").unwrap();
-        assert!(
-            claude_pos < finch_pos,
-            "CLAUDE.md should appear before FINCH.md"
-        );
+        let context_pos = text.find("context instructions").unwrap();
+        assert!(claude_pos < finch_pos, "CLAUDE.md should appear before FINCH.md");
+        assert!(finch_pos < context_pos, "FINCH.md should appear before CONTEXT.md");
     }
 
     #[test]
