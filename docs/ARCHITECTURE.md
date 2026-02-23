@@ -139,7 +139,7 @@ REPL appears instantly (<100ms)
 - 64GB+ Mac → Qwen-2.5-14B (14GB RAM, maximum)
 
 **Features:**
-- ONNX Runtime with CoreML execution provider (Metal acceleration on Apple Silicon)
+- ONNX Runtime with CoreML execution provider (macOS/Apple Silicon: dispatches ops to ANE, GPU, or CPU per-op; LLM workloads typically run mostly on CPU ARM due to partial CoreML op coverage)
 - Full KV cache support (56+ dynamic inputs for 28 layers)
 - Autoregressive generation with cache reuse
 - Graceful CPU fallback
@@ -345,21 +345,21 @@ Different providers (Claude vs. Gemini vs. Groq vs. Grok) have subtly different 
 
 **Purpose:** Efficient domain-specific adaptation with weighted examples.
 
-**Architecture:**
+**Architecture (what works today → planned pipeline):**
 ```
 User Feedback (10x/3x/1x weight)
     ↓
-TrainingCoordinator collects examples
+Feedback logged with weight to JSONL
     ↓
-Write to JSONL queue (~/.finch/training_queue.jsonl)
+~/.finch/training_queue.jsonl
     ↓
-Spawn Python training script (background)
+[Pending] External training step:
+  macOS  → MLX (mlx-lm, Apple Silicon native)
+  Linux  → PyTorch + PEFT (transformers)
     ↓
-PyTorch + PEFT LoRA training
+[Pending] Convert adapter → .onnx_adapter (Olive toolchain)
     ↓
-Save adapter to safetensors format
-    ↓
-(Future) Load adapter in ONNX Runtime
+[Pending] Load via onnxruntime-genai Adapters API at inference
 ```
 
 **Weighted Training:**
@@ -373,13 +373,16 @@ Save adapter to safetensors format
   - Example: "This is exactly right"
   - Impact: Model learns normally
 
-**Current Limitation:**
-ONNX Runtime is inference-only (no training APIs). Adapters are trained in Python but not yet loaded at runtime. Future work: implement adapter loading via weight merging or custom ONNX graph modifications.
+**Current Status:**
+The feedback collection pipeline works; training and adapter loading are not yet implemented (see Issue #1). Key clarifications:
+- ONNX Runtime itself has no training API. The training step uses an external tool: **MLX** on macOS (Apple Silicon) or **PyTorch/PEFT** on Linux/CUDA.
+- `onnxruntime-genai` *does* support loading pre-trained adapters at inference time via `.onnx_adapter` format — this is not blocked by ONNX's lack of training API.
+- `candle-metal` cannot be used for LoRA training on macOS — same missing ops (layer norm) that break inference also break training.
+- `candle-coreml` (ANEMLL crate) uses a completely different model format and is not viable.
 
 **Key Files:**
-- `src/models/lora.rs` - WeightedExample, TrainingCoordinator
-- `src/training/lora_subprocess.rs` - Python subprocess spawner
-- `scripts/train_lora.py` - PyTorch LoRA training script
+- `src/models/lora.rs` - `WeightedExample`, `LoRAConfig`, `ExampleBuffer` (placeholder infrastructure)
+- `src/training/batch_trainer.rs` - Returns honest error; not wired to real training
 
 ### 8. TUI Renderer System
 
@@ -781,12 +784,13 @@ Stored in: `~/.finch/training_queue.jsonl`
 - High performance
 - Excellent Apple Silicon support
 
-**ML Framework:** ONNX Runtime
-- Cross-platform inference engine
-- CoreML execution provider for Apple Silicon (Metal acceleration)
-- CPU fallback for maximum compatibility
+**ML Framework:** ONNX Runtime (Microsoft-maintained)
+- Cross-platform inference engine; requires ONNX-format models (converted from PyTorch)
+- CoreML execution provider for macOS/Apple Silicon — per-op dispatch to ANE, GPU, or CPU; actual ANE usage depends on CoreML op support; LLM workloads often run predominantly on CPU ARM
+- CUDA/ROCm/DirectML on Linux/Windows if available; CPU fallback everywhere
 - KV cache support for efficient autoregressive generation
 - ONNX format (optimized, portable)
+- Note: `onnxruntime-genai` supports loading pre-trained LoRA adapters (`.onnx_adapter`) at inference time — this is the path for Issue #1
 
 **Models:**
 - Base: Qwen-2.5-1.5B/3B/7B/14B (ONNX format, pre-trained)

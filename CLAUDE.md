@@ -6,7 +6,7 @@ This document provides context for AI assistants (like Claude Code) working on t
 
 **Project Name**: Shammah (שָׁמָה - "watchman/guardian")
 **Purpose**: Local-first AI coding assistant with continuous improvement
-**Core Innovation**: Local ONNX inference across 6 model families, ANE acceleration on Apple Silicon, cloud fallback during bootstrap
+**Core Innovation**: Local ONNX inference across 6 model families, Apple Silicon acceleration via CoreML execution provider, cloud fallback during bootstrap
 **Supported Models**: Qwen, Llama, Gemma, Mistral, Phi, DeepSeek (via ONNX)
 **Teacher Backends**: Claude (Anthropic), GPT-4 (OpenAI), Gemini (Google), Grok (xAI), Mistral, Groq
 
@@ -63,8 +63,8 @@ User Request
     │ ONNX Local Model                      │
     │ Qwen · Llama · Gemma · Mistral        │
     │ Phi · DeepSeek                        │
-    │ ANE via CoreML on Apple Silicon       │
-    │ CPU on Linux                          │
+    │ CoreML EP on macOS (ANE/GPU/CPU mix)  │
+    │ CUDA/CPU on Linux                     │
     └──────────┬───────────────────────────┘
            │
            v
@@ -117,12 +117,12 @@ User Request
 
 **Features:**
 - Uses ONNX Runtime with pluggable execution providers
-- ANE acceleration on Apple Silicon via CoreML execution provider
+- CoreML execution provider on macOS/Apple Silicon — dispatches ops to ANE, GPU, or CPU per-op; in practice LLM workloads run mostly on CPU ARM because CoreML's op set doesn't cover all transformer ops
 - CUDA/ROCm/DirectML on Linux/Windows if available; CPU fallback everywhere
 - Full KV cache support for autoregressive generation
 - Automatic tokenizer loading (tokenizer.json)
 
-**Why ONNX is primary (not Candle):** Candle works well on Linux CPU/CUDA and was the original backend. `candle-metal` (Candle's macOS GPU path) doesn't work reliably, so ONNX + CoreML is used for Apple Silicon. ONNX also supports all 6 model families vs. Candle's Qwen2-only support.
+**Why ONNX is primary (not Candle):** Candle works well on Linux CPU/CUDA and was the original backend. `candle-metal` (Candle's Metal GPU path on macOS) is missing key ops required by Qwen — specifically layer normalisation kernels and some matmul dimension combinations — causing incorrect output or crashes. There is also a third-party `candle-coreml` crate but it requires models in ANEMLL `.mlpackage` format (completely different from PyTorch/safetensors), is not maintained by HuggingFace, and did not work with Qwen models. ONNX + CoreML EP is the practical path for macOS. ONNX also supports all 6 model families vs. Candle's Qwen2-only support.
 
 **Key Files:**
 - `src/models/loaders/onnx.rs` - OnnxLoader, LoadedOnnxModel, KV cache
@@ -147,9 +147,21 @@ The `LoRAConfig` and `LoRAAdapter` structs exist in `src/models/lora.rs` as plac
 - Config fields (`rank`, `alpha`, `learning_rate`, etc.) accepted and stored
 
 **What is not yet implemented:**
-- Actual LoRA training (no Python subprocess, no in-process training)
+- Actual LoRA training
 - Adapter saving to `~/.finch/adapters/`
 - Adapter loading at ONNX inference time
+
+**Planned LoRA pipeline (for Issue #1):**
+
+*Training step (external tool, not in-process):*
+- On macOS: use [MLX](https://github.com/ml-explore/mlx-lm) (Apple's Python ML framework, the community standard for LoRA on Apple Silicon)
+- On Linux/CUDA: use PyTorch + PEFT (`peft`, `transformers`)
+- Neither Candle Metal (missing ops) nor candle-coreml (wrong model format) is viable for training on macOS
+
+*Inference step (loading the adapter):*
+- `onnxruntime-genai` supports loading pre-trained LoRA adapters as `.onnx_adapter` files at inference time via its `Adapters` API
+- Adapters trained with MLX/PEFT must first be converted to `.onnx_adapter` format via the Olive toolchain
+- This conversion + loading path is what Issue #1 is tracking
 
 **Key Files:**
 - `src/models/lora.rs` - LoRAAdapter, LoRAConfig, WeightedExample, ExampleBuffer (all placeholder)
@@ -557,20 +569,25 @@ automatically rewritten to `[[providers]]` format on next save.
 - High performance
 - Excellent Apple Silicon support
 
-**Primary ML Framework:** ONNX Runtime
-- Cross-platform inference engine
-- CoreML execution provider for Apple Silicon — uses ANE (Apple Neural Engine) automatically
-- CUDA/ROCm/DirectML on Linux/Windows if available; CPU fallback everywhere
+**Primary ML Framework:** ONNX Runtime (Microsoft-maintained)
+- Cross-platform inference engine; uses ONNX model format (converted from PyTorch)
+- On macOS/Apple Silicon: CoreML execution provider dispatches ops to ANE, GPU, or CPU per-op based on CoreML's op coverage. LLM workloads typically run mostly on CPU ARM because many transformer ops (attention patterns, complex reshapes) are not in CoreML's supported op set. There is some ANE/GPU dispatch for ops CoreML does support.
+- On Linux: CUDA, ROCm, DirectML if available; CPU fallback everywhere
 - KV cache support for efficient autoregressive generation
-- ONNX format (optimized, portable)
-- Supports all 6 model families (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek)
+- Supports all 6 model families (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek) — as ONNX format models from HuggingFace onnx-community org
 
-**Why ONNX over Candle on macOS:** Candle is also available as an optional backend (`--features candle`) and works well on Linux CPU/CUDA. However, `candle-metal` (Candle's Metal GPU path on macOS) doesn't work reliably, so ONNX + CoreML became the primary backend to get stable Apple Silicon acceleration. Candle on macOS is opt-in only; `candle-metal` requires Xcode and is not built by default.
+**Why ONNX over Candle on macOS:**
+- `candle-metal` (Candle's Metal GPU path) is missing key ops for Qwen: layer normalisation kernels and certain matmul dimension combinations cause incorrect output or crashes
+- `candle-coreml` (third-party `mazhewitt/candle-cormel` crate) requires ANEMLL `.mlpackage` model format — completely different from PyTorch/safetensors — and isn't maintained by HuggingFace; we tried and hit tensor dimension mismatches with Qwen models
+- ONNX + CoreML EP is the practical path on macOS despite the partial op coverage
+- ONNX also supports all 6 model families vs. Candle's Qwen2-only support
 
 **Alternative backend:** Candle (`src/models/loaders/candle.rs`)
 - Works on Linux (CPU, CUDA via candle-cuda)
 - Supports Qwen2 only (not all 6 ONNX families)
-- macOS: CPU works; Metal opt-in but unreliable
+- macOS: CPU works correctly; Metal backend present but missing layer-norm and matmul ops needed for Qwen generation → unreliable, opt-in only
+
+**Note on Mistral ONNX:** Models exist (from `microsoft/` and `nvidia/` HuggingFace orgs) but `onnx-community` specifically has not published Mistral. Issue #2 is tracking this.
 
 **Models:**
 - 6 families: Qwen 2.5, Llama 3, Gemma 2, Mistral, Phi, DeepSeek Coder (ONNX format)
@@ -988,7 +1005,7 @@ Core infrastructure is complete and production-ready. The project is a fully fun
 
 ### Capabilities Summary
 
-- **Local inference** — ONNX Runtime (primary) + Candle (Linux/CPU alt); ANE via CoreML on Apple Silicon; CUDA/ROCm on Linux
+- **Local inference** — ONNX Runtime (primary) + Candle (Linux/CPU alt); CoreML EP on macOS (partial ANE/GPU dispatch); CUDA/ROCm on Linux
 - **6 model families** — Qwen, Llama, Mistral, Gemma, Phi, DeepSeek adapters
 - **6 teacher providers** — Claude, GPT-4, Gemini, Grok, Mistral, Groq
 - **6 tools** — Read, Glob, Grep, WebFetch, Bash, Restart (with permission system)
