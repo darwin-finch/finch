@@ -6,6 +6,7 @@
 pub mod executor;
 pub mod implementations;
 pub mod mcp;
+pub mod todo;
 pub mod pattern_matcher;
 pub mod patterns;
 pub mod permissions;

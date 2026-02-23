@@ -220,6 +220,9 @@ pub struct EventLoop {
     /// Total number of status-strip lines (🧠 + context summaries).
     /// Comes from config.features.memory_context_lines (default 4).
     context_lines: usize,
+
+    /// Session task list shared with TodoWrite / TodoRead tools
+    todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
 }
 
 /// View mode for the REPL
@@ -254,8 +257,13 @@ impl EventLoop {
         session_label: String,
         available_providers: Vec<crate::config::ProviderEntry>,
         context_lines: usize,
+        todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+
+        // Wire the todo list into the TUI renderer before wrapping in Arc<Mutex>
+        let mut tui_renderer = tui_renderer;
+        tui_renderer.set_todo_list(Arc::clone(&todo_list));
 
         // Wrap TUI in Arc<Mutex> for shared access
         let tui_renderer = Arc::new(Mutex::new(tui_renderer));
@@ -323,6 +331,7 @@ impl EventLoop {
             session_label,
             cwd: String::new(), // populated at the start of run()
             context_lines,
+            todo_list,
         }
     }
 

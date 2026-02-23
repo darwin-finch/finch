@@ -147,6 +147,9 @@ pub struct Repl {
     // Phase 4: Hierarchical memory system
     memory_system: Option<Arc<crate::memory::MemorySystem>>,
 
+    // Session task list (TodoWrite / TodoRead tools)
+    todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
+
     // Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
 
@@ -329,6 +332,16 @@ impl Repl {
             if is_interactive && !daemon_mode {
                 output_status!("✓ Memory tools registered (search_memory, create_memory, list_recent_memories)");
             }
+        }
+
+        // Session task list (TodoWrite / TodoRead)
+        let todo_list = Arc::new(tokio::sync::RwLock::new(
+            crate::tools::todo::TodoList::default(),
+        ));
+        {
+            use crate::tools::implementations::{TodoReadTool, TodoWriteTool};
+            tool_registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
+            tool_registry.register(Box::new(TodoReadTool::new(Arc::clone(&todo_list))));
         }
 
         // Create permission manager
@@ -580,6 +593,9 @@ impl Repl {
 
             // Phase 4: Hierarchical memory
             memory_system,
+
+            // Session task list
+            todo_list,
 
             // Session identity
             session_label: generate_session_label(),
@@ -1500,6 +1516,7 @@ impl Repl {
             self.session_label.clone(),
             self.available_providers.clone(),
             self.memory_context_lines,
+            Arc::clone(&self.todo_list),
         );
 
         // Run the event loop
