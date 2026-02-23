@@ -1,21 +1,48 @@
 // Integration tests for Phase 2: Persona System
 
-use finch::config::Persona;
 use anyhow::Result;
+use finch::config::Persona;
 
 #[test]
 fn test_load_builtin_personas() -> Result<()> {
     // Test that all 6 builtin personas can be loaded
-    let personas = vec!["default", "expert-coder", "teacher", "analyst", "creative", "researcher"];
+    let personas = vec![
+        "default",
+        "expert-coder",
+        "teacher",
+        "analyst",
+        "creative",
+        "researcher",
+    ];
 
     for persona_name in personas {
         let persona = Persona::load_builtin(persona_name)?;
         // Name in file might have spaces (e.g., "Expert Coder" vs "expert-coder")
-        assert!(!persona.name().is_empty(), "Name should not be empty for {}", persona_name);
-        assert!(!persona.behavior.system_prompt.is_empty(), "System prompt should not be empty for {}", persona_name);
-        assert!(!persona.tone().is_empty(), "Tone should be set for {}", persona_name);
-        assert!(!persona.verbosity().is_empty(), "Verbosity should be set for {}", persona_name);
-        assert!(!persona.focus().is_empty(), "Focus should be set for {}", persona_name);
+        assert!(
+            !persona.name().is_empty(),
+            "Name should not be empty for {}",
+            persona_name
+        );
+        assert!(
+            !persona.behavior.system_prompt.is_empty(),
+            "System prompt should not be empty for {}",
+            persona_name
+        );
+        assert!(
+            !persona.tone().is_empty(),
+            "Tone should be set for {}",
+            persona_name
+        );
+        assert!(
+            !persona.verbosity().is_empty(),
+            "Verbosity should be set for {}",
+            persona_name
+        );
+        assert!(
+            !persona.focus().is_empty(),
+            "Focus should be set for {}",
+            persona_name
+        );
     }
 
     Ok(())
@@ -42,12 +69,18 @@ fn test_persona_examples() -> Result<()> {
     // Verify example structure (if they exist)
     for example in &expert_coder.behavior.examples {
         assert!(!example.user.is_empty(), "User example should not be empty");
-        assert!(!example.assistant.is_empty(), "Assistant example should not be empty");
+        assert!(
+            !example.assistant.is_empty(),
+            "Assistant example should not be empty"
+        );
     }
 
     for example in &analyst.behavior.examples {
         assert!(!example.user.is_empty(), "User example should not be empty");
-        assert!(!example.assistant.is_empty(), "Assistant example should not be empty");
+        assert!(
+            !example.assistant.is_empty(),
+            "Assistant example should not be empty"
+        );
     }
 
     Ok(())
@@ -71,7 +104,14 @@ fn test_persona_default() {
 #[test]
 fn test_all_personas_have_unique_characteristics() -> Result<()> {
     // Verify that each persona has distinct characteristics
-    let personas = vec!["default", "expert-coder", "teacher", "analyst", "creative", "researcher"];
+    let personas = vec![
+        "default",
+        "expert-coder",
+        "teacher",
+        "analyst",
+        "creative",
+        "researcher",
+    ];
     let mut prompts = std::collections::HashSet::new();
 
     for persona_name in personas {

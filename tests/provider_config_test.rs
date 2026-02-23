@@ -147,7 +147,10 @@ fn test_provider_requires_api_key() {
 
     // Current behavior: accepts empty key, fails at runtime
     // Future improvement: validate at config time
-    assert!(result.is_ok(), "Provider should accept empty key but fail at runtime");
+    assert!(
+        result.is_ok(),
+        "Provider should accept empty key but fail at runtime"
+    );
 }
 
 /// Test that model field defaults correctly when not provided
@@ -231,7 +234,10 @@ fn test_provider_capabilities() -> Result<()> {
     let provider = providers::create_provider(&[claude_teacher])?;
 
     // Claude should support both streaming and tools
-    assert!(provider.supports_streaming(), "Claude should support streaming");
+    assert!(
+        provider.supports_streaming(),
+        "Claude should support streaming"
+    );
     assert!(provider.supports_tools(), "Claude should support tools");
 
     Ok(())
@@ -260,11 +266,7 @@ fn test_document_valid_model_names() {
     ];
 
     // OpenAI:
-    let valid_openai = vec![
-        "gpt-4",
-        "gpt-4-turbo",
-        "gpt-3.5-turbo",
-    ];
+    let valid_openai = vec!["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"];
 
     // This test just documents - doesn't validate
     // In the future, we could add runtime validation against these lists

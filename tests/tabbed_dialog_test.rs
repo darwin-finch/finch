@@ -1,8 +1,8 @@
 // Integration test for tabbed dialog functionality
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use finch::cli::llm_dialogs::{Question, QuestionOption};
 use finch::cli::tui::{TabbedDialog, TabbedDialogResult};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[test]
 fn test_tabbed_dialog_creation() {
@@ -106,23 +106,21 @@ fn test_tab_navigation() {
 
 #[test]
 fn test_answer_submission() {
-    let questions = vec![
-        Question {
-            question: "Pick one?".to_string(),
-            header: "Choice".to_string(),
-            options: vec![
-                QuestionOption {
-                    label: "Yes".to_string(),
-                    description: "Affirmative".to_string(),
-                },
-                QuestionOption {
-                    label: "No".to_string(),
-                    description: "Negative".to_string(),
-                },
-            ],
-            multi_select: false,
-        },
-    ];
+    let questions = vec![Question {
+        question: "Pick one?".to_string(),
+        header: "Choice".to_string(),
+        options: vec![
+            QuestionOption {
+                label: "Yes".to_string(),
+                description: "Affirmative".to_string(),
+            },
+            QuestionOption {
+                label: "No".to_string(),
+                description: "Negative".to_string(),
+            },
+        ],
+        multi_select: false,
+    }];
 
     let mut dialog = TabbedDialog::new(questions, None);
 
@@ -143,23 +141,21 @@ fn test_answer_submission() {
 
 #[test]
 fn test_cancellation() {
-    let questions = vec![
-        Question {
-            question: "Question?".to_string(),
-            header: "Q".to_string(),
-            options: vec![
-                QuestionOption {
-                    label: "A".to_string(),
-                    description: "A".to_string(),
-                },
-                QuestionOption {
-                    label: "B".to_string(),
-                    description: "B".to_string(),
-                },
-            ],
-            multi_select: false,
-        },
-    ];
+    let questions = vec![Question {
+        question: "Question?".to_string(),
+        header: "Q".to_string(),
+        options: vec![
+            QuestionOption {
+                label: "A".to_string(),
+                description: "A".to_string(),
+            },
+            QuestionOption {
+                label: "B".to_string(),
+                description: "B".to_string(),
+            },
+        ],
+        multi_select: false,
+    }];
 
     let mut dialog = TabbedDialog::new(questions, None);
 
@@ -176,23 +172,21 @@ fn test_cancellation() {
 
 #[test]
 fn test_custom_input_mode() {
-    let questions = vec![
-        Question {
-            question: "Custom input test?".to_string(),
-            header: "Custom".to_string(),
-            options: vec![
-                QuestionOption {
-                    label: "Option 1".to_string(),
-                    description: "First".to_string(),
-                },
-                QuestionOption {
-                    label: "Option 2".to_string(),
-                    description: "Second".to_string(),
-                },
-            ],
-            multi_select: false,
-        },
-    ];
+    let questions = vec![Question {
+        question: "Custom input test?".to_string(),
+        header: "Custom".to_string(),
+        options: vec![
+            QuestionOption {
+                label: "Option 1".to_string(),
+                description: "First".to_string(),
+            },
+            QuestionOption {
+                label: "Option 2".to_string(),
+                description: "Second".to_string(),
+            },
+        ],
+        multi_select: false,
+    }];
 
     let mut dialog = TabbedDialog::new(questions, None);
 
@@ -215,27 +209,25 @@ fn test_custom_input_mode() {
 
 #[test]
 fn test_multi_select() {
-    let questions = vec![
-        Question {
-            question: "Select multiple?".to_string(),
-            header: "Multi".to_string(),
-            options: vec![
-                QuestionOption {
-                    label: "A".to_string(),
-                    description: "First".to_string(),
-                },
-                QuestionOption {
-                    label: "B".to_string(),
-                    description: "Second".to_string(),
-                },
-                QuestionOption {
-                    label: "C".to_string(),
-                    description: "Third".to_string(),
-                },
-            ],
-            multi_select: true,
-        },
-    ];
+    let questions = vec![Question {
+        question: "Select multiple?".to_string(),
+        header: "Multi".to_string(),
+        options: vec![
+            QuestionOption {
+                label: "A".to_string(),
+                description: "First".to_string(),
+            },
+            QuestionOption {
+                label: "B".to_string(),
+                description: "Second".to_string(),
+            },
+            QuestionOption {
+                label: "C".to_string(),
+                description: "Third".to_string(),
+            },
+        ],
+        multi_select: true,
+    }];
 
     let mut dialog = TabbedDialog::new(questions, None);
 

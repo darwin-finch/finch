@@ -6,10 +6,10 @@
 // - Fallback behavior
 
 use anyhow::Result;
+use dirs;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::time::sleep;
-use dirs;
 
 /// Helper to check if daemon is running on a port
 async fn is_daemon_running(port: u16) -> bool {
@@ -127,6 +127,9 @@ fn test_daemon_config_parsing() {
     "#;
 
     let config: toml::Value = toml::from_str(config_toml).unwrap();
-    assert_eq!(config["client"]["daemon_address"].as_str(), Some("127.0.0.1:11435"));
+    assert_eq!(
+        config["client"]["daemon_address"].as_str(),
+        Some("127.0.0.1:11435")
+    );
     assert_eq!(config["client"]["use_daemon"].as_bool(), Some(true));
 }

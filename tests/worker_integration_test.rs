@@ -175,8 +175,12 @@ async fn test_node_info_stable_id() {
     let json1 = body_json(resp1).await;
     let json2 = body_json(resp2).await;
 
-    let id1 = json1["identity"]["id"].as_str().expect("id must be a string");
-    let id2 = json2["identity"]["id"].as_str().expect("id must be a string");
+    let id1 = json1["identity"]["id"]
+        .as_str()
+        .expect("id must be a string");
+    let id2 = json2["identity"]["id"]
+        .as_str()
+        .expect("id must be a string");
 
     assert_eq!(
         id1, id2,
@@ -214,9 +218,7 @@ async fn test_concurrent_foreign_requests() {
 
     let mut success_count = 0usize;
     for handle in handles {
-        let result = handle
-            .await
-            .expect("task panicked");
+        let result = handle.await.expect("task panicked");
         match result {
             Ok(resp) => {
                 if resp.status() == StatusCode::OK {
@@ -325,7 +327,10 @@ async fn test_oversized_payload_rejected() {
             // Axum may reset the connection rather than sending 413 — acceptable
             let msg = e.to_string();
             assert!(
-                msg.contains("connection") || msg.contains("reset") || msg.contains("closed") || msg.contains("BodyWrite"),
+                msg.contains("connection")
+                    || msg.contains("reset")
+                    || msg.contains("closed")
+                    || msg.contains("BodyWrite"),
                 "unexpected error for oversized payload: {e}"
             );
         }

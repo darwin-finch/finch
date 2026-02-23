@@ -60,7 +60,9 @@ async fn test_concurrent_session_creation_no_duplicates() {
     let mut handles = Vec::with_capacity(TASKS);
     for _ in 0..TASKS {
         let m = Arc::clone(&manager);
-        handles.push(tokio::spawn(async move { m.get_or_create(None).map(|s| s.id) }));
+        handles.push(tokio::spawn(
+            async move { m.get_or_create(None).map(|s| s.id) },
+        ));
     }
 
     let mut ids: HashSet<String> = HashSet::new();
@@ -91,9 +93,11 @@ async fn test_session_limit_under_concurrency() {
     let mut handles = Vec::with_capacity(TASKS);
     for _ in 0..TASKS {
         let m = Arc::clone(&manager);
-        handles.push(tokio::spawn(
-            async move { m.get_or_create(None).map(|s| s.id).map_err(|e| e.to_string()) },
-        ));
+        handles.push(tokio::spawn(async move {
+            m.get_or_create(None)
+                .map(|s| s.id)
+                .map_err(|e| e.to_string())
+        }));
     }
 
     let mut success_count = 0usize;
@@ -198,7 +202,10 @@ async fn test_session_expiry_is_expired_logic() {
 
     // Fresh session must not be expired
     let fresh = SessionState::new();
-    assert!(!fresh.is_expired(30), "brand-new session must not be expired");
+    assert!(
+        !fresh.is_expired(30),
+        "brand-new session must not be expired"
+    );
 
     // Session with activity 31 minutes ago must be expired at 30-min timeout
     let mut old = SessionState::new();
@@ -253,7 +260,11 @@ async fn test_session_update_under_concurrency() {
     }
 
     // Session should still exist, count should be 1
-    assert_eq!(manager.active_count(), 1, "still exactly 1 session after concurrent updates");
+    assert_eq!(
+        manager.active_count(),
+        1,
+        "still exactly 1 session after concurrent updates"
+    );
     let final_session = manager.get_or_create(Some(&session_id)).unwrap();
     assert_eq!(final_session.id, session_id);
 }
@@ -360,14 +371,26 @@ async fn test_work_tracker_atomicity_1000_concurrent() {
         TASKS as u64,
         "local + teacher must equal total"
     );
-    assert_eq!(snap.local_queries, (TASKS / 2) as u64, "exactly half must be local");
-    assert_eq!(snap.teacher_queries, (TASKS / 2) as u64, "exactly half must be teacher");
+    assert_eq!(
+        snap.local_queries,
+        (TASKS / 2) as u64,
+        "exactly half must be local"
+    );
+    assert_eq!(
+        snap.teacher_queries,
+        (TASKS / 2) as u64,
+        "exactly half must be teacher"
+    );
     assert_eq!(
         snap.total_latency_ms,
         TASKS as u64 * LATENCY,
         "total latency must be exact sum"
     );
-    assert_eq!(snap.avg_latency_ms(), LATENCY as f64, "avg latency must equal per-task latency");
+    assert_eq!(
+        snap.avg_latency_ms(),
+        LATENCY as f64,
+        "avg latency must equal per-task latency"
+    );
 }
 
 /// 500 concurrent tasks with varying latencies and flags — no updates lost.
@@ -384,7 +407,7 @@ async fn test_work_tracker_no_lost_updates_mixed() {
         let el = Arc::clone(&expected_latency);
         handles.push(tokio::spawn(async move {
             let latency = (i as u64 % 100) + 1; // 1..=100 ms
-            let used_local = i % 3 != 0;         // 2/3 local, 1/3 teacher
+            let used_local = i % 3 != 0; // 2/3 local, 1/3 teacher
             el.fetch_add(latency, Ordering::Relaxed);
             t.record_query(latency, used_local);
         }));
@@ -443,7 +466,10 @@ async fn test_multiple_trackers_independent() {
     }
 
     // Total across all nodes
-    let total: u64 = trackers.iter().map(|t| t.snapshot().queries_processed).sum();
+    let total: u64 = trackers
+        .iter()
+        .map(|t| t.snapshot().queries_processed)
+        .sum();
     assert_eq!(total, NODES as u64 * QUERIES_PER_NODE);
 }
 
@@ -475,10 +501,7 @@ async fn test_memory_stability_10k_session_lifecycle() {
 
     // Phase 2: Delete all
     for id in &all_ids {
-        assert!(
-            manager.delete(id),
-            "session {id} must exist when deleted"
-        );
+        assert!(manager.delete(id), "session {id} must exist when deleted");
     }
 
     assert_eq!(

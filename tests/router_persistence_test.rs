@@ -6,7 +6,7 @@
 // 3. Graceful degradation with bad data
 
 use anyhow::Result;
-use finch::models::{ThresholdRouter, QueryCategory};
+use finch::models::{QueryCategory, ThresholdRouter};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -59,12 +59,18 @@ fn test_router_statistics_corruption_detection() -> Result<()> {
     // Key assertion: Router should still try local for queries in categories NOT in corrupted stats
     // "What is Rust?" → Definition category (not in corrupted "Other" stats)
     let should_try = corrupted_router.should_try_local("What is Rust?");
-    assert!(should_try, "Router should try local for queries without category history");
+    assert!(
+        should_try,
+        "Router should try local for queries without category history"
+    );
 
     // But should forward for "Other" category which has 100% failure in corrupted stats
     // "New query pattern" → Other category (matches the corrupted "Other" stats)
     let should_forward = !corrupted_router.should_try_local("New query pattern");
-    assert!(should_forward, "Router should forward queries in failed categories");
+    assert!(
+        should_forward,
+        "Router should forward queries in failed categories"
+    );
 
     Ok(())
 }
@@ -146,10 +152,16 @@ fn test_router_learning_from_mixed_patterns() -> Result<()> {
     let should_try_debugging = router.should_try_local("Debug my code");
 
     // Definition queries should try local (high success)
-    assert!(should_try_definition, "High-success categories should try local");
+    assert!(
+        should_try_definition,
+        "High-success categories should try local"
+    );
 
     // Debugging queries should forward (low success)
-    assert!(!should_try_debugging, "Low-success categories should forward");
+    assert!(
+        !should_try_debugging,
+        "Low-success categories should forward"
+    );
 
     Ok(())
 }
@@ -170,7 +182,10 @@ fn test_router_min_samples_threshold() -> Result<()> {
     router.learn_local_attempt("What is Z?", false);
 
     let should_forward = !router.should_try_local("What is A?");
-    assert!(should_forward, "Should forward when samples >= min_samples and success rate low");
+    assert!(
+        should_forward,
+        "Should forward when samples >= min_samples and success rate low"
+    );
 
     Ok(())
 }

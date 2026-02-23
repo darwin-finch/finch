@@ -26,8 +26,7 @@ async fn live_parity_nonempty_response() {
     }
 
     for (name, provider) in providers {
-        let req = ProviderRequest::new(vec![Message::user("Say: ready")])
-            .with_max_tokens(16);
+        let req = ProviderRequest::new(vec![Message::user("Say: ready")]).with_max_tokens(16);
         let resp = provider
             .send_message(&req)
             .await

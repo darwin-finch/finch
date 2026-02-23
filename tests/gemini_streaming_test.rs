@@ -21,7 +21,10 @@ fn test_gemini_supports_tools() {
 
     // Verify it supports tools
     assert!(provider.supports_tools(), "Gemini should support tools");
-    assert!(provider.supports_streaming(), "Gemini should support streaming");
+    assert!(
+        provider.supports_streaming(),
+        "Gemini should support streaming"
+    );
 }
 
 /// Test that Gemini correctly identifies its name and model
@@ -136,28 +139,24 @@ fn test_gemini_tool_use_id_format() {
 fn test_provider_request_with_tools() -> Result<()> {
     use finch::tools::types::{ToolDefinition, ToolInputSchema};
 
-    let tools = vec![
-        ToolDefinition {
-            name: "Read".to_string(),
-            description: "Read a file".to_string(),
-            input_schema: ToolInputSchema {
-                schema_type: "object".to_string(),
-                properties: serde_json::json!({
-                    "file_path": {"type": "string"}
-                }),
-                required: vec!["file_path".to_string()],
-            },
+    let tools = vec![ToolDefinition {
+        name: "Read".to_string(),
+        description: "Read a file".to_string(),
+        input_schema: ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: serde_json::json!({
+                "file_path": {"type": "string"}
+            }),
+            required: vec!["file_path".to_string()],
         },
-    ];
+    }];
 
-    let request = ProviderRequest::new(vec![
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: "Read /tmp/test.txt".to_string(),
-            }],
-        },
-    ])
+    let request = ProviderRequest::new(vec![Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "Read /tmp/test.txt".to_string(),
+        }],
+    }])
     .with_tools(tools.clone())
     .with_stream(true);
 

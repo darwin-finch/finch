@@ -1,9 +1,9 @@
 // Integration tests for Phase 1: Conversation Logging
 
-use finch::logging::ConversationLogger;
-use tempfile::NamedTempFile;
 use anyhow::Result;
+use finch::logging::ConversationLogger;
 use std::fs;
+use tempfile::NamedTempFile;
 
 #[tokio::test]
 async fn test_conversation_logger_creation() -> Result<()> {
@@ -27,12 +27,9 @@ async fn test_log_single_interaction() -> Result<()> {
     let mut logger = ConversationLogger::new(log_path.clone())?;
 
     // Log an interaction
-    logger.log_interaction(
-        "What is 2+2?",
-        "4",
-        "local",
-        &vec!["Read".to_string()]
-    ).await?;
+    logger
+        .log_interaction("What is 2+2?", "4", "local", &vec!["Read".to_string()])
+        .await?;
 
     // Force flush
     drop(logger);
@@ -70,9 +67,20 @@ async fn test_log_multiple_interactions() -> Result<()> {
     let mut logger = ConversationLogger::new(log_path.clone())?;
 
     // Log multiple interactions
-    logger.log_interaction("Query 1", "Response 1", "local", &vec![]).await?;
-    logger.log_interaction("Query 2", "Response 2", "teacher", &vec!["Bash".to_string()]).await?;
-    logger.log_interaction("Query 3", "Response 3", "local", &vec![]).await?;
+    logger
+        .log_interaction("Query 1", "Response 1", "local", &vec![])
+        .await?;
+    logger
+        .log_interaction(
+            "Query 2",
+            "Response 2",
+            "teacher",
+            &vec!["Bash".to_string()],
+        )
+        .await?;
+    logger
+        .log_interaction("Query 3", "Response 3", "local", &vec![])
+        .await?;
 
     // Force flush
     drop(logger);
@@ -103,7 +111,9 @@ async fn test_log_with_feedback() -> Result<()> {
     let mut logger = ConversationLogger::new(log_path.clone())?;
 
     // Log interaction
-    logger.log_interaction("Test query", "Test response", "local", &vec![]).await?;
+    logger
+        .log_interaction("Test query", "Test response", "local", &vec![])
+        .await?;
 
     // Get last log ID (for adding feedback)
     // Note: This would normally be done by the REPL /feedback commands
@@ -115,7 +125,11 @@ async fn test_log_with_feedback() -> Result<()> {
     let entry: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap())?;
 
     assert!(entry.get("weight").is_some(), "Weight field should exist");
-    assert_eq!(entry["weight"].as_f64().unwrap(), 1.0, "Default weight should be 1.0");
+    assert_eq!(
+        entry["weight"].as_f64().unwrap(),
+        1.0,
+        "Default weight should be 1.0"
+    );
 
     // Feedback field is omitted if None (due to skip_serializing_if)
     // This is correct behavior - feedback is only serialized when present
@@ -131,7 +145,9 @@ async fn test_buffer_flushing() -> Result<()> {
     let mut logger = ConversationLogger::new(log_path.clone())?;
 
     // Log one interaction
-    logger.log_interaction("Query", "Response", "local", &vec![]).await?;
+    logger
+        .log_interaction("Query", "Response", "local", &vec![])
+        .await?;
 
     // File should be empty initially (buffered)
     // After enough writes or explicit flush, it should be written
@@ -155,12 +171,14 @@ async fn test_jsonl_format() -> Result<()> {
 
     // Log multiple interactions
     for i in 1..=5 {
-        logger.log_interaction(
-            &format!("Query {}", i),
-            &format!("Response {}", i),
-            if i % 2 == 0 { "teacher" } else { "local" },
-            &vec![]
-        ).await?;
+        logger
+            .log_interaction(
+                &format!("Query {}", i),
+                &format!("Response {}", i),
+                if i % 2 == 0 { "teacher" } else { "local" },
+                &vec![],
+            )
+            .await?;
     }
 
     drop(logger);
@@ -173,8 +191,8 @@ async fn test_jsonl_format() -> Result<()> {
 
     // Each line should be valid JSON
     for (i, line) in lines.iter().enumerate() {
-        let entry: serde_json::Value = serde_json::from_str(line)
-            .expect(&format!("Line {} should be valid JSON", i + 1));
+        let entry: serde_json::Value =
+            serde_json::from_str(line).expect(&format!("Line {} should be valid JSON", i + 1));
 
         // Verify structure
         assert!(entry.is_object());

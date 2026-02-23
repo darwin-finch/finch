@@ -1,11 +1,16 @@
 // Integration tests for Phase 1: LLM Tools and Registry
 
+use anyhow::Result;
 use finch::config::TeacherEntry;
 use finch::llms::LLMRegistry;
 use finch::tools::implementations::llm_tools::create_llm_tools;
-use anyhow::Result;
 
-fn create_teacher(provider: &str, api_key: &str, model: Option<&str>, name: Option<&str>) -> TeacherEntry {
+fn create_teacher(
+    provider: &str,
+    api_key: &str,
+    model: Option<&str>,
+    name: Option<&str>,
+) -> TeacherEntry {
     TeacherEntry {
         provider: provider.to_string(),
         api_key: api_key.to_string(),
@@ -18,7 +23,12 @@ fn create_teacher(provider: &str, api_key: &str, model: Option<&str>, name: Opti
 #[test]
 fn test_llm_registry_creation_single_teacher() -> Result<()> {
     // With only one teacher, registry should not be created
-    let teachers = vec![create_teacher("claude", "test-key", Some("claude-sonnet-4-20250514"), Some("Claude"))];
+    let teachers = vec![create_teacher(
+        "claude",
+        "test-key",
+        Some("claude-sonnet-4-20250514"),
+        Some("Claude"),
+    )];
 
     // Registry requires > 1 teacher
     // This would be checked in the REPL initialization
@@ -31,7 +41,12 @@ fn test_llm_registry_creation_single_teacher() -> Result<()> {
 fn test_llm_registry_creation_multiple_teachers() -> Result<()> {
     // With multiple teachers, registry should be created
     let teachers = vec![
-        create_teacher("claude", "test-key-1", Some("claude-sonnet-4-20250514"), Some("Claude Sonnet")),
+        create_teacher(
+            "claude",
+            "test-key-1",
+            Some("claude-sonnet-4-20250514"),
+            Some("Claude Sonnet"),
+        ),
         create_teacher("openai", "test-key-2", Some("gpt-4"), Some("GPT-4")),
     ];
 
@@ -43,7 +58,10 @@ fn test_llm_registry_creation_multiple_teachers() -> Result<()> {
 
     // Primary should be first teacher (Claude)
     // Tools should be remaining teachers (GPT-4)
-    assert!(tool_names.len() >= 1, "Should have tools for non-primary teachers");
+    assert!(
+        tool_names.len() >= 1,
+        "Should have tools for non-primary teachers"
+    );
 
     Ok(())
 }
@@ -51,7 +69,12 @@ fn test_llm_registry_creation_multiple_teachers() -> Result<()> {
 #[test]
 fn test_llm_tool_names() -> Result<()> {
     let teachers = vec![
-        create_teacher("claude", "key1", Some("claude-sonnet-4-20250514"), Some("Claude Sonnet")),
+        create_teacher(
+            "claude",
+            "key1",
+            Some("claude-sonnet-4-20250514"),
+            Some("Claude Sonnet"),
+        ),
         create_teacher("openai", "key2", Some("gpt-4"), Some("GPT-4")),
         create_teacher("gemini", "key3", Some("gemini-pro"), Some("Gemini")),
     ];
@@ -60,7 +83,11 @@ fn test_llm_tool_names() -> Result<()> {
     let tool_names = registry.tool_names();
 
     // Should have 2 tools (GPT-4 and Gemini, excluding primary Claude)
-    assert_eq!(tool_names.len(), 2, "Should have 2 non-primary teachers as tools");
+    assert_eq!(
+        tool_names.len(),
+        2,
+        "Should have 2 non-primary teachers as tools"
+    );
 
     Ok(())
 }
@@ -68,7 +95,12 @@ fn test_llm_tool_names() -> Result<()> {
 #[test]
 fn test_create_llm_tools() -> Result<()> {
     let teachers = vec![
-        create_teacher("claude", "key1", Some("claude-sonnet-4-20250514"), Some("Claude")),
+        create_teacher(
+            "claude",
+            "key1",
+            Some("claude-sonnet-4-20250514"),
+            Some("Claude"),
+        ),
         create_teacher("openai", "key2", Some("gpt-4"), Some("GPT-4")),
     ];
 
@@ -81,10 +113,16 @@ fn test_create_llm_tools() -> Result<()> {
     // Each tool should have a name
     for tool in tools {
         assert!(!tool.name().is_empty(), "Tool should have a name");
-        assert!(!tool.description().is_empty(), "Tool should have a description");
+        assert!(
+            !tool.description().is_empty(),
+            "Tool should have a description"
+        );
 
         // Tool name should be lowercased provider name
-        assert!(tool.name().starts_with("use_"), "Tool name should start with use_");
+        assert!(
+            tool.name().starts_with("use_"),
+            "Tool name should start with use_"
+        );
     }
 
     Ok(())
@@ -93,7 +131,12 @@ fn test_create_llm_tools() -> Result<()> {
 #[test]
 fn test_llm_tool_input_schema() -> Result<()> {
     let teachers = vec![
-        create_teacher("claude", "key", Some("claude-sonnet-4-20250514"), Some("Claude")),
+        create_teacher(
+            "claude",
+            "key",
+            Some("claude-sonnet-4-20250514"),
+            Some("Claude"),
+        ),
         create_teacher("openai", "key", Some("gpt-4"), Some("GPT-4")),
     ];
 
@@ -108,12 +151,24 @@ fn test_llm_tool_input_schema() -> Result<()> {
 
         // Should have query and reason parameters
         let properties = schema.properties;
-        assert!(properties.get("query").is_some(), "Should have query parameter");
-        assert!(properties.get("reason").is_some(), "Should have reason parameter");
+        assert!(
+            properties.get("query").is_some(),
+            "Should have query parameter"
+        );
+        assert!(
+            properties.get("reason").is_some(),
+            "Should have reason parameter"
+        );
 
         // Both should be required
-        assert!(schema.required.contains(&"query".to_string()), "query should be required");
-        assert!(schema.required.contains(&"reason".to_string()), "reason should be required");
+        assert!(
+            schema.required.contains(&"query".to_string()),
+            "query should be required"
+        );
+        assert!(
+            schema.required.contains(&"reason".to_string()),
+            "reason should be required"
+        );
     }
 
     Ok(())
@@ -122,8 +177,18 @@ fn test_llm_tool_input_schema() -> Result<()> {
 #[test]
 fn test_multiple_models_same_provider() -> Result<()> {
     let teachers = vec![
-        create_teacher("claude", "key", Some("claude-sonnet-4-20250514"), Some("Claude Sonnet")),
-        create_teacher("claude", "key", Some("claude-opus-4-20250514"), Some("Claude Opus")),
+        create_teacher(
+            "claude",
+            "key",
+            Some("claude-sonnet-4-20250514"),
+            Some("Claude Sonnet"),
+        ),
+        create_teacher(
+            "claude",
+            "key",
+            Some("claude-opus-4-20250514"),
+            Some("Claude Opus"),
+        ),
     ];
 
     let registry = LLMRegistry::from_teachers(&teachers)?;

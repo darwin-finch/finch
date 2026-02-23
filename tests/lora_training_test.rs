@@ -26,8 +26,7 @@ fn test_weighted_example_serialization() {
     assert!(json.contains("\"query\":\"What is 2+2?\""));
 
     // Test deserialization
-    let deserialized: WeightedExample =
-        serde_json::from_str(&json).expect("Failed to deserialize");
+    let deserialized: WeightedExample = serde_json::from_str(&json).expect("Failed to deserialize");
     assert_eq!(deserialized.weight, 10.0);
     assert_eq!(deserialized.query, "What is 2+2?");
 }
@@ -105,7 +104,9 @@ fn test_jsonl_queue_writing() {
         .expect("Failed to add");
 
     // Write to queue
-    let count = coordinator.write_training_queue().expect("Failed to write queue");
+    let count = coordinator
+        .write_training_queue()
+        .expect("Failed to write queue");
 
     assert_eq!(count, 3);
 
@@ -133,7 +134,10 @@ fn test_jsonl_queue_writing() {
         assert_eq!(examples[1].weight, 3.0); // Improvement
         assert_eq!(examples[2].weight, 1.0); // Normal
 
-        println!("✅ JSONL queue written successfully to: {}", actual_queue_path.display());
+        println!(
+            "✅ JSONL queue written successfully to: {}",
+            actual_queue_path.display()
+        );
         println!("✅ Verified {} examples", examples.len());
     }
 }

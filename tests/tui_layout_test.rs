@@ -5,9 +5,7 @@
 // - Input at chunks[1] (y=1, below separator)
 // - Status at chunks[2] (y=2, below input)
 
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 #[test]
 fn test_separator_position_above_input() {
@@ -40,21 +38,12 @@ fn test_separator_position_above_input() {
     );
 
     // Verify input is below separator (y=1)
-    assert_eq!(
-        chunks[1].y, 1,
-        "Input should be at y=1 (below separator)"
-    );
+    assert_eq!(chunks[1].y, 1, "Input should be at y=1 (below separator)");
     assert_eq!(chunks[1].height, 1, "Input should have height of 1 line");
 
     // Verify status is below input (y=2)
-    assert_eq!(
-        chunks[2].y, 2,
-        "Status should be at y=2 (below input)"
-    );
-    assert_eq!(
-        chunks[2].height, 4,
-        "Status should have height of 4 lines"
-    );
+    assert_eq!(chunks[2].y, 2, "Status should be at y=2 (below input)");
+    assert_eq!(chunks[2].height, 4, "Status should have height of 4 lines");
 
     // Verify total height is 6 lines
     let total_height = chunks[0].height + chunks[1].height + chunks[2].height;
@@ -119,21 +108,12 @@ fn test_separator_is_first_element() {
         .split(rect);
 
     // Verify separator is the first element in the viewport
-    assert_eq!(
-        chunks[0].y, 0,
-        "Separator must be first element (y=0)"
-    );
+    assert_eq!(chunks[0].y, 0, "Separator must be first element (y=0)");
 
     // Verify input is NOT first (it should be second)
     assert_ne!(chunks[1].y, 0, "Input should NOT be at y=0");
 
     // Verify the order: separator < input < status
-    assert!(
-        chunks[0].y < chunks[1].y,
-        "Separator should be above input"
-    );
-    assert!(
-        chunks[1].y < chunks[2].y,
-        "Input should be above status"
-    );
+    assert!(chunks[0].y < chunks[1].y, "Separator should be above input");
+    assert!(chunks[1].y < chunks[2].y, "Input should be above status");
 }

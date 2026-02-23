@@ -1,7 +1,7 @@
 // Integration tests for Phase 3: Service Discovery (mDNS/Bonjour)
 
-use finch::service::{ServiceDiscovery, ServiceConfig, ServiceDiscoveryClient};
 use anyhow::Result;
+use finch::service::{ServiceConfig, ServiceDiscovery, ServiceDiscoveryClient};
 use std::time::Duration;
 
 #[test]
@@ -91,7 +91,7 @@ fn test_service_capabilities_list() -> Result<()> {
     let configs = vec![
         vec!["code", "general", "tool-use"],
         vec!["code"],
-        vec![],  // Empty capabilities
+        vec![], // Empty capabilities
     ];
 
     for caps in configs {

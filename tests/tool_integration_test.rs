@@ -86,7 +86,8 @@ Done!"#;
 
 #[test]
 fn test_tool_call_parsing_compact() {
-    let output = "<tool_use><name>bash</name><parameters>{\"command\":\"ls -la\"}</parameters></tool_use>";
+    let output =
+        "<tool_use><name>bash</name><parameters>{\"command\":\"ls -la\"}</parameters></tool_use>";
 
     let tool_uses = ToolCallParser::parse(output).expect("Failed to parse");
 

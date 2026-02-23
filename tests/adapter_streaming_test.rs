@@ -7,9 +7,7 @@
 // 4. Template artifacts are stripped (ChatML, etc.)
 
 use anyhow::Result;
-use finch::models::adapters::{
-    LocalModelAdapter, QwenAdapter, DeepSeekAdapter, LlamaAdapter,
-};
+use finch::models::adapters::{DeepSeekAdapter, LlamaAdapter, LocalModelAdapter, QwenAdapter};
 
 /// Test that QwenAdapter removes ChatML special tokens
 #[test]
@@ -79,7 +77,8 @@ fn test_deepseek_adapter_handles_mixed_tokens() {
     let adapter = DeepSeekAdapter;
 
     // Output with both ChatML and DeepSeek tokens
-    let raw = "<|im_start|>assistant\n<think>Reasoning...</think>Answer<|im_end|><｜end▁of▁sentence｜>";
+    let raw =
+        "<|im_start|>assistant\n<think>Reasoning...</think>Answer<|im_end|><｜end▁of▁sentence｜>";
     let cleaned = adapter.clean_output(raw);
 
     // Should remove all special tokens
@@ -219,9 +218,15 @@ fn test_adapter_eos_token_ids() {
     // Different models should have different EOS tokens
     // (This is a sanity check - might not always be true)
     // Just verify they're not all the same default value
-    let tokens = vec![qwen.eos_token_id(), deepseek.eos_token_id(), llama.eos_token_id()];
-    assert!(tokens.iter().any(|&t| t != tokens[0]),
-            "EOS tokens should differ between model families");
+    let tokens = vec![
+        qwen.eos_token_id(),
+        deepseek.eos_token_id(),
+        llama.eos_token_id(),
+    ];
+    assert!(
+        tokens.iter().any(|&t| t != tokens[0]),
+        "EOS tokens should differ between model families"
+    );
 }
 
 /// Test adapter family names are correct

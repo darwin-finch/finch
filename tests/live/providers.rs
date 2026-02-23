@@ -25,8 +25,7 @@ async fn live_claude_minimal_response() {
         return;
     }
     let provider = make_provider("claude").expect("claude provider");
-    let req = ProviderRequest::new(vec![Message::user("Say: ok")])
-        .with_max_tokens(16);
+    let req = ProviderRequest::new(vec![Message::user("Say: ok")]).with_max_tokens(16);
     let resp = provider
         .send_message(&req)
         .await
@@ -50,8 +49,7 @@ async fn live_openai_minimal_response() {
         return;
     }
     let provider = make_provider("openai").expect("openai provider");
-    let req = ProviderRequest::new(vec![Message::user("Say: ok")])
-        .with_max_tokens(16);
+    let req = ProviderRequest::new(vec![Message::user("Say: ok")]).with_max_tokens(16);
     let resp = provider
         .send_message(&req)
         .await
@@ -75,8 +73,7 @@ async fn live_grok_minimal_response() {
         return;
     }
     let provider = make_provider("grok").expect("grok provider");
-    let req = ProviderRequest::new(vec![Message::user("Say: ok")])
-        .with_max_tokens(16);
+    let req = ProviderRequest::new(vec![Message::user("Say: ok")]).with_max_tokens(16);
     let resp = provider
         .send_message(&req)
         .await
@@ -100,8 +97,7 @@ async fn live_gemini_minimal_response() {
         return;
     }
     let provider = make_provider("gemini").expect("gemini provider");
-    let req = ProviderRequest::new(vec![Message::user("Say: ok")])
-        .with_max_tokens(16);
+    let req = ProviderRequest::new(vec![Message::user("Say: ok")]).with_max_tokens(16);
     let resp = provider
         .send_message(&req)
         .await
@@ -125,8 +121,7 @@ async fn live_mistral_minimal_response() {
         return;
     }
     let provider = make_provider("mistral").expect("mistral provider");
-    let req = ProviderRequest::new(vec![Message::user("Say: ok")])
-        .with_max_tokens(16);
+    let req = ProviderRequest::new(vec![Message::user("Say: ok")]).with_max_tokens(16);
     let resp = provider
         .send_message(&req)
         .await
@@ -150,8 +145,7 @@ async fn live_groq_minimal_response() {
         return;
     }
     let provider = make_provider("groq").expect("groq provider");
-    let req = ProviderRequest::new(vec![Message::user("Say: ok")])
-        .with_max_tokens(16);
+    let req = ProviderRequest::new(vec![Message::user("Say: ok")]).with_max_tokens(16);
     let resp = provider
         .send_message(&req)
         .await

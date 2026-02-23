@@ -40,7 +40,10 @@ async fn test_mcp_client_with_invalid_server() {
     let client = McpClient::from_config(&config).await;
 
     // Should succeed but with no connected servers
-    assert!(client.is_ok(), "Client creation should succeed even with invalid server");
+    assert!(
+        client.is_ok(),
+        "Client creation should succeed even with invalid server"
+    );
 
     let client = client.unwrap();
     let servers = client.list_servers().await;
@@ -75,7 +78,10 @@ async fn test_mcp_client_with_disabled_server() {
     assert_eq!(servers.len(), 0, "Disabled server should not be started");
 
     // Check is_connected returns false
-    assert!(!client.is_connected("disabled_server").await, "Should not be connected");
+    assert!(
+        !client.is_connected("disabled_server").await,
+        "Should not be connected"
+    );
 }
 
 #[tokio::test]
@@ -186,11 +192,15 @@ async fn test_mcp_execute_tool_invalid_name() {
     let client = McpClient::from_config(&HashMap::new()).await.unwrap();
 
     // Tool name without "mcp_" prefix
-    let result = client.execute_tool("invalid_tool", serde_json::json!({})).await;
+    let result = client
+        .execute_tool("invalid_tool", serde_json::json!({}))
+        .await;
     assert!(result.is_err(), "Should fail with invalid tool name");
 
     // Tool name with only one underscore
-    let result = client.execute_tool("mcp_server", serde_json::json!({})).await;
+    let result = client
+        .execute_tool("mcp_server", serde_json::json!({}))
+        .await;
     assert!(result.is_err(), "Should fail with malformed tool name");
 }
 
@@ -199,7 +209,9 @@ async fn test_mcp_execute_tool_nonexistent_server() {
     // Test executing a tool from a server that doesn't exist
     let client = McpClient::from_config(&HashMap::new()).await.unwrap();
 
-    let result = client.execute_tool("mcp_nonexistent_tool", serde_json::json!({})).await;
+    let result = client
+        .execute_tool("mcp_nonexistent_tool", serde_json::json!({}))
+        .await;
     assert!(result.is_err(), "Should fail when server doesn't exist");
 
     let error_msg = result.unwrap_err().to_string();
@@ -215,7 +227,10 @@ async fn test_mcp_refresh_tools_with_no_servers() {
     let client = McpClient::from_config(&HashMap::new()).await.unwrap();
 
     let result = client.refresh_all_tools().await;
-    assert!(result.is_ok(), "Refresh should succeed even with no servers");
+    assert!(
+        result.is_ok(),
+        "Refresh should succeed even with no servers"
+    );
 }
 
 #[tokio::test]
@@ -237,7 +252,10 @@ async fn test_mcp_config_validation() {
     );
 
     let client = McpClient::from_config(&config).await;
-    assert!(client.is_ok(), "Client should handle invalid config gracefully");
+    assert!(
+        client.is_ok(),
+        "Client should handle invalid config gracefully"
+    );
 
     let client = client.unwrap();
     let servers = client.list_servers().await;
@@ -310,7 +328,10 @@ fn test_mcp_config_serialization() {
     assert_eq!(deserialized.command, config.command);
     assert_eq!(deserialized.args, config.args);
     assert_eq!(deserialized.enabled, config.enabled);
-    assert_eq!(deserialized.env.get("API_KEY"), Some(&"test123".to_string()));
+    assert_eq!(
+        deserialized.env.get("API_KEY"),
+        Some(&"test123".to_string())
+    );
 }
 
 #[test]

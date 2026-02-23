@@ -1,7 +1,9 @@
 // Integration tests for Phase 4: Hierarchical Memory System
 
-use finch::memory::{MemorySystem, MemoryConfig, EmbeddingEngine, TfIdfEmbedding, MemTree, cosine_similarity};
 use anyhow::Result;
+use finch::memory::{
+    cosine_similarity, EmbeddingEngine, MemTree, MemoryConfig, MemorySystem, TfIdfEmbedding,
+};
 use tempfile::NamedTempFile;
 
 #[tokio::test]
@@ -34,33 +36,41 @@ async fn test_insert_and_query() -> Result<()> {
     let memory = MemorySystem::new(config)?;
 
     // Insert conversations
-    memory.insert_conversation(
-        "user",
-        "How do I use Rust lifetimes?",
-        Some("local"),
-        Some("test-session"),
-    ).await?;
+    memory
+        .insert_conversation(
+            "user",
+            "How do I use Rust lifetimes?",
+            Some("local"),
+            Some("test-session"),
+        )
+        .await?;
 
-    memory.insert_conversation(
-        "assistant",
-        "Lifetimes in Rust ensure references are valid...",
-        Some("local"),
-        Some("test-session"),
-    ).await?;
+    memory
+        .insert_conversation(
+            "assistant",
+            "Lifetimes in Rust ensure references are valid...",
+            Some("local"),
+            Some("test-session"),
+        )
+        .await?;
 
-    memory.insert_conversation(
-        "user",
-        "What is Python asyncio?",
-        Some("local"),
-        Some("test-session"),
-    ).await?;
+    memory
+        .insert_conversation(
+            "user",
+            "What is Python asyncio?",
+            Some("local"),
+            Some("test-session"),
+        )
+        .await?;
 
     // Query for Rust-related content
     let results = memory.query("Rust programming", Some(3)).await?;
 
     assert!(!results.is_empty());
     // Should find Rust-related conversations
-    assert!(results.iter().any(|r| r.contains("Rust") || r.contains("lifetimes")));
+    assert!(results
+        .iter()
+        .any(|r| r.contains("Rust") || r.contains("lifetimes")));
 
     Ok(())
 }
@@ -77,17 +87,14 @@ async fn test_memory_stats() -> Result<()> {
 
     // Insert multiple conversations
     for i in 1..=10 {
-        memory.insert_conversation(
-            "user",
-            &format!("Question {}", i),
-            Some("local"),
-            None,
-        ).await?;
+        memory
+            .insert_conversation("user", &format!("Question {}", i), Some("local"), None)
+            .await?;
     }
 
     let stats = memory.stats().await?;
     assert_eq!(stats.conversation_count, 10);
-    assert_eq!(stats.tree_node_count, 10);  // One node per conversation
+    assert_eq!(stats.tree_node_count, 10); // One node per conversation
 
     Ok(())
 }
@@ -104,12 +111,9 @@ async fn test_get_recent_conversations() -> Result<()> {
 
     // Insert conversations
     for i in 1..=5 {
-        memory.insert_conversation(
-            "user",
-            &format!("Message {}", i),
-            Some("local"),
-            None,
-        ).await?;
+        memory
+            .insert_conversation("user", &format!("Message {}", i), Some("local"), None)
+            .await?;
     }
 
     // Get recent 3
@@ -186,12 +190,9 @@ async fn test_memory_persistence() -> Result<()> {
         };
 
         let memory = MemorySystem::new(config)?;
-        memory.insert_conversation(
-            "user",
-            "Test persistence",
-            Some("local"),
-            None,
-        ).await?;
+        memory
+            .insert_conversation("user", "Test persistence", Some("local"), None)
+            .await?;
     }
 
     // Reopen and verify data persists
@@ -216,7 +217,7 @@ async fn test_memory_disabled() -> Result<()> {
     let temp = NamedTempFile::new()?;
     let config = MemoryConfig {
         db_path: temp.path().to_path_buf(),
-        enabled: false,  // Disabled
+        enabled: false, // Disabled
         ..Default::default()
     };
 

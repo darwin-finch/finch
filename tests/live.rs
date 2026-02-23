@@ -13,12 +13,12 @@
 //   tests/live/parity.rs     <- cross-provider behavioral parity tests
 //   tests/live/impcpd.rs     <- IMPCPD JSON contract tests
 
-#[path = "live/providers.rs"]
-pub mod providers;
-#[path = "live/parity.rs"]
-pub mod parity;
 #[path = "live/impcpd.rs"]
 pub mod impcpd;
+#[path = "live/parity.rs"]
+pub mod parity;
+#[path = "live/providers.rs"]
+pub mod providers;
 
 use finch::config::TeacherEntry;
 use finch::providers::LlmProvider;

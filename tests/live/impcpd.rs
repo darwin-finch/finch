@@ -181,8 +181,7 @@ async fn live_impcpd_critique_parity_all_providers() {
             "{name} critique did not start with '[' (JSON contract broken)\nGot: {preview:?}"
         );
 
-        serde_json::from_str::<serde_json::Value>(trimmed).unwrap_or_else(|e| {
-            panic!("{name} critique is not valid JSON: {e}\nGot: {trimmed:?}")
-        });
+        serde_json::from_str::<serde_json::Value>(trimmed)
+            .unwrap_or_else(|e| panic!("{name} critique is not valid JSON: {e}\nGot: {trimmed:?}"));
     }
 }

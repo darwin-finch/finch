@@ -80,12 +80,28 @@ fn test_tool_display_uses_correct_unicode() {
     let result = format_tool_result(&label, "hi\n", false);
 
     // Must use ⏺ (U+23FA) as bullet, NOT ● (U+25CF)
-    assert!(result.contains('⏺'), "Expected ⏺ (U+23FA), got: {:?}", result);
-    assert!(!result.contains('●'), "Found old ● (U+25CF) — wrong bullet char in: {:?}", result);
+    assert!(
+        result.contains('⏺'),
+        "Expected ⏺ (U+23FA), got: {:?}",
+        result
+    );
+    assert!(
+        !result.contains('●'),
+        "Found old ● (U+25CF) — wrong bullet char in: {:?}",
+        result
+    );
 
     // Must use ⎿ (U+23BF) as output prefix, NOT └ (U+2514)
-    assert!(result.contains('⎿'), "Expected ⎿ (U+23BF), got: {:?}", result);
-    assert!(!result.contains('└'), "Found old └ (U+2514) — wrong corner char in: {:?}", result);
+    assert!(
+        result.contains('⎿'),
+        "Expected ⎿ (U+23BF), got: {:?}",
+        result
+    );
+    assert!(
+        !result.contains('└'),
+        "Found old └ (U+2514) — wrong corner char in: {:?}",
+        result
+    );
 }
 
 /// E2E: binary exits cleanly without panicking when invoked with --version
@@ -98,6 +114,14 @@ fn test_binary_exits_cleanly() {
 
     // Should not crash or produce panic output
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("panicked"), "unexpected panic in stderr: {}", stderr);
-    assert!(!stderr.contains("RUST_BACKTRACE"), "unexpected backtrace in stderr: {}", stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "unexpected panic in stderr: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("RUST_BACKTRACE"),
+        "unexpected backtrace in stderr: {}",
+        stderr
+    );
 }
