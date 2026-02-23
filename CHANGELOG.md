@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`finch license` command**: activate, view, and remove a commercial license key.
+  - `finch license status` — show current license (Noncommercial or Commercial)
+  - `finch license activate --key <FINCH-...>` — activate a purchased key (offline Ed25519 validation)
+  - `finch license remove` — revert to noncommercial license
+  - REPL slash commands: `/license`, `/license status`, `/license activate <key>`, `/license remove`
+- **Startup license notice**: non-commercial users see a weekly reminder with a link to
+  `https://polar.sh/darwin-finch`. Suppressed for 7 days after each display; not shown
+  for commercial licensees.
+
+### Changed
+- **License changed from MIT/Apache-2.0 to PolyForm Noncommercial 1.0.0** (source-available).
+  Personal, educational, and research use remain free. Commercial use requires a $10/yr key
+  from `https://polar.sh/darwin-finch`. `Cargo.toml` license field updated to
+  `LicenseRef-PolyForm-Noncommercial-1.0`.
+
 ### Fixed
 - **`/provider <name>` switching now works in TUI mode.** Previously, the command updated
   `teacher_session` in `repl.rs` but `event_loop.rs` called `claude_gen` directly and never

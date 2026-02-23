@@ -103,6 +103,11 @@ enum Command {
         #[command(subcommand)]
         network_command: NetworkCommand,
     },
+    /// Manage Finch commercial license key
+    License {
+        #[command(subcommand)]
+        license_command: Option<LicenseCommand>,
+    },
     /// Run as an autonomous agent, working through a task backlog
     Agent {
         /// Persona name (builtin or ~/.finch/personas/<name>.toml) or path to .toml
@@ -140,6 +145,20 @@ enum NetworkCommand {
 enum TrainCommand {
     /// Install Python dependencies for LoRA training
     Setup,
+}
+
+#[derive(Parser, Debug)]
+enum LicenseCommand {
+    /// Show license status (default when no subcommand is given)
+    Status,
+    /// Activate a commercial license key
+    Activate {
+        /// License key (FINCH-...)
+        #[arg(long)]
+        key: String,
+    },
+    /// Remove the active commercial license key
+    Remove,
 }
 
 /// Build a teacher list from well-known environment variables and config files.
@@ -249,6 +268,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Network { network_command }) => {
             return run_network_command(network_command).await;
+        }
+        Some(Command::License { license_command }) => {
+            return run_license_command(license_command).await;
         }
         Some(Command::Agent { persona, tasks, reflect_every, once }) => {
             return run_agent(persona, tasks, reflect_every, once).await;
@@ -1483,6 +1505,76 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     println!("  Press Ctrl+C to stop.\n");
 
     run_daemon(bind_address).await
+}
+
+/// Handle `finch license` subcommands
+async fn run_license_command(cmd: Option<LicenseCommand>) -> Result<()> {
+    use finch::config::{LicenseConfig, LicenseType};
+    use finch::license::validate_key;
+
+    let mut config = load_config().unwrap_or_else(|_| finch::config::Config::new(vec![]));
+
+    match cmd {
+        None | Some(LicenseCommand::Status) => {
+            match &config.license.license_type {
+                LicenseType::Commercial => {
+                    println!("License: Commercial ✓");
+                    if let Some(name) = &config.license.licensee_name {
+                        if let Some(expires) = &config.license.expires_at {
+                            println!("  Licensee:  {}", name);
+                            println!("  Expires:   {}", expires);
+                        } else {
+                            println!("  Licensee:  {}", name);
+                        }
+                    }
+                    println!("  Renew at:  https://polar.sh/darwin-finch");
+                }
+                LicenseType::Noncommercial => {
+                    println!("License: Noncommercial");
+                    println!("  Free for personal, educational, and research use.");
+                    println!("  Using Finch commercially? $10/yr → https://polar.sh/darwin-finch");
+                    println!("  Activate: finch license activate --key <key>");
+                }
+            }
+        }
+
+        Some(LicenseCommand::Activate { key }) => {
+            match validate_key(&key) {
+                Ok(parsed) => {
+                    config.license = LicenseConfig {
+                        key: Some(key),
+                        license_type: LicenseType::Commercial,
+                        verified_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+                        expires_at: Some(parsed.expires_at.format("%Y-%m-%d").to_string()),
+                        licensee_name: Some(parsed.name.clone()),
+                        notice_suppress_until: None,
+                    };
+                    if let Err(e) = config.save() {
+                        eprintln!("⚠️  License activated but could not save config: {}", e);
+                    } else {
+                        println!("✓ License activated");
+                        println!("  Licensee:  {} ({})", parsed.name, parsed.email);
+                        println!("  Expires:   {}", parsed.expires_at.format("%Y-%m-%d"));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("✗ License activation failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Some(LicenseCommand::Remove) => {
+            config.license = LicenseConfig::default();
+            if let Err(e) = config.save() {
+                eprintln!("⚠️  Could not save config: {}", e);
+            } else {
+                println!("✓ License removed. Now using noncommercial license.");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Run the autonomous agent loop

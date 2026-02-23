@@ -560,7 +560,43 @@ automatically rewritten to `[[providers]]` format on next save.
 **Key Files:**
 - `src/config/mod.rs` - Config loading, validation, migration
 - `src/config/provider.rs` - `ProviderEntry` tagged enum, conversion helpers
-- `src/config/settings.rs` - `TeacherEntry` (kept for internal/legacy use)
+- `src/config/settings.rs` - `TeacherEntry` (kept for internal/legacy use), `LicenseConfig`, `LicenseType`
+
+#### 10. **License System** (`src/license/`)
+
+**Purpose:** Offline Ed25519 commercial license key validation.
+
+**Key Format:** `FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)>`
+
+**Payload JSON:**
+```json
+{"sub":"user@example.com","name":"Jane Doe","tier":"commercial","iss":"2026-01-15","exp":"2027-01-15"}
+```
+
+**Validation flow (offline):**
+1. Strip `FINCH-` prefix
+2. Split on `.` → payload_b64, sig_b64
+3. Decode base64url (error if malformed — never panic)
+4. Verify Ed25519 signature using embedded public key
+5. Parse JSON payload; check `exp` date against today
+6. Return `ParsedLicense` with name, email, expiry
+
+**Config:** `~/.finch/config.toml` `[license]` section — written by `finch license activate`.
+
+**Enforcement:** Honor system — no blocking; startup notice shown weekly to Noncommercial users.
+
+**CLI commands:**
+- `finch license status` — show current license type
+- `finch license activate --key <FINCH-...>` — validate key and save to config
+- `finch license remove` — revert to Noncommercial
+
+**REPL commands:** `/license`, `/license status`, `/license activate <key>`, `/license remove`
+
+**Phase 2 (deferred):** GitHub Sponsors verification (`finch license --github`) requires OAuth App registration (client_id/secret) — not yet implemented.
+
+**Key Files:**
+- `src/license/mod.rs` — `validate_key()`, `validate_key_with_vk()`, `ParsedLicense`; 8 unit tests
+- `src/config/settings.rs` — `LicenseConfig`, `LicenseType`
 
 ### Technology Stack
 

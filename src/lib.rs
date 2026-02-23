@@ -29,3 +29,4 @@ pub mod service; // Service discovery (Phase 3)
 pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2)
 pub mod planning; // IMPCPD iterative plan refinement loop
+pub mod license;  // Offline Ed25519 commercial license key validation

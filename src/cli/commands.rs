@@ -50,6 +50,10 @@ pub enum Command {
     ModelShow,                // /provider  (show current active provider)
     // Service discovery (Phase 3)
     Discover,                 // Discover Finch daemons on local network
+    // License management
+    LicenseStatus,            // /license or /license status
+    LicenseActivate(String),  // /license activate <key>
+    LicenseRemove,            // /license remove
 }
 
 impl Command {
@@ -78,7 +82,18 @@ impl Command {
             "/provider list" | "/model list" | "/teacher list" => return Some(Command::ModelList),
             // Service discovery
             "/discover" => return Some(Command::Discover),
+            // License management
+            "/license" | "/license status" => return Some(Command::LicenseStatus),
+            "/license remove" => return Some(Command::LicenseRemove),
             _ => {}
+        }
+
+        // Handle /license activate <key>
+        if let Some(rest) = trimmed.strip_prefix("/license activate ") {
+            let key = rest.trim();
+            if !key.is_empty() {
+                return Some(Command::LicenseActivate(key.to_string()));
+            }
         }
 
         // Handle /persona select <name>
@@ -299,6 +314,10 @@ pub fn handle_command(
         // Service discovery is handled directly in REPL (Phase 3)
         Command::Discover => {
             Ok(CommandOutput::Status("Discover command should be handled in REPL.".to_string()))
+        }
+        // License commands are handled directly in REPL
+        Command::LicenseStatus | Command::LicenseActivate(_) | Command::LicenseRemove => {
+            Ok(CommandOutput::Status("License commands should be handled in REPL.".to_string()))
         }
     }
 }

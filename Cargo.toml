@@ -4,7 +4,7 @@ version = "0.5.2"
 edition = "2021"
 authors = ["Darwin Finch Contributors"]
 description = "AI that evolves with your code - distributed assistant with hierarchical memory"
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-PolyForm-Noncommercial-1.0"
 repository = "https://github.com/darwin-finch/finch"
 
 [dependencies]
@@ -64,8 +64,11 @@ thiserror = "1.0"
 # Clipboard access (for image paste support)
 arboard = { version = "3.6", features = ["image-data"] }
 
-# Base64 encoding (for image data)
+# Base64 encoding (for image data and license key encoding)
 base64 = "0.22"
+
+# Ed25519 signature verification for offline license key validation
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
 
 # PNG encoding (for clipboard image data → PNG bytes)
 png = "0.17"

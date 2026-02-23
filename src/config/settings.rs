@@ -100,6 +100,9 @@ pub struct Config {
 
     /// Memory system configuration (Phase 4: Hierarchical Memory)
     pub memory: crate::memory::MemoryConfig,
+
+    /// License configuration (Noncommercial by default; Commercial with a valid key)
+    pub license: LicenseConfig,
 }
 
 /// Server configuration for daemon mode
@@ -174,6 +177,42 @@ impl Default for ClientConfig {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// License configuration
+// ---------------------------------------------------------------------------
+
+/// Whether this installation has a commercial license key
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LicenseType {
+    #[default]
+    Noncommercial,
+    Commercial,
+}
+
+/// License state persisted in ~/.finch/config.toml `[license]`
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LicenseConfig {
+    /// Raw commercial license key (FINCH-…)
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Derived license type — set after successful key validation
+    #[serde(default)]
+    pub license_type: LicenseType,
+    /// ISO 8601 date when key was last validated
+    #[serde(default)]
+    pub verified_at: Option<String>,
+    /// ISO 8601 expiry date from key payload
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Name from key payload (display only)
+    #[serde(default)]
+    pub licensee_name: Option<String>,
+    /// Suppress startup notice until this ISO 8601 date
+    #[serde(default)]
+    pub notice_suppress_until: Option<String>,
+}
 
 /// A single teacher entry with provider and settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +575,7 @@ impl Config {
             features,
             mcp_servers: HashMap::new(),
             memory: crate::memory::MemoryConfig::default(),
+            license: LicenseConfig::default(),
         }
     }
 
@@ -600,6 +640,7 @@ impl Config {
             providers,
             colors: Some(self.colors.clone()),
             features: Some(self.features.clone()),
+            license: self.license.clone(),
         };
 
         let toml_string = toml::to_string_pretty(&toml_config)?;
@@ -627,6 +668,8 @@ struct TomlConfig {
     colors: Option<ColorScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     features: Option<FeaturesConfig>,
+    #[serde(default)]
+    license: LicenseConfig,
 }
 
 #[cfg(test)]

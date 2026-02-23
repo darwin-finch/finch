@@ -255,6 +255,32 @@ impl EventLoop {
         }
         // ─────────────────────────────────────────────────────────────────────
 
+        // Show weekly license notice for non-commercial users (honor system)
+        {
+            use crate::config::{load_config, LicenseType};
+            use chrono::NaiveDate;
+            if let Ok(mut cfg) = load_config() {
+                if cfg.license.license_type == LicenseType::Noncommercial {
+                    let today = chrono::Local::now().date_naive();
+                    let suppress_until = cfg.license.notice_suppress_until
+                        .as_deref()
+                        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+                    let should_show = suppress_until.map_or(true, |d| today > d);
+                    if should_show {
+                        self.output_manager.write_info(
+                            "Using Finch commercially? $10/yr supports development.\n  \
+                             Purchase: https://polar.sh/darwin-finch\n  \
+                             Activate: finch license activate --key <key>"
+                        );
+                        let new_date = (today + chrono::Duration::days(7))
+                            .format("%Y-%m-%d").to_string();
+                        cfg.license.notice_suppress_until = Some(new_date);
+                        let _ = cfg.save(); // non-fatal if save fails
+                    }
+                }
+            }
+        }
+
         // Initialize compaction status display
         self.update_compaction_status().await;
 
@@ -521,6 +547,71 @@ impl EventLoop {
                     }
                     Command::ModelSwitch(name) => {
                         self.handle_provider_switch(name).await?;
+                    }
+                    Command::LicenseStatus => {
+                        use crate::config::{load_config, LicenseType};
+                        let cfg = load_config().unwrap_or_else(|_| crate::config::Config::new(vec![]));
+                        let text = match &cfg.license.license_type {
+                            LicenseType::Commercial => {
+                                let name = cfg.license.licensee_name.as_deref().unwrap_or("(unknown)");
+                                let exp = cfg.license.expires_at.as_deref().unwrap_or("(unknown)");
+                                format!(
+                                    "License: Commercial ✓\n  Licensee: {}\n  Expires:  {}\n  Renew at: https://polar.sh/darwin-finch",
+                                    name, exp
+                                )
+                            }
+                            LicenseType::Noncommercial => {
+                                "License: Noncommercial\n  Free for personal, educational, and research use.\n  \
+                                 Commercial use requires a $10/yr key → https://polar.sh/darwin-finch\n  \
+                                 Activate: finch license activate --key <key>".to_string()
+                            }
+                        };
+                        self.output_manager.write_info(text);
+                        self.render_tui().await?;
+                    }
+                    Command::LicenseActivate(key) => {
+                        use crate::config::{load_config, LicenseConfig, LicenseType};
+                        use crate::license::validate_key;
+                        match validate_key(&key) {
+                            Ok(parsed) => {
+                                if let Ok(mut cfg) = load_config() {
+                                    cfg.license = LicenseConfig {
+                                        key: Some(key),
+                                        license_type: LicenseType::Commercial,
+                                        verified_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+                                        expires_at: Some(parsed.expires_at.format("%Y-%m-%d").to_string()),
+                                        licensee_name: Some(parsed.name.clone()),
+                                        notice_suppress_until: None,
+                                    };
+                                    if let Err(e) = cfg.save() {
+                                        self.output_manager.write_info(
+                                            format!("✓ License validated but could not save: {}", e)
+                                        );
+                                    } else {
+                                        self.output_manager.write_info(format!(
+                                            "✓ License activated\n  Licensee: {} ({})\n  Expires:  {}",
+                                            parsed.name, parsed.email, parsed.expires_at.format("%Y-%m-%d")
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.output_manager.write_info(format!("✗ License activation failed: {}", e));
+                            }
+                        }
+                        self.render_tui().await?;
+                    }
+                    Command::LicenseRemove => {
+                        use crate::config::{load_config, LicenseConfig};
+                        if let Ok(mut cfg) = load_config() {
+                            cfg.license = LicenseConfig::default();
+                            if let Err(e) = cfg.save() {
+                                self.output_manager.write_info(format!("⚠️  Could not save config: {}", e));
+                            } else {
+                                self.output_manager.write_info("✓ License removed. Now using noncommercial license.");
+                            }
+                        }
+                        self.render_tui().await?;
                     }
                     _ => {
                         // All other commands output to scrollback via write_info

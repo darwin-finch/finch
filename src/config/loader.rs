@@ -89,6 +89,8 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
         active_theme: Option<String>,
         #[serde(default)]
         huggingface_token: Option<String>,
+        #[serde(default)]
+        license: super::settings::LicenseConfig,
     }
 
     fn default_tui_enabled() -> bool {
@@ -151,6 +153,9 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
     if let Some(mcp_servers) = toml_config.mcp_servers {
         config.mcp_servers = mcp_servers;
     }
+
+    // Apply license config (default = Noncommercial when section is absent)
+    config.license = toml_config.license;
 
     // Validate configuration
     config

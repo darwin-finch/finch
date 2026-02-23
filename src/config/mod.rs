@@ -16,4 +16,4 @@ pub use colors::{ColorScheme, ColorSpec, ColorTheme, DialogColors, MessageColors
 pub use loader::load_config;
 pub use persona::Persona;
 pub use provider::ProviderEntry;
-pub use settings::{ClientConfig, Config, FeaturesConfig, ServerConfig, TeacherEntry};
+pub use settings::{ClientConfig, Config, FeaturesConfig, LicenseConfig, LicenseType, ServerConfig, TeacherEntry};
