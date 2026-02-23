@@ -597,6 +597,18 @@ automatically rewritten to `[[providers]]` format on next save.
 **Key Files:**
 - `src/license/mod.rs` — `validate_key()`, `validate_key_with_vk()`, `ParsedLicense`; 8 unit tests
 - `src/config/settings.rs` — `LicenseConfig`, `LicenseType`
+- `scripts/issue_license.py` — key signing script (requires `cryptography` pip package)
+
+---
+
+#### Issuing a Commercial License Key
+
+When the user tells you someone has paid, use `scripts/issue_license.py` to sign a key.
+Full credentials and step-by-step instructions are in `~/.claude/CLAUDE.md` (private, not in this repo).
+
+**Lotus Network integration path (future):** When a user pays via Lotus Network, the
+`checkout.session.completed` webhook can call `issue_key()` (Python logic ported to Rust)
+and email the key. Private key injected as an env var in the Lotus deployment.
 
 ### Technology Stack
 

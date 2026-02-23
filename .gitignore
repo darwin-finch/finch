@@ -19,6 +19,13 @@ Thumbs.db
 .env
 .env.local
 
+# Private keys — never commit
+*.pem
+*.key
+*.p12
+*.pfx
+*private*.json
+
 # Shammah specific
 # Don't commit local models or training data
 .claude-proxy/
