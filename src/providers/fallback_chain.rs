@@ -62,6 +62,16 @@ impl FallbackChain {
                 stream: request.stream,
                 system: request.system.clone(),
             };
+            let dropped =
+                provider_request.truncate_to_context_limit(provider.context_limit_tokens());
+            if dropped > 0 {
+                tracing::warn!(
+                    provider = provider.name(),
+                    dropped_messages = dropped,
+                    context_limit = provider.context_limit_tokens(),
+                    "Truncated conversation history to fit provider context window"
+                );
+            }
             provider_request.sanitize_messages();
 
             match provider.send_message(&provider_request).await {
@@ -126,6 +136,16 @@ impl FallbackChain {
                 stream: request.stream,
                 system: request.system.clone(),
             };
+            let dropped =
+                provider_request.truncate_to_context_limit(provider.context_limit_tokens());
+            if dropped > 0 {
+                tracing::warn!(
+                    provider = provider.name(),
+                    dropped_messages = dropped,
+                    context_limit = provider.context_limit_tokens(),
+                    "Truncated conversation history to fit provider context window"
+                );
+            }
             provider_request.sanitize_messages();
 
             match provider.send_message_stream(&provider_request).await {

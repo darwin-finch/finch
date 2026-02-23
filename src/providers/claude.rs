@@ -363,6 +363,10 @@ impl LlmProvider for ClaudeProvider {
     fn supports_tools(&self) -> bool {
         true
     }
+
+    fn context_limit_tokens(&self) -> usize {
+        190_000 // Claude has a 200k context; leave 10k headroom for response
+    }
 }
 
 #[cfg(test)]

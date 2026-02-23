@@ -1,17 +1,17 @@
 # Shammah Development Roadmap
 
 **Last Updated:** 2026-02-22
-**Current Version:** v0.5.2
+**Current Version:** v0.6.0
 
 This document is a forward-looking guide. Completed work is summarised in the "Current" section and detailed in CHANGELOG.md. Open issues are tracked at https://github.com/darwin-finch/finch/issues.
 
 ---
 
-## Current: v0.5.2 (Feb 2026)
+## Current: v0.6.0 (Feb 2026)
 
 Core infrastructure is complete and production-ready.
 
-**What shipped through v0.5.2:**
+**What shipped through v0.6.0:**
 - ONNX Runtime inference (CoreML on Apple Silicon, CPU elsewhere) — 6 model families
 - Multi-provider cloud fallback (Claude, GPT-4, Gemini, Grok, Mistral, Groq)
 - Unified `[[providers]]` config with transparent `[[teachers]]` migration
@@ -27,7 +27,7 @@ Core infrastructure is complete and production-ready.
 
 ---
 
-## Near-term: v0.5.3 – v0.6.0
+## Near-term: v0.6.1 – v0.7.0
 
 ### [#1] LoRA adapter loading at ONNX runtime
 **Effort:** 40–80h  **Priority:** High

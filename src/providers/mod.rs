@@ -74,6 +74,14 @@ pub trait LlmProvider: Send + Sync {
     fn supports_tools(&self) -> bool {
         true // Most modern providers support tools
     }
+
+    /// Maximum context window in tokens for this provider.
+    ///
+    /// Used by the fallback chain to truncate conversation history before
+    /// sending, preventing 400 "prompt too long" errors.
+    fn context_limit_tokens(&self) -> usize {
+        128_000 // Conservative default; providers override as needed
+    }
 }
 
 /// Helper to convert provider response to format compatible with existing code

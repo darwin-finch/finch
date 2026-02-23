@@ -426,6 +426,10 @@ impl LlmProvider for GeminiProvider {
     fn supports_tools(&self) -> bool {
         true
     }
+
+    fn context_limit_tokens(&self) -> usize {
+        900_000 // Gemini 1.5 Pro supports 1M context
+    }
 }
 
 // Gemini API types

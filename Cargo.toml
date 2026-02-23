@@ -46,7 +46,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }  # SQLite with bundled l
 dashmap = "5.5"
 
 # Metrics
-prometheus = "0.13"
+prometheus = "0.14"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

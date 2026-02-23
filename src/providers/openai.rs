@@ -591,6 +591,16 @@ impl LlmProvider for OpenAIProvider {
     fn supports_tools(&self) -> bool {
         true
     }
+
+    fn context_limit_tokens(&self) -> usize {
+        match self.provider_name.as_str() {
+            "grok" => 250_000,    // Grok has 256k context; 6k headroom
+            "openai" => 120_000,  // GPT-4o has 128k context
+            "mistral" => 120_000, // Mistral Large has ~128k context
+            "groq" => 30_000,     // Groq varies by model; be conservative
+            _ => 120_000,
+        }
+    }
 }
 
 // OpenAI API types

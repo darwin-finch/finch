@@ -1046,7 +1046,7 @@ git push origin vX.Y.Z
 
 ## Current Project Status
 
-**Version**: 0.5.2
+**Version**: 0.6.0
 **Last updated**: Feb 2026
 
 Core infrastructure is complete and production-ready. The project is a fully functional local-first AI coding assistant with ONNX Runtime inference, multi-turn tool execution, daemon architecture, LoRA fine-tuning infrastructure, and a professional TUI.

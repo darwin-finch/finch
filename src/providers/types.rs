@@ -175,6 +175,68 @@ impl ProviderRequest {
             }
         }
     }
+
+    /// Truncate conversation history to fit within a provider's context window.
+    ///
+    /// Uses a conservative 3-chars-per-token heuristic (see `estimate_message_tokens`).
+    /// Drops the oldest messages first, always preserving at least the last message.
+    /// Returns the number of messages dropped.
+    ///
+    /// The budget is: `token_limit - system_prompt_tokens - max_tokens (response reserve)`
+    pub fn truncate_to_context_limit(&mut self, token_limit: usize) -> usize {
+        let system_tokens = self.system.as_deref().map(|s| s.len() / 3).unwrap_or(0);
+        let response_reserve = self.max_tokens as usize;
+        let budget = token_limit
+            .saturating_sub(system_tokens)
+            .saturating_sub(response_reserve);
+
+        let costs: Vec<usize> = self.messages.iter().map(estimate_message_tokens).collect();
+        let total: usize = costs.iter().sum();
+
+        if total <= budget {
+            return 0;
+        }
+
+        // Find the newest prefix we can include within budget (newest messages have priority)
+        let mut running = 0usize;
+        let mut keep_from = self.messages.len(); // messages[keep_from..] will be sent
+        for i in (0..self.messages.len()).rev() {
+            if running + costs[i] > budget {
+                break;
+            }
+            running += costs[i];
+            keep_from = i;
+        }
+
+        // Always keep at least the last message so we have something to send
+        keep_from = keep_from.min(self.messages.len().saturating_sub(1));
+
+        let dropped = keep_from;
+        self.messages = self.messages.drain(keep_from..).collect();
+        dropped
+    }
+}
+
+/// Estimate the token cost of a single message.
+///
+/// Uses a 3-chars-per-token heuristic (conservative).  In practice, English prose
+/// averages ~4 chars/token, but code and JSON tool-result content is denser
+/// (closer to 3 chars/token).  Using 3 ensures we don't underestimate and
+/// inadvertently send payloads that exceed provider context limits.
+///
+/// Adds a small per-message overhead for role and structural JSON tokens.
+fn estimate_message_tokens(msg: &Message) -> usize {
+    let content_chars: usize = msg
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.len(),
+            ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
+            ContentBlock::ToolResult { content, .. } => content.len(),
+            ContentBlock::Image { source } => source.data.len().min(4_000) + 20,
+        })
+        .sum();
+    (content_chars / 3).max(1) + 4 // +4 overhead per message
 }
 
 /// Unified response format from LLM providers
@@ -427,6 +489,78 @@ mod tests {
             req.messages[0].content[0],
             ContentBlock::Image { .. }
         ));
+    }
+
+    // ─── truncate_to_context_limit ────────────────────────────────────────────
+
+    #[test]
+    fn test_truncate_noop_when_fits() {
+        let mut req = ProviderRequest::new(vec![Message::user("hello"), Message::assistant("hi")]);
+        let dropped = req.truncate_to_context_limit(200_000);
+        assert_eq!(dropped, 0);
+        assert_eq!(req.messages.len(), 2);
+    }
+
+    #[test]
+    fn test_truncate_drops_oldest_messages() {
+        // Create many large messages
+        let big = "x".repeat(4_000); // ~1000 tokens each
+        let mut req = ProviderRequest {
+            messages: (0..50)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        Message::user(big.clone())
+                    } else {
+                        Message::assistant(big.clone())
+                    }
+                })
+                .collect(),
+            model: String::new(),
+            max_tokens: 4096,
+            system: None,
+            tools: None,
+            temperature: None,
+            stream: false,
+        };
+        let original_len = req.messages.len();
+        let dropped = req.truncate_to_context_limit(10_000); // tight limit
+        assert!(dropped > 0, "Should have dropped messages");
+        assert_eq!(req.messages.len(), original_len - dropped);
+        // Last message always preserved
+        assert!(!req.messages.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_always_keeps_last_message() {
+        // Single enormous message — should still be kept
+        let big = "x".repeat(800_000); // way over any limit
+        let mut req = ProviderRequest::new(vec![Message::user(big)]);
+        let dropped = req.truncate_to_context_limit(1_000); // tiny limit
+        assert_eq!(dropped, 0); // nothing to drop — only 1 message
+        assert_eq!(req.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_truncate_counts_system_prompt_against_budget() {
+        let system = "s".repeat(40_000); // ~13k tokens (40k chars / 3)
+        let msg_text = "m".repeat(4_000); // ~1.3k tokens each (4k chars / 3)
+        let mut req = ProviderRequest {
+            messages: (0..10).map(|_| Message::user(msg_text.clone())).collect(),
+            model: String::new(),
+            max_tokens: 4096,
+            system: Some(system),
+            tools: None,
+            temperature: None,
+            stream: false,
+        };
+        // Limit of 20k tokens; ~13k system + ~4k response reserve = ~3k for messages
+        // Each message ~1.3k tokens so only a couple fit → should drop several
+        let dropped = req.truncate_to_context_limit(20_000);
+        assert!(
+            dropped > 0,
+            "Should drop some messages due to system prompt cost"
+        );
+        assert!(!req.messages.is_empty());
     }
 
     // ─── ProviderResponse ─────────────────────────────────────────────────────
