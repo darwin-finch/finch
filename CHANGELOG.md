@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Neural ONNX embeddings for memory** (`src/memory/neural_embedding.rs`): `all-MiniLM-L6-v2`
+  sentence transformer (Apache 2.0, ~23MB quantized) runs in-process via ONNX Runtime to
+  produce 384-dim L2-normalized embeddings. Semantic similarity replaces word-overlap hashing,
+  so memory retrieval finds relevant past context even when phrasing differs. Downloads
+  automatically from HuggingFace on first use (respects `HF_TOKEN` / `~/.cache/huggingface/token`);
+  falls back to TF-IDF if the model is not yet cached.
+- **`MemoryConfig.use_neural_embeddings`** (default `true`) and
+  **`MemoryConfig.embedding_cache_dir`**: opt-out of neural embeddings or override the
+  cache directory.
+- **`MemorySystem::new_async()`**: async constructor that triggers model download before
+  constructing, so the first session gets neural embeddings instead of the TF-IDF fallback.
+- **`MemTree::new_with_dim(dim)`**: parameterised root-embedding dimension so the tree
+  works correctly with both TF-IDF (2048) and neural (384) engines.
+- **Subagent `spawn_task` tool** (`src/tools/implementations/spawn.rs`): lets the model
+  delegate subtasks to isolated, headless agentic loops. Each subagent has its own
+  conversation history, a focused system prompt, and a restricted tool set:
+  - `general` — Read, Glob, Grep, Bash, WebFetch
+  - `explore` — Read, Glob, Grep (read-only)
+  - `researcher` — Read, Glob, Grep, WebFetch
+  - `coder` — Read, Glob, Grep, Bash
+  - `bash` — Bash only
+  Subagents cannot call `spawn_task` recursively. Multiple `spawn_task` calls in one
+  model response can be executed in parallel by the executor.
+
 ## [0.6.0] - 2026-02-22
 
 ### Added

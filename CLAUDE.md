@@ -1056,7 +1056,9 @@ Core infrastructure is complete and production-ready. The project is a fully fun
 - **Local inference** — ONNX Runtime (primary) + Candle (Linux/CPU alt); CoreML EP on macOS (partial ANE/GPU dispatch); CUDA/ROCm on Linux
 - **6 model families** — Qwen, Llama, Mistral, Gemma, Phi, DeepSeek adapters
 - **6 teacher providers** — Claude, GPT-4, Gemini, Grok, Mistral, Groq
-- **6 tools** — Read, Glob, Grep, WebFetch, Bash, Restart (with permission system)
+- **8 tools** — Read, Glob, Grep, WebFetch, Bash, Restart, `spawn_task` (subagent), memory tools (with permission system)
+- **Subagent `spawn_task`** — delegates subtasks to isolated headless agentic loops with named types (general/explore/researcher/coder/bash); no recursion; parallelisable
+- **Semantic memory** — `NeuralEmbeddingEngine` (`all-MiniLM-L6-v2`, ~23MB ONNX) produces 384-dim embeddings for the MemTree; falls back to TF-IDF when model not yet cached; downloads from HuggingFace on first use via `hf-hub`
 - **Daemon** — Auto-spawning, OpenAI-compatible API, mDNS/Bonjour discovery, VS Code integration, cross-machine local model sharing
 - **TUI** — Scrollback, streaming, ghost text, plan mode, feedback (Ctrl+G/B), history
 - **LoRA** — Weighted feedback collection + Python training pipeline (adapter loading pending)

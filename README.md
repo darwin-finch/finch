@@ -5,7 +5,7 @@ A terminal AI coding assistant with persistent memory and tool use.
 ## What it does
 
 - Answers coding questions, reads your files, runs commands, and searches your codebase — with your permission before every action
-- Remembers context across sessions using a hierarchical memory tree (MemTree), automatically injected into each conversation
+- Remembers context across sessions using a hierarchical memory tree (MemTree) with neural semantic search — a tiny `all-MiniLM-L6-v2` model (~23MB) runs locally to embed conversations so retrieval finds relevant past context even when phrasing differs
 - Works with any of the major AI providers: Grok, Claude, GPT-4, Gemini, Mistral, Groq
 - Optionally runs a local model on your machine for offline use — Qwen, Llama, Gemma, Mistral, Phi, DeepSeek via ONNX Runtime
 
@@ -111,6 +111,7 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 | `/model list`        | List available local models                            |
 | `/model <name>`      | Switch local model for the current session             |
 | `/help`              | Show available commands                                |
+| `spawn_task`         | (tool) Delegate a subtask to an isolated subagent loop |
 | `Ctrl+C`             | Cancel the current query                               |
 | `Ctrl+G`             | Mark the last response as good (training signal)       |
 | `Ctrl+B`             | Mark the last response as bad (training signal)        |
