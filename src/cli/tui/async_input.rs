@@ -112,9 +112,13 @@ pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::Unbounde
 
                                 Ok(None) // Don't submit input while dialog is active
                             } else if key.code == KeyCode::Enter {
-                                // Check if Shift is held (Shift+Enter inserts newline, Enter submits)
-                                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                    // Shift+Enter: Insert newline (pass to textarea)
+                                // Check if Shift or Alt is held (inserts newline, Enter submits).
+                                // Standard VT100 raw mode never sets SHIFT for Enter on macOS
+                                // Terminal/iTerm2 — Option+Enter sends \x1b\r, reported as
+                                // KeyCode::Enter + KeyModifiers::ALT, which is what we check.
+                                // SHIFT is also accepted for terminals that implement it.
+                                if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                                    // Shift+Enter / Alt(Option)+Enter: Insert newline (pass to textarea)
                                     tui.input_textarea.input(Event::Key(key));
                                     first_event_modified_input = true; // Mark for render
                                     Ok(None)
@@ -315,8 +319,8 @@ pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::Unbounde
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
                             Ok(Event::Key(key)) if key.code == KeyCode::Enter => {
-                                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                    // Shift+Enter: Insert newline
+                                if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                                    // Shift+Enter / Alt(Option)+Enter: Insert newline
                                     tui.input_textarea.input(Event::Key(key));
                                     had_input = true;
                                 } else {
@@ -471,6 +475,50 @@ mod tests {
     fn test_allows_del_char_as_printable() {
         // 0x7E '~' is the last printable ASCII; 0x7F DEL is NOT in ' '..='~'
         assert!(!sanitize_paste_char('\x7F'), "DEL should be blocked");
+    }
+
+    // --- Enter modifier: newline vs submit ---
+
+    /// Helper that mirrors the runtime condition: should this Enter key event
+    /// insert a newline (true) rather than submit the input (false)?
+    fn enter_should_insert_newline(modifiers: KeyModifiers) -> bool {
+        modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn enter_without_modifier_submits() {
+        assert!(
+            !enter_should_insert_newline(KeyModifiers::NONE),
+            "plain Enter should submit (not insert newline)"
+        );
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline() {
+        // Some terminals DO send SHIFT for Shift+Enter — honour it.
+        assert!(
+            enter_should_insert_newline(KeyModifiers::SHIFT),
+            "Shift+Enter should insert newline"
+        );
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline() {
+        // macOS Terminal/iTerm2 standard raw mode: Option+Enter → \x1b\r,
+        // reported by crossterm as KeyCode::Enter + KeyModifiers::ALT.
+        assert!(
+            enter_should_insert_newline(KeyModifiers::ALT),
+            "Alt/Option+Enter should insert newline"
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_does_not_insert_newline() {
+        // Ctrl+Enter is not a newline shortcut.
+        assert!(
+            !enter_should_insert_newline(KeyModifiers::CONTROL),
+            "Ctrl+Enter should not insert newline (submits instead)"
+        );
     }
 
     // --- should_accept_key_event ---

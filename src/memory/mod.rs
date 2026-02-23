@@ -10,7 +10,7 @@ mod embeddings;
 mod memtree;
 pub mod neural_embedding;
 
-pub use embeddings::{cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
+pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memtree::{MemTree, NodeId, TreeNode};
 pub use neural_embedding::NeuralEmbeddingEngine;
 
@@ -257,6 +257,73 @@ impl MemorySystem {
         tracing::debug!("Memory checkpoint requested (not yet implemented)");
         Ok(())
     }
+
+    /// Derive a short topic summary without any LLM call.
+    ///
+    /// Uses centroid queries against the MemTree:
+    /// - `overall` → representative turn for the whole session
+    /// - `current` → representative turn among the 5 most recent turns
+    ///
+    /// Returns `None`/`None` when no turns have been recorded yet.
+    ///
+    /// With a single turn, `overall` and `current` both point to that turn's
+    /// text, giving the status strip something to show after the very first
+    /// assistant response.
+    pub async fn conversation_summary(&self) -> Result<ConversationSummaryLines> {
+        let tree = self.tree.lock().await;
+        let nodes = tree.all_nodes();
+
+        // Collect leaf embeddings and texts (exclude root id=0)
+        let mut leaves: Vec<(i64, &Vec<f32>, &str)> = nodes
+            .values()
+            .filter(|n| n.id != 0 && n.children.is_empty())
+            .map(|n| (n.created_at, &n.embedding, n.text.as_str()))
+            .collect();
+
+        if leaves.is_empty() {
+            return Ok(ConversationSummaryLines::default());
+        }
+
+        // Overall centroid → most representative turn for the whole session
+        let all_embeddings: Vec<&Vec<f32>> = leaves.iter().map(|(_, e, _)| *e).collect();
+        let overall_centroid = average_embeddings(&all_embeddings);
+        let overall = tree
+            .retrieve(&overall_centroid, 1)
+            .into_iter()
+            .next()
+            .map(|(_, text, _)| truncate_str(&text, 70))
+            .filter(|s| !s.trim().is_empty());
+
+        // Recency centroid → most representative turn among the 5 most recent
+        leaves.sort_by(|a, b| b.0.cmp(&a.0)); // desc by created_at
+        let recent: Vec<&Vec<f32>> = leaves.iter().take(5).map(|(_, e, _)| *e).collect();
+        let recency_centroid = average_embeddings(&recent);
+        let current = tree
+            .retrieve(&recency_centroid, 1)
+            .into_iter()
+            .next()
+            .map(|(_, text, _)| truncate_str(&text, 64))
+            .filter(|s| !s.trim().is_empty());
+
+        Ok(ConversationSummaryLines { overall, current })
+    }
+}
+
+/// Summary of conversation topics derived from MemTree centroid queries.
+#[derive(Debug, Clone, Default)]
+pub struct ConversationSummaryLines {
+    /// Most representative turn for the whole session (overall centroid query).
+    pub overall: Option<String>,
+    /// Most representative turn among the 5 most recent (recency centroid query).
+    pub current: Option<String>,
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max_chars - 1).collect::<String>())
+    }
 }
 
 /// Memory statistics
@@ -345,6 +412,76 @@ mod tests {
             .iter()
             .any(|r| r.contains("Rust") || r.contains("lifetimes")));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_summary_empty() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+        let summary = memory.conversation_summary().await?;
+        assert!(summary.overall.is_none());
+        assert!(summary.current.is_none());
+        Ok(())
+    }
+
+    /// Regression: with threshold lowered from 2 to 1, a single turn must
+    /// produce Some (not None) so the status strip populates after the first
+    /// assistant response.
+    #[tokio::test]
+    async fn test_conversation_summary_single_turn_shows_content() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+        memory
+            .insert_conversation("user", "How do Rust lifetimes work?", Some("local"), None)
+            .await?;
+        // 1 leaf ≥ threshold of 1 → Some/Some
+        let summary = memory.conversation_summary().await?;
+        assert!(
+            summary.overall.is_some(),
+            "single turn should produce Some(overall)"
+        );
+        assert!(
+            summary.current.is_some(),
+            "single turn should produce Some(current)"
+        );
+        assert!(
+            !summary.overall.as_deref().unwrap_or("").is_empty(),
+            "overall text must not be empty"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_conversation_summary_multiple_turns() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+        for content in &[
+            "How do Rust lifetimes work?",
+            "What is async await in Rust?",
+            "Explain Rust ownership and borrowing",
+        ] {
+            memory
+                .insert_conversation("user", content, Some("local"), None)
+                .await?;
+        }
+        let summary = memory.conversation_summary().await?;
+        assert!(summary.overall.is_some(), "overall should be Some with 3 turns");
+        assert!(summary.current.is_some(), "current should be Some with 3 turns");
+        assert!(!summary.overall.as_deref().unwrap_or("").is_empty());
+        assert!(!summary.current.as_deref().unwrap_or("").is_empty());
         Ok(())
     }
 

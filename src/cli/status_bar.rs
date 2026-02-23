@@ -13,6 +13,14 @@ use std::sync::{Arc, RwLock};
 /// Types of status lines
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StatusLineType {
+    /// Session label shown permanently (e.g. "◆ swift-falcon · ~/repos/finch")
+    SessionLabel,
+    /// Memory context: engine type + recall info ("🧠 neural · 142 memories · recalled 3")
+    MemoryContext,
+    /// Conversation topic derived from MemTree overall centroid ("📋 <topic>")
+    ConversationTopic,
+    /// Conversation focus derived from MemTree recency centroid ("   └─ now: <focus>")
+    ConversationFocus,
     /// Live query statistics (tokens, latency, model)
     LiveStats,
     /// Training statistics (queries, local%, quality)
@@ -74,10 +82,39 @@ impl StatusBar {
     pub fn get_lines(&self) -> Vec<StatusLine> {
         let lines = self.lines.read().unwrap();
 
-        // Order: LiveStats, TrainingStats, DownloadProgress, OperationStatus, then Custom
+        // Order: SessionLabel, MemoryContext, LiveStats, TrainingStats, DownloadProgress,
+        //        OperationStatus, then Custom
         let mut result = Vec::new();
 
         // Add in preferred order
+        if let Some(content) = lines.get(&StatusLineType::SessionLabel) {
+            result.push(StatusLine {
+                line_type: StatusLineType::SessionLabel,
+                content: content.clone(),
+            });
+        }
+
+        if let Some(content) = lines.get(&StatusLineType::MemoryContext) {
+            result.push(StatusLine {
+                line_type: StatusLineType::MemoryContext,
+                content: content.clone(),
+            });
+        }
+
+        if let Some(content) = lines.get(&StatusLineType::ConversationTopic) {
+            result.push(StatusLine {
+                line_type: StatusLineType::ConversationTopic,
+                content: content.clone(),
+            });
+        }
+
+        if let Some(content) = lines.get(&StatusLineType::ConversationFocus) {
+            result.push(StatusLine {
+                line_type: StatusLineType::ConversationFocus,
+                content: content.clone(),
+            });
+        }
+
         if let Some(content) = lines.get(&StatusLineType::LiveStats) {
             result.push(StatusLine {
                 line_type: StatusLineType::LiveStats,
@@ -350,6 +387,23 @@ mod tests {
     }
 
     #[test]
+    fn test_status_line_ordering_with_session_and_memory() {
+        let status = StatusBar::new();
+
+        // Add in reverse order
+        status.update_line(StatusLineType::LiveStats, "Live");
+        status.update_line(StatusLineType::MemoryContext, "Memory");
+        status.update_line(StatusLineType::SessionLabel, "Session");
+
+        let lines = status.get_lines();
+
+        // SessionLabel must be first, MemoryContext second, LiveStats third
+        assert_eq!(lines[0].line_type, StatusLineType::SessionLabel);
+        assert_eq!(lines[1].line_type, StatusLineType::MemoryContext);
+        assert_eq!(lines[2].line_type, StatusLineType::LiveStats);
+    }
+
+    #[test]
     fn test_training_stats_format() {
         let status = StatusBar::new();
 
@@ -386,6 +440,26 @@ mod tests {
 
         let rendered = status.render();
         assert_eq!(rendered, "Line 1\nLine 2");
+    }
+
+    #[test]
+    fn test_status_line_ordering_conversation_before_live_stats() {
+        let status = StatusBar::new();
+
+        // Add in reverse order
+        status.update_line(StatusLineType::LiveStats, "Live");
+        status.update_line(StatusLineType::ConversationFocus, "Focus");
+        status.update_line(StatusLineType::ConversationTopic, "Topic");
+        status.update_line(StatusLineType::MemoryContext, "Memory");
+        status.update_line(StatusLineType::SessionLabel, "Session");
+
+        let lines = status.get_lines();
+
+        assert_eq!(lines[0].line_type, StatusLineType::SessionLabel);
+        assert_eq!(lines[1].line_type, StatusLineType::MemoryContext);
+        assert_eq!(lines[2].line_type, StatusLineType::ConversationTopic);
+        assert_eq!(lines[3].line_type, StatusLineType::ConversationFocus);
+        assert_eq!(lines[4].line_type, StatusLineType::LiveStats);
     }
 
     #[test]

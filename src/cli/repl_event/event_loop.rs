@@ -18,6 +18,7 @@ use crate::cli::tui::{spawn_input_task, TuiRenderer};
 use crate::feedback::{FeedbackEntry, FeedbackLogger, FeedbackRating};
 use crate::generators::{Generator, StreamChunk};
 use crate::local::LocalGenerator;
+use crate::memory::NeuralEmbeddingEngine;
 use crate::models::bootstrap::GeneratorState;
 use crate::models::tokenizer::TextTokenizer;
 use crate::router::Router;
@@ -28,6 +29,66 @@ use super::events::ReplEvent;
 use super::query_state::{QueryState, QueryStateManager};
 use super::tool_display::format_tool_label;
 use super::tool_execution::ToolExecutionCoordinator;
+
+/// Update the ConversationTopic / ConversationFocus status lines and the terminal
+/// window/tab title from the latest MemTree centroids.
+///
+/// This is a free function (not `&self`) so it can be called from the static
+/// `process_query_with_tools` closure.
+async fn refresh_context_strip(
+    memory_system: &crate::memory::MemorySystem,
+    session_label: &str,
+    cwd: &str,
+    status_bar: &StatusBar,
+) {
+    let Ok(summary) = memory_system.conversation_summary().await else {
+        return;
+    };
+
+    // Only update lines when we have content; never erase existing values.
+    // This prevents the strip from going blank between queries (e.g. when the
+    // tree has only one leaf, summary returns None/None but we don't want to
+    // erase the value that was already there).
+    if let Some(topic) = &summary.overall {
+        if !topic.trim().is_empty() {
+            status_bar.update_line(
+                crate::cli::status_bar::StatusLineType::ConversationTopic,
+                format!("📋 {}", topic),
+            );
+        }
+    }
+    if let Some(focus) = &summary.current {
+        if !focus.trim().is_empty() {
+            status_bar.update_line(
+                crate::cli::status_bar::StatusLineType::ConversationFocus,
+                format!("   └─ now: {}", focus),
+            );
+        }
+    }
+
+    // OSC 0 — set terminal window title + tab title
+    let title_topic = summary
+        .overall
+        .as_deref()
+        .map(|s| {
+            // Truncate to 35 chars for the title
+            if s.chars().count() <= 35 {
+                s.to_string()
+            } else {
+                format!("{}…", s.chars().take(34).collect::<String>())
+            }
+        })
+        .filter(|s| !s.is_empty());
+    let title = match title_topic.as_deref() {
+        Some(t) => format!("finch · {} · {} · {}", session_label, cwd, t),
+        None => format!("finch · {} · {}", session_label, cwd),
+    };
+    {
+        use std::io::Write as _;
+        print!("\x1b]0;{}\x07", title);
+        let _ = std::io::stdout().flush();
+    }
+}
 
 /// Main event loop for concurrent REPL
 #[allow(dead_code)]
@@ -138,6 +199,15 @@ pub struct EventLoop {
 
     /// Metrics logger — reads from ~/.finch/metrics/ for /metrics command
     metrics_logger: Option<crate::metrics::MetricsLogger>,
+
+    /// Memory system for semantic recall across sessions
+    memory_system: Option<Arc<crate::memory::MemorySystem>>,
+
+    /// Human-readable label for this session (e.g. "swift-falcon")
+    session_label: String,
+
+    /// Working directory at startup (for terminal title)
+    cwd: String,
 }
 
 /// View mode for the REPL
@@ -168,7 +238,8 @@ impl EventLoop {
         tokenizer: Arc<TextTokenizer>,
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
         mode: Arc<RwLock<ReplMode>>,
-        memory_tree: Option<Arc<RwLock<crate::memory::MemTree>>>,
+        memory_system: Option<Arc<crate::memory::MemorySystem>>,
+        session_label: String,
         available_providers: Vec<crate::config::ProviderEntry>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -193,16 +264,8 @@ impl EventLoop {
             Arc::clone(&plan_content),
         );
 
-        // Initialize memtree console if memory tree is provided
-        let (memtree_console, memtree_handler) = if let Some(tree) = memory_tree {
-            let console = crate::cli::memtree_console::MemTreeConsole::new(tree);
-            let handler = crate::cli::memtree_console::EventHandler::new();
-            (
-                Arc::new(RwLock::new(console)),
-                Arc::new(tokio::sync::Mutex::new(handler)),
-            )
-        } else {
-            // Create a dummy tree if no memory system is available
+        // Initialize memtree console (uses a separate dummy tree for the tree-view UI)
+        let (memtree_console, memtree_handler) = {
             let dummy_tree = Arc::new(RwLock::new(crate::memory::MemTree::new()));
             let console = crate::cli::memtree_console::MemTreeConsole::new(dummy_tree);
             let handler = crate::cli::memtree_console::EventHandler::new();
@@ -243,6 +306,9 @@ impl EventLoop {
             metrics_logger: dirs::home_dir()
                 .map(|h| h.join(".finch").join("metrics"))
                 .and_then(|p| crate::metrics::MetricsLogger::new(p).ok()),
+            memory_system,
+            session_label,
+            cwd: String::new(), // populated at the start of run()
         }
     }
 
@@ -268,6 +334,7 @@ impl EventLoop {
                 p.display().to_string()
             })
             .unwrap_or_else(|| "~".to_string());
+        self.cwd = cwd.clone();
 
         {
             let mut tui = self.tui_renderer.lock().await;
@@ -311,6 +378,39 @@ impl EventLoop {
 
         // Initialize plan mode indicator (starts in Normal mode)
         self.update_plan_mode_indicator(&crate::cli::repl::ReplMode::Normal);
+
+        // Set session label in status bar (permanent identity line)
+        self.status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::SessionLabel,
+            format!("◆ {}  ·  {}", self.session_label, cwd),
+        );
+
+        // Set initial memory context in status bar
+        if let Some(ref mem) = self.memory_system {
+            if let Ok(stats) = mem.stats().await {
+                let engine = if NeuralEmbeddingEngine::find_in_cache().is_some() {
+                    "neural"
+                } else {
+                    "tfidf"
+                };
+                self.status_bar.update_line(
+                    crate::cli::status_bar::StatusLineType::MemoryContext,
+                    format!("🧠 {}  ·  {} memories", engine, stats.conversation_count),
+                );
+            }
+        }
+
+        // Set initial terminal window/tab title (no topic yet on fresh start)
+        {
+            use std::io::Write as _;
+            print!("\x1b]0;finch · {} · {}\x07", self.session_label, cwd);
+            let _ = std::io::stdout().flush();
+        }
+
+        // Attempt initial summary — populates on restart from previous memory
+        if let Some(ref mem) = self.memory_system {
+            refresh_context_strip(mem, &self.session_label, &cwd, &self.status_bar).await;
+        }
 
         // Render interval (100ms) - blit overwrites visible area with shadow buffer
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
@@ -1033,6 +1133,9 @@ impl EventLoop {
         let output_manager = Arc::clone(&self.output_manager);
         let status_bar = Arc::clone(&self.status_bar);
         let active_tool_uses = Arc::clone(&self.active_tool_uses);
+        let memory_system = self.memory_system.clone();
+        let session_label = self.session_label.clone();
+        let cwd = self.cwd.clone();
 
         tokio::spawn(async move {
             Self::process_query_with_tools(
@@ -1052,6 +1155,9 @@ impl EventLoop {
                 output_manager,
                 status_bar,
                 active_tool_uses,
+                memory_system,
+                session_label,
+                cwd,
             )
             .await;
         });
@@ -1088,6 +1194,9 @@ impl EventLoop {
                 >,
             >,
         >,
+        memory_system: Option<Arc<crate::memory::MemorySystem>>,
+        session_label: String,
+        cwd: String,
     ) {
         tracing::debug!(
             "process_query_with_tools starting for query_id: {:?}",
@@ -1129,8 +1238,37 @@ impl EventLoop {
             }
         };
 
-        // Get conversation context
-        let messages = conversation.read().await.get_messages();
+        // Get conversation context, optionally injecting relevant memories
+        let mut memory_recall_count: usize = 0;
+        let messages = {
+            let mut msgs = conversation.read().await.get_messages();
+            if let Some(ref mem) = memory_system {
+                if let Ok(memories) = mem.query(&query, Some(5)).await {
+                    if !memories.is_empty() {
+                        memory_recall_count = memories.len();
+                        let mem_block = memories.join("\n\n---\n\n");
+                        // Inject into the last user message so the LLM sees the recalled context
+                        if let Some(last_user) =
+                            msgs.iter_mut().rev().find(|m| m.role == "user")
+                        {
+                            if let Some(ContentBlock::Text { ref mut text }) =
+                                last_user.content.first_mut()
+                            {
+                                *text = format!(
+                                    "[Relevant memories from past sessions:\n\n{}]\n\n{}",
+                                    mem_block, text
+                                );
+                            }
+                        }
+                        status_bar.update_line(
+                            crate::cli::status_bar::StatusLineType::MemoryContext,
+                            format!("🧠 recalled {}  ·  querying…", memory_recall_count),
+                        );
+                    }
+                }
+            }
+            msgs
+        };
         let caps = generator.capabilities();
 
         // Try streaming first if supported
@@ -1147,6 +1285,14 @@ impl EventLoop {
             let mut token_count: usize = 0;
             let mut throb_idx: usize = 0;
             status_bar.update_operation("✳ Channeling…");
+            {
+                use std::io::Write as _;
+                print!(
+                    "\x1b]0;finch · {} · {} · ↓ streaming…\x07",
+                    session_label, cwd
+                );
+                let _ = std::io::stdout().flush();
+            }
 
             match generator
                 .generate_stream(messages.clone(), Some((*tool_definitions).clone()))
@@ -1350,6 +1496,11 @@ impl EventLoop {
                             }
                         }
                         drop(current_mode);
+                        // Refresh the context strip even on tool-calling turns so the
+                        // ConversationTopic / ConversationFocus lines stay up-to-date.
+                        if let Some(ref mem) = memory_system {
+                            refresh_context_strip(mem, &session_label, &cwd, &status_bar).await;
+                        }
                         tracing::debug!("[EVENT_LOOP] Tool executions spawned, returning");
                         return;
                     }
@@ -1365,6 +1516,37 @@ impl EventLoop {
                         .write()
                         .await
                         .add_assistant_message(text.clone());
+
+                    // Store to memory (fire-and-forget; never blocks the response path)
+                    if let Some(ref mem) = memory_system {
+                        let model_name = generator.name().to_string();
+                        let _ = mem
+                            .insert_conversation(
+                                "user",
+                                &query,
+                                Some(&model_name),
+                                Some(&session_label),
+                            )
+                            .await;
+                        let _ = mem
+                            .insert_conversation(
+                                "assistant",
+                                &text,
+                                Some(&model_name),
+                                Some(&session_label),
+                            )
+                            .await;
+                        if let Ok(stats) = mem.stats().await {
+                            status_bar.update_line(
+                                crate::cli::status_bar::StatusLineType::MemoryContext,
+                                format!(
+                                    "🧠 recalled {}  ·  {} memories",
+                                    memory_recall_count, stats.conversation_count
+                                ),
+                            );
+                        }
+                        refresh_context_strip(mem, &session_label, &cwd, &status_bar).await;
+                    }
 
                     // Update context usage indicator now that the message is committed
                     {
@@ -1524,12 +1706,47 @@ impl EventLoop {
                         }
                     }
                     drop(current_mode);
+                    // Refresh the context strip even on tool-calling turns.
+                    if let Some(ref mem) = memory_system {
+                        refresh_context_strip(mem, &session_label, &cwd, &status_bar).await;
+                    }
                     return;
                 }
 
                 // No tools — mark WorkUnit complete
                 work_unit.set_complete();
                 tracing::debug!("Query complete (no tools), non-streaming finished");
+
+                // Store to memory (fire-and-forget)
+                if let Some(ref mem) = memory_system {
+                    let model_name = response.metadata.model.clone();
+                    let _ = mem
+                        .insert_conversation(
+                            "user",
+                            &query,
+                            Some(&model_name),
+                            Some(&session_label),
+                        )
+                        .await;
+                    let _ = mem
+                        .insert_conversation(
+                            "assistant",
+                            &response.text,
+                            Some(&model_name),
+                            Some(&session_label),
+                        )
+                        .await;
+                    if let Ok(stats) = mem.stats().await {
+                        status_bar.update_line(
+                            crate::cli::status_bar::StatusLineType::MemoryContext,
+                            format!(
+                                "🧠 recalled {}  ·  {} memories",
+                                memory_recall_count, stats.conversation_count
+                            ),
+                        );
+                    }
+                    refresh_context_strip(mem, &session_label, &cwd, &status_bar).await;
+                }
             }
             Err(e) => {
                 let _ = event_tx.send(ReplEvent::QueryFailed {
@@ -1987,16 +2204,16 @@ impl EventLoop {
                 "Allow this exact tool call for this session",
             ),
             DialogOption::with_description(
-                "Allow Pattern (Session)",
-                "Allow similar tool calls for this session",
+                "Allow All (Session)",
+                "Allow all calls to this tool for this session",
             ),
             DialogOption::with_description(
                 "Allow Exact (Persistent)",
                 "Always allow this exact tool call",
             ),
             DialogOption::with_description(
-                "Allow Pattern (Persistent)",
-                "Always allow similar tool calls",
+                "Allow All (Persistent)",
+                "Always allow all calls to this tool",
             ),
             DialogOption::with_description("Deny", "Do not execute this tool"),
         ];
@@ -2046,11 +2263,12 @@ impl EventLoop {
                     ConfirmationResult::ApproveExactSession(signature)
                 }
                 2 => {
-                    // Create pattern from tool use
+                    // Wildcard pattern: allow any call to this tool this session.
+                    // Use "*" as the pattern so it matches any context_key.
                     let pattern = ToolPattern::new(
-                        format!("{}:*", tool_use.name),
+                        "*".to_string(),
                         tool_use.name.clone(),
-                        format!("Auto-generated pattern for {}", tool_use.name),
+                        format!("Allow all {} calls (session)", tool_use.name),
                     );
                     ConfirmationResult::ApprovePatternSession(pattern)
                 }
@@ -2059,11 +2277,11 @@ impl EventLoop {
                     ConfirmationResult::ApproveExactPersistent(signature)
                 }
                 4 => {
-                    // Create pattern from tool use
+                    // Wildcard pattern: always allow any call to this tool.
                     let pattern = ToolPattern::new(
-                        format!("{}:*", tool_use.name),
+                        "*".to_string(),
                         tool_use.name.clone(),
-                        format!("Auto-generated pattern for {}", tool_use.name),
+                        format!("Allow all {} calls (persistent)", tool_use.name),
                     );
                     ConfirmationResult::ApprovePatternPersistent(pattern)
                 }
@@ -2102,17 +2320,23 @@ impl EventLoop {
                 true
             }
             ReplMode::Planning { .. } => {
-                // Inspection tools + plan completion tools allowed
+                // Inspection tools, bash (read-only by convention, confirmed normally),
+                // plan completion tools, and plan-mode meta-tools are all allowed.
+                // Write/Edit remain blocked to enforce read-only exploration during planning.
                 matches!(
                     tool_name,
                     "read"
                         | "glob"
                         | "grep"
                         | "web_fetch"
+                        | "bash"
+                        | "Bash"
                         | "present_plan"
                         | "PresentPlan"
                         | "ask_user_question"
                         | "AskUserQuestion"
+                        | "EnterPlanMode"
+                        | "ExitPlanMode"
                 )
             }
         }
@@ -2523,34 +2747,29 @@ async fn handle_present_plan(
         | crate::cli::tui::DialogResult::CustomText(_) => {
             // Request changes
             let feedback = if let crate::cli::tui::DialogResult::CustomText(text) = dialog_result {
-                text
+                Some(text)
             } else {
-                // Show text input for changes
-                let feedback_dialog = crate::cli::tui::Dialog::text_input(
-                    "What changes would you like?".to_string(),
-                    None,
-                );
-
-                let mut tui = tui_renderer.lock().await;
-                let feedback_result = tui.show_dialog(feedback_dialog);
-                drop(tui);
-
-                match feedback_result {
-                    Ok(crate::cli::tui::DialogResult::TextEntered(text)) => text,
-                    _ => return Some(Ok("Plan review cancelled.".to_string())),
-                }
+                None
             };
 
             output_manager.write_info(format!(
                 "{}",
-                "📝 Changes requested. Revising plan...".yellow()
+                "📝 Changes requested. Please type your feedback below.".yellow()
             ));
 
-            Some(Ok(format!(
-                "User reviewed the plan and requests the following changes:\n\n{}\n\n\
-                 Please revise the implementation plan based on this feedback and call PresentPlan again with the updated version.",
-                feedback
-            )))
+            let msg = if let Some(fb) = feedback {
+                format!(
+                    "User reviewed the plan and requests the following changes:\n\n{}\n\n\
+                     Please revise the implementation plan based on this feedback and call PresentPlan again with the updated version.",
+                    fb
+                )
+            } else {
+                "User wants to request changes to the plan. \
+                 Please ask the user what changes they would like, then revise the plan and call PresentPlan again with the updated version."
+                    .to_string()
+            };
+
+            Some(Ok(msg))
         }
         crate::cli::tui::DialogResult::Selected(2) => {
             // Rejected
@@ -2965,13 +3184,50 @@ mod tests {
             plan_path: std::path::PathBuf::from("/tmp/plan.md"),
             created_at: chrono::Utc::now(),
         };
-        for tool in &["bash", "Bash", "write", "Write", "edit", "Edit"] {
+        // Write/Edit are blocked in planning mode to enforce read-only exploration.
+        // Bash is allowed (subject to normal confirmation) so the AI can run
+        // read-only commands like `which gh`, `cargo check`, etc.
+        for tool in &["write", "Write", "edit", "Edit"] {
             assert!(
                 !EventLoop::is_tool_allowed_in_mode(tool, &mode),
                 "{} must NOT be allowed in planning mode",
                 tool
             );
         }
+    }
+
+    #[test]
+    fn test_plan_mode_allows_bash() {
+        let mode = ReplMode::Planning {
+            task: String::new(),
+            plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+            created_at: chrono::Utc::now(),
+        };
+        assert!(
+            EventLoop::is_tool_allowed_in_mode("bash", &mode),
+            "bash must be allowed in planning mode (with normal confirmation)"
+        );
+        assert!(
+            EventLoop::is_tool_allowed_in_mode("Bash", &mode),
+            "Bash must be allowed in planning mode"
+        );
+    }
+
+    #[test]
+    fn test_plan_mode_allows_enter_exit_plan_mode() {
+        let mode = ReplMode::Planning {
+            task: String::new(),
+            plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+            created_at: chrono::Utc::now(),
+        };
+        assert!(
+            EventLoop::is_tool_allowed_in_mode("EnterPlanMode", &mode),
+            "EnterPlanMode must be allowed in planning mode"
+        );
+        assert!(
+            EventLoop::is_tool_allowed_in_mode("ExitPlanMode", &mode),
+            "ExitPlanMode must be allowed in planning mode"
+        );
     }
 
     #[test]

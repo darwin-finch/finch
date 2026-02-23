@@ -30,6 +30,24 @@ impl<'a> StatusWidget<'a> {
     /// Get the style for a status line based on its type
     fn get_line_style(&self, line_type: &StatusLineType) -> Style {
         match line_type {
+            StatusLineType::SessionLabel => {
+                // Session label: bold, prominent
+                Style::default()
+                    .fg(self.colors.ui.cursor.to_color())
+                    .add_modifier(Modifier::BOLD)
+            }
+            StatusLineType::MemoryContext => {
+                // Memory context: subtle teal/cyan
+                Style::default().fg(Color::Cyan)
+            }
+            StatusLineType::ConversationTopic => {
+                // Conversation topic: bright white so it reads easily
+                Style::default().fg(Color::White)
+            }
+            StatusLineType::ConversationFocus => {
+                // Current focus: de-emphasised relative to the topic line
+                Style::default().fg(Color::DarkGray)
+            }
             StatusLineType::LiveStats => {
                 // Live stats: from color scheme
                 Style::default()

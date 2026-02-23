@@ -1013,4 +1013,80 @@ mod tests {
         pattern.created_by = Some("user@example.com".to_string());
         assert_eq!(pattern.created_by.as_deref(), Some("user@example.com"));
     }
+
+    // ── Regression tests for "Allow All" pattern matching ─────────────────────
+    // The auto-generated pattern was previously "tool_name:*" which never matched
+    // because the context_key format has no "tool_name:" prefix.
+    // Now it uses "*" which correctly matches any context_key.
+
+    #[test]
+    fn test_wildcard_star_matches_any_context_key() {
+        // The "Allow All" pattern: "*" on tool_name "bash" should match any bash call.
+        let pattern = ToolPattern::new("*".to_string(), "bash".to_string(), "Allow all bash".to_string());
+        let sig = ToolSignature {
+            tool_name: "bash".to_string(),
+            context_key: "cargo test in /Users/user/repos/finch".to_string(),
+            command: Some("cargo".to_string()),
+            args: Some("test".to_string()),
+            directory: Some("/Users/user/repos/finch".to_string()),
+        };
+        assert!(pattern.matches(&sig), "\"*\" pattern must match any bash context_key");
+    }
+
+    #[test]
+    fn test_wildcard_star_matches_read_context_key() {
+        // "read" tool context_key is "reading /path/to/file" — "*" must match.
+        let pattern = ToolPattern::new("*".to_string(), "read".to_string(), "Allow all reads".to_string());
+        let sig = ToolSignature {
+            tool_name: "read".to_string(),
+            context_key: "reading /Users/user/repos/finch/src/main.rs".to_string(),
+            command: None,
+            args: None,
+            directory: Some("/Users/user/repos/finch".to_string()),
+        };
+        assert!(pattern.matches(&sig), "\"*\" pattern must match read's context_key");
+    }
+
+    #[test]
+    fn test_old_broken_pattern_does_not_match_bash() {
+        // Regression: old auto-generated pattern "bash:*" must NOT match
+        // bash's context_key "cargo test in /project" (no "bash:" prefix in key).
+        let pattern = ToolPattern::new("bash:*".to_string(), "bash".to_string(), "old broken".to_string());
+        let sig = ToolSignature {
+            tool_name: "bash".to_string(),
+            context_key: "cargo test in /project".to_string(),
+            command: Some("cargo".to_string()),
+            args: Some("test".to_string()),
+            directory: Some("/project".to_string()),
+        };
+        assert!(!pattern.matches(&sig), "old \"bash:*\" pattern must NOT match bash context_key");
+    }
+
+    #[test]
+    fn test_old_broken_pattern_does_not_match_read() {
+        // Regression: old auto-generated "read:*" must NOT match "reading /path".
+        let pattern = ToolPattern::new("read:*".to_string(), "read".to_string(), "old broken".to_string());
+        let sig = ToolSignature {
+            tool_name: "read".to_string(),
+            context_key: "reading /Users/user/repos/finch/src/main.rs".to_string(),
+            command: None,
+            args: None,
+            directory: Some("/Users/user/repos/finch".to_string()),
+        };
+        assert!(!pattern.matches(&sig), "old \"read:*\" pattern must NOT match read context_key");
+    }
+
+    #[test]
+    fn test_wildcard_star_does_not_match_wrong_tool() {
+        // A "*" pattern on "bash" must NOT match a "read" call (tool_name gates it).
+        let pattern = ToolPattern::new("*".to_string(), "bash".to_string(), "bash only".to_string());
+        let sig = ToolSignature {
+            tool_name: "read".to_string(),
+            context_key: "reading /some/file".to_string(),
+            command: None,
+            args: None,
+            directory: None,
+        };
+        assert!(!pattern.matches(&sig), "\"*\" on bash must NOT match a read call");
+    }
 }

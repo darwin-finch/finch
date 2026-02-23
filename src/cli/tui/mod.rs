@@ -97,11 +97,16 @@ pub(crate) fn count_status_lines(status: &str) -> usize {
 /// cursor will be parked after draw_live_area() finishes repositioning it into
 /// the input area.
 ///
+/// This function assumes each input line occupies exactly one terminal row
+/// (no wrapping). `draw_live_area` uses inline physical-row computation instead,
+/// but this helper is retained for unit tests.
+///
 /// Parameters:
 /// - `total_rows`: total rows drawn in the live area (WorkUnit + sep + input + status)
 /// - `input_line_count`: number of input lines (≥ 1)
 /// - `cursor_row`: which input line the cursor is on (0-based)
 /// - `status_line_count`: number of status lines drawn (≥ 1)
+#[allow(dead_code)]
 pub(crate) fn compute_cursor_row_from_top(
     total_rows: usize,
     input_line_count: usize,
@@ -413,15 +418,21 @@ impl TuiRenderer {
             // ── 4. Input area ─────────────────────────────────────────────────
             let (cursor_row, cursor_col) = self.input_textarea.cursor();
             let lines = self.input_textarea.lines().to_vec();
-            let input_line_count = lines.len().max(1);
 
             let prompt = format!("{}❯{} ", CYAN, RESET);
             let prompt_vis_len: usize = 2; // visible chars: "❯ "
             let continuation = "  ";
+            let cont_vis_len: usize = 2;
+
+            // Record the rows count just before input so we know where input starts.
+            let rows_before_input = rows;
+
+            // Track physical terminal rows consumed by each input line (accounts for wrapping).
+            let mut input_phys_rows: Vec<usize> = Vec::new();
 
             if lines.is_empty() {
                 execute!(stdout, Print(&prompt))?;
-                rows += 1;
+                input_phys_rows.push(1);
             } else {
                 for (i, line) in lines.iter().enumerate() {
                     if i == 0 {
@@ -432,9 +443,24 @@ impl TuiRenderer {
                     if i < lines.len() - 1 {
                         execute!(stdout, Print("\r\n"))?;
                     }
-                    rows += 1;
+
+                    // Physical terminal rows = ceil((prefix_vis + text_vis) / term_width).
+                    // A line that exactly fills the terminal still counts as 1 physical row;
+                    // one that overflows wraps into additional rows.
+                    let prefix_vis = if i == 0 { prompt_vis_len } else { cont_vis_len };
+                    let text_vis = line.chars().count();
+                    let total_vis = prefix_vis + text_vis;
+                    let phys = if term_width > 0 {
+                        (total_vis.max(1) + term_width - 1) / term_width
+                    } else {
+                        1
+                    };
+                    input_phys_rows.push(phys.max(1));
                 }
             }
+
+            let total_input_phys: usize = input_phys_rows.iter().sum();
+            rows += total_input_phys;
 
             // ── 4b. Ghost text (dim suffix for command completions) ───────────
             if let Some(ref ghost) = self.ghost_text {
@@ -476,22 +502,51 @@ impl TuiRenderer {
             rows += status_line_count;
 
             // ── 6. Reposition cursor inside the input area ────────────────────
-            let rows_below_cursor = {
-                let input_below = input_line_count.saturating_sub(cursor_row + 1);
-                input_below + status_line_count
+            //
+            // After drawing all input lines and status lines the cursor is at the
+            // very bottom of the live area.  We compute how many physical terminal
+            // rows are below the cursor's current logical position and move up by
+            // that amount.  This correctly handles lines that wrap across multiple
+            // terminal rows.
+
+            let cursor_prefix_vis = if cursor_row == 0 { prompt_vis_len } else { cont_vis_len };
+
+            // Which physical sub-row within cursor_row's logical line is the cursor on?
+            let cursor_sub_row = if term_width > 0 {
+                (cursor_prefix_vis + cursor_col) / term_width
+            } else {
+                0
             };
+
+            // Physical rows remaining in the cursor's logical line after the cursor.
+            let phys_in_cursor_line = input_phys_rows.get(cursor_row).copied().unwrap_or(1);
+            let rows_in_cursor_line_below = phys_in_cursor_line.saturating_sub(1 + cursor_sub_row);
+
+            // Physical rows in input lines that come after cursor_row.
+            let input_below_phys: usize = input_phys_rows
+                .iter()
+                .skip(cursor_row + 1)
+                .sum::<usize>()
+                + rows_in_cursor_line_below;
+
+            let rows_below_cursor = input_below_phys + status_line_count;
             if rows_below_cursor > 0 {
                 execute!(stdout, cursor::MoveUp(rows_below_cursor as u16))?;
             }
-            let col = if cursor_row == 0 {
-                prompt_vis_len + cursor_col
+
+            // Column within the current physical sub-row (accounts for wrapping).
+            let col = if term_width > 0 {
+                (cursor_prefix_vis + cursor_col) % term_width
             } else {
-                continuation.len() + cursor_col
+                cursor_prefix_vis + cursor_col
             };
             execute!(stdout, cursor::MoveToColumn(col as u16))?;
 
-            cursor_row_from_top =
-                compute_cursor_row_from_top(rows, input_line_count, cursor_row, status_line_count);
+            // Compute cursor_row_from_top: physical rows from top of live area to cursor.
+            let cursor_phys_above: usize = input_phys_rows[..cursor_row.min(input_phys_rows.len())]
+                .iter()
+                .sum();
+            cursor_row_from_top = rows_before_input + cursor_phys_above + cursor_sub_row;
         }
 
         execute!(stdout, EndSynchronizedUpdate)?;
@@ -694,7 +749,10 @@ impl TuiRenderer {
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
                     Event::Key(key) => match (key.code, key.modifiers) {
-                        (KeyCode::Enter, KeyModifiers::SHIFT) => {
+                        // Shift+Enter or Alt/Option+Enter: insert newline instead of submit.
+                        // Standard VT100 raw mode never sends SHIFT for Enter on macOS —
+                        // Option+Enter arrives as KeyCode::Enter + KeyModifiers::ALT.
+                        (KeyCode::Enter, m) if m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
                             self.input_textarea.input(Event::Key(key));
                         }
                         (KeyCode::Enter, _) => {
@@ -805,7 +863,34 @@ impl TuiRenderer {
         execute!(stdout, Print(format!("{}\r\n", div)))?;
         rows += 1;
 
-        // Options
+        // Options — when custom text mode is active, show text input instead
+        if dialog.custom_mode_active {
+            let input_text = dialog.custom_input.as_deref().unwrap_or("");
+            execute!(
+                stdout,
+                Print(format!("│  {:<w$}  │\r\n", "Enter your response:", w = inner))
+            )?;
+            rows += 1;
+            // Show input field with cursor marker
+            let cursor = dialog.custom_cursor_pos;
+            let before: String = input_text.chars().take(cursor).collect();
+            let after: String = input_text.chars().skip(cursor).collect();
+            let with_cursor = format!("{}\x1b[7m \x1b[m{}", before, after); // block cursor
+            let visible = format!("> {}", input_text);
+            let _ = with_cursor; // used below for display
+            execute!(
+                stdout,
+                Print(format!(
+                    "│  > {}{}\x1b[7m \x1b[m{}{:<w$}  │\r\n",
+                    DIM_GRAY,
+                    before,
+                    RESET,
+                    after,
+                    w = inner.saturating_sub(3 + visible.len())
+                ))
+            )?;
+            rows += 1;
+        } else {
         match &dialog.dialog_type {
             DialogType::Select {
                 options,
@@ -891,8 +976,14 @@ impl TuiRenderer {
             }
         }
 
+        } // end else (custom_mode_active)
+
         execute!(stdout, Print(format!("{}\r\n", div)))?;
-        let help = "↑/↓ Navigate  Enter Select  Esc Cancel";
+        let help = if dialog.custom_mode_active {
+            "Enter Submit  Esc Cancel"
+        } else {
+            "↑/↓ Navigate  Enter Select  Esc Cancel"
+        };
         execute!(
             stdout,
             Print(format!(
@@ -1286,5 +1377,111 @@ mod tests {
         assert!(s.contains("history"), "should mention history: {}", s);
         assert!(s.contains("/help"), "should mention /help: {}", s);
         assert!(s.contains("Ctrl+C"), "should mention Ctrl+C: {}", s);
+    }
+
+    // ── Physical row regression tests ─────────────────────────────────────────
+    // Regression for the "separator spam" bug: when input text wrapped past the
+    // terminal width, draw_live_area() counted 1 row per logical line instead of
+    // the actual number of physical terminal rows, so erase_live_area() didn't
+    // clear enough rows and left old separator lines in the scrollback.
+    //
+    // The physical row formula: ceil((prefix_vis + text_vis) / term_width) ≥ 1
+
+    fn phys_rows(prefix_vis: usize, text_vis: usize, term_width: usize) -> usize {
+        if term_width == 0 {
+            return 1;
+        }
+        ((prefix_vis + text_vis).max(1) + term_width - 1) / term_width
+    }
+
+    #[test]
+    fn phys_rows_short_line_is_one_row() {
+        // "❯ hello" — 2 prefix + 5 text = 7 chars, fits in 80-col terminal → 1 row
+        assert_eq!(phys_rows(2, 5, 80), 1);
+    }
+
+    #[test]
+    fn phys_rows_exact_fill_is_one_row() {
+        // Exactly fills terminal width → still 1 row (no wrap)
+        assert_eq!(phys_rows(2, 78, 80), 1);
+    }
+
+    #[test]
+    fn phys_rows_one_over_wraps_to_two() {
+        // 2 + 79 = 81 chars in 80-col terminal → 2 rows
+        assert_eq!(phys_rows(2, 79, 80), 2);
+    }
+
+    #[test]
+    fn phys_rows_double_width_wraps_to_three() {
+        // 2 + 158 = 160 chars in 80-col terminal → ceil(160/80) = 2
+        assert_eq!(phys_rows(2, 158, 80), 2);
+    }
+
+    #[test]
+    fn phys_rows_empty_line_is_one_row() {
+        // Empty input still occupies 1 terminal row (for the prompt)
+        assert_eq!(phys_rows(2, 0, 80), 1);
+    }
+
+    #[test]
+    fn phys_rows_narrow_terminal_wraps_aggressively() {
+        // 2 + 10 = 12 chars in 10-col terminal → ceil(12/10) = 2
+        assert_eq!(phys_rows(2, 10, 10), 2);
+    }
+
+    // ── Dialog custom-mode regression tests ───────────────────────────────────
+    // Regression: pressing 'o' in a select_with_custom dialog must set
+    // custom_mode_active=true and accumulate typed characters in custom_input.
+    // Previously the rendering checked dialog_type instead of custom_mode_active,
+    // so the text input field was invisible even though state was updating.
+
+    #[test]
+    fn dialog_custom_mode_activates_on_o_press() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut d = Dialog::select_with_custom("Title", vec![DialogOption::new("Option A")]);
+        assert!(!d.custom_mode_active);
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(d.custom_mode_active, "pressing 'o' must activate custom input mode");
+    }
+
+    #[test]
+    fn dialog_custom_mode_accumulates_text() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut d = Dialog::select_with_custom("Title", vec![DialogOption::new("A")]);
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('h')));
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('i')));
+        let text = d.custom_input.as_deref().unwrap_or("");
+        assert_eq!(text, "hi", "typed chars must accumulate in custom_input");
+    }
+
+    #[test]
+    fn dialog_custom_mode_submit_returns_custom_text() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut d = Dialog::select_with_custom("Title", vec![DialogOption::new("A")]);
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('f')));
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        let result = d.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(result, Some(DialogResult::CustomText(ref s)) if s == "foo"),
+            "Enter in custom mode must submit CustomText: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn dialog_custom_mode_esc_exits_without_submit() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut d = Dialog::select_with_custom("Title", vec![DialogOption::new("A")]);
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+        d.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        assert!(!d.custom_mode_active, "Esc must exit custom mode");
+        // text should be cleared
+        let text = d.custom_input.as_deref().unwrap_or("");
+        assert!(text.is_empty(), "Esc must clear custom_input: {:?}", text);
     }
 }
