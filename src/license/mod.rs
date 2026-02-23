@@ -21,13 +21,15 @@ use serde::{Deserialize, Serialize};
 
 /// Ed25519 public key (compressed, 32 bytes).
 ///
-/// PLACEHOLDER — replace with your actual key before shipping.
-/// Generate a keypair:
-///   openssl genpkey -algorithm ed25519 -out private.pem
-///   openssl pkey -in private.pem -pubout -outform DER | tail -c 32 | xxd -p -c 32
-///
-/// Then paste the 32-byte hex value as a Rust byte array here.
-const PUBLIC_KEY_BYTES: &[u8; 32] = &[0u8; 32]; // PLACEHOLDER
+/// Ed25519 public key — d192687b60094f0a6ec1e24a9a1ffe1bf0892c594cafdc940235eac502d804ca
+/// Private key stored in 1Password: "Finch License Signing Key (Ed25519)" (Employee vault)
+/// Local copy: ~/.finch/license_private.pem
+const PUBLIC_KEY_BYTES: &[u8; 32] = &[
+    0xd1, 0x92, 0x68, 0x7b, 0x60, 0x09, 0x4f, 0x0a,
+    0x6e, 0xc1, 0xe2, 0x4a, 0x9a, 0x1f, 0xfe, 0x1b,
+    0xf0, 0x89, 0x2c, 0x59, 0x4c, 0xaf, 0xdc, 0x94,
+    0x02, 0x35, 0xea, 0xc5, 0x02, 0xd8, 0x04, 0xca,
+];
 
 // ---------------------------------------------------------------------------
 // Types
@@ -139,6 +141,13 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
+    /// Golden key signed with the real production private key.
+    /// Payload: ci-test@finch.internal / "CI Test" / exp 2099-01-01
+    /// Regenerate with: python3 scripts/issue_license.py ci-test@finch.internal "CI Test"
+    ///   --key ~/.finch/license_private.pem --years 73
+    /// (or see scripts/issue_license.py for exact invocation)
+    const GOLDEN_KEY: &str = "FINCH-eyJzdWIiOiJjaS10ZXN0QGZpbmNoLmludGVybmFsIiwibmFtZSI6IkNJIFRlc3QiLCJ0aWVyIjoiY29tbWVyY2lhbCIsImlzcyI6IjIwMjYtMDEtMDEiLCJleHAiOiIyMDk5LTAxLTAxIn0.d6cVaWf1rhk4zJrwrcpLOC9SfjKhSLjCaq-HY4Zh6HuKmCqQXFUFisPeHt7sF3c3CEdToI78hXNfF03DOrcRDw";
+
     /// Build a well-formed FINCH-... key signed with `signing_key`.
     fn make_test_key(signing_key: &SigningKey, payload: &LicensePayload) -> String {
         let payload_json = serde_json::to_vec(payload).unwrap();
@@ -234,6 +243,30 @@ mod tests {
             "Expected separator mention in: {}",
             msg
         );
+    }
+
+    /// Tests the full production path: PUBLIC_KEY_BYTES → validate_key() → ParsedLicense.
+    /// Uses a key pre-signed with the real Ed25519 private key; expires 2099-01-01.
+    #[test]
+    fn test_validate_key_production_path_golden_key() {
+        let result = validate_key(GOLDEN_KEY);
+        assert!(result.is_ok(), "Golden key should validate: {:?}", result.err());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.email, "ci-test@finch.internal");
+        assert_eq!(parsed.name, "CI Test");
+        assert_eq!(
+            parsed.expires_at,
+            chrono::NaiveDate::from_ymd_opt(2099, 1, 1).unwrap()
+        );
+    }
+
+    /// Ensure a key signed with a *different* (test) private key is rejected by validate_key().
+    #[test]
+    fn test_validate_key_rejects_wrong_signer() {
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let key = make_test_key(&sk, &future_payload());
+        let result = validate_key(&key);
+        assert!(result.is_err(), "Key from wrong signer must be rejected by production validate_key");
     }
 
     #[test]
