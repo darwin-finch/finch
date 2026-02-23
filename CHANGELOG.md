@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-22
+
 ### Added
 - **`finch license` command**: activate, view, and remove a commercial license key.
   - `finch license status` — show current license (Noncommercial or Commercial)
