@@ -172,7 +172,7 @@ impl AgentLoop {
                     completed_descs.push(task.description.clone());
 
                     // Trigger reflection every N tasks
-                    if completed_count % self.agent_config.reflect_every == 0 {
+                    if completed_count.is_multiple_of(self.agent_config.reflect_every) {
                         println!("Running self-reflection after {} tasks...", completed_count);
                         match reflector
                             .reflect(&persona, persona_path.as_deref(), &completed_descs)

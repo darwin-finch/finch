@@ -265,7 +265,7 @@ impl EventLoop {
                     let suppress_until = cfg.license.notice_suppress_until
                         .as_deref()
                         .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
-                    let should_show = suppress_until.map_or(true, |d| today > d);
+                    let should_show = suppress_until.is_none_or(|d| today > d);
                     if should_show {
                         self.output_manager.write_info(
                             "Using Finch commercially? $10/yr supports development.\n  \
@@ -1054,23 +1054,7 @@ impl EventLoop {
             }
         };
 
-        const MAX_TOOL_ITERATIONS: usize = 100;
-        #[allow(unused_assignments)]
-        let mut iteration = 0;
-
-        loop {
-            if iteration >= MAX_TOOL_ITERATIONS {
-                let _ = event_tx.send(ReplEvent::QueryFailed {
-                    query_id,
-                    error: format!("Max tool iterations ({}) reached", MAX_TOOL_ITERATIONS),
-                });
-                return;
-            }
-
-            iteration += 1;
-            let _ = iteration; // suppress unused_assignment warning
-
-            // Get conversation context
+        // Get conversation context
             let messages = conversation.read().await.get_messages();
             let caps = generator.capabilities();
 
@@ -1217,7 +1201,7 @@ impl EventLoop {
                             let current_mode = mode.read().await;
                             for tool_use in tool_uses {
                                 // Check if tool is allowed in current mode
-                                if !Self::is_tool_allowed_in_mode(&tool_use.name, &*current_mode) {
+                                if !Self::is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
                                     // Tool blocked by plan mode - add error row and send result
                                     let label = format_tool_label(&tool_use.name, &tool_use.input);
                                     let row_idx = work_unit.add_row(label);
@@ -1368,7 +1352,7 @@ impl EventLoop {
                         let current_mode = mode.read().await;
                         for tool_use in tool_uses {
                             // Check if tool is allowed in current mode
-                            if !Self::is_tool_allowed_in_mode(&tool_use.name, &*current_mode) {
+                            if !Self::is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
                                 let label = format_tool_label(&tool_use.name, &tool_use.input);
                                 let row_idx = work_unit.add_row(label);
                                 work_unit.fail_row(row_idx, "blocked in plan mode");
@@ -1428,17 +1412,14 @@ impl EventLoop {
                     // No tools — mark WorkUnit complete
                     work_unit.set_complete();
                     tracing::debug!("Query complete (no tools), non-streaming finished");
-                    return;
                 }
                 Err(e) => {
                     let _ = event_tx.send(ReplEvent::QueryFailed {
                         query_id,
                         error: format!("{}", e),
                     });
-                    return;
                 }
             }
-        }
     }
 
     /// Handle an event from the event channel

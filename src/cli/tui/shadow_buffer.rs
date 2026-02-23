@@ -109,7 +109,7 @@ impl ShadowBuffer {
 
         // Calculate how many rows this line needs
         let chars_per_row = self.width.max(1);
-        let num_rows = (visible_chars.len() + chars_per_row - 1) / chars_per_row;
+        let num_rows = visible_chars.len().div_ceil(chars_per_row);
         let num_rows = num_rows.min(self.height - y); // Don't exceed buffer
 
         // Write wrapped chunks with style
@@ -233,7 +233,7 @@ pub fn visible_length(s: &str) -> usize {
                 if chars.peek() == Some(&'[') {
                     // CSI sequence: \x1b[...m (color codes, cursor movement)
                     chars.next(); // consume '['
-                    while let Some(ch) = chars.next() {
+                    for ch in chars.by_ref() {
                         if ch.is_ascii_alphabetic() {
                             break; // Sequence terminator
                         }
@@ -282,7 +282,7 @@ pub fn extract_visible_chars(s: &str) -> (Vec<char>, Vec<usize>) {
                 // Skip ANSI escape sequence
                 if chars.peek() == Some(&'[') {
                     chars.next();
-                    while let Some(ch) = chars.next() {
+                    for ch in chars.by_ref() {
                         if ch.is_ascii_alphabetic() {
                             break;
                         }

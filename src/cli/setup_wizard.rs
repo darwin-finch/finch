@@ -957,27 +957,21 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     }
                 }
                 KeyCode::Char(c) => {
-                    match adding_provider {
-                        Some(AddProviderStep::ConfigureRemote { model, api_key, focused_field, .. }) => {
-                            match *focused_field {
-                                1 => { model.push(c); }
-                                2 => { api_key.push(c); }
-                                _ => {}
-                            }
+                    if let Some(AddProviderStep::ConfigureRemote { model, api_key, focused_field, .. }) = adding_provider {
+                        match *focused_field {
+                            1 => { model.push(c); }
+                            2 => { api_key.push(c); }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 KeyCode::Backspace => {
-                    match adding_provider {
-                        Some(AddProviderStep::ConfigureRemote { model, api_key, focused_field, .. }) => {
-                            match *focused_field {
-                                1 => { model.pop(); }
-                                2 => { api_key.pop(); }
-                                _ => {}
-                            }
+                    if let Some(AddProviderStep::ConfigureRemote { model, api_key, focused_field, .. }) = adding_provider {
+                        match *focused_field {
+                            1 => { model.pop(); }
+                            2 => { api_key.pop(); }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 KeyCode::Enter => {
@@ -2103,9 +2097,7 @@ fn render_models_section(
     }
 
     // Instructions (chunks[4])
-    let instructions_text = if editing_mode {
-        "Type here | Enter/Esc: Save & return"
-    } else if editing_model_mode {
+    let instructions_text = if editing_mode || editing_model_mode {
         "Type here | Enter/Esc: Save & return"
     } else {
         "E: API key | M: Model name | P: Make primary | A: Add | D: Remove | Tab: Next"
@@ -2589,7 +2581,7 @@ fn render_features_section(
     let mut items: Vec<ListItem> = Vec::new();
     let mut list_idx = 0usize; // tracks which visual row we're building
 
-    for (_feat_idx, (name, enabled, desc)) in bool_features.iter().enumerate() {
+    for (name, enabled, desc) in bool_features.iter() {
         // Insert HF token row before the appropriate bool feature
         if list_idx == hf_idx {
             let is_hf_selected = selected_idx == hf_idx;
@@ -2627,7 +2619,7 @@ fn render_features_section(
             Line::from(vec![
                 Span::raw(prefix),
                 Span::raw(format!("{} ", checkbox)),
-                Span::styled(*name, name_style.clone()),
+                Span::styled(*name, name_style),
                 Span::styled(suffix, name_style),
             ]),
             Line::from(vec![

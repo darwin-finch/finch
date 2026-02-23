@@ -231,7 +231,7 @@ impl ModelDownloader {
                     tracing::info!("Single model file not found, looking for sharded files...");
 
                     let mut shard_idx = 1;
-                    loop {
+                    'shard_loop: loop {
                         // Try downloading shards sequentially: model-00001-of-00002.safetensors, etc.
                         let mut found_this_shard = false;
 
@@ -254,7 +254,7 @@ impl ModelDownloader {
                                     // If we found shard N of N, we're done
                                     if shard_idx == total {
                                         tracing::info!("✓ Downloaded all {} shards", total);
-                                        shard_idx = total + 1; // Exit outer loop
+                                        break 'shard_loop;
                                     }
                                     break; // Move to next shard
                                 }

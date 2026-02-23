@@ -159,7 +159,7 @@ impl ThresholdRouter {
         let stats = self
             .category_stats
             .entry(category)
-            .or_insert_with(CategoryStats::default);
+            .or_default();
 
         stats.local_attempts += 1;
 
@@ -277,16 +277,15 @@ impl ThresholdRouter {
         }
 
         // Check for greetings (short queries)
-        if words.len() <= 3 {
-            if lower.starts_with("hi")
+        if words.len() <= 3
+            && (lower.starts_with("hi")
                 || lower.starts_with("hello")
                 || lower.starts_with("hey")
                 || lower == "good morning"
-                || lower == "good afternoon"
+                || lower == "good afternoon")
             {
                 return QueryCategory::Greeting;
             }
-        }
 
         // Check for explanation requests
         if lower.contains("explain") || lower.contains("describe") || lower.starts_with("why") {
@@ -354,6 +353,7 @@ impl ThresholdRouter {
         let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)?;
 
         // Acquire exclusive lock (blocks until available)

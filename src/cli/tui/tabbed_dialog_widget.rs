@@ -162,7 +162,7 @@ impl<'a> TabbedDialogWidget<'a> {
         // Render custom input field inline (always visible)
         if tab_state.custom_mode_active {
             // Show custom text input with cursor at custom_cursor_pos
-            let input_text = tab_state.custom_input.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let input_text = tab_state.custom_input.as_deref().unwrap_or("");
             let cursor_pos = tab_state.custom_cursor_pos;
             let mut spans = vec![Span::styled(
                 "❯ ",

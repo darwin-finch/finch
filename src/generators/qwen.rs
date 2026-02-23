@@ -56,12 +56,13 @@ impl Generator for QwenGenerator {
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<GeneratorResponse> {
         // If tools provided and executor available, use multi-turn tool loop
-        if tools.is_some() && self.tool_executor.is_some() {
-            self.generate_with_tools(messages, tools.unwrap()).await
-        } else {
-            // Simple single-turn generation (no tools)
-            self.generate_single_turn(messages).await
+        if let Some(tools) = tools {
+            if self.tool_executor.is_some() {
+                return self.generate_with_tools(messages, tools).await;
+            }
         }
+        // Simple single-turn generation (no tools)
+        self.generate_single_turn(messages).await
     }
 
     async fn generate_stream(

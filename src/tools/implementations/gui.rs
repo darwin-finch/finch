@@ -7,8 +7,6 @@
 //
 // NOTE: Full implementation requires testing on macOS with proper accessibility permissions
 
-#![cfg(target_os = "macos")]
-
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};

@@ -312,7 +312,7 @@ impl BackendConfig {
         )
         .unwrap_or_else(|| {
             // Fallback for compatibility
-            format!("onnx-community/Qwen2.5-1.5B-Instruct")
+            "onnx-community/Qwen2.5-1.5B-Instruct".to_string()
         })
     }
 

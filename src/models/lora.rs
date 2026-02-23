@@ -514,6 +514,12 @@ pub struct TrainingStats {
     pub loss: f64,
 }
 
+impl Default for TrainingStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrainingStats {
     pub fn new() -> Self {
         Self {

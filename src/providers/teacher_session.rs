@@ -23,6 +23,7 @@ pub struct TeacherSession {
 
 /// Tracks the state of conversation with teacher
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct ConversationState {
     /// Number of messages sent to teacher in last call
     last_teacher_message_count: usize,
@@ -37,16 +38,6 @@ pub struct ConversationState {
     teacher_call_count: usize,
 }
 
-impl Default for ConversationState {
-    fn default() -> Self {
-        Self {
-            last_teacher_message_count: 0,
-            total_input_tokens: 0,
-            estimated_cached_tokens: 0,
-            teacher_call_count: 0,
-        }
-    }
-}
 
 /// Configuration for teacher context management
 #[derive(Debug, Clone)]

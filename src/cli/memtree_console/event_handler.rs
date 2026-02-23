@@ -22,6 +22,12 @@ pub struct EventHandler {
     pending_tools: HashMap<(Uuid, String), NodeId>,
 }
 
+impl Default for EventHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EventHandler {
     pub fn new() -> Self {
         Self {

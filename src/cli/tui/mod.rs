@@ -398,10 +398,10 @@ impl TuiRenderer {
 
         // ── 3. Dialog or input ────────────────────────────────────────────────
         let cursor_row_from_top;
-        if self.active_dialog.is_some() {
+        if let Some(dialog) = &self.active_dialog {
             let dialog_rows = Self::draw_dialog_inline_static(
                 &mut stdout,
-                self.active_dialog.as_ref().expect("active_dialog is Some — guarded above"),
+                dialog,
             )?;
             rows += dialog_rows;
             // Dialog drawing leaves the cursor at the last drawn row (no reposition).
@@ -658,7 +658,7 @@ impl TuiRenderer {
         // The `\r\n` ensures the shell prompt lands on its own fresh line rather
         // than overwriting content from the erased live area.
         let _ = execute!(io::stdout(), cursor::Show, ResetColor);
-        let _ = print!("\r\n");
+        print!("\r\n");
         // Flush pending output BEFORE leaving raw mode — otherwise some terminals
         // silently discard buffered bytes after the mode switch.
         let _ = io::stdout().flush();

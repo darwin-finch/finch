@@ -59,7 +59,6 @@ impl LocalGenerator {
         let response_generator =
             TemplateGenerator::with_models(pattern_classifier.clone(), neural_generator, &model_name);
 
-        let model_name = model_name; // capture before move
         Self {
             pattern_classifier,
             response_generator,

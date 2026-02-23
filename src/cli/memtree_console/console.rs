@@ -103,8 +103,8 @@ impl MemTreeConsole {
 
     /// Generate a new unique node ID
     fn next_id(&mut self) -> NodeId {
-        let id = self.nodes.len() as NodeId;
-        id
+        
+        self.nodes.len() as NodeId
     }
 
     /// Add a user message node

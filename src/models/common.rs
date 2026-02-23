@@ -80,8 +80,10 @@ impl ModelConfig {
 /// - DirectML (Windows GPUs)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[deprecated(note = "Use ONNX Runtime execution providers instead")]
+#[derive(Default)]
 pub enum DevicePreference {
     /// Use best available device
+    #[default]
     Auto,
     /// Force CPU usage
     Cpu,
@@ -89,11 +91,6 @@ pub enum DevicePreference {
     Metal,
 }
 
-impl Default for DevicePreference {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 // Phase 4: Device functions removed (Candle-based)
 // ONNX Runtime handles device selection via execution providers

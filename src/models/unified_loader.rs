@@ -14,9 +14,11 @@ use super::model_selector::QwenSize;
 
 /// Inference provider selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum InferenceProvider {
     /// ONNX Runtime (recommended, works on all platforms)
     #[serde(rename = "onnx")]
+    #[default]
     Onnx,
     /// Candle (alternative, native Rust implementation)
     #[cfg(feature = "candle")]
@@ -24,11 +26,6 @@ pub enum InferenceProvider {
     Candle,
 }
 
-impl Default for InferenceProvider {
-    fn default() -> Self {
-        Self::Onnx  // ONNX is the default provider
-    }
-}
 
 impl InferenceProvider {
     /// Get human-readable name
@@ -390,7 +387,7 @@ impl UnifiedModelLoader {
         let repo_id = self.resolve_repository(config)?;
 
         // Extract model name from repo ID (e.g., "onnx-community/Qwen2.5-1.5B-Instruct" → "Qwen2.5-1.5B-Instruct")
-        let model_name = repo_id.split('/').last().unwrap_or(&repo_id).to_string();
+        let model_name = repo_id.split('/').next_back().unwrap_or(&repo_id).to_string();
 
         // Map ExecutionTarget to ONNX Runtime execution providers
         use super::loaders::onnx_config::ExecutionProvider;

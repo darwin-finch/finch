@@ -1077,7 +1077,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 // Extract port from bind_address
                 let port = config.server.bind_address
                     .split(':')
-                    .last()
+                    .next_back()
                     .and_then(|p| p.parse::<u16>().ok())
                     .unwrap_or(finch::config::constants::DEFAULT_DAEMON_PORT);
 

@@ -21,6 +21,7 @@ const MAX_VISIBLE_SUGGESTIONS: usize = 8;
 
 /// Autocomplete state for TUI rendering
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct AutocompleteState {
     /// Matched commands from registry
     pub matches: Vec<CommandSpec>,
@@ -30,15 +31,6 @@ pub struct AutocompleteState {
     pub visible: bool,
 }
 
-impl Default for AutocompleteState {
-    fn default() -> Self {
-        Self {
-            matches: Vec::new(),
-            selected_index: 0,
-            visible: false,
-        }
-    }
-}
 
 impl AutocompleteState {
     pub fn new() -> Self {

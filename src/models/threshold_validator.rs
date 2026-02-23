@@ -31,6 +31,7 @@ pub struct QualityStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct SignalStats {
     pub present_and_good: usize,
     pub present_and_bad: usize,
@@ -38,16 +39,6 @@ pub struct SignalStats {
     pub absent_and_bad: usize,
 }
 
-impl Default for SignalStats {
-    fn default() -> Self {
-        Self {
-            present_and_good: 0,
-            present_and_bad: 0,
-            absent_and_good: 0,
-            absent_and_bad: 0,
-        }
-    }
-}
 
 impl SignalStats {
     fn precision(&self) -> f64 {
@@ -225,7 +216,7 @@ impl ThresholdValidator {
                 .stats
                 .signal_stats
                 .entry(*signal)
-                .or_insert_with(SignalStats::default);
+                .or_default();
 
             let present = signals_present.contains(signal);
 

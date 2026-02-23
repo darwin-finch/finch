@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 /// Predefined color themes for different terminal backgrounds
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ColorTheme {
     /// White text on black background (default)
+    #[default]
     Dark,
     /// Black text on white background
     Light,
@@ -186,11 +188,6 @@ impl ColorTheme {
     }
 }
 
-impl Default for ColorTheme {
-    fn default() -> Self {
-        Self::Dark
-    }
-}
 
 /// Color scheme for TUI elements
 #[derive(Debug, Clone, Serialize, Deserialize)]

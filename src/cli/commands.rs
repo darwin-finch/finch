@@ -323,8 +323,7 @@ pub fn handle_command(
 }
 
 pub fn format_help() -> String {
-    format!(
-        "\x1b[1;36m╔═══════════════════════════════════════════════════════════════════════╗\x1b[0m\n\
+    "\x1b[1;36m╔═══════════════════════════════════════════════════════════════════════╗\x1b[0m\n\
          \x1b[1;36m║\x1b[0m                   \x1b[1;32mFinch Help - Commands & Shortcuts\x1b[0m                   \x1b[1;36m║\x1b[0m\n\
          \x1b[1;36m╚═══════════════════════════════════════════════════════════════════════╝\x1b[0m\n\n\
          \x1b[1;33m📋 Basic Commands:\x1b[0m\n\
@@ -422,8 +421,7 @@ pub fn format_help() -> String {
          \x1b[90m  • Can you read my Cargo.toml and explain the dependencies?\x1b[0m\n\
          \x1b[90m  • Find all TODO comments in my code\x1b[0m\n\n\
          \x1b[1;36m─────────────────────────────────────────────────────────────────────────\x1b[0m\n\
-         \x1b[90mTip: Use Ctrl+C to cancel long-running queries\x1b[0m"
-    )
+         \x1b[90mTip: Use Ctrl+C to cancel long-running queries\x1b[0m".to_string()
 }
 
 pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {

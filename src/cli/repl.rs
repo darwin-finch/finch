@@ -2052,7 +2052,7 @@ impl Repl {
                     "    Matches: {} | Last used: {}\n",
                     pattern.match_count, last_used_str
                 ));
-                output.push_str("\n");
+                output.push('\n');
             }
         }
 
@@ -2069,7 +2069,7 @@ impl Repl {
                 ));
                 output.push_str(&format!("    Signature: {}\n", approval.signature));
                 output.push_str(&format!("    Matches: {}\n", approval.match_count));
-                output.push_str("\n");
+                output.push('\n');
             }
         }
 
@@ -2819,7 +2819,7 @@ impl Repl {
 
         // Checkpoint every 10 queries
         let router_stats = self.router.stats(); // CHANGED: use router.stats()
-        if router_stats.total_queries % 10 == 0 && router_stats.total_queries > 0 {
+        if router_stats.total_queries.is_multiple_of(10) && router_stats.total_queries > 0 {
             let _ = self.save_models().await; // Ignore errors during checkpoint
         }
 
@@ -2932,9 +2932,7 @@ impl Repl {
         };
 
         // Create feedback message
-        let feedback = note
-            .as_ref()
-            .map(|s| s.clone())
+        let feedback = note.clone()
             .unwrap_or_else(|| match weight as i32 {
                 10 => "Critical issue that needs correction".to_string(),
                 3 => "Could be improved".to_string(),

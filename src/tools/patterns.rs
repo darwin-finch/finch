@@ -10,8 +10,10 @@ use super::executor::ToolSignature;
 /// Type of pattern matching to use
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum PatternType {
     /// Wildcard matching with * and **
+    #[default]
     Wildcard,
     /// Regular expression matching
     Regex,
@@ -19,11 +21,6 @@ pub enum PatternType {
     Structured,
 }
 
-impl Default for PatternType {
-    fn default() -> Self {
-        PatternType::Wildcard
-    }
-}
 
 /// A pattern that can match multiple tool signatures using wildcards or regex
 #[derive(Debug, Clone, Serialize, Deserialize)]

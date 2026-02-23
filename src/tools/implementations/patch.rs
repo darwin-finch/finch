@@ -138,8 +138,8 @@ fn parse_hunks(patch: &str) -> Result<Vec<Hunk>> {
                 } else {
                     hunk.lines.push(('+', rest.to_string()));
                 }
-            } else if raw_line.starts_with(' ') {
-                hunk.lines.push((' ', raw_line[1..].to_string()));
+            } else if let Some(rest) = raw_line.strip_prefix(' ') {
+                hunk.lines.push((' ', rest.to_string()));
             } else if raw_line.is_empty() {
                 // Blank lines inside a hunk are treated as context
                 hunk.lines.push((' ', String::new()));

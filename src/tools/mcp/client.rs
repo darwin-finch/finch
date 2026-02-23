@@ -189,7 +189,7 @@ fn convert_mcp_schema(mcp_schema: &Value) -> ToolInputSchema {
     let required = mcp_schema.get("required")
         .and_then(|r| r.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_else(Vec::new);
+        .unwrap_or_default();
 
     ToolInputSchema {
         schema_type: "object".to_string(),

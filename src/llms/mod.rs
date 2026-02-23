@@ -118,7 +118,7 @@ impl LLM for ProviderLLM {
 
 /// Create an LLM instance from a teacher configuration
 fn create_llm_from_teacher(teacher: &TeacherEntry) -> Result<ProviderLLM> {
-    let provider = providers::factory::create_providers(&[teacher.clone()])?
+    let provider = providers::factory::create_providers(std::slice::from_ref(teacher))?
         .into_iter()
         .next()
         .context("Failed to create provider")?;

@@ -443,9 +443,7 @@ pub async fn handle_chat_completions(
     // Extract user query for routing
     let user_query = request
         .messages
-        .iter()
-        .filter(|m| m.role == "user")
-        .last()
+        .iter().rfind(|m| m.role == "user")
         .and_then(|m| m.content.as_deref())
         .unwrap_or("");
 

@@ -49,7 +49,7 @@ impl Tool for BashTool {
 
         if !stderr.is_empty() {
             if !result.is_empty() {
-                result.push_str("\n");
+                result.push('\n');
             }
             result.push_str("STDERR:\n");
             result.push_str(&stderr);
@@ -57,7 +57,7 @@ impl Tool for BashTool {
 
         if exit_code != 0 {
             if !result.is_empty() {
-                result.push_str("\n");
+                result.push('\n');
             }
             result.push_str(&format!("Exit code: {}", exit_code));
         }

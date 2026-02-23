@@ -82,7 +82,7 @@ pub trait UserFriendlyError {
 
 impl<T> UserFriendlyError for Result<T> {
     fn user_context(self, message: &str) -> Self {
-        self.with_context(|| format!("{}", message))
+        self.with_context(|| message.to_string())
     }
 
     fn user_context_with_suggestion(self, problem: &str, suggestion: &str) -> Self {
