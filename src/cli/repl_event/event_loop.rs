@@ -1366,6 +1366,16 @@ impl EventLoop {
                         .await
                         .add_assistant_message(text.clone());
 
+                    // Update context usage indicator now that the message is committed
+                    {
+                        let conv = conversation.read().await;
+                        let pct = (conv.compaction_percent_remaining() * 100.0) as u8;
+                        status_bar.update_line(
+                            crate::cli::status_bar::StatusLineType::CompactionPercent,
+                            format!("Context left until auto-compact: {}%", pct),
+                        );
+                    }
+
                     // Update query state
                     query_states
                         .update_state(
@@ -1653,6 +1663,9 @@ impl EventLoop {
                 } else {
                     tracing::debug!("[EVENT_LOOP] Tools executing, skipping duplicate message");
                 }
+
+                // Update context usage indicator now that the message is committed
+                self.update_compaction_status().await;
 
                 // Render TUI to write the complete message to scrollback
                 self.render_tui().await?;
