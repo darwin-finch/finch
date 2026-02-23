@@ -24,6 +24,10 @@ pub mod fallback_chain;
 // Teacher session management with context optimization
 pub mod teacher_session;
 
+// Universal alignment prompt for cross-provider behavioral consistency
+pub mod alignment;
+pub use alignment::{with_alignment, UNIVERSAL_ALIGNMENT_PROMPT};
+
 // Re-export commonly used types
 pub use factory::{
     create_provider,
