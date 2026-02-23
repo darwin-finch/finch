@@ -9,11 +9,11 @@
 mod embeddings;
 mod memtree;
 
-pub use embeddings::{EmbeddingEngine, TfIdfEmbedding, cosine_similarity};
-pub use memtree::{MemTree, TreeNode, NodeId};
+pub use embeddings::{cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
+pub use memtree::{MemTree, NodeId, TreeNode};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -42,7 +42,7 @@ impl Default for MemoryConfig {
             db_path,
             enabled: true,
             max_context_items: 5,
-            checkpoint_interval_secs: 300,  // 5 minutes
+            checkpoint_interval_secs: 300, // 5 minutes
         }
     }
 }
@@ -84,9 +84,8 @@ impl MemorySystem {
         let mut tree = MemTree::new();
 
         {
-            let mut stmt = conn.prepare(
-                "SELECT content FROM conversations ORDER BY created_at ASC",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT content FROM conversations ORDER BY created_at ASC")?;
             let rows: Vec<String> = stmt
                 .query_map([], |row| row.get(0))?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -118,7 +117,8 @@ impl MemorySystem {
         model: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<()> {
-        let timestamp = chrono::Utc::now().timestamp_nanos_opt()
+        let timestamp = chrono::Utc::now()
+            .timestamp_nanos_opt()
             .ok_or_else(|| anyhow::anyhow!("Timestamp out of range"))?;
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -180,9 +180,7 @@ impl MemorySystem {
         )?;
 
         let conversations: Vec<(String, String)> = stmt
-            .query_map([limit], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
+            .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(conversations)
@@ -192,11 +190,8 @@ impl MemorySystem {
     pub async fn stats(&self) -> Result<MemoryStats> {
         let conn = self.db.lock().await;
 
-        let conversation_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM conversations",
-            [],
-            |row| row.get(0),
-        )?;
+        let conversation_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))?;
 
         let tree = self.tree.lock().await;
         let tree_size = tree.size();
@@ -257,12 +252,14 @@ mod tests {
 
         let memory = MemorySystem::new(config)?;
 
-        memory.insert_conversation(
-            "user",
-            "How do I use Rust lifetimes?",
-            Some("local"),
-            Some("test-session"),
-        ).await?;
+        memory
+            .insert_conversation(
+                "user",
+                "How do I use Rust lifetimes?",
+                Some("local"),
+                Some("test-session"),
+            )
+            .await?;
 
         let stats = memory.stats().await?;
         assert_eq!(stats.conversation_count, 1);
@@ -282,26 +279,22 @@ mod tests {
         let memory = MemorySystem::new(config)?;
 
         // Insert conversations
-        memory.insert_conversation(
-            "user",
-            "How do I use Rust lifetimes?",
-            Some("local"),
-            None,
-        ).await?;
+        memory
+            .insert_conversation("user", "How do I use Rust lifetimes?", Some("local"), None)
+            .await?;
 
-        memory.insert_conversation(
-            "user",
-            "What is Python asyncio?",
-            Some("local"),
-            None,
-        ).await?;
+        memory
+            .insert_conversation("user", "What is Python asyncio?", Some("local"), None)
+            .await?;
 
         // Query for Rust-related content
         let results = memory.query("Rust programming", Some(2)).await?;
 
         assert!(!results.is_empty());
         // Should return Rust-related conversation
-        assert!(results.iter().any(|r| r.contains("Rust") || r.contains("lifetimes")));
+        assert!(results
+            .iter()
+            .any(|r| r.contains("Rust") || r.contains("lifetimes")));
 
         Ok(())
     }
@@ -318,12 +311,9 @@ mod tests {
 
         // Insert multiple conversations
         for i in 1..=5 {
-            memory.insert_conversation(
-                "user",
-                &format!("Message {}", i),
-                Some("local"),
-                None,
-            ).await?;
+            memory
+                .insert_conversation("user", &format!("Message {}", i), Some("local"), None)
+                .await?;
         }
 
         // Get recent 3

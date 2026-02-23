@@ -102,7 +102,11 @@ impl Tool for LLMDelegationTool {
         }
     }
 
-    async fn execute(&self, input: serde_json::Value, _context: &ToolContext<'_>) -> Result<String> {
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        _context: &ToolContext<'_>,
+    ) -> Result<String> {
         let query = input["query"]
             .as_str()
             .context("Missing 'query' parameter")?;
@@ -136,9 +140,7 @@ impl Tool for LLMDelegationTool {
 }
 
 /// Helper to create all LLM delegation tools from registry
-pub fn create_llm_tools(
-    registry: &crate::llms::LLMRegistry,
-) -> Vec<Box<dyn Tool>> {
+pub fn create_llm_tools(registry: &crate::llms::LLMRegistry) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
     for tool_name in registry.tool_names() {

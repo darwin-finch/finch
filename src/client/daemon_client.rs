@@ -11,10 +11,10 @@ use tracing::{debug, error, info};
 use crate::claude::{ContentBlock, Message};
 use crate::daemon::ensure_daemon_running;
 use crate::server::openai_types::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Tool, FunctionDefinition,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionDefinition, Tool,
 };
-use crate::tools::types::{ToolDefinition, ToolUse};
 use crate::tools::executor::ToolExecutor;
+use crate::tools::types::{ToolDefinition, ToolUse};
 
 /// Configuration for daemon connection
 #[derive(Debug, Clone)]
@@ -73,7 +73,7 @@ impl DaemonClient {
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_seconds))
             .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(0)  // Disable connection pooling
+            .pool_max_idle_per_host(0) // Disable connection pooling
             .build()
             .context("Failed to build HTTP client")?;
 
@@ -283,10 +283,16 @@ impl DaemonClient {
                         info!("Executing tool locally: {} ({})", name, id);
 
                         // Execute tool
-                        let tool_use = ToolUse { id: id.clone(), name, input };
+                        let tool_use = ToolUse {
+                            id: id.clone(),
+                            name,
+                            input,
+                        };
 
                         let result = tool_executor
-                            .execute_tool::<fn() -> Result<()>>(&tool_use, None, None, None, None, None, None, None)
+                            .execute_tool::<fn() -> Result<()>>(
+                                &tool_use, None, None, None, None, None, None, None,
+                            )
                             .await?;
 
                         tool_result_blocks.push(ContentBlock::ToolResult {
@@ -328,11 +334,18 @@ impl DaemonClient {
             // A "user" message whose content is entirely ToolResult blocks must be
             // sent as one "tool" role message per result in OpenAI/Claude format.
             let all_tool_results = !m.content.is_empty()
-                && m.content.iter().all(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                && m.content
+                    .iter()
+                    .all(|b| matches!(b, ContentBlock::ToolResult { .. }));
 
             if all_tool_results {
                 for block in &m.content {
-                    if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = block
+                    {
                         result.push(ChatMessage {
                             role: "tool".to_string(),
                             content: Some(content.clone()),
@@ -372,7 +385,11 @@ impl DaemonClient {
                             },
                         });
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
                         // Mixed ToolResult + text: encode as text (edge case)
                         text_parts.push(format!("[Tool Result for {}]: {}", tool_use_id, content));
                     }
@@ -418,7 +435,7 @@ impl DaemonClient {
         let response = self
             .client
             .get(&url)
-            .timeout(Duration::from_secs(30))  // Increased from 5 to 30 seconds
+            .timeout(Duration::from_secs(30)) // Increased from 5 to 30 seconds
             .send()
             .await
             .context("Failed to check daemon health")?
@@ -432,7 +449,7 @@ impl DaemonClient {
     /// Internal health check (used during connection)
     async fn check_health(base_url: &str) -> Result<()> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))  // Increased from 5 to 30 seconds
+            .timeout(Duration::from_secs(30)) // Increased from 5 to 30 seconds
             .build()
             .context("Failed to build HTTP client")?;
 
@@ -565,9 +582,9 @@ impl DaemonClient {
                             tokio::time::sleep(Duration::from_millis(500)).await;
 
                             // Retry query once
-                            self.query(messages).await.context(
-                                "Query failed after daemon restart. Original error: {}",
-                            )
+                            self.query(messages)
+                                .await
+                                .context("Query failed after daemon restart. Original error: {}")
                         }
                         Err(restart_err) => {
                             anyhow::bail!(
@@ -634,7 +651,7 @@ impl DaemonClient {
             .client
             .post(&url)
             .json(&request)
-            .timeout(Duration::from_secs(300))  // 5 minute timeout for streaming
+            .timeout(Duration::from_secs(300)) // 5 minute timeout for streaming
             .send()
             .await
             .context("Failed to send streaming request to daemon")?;
@@ -654,7 +671,8 @@ impl DaemonClient {
                     // SSE format: "data: {...}\n\n"
                     // Look for double newline separator
                     loop {
-                        let separator_pos = buffer.windows(2)
+                        let separator_pos = buffer
+                            .windows(2)
                             .position(|w| w == b"\n\n")
                             .or_else(|| buffer.windows(4).position(|w| w == b"\r\n\r\n"));
 
@@ -676,12 +694,19 @@ impl DaemonClient {
                                     }
 
                                     // Parse JSON chunk
-                                    if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(data) {
+                                    if let Ok(chunk_json) =
+                                        serde_json::from_str::<serde_json::Value>(data)
+                                    {
                                         if let Some(choices) = chunk_json["choices"].as_array() {
                                             if let Some(first_choice) = choices.first() {
-                                                if let Some(delta) = first_choice["delta"].as_object() {
+                                                if let Some(delta) =
+                                                    first_choice["delta"].as_object()
+                                                {
                                                     // Safely check for "content" key (final chunk has empty delta)
-                                                    if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                                    if let Some(content) = delta
+                                                        .get("content")
+                                                        .and_then(|v| v.as_str())
+                                                    {
                                                         accumulated_content.push_str(content);
                                                         // Call callback for UI update
                                                         token_callback(content);
@@ -709,14 +734,20 @@ impl DaemonClient {
                 anyhow::bail!("Local model not ready (initializing/downloading/loading)")
             }
             StatusCode::INTERNAL_SERVER_ERROR => {
-                let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
                 anyhow::bail!("Local generation failed: {}", error_body)
             }
             StatusCode::NOT_IMPLEMENTED => {
                 anyhow::bail!("Local model not available")
             }
             status => {
-                let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
                 anyhow::bail!("Unexpected status {}: {}", status, error_body)
             }
         }
@@ -764,7 +795,7 @@ impl DaemonClient {
             .client
             .post(&url)
             .json(&request)
-            .timeout(Duration::from_secs(300))  // 5 minute timeout for streaming (per chunk, not total)
+            .timeout(Duration::from_secs(300)) // 5 minute timeout for streaming (per chunk, not total)
             .send()
             .await
             .context("Failed to send streaming request to daemon")?;
@@ -784,7 +815,8 @@ impl DaemonClient {
                     // SSE format: "data: {...}\n\n"
                     // Look for double newline separator
                     loop {
-                        let separator_pos = buffer.windows(2)
+                        let separator_pos = buffer
+                            .windows(2)
                             .position(|w| w == b"\n\n")
                             .or_else(|| buffer.windows(4).position(|w| w == b"\r\n\r\n"));
 
@@ -806,12 +838,19 @@ impl DaemonClient {
                                     }
 
                                     // Parse JSON chunk
-                                    if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(data) {
+                                    if let Ok(chunk_json) =
+                                        serde_json::from_str::<serde_json::Value>(data)
+                                    {
                                         if let Some(choices) = chunk_json["choices"].as_array() {
                                             if let Some(first_choice) = choices.first() {
-                                                if let Some(delta) = first_choice["delta"].as_object() {
+                                                if let Some(delta) =
+                                                    first_choice["delta"].as_object()
+                                                {
                                                     // Safely check for "content" key (final chunk has empty delta)
-                                                    if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                                    if let Some(content) = delta
+                                                        .get("content")
+                                                        .and_then(|v| v.as_str())
+                                                    {
                                                         accumulated_content.push_str(content);
                                                     }
                                                 }
@@ -837,14 +876,20 @@ impl DaemonClient {
                 anyhow::bail!("Local model not ready (initializing/downloading/loading)")
             }
             StatusCode::INTERNAL_SERVER_ERROR => {
-                let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
                 anyhow::bail!("Local generation failed: {}", error_body)
             }
             StatusCode::NOT_IMPLEMENTED => {
                 anyhow::bail!("Local model not available")
             }
             status => {
-                let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
                 anyhow::bail!("Unexpected status {}: {}", status, error_body)
             }
         }
@@ -884,9 +929,9 @@ impl DaemonClient {
                             tokio::time::sleep(Duration::from_millis(500)).await;
 
                             // Retry query once (with streaming)
-                            self.query_local_only_streaming(query).await.context(
-                                "Streaming query failed after daemon restart",
-                            )
+                            self.query_local_only_streaming(query)
+                                .await
+                                .context("Streaming query failed after daemon restart")
                         }
                         Err(restart_err) => {
                             anyhow::bail!(

@@ -67,7 +67,11 @@ impl TemplateGenerator {
 
         // Get appropriate model adapter
         let model_adapter = AdapterRegistry::get_adapter(model_name);
-        tracing::info!("Using {} adapter for model: {}", model_adapter.family_name(), model_name);
+        tracing::info!(
+            "Using {} adapter for model: {}",
+            model_adapter.family_name(),
+            model_name
+        );
 
         let mut templates = HashMap::new();
 
@@ -265,7 +269,8 @@ impl TemplateGenerator {
 
     /// Format user query with chat template using model-specific adapter
     fn format_chat_prompt(&self, user_query: &str) -> String {
-        self.model_adapter.format_chat_prompt(&self.system_prompt, user_query)
+        self.model_adapter
+            .format_chat_prompt(&self.system_prompt, user_query)
     }
 
     /// Try to generate response using neural model with streaming
@@ -299,7 +304,8 @@ impl TemplateGenerator {
             .ok_or_else(|| anyhow::anyhow!("Backend is not an ONNX model"))?;
 
         // Tokenize input
-        let encoding = onnx_model.tokenizer()
+        let encoding = onnx_model
+            .tokenizer()
             .encode(formatted_prompt.as_str(), true)
             .map_err(|e| anyhow::anyhow!("Failed to encode prompt: {}", e))?;
 
@@ -320,7 +326,7 @@ impl TemplateGenerator {
                     || token_text.contains("<think>")  // DeepSeek reasoning markers
                     || token_text.contains("</think>")
                     || token_text.contains("\\boxed")  // LaTeX formatting
-                    || token_text.trim().is_empty();  // Skip whitespace-only tokens
+                    || token_text.trim().is_empty(); // Skip whitespace-only tokens
 
                 if !is_special {
                     token_callback(token_id, token_text);
@@ -329,7 +335,8 @@ impl TemplateGenerator {
         )?;
 
         // Decode full output
-        let raw_response = onnx_model.tokenizer()
+        let raw_response = onnx_model
+            .tokenizer()
             .decode(&output_ids, true)
             .map_err(|e| anyhow::anyhow!("Failed to decode output: {}", e))?;
 
@@ -352,11 +359,17 @@ impl TemplateGenerator {
         query: &str,
         generator: &Arc<RwLock<GeneratorModel>>,
     ) -> Result<String> {
-        tracing::info!("[neural_gen] Starting neural generation for query: {}", query);
+        tracing::info!(
+            "[neural_gen] Starting neural generation for query: {}",
+            query
+        );
 
         // Format query with system prompt using chat template
         let formatted_prompt = self.format_chat_prompt(query);
-        tracing::debug!("[neural_gen] Formatted prompt length: {} chars", formatted_prompt.len());
+        tracing::debug!(
+            "[neural_gen] Formatted prompt length: {} chars",
+            formatted_prompt.len()
+        );
 
         // Generate with neural model (try non-blocking lock)
         tracing::debug!("[neural_gen] Acquiring generator lock...");
@@ -369,12 +382,18 @@ impl TemplateGenerator {
         // Use generate_text() which handles tokenization internally
         let raw_response = gen.generate_text(&formatted_prompt, 100)?; // max 100 new tokens
 
-        tracing::info!("[neural_gen] Raw response length: {} chars", raw_response.len());
+        tracing::info!(
+            "[neural_gen] Raw response length: {} chars",
+            raw_response.len()
+        );
 
         // Clean output using model adapter
         let clean_response = self.model_adapter.clean_output(&raw_response);
 
-        tracing::info!("[neural_gen] Cleaned response length: {} chars", clean_response.len());
+        tracing::info!(
+            "[neural_gen] Cleaned response length: {} chars",
+            clean_response.len()
+        );
 
         Ok(clean_response)
     }

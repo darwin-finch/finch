@@ -6,22 +6,21 @@
 // with syntax hints, descriptions, and category grouping.
 
 use ratatui::{
-    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame,
 };
 
-use crate::cli::command_autocomplete::{CommandSpec, CommandCategory};
+use crate::cli::command_autocomplete::{CommandCategory, CommandSpec};
 use crate::config::ColorScheme;
 
 /// Maximum number of autocomplete suggestions to show at once
 const MAX_VISIBLE_SUGGESTIONS: usize = 8;
 
 /// Autocomplete state for TUI rendering
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AutocompleteState {
     /// Matched commands from registry
     pub matches: Vec<CommandSpec>,
@@ -30,7 +29,6 @@ pub struct AutocompleteState {
     /// Whether the dropdown is visible
     pub visible: bool,
 }
-
 
 impl AutocompleteState {
     pub fn new() -> Self {
@@ -138,9 +136,7 @@ pub fn render_autocomplete_dropdown(
 
             // Command name (bold if selected)
             let cmd_style = if is_selected {
-                Style::default()
-                    .fg(cat_color)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(cat_color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(cat_color)
             };
@@ -195,7 +191,10 @@ pub fn render_autocomplete_dropdown(
         };
 
         let hint = Paragraph::new(Span::styled(
-            format!("↑↓ to navigate  •  {} more", state.matches.len() - MAX_VISIBLE_SUGGESTIONS),
+            format!(
+                "↑↓ to navigate  •  {} more",
+                state.matches.len() - MAX_VISIBLE_SUGGESTIONS
+            ),
             Style::default().fg(Color::DarkGray),
         ));
 
@@ -274,14 +273,12 @@ mod tests {
     fn test_get_selected() {
         let mut state = AutocompleteState::new();
 
-        let matches = vec![
-            CommandSpec {
-                name: "/help",
-                params: None,
-                description: "Show help",
-                category: CommandCategory::Basic,
-            },
-        ];
+        let matches = vec![CommandSpec {
+            name: "/help",
+            params: None,
+            description: "Show help",
+            category: CommandCategory::Basic,
+        }];
 
         state.show_matches(matches);
         assert!(state.get_selected().is_some());

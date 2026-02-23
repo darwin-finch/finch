@@ -235,13 +235,14 @@ impl Message for WorkUnit {
 
             MessageStatus::Complete | MessageStatus::Failed => {
                 // Use captured elapsed (stable), fall back to live elapsed before first commit
-                let secs = inner.elapsed_at_finish
-                    .unwrap_or(elapsed)
-                    .as_secs();
+                let secs = inner.elapsed_at_finish.unwrap_or(elapsed).as_secs();
                 let timing = if inner.token_count > 0 {
                     format!(
                         " {}({} · {} tokens){}",
-                        GRAY_DIM, fmt_elapsed(secs), fmt_tokens(inner.token_count), RESET
+                        GRAY_DIM,
+                        fmt_elapsed(secs),
+                        fmt_tokens(inner.token_count),
+                        RESET
                     )
                 } else if secs > 0 {
                     format!(" {}({}){}", GRAY_DIM, fmt_elapsed(secs), RESET)
@@ -267,10 +268,7 @@ impl Message for WorkUnit {
     }
 
     fn status(&self) -> MessageStatus {
-        self.inner
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .status
+        self.inner.read().unwrap_or_else(|p| p.into_inner()).status
     }
 
     fn content(&self) -> String {
@@ -289,14 +287,12 @@ impl Message for WorkUnit {
 fn format_row(row: &WorkRow) -> String {
     match &row.status {
         WorkRowStatus::Running => {
-            format!(
-                "  {}⎿{} {}{}…{}",
-                GRAY, RESET, row.label, GRAY_DIM, RESET
-            )
+            format!("  {}⎿{} {}{}…{}", GRAY, RESET, row.label, GRAY_DIM, RESET)
         }
         WorkRowStatus::Complete(summary) => {
             // Use captured elapsed time (not recalculated) so scrollback timing is stable
-            let timing = row.elapsed_at_finish
+            let timing = row
+                .elapsed_at_finish
                 .filter(|d| d.as_secs() >= 1)
                 .map(|d| format!(" {}({}){}", GRAY_DIM, fmt_elapsed(d.as_secs()), RESET))
                 .unwrap_or_default();
@@ -310,7 +306,8 @@ fn format_row(row: &WorkRow) -> String {
             }
         }
         WorkRowStatus::Error(err) => {
-            let timing = row.elapsed_at_finish
+            let timing = row
+                .elapsed_at_finish
                 .filter(|d| d.as_secs() >= 1)
                 .map(|d| format!(" {}({}){}", GRAY_DIM, fmt_elapsed(d.as_secs()), RESET))
                 .unwrap_or_default();
@@ -453,9 +450,7 @@ mod tests {
         let idx = wu.add_row("bash(ls)");
         wu.complete_row(idx, "3 files");
         let inner = wu.inner.read().unwrap();
-        assert!(
-            matches!(&inner.rows[0].status, WorkRowStatus::Complete(s) if s == "3 files")
-        );
+        assert!(matches!(&inner.rows[0].status, WorkRowStatus::Complete(s) if s == "3 files"));
     }
 
     #[test]
@@ -464,9 +459,7 @@ mod tests {
         let idx = wu.add_row("bash(true)");
         wu.complete_row(idx, "");
         let inner = wu.inner.read().unwrap();
-        assert!(
-            matches!(&inner.rows[0].status, WorkRowStatus::Complete(s) if s.is_empty())
-        );
+        assert!(matches!(&inner.rows[0].status, WorkRowStatus::Complete(s) if s.is_empty()));
     }
 
     #[test]
@@ -484,7 +477,7 @@ mod tests {
     fn test_out_of_bounds_row_ops_do_not_panic() {
         let wu = WorkUnit::new("X");
         wu.complete_row(99, "summary"); // should not panic
-        wu.fail_row(99, "error");       // should not panic
+        wu.fail_row(99, "error"); // should not panic
     }
 
     // ── format() — InProgress ────────────────────────────────────────────────
@@ -529,7 +522,10 @@ mod tests {
         wu.set_complete();
         let f = wu.format(&colors());
         assert!(f.contains("⏺"), "should contain bullet: {}", f);
-        assert!(!f.contains("Channeling"), "verb should be gone in complete state");
+        assert!(
+            !f.contains("Channeling"),
+            "verb should be gone in complete state"
+        );
     }
 
     #[test]
@@ -710,7 +706,11 @@ mod tests {
         let f = wu.format(&colors());
         // Complete format always has the bullet
         assert!(f.contains("⏺"), "complete format should show bullet: {}", f);
-        assert!(f.contains("Done."), "complete format should show response: {}", f);
+        assert!(
+            f.contains("Done."),
+            "complete format should show response: {}",
+            f
+        );
     }
 
     #[test]
@@ -720,8 +720,16 @@ mod tests {
         wu.set_response("Done.");
         wu.set_complete();
         let f = wu.format(&colors());
-        assert!(f.contains("tokens"), "complete format with tokens should say 'tokens': {}", f);
-        assert!(f.contains("3"), "complete format should show token count: {}", f);
+        assert!(
+            f.contains("tokens"),
+            "complete format with tokens should say 'tokens': {}",
+            f
+        );
+        assert!(
+            f.contains("3"),
+            "complete format should show token count: {}",
+            f
+        );
     }
 
     #[test]
@@ -735,8 +743,16 @@ mod tests {
         };
         let f = format_row(&row);
         // The label contains "(true)" but timing should NOT appear as "(0s)" pattern
-        assert!(!f.contains("(0s)"), "sub-second row should hide timing: {}", f);
-        assert!(!f.contains("(800"), "sub-second row should hide timing: {}", f);
+        assert!(
+            !f.contains("(0s)"),
+            "sub-second row should hide timing: {}",
+            f
+        );
+        assert!(
+            !f.contains("(800"),
+            "sub-second row should hide timing: {}",
+            f
+        );
     }
 
     #[test]

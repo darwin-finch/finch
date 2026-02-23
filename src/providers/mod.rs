@@ -12,8 +12,8 @@ pub mod types;
 
 // Provider implementations
 pub mod claude;
-pub mod openai;
 pub mod gemini;
+pub mod openai;
 
 // Provider factory
 pub mod factory;
@@ -30,12 +30,8 @@ pub use alignment::{with_alignment, UNIVERSAL_ALIGNMENT_PROMPT};
 
 // Re-export commonly used types
 pub use factory::{
-    create_provider,
-    create_provider_from_entry,
-    create_provider_from_entries,
-    create_provider_from_teacher,
-    create_providers,
-    create_providers_from_entries,
+    create_provider, create_provider_from_entries, create_provider_from_entry,
+    create_provider_from_teacher, create_providers, create_providers_from_entries,
 };
 pub use fallback_chain::FallbackChain;
 pub use teacher_session::{

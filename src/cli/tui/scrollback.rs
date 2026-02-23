@@ -20,7 +20,8 @@ fn calculate_display_height(content: &str, terminal_width: usize) -> usize {
         1
     } else {
         // Account for wrapping (approximate)
-        let wrapped_lines: usize = content.lines()
+        let wrapped_lines: usize = content
+            .lines()
             .map(|line| {
                 let visible_len = strip_ansi_codes(line).len();
                 (visible_len + terminal_width - 1) / terminal_width.max(1)
@@ -55,7 +56,7 @@ fn strip_ansi_codes(s: &str) -> String {
 #[derive(Debug, Clone)]
 struct LineRef {
     message_id: MessageId,
-    line_offset: usize,  // 0-indexed line within message
+    line_offset: usize, // 0-indexed line within message
 }
 
 /// Scrollback buffer for conversation history
@@ -95,7 +96,7 @@ impl ScrollbackBuffer {
             terminal_width,
             auto_scroll: true,
             ring_buffer: VecDeque::new(),
-            max_lines: 1000,  // Configurable
+            max_lines: 1000, // Configurable
             most_recent_line: 0,
         }
     }
@@ -135,9 +136,15 @@ impl ScrollbackBuffer {
         }
 
         // Calculate total height of all messages
-        let message_heights: Vec<usize> = self.messages
+        let message_heights: Vec<usize> = self
+            .messages
             .iter()
-            .map(|m| calculate_display_height(&m.format(&crate::config::ColorScheme::default()), self.terminal_width))
+            .map(|m| {
+                calculate_display_height(
+                    &m.format(&crate::config::ColorScheme::default()),
+                    self.terminal_width,
+                )
+            })
             .collect();
 
         let total_height: usize = message_heights.iter().sum();
@@ -172,9 +179,15 @@ impl ScrollbackBuffer {
 
     /// Scroll up (away from bottom) by N lines
     pub fn scroll_up(&mut self, lines: usize) {
-        let total_height: usize = self.messages
+        let total_height: usize = self
+            .messages
             .iter()
-            .map(|m| calculate_display_height(&m.format(&crate::config::ColorScheme::default()), self.terminal_width))
+            .map(|m| {
+                calculate_display_height(
+                    &m.format(&crate::config::ColorScheme::default()),
+                    self.terminal_width,
+                )
+            })
             .sum();
 
         let max_scroll = total_height.saturating_sub(self.viewport_height);
@@ -204,9 +217,15 @@ impl ScrollbackBuffer {
 
     /// Scroll to the very top (oldest messages)
     pub fn scroll_to_top(&mut self) {
-        let total_height: usize = self.messages
+        let total_height: usize = self
+            .messages
             .iter()
-            .map(|m| calculate_display_height(&m.format(&crate::config::ColorScheme::default()), self.terminal_width))
+            .map(|m| {
+                calculate_display_height(
+                    &m.format(&crate::config::ColorScheme::default()),
+                    self.terminal_width,
+                )
+            })
             .sum();
 
         self.scroll_offset = total_height.saturating_sub(self.viewport_height);
@@ -226,9 +245,15 @@ impl ScrollbackBuffer {
 
     /// Get scroll position as percentage (0-100)
     pub fn scroll_percentage(&self) -> u8 {
-        let total_height: usize = self.messages
+        let total_height: usize = self
+            .messages
             .iter()
-            .map(|m| calculate_display_height(&m.format(&crate::config::ColorScheme::default()), self.terminal_width))
+            .map(|m| {
+                calculate_display_height(
+                    &m.format(&crate::config::ColorScheme::default()),
+                    self.terminal_width,
+                )
+            })
             .sum();
 
         if total_height <= self.viewport_height {
@@ -257,7 +282,7 @@ impl ScrollbackBuffer {
     pub fn push_line(&mut self, message_id: MessageId, line_offset: usize) {
         if self.ring_buffer.len() >= self.max_lines {
             self.ring_buffer.pop_front(); // Drop oldest
-            // Adjust most_recent_line if needed
+                                          // Adjust most_recent_line if needed
             if self.most_recent_line > 0 {
                 self.most_recent_line -= 1;
             }
@@ -275,7 +300,9 @@ impl ScrollbackBuffer {
             return Vec::new();
         }
 
-        let start_idx = self.most_recent_line.saturating_sub(self.viewport_height.saturating_sub(1));
+        let start_idx = self
+            .most_recent_line
+            .saturating_sub(self.viewport_height.saturating_sub(1));
         let end_idx = self.most_recent_line + 1;
 
         self.ring_buffer
@@ -292,9 +319,18 @@ impl ScrollbackBuffer {
         self.most_recent_line = 0;
 
         // Collect message data first to avoid borrow checker issues
-        let message_data: Vec<(MessageId, usize)> = self.messages
+        let message_data: Vec<(MessageId, usize)> = self
+            .messages
             .iter()
-            .map(|msg| (msg.id(), calculate_display_height(&msg.format(&crate::config::ColorScheme::default()), self.terminal_width)))
+            .map(|msg| {
+                (
+                    msg.id(),
+                    calculate_display_height(
+                        &msg.format(&crate::config::ColorScheme::default()),
+                        self.terminal_width,
+                    ),
+                )
+            })
             .collect();
 
         for (message_id, height) in message_data {

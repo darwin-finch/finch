@@ -68,15 +68,17 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
             Ok(Box::new(provider))
         }
 
-        ProviderEntry::Local { .. } => bail!(
-            "Local providers use a local generator — call create_local_generator() instead"
-        ),
+        ProviderEntry::Local { .. } => {
+            bail!("Local providers use a local generator — call create_local_generator() instead")
+        }
     }
 }
 
 /// Create providers from a slice of unified `ProviderEntry` values.
 /// Only cloud entries are included; `Local` variants are silently skipped.
-pub fn create_providers_from_entries(entries: &[ProviderEntry]) -> Result<Vec<Box<dyn LlmProvider>>> {
+pub fn create_providers_from_entries(
+    entries: &[ProviderEntry],
+) -> Result<Vec<Box<dyn LlmProvider>>> {
     let cloud: Vec<_> = entries.iter().filter(|e| !e.is_local()).collect();
     if cloud.is_empty() {
         bail!("No cloud provider entries configured");
@@ -96,7 +98,10 @@ pub fn create_providers_from_entries(entries: &[ProviderEntry]) -> Result<Vec<Bo
 pub fn create_provider_from_entries(entries: &[ProviderEntry]) -> Result<Box<dyn LlmProvider>> {
     let providers = create_providers_from_entries(entries)?;
     if providers.len() == 1 {
-        Ok(providers.into_iter().next().expect("len == 1 checked above"))
+        Ok(providers
+            .into_iter()
+            .next()
+            .expect("len == 1 checked above"))
     } else {
         use super::FallbackChain;
         Ok(Box::new(FallbackChain::new(providers)))
@@ -183,7 +188,10 @@ pub fn create_provider(teachers: &[TeacherEntry]) -> Result<Box<dyn LlmProvider>
     let providers = create_providers(teachers)?;
 
     if providers.len() == 1 {
-        Ok(providers.into_iter().next().expect("len == 1 checked above"))
+        Ok(providers
+            .into_iter()
+            .next()
+            .expect("len == 1 checked above"))
     } else {
         use super::FallbackChain;
         Ok(Box::new(FallbackChain::new(providers)))
@@ -193,9 +201,9 @@ pub fn create_provider(teachers: &[TeacherEntry]) -> Result<Box<dyn LlmProvider>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ExecutionTarget;
     use crate::config::{ProviderEntry, TeacherEntry};
     use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
-    use crate::config::ExecutionTarget;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -275,7 +283,11 @@ mod tests {
     fn test_unknown_provider_returns_error() {
         let result = create_provider_from_teacher(&entry("unknown_provider_xyz", "test-key"));
         assert!(result.is_err());
-        assert!(result.err().unwrap().to_string().contains("Unknown provider"));
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Unknown provider"));
     }
 
     #[test]
@@ -286,10 +298,7 @@ mod tests {
 
     #[test]
     fn test_multiple_teachers() {
-        let teachers = vec![
-            entry("openai", "key-1"),
-            entry("claude", "key-2"),
-        ];
+        let teachers = vec![entry("openai", "key-1"), entry("claude", "key-2")];
         let providers = create_providers(&teachers).unwrap();
         assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].name(), "openai");
@@ -417,18 +426,16 @@ mod tests {
 
     #[test]
     fn test_create_providers_from_entries_empty_cloud_errors() {
-        let entries = vec![
-            ProviderEntry::Local {
-                inference_provider: InferenceProvider::Onnx,
-                execution_target: ExecutionTarget::Auto,
-                model_family: ModelFamily::Qwen2,
-                model_size: ModelSize::Medium,
-                model_repo: None,
-                model_path: None,
-                enabled: true,
-                name: None,
-            },
-        ];
+        let entries = vec![ProviderEntry::Local {
+            inference_provider: InferenceProvider::Onnx,
+            execution_target: ExecutionTarget::Auto,
+            model_family: ModelFamily::Qwen2,
+            model_size: ModelSize::Medium,
+            model_repo: None,
+            model_path: None,
+            enabled: true,
+            name: None,
+        }];
         let result = create_providers_from_entries(&entries);
         assert!(result.is_err());
     }

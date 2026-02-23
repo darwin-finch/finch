@@ -6,17 +6,17 @@
 // LocalModelAdapter: Format prompts for local ONNX inference
 // TeacherProvider: Make HTTP requests to external APIs (Claude, OpenAI, etc.)
 
-pub mod qwen;
+pub mod deepseek;
 pub mod llama;
 pub mod mistral;
 pub mod phi;
-pub mod deepseek;
+pub mod qwen;
 
-pub use qwen::QwenAdapter;
+pub use deepseek::DeepSeekAdapter;
 pub use llama::LlamaAdapter;
 pub use mistral::MistralAdapter;
 pub use phi::PhiAdapter;
-pub use deepseek::DeepSeekAdapter;
+pub use qwen::QwenAdapter;
 
 use std::fmt;
 
@@ -183,11 +183,23 @@ mod tests {
 
     #[test]
     fn test_model_family_detection() {
-        assert_eq!(ModelFamily::from_name("Qwen2.5-1.5B"), Some(ModelFamily::Qwen));
-        assert_eq!(ModelFamily::from_name("Llama-3-8B"), Some(ModelFamily::Llama));
-        assert_eq!(ModelFamily::from_name("Mistral-7B"), Some(ModelFamily::Mistral));
+        assert_eq!(
+            ModelFamily::from_name("Qwen2.5-1.5B"),
+            Some(ModelFamily::Qwen)
+        );
+        assert_eq!(
+            ModelFamily::from_name("Llama-3-8B"),
+            Some(ModelFamily::Llama)
+        );
+        assert_eq!(
+            ModelFamily::from_name("Mistral-7B"),
+            Some(ModelFamily::Mistral)
+        );
         assert_eq!(ModelFamily::from_name("Phi-3-mini"), Some(ModelFamily::Phi));
-        assert_eq!(ModelFamily::from_name("deepseek-coder-7b"), Some(ModelFamily::DeepSeek));
+        assert_eq!(
+            ModelFamily::from_name("deepseek-coder-7b"),
+            Some(ModelFamily::DeepSeek)
+        );
         assert_eq!(ModelFamily::from_name("unknown-model"), None);
     }
 }

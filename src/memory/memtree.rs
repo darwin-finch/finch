@@ -1,6 +1,6 @@
 // MemTree implementation - Hierarchical semantic memory
 //
-// Based on "From Isolated Conversations to Hierarchical Schemas: 
+// Based on "From Isolated Conversations to Hierarchical Schemas:
 // Dynamic Tree Memory Representation for LLMs" (arXiv:2410.14052)
 //
 // Key properties:
@@ -9,7 +9,7 @@
 // - Semantic similarity-based navigation
 // - Aggregated parent summaries
 
-use super::embeddings::{cosine_similarity, average_embeddings};
+use super::embeddings::{average_embeddings, cosine_similarity};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -50,7 +50,7 @@ impl MemTree {
             parent: None,
             children: Vec::new(),
             text: String::from("ROOT"),
-            embedding: vec![0.0; 2048],  // Zero vector — matches TfIdfEmbedding dimension
+            embedding: vec![0.0; 2048], // Zero vector — matches TfIdfEmbedding dimension
             level: 0,
             created_at: chrono::Utc::now().timestamp(),
         };
@@ -79,8 +79,12 @@ impl MemTree {
         let mut current = self.root;
 
         loop {
-            let node = self.nodes.get(&current)
-                .ok_or_else(|| anyhow::anyhow!("memtree: node {} not found during insert", current))?
+            let node = self
+                .nodes
+                .get(&current)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("memtree: node {} not found during insert", current)
+                })?
                 .clone();
 
             // Compute similarity with current node
@@ -98,8 +102,9 @@ impl MemTree {
                 let mut best_similarity = 0.0;
 
                 for &child_id in &node.children {
-                    let child = self.nodes.get(&child_id)
-                        .ok_or_else(|| anyhow::anyhow!("memtree: child node {} not found", child_id))?;
+                    let child = self.nodes.get(&child_id).ok_or_else(|| {
+                        anyhow::anyhow!("memtree: child node {} not found", child_id)
+                    })?;
                     let child_sim = cosine_similarity(&embedding, &child.embedding);
                     if child_sim > best_similarity {
                         best_similarity = child_sim;
@@ -126,8 +131,9 @@ impl MemTree {
                 self.nodes.insert(new_id, new_node);
 
                 // Update parent's children list
-                let parent = self.nodes.get_mut(&current)
-                    .ok_or_else(|| anyhow::anyhow!("memtree: parent node {} not found during insert", current))?;
+                let parent = self.nodes.get_mut(&current).ok_or_else(|| {
+                    anyhow::anyhow!("memtree: parent node {} not found during insert", current)
+                })?;
                 parent.children.push(new_id);
 
                 // Update parent's aggregated embedding
@@ -140,8 +146,9 @@ impl MemTree {
 
     /// Update parent node's embedding to be average of children
     fn update_parent_aggregation(&mut self, node_id: NodeId) -> Result<()> {
-        let node = self.nodes.get(&node_id)
-            .ok_or_else(|| anyhow::anyhow!("memtree: node {} not found during aggregation", node_id))?;
+        let node = self.nodes.get(&node_id).ok_or_else(|| {
+            anyhow::anyhow!("memtree: node {} not found during aggregation", node_id)
+        })?;
 
         if node.children.is_empty() {
             return Ok(());
@@ -163,8 +170,9 @@ impl MemTree {
         let aggregated = average_embeddings(&child_embeddings);
 
         // Update parent embedding
-        let parent = self.nodes.get_mut(&node_id)
-            .ok_or_else(|| anyhow::anyhow!("memtree: node {} not found for embedding update", node_id))?;
+        let parent = self.nodes.get_mut(&node_id).ok_or_else(|| {
+            anyhow::anyhow!("memtree: node {} not found for embedding update", node_id)
+        })?;
         parent.embedding = aggregated;
 
         // Recursively update ancestors
@@ -183,7 +191,7 @@ impl MemTree {
         let mut results: Vec<_> = self
             .nodes
             .values()
-            .filter(|node| node.id != self.root)  // Skip root
+            .filter(|node| node.id != self.root) // Skip root
             .map(|node| {
                 let similarity = cosine_similarity(query_embedding, &node.embedding);
                 (node.id, node.text.clone(), similarity)
@@ -222,12 +230,12 @@ impl Default for MemTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::embeddings::{TfIdfEmbedding, EmbeddingEngine};
+    use crate::memory::embeddings::{EmbeddingEngine, TfIdfEmbedding};
 
     #[test]
     fn test_memtree_creation() {
         let tree = MemTree::new();
-        assert_eq!(tree.size(), 0);  // No nodes except root
+        assert_eq!(tree.size(), 0); // No nodes except root
     }
 
     #[test]
@@ -248,11 +256,7 @@ mod tests {
         let engine = TfIdfEmbedding::new();
 
         // Insert similar texts
-        let texts = vec![
-            "rust programming",
-            "rust coding",
-            "python programming",
-        ];
+        let texts = vec!["rust programming", "rust coding", "python programming"];
 
         for text in texts {
             let emb = engine.embed(text).unwrap();
@@ -326,8 +330,14 @@ mod tests {
         let mut tree = MemTree::new();
         let engine = TfIdfEmbedding::new();
         let texts = [
-            "alpha", "beta", "gamma", "delta", "epsilon",
-            "alpha variant", "beta variant", "gamma coding",
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+            "epsilon",
+            "alpha variant",
+            "beta variant",
+            "gamma coding",
         ];
         for text in &texts {
             let emb = engine.embed(text).unwrap();

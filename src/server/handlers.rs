@@ -150,9 +150,7 @@ async fn handle_message(
                     let mut generator = server.local_generator().write().await;
 
                     match generator.try_generate_from_pattern(&user_text) {
-                        Ok(Some(response_text)) => {
-                            (response_text, "local".to_string())
-                        }
+                        Ok(Some(response_text)) => (response_text, "local".to_string()),
                         Ok(None) => {
                             // Confidence too low, fall back to Claude
                             tracing::info!(
@@ -161,8 +159,10 @@ async fn handle_message(
                             );
                             drop(generator); // Release lock
 
-                            let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
-                            let response = server.claude_client().send_message(&claude_request).await?;
+                            let claude_request =
+                                ClaudeRequest::with_context(session.conversation.get_messages());
+                            let response =
+                                server.claude_client().send_message(&claude_request).await?;
                             let text = response.text();
 
                             (text, "confidence_fallback".to_string())
@@ -176,15 +176,19 @@ async fn handle_message(
                             drop(generator); // Release lock
 
                             // Fall back to Claude on error
-                            let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
-                            let response = server.claude_client().send_message(&claude_request).await?;
+                            let claude_request =
+                                ClaudeRequest::with_context(session.conversation.get_messages());
+                            let response =
+                                server.claude_client().send_message(&claude_request).await?;
                             let text = response.text();
 
                             (text, "local_error_fallback".to_string())
                         }
                     }
                 }
-                GeneratorState::Initializing | GeneratorState::Downloading { .. } | GeneratorState::Loading { .. } => {
+                GeneratorState::Initializing
+                | GeneratorState::Downloading { .. }
+                | GeneratorState::Loading { .. } => {
                     tracing::info!(
                         session_id = %session.id,
                         "Model still loading, forwarding to Claude"
@@ -192,7 +196,8 @@ async fn handle_message(
                     drop(state); // Release lock
 
                     // Model not ready yet, forward to Claude
-                    let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+                    let claude_request =
+                        ClaudeRequest::with_context(session.conversation.get_messages());
                     let response = server.claude_client().send_message(&claude_request).await?;
                     let text = response.text();
 
@@ -207,7 +212,8 @@ async fn handle_message(
                     drop(state); // Release lock
 
                     // Model failed to load, forward to Claude
-                    let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+                    let claude_request =
+                        ClaudeRequest::with_context(session.conversation.get_messages());
                     let response = server.claude_client().send_message(&claude_request).await?;
                     let text = response.text();
 
@@ -221,7 +227,8 @@ async fn handle_message(
                     drop(state); // Release lock
 
                     // No model available, forward to Claude
-                    let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+                    let claude_request =
+                        ClaudeRequest::with_context(session.conversation.get_messages());
                     let response = server.claude_client().send_message(&claude_request).await?;
                     let text = response.text();
 
@@ -453,8 +460,8 @@ where
 
 /// Handle GET /v1/node/info — return this node's identity and capabilities
 pub async fn handle_node_info() -> Result<Json<serde_json::Value>, AppError> {
-    use crate::node::NodeInfo;
     use crate::config::load_config;
+    use crate::node::NodeInfo;
 
     let has_teacher = load_config()
         .map(|c| c.active_teacher().is_some())

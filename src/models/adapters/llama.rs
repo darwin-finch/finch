@@ -3,7 +3,7 @@
 // Handles Llama-specific chat template and token IDs.
 // Llama models: Llama 3, Llama 3.1, Llama 3.2
 
-use super::{LocalModelAdapter, GenerationConfig};
+use super::{GenerationConfig, LocalModelAdapter};
 
 /// Adapter for Llama model family (Llama 3+ format)
 pub struct LlamaAdapter;
@@ -77,10 +77,7 @@ mod tests {
     #[test]
     fn test_llama_format() {
         let adapter = LlamaAdapter;
-        let prompt = adapter.format_chat_prompt(
-            "You are a helpful assistant.",
-            "What is 2+2?"
-        );
+        let prompt = adapter.format_chat_prompt("You are a helpful assistant.", "What is 2+2?");
 
         assert!(prompt.contains("<|begin_of_text|>"));
         assert!(prompt.contains("<|start_header_id|>system<|end_header_id|>"));

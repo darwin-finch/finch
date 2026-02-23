@@ -52,7 +52,10 @@ impl<'a> DialogWidget<'a> {
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                Span::styled(format!("{}. ", number), Style::default().fg(self.colors.ui.separator.to_color()))
+                Span::styled(
+                    format!("{}. ", number),
+                    Style::default().fg(self.colors.ui.separator.to_color()),
+                )
             };
 
             let label = if is_selected {
@@ -64,7 +67,10 @@ impl<'a> DialogWidget<'a> {
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                Span::styled(option.label.clone(), Style::default().fg(self.colors.dialog.option.to_color()))
+                Span::styled(
+                    option.label.clone(),
+                    Style::default().fg(self.colors.dialog.option.to_color()),
+                )
             };
 
             let mut spans = vec![prefix, label];
@@ -100,9 +106,11 @@ impl<'a> DialogWidget<'a> {
         if custom_mode_active {
             if let Some(input_text) = custom_input {
                 lines.push(Line::from(""));
-                lines.push(Line::from(
-                    Self::render_custom_input_spans(input_text, custom_cursor_pos, self.colors),
-                ));
+                lines.push(Line::from(Self::render_custom_input_spans(
+                    input_text,
+                    custom_cursor_pos,
+                    self.colors,
+                )));
             }
         }
 
@@ -166,7 +174,10 @@ impl<'a> DialogWidget<'a> {
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                Span::styled(format!("{} ", checkbox), Style::default().fg(self.colors.ui.separator.to_color()))
+                Span::styled(
+                    format!("{} ", checkbox),
+                    Style::default().fg(self.colors.ui.separator.to_color()),
+                )
             };
 
             let label = if is_cursor {
@@ -178,7 +189,10 @@ impl<'a> DialogWidget<'a> {
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                Span::styled(option.label.clone(), Style::default().fg(self.colors.dialog.option.to_color()))
+                Span::styled(
+                    option.label.clone(),
+                    Style::default().fg(self.colors.dialog.option.to_color()),
+                )
             };
 
             let mut spans = vec![checkbox_span, label];
@@ -214,9 +228,11 @@ impl<'a> DialogWidget<'a> {
         if custom_mode_active {
             if let Some(input_text) = custom_input {
                 lines.push(Line::from(""));
-                lines.push(Line::from(
-                    Self::render_custom_input_spans(input_text, custom_cursor_pos, self.colors),
-                ));
+                lines.push(Line::from(Self::render_custom_input_spans(
+                    input_text,
+                    custom_cursor_pos,
+                    self.colors,
+                )));
             }
         }
 
@@ -475,7 +491,7 @@ impl<'a> Widget for DialogWidget<'a> {
                 &self.dialog.custom_input,
                 self.dialog.custom_mode_active,
                 self.dialog.custom_cursor_pos,
-                &self.dialog.help_message
+                &self.dialog.help_message,
             ),
 
             DialogType::MultiSelect {
@@ -540,10 +556,7 @@ mod tests {
 
         let dialog = Dialog::select(
             "Test",
-            vec![
-                DialogOption::new("Option 1"),
-                DialogOption::new("Option 2"),
-            ],
+            vec![DialogOption::new("Option 1"), DialogOption::new("Option 2")],
         );
 
         let colors = ColorScheme::default();
@@ -571,11 +584,11 @@ mod tests {
                 DialogOption::with_description("Option 2", "With description"),
             ],
             0,
-            false,      // allow_custom
-            &None,      // custom_input
-            false,      // custom_mode_active
-            0,          // custom_cursor_pos
-            &None,      // help
+            false, // allow_custom
+            &None, // custom_input
+            false, // custom_mode_active
+            0,     // custom_cursor_pos
+            &None, // help
         );
 
         // Should have: 2 options + empty line + keybindings = 4 lines
@@ -601,11 +614,11 @@ mod tests {
             &[DialogOption::new("Option 1"), DialogOption::new("Option 2")],
             &selected,
             0,
-            false,      // allow_custom
-            &None,      // custom_input
-            false,      // custom_mode_active
-            0,          // custom_cursor_pos
-            &None,      // help
+            false, // allow_custom
+            &None, // custom_input
+            false, // custom_mode_active
+            0,     // custom_cursor_pos
+            &None, // help
         );
 
         // Should have: 2 options + empty line + keybindings = 4 lines

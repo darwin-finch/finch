@@ -31,7 +31,7 @@ pub struct StreamDelta {
     pub delta_type: String,
     pub text: Option<String>,
     #[serde(default)]
-    pub partial_json: Option<String>,  // For input_json_delta
+    pub partial_json: Option<String>, // For input_json_delta
 }
 
 impl StreamEvent {

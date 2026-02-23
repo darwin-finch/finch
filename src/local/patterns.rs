@@ -337,7 +337,11 @@ mod tests {
         for variant in &variants {
             let s = variant.as_str();
             let parsed = QueryPattern::from_str(s);
-            assert_eq!(&parsed, variant, "from_str roundtrip failed for {:?}", variant);
+            assert_eq!(
+                &parsed, variant,
+                "from_str roundtrip failed for {:?}",
+                variant
+            );
         }
     }
 

@@ -102,9 +102,7 @@ impl Menu {
             let result = tui.show_dialog(dialog)?;
 
             match result {
-                DialogResult::Selected(index) => {
-                    Ok(options[index].value.clone())
-                }
+                DialogResult::Selected(index) => Ok(options[index].value.clone()),
                 DialogResult::Cancelled => {
                     anyhow::bail!("Menu selection cancelled")
                 }
@@ -183,7 +181,9 @@ impl Menu {
                 DialogResult::Cancelled => {
                     anyhow::bail!("Menu selection cancelled")
                 }
-                _ => unreachable!("MultiSelect dialog should only return MultiSelected or Cancelled"),
+                _ => {
+                    unreachable!("MultiSelect dialog should only return MultiSelected or Cancelled")
+                }
             }
         } else {
             // No TUI available, return empty

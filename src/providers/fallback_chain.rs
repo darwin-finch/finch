@@ -250,7 +250,9 @@ mod tests {
 
             let (tx, rx) = mpsc::channel(1);
             tokio::spawn(async move {
-                let _ = tx.send(Ok(StreamChunk::TextDelta("test".to_string()))).await;
+                let _ = tx
+                    .send(Ok(StreamChunk::TextDelta("test".to_string())))
+                    .await;
             });
             Ok(rx)
         }

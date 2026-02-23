@@ -20,9 +20,9 @@ impl Feedback {
     /// Get the training weight for this feedback type
     pub fn weight(&self) -> f64 {
         match self {
-            Feedback::Good => 1.0,       // Normal weight
-            Feedback::Bad => 3.0,        // Medium weight
-            Feedback::Critical => 10.0,  // High weight
+            Feedback::Good => 1.0,      // Normal weight
+            Feedback::Bad => 3.0,       // Medium weight
+            Feedback::Critical => 10.0, // High weight
         }
     }
 }
@@ -75,12 +75,7 @@ fn default_weight() -> f64 {
 
 impl LogEntry {
     /// Create a new log entry
-    pub fn new(
-        query: String,
-        response: String,
-        model: String,
-        tools_used: Vec<String>,
-    ) -> Self {
+    pub fn new(query: String, response: String, model: String, tools_used: Vec<String>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
@@ -113,8 +108,7 @@ impl ConversationLogger {
     pub fn new(log_path: PathBuf) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create logging directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create logging directory")?;
         }
 
         Ok(Self {
@@ -165,10 +159,8 @@ impl ConversationLogger {
             .context("Failed to open log file")?;
 
         for entry in &self.buffer {
-            let json = serde_json::to_string(entry)
-                .context("Failed to serialize log entry")?;
-            writeln!(file, "{}", json)
-                .context("Failed to write log entry")?;
+            let json = serde_json::to_string(entry).context("Failed to serialize log entry")?;
+            writeln!(file, "{}", json).context("Failed to write log entry")?;
         }
 
         self.buffer.clear();
@@ -178,8 +170,8 @@ impl ConversationLogger {
     /// Add feedback to a logged entry
     pub async fn add_feedback(&mut self, entry_id: &str, feedback: Feedback) -> Result<()> {
         // Read all entries from file
-        let contents = std::fs::read_to_string(&self.log_path)
-            .context("Failed to read log file")?;
+        let contents =
+            std::fs::read_to_string(&self.log_path).context("Failed to read log file")?;
 
         let mut updated_entries = Vec::new();
         let mut found = false;
@@ -189,8 +181,8 @@ impl ConversationLogger {
                 continue;
             }
 
-            let mut entry: LogEntry = serde_json::from_str(line)
-                .context("Failed to parse log entry")?;
+            let mut entry: LogEntry =
+                serde_json::from_str(line).context("Failed to parse log entry")?;
 
             if entry.id == entry_id {
                 entry.set_feedback(feedback.clone());
@@ -206,8 +198,8 @@ impl ConversationLogger {
         }
 
         // Write back all entries
-        let mut file = File::create(&self.log_path)
-            .context("Failed to open log file for writing")?;
+        let mut file =
+            File::create(&self.log_path).context("Failed to open log file for writing")?;
 
         for entry in updated_entries {
             let json = serde_json::to_string(&entry)?;

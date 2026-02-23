@@ -23,21 +23,13 @@ pub enum ConfirmationResult {
 #[allow(dead_code)]
 pub enum ReplEvent {
     /// User submitted input (query or command)
-    UserInput {
-        input: String,
-    },
+    UserInput { input: String },
 
     /// A query completed successfully with a response
-    QueryComplete {
-        query_id: Uuid,
-        response: String,
-    },
+    QueryComplete { query_id: Uuid, response: String },
 
     /// A query failed with an error
-    QueryFailed {
-        query_id: Uuid,
-        error: String,
-    },
+    QueryFailed { query_id: Uuid, error: String },
 
     /// A tool execution completed
     ToolResult {
@@ -54,9 +46,7 @@ pub enum ReplEvent {
     },
 
     /// Output is ready to display
-    OutputReady {
-        message: String,
-    },
+    OutputReady { message: String },
 
     /// Streaming response completed (used for non-streaming path)
     StreamingComplete {
@@ -94,7 +84,9 @@ mod tests {
 
     #[test]
     fn test_repl_event_user_input() {
-        let event = ReplEvent::UserInput { input: "hello world".to_string() };
+        let event = ReplEvent::UserInput {
+            input: "hello world".to_string(),
+        };
         match event {
             ReplEvent::UserInput { input } => assert_eq!(input, "hello world"),
             _ => panic!("Wrong variant"),
@@ -132,7 +124,9 @@ mod tests {
 
     #[test]
     fn test_repl_event_output_ready() {
-        let event = ReplEvent::OutputReady { message: "streaming chunk".to_string() };
+        let event = ReplEvent::OutputReady {
+            message: "streaming chunk".to_string(),
+        };
         match event {
             ReplEvent::OutputReady { message } => assert_eq!(message, "streaming chunk"),
             _ => panic!("Wrong variant"),
@@ -163,7 +157,12 @@ mod tests {
             latency_ms: Some(1500),
         };
         match event {
-            ReplEvent::StatsUpdate { model, input_tokens, output_tokens, latency_ms } => {
+            ReplEvent::StatsUpdate {
+                model,
+                input_tokens,
+                output_tokens,
+                latency_ms,
+            } => {
                 assert_eq!(model, "claude-sonnet-4-6");
                 assert_eq!(input_tokens, Some(100));
                 assert_eq!(output_tokens, Some(250));
@@ -182,7 +181,12 @@ mod tests {
             latency_ms: None,
         };
         match event {
-            ReplEvent::StatsUpdate { input_tokens, output_tokens, latency_ms, .. } => {
+            ReplEvent::StatsUpdate {
+                input_tokens,
+                output_tokens,
+                latency_ms,
+                ..
+            } => {
                 assert!(input_tokens.is_none());
                 assert!(output_tokens.is_none());
                 assert!(latency_ms.is_none());

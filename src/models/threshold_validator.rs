@@ -30,15 +30,13 @@ pub struct QualityStats {
     pub signal_stats: HashMap<QualitySignal, SignalStats>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SignalStats {
     pub present_and_good: usize,
     pub present_and_bad: usize,
     pub absent_and_good: usize,
     pub absent_and_bad: usize,
 }
-
 
 impl SignalStats {
     fn precision(&self) -> f64 {
@@ -212,11 +210,7 @@ impl ThresholdValidator {
             QualitySignal::WellFormatted,
             QualitySignal::AnswersQuestion,
         ] {
-            let signal_stats = self
-                .stats
-                .signal_stats
-                .entry(*signal)
-                .or_default();
+            let signal_stats = self.stats.signal_stats.entry(*signal).or_default();
 
             let present = signals_present.contains(signal);
 

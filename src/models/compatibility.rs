@@ -107,10 +107,10 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         #[cfg(feature = "candle")]
         candle_repo_template: "Qwen/Qwen2.5-{size}-Instruct",
         sizes: &[
-            ModelSize::Small,   // 1.5B
-            ModelSize::Medium,  // 3B
-            ModelSize::Large,   // 7B
-            ModelSize::XLarge,  // 14B
+            ModelSize::Small,  // 1.5B
+            ModelSize::Medium, // 3B
+            ModelSize::Large,  // 7B
+            ModelSize::XLarge, // 14B
         ],
         onnx_size_repos: Some(|size| match size {
             ModelSize::Small => Some("onnx-community/Qwen2.5-1.5B-Instruct"),
@@ -125,9 +125,9 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
             ModelSize::Large => Some("Qwen/Qwen2.5-7B-Instruct"),
             ModelSize::XLarge => Some("Qwen/Qwen2.5-14B-Instruct"),
         }),
-        notes: "Best overall quality. ONNX uses Coder variant for 3B. Candle uses original Qwen repos.",
+        notes:
+            "Best overall quality. ONNX uses Coder variant for 3B. Candle uses original Qwen repos.",
     },
-
     // Llama 3.2 - Meta's model, good general purpose
     // ONNX: Only 1B and 3B exist (no 8B)
     // Candle: Full range available
@@ -144,10 +144,10 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         #[cfg(feature = "candle")]
         candle_repo_template: "meta-llama/Llama-3.2-{size}-Instruct",
         sizes: &[
-            ModelSize::Small,   // 1B
-            ModelSize::Medium,  // 3B
-            ModelSize::Large,   // 3B (ONNX fallback), 8B (Candle)
-            ModelSize::XLarge,  // 3B (ONNX fallback), 70B (Candle)
+            ModelSize::Small,  // 1B
+            ModelSize::Medium, // 3B
+            ModelSize::Large,  // 3B (ONNX fallback), 8B (Candle)
+            ModelSize::XLarge, // 3B (ONNX fallback), 70B (Candle)
         ],
         onnx_size_repos: Some(|size| match size {
             ModelSize::Small => Some("onnx-community/Llama-3.2-1B-Instruct-ONNX"),
@@ -159,12 +159,11 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         candle_size_repos: Some(|size| match size {
             ModelSize::Small => Some("meta-llama/Llama-3.2-1B-Instruct"),
             ModelSize::Medium => Some("meta-llama/Llama-3.2-3B-Instruct"),
-            ModelSize::Large => Some("meta-llama/Llama-3.1-8B-Instruct"),  // 3.1 for 8B
+            ModelSize::Large => Some("meta-llama/Llama-3.1-8B-Instruct"), // 3.1 for 8B
             ModelSize::XLarge => Some("meta-llama/Llama-3.1-70B-Instruct"),
         }),
         notes: "ONNX: Only 1B/3B available. Candle: Full range including 8B and 70B.",
     },
-
     // Gemma - Google's model
     // ONNX: Mixed community sources
     // Candle: Official Google repos
@@ -181,10 +180,10 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         #[cfg(feature = "candle")]
         candle_repo_template: "google/gemma-2-{size}b-it",
         sizes: &[
-            ModelSize::Small,   // 270M (ONNX), 2B (Candle)
-            ModelSize::Medium,  // 2B
-            ModelSize::Large,   // 7B (ONNX), 9B (Candle)
-            ModelSize::XLarge,  // 7B (ONNX), 27B (Candle)
+            ModelSize::Small,  // 270M (ONNX), 2B (Candle)
+            ModelSize::Medium, // 2B
+            ModelSize::Large,  // 7B (ONNX), 9B (Candle)
+            ModelSize::XLarge, // 7B (ONNX), 27B (Candle)
         ],
         onnx_size_repos: Some(|size| match size {
             ModelSize::Small => Some("onnx-community/gemma-3-270m-it-ONNX"),
@@ -200,7 +199,6 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         }),
         notes: "ONNX: Community repos (270M/2B/7B). Candle: Official Google repos (2B/9B/27B).",
     },
-
     // Mistral - Efficient 7B model
     // ONNX: Community conversion (CalvinU)
     // Candle: Official Mistral repos
@@ -217,10 +215,10 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         #[cfg(feature = "candle")]
         candle_repo_template: "mistralai/Mistral-{size}B-Instruct-v0.3",
         sizes: &[
-            ModelSize::Small,   // 7B (ONNX only), 7B (Candle)
-            ModelSize::Medium,  // 7B (ONNX), 7B (Candle)
-            ModelSize::Large,   // 7B (ONNX), 22B (Candle)
-            ModelSize::XLarge,  // 7B (ONNX), 22B (Candle)
+            ModelSize::Small,  // 7B (ONNX only), 7B (Candle)
+            ModelSize::Medium, // 7B (ONNX), 7B (Candle)
+            ModelSize::Large,  // 7B (ONNX), 22B (Candle)
+            ModelSize::XLarge, // 7B (ONNX), 22B (Candle)
         ],
         onnx_size_repos: Some(|_size| Some("CalvinU/Mistral-7B-ONNX")),
         #[cfg(feature = "candle")]
@@ -230,7 +228,6 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         }),
         notes: "ONNX: Only 7B (community). Candle: 7B and 22B (official Mistral).",
     },
-
     // Phi - Microsoft's compact model
     // ONNX: Official Microsoft repositories
     // Candle: Official Microsoft repositories
@@ -247,10 +244,10 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         #[cfg(feature = "candle")]
         candle_repo_template: "microsoft/Phi-{version}-instruct",
         sizes: &[
-            ModelSize::Small,   // 3.8B (Phi-4-mini)
-            ModelSize::Medium,  // 3.8B (Phi-3.5-mini)
-            ModelSize::Large,   // 14B (Phi-4)
-            ModelSize::XLarge,  // 14B (Phi-4)
+            ModelSize::Small,  // 3.8B (Phi-4-mini)
+            ModelSize::Medium, // 3.8B (Phi-3.5-mini)
+            ModelSize::Large,  // 14B (Phi-4)
+            ModelSize::XLarge, // 14B (Phi-4)
         ],
         onnx_size_repos: Some(|size| match size {
             ModelSize::Small => Some("onnx-community/Phi-4-mini-instruct-ONNX"),
@@ -265,7 +262,6 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         }),
         notes: "Official Microsoft repositories for both ONNX and Candle. Phi-4 recommended.",
     },
-
     // DeepSeek - Specialized for coding
     // ONNX: Only 1.5B available (R1 Distill)
     // Candle: Full range including larger models
@@ -282,17 +278,17 @@ static COMPATIBILITY_MATRIX: &[ModelCompatibility] = &[
         #[cfg(feature = "candle")]
         candle_repo_template: "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
         sizes: &[
-            ModelSize::Small,   // 1.5B (ONNX), 1.3B (Candle)
-            ModelSize::Medium,  // 1.5B (ONNX), 6.7B (Candle)
-            ModelSize::Large,   // 1.5B (ONNX), 16B (Candle)
-            ModelSize::XLarge,  // 1.5B (ONNX), 33B (Candle)
+            ModelSize::Small,  // 1.5B (ONNX), 1.3B (Candle)
+            ModelSize::Medium, // 1.5B (ONNX), 6.7B (Candle)
+            ModelSize::Large,  // 1.5B (ONNX), 16B (Candle)
+            ModelSize::XLarge, // 1.5B (ONNX), 33B (Candle)
         ],
         onnx_size_repos: Some(|_size| Some("onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX")),
         #[cfg(feature = "candle")]
         candle_size_repos: Some(|size| match size {
             ModelSize::Small => Some("deepseek-ai/DeepSeek-Coder-1.3B-Instruct"),
             ModelSize::Medium => Some("deepseek-ai/DeepSeek-Coder-6.7B-Instruct"),
-            ModelSize::Large => Some("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"),  // 16B
+            ModelSize::Large => Some("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"), // 16B
             ModelSize::XLarge => Some("deepseek-ai/DeepSeek-Coder-33B-Instruct"),
         }),
         notes: "ONNX: Only 1.5B (R1 Distill). Candle: Full Coder range (1.3B-33B).",
@@ -323,9 +319,13 @@ pub fn get_compatible_families_for_provider(
 
             // Must have a repository for this provider
             match provider {
-                InferenceProvider::Onnx => c.onnx_size_repos.is_some() || !c.onnx_repo_template.is_empty(),
+                InferenceProvider::Onnx => {
+                    c.onnx_size_repos.is_some() || !c.onnx_repo_template.is_empty()
+                }
                 #[cfg(feature = "candle")]
-                InferenceProvider::Candle => c.candle_size_repos.is_some() || !c.candle_repo_template.is_empty(),
+                InferenceProvider::Candle => {
+                    c.candle_size_repos.is_some() || !c.candle_repo_template.is_empty()
+                }
             }
         })
         .map(|c| c.family)
@@ -342,7 +342,11 @@ pub fn is_compatible(family: ModelFamily, target: ExecutionTarget) -> bool {
 }
 
 /// Get repository ID for a specific provider, family, and size
-pub fn get_repository(provider: InferenceProvider, family: ModelFamily, size: ModelSize) -> Option<String> {
+pub fn get_repository(
+    provider: InferenceProvider,
+    family: ModelFamily,
+    size: ModelSize,
+) -> Option<String> {
     COMPATIBILITY_MATRIX
         .iter()
         .find(|c| c.family == family)
@@ -407,15 +411,27 @@ mod tests {
     fn test_qwen_repository_resolution_onnx() {
         // Test ONNX repositories
         assert_eq!(
-            get_repository(InferenceProvider::Onnx, ModelFamily::Qwen2, ModelSize::Small),
+            get_repository(
+                InferenceProvider::Onnx,
+                ModelFamily::Qwen2,
+                ModelSize::Small
+            ),
             Some("onnx-community/Qwen2.5-1.5B-Instruct".to_string())
         );
         assert_eq!(
-            get_repository(InferenceProvider::Onnx, ModelFamily::Qwen2, ModelSize::Medium),
+            get_repository(
+                InferenceProvider::Onnx,
+                ModelFamily::Qwen2,
+                ModelSize::Medium
+            ),
             Some("onnx-community/Qwen2.5-Coder-3B-Instruct".to_string())
         );
         assert_eq!(
-            get_repository(InferenceProvider::Onnx, ModelFamily::Qwen2, ModelSize::Large),
+            get_repository(
+                InferenceProvider::Onnx,
+                ModelFamily::Qwen2,
+                ModelSize::Large
+            ),
             Some("GreenHalo/Qwen2.5-7B-Instruct-16bit-ONNX".to_string())
         );
     }
@@ -425,11 +441,19 @@ mod tests {
     fn test_qwen_repository_resolution_candle() {
         // Test Candle repositories
         assert_eq!(
-            get_repository(InferenceProvider::Candle, ModelFamily::Qwen2, ModelSize::Small),
+            get_repository(
+                InferenceProvider::Candle,
+                ModelFamily::Qwen2,
+                ModelSize::Small
+            ),
             Some("Qwen/Qwen2.5-1.5B-Instruct".to_string())
         );
         assert_eq!(
-            get_repository(InferenceProvider::Candle, ModelFamily::Qwen2, ModelSize::Medium),
+            get_repository(
+                InferenceProvider::Candle,
+                ModelFamily::Qwen2,
+                ModelSize::Medium
+            ),
             Some("Qwen/Qwen2.5-3B-Instruct".to_string())
         );
     }
@@ -437,7 +461,12 @@ mod tests {
     #[test]
     fn test_mistral_repository_resolution() {
         // Mistral only has 7B (community repo for ONNX)
-        for size in [ModelSize::Small, ModelSize::Medium, ModelSize::Large, ModelSize::XLarge] {
+        for size in [
+            ModelSize::Small,
+            ModelSize::Medium,
+            ModelSize::Large,
+            ModelSize::XLarge,
+        ] {
             assert_eq!(
                 get_repository(InferenceProvider::Onnx, ModelFamily::Mistral, size),
                 Some("CalvinU/Mistral-7B-ONNX".to_string())
@@ -449,16 +478,28 @@ mod tests {
     fn test_llama_repository_resolution() {
         // Llama has 1B and 3B (3B is fallback for larger sizes in ONNX)
         assert_eq!(
-            get_repository(InferenceProvider::Onnx, ModelFamily::Llama3, ModelSize::Small),
+            get_repository(
+                InferenceProvider::Onnx,
+                ModelFamily::Llama3,
+                ModelSize::Small
+            ),
             Some("onnx-community/Llama-3.2-1B-Instruct-ONNX".to_string())
         );
         assert_eq!(
-            get_repository(InferenceProvider::Onnx, ModelFamily::Llama3, ModelSize::Medium),
+            get_repository(
+                InferenceProvider::Onnx,
+                ModelFamily::Llama3,
+                ModelSize::Medium
+            ),
             Some("onnx-community/Llama-3.2-3B-Instruct-ONNX".to_string())
         );
         // Large and XLarge fall back to 3B in ONNX
         assert_eq!(
-            get_repository(InferenceProvider::Onnx, ModelFamily::Llama3, ModelSize::Large),
+            get_repository(
+                InferenceProvider::Onnx,
+                ModelFamily::Llama3,
+                ModelSize::Large
+            ),
             Some("onnx-community/Llama-3.2-3B-Instruct-ONNX".to_string())
         );
     }
@@ -466,7 +507,12 @@ mod tests {
     #[test]
     fn test_deepseek_repository_resolution() {
         // DeepSeek only has 1.5B in ONNX
-        for size in [ModelSize::Small, ModelSize::Medium, ModelSize::Large, ModelSize::XLarge] {
+        for size in [
+            ModelSize::Small,
+            ModelSize::Medium,
+            ModelSize::Large,
+            ModelSize::XLarge,
+        ] {
             assert_eq!(
                 get_repository(InferenceProvider::Onnx, ModelFamily::DeepSeek, size),
                 Some("onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX".to_string())
@@ -480,7 +526,10 @@ mod tests {
         assert!(is_compatible(ModelFamily::Qwen2, ExecutionTarget::CoreML));
         assert!(is_compatible(ModelFamily::Qwen2, ExecutionTarget::Cpu));
         assert!(is_compatible(ModelFamily::Mistral, ExecutionTarget::CoreML));
-        assert!(is_compatible(ModelFamily::DeepSeek, ExecutionTarget::CoreML));
+        assert!(is_compatible(
+            ModelFamily::DeepSeek,
+            ExecutionTarget::CoreML
+        ));
     }
 
     #[test]

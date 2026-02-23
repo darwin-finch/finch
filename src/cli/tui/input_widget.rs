@@ -4,11 +4,11 @@
 // Instead, we provide a helper function to render the textarea.
 
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::Span,
     widgets::Paragraph,
+    Frame,
 };
 use tui_textarea::TextArea;
 
@@ -28,8 +28,8 @@ pub fn render_input_widget<'a>(
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(3),  // Prompt: " ❯ "
-            Constraint::Min(1),     // Textarea: rest of line
+            Constraint::Length(3), // Prompt: " ❯ "
+            Constraint::Min(1),    // Textarea: rest of line
         ])
         .split(area);
 
@@ -53,10 +53,8 @@ pub fn render_input_widget<'a>(
             let ghost_y = chunks[1].y;
 
             // Render ghost text in gray after cursor
-            let ghost_widget = Paragraph::new(Span::styled(
-                ghost,
-                Style::default().fg(Color::DarkGray),
-            ));
+            let ghost_widget =
+                Paragraph::new(Span::styled(ghost, Style::default().fg(Color::DarkGray)));
 
             // Calculate available space for ghost text
             let available_width = chunks[1].width.saturating_sub(cursor_col as u16);

@@ -207,7 +207,9 @@ impl ClaudeProvider {
 
                                 // Check for end marker
                                 if json_str == "[DONE]" {
-                                    tracing::debug!("[STREAM] Received [DONE], marking stream as complete");
+                                    tracing::debug!(
+                                        "[STREAM] Received [DONE], marking stream as complete"
+                                    );
                                     done = true;
                                     break;
                                 }
@@ -246,9 +248,11 @@ impl ClaudeProvider {
                                                                 builder.accumulated.push_str(&text);
                                                                 // Send delta immediately
                                                                 if tx
-                                                                    .send(Ok(StreamChunk::TextDelta(
-                                                                        text,
-                                                                    )))
+                                                                    .send(Ok(
+                                                                        StreamChunk::TextDelta(
+                                                                            text,
+                                                                        ),
+                                                                    ))
                                                                     .await
                                                                     .is_err()
                                                                 {

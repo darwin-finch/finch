@@ -168,7 +168,9 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
     let mut seen_providers = std::collections::HashSet::new();
 
     let mut add = |provider: &str, key: &str| {
-        if seen_providers.contains(provider) { return; }
+        if seen_providers.contains(provider) {
+            return;
+        }
         seen_providers.insert(provider.to_string());
         teachers.push(finch::config::TeacherEntry {
             provider: provider.to_string(),
@@ -196,12 +198,12 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
     // 2. Environment variables
     let candidates = [
         ("ANTHROPIC_API_KEY", "claude"),
-        ("OPENAI_API_KEY",    "openai"),
-        ("GROK_API_KEY",      "grok"),
-        ("XAI_API_KEY",       "grok"),
-        ("GEMINI_API_KEY",    "gemini"),
-        ("MISTRAL_API_KEY",   "mistral"),
-        ("GROQ_API_KEY",      "groq"),
+        ("OPENAI_API_KEY", "openai"),
+        ("GROK_API_KEY", "grok"),
+        ("XAI_API_KEY", "grok"),
+        ("GEMINI_API_KEY", "gemini"),
+        ("MISTRAL_API_KEY", "mistral"),
+        ("GROQ_API_KEY", "groq"),
     ];
 
     for (env_var, provider) in &candidates {
@@ -229,7 +231,7 @@ async fn main() -> Result<()> {
     // Suppress ONNX Runtime verbose logs BEFORE any initialization
     // Must be set early, before any ONNX library code runs
     // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
-    std::env::set_var("ORT_LOGGING_LEVEL", "3");  // Error and Fatal only
+    std::env::set_var("ORT_LOGGING_LEVEL", "3"); // Error and Fatal only
 
     // Install panic handler to cleanup terminal on panic
     install_panic_handler();
@@ -272,7 +274,12 @@ async fn main() -> Result<()> {
         Some(Command::License { license_command }) => {
             return run_license_command(license_command).await;
         }
-        Some(Command::Agent { persona, tasks, reflect_every, once }) => {
+        Some(Command::Agent {
+            persona,
+            tasks,
+            reflect_every,
+            once,
+        }) => {
             return run_agent(persona, tasks, reflect_every, once).await;
         }
         None => {
@@ -297,8 +304,8 @@ async fn main() -> Result<()> {
 
     // CRITICAL: Create and configure OutputManager BEFORE initializing tracing
     // This prevents lazy initialization with stdout enabled
-    use finch::cli::{OutputManager, StatusBar};
     use finch::cli::global_output::{set_global_output, set_global_status};
+    use finch::cli::{OutputManager, StatusBar};
     use finch::config::ColorScheme;
 
     let output_manager = Arc::new(OutputManager::new(ColorScheme::default()));
@@ -342,99 +349,104 @@ async fn main() -> Result<()> {
                 cfg.save().ok();
                 cfg
             } else {
+                eprintln!("\n\x1b[1;33m⚠️  Running first-time setup wizard...\x1b[0m\n");
 
-            eprintln!("\n\x1b[1;33m⚠️  Running first-time setup wizard...\x1b[0m\n");
+                // Run setup wizard
+                use finch::cli::show_setup_wizard;
+                match show_setup_wizard() {
+                    Ok(result) => {
+                        // Create config from unified providers list (new format)
+                        let active_theme = result.active_theme.clone();
+                        let default_persona = result.default_persona.clone();
+                        let daemon_only_mode = result.daemon_only_mode;
+                        let mdns_discovery = result.mdns_discovery;
 
-            // Run setup wizard
-            use finch::cli::show_setup_wizard;
-            match show_setup_wizard() {
-                Ok(result) => {
-                    // Create config from unified providers list (new format)
-                    let active_theme = result.active_theme.clone();
-                    let default_persona = result.default_persona.clone();
-                    let daemon_only_mode = result.daemon_only_mode;
-                    let mdns_discovery = result.mdns_discovery;
-
-                    // Patch any empty API keys in the providers list with
-                    // auto-detected values from environment variables.
-                    let mut providers = result.providers;
-                    let auto = build_teachers_from_env();
-                    for p in &mut providers {
-                        if let Some(key) = p.api_key() {
-                            if key.is_empty() {
-                                let ptype = p.provider_type().to_string();
-                                if let Some(detected) = auto.iter().find(|t| t.provider == ptype) {
-                                    // Replace the empty-key entry with a filled one
-                                    *p = finch::config::ProviderEntry::from_teacher_entry(detected);
+                        // Patch any empty API keys in the providers list with
+                        // auto-detected values from environment variables.
+                        let mut providers = result.providers;
+                        let auto = build_teachers_from_env();
+                        for p in &mut providers {
+                            if let Some(key) = p.api_key() {
+                                if key.is_empty() {
+                                    let ptype = p.provider_type().to_string();
+                                    if let Some(detected) =
+                                        auto.iter().find(|t| t.provider == ptype)
+                                    {
+                                        // Replace the empty-key entry with a filled one
+                                        *p = finch::config::ProviderEntry::from_teacher_entry(
+                                            detected,
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }
-                    // If still no cloud providers with keys, add auto-detected ones
-                    let has_keys = providers.iter().any(|p| {
-                        p.api_key().map(|k| !k.is_empty()).unwrap_or(false)
-                    });
-                    if !has_keys && !auto.is_empty() {
-                        for t in &auto {
-                            providers.insert(0, finch::config::ProviderEntry::from_teacher_entry(t));
+                        // If still no cloud providers with keys, add auto-detected ones
+                        let has_keys = providers
+                            .iter()
+                            .any(|p| p.api_key().map(|k| !k.is_empty()).unwrap_or(false));
+                        if !has_keys && !auto.is_empty() {
+                            for t in &auto {
+                                providers
+                                    .insert(0, finch::config::ProviderEntry::from_teacher_entry(t));
+                            }
                         }
-                    }
 
-                    let mut new_config = Config::with_providers(providers);
-                    new_config.active_theme = active_theme;
-                    new_config.active_persona = default_persona;
-                    if let Some(hf_tok) = result.hf_token {
-                        if !hf_tok.is_empty() {
-                            new_config.huggingface_token = Some(hf_tok);
+                        let mut new_config = Config::with_providers(providers);
+                        new_config.active_theme = active_theme;
+                        new_config.active_persona = default_persona;
+                        if let Some(hf_tok) = result.hf_token {
+                            if !hf_tok.is_empty() {
+                                new_config.huggingface_token = Some(hf_tok);
+                            }
                         }
+                        new_config.features = finch::config::FeaturesConfig {
+                            auto_approve_tools: result.auto_approve_tools,
+                            streaming_enabled: result.streaming_enabled,
+                            debug_logging: result.debug_logging,
+                            #[cfg(target_os = "macos")]
+                            gui_automation: result.gui_automation,
+                        };
+                        if daemon_only_mode {
+                            new_config.server.mode = "daemon-only".to_string();
+                        }
+                        if mdns_discovery {
+                            new_config.server.advertise = true;
+                            new_config.client.auto_discover = true;
+                        }
+                        #[allow(deprecated)]
+                        {
+                            new_config.streaming_enabled = new_config.features.streaming_enabled;
+                        }
+                        new_config.save()?;
+                        eprintln!("\n\x1b[1;32m✓ Configuration saved!\x1b[0m\n");
+                        new_config
                     }
-                    new_config.features = finch::config::FeaturesConfig {
-                        auto_approve_tools: result.auto_approve_tools,
-                        streaming_enabled: result.streaming_enabled,
-                        debug_logging: result.debug_logging,
-                        #[cfg(target_os = "macos")]
-                        gui_automation: result.gui_automation,
-                    };
-                    if daemon_only_mode {
-                        new_config.server.mode = "daemon-only".to_string();
-                    }
-                    if mdns_discovery {
-                        new_config.server.advertise = true;
-                        new_config.client.auto_discover = true;
-                    }
-                    #[allow(deprecated)]
-                    {
-                        new_config.streaming_enabled = new_config.features.streaming_enabled;
-                    }
-                    new_config.save()?;
-                    eprintln!("\n\x1b[1;32m✓ Configuration saved!\x1b[0m\n");
-                    new_config
-                }
-                Err(wizard_err) if wizard_err.to_string().contains("Setup cancelled") => {
-                    // User pressed Escape/Ctrl+C — don't crash, fall back gracefully
-                    eprintln!("\n\x1b[33mSetup skipped. Detecting API keys from environment...\x1b[0m");
+                    Err(wizard_err) if wizard_err.to_string().contains("Setup cancelled") => {
+                        // User pressed Escape/Ctrl+C — don't crash, fall back gracefully
+                        eprintln!("\n\x1b[33mSetup skipped. Detecting API keys from environment...\x1b[0m");
 
-                    let teachers = build_teachers_from_env();
+                        let teachers = build_teachers_from_env();
 
-                    if teachers.is_empty() {
-                        eprintln!(
+                        if teachers.is_empty() {
+                            eprintln!(
                             "\x1b[33mNo API keys found. Set ANTHROPIC_API_KEY (or OPENAI_API_KEY / GROK_API_KEY)\x1b[0m"
                         );
-                        eprintln!("\x1b[33mand re-run, or run `finch setup` to configure interactively.\x1b[0m\n");
-                    } else {
-                        let names: Vec<&str> = teachers.iter().map(|t| t.provider.as_str()).collect();
-                        eprintln!("\x1b[32m✓ Auto-configured: {}\x1b[0m\n", names.join(", "));
-                    }
+                            eprintln!("\x1b[33mand re-run, or run `finch setup` to configure interactively.\x1b[0m\n");
+                        } else {
+                            let names: Vec<&str> =
+                                teachers.iter().map(|t| t.provider.as_str()).collect();
+                            eprintln!("\x1b[32m✓ Auto-configured: {}\x1b[0m\n", names.join(", "));
+                        }
 
-                    let cfg = Config::new(teachers);
-                    // Save so next launch doesn't show the wizard again
-                    if cfg.save().is_err() {
-                        // Non-fatal — we'll just show the wizard again next time
+                        let cfg = Config::new(teachers);
+                        // Save so next launch doesn't show the wizard again
+                        if cfg.save().is_err() {
+                            // Non-fatal — we'll just show the wizard again next time
+                        }
+                        cfg
                     }
-                    cfg
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            }
             } // end else (no auto-detected keys)
         }
     };
@@ -624,7 +636,7 @@ fn init_tracing() {
 /// Run HTTP daemon server
 /// Start the daemon in background
 async fn run_daemon_start(bind_address: String) -> Result<()> {
-    use finch::daemon::{DaemonLifecycle, ensure_daemon_running};
+    use finch::daemon::{ensure_daemon_running, DaemonLifecycle};
 
     let lifecycle = DaemonLifecycle::new()?;
 
@@ -692,7 +704,10 @@ async fn run_daemon_status() -> Result<()> {
 
     // Query health endpoint
     let client = reqwest::Client::new();
-    let daemon_url = format!("http://{}/health", finch::config::constants::DEFAULT_DAEMON_ADDR);
+    let daemon_url = format!(
+        "http://{}/health",
+        finch::config::constants::DEFAULT_DAEMON_ADDR
+    );
 
     let response = client
         .get(&daemon_url)
@@ -725,7 +740,10 @@ async fn run_daemon_status() -> Result<()> {
     println!("  PID:             {}", pid);
     println!("  Uptime:          {}s", health.uptime_seconds);
     println!("  Active Sessions: {}", health.active_sessions);
-    println!("  Bind Address:    {}", finch::config::constants::DEFAULT_DAEMON_ADDR);
+    println!(
+        "  Bind Address:    {}",
+        finch::config::constants::DEFAULT_DAEMON_ADDR
+    );
     println!();
 
     Ok(())
@@ -740,14 +758,13 @@ async fn run_train_command(train_command: TrainCommand) -> Result<()> {
 
 /// Set up Python environment for LoRA training
 async fn run_train_setup() -> Result<()> {
-    
     use std::process::Command;
 
     println!("\x1b[1;36m🔧 Setting up Python environment for LoRA training\x1b[0m\n");
 
     // Determine paths
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
     let venv_dir = home.join(".finch/venv");
     let requirements_path = std::env::current_dir()?.join("scripts/requirements.txt");
 
@@ -837,7 +854,10 @@ async fn run_train_setup() -> Result<()> {
 
     // Success message
     println!("\n\x1b[1;32m✅ Setup complete!\x1b[0m\n");
-    println!("Python environment ready at: \x1b[1m{}\x1b[0m", venv_dir.display());
+    println!(
+        "Python environment ready at: \x1b[1m{}\x1b[0m",
+        venv_dir.display()
+    );
     println!("\nTo use the training scripts:");
     println!("  \x1b[1;36m~/.finch/venv/bin/python scripts/train_lora.py\x1b[0m");
     println!("\nTraining will run automatically when you provide feedback.");
@@ -846,13 +866,13 @@ async fn run_train_setup() -> Result<()> {
 }
 
 async fn run_daemon(bind_address: String) -> Result<()> {
-    use finch::server::{AgentServer, ServerConfig};
-    use finch::models::{BootstrapLoader, GeneratorState, TrainingCoordinator};
-    use finch::local::LocalGenerator;
     use finch::daemon::DaemonLifecycle;
+    use finch::local::LocalGenerator;
+    use finch::models::{BootstrapLoader, GeneratorState, TrainingCoordinator};
+    use finch::server::{AgentServer, ServerConfig};
+    use finch::{output_progress, output_status};
     use std::sync::Arc;
     use tokio::sync::RwLock;
-    use finch::{output_progress, output_status};
 
     // Check if debug logging is enabled in config (before setting up tracing)
     // This allows the debug_logging feature flag to control log verbosity
@@ -878,11 +898,11 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         .with_context(|| format!("Failed to open daemon log: {}", log_path.display()))?;
 
     // Create a file logger layer
-    
+
     let file_writer = Arc::new(log_file);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(move || file_writer.clone())
-        .with_ansi(false);  // No ANSI colors in log file
+        .with_ansi(false); // No ANSI colors in log file
 
     // Add file layer to tracing
     use tracing_subscriber::prelude::*;
@@ -898,7 +918,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     // Suppress ONNX Runtime verbose logs (must be set before library initialization)
     // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
-    std::env::set_var("ORT_LOGGING_LEVEL", "3");  // Error and Fatal only
+    std::env::set_var("ORT_LOGGING_LEVEL", "3"); // Error and Fatal only
 
     // Note: init_tracing() is NOT called in daemon mode - we set up file logging above instead
 
@@ -1063,19 +1083,25 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     // Set up mDNS service advertisement if enabled
     let service_discovery = if config.server.advertise {
-        use finch::service::{ServiceDiscovery, ServiceConfig};
+        use finch::service::{ServiceConfig, ServiceDiscovery};
 
         let service_config = ServiceConfig {
             name: config.server.service_name.clone(),
             description: config.server.service_description.clone(),
-            model: format!("{:?}", config.backend.model_size),  // e.g., "Small", "Medium", "Large"
-            capabilities: vec!["code".to_string(), "general".to_string(), "tool-use".to_string()],
+            model: format!("{:?}", config.backend.model_size), // e.g., "Small", "Medium", "Large"
+            capabilities: vec![
+                "code".to_string(),
+                "general".to_string(),
+                "tool-use".to_string(),
+            ],
         };
 
         match ServiceDiscovery::new(service_config) {
             Ok(discovery) => {
                 // Extract port from bind_address
-                let port = config.server.bind_address
+                let port = config
+                    .server
+                    .bind_address
                     .split(':')
                     .next_back()
                     .and_then(|p| p.parse::<u16>().ok())
@@ -1087,13 +1113,19 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                         Some(discovery)
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to advertise service: {}. Continuing without mDNS.", e);
+                        tracing::warn!(
+                            "Failed to advertise service: {}. Continuing without mDNS.",
+                            e
+                        );
                         None
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to create service discovery: {}. Continuing without mDNS.", e);
+                tracing::warn!(
+                    "Failed to create service discovery: {}. Continuing without mDNS.",
+                    e
+                );
                 None
             }
         }
@@ -1102,9 +1134,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     };
 
     // Set up graceful shutdown handling
-    let server_handle = tokio::spawn(async move {
-        server.serve().await
-    });
+    let server_handle = tokio::spawn(async move { server.serve().await });
 
     // Wait for shutdown signal (Ctrl+C or SIGTERM)
     tokio::select! {
@@ -1146,10 +1176,10 @@ async fn build_query_tool_executor() -> Result<(
     Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
     Vec<finch::tools::types::ToolDefinition>,
 )> {
-    use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
     use finch::tools::implementations::{
         BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
     };
+    use finch::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadTool));
@@ -1199,7 +1229,9 @@ async fn run_query(query: &str) -> Result<()> {
     let client = DaemonClient::connect(daemon_config).await?;
 
     let guard = executor.lock().await;
-    let response = client.query_with_tools(query, tool_definitions, &guard).await?;
+    let response = client
+        .query_with_tools(query, tool_definitions, &guard)
+        .await?;
     println!("{}", response);
 
     Ok(())
@@ -1257,8 +1289,7 @@ async fn run_query_teacher_only(
                 let guard = executor.lock().await;
                 guard
                     .execute_tool::<fn() -> anyhow::Result<()>>(
-                        &tool_use,
-                        None, // conversation
+                        &tool_use, None, // conversation
                         None, // save_models_fn
                         None, // batch_trainer
                         None, // local_generator
@@ -1343,7 +1374,14 @@ async fn run_node_info() -> Result<()> {
     } else {
         println!("  Model    : cloud-only (teacher API)");
     }
-    println!("  Teacher  : {}", if info.capabilities.has_teacher_api { "configured" } else { "none" });
+    println!(
+        "  Teacher  : {}",
+        if info.capabilities.has_teacher_api {
+            "configured"
+        } else {
+            "none"
+        }
+    );
     println!();
     println!("  To run as a worker node:");
     println!("    finch worker");
@@ -1355,8 +1393,8 @@ async fn run_node_info() -> Result<()> {
 
 /// Handle `finch network` subcommands
 async fn run_network_command(cmd: NetworkCommand) -> Result<()> {
-    use finch::network::{DeviceMembership, LotusClient, MembershipStatus};
     use finch::network::client::RegisterDeviceRequest;
+    use finch::network::{DeviceMembership, LotusClient, MembershipStatus};
     use finch::node::identity::NodeIdentity;
 
     let identity = NodeIdentity::load_or_create()?;
@@ -1384,7 +1422,11 @@ async fn run_network_command(cmd: NetworkCommand) -> Result<()> {
                     println!("  To link this device to a Lotus account:");
                     println!("    finch network join <invite-code>");
                 }
-                MembershipStatus::AccountMember { account_id, account_name, .. } => {
+                MembershipStatus::AccountMember {
+                    account_id,
+                    account_name,
+                    ..
+                } => {
                     let name = account_name.as_deref().unwrap_or("(unnamed)");
                     println!("  Status     : Account member");
                     println!("  Account    : {} ({})", name, account_id);
@@ -1401,16 +1443,22 @@ async fn run_network_command(cmd: NetworkCommand) -> Result<()> {
                 return Ok(());
             }
 
-            println!("Registering device {} with Lotus Network...", identity.short_id());
+            println!(
+                "Registering device {} with Lotus Network...",
+                identity.short_id()
+            );
             println!("  URL: {}", membership.lotus_url);
 
             let client = LotusClient::new(&membership.lotus_url)?;
-            match client.register_device(RegisterDeviceRequest {
-                device_id: identity.id,
-                fingerprint: identity.name.clone(),
-                finch_version: identity.version.clone(),
-                os: std::env::consts::OS.to_string(),
-            }).await {
+            match client
+                .register_device(RegisterDeviceRequest {
+                    device_id: identity.id,
+                    fingerprint: identity.name.clone(),
+                    finch_version: identity.version.clone(),
+                    os: std::env::consts::OS.to_string(),
+                })
+                .await
+            {
                 Ok(resp) => {
                     membership.status = MembershipStatus::Anonymous {
                         device_token: resp.device_token,
@@ -1442,7 +1490,10 @@ async fn run_network_command(cmd: NetworkCommand) -> Result<()> {
                 }
             };
 
-            println!("Joining Lotus account with invite code {}...", &invite_code[..invite_code.len().min(6)]);
+            println!(
+                "Joining Lotus account with invite code {}...",
+                &invite_code[..invite_code.len().min(6)]
+            );
 
             let client = LotusClient::new(&membership.lotus_url)?;
             match client.join_account(&device_token, &invite_code).await {
@@ -1455,14 +1506,18 @@ async fn run_network_command(cmd: NetworkCommand) -> Result<()> {
                     };
                     membership.save()?;
 
-                    println!("✓ Joined account: {} ({})",
+                    println!(
+                        "✓ Joined account: {} ({})",
                         resp.account_name.as_deref().unwrap_or("(unnamed)"),
-                        resp.account_id);
+                        resp.account_id
+                    );
                 }
                 Err(e) => {
                     println!("⚠  Could not join account: {}", e);
                     println!();
-                    println!("  Check that the invite code is valid and hasn't expired (15 min TTL).");
+                    println!(
+                        "  Check that the invite code is valid and hasn't expired (15 min TTL)."
+                    );
                     println!("  Generate a new code at lotus.net and try again.");
                 }
             }
@@ -1515,54 +1570,50 @@ async fn run_license_command(cmd: Option<LicenseCommand>) -> Result<()> {
     let mut config = load_config().unwrap_or_else(|_| finch::config::Config::new(vec![]));
 
     match cmd {
-        None | Some(LicenseCommand::Status) => {
-            match &config.license.license_type {
-                LicenseType::Commercial => {
-                    println!("License: Commercial ✓");
-                    if let Some(name) = &config.license.licensee_name {
-                        if let Some(expires) = &config.license.expires_at {
-                            println!("  Licensee:  {}", name);
-                            println!("  Expires:   {}", expires);
-                        } else {
-                            println!("  Licensee:  {}", name);
-                        }
-                    }
-                    println!("  Renew at:  https://polar.sh/darwin-finch");
-                }
-                LicenseType::Noncommercial => {
-                    println!("License: Noncommercial");
-                    println!("  Free for personal, educational, and research use.");
-                    println!("  Using Finch commercially? $10/yr → https://polar.sh/darwin-finch");
-                    println!("  Activate: finch license activate --key <key>");
-                }
-            }
-        }
-
-        Some(LicenseCommand::Activate { key }) => {
-            match validate_key(&key) {
-                Ok(parsed) => {
-                    config.license = LicenseConfig {
-                        key: Some(key),
-                        license_type: LicenseType::Commercial,
-                        verified_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-                        expires_at: Some(parsed.expires_at.format("%Y-%m-%d").to_string()),
-                        licensee_name: Some(parsed.name.clone()),
-                        notice_suppress_until: None,
-                    };
-                    if let Err(e) = config.save() {
-                        eprintln!("⚠️  License activated but could not save config: {}", e);
+        None | Some(LicenseCommand::Status) => match &config.license.license_type {
+            LicenseType::Commercial => {
+                println!("License: Commercial ✓");
+                if let Some(name) = &config.license.licensee_name {
+                    if let Some(expires) = &config.license.expires_at {
+                        println!("  Licensee:  {}", name);
+                        println!("  Expires:   {}", expires);
                     } else {
-                        println!("✓ License activated");
-                        println!("  Licensee:  {} ({})", parsed.name, parsed.email);
-                        println!("  Expires:   {}", parsed.expires_at.format("%Y-%m-%d"));
+                        println!("  Licensee:  {}", name);
                     }
                 }
-                Err(e) => {
-                    eprintln!("✗ License activation failed: {}", e);
-                    std::process::exit(1);
+                println!("  Renew at:  https://polar.sh/darwin-finch");
+            }
+            LicenseType::Noncommercial => {
+                println!("License: Noncommercial");
+                println!("  Free for personal, educational, and research use.");
+                println!("  Using Finch commercially? $10/yr → https://polar.sh/darwin-finch");
+                println!("  Activate: finch license activate --key <key>");
+            }
+        },
+
+        Some(LicenseCommand::Activate { key }) => match validate_key(&key) {
+            Ok(parsed) => {
+                config.license = LicenseConfig {
+                    key: Some(key),
+                    license_type: LicenseType::Commercial,
+                    verified_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+                    expires_at: Some(parsed.expires_at.format("%Y-%m-%d").to_string()),
+                    licensee_name: Some(parsed.name.clone()),
+                    notice_suppress_until: None,
+                };
+                if let Err(e) = config.save() {
+                    eprintln!("⚠️  License activated but could not save config: {}", e);
+                } else {
+                    println!("✓ License activated");
+                    println!("  Licensee:  {} ({})", parsed.name, parsed.email);
+                    println!("  Expires:   {}", parsed.expires_at.format("%Y-%m-%d"));
                 }
             }
-        }
+            Err(e) => {
+                eprintln!("✗ License activation failed: {}", e);
+                std::process::exit(1);
+            }
+        },
 
         Some(LicenseCommand::Remove) => {
             config.license = LicenseConfig::default();

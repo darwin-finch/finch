@@ -12,8 +12,10 @@ use serde_json::Value;
 ///
 /// Matches: <tool_use>\s*<name>...</name>\s*<parameters>...</parameters>\s*</tool_use>
 static TOOL_USE_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?s)<tool_use>\s*<name>([^<]+)</name>\s*<parameters>(.+?)</parameters>\s*</tool_use>")
-        .expect("Failed to compile tool_use regex")
+    Regex::new(
+        r"(?s)<tool_use>\s*<name>([^<]+)</name>\s*<parameters>(.+?)</parameters>\s*</tool_use>",
+    )
+    .expect("Failed to compile tool_use regex")
 });
 
 /// Parser for extracting tool calls from model output
@@ -146,7 +148,8 @@ Then I'll search for the pattern:
     #[test]
     fn test_parse_compact_format() {
         // Test without extra whitespace
-        let output = "<tool_use><name>bash</name><parameters>{\"command\":\"ls\"}</parameters></tool_use>";
+        let output =
+            "<tool_use><name>bash</name><parameters>{\"command\":\"ls\"}</parameters></tool_use>";
 
         let tool_uses = ToolCallParser::parse(output).unwrap();
         assert_eq!(tool_uses.len(), 1);

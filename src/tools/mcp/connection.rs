@@ -10,7 +10,9 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child as TokioChild, ChildStdin as TokioChildStdin, ChildStdout as TokioChildStdout};
+use tokio::process::{
+    Child as TokioChild, ChildStdin as TokioChildStdin, ChildStdout as TokioChildStdout,
+};
 use tokio::sync::Mutex;
 
 /// JSON-RPC 2.0 request
@@ -159,7 +161,11 @@ impl McpConnection {
         conn.refresh_tools().await?;
 
         conn.is_connected = true;
-        tracing::info!("Connected to MCP server '{}' with {} tools", name, conn.tools.len());
+        tracing::info!(
+            "Connected to MCP server '{}' with {} tools",
+            name,
+            conn.tools.len()
+        );
 
         Ok(conn)
     }
@@ -167,18 +173,21 @@ impl McpConnection {
     /// Initialize the MCP connection
     async fn initialize(&mut self) -> Result<()> {
         let response = self
-            .send_request("initialize", Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "roots": {
-                        "listChanged": false
+            .send_request(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "roots": {
+                            "listChanged": false
+                        }
+                    },
+                    "clientInfo": {
+                        "name": "finch",
+                        "version": env!("CARGO_PKG_VERSION")
                     }
-                },
-                "clientInfo": {
-                    "name": "finch",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            })))
+                })),
+            )
             .await?;
 
         // Parse server info
@@ -187,7 +196,8 @@ impl McpConnection {
         }
 
         // Send initialized notification
-        self.send_notification("notifications/initialized", None).await?;
+        self.send_notification("notifications/initialized", None)
+            .await?;
 
         Ok(())
     }
@@ -203,11 +213,15 @@ impl McpConnection {
 
         // Parse tools array
         if let Some(tools_val) = response.get("tools") {
-            self.tools = serde_json::from_value(tools_val.clone())
-                .context("Failed to parse tools list")?;
+            self.tools =
+                serde_json::from_value(tools_val.clone()).context("Failed to parse tools list")?;
         }
 
-        tracing::debug!("Discovered {} tools from MCP server '{}'", self.tools.len(), self.name);
+        tracing::debug!(
+            "Discovered {} tools from MCP server '{}'",
+            self.tools.len(),
+            self.name
+        );
 
         Ok(())
     }
@@ -215,10 +229,13 @@ impl McpConnection {
     /// Call a tool on this server
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<String> {
         let response = self
-            .send_request("tools/call", Some(serde_json::json!({
-                "name": tool_name,
-                "arguments": arguments
-            })))
+            .send_request(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": tool_name,
+                    "arguments": arguments
+                })),
+            )
             .await?;
 
         // Extract content from response
@@ -278,8 +295,8 @@ impl McpConnection {
 
         tracing::debug!("MCP response: {}", line.trim());
 
-        let response: JsonRpcResponse = serde_json::from_str(&line)
-            .context("Failed to parse JSON-RPC response")?;
+        let response: JsonRpcResponse =
+            serde_json::from_str(&line).context("Failed to parse JSON-RPC response")?;
 
         // Check for errors
         if let Some(error) = response.error {
@@ -388,7 +405,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_json_rpc_error_parsing() {
-        let response_json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}"#;
+        let response_json =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}"#;
         let response: JsonRpcResponse = serde_json::from_str(response_json).unwrap();
 
         assert!(response.result.is_none());

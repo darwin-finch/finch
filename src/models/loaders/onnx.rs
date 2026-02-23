@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ndarray;
 use ort::{
     ep,
     memory::MemoryInfo,
-    session::{Session, builder::GraphOptimizationLevel, output::SessionOutputs},
-    value::{Value, DynValue},
+    session::{builder::GraphOptimizationLevel, output::SessionOutputs, Session},
+    value::{DynValue, Value},
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -28,21 +28,17 @@ impl OnnxLoader {
     }
 
     /// Create ONNX Runtime session with execution providers
-    fn create_session(
-        &self,
-        model_path: &Path,
-        config: &OnnxLoadConfig,
-    ) -> Result<Session> {
+    fn create_session(&self, model_path: &Path, config: &OnnxLoadConfig) -> Result<Session> {
         info!("Creating ONNX session from: {:?}", model_path);
 
         // Suppress ONNX Runtime logs (set before session creation)
         // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
-        std::env::set_var("ORT_LOGGING_LEVEL", "2");  // Warning and above only
+        std::env::set_var("ORT_LOGGING_LEVEL", "2"); // Warning and above only
 
         // Build execution provider list
         let mut builder = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?;  // Parallel ops within layer
+            .with_intra_threads(4)?; // Parallel ops within layer
 
         // Add execution providers based on config
         let providers = self.get_execution_providers(config);
@@ -61,7 +57,10 @@ impl OnnxLoader {
     }
 
     /// Get execution providers based on backend configuration
-    fn get_execution_providers(&self, config: &OnnxLoadConfig) -> Vec<ort::ep::ExecutionProviderDispatch> {
+    fn get_execution_providers(
+        &self,
+        config: &OnnxLoadConfig,
+    ) -> Vec<ort::ep::ExecutionProviderDispatch> {
         let mut providers = vec![];
 
         // Add execution providers based on config
@@ -125,10 +124,7 @@ impl OnnxLoader {
     }
 
     /// Load ONNX model with progress tracking
-    pub fn load_model_sync(
-        &self,
-        config: &OnnxLoadConfig,
-    ) -> Result<LoadedOnnxModel> {
+    pub fn load_model_sync(&self, config: &OnnxLoadConfig) -> Result<LoadedOnnxModel> {
         info!("Loading ONNX model: {}", config.model_name);
 
         // Step 1: Download model files from HuggingFace
@@ -207,8 +203,9 @@ impl OnnxLoader {
             bail!("Tokenizer file not found: {:?}", tokenizer_path);
         }
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {:?}: {}", tokenizer_path, e))?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            anyhow::anyhow!("Failed to load tokenizer from {:?}: {}", tokenizer_path, e)
+        })?;
 
         debug!("Tokenizer loaded successfully");
         Ok(tokenizer)
@@ -277,7 +274,11 @@ impl LoadedOnnxModel {
     }
 
     /// Autoregressive text generation with KV cache (Phase 5.1)
-    fn generate_autoregressive(&mut self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+    fn generate_autoregressive(
+        &mut self,
+        input_ids: &[u32],
+        max_new_tokens: usize,
+    ) -> Result<Vec<u32>> {
         self.generate_autoregressive_with_callback(input_ids, max_new_tokens, None)
     }
 
@@ -288,8 +289,11 @@ impl LoadedOnnxModel {
         max_new_tokens: usize,
         mut token_callback: Option<Box<dyn FnMut(u32, &str) + Send>>,
     ) -> Result<Vec<u32>> {
-        info!("ONNX autoregressive generation: {} input tokens, max {} new tokens",
-              input_ids.len(), max_new_tokens);
+        info!(
+            "ONNX autoregressive generation: {} input tokens, max {} new tokens",
+            input_ids.len(),
+            max_new_tokens
+        );
 
         let mut output_ids = input_ids.to_vec();
         let eos_token_id = self.get_eos_token_id();
@@ -311,7 +315,7 @@ impl LoadedOnnxModel {
             let input_for_step = if step == 0 {
                 &output_ids[..] // First step: all input tokens
             } else {
-                &output_ids[output_ids.len()-1..] // Subsequent: only last generated token
+                &output_ids[output_ids.len() - 1..] // Subsequent: only last generated token
             };
 
             // 2. Run inference with KV cache using IoBinding
@@ -353,13 +357,18 @@ impl LoadedOnnxModel {
             // 6. Call streaming callback if provided
             if let Some(ref mut callback) = token_callback {
                 // Decode just this token to text
-                let token_text = self.tokenizer.decode(&[next_token], false)
+                let token_text = self
+                    .tokenizer
+                    .decode(&[next_token], false)
                     .unwrap_or_else(|_| format!("[token_{}]", next_token));
                 callback(next_token, &token_text);
             }
         }
 
-        info!("Generated {} new tokens", output_ids.len() - input_ids.len());
+        info!(
+            "Generated {} new tokens",
+            output_ids.len() - input_ids.len()
+        );
         Ok(output_ids)
     }
 
@@ -414,7 +423,11 @@ impl LoadedOnnxModel {
         binding.bind_input("attention_mask", &attention_mask)?;
 
         // Bind past_key_values for each layer
-        let cache_to_bind = if past_seq_len == 0 { &kv_cache } else { past_kv };
+        let cache_to_bind = if past_seq_len == 0 {
+            &kv_cache
+        } else {
+            past_kv
+        };
         for (layer_idx, (key, value)) in cache_to_bind.iter().enumerate() {
             let key_name = format!("past_key_values.{}.key", layer_idx);
             let value_name = format!("past_key_values.{}.value", layer_idx);
@@ -447,9 +460,11 @@ impl LoadedOnnxModel {
             let value_name = format!("present.{}.value", layer_idx);
 
             // Get owned DynValue by removing from outputs
-            let key_output = outputs.remove(&key_name)
+            let key_output = outputs
+                .remove(&key_name)
                 .ok_or_else(|| anyhow::anyhow!("Missing output: {}", key_name))?;
-            let value_output = outputs.remove(&value_name)
+            let value_output = outputs
+                .remove(&value_name)
                 .ok_or_else(|| anyhow::anyhow!("Missing output: {}", value_name))?;
 
             new_cache.push((key_output, value_output));
@@ -466,21 +481,21 @@ impl LoadedOnnxModel {
         let input_data: Vec<i64> = tokens.iter().map(|&t| t as i64).collect();
 
         // Create tensor with shape [batch_size=1, seq_len]
-        let array = ndarray::Array2::from_shape_vec(
-            (1, tokens.len()),
-            input_data
-        ).context("Failed to create ndarray for input")?;
+        let array = ndarray::Array2::from_shape_vec((1, tokens.len()), input_data)
+            .context("Failed to create ndarray for input")?;
 
         // Convert to ort::Value (ndarray feature enabled)
         // Use into_dyn() to erase the specific type to DynValueTypeMarker
-        let value = Value::from_array(array)
-            .context("Failed to create ONNX Value from array")?;
+        let value = Value::from_array(array).context("Failed to create ONNX Value from array")?;
         Ok(value.into_dyn())
     }
 
     /// Prepare position_ids tensor for ONNX Runtime
     fn prepare_position_ids(&self, seq_len: usize, past_seq_len: usize) -> Result<DynValue> {
-        debug!("Preparing position_ids: seq_len={}, past_seq_len={}", seq_len, past_seq_len);
+        debug!(
+            "Preparing position_ids: seq_len={}, past_seq_len={}",
+            seq_len, past_seq_len
+        );
 
         // Position IDs start from past_seq_len and go to past_seq_len + seq_len
         // For first step with seq_len=5: [0, 1, 2, 3, 4]
@@ -490,10 +505,8 @@ impl LoadedOnnxModel {
             .collect();
 
         // Create tensor with shape [batch_size=1, seq_len]
-        let array = ndarray::Array2::from_shape_vec(
-            (1, seq_len),
-            position_data
-        ).context("Failed to create ndarray for position_ids")?;
+        let array = ndarray::Array2::from_shape_vec((1, seq_len), position_data)
+            .context("Failed to create ndarray for position_ids")?;
 
         // Convert to ort::Value
         let value = Value::from_array(array)
@@ -503,7 +516,10 @@ impl LoadedOnnxModel {
 
     /// Prepare attention_mask tensor for ONNX Runtime
     fn prepare_attention_mask(&self, seq_len: usize, past_seq_len: usize) -> Result<DynValue> {
-        debug!("Preparing attention_mask: seq_len={}, past_seq_len={}", seq_len, past_seq_len);
+        debug!(
+            "Preparing attention_mask: seq_len={}, past_seq_len={}",
+            seq_len, past_seq_len
+        );
 
         // Attention mask is all 1s for the total sequence length
         // Shape: [batch_size=1, total_seq_len]
@@ -511,10 +527,8 @@ impl LoadedOnnxModel {
         let mask_data: Vec<i64> = vec![1; total_seq_len];
 
         // Create tensor with shape [batch_size=1, total_seq_len]
-        let array = ndarray::Array2::from_shape_vec(
-            (1, total_seq_len),
-            mask_data
-        ).context("Failed to create ndarray for attention_mask")?;
+        let array = ndarray::Array2::from_shape_vec((1, total_seq_len), mask_data)
+            .context("Failed to create ndarray for attention_mask")?;
 
         // Convert to ort::Value
         let value = Value::from_array(array)
@@ -528,14 +542,16 @@ impl LoadedOnnxModel {
 
         // Get the first output by name (typically "logits" or similar)
         // Try common output names first
-        let output_tensor = outputs.get("logits")
+        let output_tensor = outputs
+            .get("logits")
             .or_else(|| outputs.get("output"))
             .or_else(|| outputs.get("last_hidden_state"))
             .ok_or_else(|| anyhow::anyhow!("No output tensor found with expected names"))?;
 
         // Extract tensor data as f32
         // try_extract_tensor returns Result<(shape, data_slice)>
-        let (shape, data) = output_tensor.try_extract_tensor::<f32>()
+        let (shape, data) = output_tensor
+            .try_extract_tensor::<f32>()
             .context("Failed to extract f32 tensor from output")?;
 
         debug!("Output tensor shape: {:?}", shape);
@@ -642,7 +658,10 @@ impl LoadedOnnxModel {
         for &(idx, prob) in &top_p_indices {
             rand_val -= prob;
             if rand_val <= 0.0 {
-                debug!("Sampled token {} (prob: {:.4}, temp: {:.1}, top_p: {:.1})", idx, prob, temperature, top_p);
+                debug!(
+                    "Sampled token {} (prob: {:.4}, temp: {:.1}, top_p: {:.1})",
+                    idx, prob, temperature, top_p
+                );
                 return Ok(idx as u32);
             }
         }
@@ -662,7 +681,8 @@ impl LoadedOnnxModel {
         // Fallback to common value if not available
         let vocab = self.tokenizer.get_vocab(true);
 
-        vocab.get("<|endoftext|>")
+        vocab
+            .get("<|endoftext|>")
             .or_else(|| vocab.get("<|im_end|>"))
             .or_else(|| vocab.get("</s>"))
             .copied()
@@ -686,7 +706,8 @@ impl TextGeneration for LoadedOnnxModel {
     }
 
     fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self.tokenizer
+        let encoding = self
+            .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         Ok(encoding.get_ids().to_vec())

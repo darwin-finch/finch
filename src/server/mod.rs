@@ -10,7 +10,9 @@ mod session;
 mod training_worker;
 
 pub use feedback_handler::{handle_feedback, handle_training_status};
-pub use handlers::{create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint};
+pub use handlers::{
+    create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
+};
 pub use middleware::{auth_middleware, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
 pub use openai_types::*;
@@ -138,8 +140,8 @@ impl AgentServer {
         let worker = TrainingWorker::new(
             training_rx,
             Arc::clone(&self.training_coordinator),
-            10,  // batch_threshold: trigger after 10 examples
-            5,   // batch_timeout_minutes: trigger after 5 minutes
+            10, // batch_threshold: trigger after 10 examples
+            5,  // batch_timeout_minutes: trigger after 5 minutes
         );
 
         tokio::spawn(async move {
@@ -157,7 +159,10 @@ impl AgentServer {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 let state = state_monitor.read().await;
-                tracing::debug!("Monitor checking state: {:?}", std::mem::discriminant(&*state));
+                tracing::debug!(
+                    "Monitor checking state: {:?}",
+                    std::mem::discriminant(&*state)
+                );
 
                 if let GeneratorState::Ready { model, model_name } = &*state {
                     let model_clone = Arc::clone(model);
@@ -167,22 +172,23 @@ impl AgentServer {
                     tracing::info!("Model is ready: {}, injecting into LocalGenerator", name);
 
                     // Try to inject with timeout
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
-                        async {
-                            tracing::info!("Acquiring write lock on LocalGenerator...");
-                            let mut gen = local_gen_clone.write().await;
-                            tracing::info!("Write lock acquired, creating new LocalGenerator...");
-                            *gen = LocalGenerator::with_models(Some(model_clone));
-                            tracing::info!("LocalGenerator updated");
-                        }
-                    ).await {
+                    match tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                        tracing::info!("Acquiring write lock on LocalGenerator...");
+                        let mut gen = local_gen_clone.write().await;
+                        tracing::info!("Write lock acquired, creating new LocalGenerator...");
+                        *gen = LocalGenerator::with_models(Some(model_clone));
+                        tracing::info!("LocalGenerator updated");
+                    })
+                    .await
+                    {
                         Ok(_) => {
                             tracing::info!("✓ Model injected - local generation enabled");
                             break; // Stop monitoring once injected
                         }
                         Err(_) => {
-                            tracing::error!("❌ Timeout while injecting model (5s) - write lock may be held");
+                            tracing::error!(
+                                "❌ Timeout while injecting model (5s) - write lock may be held"
+                            );
                         }
                     }
                 } else if matches!(
@@ -230,7 +236,11 @@ impl AgentServer {
             return None;
         }
         if let Some(n) = name {
-            if let Some(p) = self.providers.iter().find(|p| p.name().eq_ignore_ascii_case(n)) {
+            if let Some(p) = self
+                .providers
+                .iter()
+                .find(|p| p.name().eq_ignore_ascii_case(n))
+            {
                 return Some(p);
             }
         }
@@ -253,7 +263,9 @@ impl AgentServer {
     }
 
     /// Get reference to training examples sender
-    pub fn training_tx(&self) -> &Arc<tokio::sync::mpsc::UnboundedSender<crate::models::WeightedExample>> {
+    pub fn training_tx(
+        &self,
+    ) -> &Arc<tokio::sync::mpsc::UnboundedSender<crate::models::WeightedExample>> {
         &self.training_tx
     }
 
@@ -294,8 +306,12 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for NamedProvider {
-        fn name(&self) -> &str { &self.0 }
-        fn default_model(&self) -> &str { "test-model" }
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn default_model(&self) -> &str {
+            "test-model"
+        }
         async fn send_message(&self, _r: &ProviderRequest) -> anyhow::Result<ProviderResponse> {
             unimplemented!()
         }
@@ -352,7 +368,9 @@ mod tests {
     fn test_provider_for_name_unknown_falls_back_to_first() {
         let providers = make_providers(&["claude", "grok"]);
         // When name is unknown, provider_for_name returns providers.first()
-        let matched = providers.iter().find(|p| p.name().eq_ignore_ascii_case("unknown"));
+        let matched = providers
+            .iter()
+            .find(|p| p.name().eq_ignore_ascii_case("unknown"));
         let result = matched.or_else(|| providers.first());
         assert!(result.is_some());
         assert_eq!(result.unwrap().name(), "claude");

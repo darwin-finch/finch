@@ -10,11 +10,15 @@ use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::models::{ToolCallParser, ToolPromptFormatter};
 use crate::tools::executor::ToolExecutor;
-use crate::tools::types::{ToolDefinition, ToolResult};
-use crate::tools::types::ToolUse as ToolsToolUse; // Import with alias to avoid confusion
+use crate::tools::types::ToolUse as ToolsToolUse;
+use crate::tools::types::{ToolDefinition, ToolResult}; // Import with alias to avoid confusion
 
 use super::{
-    Generator, GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk,
+    Generator,
+    GeneratorCapabilities,
+    GeneratorResponse,
+    ResponseMetadata,
+    StreamChunk,
     ToolUse as GenToolUse, // Use the generator's ToolUse type
 };
 
@@ -39,10 +43,10 @@ impl QwenGenerator {
             tokenizer,
             tool_executor,
             capabilities: GeneratorCapabilities {
-                supports_streaming: false,  // Qwen blocks (for now)
-                supports_tools,             // Enable if executor provided
+                supports_streaming: false,             // Qwen blocks (for now)
+                supports_tools,                        // Enable if executor provided
                 supports_conversation: supports_tools, // Enable multi-turn if tools enabled
-                max_context_messages: Some(5), // Limit context to prevent token overflow
+                max_context_messages: Some(5),         // Limit context to prevent token overflow
             },
         }
     }
@@ -169,7 +173,11 @@ impl QwenGenerator {
             // 2. Generate response
             let output = self.generate_text(&prompt).await?;
 
-            tracing::debug!("Generated output ({} chars): {}", output.len(), &output[..output.len().min(100)]);
+            tracing::debug!(
+                "Generated output ({} chars): {}",
+                output.len(),
+                &output[..output.len().min(100)]
+            );
 
             // 3. Check for tool calls
             if !ToolCallParser::has_tool_calls(&output) {
@@ -198,8 +206,8 @@ impl QwenGenerator {
             }
 
             // 4. Parse tool calls (returns tools::types::ToolUse)
-            let tool_calls: Vec<ToolsToolUse> = ToolCallParser::parse(&output)
-                .context("Failed to parse tool calls from output")?;
+            let tool_calls: Vec<ToolsToolUse> =
+                ToolCallParser::parse(&output).context("Failed to parse tool calls from output")?;
 
             tracing::info!("Parsed {} tool call(s)", tool_calls.len());
 
@@ -287,7 +295,9 @@ impl QwenGenerator {
                             ContentBlock::Text { text } => {
                                 conversation.push_str(text);
                             }
-                            ContentBlock::ToolResult { content, is_error, .. } => {
+                            ContentBlock::ToolResult {
+                                content, is_error, ..
+                            } => {
                                 if *is_error == Some(true) {
                                     conversation.push_str(&format!("[Tool Error: {}]", content));
                                 } else {
@@ -349,20 +359,17 @@ impl QwenGenerator {
             let result = executor
                 .execute_tool(
                     tool_use,
-                    None, // conversation
-                    None::<fn() -> Result<()>>, // save_models_fn
-                    None, // batch_trainer
+                    None,                                    // conversation
+                    None::<fn() -> Result<()>>,              // save_models_fn
+                    None,                                    // batch_trainer
                     Some(Arc::clone(&self.local_generator)), // local_generator (for query_local tool)
-                    Some(Arc::clone(&self.tokenizer)),  // tokenizer
-                    None, // repl_mode
-                    None, // plan_content
+                    Some(Arc::clone(&self.tokenizer)),       // tokenizer
+                    None,                                    // repl_mode
+                    None,                                    // plan_content
                 )
                 .await
                 .unwrap_or_else(|e| {
-                    ToolResult::error(
-                        tool_use.id.clone(),
-                        format!("Tool execution failed: {}", e),
-                    )
+                    ToolResult::error(tool_use.id.clone(), format!("Tool execution failed: {}", e))
                 });
 
             results.push(result);

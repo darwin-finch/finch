@@ -63,9 +63,7 @@ impl Tool for PatchTool {
         let file_path = input["file_path"]
             .as_str()
             .context("Missing file_path parameter")?;
-        let patch_text = input["patch"]
-            .as_str()
-            .context("Missing patch parameter")?;
+        let patch_text = input["patch"].as_str().context("Missing patch parameter")?;
 
         let original = fs::read_to_string(file_path)
             .with_context(|| format!("Failed to read file: {}", file_path))?;
@@ -87,9 +85,7 @@ impl Tool for PatchTool {
 
         Ok(format!(
             "{BOLD}Patched {}{RESET}: {}\n{}",
-            file_path,
-            summary.counts,
-            summary.detail
+            file_path, summary.counts, summary.detail
         ))
     }
 }
@@ -119,11 +115,12 @@ fn parse_hunks(patch: &str) -> Result<Vec<Hunk>> {
             }
 
             // Parse `@@ -start[,count] +start[,count] @@`
-            let orig_start = parse_hunk_header(raw_line).with_context(|| {
-                format!("Bad hunk header: {}", raw_line)
-            })?;
-            current = Some(Hunk { orig_start, lines: Vec::new() });
-
+            let orig_start = parse_hunk_header(raw_line)
+                .with_context(|| format!("Bad hunk header: {}", raw_line))?;
+            current = Some(Hunk {
+                orig_start,
+                lines: Vec::new(),
+            });
         } else if let Some(ref mut hunk) = current {
             if let Some(rest) = raw_line.strip_prefix('-') {
                 // Ignore --- file header lines (they have no preceding @@ line)
@@ -170,10 +167,14 @@ fn parse_hunk_header(header: &str) -> Result<usize> {
         .find(|s| s.starts_with('-'))
         .context("No -N in hunk header")?;
 
-    let number_str = orig_part.trim_start_matches('-').split(',').next().unwrap_or("1");
-    let start: usize = number_str.parse().with_context(|| {
-        format!("Could not parse line number from hunk header: {}", header)
-    })?;
+    let number_str = orig_part
+        .trim_start_matches('-')
+        .split(',')
+        .next()
+        .unwrap_or("1");
+    let start: usize = number_str
+        .parse()
+        .with_context(|| format!("Could not parse line number from hunk header: {}", header))?;
 
     Ok(start.max(1)) // line numbers are 1-based
 }
@@ -234,12 +235,7 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<(String, ApplySummary)>
         if added > 0 || removed > 0 {
             detail_parts.push(format!(
                 "  {GRAY}@@{RESET} line {}{}{}{}: {GREEN}+{}{RESET} {RED}-{}{RESET}",
-                hunk.orig_start,
-                GRAY,
-                "",
-                RESET,
-                added,
-                removed,
+                hunk.orig_start, GRAY, "", RESET, added, removed,
             ));
         }
     }
@@ -252,10 +248,18 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<(String, ApplySummary)>
 
     let mut summary_parts = Vec::new();
     if total_added > 0 {
-        summary_parts.push(format!("{GREEN}+{} line{}{RESET}", total_added, if total_added == 1 { "" } else { "s" }));
+        summary_parts.push(format!(
+            "{GREEN}+{} line{}{RESET}",
+            total_added,
+            if total_added == 1 { "" } else { "s" }
+        ));
     }
     if total_removed > 0 {
-        summary_parts.push(format!("{RED}-{} line{}{RESET}", total_removed, if total_removed == 1 { "" } else { "s" }));
+        summary_parts.push(format!(
+            "{RED}-{} line{}{RESET}",
+            total_removed,
+            if total_removed == 1 { "" } else { "s" }
+        ));
     }
     let counts = if summary_parts.is_empty() {
         "no changes".to_string()
@@ -263,7 +267,13 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<(String, ApplySummary)>
         summary_parts.join(", ")
     };
 
-    Ok((patched, ApplySummary { counts, detail: detail_parts.join("\n") }))
+    Ok((
+        patched,
+        ApplySummary {
+            counts,
+            detail: detail_parts.join("\n"),
+        },
+    ))
 }
 
 /// Apply a single hunk, returning the replacement lines and (added, removed) counts.
@@ -354,7 +364,10 @@ mod tests {
         let patch = "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n";
         let hunks = parse_hunks(patch).unwrap();
         assert_eq!(hunks.len(), 1);
-        assert_eq!(hunks[0].lines, vec![('-', "old".to_string()), ('+', "new".to_string())]);
+        assert_eq!(
+            hunks[0].lines,
+            vec![('-', "old".to_string()), ('+', "new".to_string())]
+        );
     }
 
     #[test]
@@ -370,7 +383,10 @@ mod tests {
     fn test_parse_hunk_header_with_count() {
         assert_eq!(parse_hunk_header("@@ -5,3 +5,4 @@").unwrap(), 5);
         assert_eq!(parse_hunk_header("@@ -1 +1 @@").unwrap(), 1);
-        assert_eq!(parse_hunk_header("@@ -100,10 +100,9 @@ fn foo()").unwrap(), 100);
+        assert_eq!(
+            parse_hunk_header("@@ -100,10 +100,9 @@ fn foo()").unwrap(),
+            100
+        );
     }
 
     // ── apply_hunks ──
@@ -413,7 +429,11 @@ mod tests {
         assert!(result.is_err());
         // Use {:#} to include the full error chain (outer context + inner cause)
         let msg = format!("{:#}", result.unwrap_err());
-        assert!(msg.contains("mismatch") || msg.contains("failed to apply"), "unexpected error: {}", msg);
+        assert!(
+            msg.contains("mismatch") || msg.contains("failed to apply"),
+            "unexpected error: {}",
+            msg
+        );
     }
 
     #[test]

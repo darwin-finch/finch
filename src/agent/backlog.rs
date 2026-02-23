@@ -129,8 +129,9 @@ impl TaskBacklog {
         if !self.path.exists() {
             return Ok(());
         }
-        let contents = fs::read_to_string(&self.path)
-            .with_context(|| format!("Failed to reload task backlog from {}", self.path.display()))?;
+        let contents = fs::read_to_string(&self.path).with_context(|| {
+            format!("Failed to reload task backlog from {}", self.path.display())
+        })?;
         let file: BacklogFile =
             toml::from_str(&contents).context("Failed to parse tasks.toml on reload")?;
 

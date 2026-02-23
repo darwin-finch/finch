@@ -97,11 +97,7 @@ impl LoRATrainingSubprocess {
     ///
     /// # Returns
     /// Ok(()) if subprocess spawned successfully
-    pub async fn train_async(
-        &self,
-        queue_path: &Path,
-        output_adapter: &Path,
-    ) -> Result<()> {
+    pub async fn train_async(&self, queue_path: &Path, output_adapter: &Path) -> Result<()> {
         // Validate inputs
         if !queue_path.exists() {
             anyhow::bail!("Training queue not found: {}", queue_path.display());
@@ -142,8 +138,8 @@ impl LoRATrainingSubprocess {
 
         // Redirect output to log file
         let log_path = output_adapter.with_extension("training.log");
-        let log_file = std::fs::File::create(&log_path)
-            .context("Failed to create training log file")?;
+        let log_file =
+            std::fs::File::create(&log_path).context("Failed to create training log file")?;
 
         cmd.stdout(Stdio::from(log_file.try_clone()?))
             .stderr(Stdio::from(log_file));
@@ -223,13 +219,10 @@ impl LoRATrainingSubprocess {
 /// Archive training queue after successful training
 fn archive_training_queue(queue_path: &Path) -> Result<()> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let archive_path = queue_path.with_file_name(format!(
-        "training_queue_archive_{}.jsonl",
-        timestamp
-    ));
+    let archive_path =
+        queue_path.with_file_name(format!("training_queue_archive_{}.jsonl", timestamp));
 
-    std::fs::rename(queue_path, &archive_path)
-        .context("Failed to archive training queue")?;
+    std::fs::rename(queue_path, &archive_path).context("Failed to archive training queue")?;
 
     tracing::info!("Archived training queue to: {}", archive_path.display());
 

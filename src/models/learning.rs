@@ -204,7 +204,10 @@ mod tests {
             actual_outcome: "local".to_string(),
         };
         match exp {
-            ModelExpectation::RouteDecision { correct_choice, actual_outcome } => {
+            ModelExpectation::RouteDecision {
+                correct_choice,
+                actual_outcome,
+            } => {
                 assert!(correct_choice);
                 assert_eq!(actual_outcome, "local");
             }
@@ -219,7 +222,10 @@ mod tests {
             issues: vec!["ambiguous".to_string(), "too vague".to_string()],
         };
         match exp {
-            ModelExpectation::QualityTarget { is_acceptable, issues } => {
+            ModelExpectation::QualityTarget {
+                is_acceptable,
+                issues,
+            } => {
                 assert!(!is_acceptable);
                 assert_eq!(issues.len(), 2);
             }

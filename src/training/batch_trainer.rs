@@ -364,4 +364,3 @@ mod tests {
         assert_eq!(result.router_old_loss - result.router_new_loss, 0.0);
     }
 }
-

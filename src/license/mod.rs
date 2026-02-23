@@ -12,7 +12,7 @@
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -25,10 +25,8 @@ use serde::{Deserialize, Serialize};
 /// Private key stored in 1Password: "Finch License Signing Key (Ed25519)" (Employee vault)
 /// Local copy: ~/.finch/license_private.pem
 const PUBLIC_KEY_BYTES: &[u8; 32] = &[
-    0xd1, 0x92, 0x68, 0x7b, 0x60, 0x09, 0x4f, 0x0a,
-    0x6e, 0xc1, 0xe2, 0x4a, 0x9a, 0x1f, 0xfe, 0x1b,
-    0xf0, 0x89, 0x2c, 0x59, 0x4c, 0xaf, 0xdc, 0x94,
-    0x02, 0x35, 0xea, 0xc5, 0x02, 0xd8, 0x04, 0xca,
+    0xd1, 0x92, 0x68, 0x7b, 0x60, 0x09, 0x4f, 0x0a, 0x6e, 0xc1, 0xe2, 0x4a, 0x9a, 0x1f, 0xfe, 0x1b,
+    0xf0, 0x89, 0x2c, 0x59, 0x4c, 0xaf, 0xdc, 0x94, 0x02, 0x35, 0xea, 0xc5, 0x02, 0xd8, 0x04, 0xca,
 ];
 
 // ---------------------------------------------------------------------------
@@ -102,17 +100,19 @@ pub fn validate_key_with_vk(key: &str, vk: &VerifyingKey) -> Result<ParsedLicens
         .context("Invalid key: signature section is not valid base64url")?;
 
     // 4. Verify Ed25519 signature over the raw payload bytes
-    let sig_array: &[u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid signature: expected 64 bytes, got {}", sig_bytes.len()))?;
+    let sig_array: &[u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "Invalid signature: expected 64 bytes, got {}",
+            sig_bytes.len()
+        )
+    })?;
     let signature = Signature::from_bytes(sig_array);
     vk.verify(&payload_bytes, &signature)
         .map_err(|_| anyhow::anyhow!("Invalid signature: key signature verification failed"))?;
 
     // 5. Parse payload JSON
-    let payload: LicensePayload = serde_json::from_slice(&payload_bytes)
-        .context("Invalid key: payload JSON is malformed")?;
+    let payload: LicensePayload =
+        serde_json::from_slice(&payload_bytes).context("Invalid key: payload JSON is malformed")?;
 
     // 6. Check expiry against today's date
     let expires_at = chrono::NaiveDate::parse_from_str(&payload.exp, "%Y-%m-%d")
@@ -210,16 +210,16 @@ mod tests {
 
         // Replace the signature portion with 64 zero bytes (valid length, wrong value)
         let dot = key.rfind('.').unwrap();
-        let tampered = format!(
-            "{}.{}",
-            &key[..dot],
-            URL_SAFE_NO_PAD.encode([0u8; 64])
-        );
+        let tampered = format!("{}.{}", &key[..dot], URL_SAFE_NO_PAD.encode([0u8; 64]));
 
         let result = validate_key_with_vk(&tampered, &vk);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string().to_lowercase();
-        assert!(msg.contains("signature"), "Expected 'signature' in: {}", msg);
+        assert!(
+            msg.contains("signature"),
+            "Expected 'signature' in: {}",
+            msg
+        );
     }
 
     #[test]
@@ -250,7 +250,11 @@ mod tests {
     #[test]
     fn test_validate_key_production_path_golden_key() {
         let result = validate_key(GOLDEN_KEY);
-        assert!(result.is_ok(), "Golden key should validate: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Golden key should validate: {:?}",
+            result.err()
+        );
         let parsed = result.unwrap();
         assert_eq!(parsed.email, "ci-test@finch.internal");
         assert_eq!(parsed.name, "CI Test");
@@ -266,7 +270,10 @@ mod tests {
         let sk = SigningKey::generate(&mut rand::rngs::OsRng);
         let key = make_test_key(&sk, &future_payload());
         let result = validate_key(&key);
-        assert!(result.is_err(), "Key from wrong signer must be rejected by production validate_key");
+        assert!(
+            result.is_err(),
+            "Key from wrong signer must be rejected by production validate_key"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Model size variants for Qwen2.5 models
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,9 +19,9 @@ impl ModelSize {
     pub fn from_ram(ram_gb: usize) -> Self {
         match ram_gb {
             0..=5 => ModelSize::Small,   // 0.5B — old laptops / 4GB machines
-            6..=11 => ModelSize::Medium,  // 1.5B — 8GB machines
-            12..=23 => ModelSize::Large,  // 3B   — 16GB machines
-            _ => ModelSize::XLarge,       // 7B   — 32GB+ machines
+            6..=11 => ModelSize::Medium, // 1.5B — 8GB machines
+            12..=23 => ModelSize::Large, // 3B   — 16GB machines
+            _ => ModelSize::XLarge,      // 7B   — 32GB+ machines
         }
     }
 
@@ -165,20 +165,17 @@ mod tests {
 
     #[test]
     fn test_model_size_from_ram() {
-        assert_eq!(ModelSize::from_ram(4), ModelSize::Small);   // old laptop
-        assert_eq!(ModelSize::from_ram(5), ModelSize::Small);   // 5GB
-        assert_eq!(ModelSize::from_ram(8), ModelSize::Medium);  // 8GB machine
-        assert_eq!(ModelSize::from_ram(16), ModelSize::Large);  // 16GB machine
+        assert_eq!(ModelSize::from_ram(4), ModelSize::Small); // old laptop
+        assert_eq!(ModelSize::from_ram(5), ModelSize::Small); // 5GB
+        assert_eq!(ModelSize::from_ram(8), ModelSize::Medium); // 8GB machine
+        assert_eq!(ModelSize::from_ram(16), ModelSize::Large); // 16GB machine
         assert_eq!(ModelSize::from_ram(32), ModelSize::XLarge); // 32GB machine
         assert_eq!(ModelSize::from_ram(64), ModelSize::XLarge); // 64GB machine
     }
 
     #[test]
     fn test_huggingface_repo() {
-        let config = OnnxLoadConfig::with_size(
-            ModelSize::Medium,
-            PathBuf::from("/tmp/cache"),
-        );
+        let config = OnnxLoadConfig::with_size(ModelSize::Medium, PathBuf::from("/tmp/cache"));
         assert_eq!(
             config.huggingface_repo(),
             "onnx-community/Qwen2.5-1.5B-Instruct"

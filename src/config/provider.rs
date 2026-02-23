@@ -275,13 +275,39 @@ mod tests {
 
     #[test]
     fn test_provider_type_tags() {
-        assert_eq!(ProviderEntry::Claude { api_key: "k".to_string(), model: None, base_url: None, name: None }.provider_type(), "claude");
-        assert_eq!(ProviderEntry::Grok { api_key: "k".to_string(), model: None, name: None }.provider_type(), "grok");
-        assert_eq!(ProviderEntry::Local {
-            inference_provider: InferenceProvider::Onnx, execution_target: ExecutionTarget::Auto,
-            model_family: ModelFamily::Qwen2, model_size: ModelSize::Medium,
-            model_repo: None, model_path: None, enabled: true, name: None,
-        }.provider_type(), "local");
+        assert_eq!(
+            ProviderEntry::Claude {
+                api_key: "k".to_string(),
+                model: None,
+                base_url: None,
+                name: None
+            }
+            .provider_type(),
+            "claude"
+        );
+        assert_eq!(
+            ProviderEntry::Grok {
+                api_key: "k".to_string(),
+                model: None,
+                name: None
+            }
+            .provider_type(),
+            "grok"
+        );
+        assert_eq!(
+            ProviderEntry::Local {
+                inference_provider: InferenceProvider::Onnx,
+                execution_target: ExecutionTarget::Auto,
+                model_family: ModelFamily::Qwen2,
+                model_size: ModelSize::Medium,
+                model_repo: None,
+                model_path: None,
+                enabled: true,
+                name: None,
+            }
+            .provider_type(),
+            "local"
+        );
     }
 
     #[test]
@@ -312,8 +338,12 @@ mod tests {
 
         // Serialize as TOML array
         #[derive(Serialize, Deserialize)]
-        struct Wrapper { providers: Vec<ProviderEntry> }
-        let w = Wrapper { providers: providers.clone() };
+        struct Wrapper {
+            providers: Vec<ProviderEntry>,
+        }
+        let w = Wrapper {
+            providers: providers.clone(),
+        };
         let toml_str = toml::to_string(&w).unwrap();
         let decoded: Wrapper = toml::from_str(&toml_str).unwrap();
         assert_eq!(decoded.providers.len(), 3);

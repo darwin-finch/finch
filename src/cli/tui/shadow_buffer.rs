@@ -135,7 +135,11 @@ impl ShadowBuffer {
 
     /// Render messages to shadow buffer with proper wrapping
     /// Returns bottom-aligned content (last N rows that fit)
-    pub fn render_messages(&mut self, messages: &[MessageRef], colors: &crate::config::ColorScheme) {
+    pub fn render_messages(
+        &mut self,
+        messages: &[MessageRef],
+        colors: &crate::config::ColorScheme,
+    ) {
         // Clear buffer first
         self.clear();
 
@@ -171,7 +175,9 @@ impl ShadowBuffer {
         let mut accumulated_rows = 0;
 
         // Walk backwards from last line
-        for (line_idx, ((line, style), row_count)) in all_lines.iter().zip(&line_row_counts).enumerate().rev() {
+        for (line_idx, ((line, style), row_count)) in
+            all_lines.iter().zip(&line_row_counts).enumerate().rev()
+        {
             if accumulated_rows + row_count > self.height {
                 break; // Stop when can't fit more
             }
@@ -182,7 +188,9 @@ impl ShadowBuffer {
         lines_to_render.reverse(); // Restore chronological order
 
         // Calculate starting row (bottom-aligned)
-        let start_row = self.height.saturating_sub(accumulated_rows.min(self.height));
+        let start_row = self
+            .height
+            .saturating_sub(accumulated_rows.min(self.height));
 
         // Render lines with their styles, handling truncation if needed
         let mut current_y = start_row;

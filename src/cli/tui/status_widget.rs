@@ -52,8 +52,7 @@ impl<'a> StatusWidget<'a> {
             }
             StatusLineType::Suggestions => {
                 // Suggestions: cyan with subtle styling
-                Style::default()
-                    .fg(self.colors.ui.cursor.to_color())
+                Style::default().fg(self.colors.ui.cursor.to_color())
             }
             StatusLineType::CompactionPercent => {
                 // Compaction percentage: subtle gray
@@ -165,10 +164,8 @@ mod tests {
         let status_bar = StatusBar::new();
         let colors = ColorScheme::default();
         let widget = StatusWidget::new(&status_bar, &colors);
-        let line = widget.status_line_to_line(
-            &StatusLineType::TrainingStats,
-            "Training: 10 queries",
-        );
+        let line =
+            widget.status_line_to_line(&StatusLineType::TrainingStats, "Training: 10 queries");
         assert_eq!(line.spans.len(), 1);
     }
 

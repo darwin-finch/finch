@@ -54,11 +54,7 @@ impl ConversationHistory {
 
     /// Add a user message with optional image attachments.
     /// Each image is `(media_type, base64_data)`.
-    pub fn add_user_message_with_images(
-        &mut self,
-        text: String,
-        images: &[(String, String)],
-    ) {
+    pub fn add_user_message_with_images(&mut self, text: String, images: &[(String, String)]) {
         let mut blocks: Vec<ContentBlock> = images
             .iter()
             .map(|(media_type, data)| ContentBlock::image(media_type.clone(), data.clone()))
@@ -183,7 +179,8 @@ impl ConversationHistory {
 
     /// Check if compaction should be triggered
     pub fn should_compact(&self) -> bool {
-        self.auto_compact_enabled && self.context_usage_percent() >= self.compaction_threshold_percent
+        self.auto_compact_enabled
+            && self.context_usage_percent() >= self.compaction_threshold_percent
     }
 
     /// Enable or disable auto-compaction
@@ -343,7 +340,10 @@ impl<'a> ConversationCompactor<'a> {
 
         // If we have fewer messages than keep_recent_count, nothing to compact
         if messages.len() <= self.keep_recent_count {
-            tracing::debug!("Not enough messages to compact (need at least {})", self.keep_recent_count + 1);
+            tracing::debug!(
+                "Not enough messages to compact (need at least {})",
+                self.keep_recent_count + 1
+            );
             return Ok(());
         }
 
@@ -434,7 +434,11 @@ impl<'a> ConversationCompactor<'a> {
             "Conversation compacted: {} → {} messages (saved ~{} tokens)",
             messages.len(),
             history.message_count(),
-            to_summarize.iter().map(|m| m.text().len() / 4).sum::<usize>() - summary_text.len() / 4
+            to_summarize
+                .iter()
+                .map(|m| m.text().len() / 4)
+                .sum::<usize>()
+                - summary_text.len() / 4
         );
 
         Ok(())

@@ -9,8 +9,6 @@ use std::sync::{Arc, RwLock};
 
 /// Helper to convert ColorSpec to ANSI escape code
 fn color_to_ansi(color: &ColorSpec) -> String {
-    
-
     match color {
         ColorSpec::Named(name) => {
             // Map named colors to ANSI codes
@@ -32,7 +30,8 @@ fn color_to_ansi(color: &ColorSpec) -> String {
                 "lightmagenta" => "\x1b[95m",
                 "lightcyan" => "\x1b[96m",
                 _ => "\x1b[37m", // Default to white
-            }.to_string()
+            }
+            .to_string()
         }
         ColorSpec::Rgb(r, g, b) => {
             // True color ANSI escape code
@@ -87,9 +86,11 @@ impl Message for UserQueryMessage {
     fn background_style(&self) -> Option<ratatui::style::Style> {
         use ratatui::style::{Color, Style};
         // Grey background for user messages (like Claude Code)
-        Some(Style::default()
-            .bg(Color::Rgb(220, 220, 220))
-            .fg(Color::Black))
+        Some(
+            Style::default()
+                .bg(Color::Rgb(220, 220, 220))
+                .fg(Color::Black),
+        )
     }
 }
 
@@ -120,7 +121,9 @@ impl StreamingResponseMessage {
         match self.content.write() {
             Ok(mut content) => content.push_str(text),
             Err(poisoned) => {
-                tracing::warn!("StreamingResponseMessage content lock poisoned in append_chunk, recovering");
+                tracing::warn!(
+                    "StreamingResponseMessage content lock poisoned in append_chunk, recovering"
+                );
                 let mut content = poisoned.into_inner();
                 content.push_str(text);
             }
@@ -132,7 +135,9 @@ impl StreamingResponseMessage {
         match self.thinking.write() {
             Ok(mut t) => *t = thinking,
             Err(poisoned) => {
-                tracing::warn!("StreamingResponseMessage thinking lock poisoned in set_thinking, recovering");
+                tracing::warn!(
+                    "StreamingResponseMessage thinking lock poisoned in set_thinking, recovering"
+                );
                 *poisoned.into_inner() = thinking;
             }
         }
@@ -143,7 +148,9 @@ impl StreamingResponseMessage {
         match self.status.write() {
             Ok(mut s) => *s = MessageStatus::Complete,
             Err(poisoned) => {
-                tracing::warn!("StreamingResponseMessage status lock poisoned in set_complete, recovering");
+                tracing::warn!(
+                    "StreamingResponseMessage status lock poisoned in set_complete, recovering"
+                );
                 *poisoned.into_inner() = MessageStatus::Complete;
             }
         }
@@ -154,7 +161,9 @@ impl StreamingResponseMessage {
         match self.status.write() {
             Ok(mut s) => *s = MessageStatus::Failed,
             Err(poisoned) => {
-                tracing::warn!("StreamingResponseMessage status lock poisoned in set_failed, recovering");
+                tracing::warn!(
+                    "StreamingResponseMessage status lock poisoned in set_failed, recovering"
+                );
                 *poisoned.into_inner() = MessageStatus::Failed;
             }
         }
@@ -171,7 +180,9 @@ impl Message for StreamingResponseMessage {
         let content = match self.content.read() {
             Ok(c) => c.clone(),
             Err(poisoned) => {
-                tracing::warn!("StreamingResponseMessage content lock poisoned, using recovered data");
+                tracing::warn!(
+                    "StreamingResponseMessage content lock poisoned, using recovered data"
+                );
                 poisoned.into_inner().clone()
             }
         };
@@ -179,7 +190,9 @@ impl Message for StreamingResponseMessage {
         let status = match self.status.read() {
             Ok(s) => *s,
             Err(poisoned) => {
-                tracing::warn!("StreamingResponseMessage status lock poisoned, defaulting to InProgress");
+                tracing::warn!(
+                    "StreamingResponseMessage status lock poisoned, defaulting to InProgress"
+                );
                 *poisoned.into_inner()
             }
         };
@@ -187,7 +200,9 @@ impl Message for StreamingResponseMessage {
         let thinking = match self.thinking.read() {
             Ok(t) => *t,
             Err(poisoned) => {
-                tracing::warn!("StreamingResponseMessage thinking lock poisoned, defaulting to false");
+                tracing::warn!(
+                    "StreamingResponseMessage thinking lock poisoned, defaulting to false"
+                );
                 *poisoned.into_inner()
             }
         };
@@ -211,7 +226,8 @@ impl Message for StreamingResponseMessage {
             MessageStatus::Failed => {
                 format!(
                     "{}⏺{} {}❌ Response failed{}\n{}",
-                    CYAN, RESET,
+                    CYAN,
+                    RESET,
                     color_to_ansi(&colors.messages.error),
                     RESET,
                     text
@@ -279,7 +295,9 @@ impl ToolExecutionMessage {
         match self.stdout.write() {
             Ok(mut stdout) => stdout.push_str(text),
             Err(poisoned) => {
-                tracing::warn!("ToolExecutionMessage stdout lock poisoned in append_stdout, recovering");
+                tracing::warn!(
+                    "ToolExecutionMessage stdout lock poisoned in append_stdout, recovering"
+                );
                 let mut stdout = poisoned.into_inner();
                 stdout.push_str(text);
             }
@@ -291,7 +309,9 @@ impl ToolExecutionMessage {
         match self.stderr.write() {
             Ok(mut stderr) => stderr.push_str(text),
             Err(poisoned) => {
-                tracing::warn!("ToolExecutionMessage stderr lock poisoned in append_stderr, recovering");
+                tracing::warn!(
+                    "ToolExecutionMessage stderr lock poisoned in append_stderr, recovering"
+                );
                 let mut stderr = poisoned.into_inner();
                 stderr.push_str(text);
             }
@@ -303,14 +323,18 @@ impl ToolExecutionMessage {
         match self.exit_code.write() {
             Ok(mut e) => *e = Some(code),
             Err(poisoned) => {
-                tracing::warn!("ToolExecutionMessage exit_code lock poisoned in set_exit_code, recovering");
+                tracing::warn!(
+                    "ToolExecutionMessage exit_code lock poisoned in set_exit_code, recovering"
+                );
                 *poisoned.into_inner() = Some(code);
             }
         }
         match self.status.write() {
             Ok(mut s) => *s = MessageStatus::Complete,
             Err(poisoned) => {
-                tracing::warn!("ToolExecutionMessage status lock poisoned in set_exit_code, recovering");
+                tracing::warn!(
+                    "ToolExecutionMessage status lock poisoned in set_exit_code, recovering"
+                );
                 *poisoned.into_inner() = MessageStatus::Complete;
             }
         }
@@ -321,7 +345,9 @@ impl ToolExecutionMessage {
         match self.status.write() {
             Ok(mut s) => *s = MessageStatus::Failed,
             Err(poisoned) => {
-                tracing::warn!("ToolExecutionMessage status lock poisoned in set_failed, recovering");
+                tracing::warn!(
+                    "ToolExecutionMessage status lock poisoned in set_failed, recovering"
+                );
                 *poisoned.into_inner() = MessageStatus::Failed;
             }
         }
@@ -354,7 +380,9 @@ impl Message for ToolExecutionMessage {
         let exit_code = match self.exit_code.read() {
             Ok(e) => *e,
             Err(poisoned) => {
-                tracing::warn!("ToolExecutionMessage exit_code lock poisoned, using recovered data");
+                tracing::warn!(
+                    "ToolExecutionMessage exit_code lock poisoned, using recovered data"
+                );
                 *poisoned.into_inner()
             }
         };
@@ -417,7 +445,9 @@ impl Message for ToolExecutionMessage {
         let stdout = match self.stdout.read() {
             Ok(s) => s.clone(),
             Err(poisoned) => {
-                tracing::warn!("ToolExecutionMessage stdout lock poisoned in content(), using recovered data");
+                tracing::warn!(
+                    "ToolExecutionMessage stdout lock poisoned in content(), using recovered data"
+                );
                 poisoned.into_inner().clone()
             }
         };
@@ -425,7 +455,9 @@ impl Message for ToolExecutionMessage {
         let stderr = match self.stderr.read() {
             Ok(s) => s.clone(),
             Err(poisoned) => {
-                tracing::warn!("ToolExecutionMessage stderr lock poisoned in content(), using recovered data");
+                tracing::warn!(
+                    "ToolExecutionMessage stderr lock poisoned in content(), using recovered data"
+                );
                 poisoned.into_inner().clone()
             }
         };
@@ -515,7 +547,11 @@ impl Message for LiveToolMessage {
 
     fn format(&self, _colors: &crate::config::ColorScheme) -> String {
         let content = self.content.read().map(|c| c.clone()).unwrap_or_default();
-        let status = self.status.read().map(|s| *s).unwrap_or(MessageStatus::InProgress);
+        let status = self
+            .status
+            .read()
+            .map(|s| *s)
+            .unwrap_or(MessageStatus::InProgress);
 
         match status {
             MessageStatus::InProgress => {
@@ -542,11 +578,18 @@ impl Message for LiveToolMessage {
     }
 
     fn status(&self) -> MessageStatus {
-        self.status.read().map(|s| *s).unwrap_or(MessageStatus::InProgress)
+        self.status
+            .read()
+            .map(|s| *s)
+            .unwrap_or(MessageStatus::InProgress)
     }
 
     fn content(&self) -> String {
-        format!("{}\n{}", self.header, self.content.read().map(|c| c.clone()).unwrap_or_default())
+        format!(
+            "{}\n{}",
+            self.header,
+            self.content.read().map(|c| c.clone()).unwrap_or_default()
+        )
     }
 }
 
@@ -636,7 +679,11 @@ impl Message for OperationMessage {
         let rows = self.rows.read().unwrap_or_else(|p| p.into_inner());
         let status = *self.status.read().unwrap_or_else(|p| p.into_inner());
 
-        let ellipsis = if status == MessageStatus::InProgress { "…" } else { "" };
+        let ellipsis = if status == MessageStatus::InProgress {
+            "…"
+        } else {
+            ""
+        };
         let mut result = format!("{}⏺{} {}{}\n", CYAN, RESET, self.header, ellipsis);
 
         for row in rows.iter() {
@@ -706,7 +753,9 @@ impl ProgressMessage {
         match self.current.write() {
             Ok(mut c) => *c = current,
             Err(poisoned) => {
-                tracing::warn!("ProgressMessage current lock poisoned in update_progress, recovering");
+                tracing::warn!(
+                    "ProgressMessage current lock poisoned in update_progress, recovering"
+                );
                 *poisoned.into_inner() = current;
             }
         }
@@ -716,7 +765,9 @@ impl ProgressMessage {
             match self.status.write() {
                 Ok(mut s) => *s = MessageStatus::Complete,
                 Err(poisoned) => {
-                    tracing::warn!("ProgressMessage status lock poisoned in update_progress, recovering");
+                    tracing::warn!(
+                        "ProgressMessage status lock poisoned in update_progress, recovering"
+                    );
                     *poisoned.into_inner() = MessageStatus::Complete;
                 }
             }
@@ -827,7 +878,9 @@ impl Message for ProgressMessage {
         let current = match self.current.read() {
             Ok(c) => *c,
             Err(poisoned) => {
-                tracing::warn!("ProgressMessage current lock poisoned in content(), using recovered data");
+                tracing::warn!(
+                    "ProgressMessage current lock poisoned in content(), using recovered data"
+                );
                 *poisoned.into_inner()
             }
         };
@@ -1059,9 +1112,17 @@ mod tests {
         let formatted = msg.format(&colors);
         // InProgress + empty content → header with trailing "…" on same line
         assert!(formatted.contains("bash(echo hi)"));
-        assert!(formatted.contains('…'), "expected ellipsis '…' in: {:?}", formatted);
+        assert!(
+            formatted.contains('…'),
+            "expected ellipsis '…' in: {:?}",
+            formatted
+        );
         // Must NOT contain old spinner symbol
-        assert!(!formatted.contains('⟳'), "unexpected '⟳' in: {:?}", formatted);
+        assert!(
+            !formatted.contains('⟳'),
+            "unexpected '⟳' in: {:?}",
+            formatted
+        );
     }
 
     #[test]
@@ -1071,8 +1132,16 @@ mod tests {
         msg.append_line("hello world");
         let formatted = msg.format(&colors);
         // InProgress + content → both header and content present
-        assert!(formatted.contains("bash(echo hi)"), "header missing in: {:?}", formatted);
-        assert!(formatted.contains("hello world"), "content missing in: {:?}", formatted);
+        assert!(
+            formatted.contains("bash(echo hi)"),
+            "header missing in: {:?}",
+            formatted
+        );
+        assert!(
+            formatted.contains("hello world"),
+            "content missing in: {:?}",
+            formatted
+        );
     }
 
     #[test]
@@ -1083,8 +1152,16 @@ mod tests {
         msg.set_complete();
         let formatted = msg.format(&colors);
         // Complete with output → shows output, no spinner
-        assert!(formatted.contains("hello world"), "output missing in: {:?}", formatted);
-        assert!(!formatted.contains('⟳'), "unexpected '⟳' in: {:?}", formatted);
+        assert!(
+            formatted.contains("hello world"),
+            "output missing in: {:?}",
+            formatted
+        );
+        assert!(
+            !formatted.contains('⟳'),
+            "unexpected '⟳' in: {:?}",
+            formatted
+        );
     }
 
     #[test]
@@ -1094,10 +1171,22 @@ mod tests {
         msg.set_complete();
         let formatted = msg.format(&colors);
         // Complete with no output → just header, no garbage
-        assert!(formatted.contains("bash(true)"), "header missing in: {:?}", formatted);
-        assert!(!formatted.contains('⟳'), "unexpected '⟳' in: {:?}", formatted);
+        assert!(
+            formatted.contains("bash(true)"),
+            "header missing in: {:?}",
+            formatted
+        );
+        assert!(
+            !formatted.contains('⟳'),
+            "unexpected '⟳' in: {:?}",
+            formatted
+        );
         // Should not have a bare "…" (that would indicate still InProgress display)
-        assert!(!formatted.contains('…'), "unexpected '…' in complete state: {:?}", formatted);
+        assert!(
+            !formatted.contains('…'),
+            "unexpected '…' in complete state: {:?}",
+            formatted
+        );
     }
 
     #[test]
@@ -1107,8 +1196,16 @@ mod tests {
         msg.set_content("command not found\n");
         msg.set_failed();
         let formatted = msg.format(&colors);
-        assert!(formatted.contains("bash(bad_cmd)"), "header missing in: {:?}", formatted);
-        assert!(formatted.contains("command not found"), "error content missing in: {:?}", formatted);
+        assert!(
+            formatted.contains("bash(bad_cmd)"),
+            "header missing in: {:?}",
+            formatted
+        );
+        assert!(
+            formatted.contains("command not found"),
+            "error content missing in: {:?}",
+            formatted
+        );
     }
 
     // ── OperationMessage format state tests ────────────────────────────────
@@ -1122,11 +1219,27 @@ mod tests {
         msg.set_complete();
         let formatted = msg.format(&colors);
         // Must use ⏺ (U+23FA), not ● (U+25CF)
-        assert!(formatted.contains('⏺'), "Expected ⏺ (U+23FA), got: {:?}", formatted);
-        assert!(!formatted.contains('●'), "Found old ● (U+25CF) in: {:?}", formatted);
+        assert!(
+            formatted.contains('⏺'),
+            "Expected ⏺ (U+23FA), got: {:?}",
+            formatted
+        );
+        assert!(
+            !formatted.contains('●'),
+            "Found old ● (U+25CF) in: {:?}",
+            formatted
+        );
         // Must use ⎿ (U+23BF), not └ (U+2514)
-        assert!(formatted.contains('⎿'), "Expected ⎿ (U+23BF), got: {:?}", formatted);
-        assert!(!formatted.contains('└'), "Found old └ (U+2514) in: {:?}", formatted);
+        assert!(
+            formatted.contains('⎿'),
+            "Expected ⎿ (U+23BF), got: {:?}",
+            formatted
+        );
+        assert!(
+            !formatted.contains('└'),
+            "Found old └ (U+2514) in: {:?}",
+            formatted
+        );
     }
 
     #[test]
@@ -1135,7 +1248,11 @@ mod tests {
         let msg = OperationMessage::new("Generating");
         let formatted = msg.format(&colors);
         // InProgress: header ends with ellipsis
-        assert!(formatted.contains("Generating…"), "expected 'Generating…' in: {:?}", formatted);
+        assert!(
+            formatted.contains("Generating…"),
+            "expected 'Generating…' in: {:?}",
+            formatted
+        );
     }
 
     #[test]
@@ -1145,8 +1262,16 @@ mod tests {
         msg.set_complete();
         let formatted = msg.format(&colors);
         // Complete: no trailing ellipsis
-        assert!(!formatted.contains("Generating…"), "unexpected '…' in complete state: {:?}", formatted);
-        assert!(formatted.contains("Generating"), "header missing in: {:?}", formatted);
+        assert!(
+            !formatted.contains("Generating…"),
+            "unexpected '…' in complete state: {:?}",
+            formatted
+        );
+        assert!(
+            formatted.contains("Generating"),
+            "header missing in: {:?}",
+            formatted
+        );
     }
 
     #[test]
@@ -1156,8 +1281,16 @@ mod tests {
         msg.add_row("bash(ls)");
         let formatted = msg.format(&colors);
         // Running row: label + "…"
-        assert!(formatted.contains("bash(ls)"), "row label missing in: {:?}", formatted);
-        assert!(formatted.contains('⎿'), "expected ⎿ prefix in: {:?}", formatted);
+        assert!(
+            formatted.contains("bash(ls)"),
+            "row label missing in: {:?}",
+            formatted
+        );
+        assert!(
+            formatted.contains('⎿'),
+            "expected ⎿ prefix in: {:?}",
+            formatted
+        );
     }
 
     #[test]
@@ -1167,7 +1300,15 @@ mod tests {
         let idx = msg.add_row("bash(bad)");
         msg.fail_row(idx, "permission denied");
         let formatted = msg.format(&colors);
-        assert!(formatted.contains("bash(bad)"), "row label missing in: {:?}", formatted);
-        assert!(formatted.contains("permission denied"), "error message missing in: {:?}", formatted);
+        assert!(
+            formatted.contains("bash(bad)"),
+            "row label missing in: {:?}",
+            formatted
+        );
+        assert!(
+            formatted.contains("permission denied"),
+            "error message missing in: {:?}",
+            formatted
+        );
     }
 }

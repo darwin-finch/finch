@@ -110,9 +110,7 @@ impl ModelRouter {
     /// Save the models to disk
     pub fn save_models(&self, models_dir: &str) -> Result<()> {
         let path = std::path::Path::new(models_dir);
-        self.ensemble
-            .save(path)
-            .context("Failed to save models")
+        self.ensemble.save(path).context("Failed to save models")
     }
 
     /// Get statistics about the ensemble
@@ -136,5 +134,4 @@ mod tests {
         let router = ModelRouter::new();
         assert!(router.is_ok());
     }
-
 }

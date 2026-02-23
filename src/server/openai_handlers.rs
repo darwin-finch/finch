@@ -6,7 +6,10 @@
 use axum::{
     extract::State,
     http::StatusCode,
-    response::{IntoResponse, Json, Response, sse::{Event, Sse}},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Json, Response,
+    },
 };
 use futures::stream::{self};
 use std::convert::Infallible;
@@ -104,8 +107,13 @@ impl TokenBuffer {
 
     fn is_start_of_special_marker(&self, token: &str) -> bool {
         const MARKER_STARTS: &[&str] = &[
-            "<|", "<｜", "<think", "</think",
-            "user\n", "system\n", "assistant\n"
+            "<|",
+            "<｜",
+            "<think",
+            "</think",
+            "user\n",
+            "system\n",
+            "assistant\n",
         ];
         MARKER_STARTS.iter().any(|start| token.starts_with(start))
     }
@@ -256,43 +264,50 @@ async fn handle_chat_completions_streaming(
             let handle = tokio::runtime::Handle::current();
 
             // Get generator (need to use block_on since we're in blocking context)
-            let mut generator = handle.block_on(async {
-                server_clone.local_generator().write().await
-            });
+            let mut generator =
+                handle.block_on(async { server_clone.local_generator().write().await });
 
             // Accumulate response for logging
             let accumulated_response = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let accumulated_clone = accumulated_response.clone();
 
             // Try to generate with streaming callback
-            let result = generator.try_generate_from_pattern_streaming(&internal_messages, move |_token_id, token_text| {
-                tracing::debug!("[daemon] Sending token to SSE: {:?}", token_text);
+            let result = generator.try_generate_from_pattern_streaming(
+                &internal_messages,
+                move |_token_id, token_text| {
+                    tracing::debug!("[daemon] Sending token to SSE: {:?}", token_text);
 
-                // Accumulate for logging
-                if let Ok(mut acc) = accumulated_clone.lock() {
-                    acc.push_str(token_text);
-                }
+                    // Accumulate for logging
+                    if let Ok(mut acc) = accumulated_clone.lock() {
+                        acc.push_str(token_text);
+                    }
 
-                // Send token via bounded channel (blocking send)
-                // This provides backpressure - if the HTTP consumer is slow,
-                // generation will pause here until there's space in the channel
-                if tx.blocking_send(token_text.to_string()).is_err() {
-                    // Channel closed (client disconnected), stop generating
-                    return;
-                }
+                    // Send token via bounded channel (blocking send)
+                    // This provides backpressure - if the HTTP consumer is slow,
+                    // generation will pause here until there's space in the channel
+                    if tx.blocking_send(token_text.to_string()).is_err() {
+                        // Channel closed (client disconnected), stop generating
+                        return;
+                    }
 
-                // Small sleep to pace token delivery and allow async runtime to process
-                // This helps prevent tokens from bunching up even with backpressure
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            });
+                    // Small sleep to pace token delivery and allow async runtime to process
+                    // This helps prevent tokens from bunching up even with backpressure
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                },
+            );
 
             // Log complete response
             if let Ok(acc) = accumulated_response.lock() {
-                info!("[DAEMON_RESPONSE] Complete response ({} chars): {:?}", acc.len(), &acc);
+                info!(
+                    "[DAEMON_RESPONSE] Complete response ({} chars): {:?}",
+                    acc.len(),
+                    &acc
+                );
             }
 
             result
-        }).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(Some(_response))) => {
@@ -312,55 +327,58 @@ async fn handle_chat_completions_streaming(
 
     // Create SSE stream from cleaned token receiver
     // State: (receiver, model_name, done_flag)
-    let stream = stream::unfold((cleaned_rx, model_name, false), |(mut rx, model_name, done)| async move {
-        if done {
-            // Already sent final chunk, terminate stream
-            return None;
-        }
-
-        match rx.recv().await {
-            Some(token_text) => {
-                // Format as OpenAI streaming chunk
-                let chunk = serde_json::json!({
-                    "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                    "object": "chat.completion.chunk",
-                    "created": chrono::Utc::now().timestamp(),
-                    "model": &model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "content": token_text
-                        },
-                        "finish_reason": null
-                    }]
-                });
-
-                Some((
-                    Ok::<_, Infallible>(Event::default().json_data(chunk).unwrap()),
-                    (rx, model_name, false), // Continue streaming
-                ))
+    let stream = stream::unfold(
+        (cleaned_rx, model_name, false),
+        |(mut rx, model_name, done)| async move {
+            if done {
+                // Already sent final chunk, terminate stream
+                return None;
             }
-            None => {
-                // Send final chunk with finish_reason
-                let chunk = serde_json::json!({
-                    "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
-                    "object": "chat.completion.chunk",
-                    "created": chrono::Utc::now().timestamp(),
-                    "model": &model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": "stop"
-                    }]
-                });
 
-                Some((
-                    Ok::<_, Infallible>(Event::default().json_data(chunk).unwrap()),
-                    (rx, model_name, true), // Mark done, will terminate on next call
-                ))
+            match rx.recv().await {
+                Some(token_text) => {
+                    // Format as OpenAI streaming chunk
+                    let chunk = serde_json::json!({
+                        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                        "object": "chat.completion.chunk",
+                        "created": chrono::Utc::now().timestamp(),
+                        "model": &model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "content": token_text
+                            },
+                            "finish_reason": null
+                        }]
+                    });
+
+                    Some((
+                        Ok::<_, Infallible>(Event::default().json_data(chunk).unwrap()),
+                        (rx, model_name, false), // Continue streaming
+                    ))
+                }
+                None => {
+                    // Send final chunk with finish_reason
+                    let chunk = serde_json::json!({
+                        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                        "object": "chat.completion.chunk",
+                        "created": chrono::Utc::now().timestamp(),
+                        "model": &model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop"
+                        }]
+                    });
+
+                    Some((
+                        Ok::<_, Infallible>(Event::default().json_data(chunk).unwrap()),
+                        (rx, model_name, true), // Mark done, will terminate on next call
+                    ))
+                }
             }
-        }
-    });
+        },
+    );
 
     Ok(Sse::new(stream).into_response())
 }
@@ -409,10 +427,7 @@ pub async fn handle_chat_completions(
 
     // Validate request
     if request.messages.is_empty() {
-        return error_response(
-            "messages array cannot be empty",
-            "invalid_request_error",
-        );
+        return error_response("messages array cannot be empty", "invalid_request_error");
     }
 
     // Handle streaming requests
@@ -438,12 +453,16 @@ pub async fn handle_chat_completions(
     };
 
     // Convert OpenAI tools to internal format
-    let internal_tools = request.tools.as_ref().map(|tools| convert_tools_to_internal(tools));
+    let internal_tools = request
+        .tools
+        .as_ref()
+        .map(|tools| convert_tools_to_internal(tools));
 
     // Extract user query for routing
     let user_query = request
         .messages
-        .iter().rfind(|m| m.role == "user")
+        .iter()
+        .rfind(|m| m.role == "user")
         .and_then(|m| m.content.as_deref())
         .unwrap_or("");
 
@@ -454,7 +473,10 @@ pub async fn handle_chat_completions(
 
     let (content_blocks, routing_decision) = match decision {
         RouteDecision::Forward { reason } => {
-            info!("☁️  ROUTING TO TEACHER API (reason: {:?}, provider: {:?})", reason, provider_name);
+            info!(
+                "☁️  ROUTING TO TEACHER API (reason: {:?}, provider: {:?})",
+                reason, provider_name
+            );
 
             match forward_to_cloud(
                 &server,
@@ -481,7 +503,10 @@ pub async fn handle_chat_completions(
 
                     // Try local generation with tools
                     let mut generator = server.local_generator().write().await;
-                    match generator.try_generate_from_pattern_with_tools(&internal_messages, internal_tools.clone()) {
+                    match generator.try_generate_from_pattern_with_tools(
+                        &internal_messages,
+                        internal_tools.clone(),
+                    ) {
                         Ok(Some(response)) => {
                             info!("✓ LOCAL MODEL RESPONDED");
                             (response.content_blocks, "local")
@@ -553,7 +578,7 @@ pub async fn handle_chat_completions(
             let example = crate::models::WeightedExample {
                 query: user_query.to_string(),
                 response: response_text,
-                weight: 1.0, // Normal weight for automatic collection
+                weight: 1.0,    // Normal weight for automatic collection
                 feedback: None, // No explicit feedback for auto-collected examples
             };
 
@@ -590,7 +615,9 @@ async fn handle_local_only_query(
         GeneratorState::Ready { .. } => {
             // Model ready, proceed (state will be dropped at end of scope)
         }
-        GeneratorState::Initializing | GeneratorState::Downloading { .. } | GeneratorState::Loading { .. } => {
+        GeneratorState::Initializing
+        | GeneratorState::Downloading { .. }
+        | GeneratorState::Loading { .. } => {
             warn!("Local model not ready: {:?}", &*state);
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -634,34 +661,38 @@ async fn handle_local_only_query(
     let mut generator = server.local_generator().write().await;
     info!("Write lock acquired, starting generation...");
 
-    let content_blocks = match generator.try_generate_from_pattern_with_tools(&internal_messages, None) {
-        Ok(Some(response)) => {
-            info!("Generation successful, {} content blocks", response.content_blocks.len());
-            response.content_blocks
-        }
-        Ok(None) => {
-            warn!("Generation returned None");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "Local model returned no response".to_string(),
-                    "generation_failed".to_string(),
-                )),
-            )
-                .into_response());
-        }
-        Err(e) => {
-            warn!("Local generation failed: {}", e);
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    format!("Local generation failed: {}", e),
-                    "generation_failed".to_string(),
-                )),
-            )
-                .into_response());
-        }
-    };
+    let content_blocks =
+        match generator.try_generate_from_pattern_with_tools(&internal_messages, None) {
+            Ok(Some(response)) => {
+                info!(
+                    "Generation successful, {} content blocks",
+                    response.content_blocks.len()
+                );
+                response.content_blocks
+            }
+            Ok(None) => {
+                warn!("Generation returned None");
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        "Local model returned no response".to_string(),
+                        "generation_failed".to_string(),
+                    )),
+                )
+                    .into_response());
+            }
+            Err(e) => {
+                warn!("Local generation failed: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new(
+                        format!("Local generation failed: {}", e),
+                        "generation_failed".to_string(),
+                    )),
+                )
+                    .into_response());
+            }
+        };
     drop(generator);
     info!("Write lock dropped");
 
@@ -692,29 +723,33 @@ fn convert_tools_to_internal(tools: &[Tool]) -> Vec<InternalToolDefinition> {
         .iter()
         .map(|t| {
             // Extract schema components from parameters
-            let (schema_type, properties, required) = if let Some(obj) = t.function.parameters.as_object() {
-                let schema_type = obj.get("type")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("object")
-                    .to_string();
+            let (schema_type, properties, required) =
+                if let Some(obj) = t.function.parameters.as_object() {
+                    let schema_type = obj
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("object")
+                        .to_string();
 
-                let properties = obj.get("properties")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
+                    let properties = obj
+                        .get("properties")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
 
-                let required = obj.get("required")
-                    .and_then(|r| r.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                    let required = obj
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
-                (schema_type, properties, required)
-            } else {
-                ("object".to_string(), serde_json::json!({}), vec![])
-            };
+                    (schema_type, properties, required)
+                } else {
+                    ("object".to_string(), serde_json::json!({}), vec![])
+                };
 
             InternalToolDefinition {
                 name: t.function.name.clone(),
@@ -756,9 +791,7 @@ fn convert_response_to_openai(
                     },
                 };
 
-                tool_calls
-                    .get_or_insert_with(Vec::new)
-                    .push(tool_call);
+                tool_calls.get_or_insert_with(Vec::new).push(tool_call);
 
                 finish_reason = "tool_calls";
             }
@@ -820,7 +853,10 @@ fn convert_messages_to_internal(messages: &[ChatMessage]) -> anyhow::Result<Vec<
                 // blocks (batch all results from one turn into a single user message).
                 let appended = if let Some(last) = result.last_mut() {
                     if last.role == "user"
-                        && last.content.iter().all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                        && last
+                            .content
+                            .iter()
+                            .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
                     {
                         last.content.push(result_block.clone());
                         true
@@ -881,7 +917,9 @@ fn convert_messages_to_internal(messages: &[ChatMessage]) -> anyhow::Result<Vec<
 
 /// Check if content blocks contain tool calls
 fn has_tool_calls(blocks: &[ContentBlock]) -> bool {
-    blocks.iter().any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+    blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
 }
 
 /// Extract text from content blocks
@@ -943,9 +981,18 @@ mod tests {
         let mut buffer = TokenBuffer::new();
 
         // Start of ChatML marker
-        assert!(buffer.add_token("<|").is_none(), "Should buffer start marker");
-        assert!(buffer.add_token("im_").is_none(), "Should continue buffering");
-        assert!(buffer.add_token("end|>").is_none(), "Should complete and discard marker");
+        assert!(
+            buffer.add_token("<|").is_none(),
+            "Should buffer start marker"
+        );
+        assert!(
+            buffer.add_token("im_").is_none(),
+            "Should continue buffering"
+        );
+        assert!(
+            buffer.add_token("end|>").is_none(),
+            "Should complete and discard marker"
+        );
 
         // Normal token should be added
         buffer.add_token("normal");
@@ -980,6 +1027,9 @@ mod tests {
         }
 
         let second_flush = buffer.flush();
-        assert_eq!(second_flush, " How are you?", "Should only return new content");
+        assert_eq!(
+            second_flush, " How are you?",
+            "Should only return new content"
+        );
     }
 }

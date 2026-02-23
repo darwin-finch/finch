@@ -42,8 +42,9 @@ impl DaemonLifecycle {
     /// Remove PID file (called on shutdown)
     pub fn cleanup(&self) -> Result<()> {
         if self.pid_file.exists() {
-            fs::remove_file(&self.pid_file)
-                .with_context(|| format!("Failed to remove PID file: {}", self.pid_file.display()))?;
+            fs::remove_file(&self.pid_file).with_context(|| {
+                format!("Failed to remove PID file: {}", self.pid_file.display())
+            })?;
             info!("Daemon PID file removed");
         }
         Ok(())
@@ -108,7 +109,10 @@ impl DaemonLifecycle {
         };
 
         if !process_exists(pid) {
-            info!(pid = pid, "Daemon not running (process does not exist). Removing stale PID file...");
+            info!(
+                pid = pid,
+                "Daemon not running (process does not exist). Removing stale PID file..."
+            );
             self.cleanup()?;
             return Ok(());
         }
@@ -139,7 +143,10 @@ impl DaemonLifecycle {
             }
 
             // Still running after timeout, send SIGKILL
-            warn!(pid = pid, "Daemon did not stop gracefully, sending SIGKILL...");
+            warn!(
+                pid = pid,
+                "Daemon did not stop gracefully, sending SIGKILL..."
+            );
             kill(Pid::from_raw(pid as i32), Signal::SIGKILL)
                 .context("Failed to send SIGKILL to daemon")?;
 
@@ -201,10 +208,7 @@ fn process_exists(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
     let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        ProcessRefreshKind::nothing(),
-    );
+    system.refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::nothing());
     system.process(Pid::from(pid as usize)).is_some()
 }
 

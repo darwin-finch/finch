@@ -20,14 +20,10 @@ pub enum QueryState {
     },
 
     /// Query completed successfully
-    Completed {
-        response: String,
-    },
+    Completed { response: String },
 
     /// Query failed with an error
-    Failed {
-        error: String,
-    },
+    Failed { error: String },
 
     /// Query was cancelled by user
     Cancelled,
@@ -182,7 +178,12 @@ mod tests {
         let manager = QueryStateManager::new();
         let id = manager.create_query(vec![]).await;
         manager
-            .update_state(id, QueryState::Completed { response: "all done".to_string() })
+            .update_state(
+                id,
+                QueryState::Completed {
+                    response: "all done".to_string(),
+                },
+            )
             .await;
         match manager.get_state(id).await.unwrap() {
             QueryState::Completed { response } => assert_eq!(response, "all done"),
@@ -195,7 +196,12 @@ mod tests {
         let manager = QueryStateManager::new();
         let id = manager.create_query(vec![]).await;
         manager
-            .update_state(id, QueryState::Failed { error: "timeout".to_string() })
+            .update_state(
+                id,
+                QueryState::Failed {
+                    error: "timeout".to_string(),
+                },
+            )
             .await;
         match manager.get_state(id).await.unwrap() {
             QueryState::Failed { error } => assert_eq!(error, "timeout"),
@@ -208,10 +214,19 @@ mod tests {
         let manager = QueryStateManager::new();
         let id = manager.create_query(vec![]).await;
         manager
-            .update_state(id, QueryState::ExecutingTools { tools_pending: 3, tools_completed: 1 })
+            .update_state(
+                id,
+                QueryState::ExecutingTools {
+                    tools_pending: 3,
+                    tools_completed: 1,
+                },
+            )
             .await;
         match manager.get_state(id).await.unwrap() {
-            QueryState::ExecutingTools { tools_pending, tools_completed } => {
+            QueryState::ExecutingTools {
+                tools_pending,
+                tools_completed,
+            } => {
                 assert_eq!(tools_pending, 3);
                 assert_eq!(tools_completed, 1);
             }
@@ -224,7 +239,10 @@ mod tests {
         let manager = QueryStateManager::new();
         let id = manager.create_query(vec![]).await;
         manager.cancel_query(id).await;
-        assert!(matches!(manager.get_state(id).await.unwrap(), QueryState::Cancelled));
+        assert!(matches!(
+            manager.get_state(id).await.unwrap(),
+            QueryState::Cancelled
+        ));
     }
 
     #[tokio::test]
@@ -240,7 +258,10 @@ mod tests {
 
         assert!(!token.is_cancelled(), "token should not be cancelled yet");
         manager.cancel_query(id).await;
-        assert!(token.is_cancelled(), "token should be cancelled after cancel_query()");
+        assert!(
+            token.is_cancelled(),
+            "token should be cancelled after cancel_query()"
+        );
     }
 
     #[tokio::test]
@@ -249,7 +270,10 @@ mod tests {
         let id = manager.create_query(vec![]).await;
         assert!(manager.get_state(id).await.is_some());
         manager.remove_query(id).await;
-        assert!(manager.get_state(id).await.is_none(), "state should be gone after removal");
+        assert!(
+            manager.get_state(id).await.is_none(),
+            "state should be gone after removal"
+        );
     }
 
     #[tokio::test]
@@ -258,12 +282,23 @@ mod tests {
         manager.create_query(vec![]).await;
         manager.create_query(vec![]).await;
         let id3 = manager.create_query(vec![]).await;
-        manager.update_state(id3, QueryState::Completed { response: "done".to_string() }).await;
+        manager
+            .update_state(
+                id3,
+                QueryState::Completed {
+                    response: "done".to_string(),
+                },
+            )
+            .await;
 
-        let processing = manager.count_by_state(|s| matches!(s, QueryState::Processing)).await;
+        let processing = manager
+            .count_by_state(|s| matches!(s, QueryState::Processing))
+            .await;
         assert_eq!(processing, 2);
 
-        let completed = manager.count_by_state(|s| matches!(s, QueryState::Completed { .. })).await;
+        let completed = manager
+            .count_by_state(|s| matches!(s, QueryState::Completed { .. }))
+            .await;
         assert_eq!(completed, 1);
     }
 
@@ -271,7 +306,14 @@ mod tests {
     async fn test_cleanup_removes_old_completed_queries() {
         let manager = QueryStateManager::new();
         let id = manager.create_query(vec![]).await;
-        manager.update_state(id, QueryState::Completed { response: "done".to_string() }).await;
+        manager
+            .update_state(
+                id,
+                QueryState::Completed {
+                    response: "done".to_string(),
+                },
+            )
+            .await;
 
         // Zero-duration threshold: everything completed is "old"
         manager.cleanup_old_queries(Duration::from_secs(0)).await;
@@ -300,13 +342,26 @@ mod tests {
         let id_fail = manager.create_query(vec![]).await;
         let id_cancel = manager.create_query(vec![]).await;
 
-        manager.update_state(id_fail, QueryState::Failed { error: "err".to_string() }).await;
+        manager
+            .update_state(
+                id_fail,
+                QueryState::Failed {
+                    error: "err".to_string(),
+                },
+            )
+            .await;
         manager.update_state(id_cancel, QueryState::Cancelled).await;
 
         manager.cleanup_old_queries(Duration::from_secs(0)).await;
 
-        assert!(manager.get_state(id_fail).await.is_none(), "old failed should be cleaned");
-        assert!(manager.get_state(id_cancel).await.is_none(), "old cancelled should be cleaned");
+        assert!(
+            manager.get_state(id_fail).await.is_none(),
+            "old failed should be cleaned"
+        );
+        assert!(
+            manager.get_state(id_cancel).await.is_none(),
+            "old cancelled should be cleaned"
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -41,7 +41,9 @@ impl Tool for PresentPlanTool {
         }
 
         // Check if repl_mode is available
-        let mode = context.repl_mode.as_ref()
+        let mode = context
+            .repl_mode
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Plan mode not available in this context"))?;
 
         // Verify we're in planning mode
@@ -53,7 +55,10 @@ impl Tool for PresentPlanTool {
                     return Ok("⚠️  Not in planning mode. Use EnterPlanMode first.".to_string());
                 }
                 crate::cli::ReplMode::Executing { .. } => {
-                    return Ok("⚠️  Already executing plan. Use /done to return to normal mode.".to_string());
+                    return Ok(
+                        "⚠️  Already executing plan. Use /done to return to normal mode."
+                            .to_string(),
+                    );
                 }
             }
         };
@@ -92,10 +97,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_plan() {
-        use std::sync::Arc;
-        use tokio::sync::RwLock;
         use crate::cli::ReplMode;
         use std::path::PathBuf;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
 
         let tool = PresentPlanTool;
 

@@ -9,8 +9,8 @@
 //   ● Read(src/cli/mod.rs)
 //     └ 33 lines read
 
-use std::sync::Arc;
 use serde_json::Value;
+use std::sync::Arc;
 
 const CYAN: &str = "\x1b[36m";
 const GRAY: &str = "\x1b[90m";
@@ -29,9 +29,15 @@ pub fn format_tool_label(name: &str, input: &Value) -> String {
     } else {
         format!(
             "{}{}{}{}({}{}{}{}){}",
-            CYAN, BOLD, name, RESET,
-            GRAY, truncate(&key_param, MAX_PARAM_LEN), RESET,
-            CYAN, RESET,
+            CYAN,
+            BOLD,
+            name,
+            RESET,
+            GRAY,
+            truncate(&key_param, MAX_PARAM_LEN),
+            RESET,
+            CYAN,
+            RESET,
         )
     }
 }
@@ -229,13 +235,19 @@ mod tests {
 
     #[test]
     fn test_bash_label() {
-        let label = extract_key_param("bash", &serde_json::json!({"command": "git push origin main"}));
+        let label = extract_key_param(
+            "bash",
+            &serde_json::json!({"command": "git push origin main"}),
+        );
         assert_eq!(label, "git push origin main");
     }
 
     #[test]
     fn test_read_label() {
-        let label = extract_key_param("read", &serde_json::json!({"file_path": "/Users/foo/repos/project/src/main.rs"}));
+        let label = extract_key_param(
+            "read",
+            &serde_json::json!({"file_path": "/Users/foo/repos/project/src/main.rs"}),
+        );
         assert_eq!(label, "…/src/main.rs");
     }
 
@@ -248,7 +260,10 @@ mod tests {
 
     #[test]
     fn test_format_tool_result_truncation() {
-        let content = (0..20).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (0..20)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = format_tool_result("Bash(ls)", &content, false);
         assert!(result.contains("+12 lines"));
     }
@@ -259,47 +274,95 @@ mod tests {
     fn test_format_tool_result_uses_correct_bullet() {
         let result = format_tool_result("bash(echo hi)", "hi", false);
         // Must use ⏺ (U+23FA), not ● (U+25CF)
-        assert!(result.contains('⏺'), "Expected ⏺ (U+23FA), got: {:?}", result);
-        assert!(!result.contains('●'), "Found old ● (U+25CF) in: {:?}", result);
+        assert!(
+            result.contains('⏺'),
+            "Expected ⏺ (U+23FA), got: {:?}",
+            result
+        );
+        assert!(
+            !result.contains('●'),
+            "Found old ● (U+25CF) in: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_format_tool_result_uses_correct_corner() {
         let result = format_tool_result("bash(echo hi)", "hi\nline2", false);
         // Must use ⎿ (U+23BF), not └ (U+2514)
-        assert!(result.contains('⎿'), "Expected ⎿ (U+23BF), got: {:?}", result);
-        assert!(!result.contains('└'), "Found old └ (U+2514) in: {:?}", result);
+        assert!(
+            result.contains('⎿'),
+            "Expected ⎿ (U+23BF), got: {:?}",
+            result
+        );
+        assert!(
+            !result.contains('└'),
+            "Found old └ (U+2514) in: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_format_tool_result_empty_output_no_corner() {
         let result = format_tool_result("bash(true)", "", false);
         // Empty output: header shown, no ⎿ (no output lines)
-        assert!(result.contains("bash(true)"), "header missing in: {:?}", result);
-        assert!(!result.contains('⎿'), "unexpected ⎿ for empty output in: {:?}", result);
+        assert!(
+            result.contains("bash(true)"),
+            "header missing in: {:?}",
+            result
+        );
+        assert!(
+            !result.contains('⎿'),
+            "unexpected ⎿ for empty output in: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_format_tool_result_error_uses_red_bullet() {
         let result = format_tool_result("bash(bad)", "error message", true);
         // Error: ⏺ in red (still ⏺, not ●)
-        assert!(result.contains('⏺'), "Expected ⏺ in error result, got: {:?}", result);
-        assert!(!result.contains('●'), "Found old ● in error result: {:?}", result);
+        assert!(
+            result.contains('⏺'),
+            "Expected ⏺ in error result, got: {:?}",
+            result
+        );
+        assert!(
+            !result.contains('●'),
+            "Found old ● in error result: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_build_result_content_uses_correct_corner() {
         let result = build_result_content("output line", false);
-        assert!(result.contains('⎿'), "Expected ⎿ (U+23BF), got: {:?}", result);
-        assert!(!result.contains('└'), "Found old └ (U+2514) in: {:?}", result);
+        assert!(
+            result.contains('⎿'),
+            "Expected ⎿ (U+23BF), got: {:?}",
+            result
+        );
+        assert!(
+            !result.contains('└'),
+            "Found old └ (U+2514) in: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_build_result_content_empty_returns_empty() {
         let result = build_result_content("", false);
-        assert!(result.is_empty(), "Expected empty string for empty content, got: {:?}", result);
+        assert!(
+            result.is_empty(),
+            "Expected empty string for empty content, got: {:?}",
+            result
+        );
         let result = build_result_content("   ", false);
-        assert!(result.is_empty(), "Expected empty for whitespace-only content, got: {:?}", result);
+        assert!(
+            result.is_empty(),
+            "Expected empty for whitespace-only content, got: {:?}",
+            result
+        );
     }
 
     #[test]

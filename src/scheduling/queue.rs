@@ -108,7 +108,12 @@ mod tests {
 
     #[test]
     fn test_task_status_serde_roundtrip() {
-        for status in [TaskStatus::Pending, TaskStatus::Running, TaskStatus::Completed, TaskStatus::Failed] {
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+        ] {
             let json = serde_json::to_string(&status).unwrap();
             let decoded: TaskStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, status);
@@ -148,8 +153,14 @@ mod tests {
         let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q2.db")).unwrap();
         let task = make_task("test_task");
         let result = queue.enqueue(task).await;
-        assert!(result.is_err(), "enqueue should return an error until SQLite backend is implemented");
-        assert!(result.unwrap_err().to_string().contains("not yet implemented"));
+        assert!(
+            result.is_err(),
+            "enqueue should return an error until SQLite backend is implemented"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[tokio::test]

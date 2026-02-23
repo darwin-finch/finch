@@ -65,12 +65,15 @@ impl TabState {
     fn get_answer(&self) -> Option<String> {
         if self.custom_mode_active {
             // In custom mode, return custom text if non-empty
-            self.custom_input.as_ref()
+            self.custom_input
+                .as_ref()
                 .filter(|s| !s.trim().is_empty())
                 .cloned()
         } else if self.question.multi_select {
             // Multi-select: join selected labels
-            let labels: Vec<String> = self.selected_indices.iter()
+            let labels: Vec<String> = self
+                .selected_indices
+                .iter()
                 .filter_map(|&idx| {
                     if idx < self.question.options.len() {
                         Some(self.question.options[idx].label.clone())
@@ -158,11 +161,12 @@ impl TabbedDialog {
 
     /// Get all answers as a HashMap
     pub fn collect_answers(&self) -> HashMap<String, String> {
-        self.tabs.iter()
+        self.tabs
+            .iter()
             .filter_map(|tab| {
-                tab.answer.as_ref().map(|answer| {
-                    (tab.question.question.clone(), answer.clone())
-                })
+                tab.answer
+                    .as_ref()
+                    .map(|answer| (tab.question.question.clone(), answer.clone()))
             })
             .collect()
     }
@@ -241,8 +245,8 @@ impl TabbedDialog {
                 tab.selected_index = tab.selected_index.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                tab.selected_index = (tab.selected_index + 1)
-                    .min(tab.question.options.len().saturating_sub(1));
+                tab.selected_index =
+                    (tab.selected_index + 1).min(tab.question.options.len().saturating_sub(1));
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
                 let num = c.to_digit(10).unwrap() as usize;
@@ -264,8 +268,8 @@ impl TabbedDialog {
                 tab.selected_index = tab.selected_index.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                tab.selected_index = (tab.selected_index + 1)
-                    .min(tab.question.options.len().saturating_sub(1));
+                tab.selected_index =
+                    (tab.selected_index + 1).min(tab.question.options.len().saturating_sub(1));
             }
             KeyCode::Char(' ') => {
                 // Toggle selection at cursor
@@ -382,26 +386,23 @@ mod tests {
         Question {
             question: text.to_string(),
             header: text[..text.len().min(12)].to_string(),
-            options: options.iter().map(|&label| QuestionOption {
-                label: label.to_string(),
-                description: format!("{label} description"),
-            }).collect(),
+            options: options
+                .iter()
+                .map(|&label| QuestionOption {
+                    label: label.to_string(),
+                    description: format!("{label} description"),
+                })
+                .collect(),
             multi_select: multi,
         }
     }
 
     fn single_tab_dialog(options: &[&str]) -> TabbedDialog {
-        TabbedDialog::new(
-            vec![make_question("Pick one?", options, false)],
-            None,
-        )
+        TabbedDialog::new(vec![make_question("Pick one?", options, false)], None)
     }
 
     fn multi_tab_dialog(options: &[&str]) -> TabbedDialog {
-        TabbedDialog::new(
-            vec![make_question("Pick many?", options, true)],
-            None,
-        )
+        TabbedDialog::new(vec![make_question("Pick many?", options, true)], None)
     }
 
     // --- basic construction ---
@@ -420,7 +421,10 @@ mod tests {
 
     #[test]
     fn test_title_stored_correctly() {
-        let d = TabbedDialog::new(vec![make_question("Q?", &["A"], false)], Some("My Title".to_string()));
+        let d = TabbedDialog::new(
+            vec![make_question("Q?", &["A"], false)],
+            Some("My Title".to_string()),
+        );
         assert_eq!(d.title(), Some("My Title"));
     }
 
@@ -542,7 +546,7 @@ mod tests {
             None,
         );
         d.handle_key_event(key(KeyCode::Right)); // Go to tab 1
-        d.handle_key_event(key(KeyCode::Left));  // Back to tab 0
+        d.handle_key_event(key(KeyCode::Left)); // Back to tab 0
         assert_eq!(d.current_tab_index(), 0);
     }
 
@@ -563,7 +567,10 @@ mod tests {
             None,
         );
         let result = d.handle_key_event(key(KeyCode::Enter)); // Answer first tab
-        assert!(result.is_none(), "should advance to next tab, not complete yet");
+        assert!(
+            result.is_none(),
+            "should advance to next tab, not complete yet"
+        );
         assert_eq!(d.current_tab_index(), 1);
     }
 
@@ -599,7 +606,7 @@ mod tests {
     fn test_multi_select_multiple_options() {
         let mut d = multi_tab_dialog(&["A", "B", "C"]);
         d.handle_key_event(key(KeyCode::Char(' '))); // Select A
-        d.handle_key_event(key(KeyCode::Down));       // Move to B
+        d.handle_key_event(key(KeyCode::Down)); // Move to B
         d.handle_key_event(key(KeyCode::Char(' '))); // Select B
         assert_eq!(d.current_tab().selected_indices.len(), 2);
     }

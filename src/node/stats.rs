@@ -79,7 +79,8 @@ impl WorkTracker {
     /// Record a completed query
     pub fn record_query(&self, latency_ms: u64, used_local: bool) {
         self.queries.fetch_add(1, Ordering::Relaxed);
-        self.latency_ms_total.fetch_add(latency_ms, Ordering::Relaxed);
+        self.latency_ms_total
+            .fetch_add(latency_ms, Ordering::Relaxed);
         if used_local {
             self.local_queries.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -107,8 +108,8 @@ impl WorkTracker {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(&stats)
-            .context("Failed to serialize work stats")?;
+        let json =
+            serde_json::to_string_pretty(&stats).context("Failed to serialize work stats")?;
         std::fs::write(&path, json)
             .with_context(|| format!("Failed to write work stats to {}", path.display()))?;
         Ok(())
@@ -120,12 +121,10 @@ impl WorkTracker {
         if !path.exists() {
             return Ok(WorkStats::new());
         }
-        let raw = std::fs::read_to_string(&path)
-            .context("Failed to read work stats")?;
+        let raw = std::fs::read_to_string(&path).context("Failed to read work stats")?;
         serde_json::from_str(&raw).context("Failed to parse work stats")
     }
 }
-
 
 fn stats_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Cannot determine home directory")?;

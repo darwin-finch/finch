@@ -22,8 +22,7 @@ pub struct TeacherSession {
 }
 
 /// Tracks the state of conversation with teacher
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ConversationState {
     /// Number of messages sent to teacher in last call
     last_teacher_message_count: usize,
@@ -37,7 +36,6 @@ pub struct ConversationState {
     /// Number of times teacher has been called
     teacher_call_count: usize,
 }
-
 
 /// Configuration for teacher context management
 #[derive(Debug, Clone)]
@@ -56,8 +54,8 @@ pub struct TeacherContextConfig {
 impl Default for TeacherContextConfig {
     fn default() -> Self {
         Self {
-            max_context_turns: 0,  // Unlimited by default
-            tool_result_retention_turns: 0,  // Keep all by default
+            max_context_turns: 0,           // Unlimited by default
+            tool_result_retention_turns: 0, // Keep all by default
             prompt_caching_enabled: true,
         }
     }
@@ -352,14 +350,10 @@ impl TeacherSession {
             .collect();
 
         // Step 2: Get recent non-system messages
-        let non_system_messages: Vec<&Message> = messages
-            .iter()
-            .filter(|msg| msg.role != "system")
-            .collect();
+        let non_system_messages: Vec<&Message> =
+            messages.iter().filter(|msg| msg.role != "system").collect();
 
-        let recent_start = non_system_messages
-            .len()
-            .saturating_sub(max_messages);
+        let recent_start = non_system_messages.len().saturating_sub(max_messages);
         let recent_messages: Vec<Message> = non_system_messages[recent_start..]
             .iter()
             .map(|&m| m.clone())
@@ -435,7 +429,9 @@ mod tests {
         ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
             let (tx, rx) = mpsc::channel(1);
             tokio::spawn(async move {
-                let _ = tx.send(Ok(StreamChunk::TextDelta("test".to_string()))).await;
+                let _ = tx
+                    .send(Ok(StreamChunk::TextDelta("test".to_string())))
+                    .await;
             });
             Ok(rx)
         }
@@ -628,7 +624,10 @@ mod tests {
 
         // Should keep only last 4 messages (2 turns)
         assert_eq!(truncated.messages.len(), 4);
-        assert_eq!(truncated.messages[0].content[0].as_text().unwrap(), "Turn 2 user");
+        assert_eq!(
+            truncated.messages[0].content[0].as_text().unwrap(),
+            "Turn 2 user"
+        );
         assert_eq!(
             truncated.messages[3].content[0].as_text().unwrap(),
             "Turn 3 assistant"
@@ -783,8 +782,8 @@ mod tests {
     async fn test_full_optimization() {
         let provider = Box::new(MockProvider);
         let config = TeacherContextConfig {
-            max_context_turns: 2,                // Keep 2 turns
-            tool_result_retention_turns: 1,      // Keep 1 turn of tool results
+            max_context_turns: 2,           // Keep 2 turns
+            tool_result_retention_turns: 1, // Keep 1 turn of tool results
             prompt_caching_enabled: true,
         };
         let mut session = TeacherSession::with_config(provider, config);

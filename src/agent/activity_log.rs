@@ -133,9 +133,7 @@ mod tests {
     fn test_multiple_logs_append() {
         let (logger, _dir) = logger_in_tempdir();
         for i in 0..5 {
-            logger
-                .log(AgentEvent::Idle { sleep_s: i })
-                .unwrap();
+            logger.log(AgentEvent::Idle { sleep_s: i }).unwrap();
         }
         let lines = read_lines(&logger);
         assert_eq!(lines.len(), 5);
@@ -162,7 +160,11 @@ mod tests {
         let lines = read_lines(&logger);
         let ts = lines[0]["ts"].as_str().unwrap();
         // RFC 3339 timestamps contain a 'T'
-        assert!(ts.contains('T'), "timestamp should be RFC 3339, got: {}", ts);
+        assert!(
+            ts.contains('T'),
+            "timestamp should be RFC 3339, got: {}",
+            ts
+        );
     }
 
     // ── event tag serialisation ───────────────────────────────────────────────

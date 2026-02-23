@@ -69,8 +69,7 @@ impl RateLimiter {
 
         // Refill tokens based on elapsed time
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * self.inner.refill_rate)
-            .min(self.inner.capacity);
+        bucket.tokens = (bucket.tokens + elapsed * self.inner.refill_rate).min(self.inner.capacity);
         bucket.last_refill = now;
 
         if bucket.tokens >= 1.0 {
@@ -86,9 +85,9 @@ impl RateLimiter {
     pub fn purge_idle(&self, idle_secs: u64) {
         let cutoff = Duration::from_secs(idle_secs);
         let now = Instant::now();
-        self.inner.buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_refill) < cutoff
-        });
+        self.inner
+            .buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < cutoff);
     }
 
     /// Number of currently tracked IPs.
@@ -158,7 +157,10 @@ mod tests {
 
         // First 10 requests should all be allowed (burst)
         for i in 0..10 {
-            assert!(limiter.check(client), "request {i} should be allowed within burst");
+            assert!(
+                limiter.check(client),
+                "request {i} should be allowed within burst"
+            );
         }
     }
 
@@ -215,7 +217,10 @@ mod tests {
                 allowed += 1;
             }
         }
-        assert_eq!(allowed, 50, "exactly burst capacity should be allowed, got {allowed}");
+        assert_eq!(
+            allowed, 50,
+            "exactly burst capacity should be allowed, got {allowed}"
+        );
     }
 
     #[tokio::test]
@@ -277,6 +282,9 @@ mod tests {
 
         // Every unique IP has a fresh bucket with burst=20 — first request always allowed
         let count = allowed.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(count, 1000, "every unique IP's first request must be allowed");
+        assert_eq!(
+            count, 1000,
+            "every unique IP's first request must be allowed"
+        );
     }
 }

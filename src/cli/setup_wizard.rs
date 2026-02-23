@@ -1,5 +1,6 @@
 // Setup Wizard - First-run configuration
 
+use crate::service::discovery_client::{DiscoveredService, ServiceDiscoveryClient};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{
@@ -13,19 +14,20 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use crate::service::discovery_client::{ServiceDiscoveryClient, DiscoveredService};
 
 /// Step in the "Add Provider" flow (overlay inside Models section)
 #[derive(Debug, Clone)]
 enum AddProviderStep {
     // Step 0: what kind of provider to add?
-    SelectAddType { selected: usize },
+    SelectAddType {
+        selected: usize,
+    },
     // Cloud AI path — single dialog (provider, model, api key on one screen)
     ConfigureRemote {
-        provider_idx: usize,   // index into CLOUD_PROVIDERS
-        model: String,         // editable model name
-        api_key: String,       // editable API key
-        focused_field: usize,  // 0=Provider, 1=Model, 2=APIKey
+        provider_idx: usize,  // index into CLOUD_PROVIDERS
+        model: String,        // editable model name
+        api_key: String,      // editable API key
+        focused_field: usize, // 0=Provider, 1=Model, 2=APIKey
     },
     // Local model path — single dialog (backend, family, size, device on one screen)
     ConfigureLocal {
@@ -33,26 +35,61 @@ enum AddProviderStep {
         family: ModelFamily,
         size: ModelSize,
         execution: ExecutionTarget,
-        focused_field: usize,  // 0=Backend, 1=Family, 2=Size, 3=Device
+        focused_field: usize, // 0=Backend, 1=Family, 2=Size, 3=Device
     },
     // Network scan path
-    Scanning { results: Arc<Mutex<Option<Vec<DiscoveredService>>>> },
-    SelectAgent { agents: Vec<DiscoveredService>, selected: usize },
+    Scanning {
+        results: Arc<Mutex<Option<Vec<DiscoveredService>>>>,
+    },
+    SelectAgent {
+        agents: Vec<DiscoveredService>,
+        selected: usize,
+    },
 }
 
 /// Cloud provider options shown in the add-provider overlay
 const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
-    ("grok",    "Grok (xAI)",        "grok-code-fast-1",           "get key at console.x.ai (X Premium+ included)"),
-    ("claude",  "Claude (Anthropic)", "claude-sonnet-4-6",          "get key at console.anthropic.com"),
-    ("openai",  "GPT-4 (OpenAI)",    "gpt-4o",                     "get key at platform.openai.com"),
-    ("gemini",  "Gemini (Google)",   "gemini-2.0-flash",           "get key at aistudio.google.com"),
-    ("mistral", "Mistral AI",        "mistral-large-latest",       "get key at console.mistral.ai"),
-    ("groq",    "Groq (fast cloud)", "llama-3.3-70b-versatile",    "get key at console.groq.com"),
+    (
+        "grok",
+        "Grok (xAI)",
+        "grok-code-fast-1",
+        "get key at console.x.ai (X Premium+ included)",
+    ),
+    (
+        "claude",
+        "Claude (Anthropic)",
+        "claude-sonnet-4-6",
+        "get key at console.anthropic.com",
+    ),
+    (
+        "openai",
+        "GPT-4 (OpenAI)",
+        "gpt-4o",
+        "get key at platform.openai.com",
+    ),
+    (
+        "gemini",
+        "Gemini (Google)",
+        "gemini-2.0-flash",
+        "get key at aistudio.google.com",
+    ),
+    (
+        "mistral",
+        "Mistral AI",
+        "mistral-large-latest",
+        "get key at console.mistral.ai",
+    ),
+    (
+        "groq",
+        "Groq (fast cloud)",
+        "llama-3.3-70b-versatile",
+        "get key at console.groq.com",
+    ),
 ];
 
 use crate::config::{ExecutionTarget, ProviderEntry, TeacherEntry};
-use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use crate::models::compatibility;
+use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 
 /// Try to detect an existing Anthropic API key from the environment or Claude Code config.
 fn detect_anthropic_api_key() -> Option<String> {
@@ -95,12 +132,24 @@ fn detect_xai_api_key() -> Option<String> {
 /// Known model names for cloud providers (used for cycling in ConfigureRemote dialog)
 fn known_models_for(provider: &str) -> &'static [&'static str] {
     match provider {
-        "claude"  => &["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
-        "openai"  => &["gpt-4o", "gpt-4-turbo", "o1-mini", "o3-mini"],
-        "grok"    => &["grok-code-fast-1", "grok-2-latest"],
-        "gemini"  => &["gemini-2.0-flash", "gemini-2.0-pro-exp", "gemini-1.5-pro"],
-        "mistral" => &["mistral-large-latest", "codestral-latest", "mistral-medium-latest"],
-        "groq"    => &["llama-3.3-70b-versatile", "mixtral-8x7b-32768", "gemma2-9b-it"],
+        "claude" => &[
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-haiku-4-5-20251001",
+        ],
+        "openai" => &["gpt-4o", "gpt-4-turbo", "o1-mini", "o3-mini"],
+        "grok" => &["grok-code-fast-1", "grok-2-latest"],
+        "gemini" => &["gemini-2.0-flash", "gemini-2.0-pro-exp", "gemini-1.5-pro"],
+        "mistral" => &[
+            "mistral-large-latest",
+            "codestral-latest",
+            "mistral-medium-latest",
+        ],
+        "groq" => &[
+            "llama-3.3-70b-versatile",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+        ],
         _ => &[],
     }
 }
@@ -225,7 +274,9 @@ impl ModelConfig {
             Self::Local { family, size, .. } => {
                 format!("Local {} {}", family.name(), model_size_display(size))
             }
-            Self::Remote { provider, model, .. } => {
+            Self::Remote {
+                provider, model, ..
+            } => {
                 if !model.is_empty() {
                     format!("{} - {}", provider, model)
                 } else {
@@ -246,8 +297,8 @@ impl ModelConfig {
 
 #[derive(Debug, Clone)]
 struct PersonaInfo {
-    slug: String,       // Key used to load the persona (e.g. "expert-coder")
-    name: String,       // Display name (e.g. "Expert Coder")
+    slug: String, // Key used to load the persona (e.g. "expert-coder")
+    name: String, // Display name (e.g. "Expert Coder")
     description: String,
     system_prompt: String,
 }
@@ -261,8 +312,8 @@ struct WizardState {
 
 impl WizardState {
     fn new(existing_config: Option<&crate::config::Config>) -> Self {
-        use crate::config::ColorTheme;
         use crate::config::persona::Persona;
+        use crate::config::ColorTheme;
 
         let mut sections = HashMap::new();
 
@@ -373,7 +424,9 @@ impl WizardState {
 
         let selected_idx = builtin_personas
             .iter()
-            .position(|p| p.slug == default_persona || p.name.to_lowercase() == default_persona.to_lowercase())
+            .position(|p| {
+                p.slug == default_persona || p.name.to_lowercase() == default_persona.to_lowercase()
+            })
             .unwrap_or(0);
 
         sections.insert(
@@ -412,9 +465,7 @@ impl WizardState {
                 daemon_only_mode: existing_config
                     .map(|c| c.server.mode == "daemon-only")
                     .unwrap_or(false),
-                mdns_discovery: existing_config
-                    .map(|c| c.server.advertise)
-                    .unwrap_or(false),
+                mdns_discovery: existing_config.map(|c| c.server.advertise).unwrap_or(false),
                 selected_idx: 0,
             },
         );
@@ -501,7 +552,6 @@ impl SetupResult {
     }
 }
 
-
 /// Restore the terminal to normal state after the wizard exits.
 fn cleanup_terminal(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
@@ -521,13 +571,23 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
     // Try to load existing config to pre-fill values
     let existing_config = match crate::config::load_config() {
         Ok(config) => {
-            let debug_msg = format!("Successfully loaded existing config with {} teachers\n", config.teachers.len());
+            let debug_msg = format!(
+                "Successfully loaded existing config with {} teachers\n",
+                config.teachers.len()
+            );
             if let Some(teacher) = config.active_teacher() {
-                let debug_msg = format!("{}Active teacher: provider={}, key_len={}\n",
-                    debug_msg, teacher.provider, teacher.api_key.len());
+                let debug_msg = format!(
+                    "{}Active teacher: provider={}, key_len={}\n",
+                    debug_msg,
+                    teacher.provider,
+                    teacher.api_key.len()
+                );
                 let _ = std::fs::write("/tmp/wizard_debug.log", debug_msg);
             }
-            tracing::debug!("Successfully loaded existing config with {} teachers", config.teachers.len());
+            tracing::debug!(
+                "Successfully loaded existing config with {} teachers",
+                config.teachers.len()
+            );
             Some(config)
         }
         Err(e) => {
@@ -563,8 +623,9 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
 
 /// Returns true if the Models section is currently in the Scanning sub-step
 fn is_scanning_state(state: &WizardState) -> bool {
-    if let Some(SectionState::Models { adding_provider, .. }) =
-        state.sections.get(&WizardSection::Models)
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get(&WizardSection::Models)
     {
         matches!(adding_provider, Some(AddProviderStep::Scanning { .. }))
     } else {
@@ -574,8 +635,9 @@ fn is_scanning_state(state: &WizardState) -> bool {
 
 /// Returns true if the Models section currently has any overlay open
 fn is_overlay_active(state: &WizardState) -> bool {
-    if let Some(SectionState::Models { adding_provider, .. }) =
-        state.sections.get(&WizardSection::Models)
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get(&WizardSection::Models)
     {
         adding_provider.is_some()
     } else {
@@ -585,21 +647,26 @@ fn is_overlay_active(state: &WizardState) -> bool {
 
 /// If a network scan has finished, advance to SelectAgent (or close overlay if no agents)
 fn advance_scan_if_done(state: &mut WizardState) {
-    if let Some(SectionState::Models { adding_provider, .. }) =
-        state.sections.get_mut(&WizardSection::Models)
+    if let Some(SectionState::Models {
+        adding_provider, ..
+    }) = state.sections.get_mut(&WizardSection::Models)
     {
         // Check if results are ready without holding the lock across the reassignment
-        let agents_opt = if let Some(AddProviderStep::Scanning { results }) = adding_provider.as_ref() {
-            results.try_lock().ok().and_then(|g| g.as_ref().cloned())
-        } else {
-            return;
-        };
+        let agents_opt =
+            if let Some(AddProviderStep::Scanning { results }) = adding_provider.as_ref() {
+                results.try_lock().ok().and_then(|g| g.as_ref().cloned())
+            } else {
+                return;
+            };
 
         if let Some(agents) = agents_opt {
             *adding_provider = if agents.is_empty() {
                 None // No agents found — close overlay
             } else {
-                Some(AddProviderStep::SelectAgent { agents, selected: 0 })
+                Some(AddProviderStep::SelectAgent {
+                    agents,
+                    selected: 0,
+                })
             };
         }
     }
@@ -636,7 +703,9 @@ fn run_tabbed_wizard(
             }
         };
 
-        let Some(key) = key_opt else { continue; };
+        let Some(key) = key_opt else {
+            continue;
+        };
 
         // Global navigation (works in any section)
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -760,7 +829,9 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     )
                 }
                 #[cfg(not(feature = "candle"))]
-                { false }
+                {
+                    false
+                }
             };
             let local_families: Vec<ModelFamily> = if candle_selected {
                 vec![ModelFamily::Qwen2]
@@ -803,49 +874,66 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                     }
                 }
-                KeyCode::Up => {
-                    match adding_provider {
-                        Some(AddProviderStep::SelectAddType { selected }) => {
-                            if *selected > 0 { *selected -= 1; }
+                KeyCode::Up => match adding_provider {
+                    Some(AddProviderStep::SelectAddType { selected }) => {
+                        if *selected > 0 {
+                            *selected -= 1;
                         }
-                        Some(AddProviderStep::ConfigureLocal { focused_field, .. }) => {
-                            *focused_field = focused_field.saturating_sub(1);
-                        }
-                        Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
-                            *focused_field = focused_field.saturating_sub(1);
-                        }
-                        Some(AddProviderStep::SelectAgent { selected, .. }) => {
-                            if *selected > 0 { *selected -= 1; }
-                        }
-                        _ => {}
                     }
-                }
-                KeyCode::Down => {
-                    match adding_provider {
-                        Some(AddProviderStep::SelectAddType { selected }) => {
-                            if *selected < CLOUD_PROVIDERS.len() + 1 { *selected += 1; }
-                        }
-                        Some(AddProviderStep::ConfigureLocal { focused_field, .. }) => {
-                            if *focused_field < 3 { *focused_field += 1; }
-                        }
-                        Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
-                            if *focused_field < 2 { *focused_field += 1; }
-                        }
-                        Some(AddProviderStep::SelectAgent { agents, selected }) => {
-                            if *selected + 1 < agents.len() { *selected += 1; }
-                        }
-                        _ => {}
+                    Some(AddProviderStep::ConfigureLocal { focused_field, .. }) => {
+                        *focused_field = focused_field.saturating_sub(1);
                     }
-                }
+                    Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
+                        *focused_field = focused_field.saturating_sub(1);
+                    }
+                    Some(AddProviderStep::SelectAgent { selected, .. }) => {
+                        if *selected > 0 {
+                            *selected -= 1;
+                        }
+                    }
+                    _ => {}
+                },
+                KeyCode::Down => match adding_provider {
+                    Some(AddProviderStep::SelectAddType { selected }) => {
+                        if *selected < CLOUD_PROVIDERS.len() + 1 {
+                            *selected += 1;
+                        }
+                    }
+                    Some(AddProviderStep::ConfigureLocal { focused_field, .. }) => {
+                        if *focused_field < 3 {
+                            *focused_field += 1;
+                        }
+                    }
+                    Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
+                        if *focused_field < 2 {
+                            *focused_field += 1;
+                        }
+                    }
+                    Some(AddProviderStep::SelectAgent { agents, selected }) => {
+                        if *selected + 1 < agents.len() {
+                            *selected += 1;
+                        }
+                    }
+                    _ => {}
+                },
                 KeyCode::Left => {
                     match adding_provider {
                         Some(AddProviderStep::ConfigureLocal {
-                            inference_provider, family, size, execution, focused_field,
+                            inference_provider,
+                            family,
+                            size,
+                            execution,
+                            focused_field,
                         }) => {
                             match *focused_field {
                                 0 => {
-                                    if let Some(pos) = local_backends.iter().position(|x| *x == *inference_provider) {
-                                        *inference_provider = local_backends[(pos + local_backends.len() - 1) % local_backends.len()];
+                                    if let Some(pos) = local_backends
+                                        .iter()
+                                        .position(|x| *x == *inference_provider)
+                                    {
+                                        *inference_provider =
+                                            local_backends[(pos + local_backends.len() - 1)
+                                                % local_backends.len()];
                                     }
                                     // Candle only supports Qwen 2.5; reset family if needed
                                     #[cfg(feature = "candle")]
@@ -854,29 +942,41 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     }
                                 }
                                 1 => {
-                                    if let Some(pos) = local_families.iter().position(|x| *x == *family) {
-                                        *family = local_families[(pos + local_families.len() - 1) % local_families.len()];
+                                    if let Some(pos) =
+                                        local_families.iter().position(|x| *x == *family)
+                                    {
+                                        *family = local_families[(pos + local_families.len() - 1)
+                                            % local_families.len()];
                                     }
                                 }
                                 2 => {
-                                    if let Some(pos) = local_sizes.iter().position(|x| *x == *size) {
-                                        *size = local_sizes[(pos + local_sizes.len() - 1) % local_sizes.len()];
+                                    if let Some(pos) = local_sizes.iter().position(|x| *x == *size)
+                                    {
+                                        *size = local_sizes
+                                            [(pos + local_sizes.len() - 1) % local_sizes.len()];
                                     }
                                 }
                                 3 => {
-                                    if let Some(pos) = local_devices.iter().position(|x| *x == *execution) {
-                                        *execution = local_devices[(pos + local_devices.len() - 1) % local_devices.len()];
+                                    if let Some(pos) =
+                                        local_devices.iter().position(|x| *x == *execution)
+                                    {
+                                        *execution = local_devices
+                                            [(pos + local_devices.len() - 1) % local_devices.len()];
                                     }
                                 }
                                 _ => {}
                             }
                         }
                         Some(AddProviderStep::ConfigureRemote {
-                            provider_idx, model, focused_field, ..
+                            provider_idx,
+                            model,
+                            focused_field,
+                            ..
                         }) => {
                             match *focused_field {
                                 0 => {
-                                    let new_idx = (*provider_idx + CLOUD_PROVIDERS.len() - 1) % CLOUD_PROVIDERS.len();
+                                    let new_idx = (*provider_idx + CLOUD_PROVIDERS.len() - 1)
+                                        % CLOUD_PROVIDERS.len();
                                     *provider_idx = new_idx;
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
@@ -886,7 +986,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
                                     let models = known_models_for(provider_id);
                                     if !models.is_empty() {
-                                        let pos = models.iter().position(|m| *m == model.as_str()).unwrap_or(0);
+                                        let pos = models
+                                            .iter()
+                                            .position(|m| *m == model.as_str())
+                                            .unwrap_or(0);
                                         let new_pos = (pos + models.len() - 1) % models.len();
                                         *model = models[new_pos].to_string();
                                     }
@@ -900,12 +1003,20 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 KeyCode::Right => {
                     match adding_provider {
                         Some(AddProviderStep::ConfigureLocal {
-                            inference_provider, family, size, execution, focused_field,
+                            inference_provider,
+                            family,
+                            size,
+                            execution,
+                            focused_field,
                         }) => {
                             match *focused_field {
                                 0 => {
-                                    if let Some(pos) = local_backends.iter().position(|x| *x == *inference_provider) {
-                                        *inference_provider = local_backends[(pos + 1) % local_backends.len()];
+                                    if let Some(pos) = local_backends
+                                        .iter()
+                                        .position(|x| *x == *inference_provider)
+                                    {
+                                        *inference_provider =
+                                            local_backends[(pos + 1) % local_backends.len()];
                                     }
                                     // Candle only supports Qwen 2.5; reset family if needed
                                     #[cfg(feature = "candle")]
@@ -914,17 +1025,22 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     }
                                 }
                                 1 => {
-                                    if let Some(pos) = local_families.iter().position(|x| *x == *family) {
+                                    if let Some(pos) =
+                                        local_families.iter().position(|x| *x == *family)
+                                    {
                                         *family = local_families[(pos + 1) % local_families.len()];
                                     }
                                 }
                                 2 => {
-                                    if let Some(pos) = local_sizes.iter().position(|x| *x == *size) {
+                                    if let Some(pos) = local_sizes.iter().position(|x| *x == *size)
+                                    {
                                         *size = local_sizes[(pos + 1) % local_sizes.len()];
                                     }
                                 }
                                 3 => {
-                                    if let Some(pos) = local_devices.iter().position(|x| *x == *execution) {
+                                    if let Some(pos) =
+                                        local_devices.iter().position(|x| *x == *execution)
+                                    {
                                         *execution = local_devices[(pos + 1) % local_devices.len()];
                                     }
                                 }
@@ -932,7 +1048,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             }
                         }
                         Some(AddProviderStep::ConfigureRemote {
-                            provider_idx, model, focused_field, ..
+                            provider_idx,
+                            model,
+                            focused_field,
+                            ..
                         }) => {
                             match *focused_field {
                                 0 => {
@@ -946,7 +1065,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
                                     let models = known_models_for(provider_id);
                                     if !models.is_empty() {
-                                        let pos = models.iter().position(|m| *m == model.as_str()).unwrap_or(0);
+                                        let pos = models
+                                            .iter()
+                                            .position(|m| *m == model.as_str())
+                                            .unwrap_or(0);
                                         *model = models[(pos + 1) % models.len()].to_string();
                                     }
                                 }
@@ -957,19 +1079,39 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     }
                 }
                 KeyCode::Char(c) => {
-                    if let Some(AddProviderStep::ConfigureRemote { model, api_key, focused_field, .. }) = adding_provider {
+                    if let Some(AddProviderStep::ConfigureRemote {
+                        model,
+                        api_key,
+                        focused_field,
+                        ..
+                    }) = adding_provider
+                    {
                         match *focused_field {
-                            1 => { model.push(c); }
-                            2 => { api_key.push(c); }
+                            1 => {
+                                model.push(c);
+                            }
+                            2 => {
+                                api_key.push(c);
+                            }
                             _ => {}
                         }
                     }
                 }
                 KeyCode::Backspace => {
-                    if let Some(AddProviderStep::ConfigureRemote { model, api_key, focused_field, .. }) = adding_provider {
+                    if let Some(AddProviderStep::ConfigureRemote {
+                        model,
+                        api_key,
+                        focused_field,
+                        ..
+                    }) = adding_provider
+                    {
                         match *focused_field {
-                            1 => { model.pop(); }
-                            2 => { api_key.pop(); }
+                            1 => {
+                                model.pop();
+                            }
+                            2 => {
+                                api_key.pop();
+                            }
                             _ => {}
                         }
                     }
@@ -1017,12 +1159,20 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                         *arc_clone.lock().unwrap() = Some(vec![]);
                                     }
                                 });
-                                Some(AddProviderStep::Scanning { results: results_arc })
+                                Some(AddProviderStep::Scanning {
+                                    results: results_arc,
+                                })
                             }
                         }
                         // ── single-screen remote dialog — confirm ────────────────────
-                        Some(AddProviderStep::ConfigureRemote { provider_idx, model, api_key, .. }) => {
-                            let (provider_id, _, default_model, _) = CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)];
+                        Some(AddProviderStep::ConfigureRemote {
+                            provider_idx,
+                            model,
+                            api_key,
+                            ..
+                        }) => {
+                            let (provider_id, _, default_model, _) =
+                                CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)];
                             let resolved_model = if model.is_empty() {
                                 default_model.to_string()
                             } else {
@@ -1052,7 +1202,13 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             None
                         }
                         // ── single-screen local dialog — confirm ─────────────────────
-                        Some(AddProviderStep::ConfigureLocal { inference_provider, family, size, execution, .. }) => {
+                        Some(AddProviderStep::ConfigureLocal {
+                            inference_provider,
+                            family,
+                            size,
+                            execution,
+                            ..
+                        }) => {
                             let replace_primary = matches!(
                                 primary_model,
                                 ModelConfig::Remote { api_key, .. } if api_key.is_empty()
@@ -1281,7 +1437,11 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
             };
 
             match key.code {
-                KeyCode::Char('s') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                KeyCode::Char('s')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
                     let new_prompt = prompt_input.clone();
                     if let Some(persona) = available_personas.get_mut(*selected_idx) {
                         persona.system_prompt = new_prompt;
@@ -1326,10 +1486,16 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 KeyCode::Up => {
                     // Move cursor to the same column on the line above
                     let before: String = prompt_input.chars().take(*cursor_pos).collect();
-                    let col = before.rfind('\n').map(|i| before[i+1..].chars().count()).unwrap_or(before.chars().count());
+                    let col = before
+                        .rfind('\n')
+                        .map(|i| before[i + 1..].chars().count())
+                        .unwrap_or(before.chars().count());
                     if let Some(prev_nl) = before.rfind('\n') {
                         let line_before_prev = &before[..prev_nl];
-                        let prev_line_len = line_before_prev.rfind('\n').map(|i| line_before_prev[i+1..].chars().count()).unwrap_or(line_before_prev.chars().count());
+                        let prev_line_len = line_before_prev
+                            .rfind('\n')
+                            .map(|i| line_before_prev[i + 1..].chars().count())
+                            .unwrap_or(line_before_prev.chars().count());
                         let new_col = col.min(prev_line_len);
                         *cursor_pos = line_before_prev.chars().count() + 1 + new_col;
                     } else {
@@ -1338,12 +1504,19 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 }
                 KeyCode::Down => {
                     let before: String = prompt_input.chars().take(*cursor_pos).collect();
-                    let col = before.rfind('\n').map(|i| before[i+1..].chars().count()).unwrap_or(before.chars().count());
+                    let col = before
+                        .rfind('\n')
+                        .map(|i| before[i + 1..].chars().count())
+                        .unwrap_or(before.chars().count());
                     let after: String = prompt_input.chars().skip(*cursor_pos).collect();
                     if let Some(next_nl) = after.find('\n') {
-                        let before_count = prompt_input.chars().take(*cursor_pos + next_nl + 1).count();
+                        let before_count =
+                            prompt_input.chars().take(*cursor_pos + next_nl + 1).count();
                         let next_line: String = prompt_input.chars().skip(before_count).collect();
-                        let next_line_len = next_line.find('\n').map(|i| next_line[..i].chars().count()).unwrap_or(next_line.chars().count());
+                        let next_line_len = next_line
+                            .find('\n')
+                            .map(|i| next_line[..i].chars().count())
+                            .unwrap_or(next_line.chars().count());
                         let new_col = col.min(next_line_len);
                         *cursor_pos = before_count + new_col;
                     } else {
@@ -1546,8 +1719,9 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract persona
-    let default_persona = if let Some(SectionState::Personas { default_persona, .. }) =
-        state.sections.get(&WizardSection::Personas)
+    let default_persona = if let Some(SectionState::Personas {
+        default_persona, ..
+    }) = state.sections.get(&WizardSection::Personas)
     {
         default_persona.clone()
     } else {
@@ -1555,27 +1729,32 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract features
-    let (auto_approve, streaming, debug, hf_token_val, daemon_only, mdns) = if let Some(SectionState::Features {
-        auto_approve,
-        streaming,
-        debug,
-        hf_token,
-        daemon_only_mode,
-        mdns_discovery,
-        ..
-    }) = state.sections.get(&WizardSection::Features)
-    {
-        (
-            *auto_approve,
-            *streaming,
-            *debug,
-            if hf_token.is_empty() { None } else { Some(hf_token.clone()) },
-            *daemon_only_mode,
-            *mdns_discovery,
-        )
-    } else {
-        (false, true, false, None, false, false)
-    };
+    let (auto_approve, streaming, debug, hf_token_val, daemon_only, mdns) =
+        if let Some(SectionState::Features {
+            auto_approve,
+            streaming,
+            debug,
+            hf_token,
+            daemon_only_mode,
+            mdns_discovery,
+            ..
+        }) = state.sections.get(&WizardSection::Features)
+        {
+            (
+                *auto_approve,
+                *streaming,
+                *debug,
+                if hf_token.is_empty() {
+                    None
+                } else {
+                    Some(hf_token.clone())
+                },
+                *daemon_only_mode,
+                *mdns_discovery,
+            )
+        } else {
+            (false, true, false, None, false, false)
+        };
 
     #[cfg(target_os = "macos")]
     let gui_automation = if let Some(SectionState::Features { gui_automation, .. }) =
@@ -1587,38 +1766,64 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Map to backward-compatible fields
-    let (claude_api_key, backend_enabled, inference_provider, execution_target, model_family, model_size) =
-        match &primary_model {
-            ModelConfig::Local { family, size, execution, inference_provider, .. } => (
-                String::new(), // No API key for local
-                true,
-                *inference_provider,
-                *execution,
-                *family,
-                *size,
-            ),
-            ModelConfig::Remote { provider: _, api_key, .. } => {
-                // Remote API is primary - backend disabled
-                (
-                    api_key.clone(),
-                    false,
-                    InferenceProvider::Onnx,
-                    ExecutionTarget::Cpu, // Placeholder
-                    ModelFamily::Qwen2,   // Placeholder
-                    ModelSize::Medium,    // Placeholder
-                )
-            }
-        };
+    let (
+        claude_api_key,
+        backend_enabled,
+        inference_provider,
+        execution_target,
+        model_family,
+        model_size,
+    ) = match &primary_model {
+        ModelConfig::Local {
+            family,
+            size,
+            execution,
+            inference_provider,
+            ..
+        } => (
+            String::new(), // No API key for local
+            true,
+            *inference_provider,
+            *execution,
+            *family,
+            *size,
+        ),
+        ModelConfig::Remote {
+            provider: _,
+            api_key,
+            ..
+        } => {
+            // Remote API is primary - backend disabled
+            (
+                api_key.clone(),
+                false,
+                InferenceProvider::Onnx,
+                ExecutionTarget::Cpu, // Placeholder
+                ModelFamily::Qwen2,   // Placeholder
+                ModelSize::Medium,    // Placeholder
+            )
+        }
+    };
 
     // Build teachers list from primary + tool models
     let mut teachers: Vec<TeacherEntry> = Vec::new();
 
     // Primary model as first teacher (if remote)
-    if let ModelConfig::Remote { provider, api_key, model, .. } = &primary_model {
+    if let ModelConfig::Remote {
+        provider,
+        api_key,
+        model,
+        ..
+    } = &primary_model
+    {
         teachers.push(TeacherEntry {
             provider: provider.clone(),
             api_key: api_key.clone(),
-            model: if model.is_empty() { None } else { Some(model.clone()) },
+            model: if model.is_empty() {
+                None
+            } else {
+                Some(model.clone())
+            },
             base_url: None,
             name: Some(format!("{} (Primary)", provider)),
         });
@@ -1626,12 +1831,22 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
 
     // Tool models as additional teachers
     for tool_model in &tool_models {
-        if let ModelConfig::Remote { provider, api_key, model, enabled } = tool_model {
+        if let ModelConfig::Remote {
+            provider,
+            api_key,
+            model,
+            enabled,
+        } = tool_model
+        {
             if *enabled {
                 teachers.push(TeacherEntry {
                     provider: provider.clone(),
                     api_key: api_key.clone(),
-                    model: if model.is_empty() { None } else { Some(model.clone()) },
+                    model: if model.is_empty() {
+                        None
+                    } else {
+                        Some(model.clone())
+                    },
                     base_url: None,
                     name: Some(provider.clone()),
                 });
@@ -1717,7 +1932,11 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
         .unwrap_or(0);
 
     let tabs = Tabs::new(tab_titles)
-        .block(Block::default().borders(Borders::ALL).title(" Finch Setup "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Finch Setup "),
+        )
         .select(selected_idx)
         .style(Style::default().fg(Color::Blue))
         .highlight_style(
@@ -1735,12 +1954,18 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
         WizardSection::Themes => "↑/↓: Choose theme | Enter: Next | Tab: Jump to section",
         WizardSection::Models => "E: API key  M: Model name  A: Add  D: Remove  Tab: Next",
         WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next | Tab: Jump",
-        WizardSection::Features => "↑/↓: Navigate | Space: Toggle | Enter: Save | Tab: Jump to section",
+        WizardSection::Features => {
+            "↑/↓: Navigate | Space: Toggle | Enter: Save | Tab: Jump to section"
+        }
         WizardSection::Review => "Enter: Save & start | Tab: Go back to edit",
     };
 
     let help = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
 }
@@ -1781,7 +2006,16 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             editing_prompt,
             prompt_input,
             cursor_pos,
-        }) => render_personas_section(f, area, available_personas, *selected_idx, default_persona, *editing_prompt, prompt_input, *cursor_pos),
+        }) => render_personas_section(
+            f,
+            area,
+            available_personas,
+            *selected_idx,
+            default_persona,
+            *editing_prompt,
+            prompt_input,
+            *cursor_pos,
+        ),
         Some(SectionState::Features {
             auto_approve,
             streaming,
@@ -1823,15 +2057,19 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(8),     // Theme list
-            Constraint::Length(8),  // Preview
-            Constraint::Length(3),  // Instructions
+            Constraint::Length(3), // Title
+            Constraint::Min(8),    // Theme list
+            Constraint::Length(8), // Preview
+            Constraint::Length(3), // Instructions
         ])
         .split(area);
 
     let title = Paragraph::new("Theme Selection")
-        .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
@@ -1849,42 +2087,59 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
                     Style::default()
                         .bg(Color::Black)
                         .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::BOLD),
                 )
             } else {
-                (
-                    "    ",
-                    "",
-                    Style::default().fg(Color::Blue)
-                )
+                ("    ", "", Style::default().fg(Color::Blue))
             };
 
-            let text = format!("{}{} - {}{}", prefix, theme.name(), theme.description(), suffix);
+            let text = format!(
+                "{}{} - {}{}",
+                prefix,
+                theme.name(),
+                theme.description(),
+                suffix
+            );
             ListItem::new(text).style(style)
         })
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Available Themes"));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Available Themes"),
+    );
     f.render_widget(list, chunks[1]);
 
     // Render preview of selected theme
     let preview_theme = themes[selected_theme].to_scheme();
     let preview_lines = vec![
         Line::from(vec![
-            Span::styled("User: ", Style::default().fg(preview_theme.messages.user.to_color())),
+            Span::styled(
+                "User: ",
+                Style::default().fg(preview_theme.messages.user.to_color()),
+            ),
             Span::raw("What is 2+2?"),
         ]),
         Line::from(vec![
-            Span::styled("Assistant: ", Style::default().fg(preview_theme.messages.assistant.to_color())),
+            Span::styled(
+                "Assistant: ",
+                Style::default().fg(preview_theme.messages.assistant.to_color()),
+            ),
             Span::raw("The answer is 4."),
         ]),
         Line::from(vec![
-            Span::styled("🔧 Tool: ", Style::default().fg(preview_theme.messages.tool.to_color())),
+            Span::styled(
+                "🔧 Tool: ",
+                Style::default().fg(preview_theme.messages.tool.to_color()),
+            ),
             Span::raw("Reading file..."),
         ]),
         Line::from(vec![
-            Span::styled("❌ Error: ", Style::default().fg(preview_theme.messages.error.to_color())),
+            Span::styled(
+                "❌ Error: ",
+                Style::default().fg(preview_theme.messages.error.to_color()),
+            ),
             Span::raw("File not found"),
         ]),
     ];
@@ -1896,9 +2151,13 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
 
     let instructions = Paragraph::new(
         "Use ↑/↓ arrow keys to move selection (>>> theme <<<)\n\
-         Selected theme shows with white background. Press Enter to confirm."
+         Selected theme shows with white background. Press Enter to confirm.",
     )
-    .style(Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+    .style(
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    )
     .wrap(Wrap { trim: false });
     f.render_widget(instructions, chunks[3]);
 }
@@ -1919,17 +2178,21 @@ fn render_models_section(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Length(4),  // Description
-            Constraint::Min(6),     // Primary model + tool models
-            Constraint::Length(3),  // Input panel (edit mode) or dim hint
-            Constraint::Length(2),  // Instructions
-            Constraint::Length(2),  // Error (if present)
+            Constraint::Length(3), // Title
+            Constraint::Length(4), // Description
+            Constraint::Min(6),    // Primary model + tool models
+            Constraint::Length(3), // Input panel (edit mode) or dim hint
+            Constraint::Length(2), // Instructions
+            Constraint::Length(2), // Error (if present)
         ])
         .split(area);
 
     let title = Paragraph::new("AI Providers")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
@@ -1940,11 +2203,14 @@ fn render_models_section(
     };
 
     let description_text = if has_key {
-        format!("Primary provider configured. Press A to add more providers ({} total).",
-            1 + tool_models.len())
+        format!(
+            "Primary provider configured. Press A to add more providers ({} total).",
+            1 + tool_models.len()
+        )
     } else {
         "Paste your API key below (E), or add a provider with A.\n\
-         No key yet? Get one at console.anthropic.com/keys".to_string()
+         No key yet? Get one at console.anthropic.com/keys"
+            .to_string()
     };
     let description = Paragraph::new(description_text)
         .style(Style::default().fg(Color::Blue))
@@ -1964,18 +2230,19 @@ fn render_models_section(
             Style::default()
                 .bg(Color::Black)
                 .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
-        (
-            "    ",
-            "",
-            Style::default().fg(Color::Blue)
-        )
+        ("    ", "", Style::default().fg(Color::Blue))
     };
 
     let primary_display = match primary_model {
-        ModelConfig::Local { family, size, execution, .. } => {
+        ModelConfig::Local {
+            family,
+            size,
+            execution,
+            ..
+        } => {
             format!(
                 "{}★ Primary: Local {} {} ({}){}",
                 prefix,
@@ -1985,11 +2252,27 @@ fn render_models_section(
                 suffix
             )
         }
-        ModelConfig::Remote { provider, api_key, model, .. } => {
+        ModelConfig::Remote {
+            provider,
+            api_key,
+            model,
+            ..
+        } => {
             let key_display = if api_key.is_empty() {
                 "[Not configured]".to_string()
             } else {
-                format!("{}...{}", &api_key.chars().take(10).collect::<String>(), api_key.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>())
+                format!(
+                    "{}...{}",
+                    &api_key.chars().take(10).collect::<String>(),
+                    api_key
+                        .chars()
+                        .rev()
+                        .take(4)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
+                )
             };
             let model_display = if !model.is_empty() {
                 format!(" - {}", model)
@@ -2017,7 +2300,7 @@ fn render_models_section(
                 Style::default()
                     .bg(Color::Black)
                     .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::BOLD),
             )
         } else if tool_model.enabled() {
             ("    ", "", Style::default())
@@ -2031,10 +2314,16 @@ fn render_models_section(
             ModelConfig::Local { family, size, .. } => {
                 format!(
                     "{}{} Tool: Local {} {}{}",
-                    prefix, checkbox, family.name(), model_size_display(size), suffix
+                    prefix,
+                    checkbox,
+                    family.name(),
+                    model_size_display(size),
+                    suffix
                 )
             }
-            ModelConfig::Remote { provider, model, .. } => {
+            ModelConfig::Remote {
+                provider, model, ..
+            } => {
                 let model_display = if !model.is_empty() {
                     format!(" - {}", model)
                 } else {
@@ -2050,12 +2339,7 @@ fn render_models_section(
         items.push(ListItem::new(display).style(style));
     }
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("AI Providers"),
-        );
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("AI Providers"));
     f.render_widget(list, chunks[2]);
 
     // Input panel (chunks[3]): bordered text box when in editing mode, dim hint otherwise
@@ -2072,27 +2356,26 @@ fn render_models_section(
                 _ => "",
             }
         };
-        let panel = Paragraph::new(format!("{}█", current_key))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Edit API Key")
-                    .border_style(Style::default().fg(Color::Yellow)),
-            );
+        let panel = Paragraph::new(format!("{}█", current_key)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Edit API Key")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
         f.render_widget(panel, chunks[3]);
     } else if editing_model_mode {
-        let panel = Paragraph::new(format!("{}█", model_input))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Edit Model")
-                    .border_style(Style::default().fg(Color::Yellow)),
-            );
+        let panel = Paragraph::new(format!("{}█", model_input)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Edit Model")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
         f.render_widget(panel, chunks[3]);
     } else {
-        let hint = Paragraph::new("Press E to edit API key · M to edit model name · P to make primary")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
+        let hint =
+            Paragraph::new("Press E to edit API key · M to edit model name · P to make primary")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
         f.render_widget(hint, chunks[3]);
     }
 
@@ -2103,7 +2386,11 @@ fn render_models_section(
         "E: API key | M: Model name | P: Make primary | A: Add | D: Remove | Tab: Next"
     };
     let instructions = Paragraph::new(instructions_text)
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center);
     f.render_widget(instructions, chunks[4]);
 
@@ -2135,7 +2422,11 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Add AI Provider ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(Style::default().bg(Color::Black));
     f.render_widget(background, overlay);
 
@@ -2156,13 +2447,21 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                 .map(|(i, (_, display_name, _, hint))| {
                     let is_sel = i == *selected;
                     let (prefix, suffix, style) = if is_sel {
-                        (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                        (
+                            ">>> ",
+                            " <<<",
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        )
                     } else {
                         ("    ", "", Style::default().fg(Color::Cyan))
                     };
                     let lines = vec![
                         Line::from(format!("{}{}{}", prefix, display_name, suffix)).style(style),
-                        Line::from(format!("        {}", hint)).style(Style::default().fg(Color::DarkGray)),
+                        Line::from(format!("        {}", hint))
+                            .style(Style::default().fg(Color::DarkGray)),
                     ];
                     ListItem::new(lines)
                 })
@@ -2170,38 +2469,81 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
             {
                 let is_sel = *selected == n_cloud;
                 let (prefix, suffix, style) = if is_sel {
-                    (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    (
+                        ">>> ",
+                        " <<<",
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
                     ("    ", "", Style::default().fg(Color::Cyan))
                 };
                 items.push(ListItem::new(vec![
                     Line::from(format!("{}Local model{}", prefix, suffix)).style(style),
-                    Line::from("        Run a model on this machine (no internet after download)").style(Style::default().fg(Color::DarkGray)),
+                    Line::from("        Run a model on this machine (no internet after download)")
+                        .style(Style::default().fg(Color::DarkGray)),
                 ]));
             }
             {
                 let is_sel = *selected == n_cloud + 1;
                 let (prefix, suffix, style) = if is_sel {
-                    (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                    (
+                        ">>> ",
+                        " <<<",
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
                     ("    ", "", Style::default().fg(Color::DarkGray))
                 };
                 items.push(ListItem::new(vec![
                     Line::from(format!("{}Scan local network{}", prefix, suffix)).style(style),
-                    Line::from("        Discover other Finch instances running on your LAN").style(Style::default().fg(Color::DarkGray)),
+                    Line::from("        Discover other Finch instances running on your LAN")
+                        .style(Style::default().fg(Color::DarkGray)),
                 ]));
             }
-            let list = List::new(items)
-                .block(Block::default().title("Add AI provider  ↑/↓: Move | Enter: Select | Esc: Cancel"));
+            let list = List::new(items).block(
+                Block::default().title("Add AI provider  ↑/↓: Move | Enter: Select | Esc: Cancel"),
+            );
             f.render_widget(list, inner);
         }
         // ── single-screen cloud provider dialog ──────────────────────────────────────
-        AddProviderStep::ConfigureRemote { provider_idx, model, api_key, focused_field } => {
-            render_configure_remote_overlay(f, inner, *provider_idx, model, api_key, *focused_field);
+        AddProviderStep::ConfigureRemote {
+            provider_idx,
+            model,
+            api_key,
+            focused_field,
+        } => {
+            render_configure_remote_overlay(
+                f,
+                inner,
+                *provider_idx,
+                model,
+                api_key,
+                *focused_field,
+            );
         }
         // ── single-screen local model dialog ─────────────────────────────────────────
-        AddProviderStep::ConfigureLocal { inference_provider, family, size, execution, focused_field } => {
-            render_configure_local_overlay(f, inner, *inference_provider, *family, *size, *execution, *focused_field);
+        AddProviderStep::ConfigureLocal {
+            inference_provider,
+            family,
+            size,
+            execution,
+            focused_field,
+        } => {
+            render_configure_local_overlay(
+                f,
+                inner,
+                *inference_provider,
+                *family,
+                *size,
+                *execution,
+                *focused_field,
+            );
         }
         // ── network scan path ─────────────────────────────────────────────────────────
         AddProviderStep::Scanning { .. } => {
@@ -2209,7 +2551,9 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                 Line::from(""),
                 Line::from(Span::styled(
                     "Scanning for Finch agents on local network…",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
@@ -2217,7 +2561,10 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(""),
-                Line::from(Span::styled("Esc: Cancel", Style::default().fg(Color::Yellow))),
+                Line::from(Span::styled(
+                    "Esc: Cancel",
+                    Style::default().fg(Color::Yellow),
+                )),
             ];
             let para = Paragraph::new(lines)
                 .alignment(Alignment::Center)
@@ -2231,11 +2578,21 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                 .map(|(i, agent)| {
                     let is_sel = i == *selected;
                     let (prefix, suffix, style) = if is_sel {
-                        (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                        (
+                            ">>> ",
+                            " <<<",
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        )
                     } else {
                         ("    ", "", Style::default().fg(Color::Cyan))
                     };
-                    let label = format!("{}{} @ {}:{}{}", prefix, agent.name, agent.host, agent.port, suffix);
+                    let label = format!(
+                        "{}{} @ {}:{}{}",
+                        prefix, agent.name, agent.host, agent.port, suffix
+                    );
                     let model_line = format!("        model: {}", agent.model);
                     let lines = vec![
                         Line::from(label).style(style),
@@ -2244,8 +2601,9 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                     ListItem::new(lines)
                 })
                 .collect();
-            let list = List::new(items)
-                .block(Block::default().title("Discovered agents  ↑/↓: Move | Enter: Add | Esc: Cancel"));
+            let list = List::new(items).block(
+                Block::default().title("Discovered agents  ↑/↓: Move | Enter: Add | Esc: Cancel"),
+            );
             f.render_widget(list, inner);
         }
     }
@@ -2264,31 +2622,37 @@ fn render_configure_remote_overlay(
         CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)];
 
     // Row rendering helper: label + bracketed value, highlighted when focused
-    let make_row = |label: &str, value: &str, focused: bool, is_text_input: bool| -> Line<'static> {
-        let label_str = format!("{:<10}", label);
-        let value_str = if is_text_input && focused {
-            format!("[ {}█ ]", value)
-        } else if focused {
-            format!("[◄ {:<34}►]", value)
-        } else {
-            format!("[  {:<34} ]", value)
+    let make_row =
+        |label: &str, value: &str, focused: bool, is_text_input: bool| -> Line<'static> {
+            let label_str = format!("{:<10}", label);
+            let value_str = if is_text_input && focused {
+                format!("[ {}█ ]", value)
+            } else if focused {
+                format!("[◄ {:<34}►]", value)
+            } else {
+                format!("[  {:<34} ]", value)
+            };
+            let (label_style, value_style) = if focused {
+                (
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Cyan),
+                )
+            };
+            Line::from(vec![
+                Span::styled(label_str, label_style),
+                Span::styled(value_str, value_style),
+            ])
         };
-        let (label_style, value_style) = if focused {
-            (
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            (
-                Style::default().fg(Color::DarkGray),
-                Style::default().fg(Color::Cyan),
-            )
-        };
-        Line::from(vec![
-            Span::styled(label_str, label_style),
-            Span::styled(value_str, value_style),
-        ])
-    };
 
     let provider_value = format!("{} ({})", provider_name, provider_id);
     let model_display = if model.is_empty() { "(default)" } else { model };
@@ -2305,7 +2669,10 @@ fn render_configure_remote_overlay(
         make_row("Model", model_display, focused_field == 1, true),
         make_row("API Key", &key_display, focused_field == 2, true),
         Line::from(""),
-        Line::from(Span::styled("─".repeat(area.width as usize), Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     // Hint line
@@ -2346,8 +2713,13 @@ fn render_configure_local_overlay(
         };
         let (label_style, value_style) = if focused {
             (
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::White).bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             (
@@ -2382,7 +2754,10 @@ fn render_configure_local_overlay(
         make_row("Size", size_name, focused_field == 2),
         make_row("Device", device_name, focused_field == 3),
         Line::from(""),
-        Line::from(Span::styled("─".repeat(area.width as usize), Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     // Preview line: RAM estimate + resolved model repo
@@ -2391,14 +2766,17 @@ fn render_configure_local_overlay(
         .unwrap_or_else(|| "(no model available for this combination)".to_string());
 
     let ram_estimate = match size {
-        ModelSize::Small  => "~2 GB RAM",
+        ModelSize::Small => "~2 GB RAM",
         ModelSize::Medium => "~4 GB RAM",
-        ModelSize::Large  => "~8 GB RAM",
+        ModelSize::Large => "~8 GB RAM",
         ModelSize::XLarge => "~16 GB RAM",
     };
 
     lines.push(Line::from(vec![
-        Span::styled(format!("{}  ", ram_estimate), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("{}  ", ram_estimate),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled(repo_preview, Style::default().fg(Color::DarkGray)),
     ]));
 
@@ -2445,7 +2823,7 @@ fn render_personas_section(
                     Style::default()
                         .bg(Color::Black)
                         .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::BOLD),
                 )
             } else if is_default {
                 ("★   ", "", Style::default().fg(Color::Yellow))
@@ -2457,8 +2835,11 @@ fn render_personas_section(
         })
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Choose a Style"));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Choose a Style"),
+    );
 
     f.render_widget(list, chunks[0]);
 
@@ -2472,7 +2853,9 @@ fn render_personas_section(
             let mut lines = vec![
                 Line::from(Span::styled(
                     "Editing system prompt  (Ctrl+S: Save | Esc: Cancel)",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
             ];
@@ -2480,8 +2863,12 @@ fn render_personas_section(
                 lines.push(Line::from(line.to_string()));
             }
             let edit_area = Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL).title("Edit System Prompt")
-                    .border_style(Style::default().fg(Color::Yellow)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Edit System Prompt")
+                        .border_style(Style::default().fg(Color::Yellow)),
+                )
                 .wrap(Wrap { trim: false });
             f.render_widget(edit_area, chunks[1]);
         } else {
@@ -2537,14 +2924,18 @@ fn render_features_section(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(10),    // Feature list
-            Constraint::Length(3),  // Instructions
+            Constraint::Length(3), // Title
+            Constraint::Min(10),   // Feature list
+            Constraint::Length(3), // Instructions
         ])
         .split(area);
 
     let title = Paragraph::new("Settings")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
@@ -2554,22 +2945,66 @@ fn render_features_section(
 
     #[cfg(not(target_os = "macos"))]
     let bool_features: Vec<(&str, bool, &str)> = vec![
-        ("Live responses",        streaming,        "See Finch's answer as it types, word by word"),
-        ("Skip permission prompts", auto_approve,   "Let Finch run tools without asking each time"),
-        ("Debug logging",         debug,            "Write verbose logs to ~/.finch/debug.log"),
+        (
+            "Live responses",
+            streaming,
+            "See Finch's answer as it types, word by word",
+        ),
+        (
+            "Skip permission prompts",
+            auto_approve,
+            "Let Finch run tools without asking each time",
+        ),
+        (
+            "Debug logging",
+            debug,
+            "Write verbose logs to ~/.finch/debug.log",
+        ),
         // index 3 = HF token (handled separately below)
-        ("Daemon-only mode",      daemon_only_mode, "Run as background server, no interactive REPL"),
-        ("Advertise on network",  mdns_discovery,   "Broadcast this Finch instance via mDNS so others can discover it"),
+        (
+            "Daemon-only mode",
+            daemon_only_mode,
+            "Run as background server, no interactive REPL",
+        ),
+        (
+            "Advertise on network",
+            mdns_discovery,
+            "Broadcast this Finch instance via mDNS so others can discover it",
+        ),
     ];
     #[cfg(target_os = "macos")]
     let bool_features: Vec<(&str, bool, &str)> = vec![
-        ("Live responses",        streaming,        "See Finch's answer as it types, word by word"),
-        ("Skip permission prompts", auto_approve,   "Let Finch run tools without asking each time"),
-        ("Debug logging",         debug,            "Write verbose logs to ~/.finch/debug.log"),
-        ("GUI automation",        gui_automation,   "Allow tools to click/type in macOS apps"),
+        (
+            "Live responses",
+            streaming,
+            "See Finch's answer as it types, word by word",
+        ),
+        (
+            "Skip permission prompts",
+            auto_approve,
+            "Let Finch run tools without asking each time",
+        ),
+        (
+            "Debug logging",
+            debug,
+            "Write verbose logs to ~/.finch/debug.log",
+        ),
+        (
+            "GUI automation",
+            gui_automation,
+            "Allow tools to click/type in macOS apps",
+        ),
         // index 4 = HF token (handled separately)
-        ("Daemon-only mode",      daemon_only_mode, "Run as background server, no interactive REPL"),
-        ("Advertise on network",  mdns_discovery,   "Broadcast this Finch instance via mDNS so others can discover it"),
+        (
+            "Daemon-only mode",
+            daemon_only_mode,
+            "Run as background server, no interactive REPL",
+        ),
+        (
+            "Advertise on network",
+            mdns_discovery,
+            "Broadcast this Finch instance via mDNS so others can discover it",
+        ),
     ];
 
     #[cfg(not(target_os = "macos"))]
@@ -2586,7 +3021,14 @@ fn render_features_section(
         if list_idx == hf_idx {
             let is_hf_selected = selected_idx == hf_idx;
             let (prefix, suffix, style) = if is_hf_selected {
-                (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD))
+                (
+                    ">>> ",
+                    " <<<",
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 ("    ", "", Style::default().fg(Color::Cyan))
             };
@@ -2595,13 +3037,26 @@ fn render_features_section(
             } else if hf_token.is_empty() {
                 format!("{}HF Token: [not set — press E to enter]{}", prefix, suffix)
             } else {
-                let masked = format!("{}...{}", &hf_token.chars().take(4).collect::<String>(),
-                    hf_token.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>());
+                let masked = format!(
+                    "{}...{}",
+                    &hf_token.chars().take(4).collect::<String>(),
+                    hf_token
+                        .chars()
+                        .rev()
+                        .take(4)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
+                );
                 format!("{}HF Token: {}{}", prefix, masked, suffix)
             };
             let hf_lines = vec![
                 Line::from(Span::styled(token_display, style)),
-                Line::from(Span::styled("        For model downloads from HuggingFace", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(
+                    "        For model downloads from HuggingFace",
+                    Style::default().fg(Color::DarkGray),
+                )),
             ];
             items.push(ListItem::new(hf_lines));
             list_idx += 1;
@@ -2610,9 +3065,24 @@ fn render_features_section(
         let is_selected = list_idx == selected_idx;
         let checkbox = if *enabled { "✅" } else { "☐" };
         let (prefix, suffix, name_style) = if is_selected {
-            (">>> ", " <<<", Style::default().bg(Color::Black).fg(Color::White).add_modifier(Modifier::BOLD))
+            (
+                ">>> ",
+                " <<<",
+                Style::default()
+                    .bg(Color::Black)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
-            ("    ", "", if *enabled { Style::default().fg(Color::Blue) } else { Style::default().fg(Color::DarkGray) })
+            (
+                "    ",
+                "",
+                if *enabled {
+                    Style::default().fg(Color::Blue)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            )
         };
 
         let feat_lines = vec![
@@ -2635,7 +3105,14 @@ fn render_features_section(
     if hf_idx >= list_idx {
         let is_hf_selected = selected_idx == list_idx;
         let (prefix, suffix, style) = if is_hf_selected {
-            (">>> ", " <<<", Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD))
+            (
+                ">>> ",
+                " <<<",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             ("    ", "", Style::default().fg(Color::Cyan))
         };
@@ -2644,19 +3121,31 @@ fn render_features_section(
         } else if hf_token.is_empty() {
             format!("{}HF Token: [not set — press E to enter]{}", prefix, suffix)
         } else {
-            let masked = format!("{}...{}", &hf_token.chars().take(4).collect::<String>(),
-                hf_token.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>());
+            let masked = format!(
+                "{}...{}",
+                &hf_token.chars().take(4).collect::<String>(),
+                hf_token
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
             format!("{}HF Token: {}{}", prefix, masked, suffix)
         };
         let hf_lines = vec![
             Line::from(Span::styled(token_display, style)),
-            Line::from(Span::styled("        For model downloads from HuggingFace", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                "        For model downloads from HuggingFace",
+                Style::default().fg(Color::DarkGray),
+            )),
         ];
         items.push(ListItem::new(hf_lines));
     }
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Options"));
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Options"));
     f.render_widget(list, chunks[1]);
 
     let instructions_text = if editing_hf_token {
@@ -2665,7 +3154,11 @@ fn render_features_section(
         "↑/↓: Move | Space: Toggle | E: Edit HF token | Enter: Continue"
     };
     let instructions = Paragraph::new(instructions_text)
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center);
     f.render_widget(instructions, chunks[2]);
 }
@@ -2675,20 +3168,29 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
     use crate::config::ColorTheme;
 
     let title = Paragraph::new("Ready to go!")
-        .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center);
 
     // Build summary text
     let mut lines = vec![
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Here's what you set up:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Here's what you set up:",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]),
         Line::from(""),
     ];
 
     // Theme
-    if let Some(SectionState::Themes { selected_theme }) = state.sections.get(&WizardSection::Themes) {
+    if let Some(SectionState::Themes { selected_theme }) =
+        state.sections.get(&WizardSection::Themes)
+    {
         let themes = ColorTheme::all();
         let theme_name = themes[*selected_theme].name().to_string();
         lines.push(Line::from(vec![
@@ -2698,9 +3200,13 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
     }
 
     // Models
-    if let Some(SectionState::Models { primary_model, .. }) = state.sections.get(&WizardSection::Models) {
+    if let Some(SectionState::Models { primary_model, .. }) =
+        state.sections.get(&WizardSection::Models)
+    {
         let ai_label = match primary_model {
-            ModelConfig::Remote { api_key, .. } if !api_key.is_empty() => "Claude (API key configured)",
+            ModelConfig::Remote { api_key, .. } if !api_key.is_empty() => {
+                "Claude (API key configured)"
+            }
             ModelConfig::Remote { .. } => "Claude (no API key — will prompt on first use)",
             ModelConfig::Local { family, size, .. } => {
                 // Use a static fallback — dynamic format not possible here
@@ -2715,7 +3221,10 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
     }
 
     // Persona
-    if let Some(SectionState::Personas { default_persona, .. }) = state.sections.get(&WizardSection::Personas) {
+    if let Some(SectionState::Personas {
+        default_persona, ..
+    }) = state.sections.get(&WizardSection::Personas)
+    {
         lines.push(Line::from(vec![
             Span::styled("Style: ", Style::default().fg(Color::Yellow)),
             Span::raw(default_persona),
@@ -2749,12 +3258,16 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("Press Enter to save & start chatting", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Tab: Go back to change anything", Style::default().fg(Color::Gray)),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "Press Enter to save & start chatting",
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "Tab: Go back to change anything",
+        Style::default().fg(Color::Gray),
+    )]));
 
     let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
@@ -2786,8 +3299,9 @@ mod tests {
 
     fn state_with_step(step: AddProviderStep) -> WizardState {
         let mut state = WizardState::new(None);
-        if let Some(SectionState::Models { adding_provider, .. }) =
-            state.sections.get_mut(&WizardSection::Models)
+        if let Some(SectionState::Models {
+            adding_provider, ..
+        }) = state.sections.get_mut(&WizardSection::Models)
         {
             *adding_provider = Some(step);
         }
@@ -2795,8 +3309,9 @@ mod tests {
     }
 
     fn get_step(state: &WizardState) -> Option<&AddProviderStep> {
-        if let Some(SectionState::Models { adding_provider, .. }) =
-            state.sections.get(&WizardSection::Models)
+        if let Some(SectionState::Models {
+            adding_provider, ..
+        }) = state.sections.get(&WizardSection::Models)
         {
             adding_provider.as_ref()
         } else {
@@ -2854,7 +3369,9 @@ mod tests {
             assert!(
                 models.contains(default_model),
                 "provider '{}': default model '{}' not in known_models_for list {:?}",
-                id, default_model, models
+                id,
+                default_model,
+                models
             );
         }
     }
@@ -2941,7 +3458,7 @@ mod tests {
     #[test]
     fn test_configure_local_right_cycles_family_forward() {
         let mut state = state_with_step(default_configure_local(1)); // focused on Family
-        // Qwen2 → Gemma2
+                                                                     // Qwen2 → Gemma2
         handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
         if let Some(AddProviderStep::ConfigureLocal { family, .. }) = get_step(&state) {
             assert_eq!(*family, ModelFamily::Gemma2);
@@ -2953,7 +3470,7 @@ mod tests {
     #[test]
     fn test_configure_local_left_cycles_family_backward() {
         let mut state = state_with_step(default_configure_local(1)); // Qwen2, focused Family
-        // Qwen2 → wraps to last family (DeepSeek)
+                                                                     // Qwen2 → wraps to last family (DeepSeek)
         handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
         if let Some(AddProviderStep::ConfigureLocal { family, .. }) = get_step(&state) {
             assert_eq!(*family, ModelFamily::DeepSeek);
@@ -2985,7 +3502,11 @@ mod tests {
         // Auto is first in the list; right should cycle to next (Cpu on non-macOS, CoreML on macOS)
         handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
         if let Some(AddProviderStep::ConfigureLocal { execution, .. }) = get_step(&state) {
-            assert_ne!(*execution, ExecutionTarget::Auto, "should have cycled off Auto");
+            assert_ne!(
+                *execution,
+                ExecutionTarget::Auto,
+                "should have cycled off Auto"
+            );
         } else {
             panic!("expected ConfigureLocal");
         }
@@ -2996,15 +3517,24 @@ mod tests {
         let mut state = state_with_step(default_configure_local(2)); // focused Size
         let before_family;
         let before_execution;
-        if let Some(AddProviderStep::ConfigureLocal { family, execution, .. }) = get_step(&state) {
+        if let Some(AddProviderStep::ConfigureLocal {
+            family, execution, ..
+        }) = get_step(&state)
+        {
             before_family = *family;
             before_execution = *execution;
         } else {
             panic!();
         }
         handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
-        if let Some(AddProviderStep::ConfigureLocal { family, execution, .. }) = get_step(&state) {
-            assert_eq!(*family, before_family, "family should not change when Size is focused");
+        if let Some(AddProviderStep::ConfigureLocal {
+            family, execution, ..
+        }) = get_step(&state)
+        {
+            assert_eq!(
+                *family, before_family,
+                "family should not change when Size is focused"
+            );
             assert_eq!(*execution, before_execution, "execution should not change");
         }
     }
@@ -3025,7 +3555,14 @@ mod tests {
         // overlay should be gone
         assert!(get_step(&state).is_none());
         // primary should now be local
-        if let Some(ModelConfig::Local { family, size, execution, inference_provider, .. }) = get_primary(&state) {
+        if let Some(ModelConfig::Local {
+            family,
+            size,
+            execution,
+            inference_provider,
+            ..
+        }) = get_primary(&state)
+        {
             assert_eq!(*family, ModelFamily::Phi);
             assert_eq!(*size, ModelSize::Small);
             assert_eq!(*execution, ExecutionTarget::Cpu);
@@ -3067,7 +3604,10 @@ mod tests {
         let mut state = state_with_step(default_configure_local(0));
         handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
         assert!(
-            matches!(get_step(&state), Some(AddProviderStep::SelectAddType { .. })),
+            matches!(
+                get_step(&state),
+                Some(AddProviderStep::SelectAddType { .. })
+            ),
             "Esc from ConfigureLocal should return to SelectAddType"
         );
     }
@@ -3114,7 +3654,12 @@ mod tests {
         let mut state = state_with_step(default_configure_remote(0)); // focused Provider
         let initial_idx = 0usize; // grok
         handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
-        if let Some(AddProviderStep::ConfigureRemote { provider_idx, model, .. }) = get_step(&state) {
+        if let Some(AddProviderStep::ConfigureRemote {
+            provider_idx,
+            model,
+            ..
+        }) = get_step(&state)
+        {
             assert_eq!(*provider_idx, initial_idx + 1);
             // model should reset to default for new provider
             let expected_model = CLOUD_PROVIDERS[initial_idx + 1].2;
@@ -3128,7 +3673,12 @@ mod tests {
     fn test_configure_remote_left_wraps_provider_to_last() {
         let mut state = state_with_step(default_configure_remote(0)); // provider_idx=0, focused
         handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
-        if let Some(AddProviderStep::ConfigureRemote { provider_idx, model, .. }) = get_step(&state) {
+        if let Some(AddProviderStep::ConfigureRemote {
+            provider_idx,
+            model,
+            ..
+        }) = get_step(&state)
+        {
             assert_eq!(*provider_idx, CLOUD_PROVIDERS.len() - 1);
             let expected_model = CLOUD_PROVIDERS[CLOUD_PROVIDERS.len() - 1].2;
             assert_eq!(model.as_str(), expected_model);
@@ -3142,7 +3692,10 @@ mod tests {
     #[test]
     fn test_configure_remote_right_on_model_field_cycles_to_next_known_model() {
         // Use claude (idx 1) so we have a known model list
-        let claude_idx = CLOUD_PROVIDERS.iter().position(|(id, _, _, _)| *id == "claude").unwrap();
+        let claude_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "claude")
+            .unwrap();
         let first_model = known_models_for("claude")[0];
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
@@ -3161,7 +3714,10 @@ mod tests {
 
     #[test]
     fn test_configure_remote_left_on_model_field_cycles_backward() {
-        let claude_idx = CLOUD_PROVIDERS.iter().position(|(id, _, _, _)| *id == "claude").unwrap();
+        let claude_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "claude")
+            .unwrap();
         let first_model = known_models_for("claude")[0];
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
@@ -3233,7 +3789,10 @@ mod tests {
         }
         handle_models_input(&mut state, key(KeyCode::Char('x'))).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { api_key, .. }) = get_step(&state) {
-            assert_eq!(api_key, &before_key, "typing on Provider field should not modify api_key");
+            assert_eq!(
+                api_key, &before_key,
+                "typing on Provider field should not modify api_key"
+            );
         }
     }
 
@@ -3241,7 +3800,10 @@ mod tests {
 
     #[test]
     fn test_configure_remote_enter_replaces_empty_primary() {
-        let grok_idx = CLOUD_PROVIDERS.iter().position(|(id, _, _, _)| *id == "grok").unwrap();
+        let grok_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "grok")
+            .unwrap();
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: grok_idx,
             model: "grok-code-fast-1".to_string(),
@@ -3250,7 +3812,13 @@ mod tests {
         });
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         assert!(get_step(&state).is_none());
-        if let Some(ModelConfig::Remote { provider, api_key, model, .. }) = get_primary(&state) {
+        if let Some(ModelConfig::Remote {
+            provider,
+            api_key,
+            model,
+            ..
+        }) = get_primary(&state)
+        {
             assert_eq!(provider.as_str(), "grok");
             assert_eq!(api_key.as_str(), "xai-test-key");
             assert_eq!(model.as_str(), "grok-code-fast-1");
@@ -3261,7 +3829,10 @@ mod tests {
 
     #[test]
     fn test_configure_remote_enter_uses_default_model_when_model_empty() {
-        let claude_idx = CLOUD_PROVIDERS.iter().position(|(id, _, _, _)| *id == "claude").unwrap();
+        let claude_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "claude")
+            .unwrap();
         let default_claude_model = CLOUD_PROVIDERS[claude_idx].2;
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
@@ -3284,7 +3855,10 @@ mod tests {
         let mut state = state_with_step(default_configure_remote(0));
         handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
         assert!(
-            matches!(get_step(&state), Some(AddProviderStep::SelectAddType { .. })),
+            matches!(
+                get_step(&state),
+                Some(AddProviderStep::SelectAddType { .. })
+            ),
             "Esc from ConfigureRemote should return to SelectAddType"
         );
     }
@@ -3296,7 +3870,13 @@ mod tests {
         let mut state = state_with_step(AddProviderStep::SelectAddType { selected: 0 });
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         assert!(
-            matches!(get_step(&state), Some(AddProviderStep::ConfigureRemote { provider_idx: 0, .. })),
+            matches!(
+                get_step(&state),
+                Some(AddProviderStep::ConfigureRemote {
+                    provider_idx: 0,
+                    ..
+                })
+            ),
             "selecting first cloud provider should open ConfigureRemote at index 0"
         );
     }
@@ -3307,7 +3887,10 @@ mod tests {
         let mut state = state_with_step(AddProviderStep::SelectAddType { selected: n_cloud });
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         assert!(
-            matches!(get_step(&state), Some(AddProviderStep::ConfigureLocal { .. })),
+            matches!(
+                get_step(&state),
+                Some(AddProviderStep::ConfigureLocal { .. })
+            ),
             "selecting 'Local model' should open ConfigureLocal"
         );
     }
@@ -3319,9 +3902,15 @@ mod tests {
         let mut state = state_with_step(AddProviderStep::SelectAddType { selected: 0 });
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { focused_field, .. }) = get_step(&state) {
-            assert_eq!(*focused_field, 2, "ConfigureRemote should open focused on API key field");
+            assert_eq!(
+                *focused_field, 2,
+                "ConfigureRemote should open focused on API key field"
+            );
         } else {
-            panic!("expected ConfigureRemote, got {:?}", get_step(&state).map(|s| format!("{:?}", s)));
+            panic!(
+                "expected ConfigureRemote, got {:?}",
+                get_step(&state).map(|s| format!("{:?}", s))
+            );
         }
         let _ = n_cloud; // suppress unused warning
     }
@@ -3330,7 +3919,10 @@ mod tests {
     fn test_select_add_type_esc_closes_overlay() {
         let mut state = state_with_step(AddProviderStep::SelectAddType { selected: 0 });
         handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
-        assert!(get_step(&state).is_none(), "Esc on SelectAddType should close overlay");
+        assert!(
+            get_step(&state).is_none(),
+            "Esc on SelectAddType should close overlay"
+        );
     }
 
     // ── build_setup_result: inference_provider propagation ───────────────────
@@ -3387,7 +3979,10 @@ mod tests {
             inference_provider: InferenceProvider::Onnx,
             enabled: true,
         };
-        if let ModelConfig::Local { inference_provider, .. } = config {
+        if let ModelConfig::Local {
+            inference_provider, ..
+        } = config
+        {
             assert_eq!(inference_provider, InferenceProvider::Onnx);
         } else {
             panic!("unexpected variant");
@@ -3407,7 +4002,12 @@ mod tests {
             ..Default::default()
         };
         let state = WizardState::new(Some(&config));
-        if let Some(ModelConfig::Local { inference_provider, family, .. }) = get_primary(&state) {
+        if let Some(ModelConfig::Local {
+            inference_provider,
+            family,
+            ..
+        }) = get_primary(&state)
+        {
             assert_eq!(*inference_provider, InferenceProvider::Onnx);
             assert_eq!(*family, ModelFamily::DeepSeek);
         } else {

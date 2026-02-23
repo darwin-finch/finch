@@ -18,7 +18,7 @@ use std::fs;
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
 const GRAY: &str = "\x1b[90m";
-const RED_BG: &str = "\x1b[48;5;52m";   // Dark red background
+const RED_BG: &str = "\x1b[48;5;52m"; // Dark red background
 const GREEN_BG: &str = "\x1b[48;5;22m"; // Dark green background
 const RESET: &str = "\x1b[0m";
 
@@ -116,7 +116,12 @@ impl Tool for EditTool {
             .with_context(|| format!("Failed to write file: {}", file_path))?;
 
         // Generate and return colored diff
-        Ok(generate_edit_diff(&original, old_string, new_string, match_count.min(if replace_all { match_count } else { 1 })))
+        Ok(generate_edit_diff(
+            &original,
+            old_string,
+            new_string,
+            match_count.min(if replace_all { match_count } else { 1 }),
+        ))
     }
 }
 
@@ -127,7 +132,12 @@ impl Tool for EditTool {
 ///     196     pub fn validate(&self) -> ...
 ///     199 -   // Old comment
 ///     199 +   // New comment
-pub fn generate_edit_diff(original: &str, old_string: &str, new_string: &str, occurrences: usize) -> String {
+pub fn generate_edit_diff(
+    original: &str,
+    old_string: &str,
+    new_string: &str,
+    occurrences: usize,
+) -> String {
     let orig_lines: Vec<&str> = original.lines().collect();
     let old_str_lines: Vec<&str> = old_string.lines().collect();
     let new_str_lines: Vec<&str> = new_string.lines().collect();
@@ -138,10 +148,18 @@ pub fn generate_edit_diff(original: &str, old_string: &str, new_string: &str, oc
     // Build summary
     let mut summary_parts = Vec::new();
     if added > 0 {
-        summary_parts.push(format!("Added {} line{}", added, if added == 1 { "" } else { "s" }));
+        summary_parts.push(format!(
+            "Added {} line{}",
+            added,
+            if added == 1 { "" } else { "s" }
+        ));
     }
     if removed > 0 {
-        summary_parts.push(format!("removed {} line{}", removed, if removed == 1 { "" } else { "s" }));
+        summary_parts.push(format!(
+            "removed {} line{}",
+            removed,
+            if removed == 1 { "" } else { "s" }
+        ));
     }
     if occurrences > 1 {
         summary_parts.push(format!("{} occurrences replaced", occurrences));

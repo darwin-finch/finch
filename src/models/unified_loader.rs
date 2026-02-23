@@ -5,16 +5,15 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::config::ExecutionTarget;
 use super::download::ModelDownloader;
 use super::generator_new::TextGeneration;
-use super::loaders::onnx::{OnnxLoader, LoadedOnnxModel};
-use super::loaders::onnx_config::{OnnxLoadConfig, ModelSize as OnnxModelSize};
+use super::loaders::onnx::{LoadedOnnxModel, OnnxLoader};
+use super::loaders::onnx_config::{ModelSize as OnnxModelSize, OnnxLoadConfig};
 use super::model_selector::QwenSize;
+use crate::config::ExecutionTarget;
 
 /// Inference provider selection
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum InferenceProvider {
     /// ONNX Runtime (recommended, works on all platforms)
     #[serde(rename = "onnx")]
@@ -25,7 +24,6 @@ pub enum InferenceProvider {
     #[serde(rename = "candle")]
     Candle,
 }
-
 
 impl InferenceProvider {
     /// Get human-readable name
@@ -132,7 +130,7 @@ impl ModelSize {
     /// Convert legacy QwenSize to generic ModelSize
     pub fn from_qwen(qwen_size: QwenSize) -> Self {
         match qwen_size {
-            QwenSize::Qwen500M => Self::Small,  // 0.5B maps to Small slot
+            QwenSize::Qwen500M => Self::Small, // 0.5B maps to Small slot
             QwenSize::Qwen1_5B => Self::Small,
             QwenSize::Qwen3B => Self::Medium,
             QwenSize::Qwen7B => Self::Large,
@@ -377,17 +375,21 @@ impl UnifiedModelLoader {
 
         // Map unified ModelSize to ONNX ModelSize
         let onnx_size = match config.size {
-            ModelSize::Small => OnnxModelSize::Medium,   // 1.5B
-            ModelSize::Medium => OnnxModelSize::Large,   // 3B
-            ModelSize::Large => OnnxModelSize::XLarge,   // 7B
-            ModelSize::XLarge => OnnxModelSize::XLarge,  // 7B (max for ONNX currently)
+            ModelSize::Small => OnnxModelSize::Medium,  // 1.5B
+            ModelSize::Medium => OnnxModelSize::Large,  // 3B
+            ModelSize::Large => OnnxModelSize::XLarge,  // 7B
+            ModelSize::XLarge => OnnxModelSize::XLarge, // 7B (max for ONNX currently)
         };
 
         // Resolve HuggingFace repository ID based on family and size
         let repo_id = self.resolve_repository(config)?;
 
         // Extract model name from repo ID (e.g., "onnx-community/Qwen2.5-1.5B-Instruct" → "Qwen2.5-1.5B-Instruct")
-        let model_name = repo_id.split('/').next_back().unwrap_or(&repo_id).to_string();
+        let model_name = repo_id
+            .split('/')
+            .next_back()
+            .unwrap_or(&repo_id)
+            .to_string();
 
         // Map ExecutionTarget to ONNX Runtime execution providers
         use super::loaders::onnx_config::ExecutionProvider;
@@ -395,21 +397,11 @@ impl UnifiedModelLoader {
         let execution_providers = match config.target {
             #[cfg(target_os = "macos")]
             ExecutionTarget::CoreML => {
-                Some(vec![
-                    ExecutionProvider::CoreML,
-                    ExecutionProvider::CPU,
-                ])
+                Some(vec![ExecutionProvider::CoreML, ExecutionProvider::CPU])
             }
             #[cfg(feature = "cuda")]
-            ExecutionTarget::Cuda => {
-                Some(vec![
-                    ExecutionProvider::CUDA,
-                    ExecutionProvider::CPU,
-                ])
-            }
-            ExecutionTarget::Cpu => {
-                Some(vec![ExecutionProvider::CPU])
-            }
+            ExecutionTarget::Cuda => Some(vec![ExecutionProvider::CUDA, ExecutionProvider::CPU]),
+            ExecutionTarget::Cpu => Some(vec![ExecutionProvider::CPU]),
             ExecutionTarget::Auto => None, // Let ONNX loader decide
         };
 
@@ -474,12 +466,12 @@ impl UnifiedModelLoader {
 
         // Use compatibility matrix to resolve repository
         super::compatibility::get_repository(config.provider, config.family, config.size)
-            .with_context(|| format!(
-                "No {:?} model repository available for {:?} {:?}",
-                config.provider,
-                config.family,
-                config.size
-            ))
+            .with_context(|| {
+                format!(
+                    "No {:?} model repository available for {:?} {:?}",
+                    config.provider, config.family, config.size
+                )
+            })
     }
 
     /// Load model variant based on family + backend combination
@@ -633,8 +625,7 @@ impl UnifiedModelLoader {
             .context("Failed to determine home directory")?
             .join(".cache/huggingface/hub");
 
-        std::fs::create_dir_all(&cache_dir)
-            .context("Failed to create cache directory")?;
+        std::fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
 
         // Create ONNX config with automatic size selection
         let config = if let Some(ram) = ram_gb {
@@ -648,7 +639,8 @@ impl UnifiedModelLoader {
         let loader = OnnxLoader::new(config.cache_dir.clone());
 
         // Load model
-        let model = loader.load_model_sync(&config)
+        let model = loader
+            .load_model_sync(&config)
             .context("Failed to load ONNX model")?;
 
         tracing::info!("Successfully loaded ONNX model: {}", model.model_name());

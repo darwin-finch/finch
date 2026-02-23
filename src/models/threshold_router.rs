@@ -103,7 +103,8 @@ impl Clone for ThresholdRouter {
             target_forward_rate: self.target_forward_rate,
             session_id: self.session_id.clone(),
             has_saved_this_session: AtomicBool::new(
-                self.has_saved_this_session.load(std::sync::atomic::Ordering::Relaxed),
+                self.has_saved_this_session
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             loaded_from_disk: self.loaded_from_disk,
         }
@@ -156,10 +157,7 @@ impl ThresholdRouter {
         self.total_local_attempts += 1;
 
         let category = Self::categorize_query(query);
-        let stats = self
-            .category_stats
-            .entry(category)
-            .or_default();
+        let stats = self.category_stats.entry(category).or_default();
 
         stats.local_attempts += 1;
 
@@ -283,9 +281,9 @@ impl ThresholdRouter {
                 || lower.starts_with("hey")
                 || lower == "good morning"
                 || lower == "good afternoon")
-            {
-                return QueryCategory::Greeting;
-            }
+        {
+            return QueryCategory::Greeting;
+        }
 
         // Check for explanation requests
         if lower.contains("explain") || lower.contains("describe") || lower.starts_with("why") {

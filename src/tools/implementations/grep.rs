@@ -56,8 +56,8 @@ impl Tool for GrepTool {
         let context_lines = input["context_lines"].as_u64().unwrap_or(0) as usize;
         let glob_filter = input["glob"].as_str();
 
-        let regex = Regex::new(pattern)
-            .with_context(|| format!("Invalid regex pattern: {}", pattern))?;
+        let regex =
+            Regex::new(pattern).with_context(|| format!("Invalid regex pattern: {}", pattern))?;
 
         let mut output_lines: Vec<String> = Vec::new();
         let mut file_count = 0;
@@ -113,7 +113,8 @@ impl Tool for GrepTool {
             }
 
             let file_path = entry.path().display().to_string();
-            let match_set: std::collections::HashSet<usize> = match_indices.iter().copied().collect();
+            let match_set: std::collections::HashSet<usize> =
+                match_indices.iter().copied().collect();
 
             let mut prev_printed: Option<usize> = None;
             for &line_idx in &lines_to_print {
@@ -124,7 +125,11 @@ impl Tool for GrepTool {
                     }
                 }
 
-                let marker = if match_set.contains(&line_idx) { ">" } else { " " };
+                let marker = if match_set.contains(&line_idx) {
+                    ">"
+                } else {
+                    " "
+                };
                 output_lines.push(format!(
                     "{}:{}{}: {}",
                     file_path,
@@ -177,10 +182,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_grep_in_cargo_toml() {
-        let result = GrepTool.execute(
-            serde_json::json!({"pattern": "name.*=", "path": "Cargo.toml"}),
-            &ctx(),
-        ).await;
+        let result = GrepTool
+            .execute(
+                serde_json::json!({"pattern": "name.*=", "path": "Cargo.toml"}),
+                &ctx(),
+            )
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("Cargo.toml"));
     }
@@ -199,28 +206,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_grep_glob_filter() {
-        let result = GrepTool.execute(
-            serde_json::json!({"pattern": "fn main", "path": "src", "glob": "*.rs"}),
-            &ctx(),
-        ).await;
+        let result = GrepTool
+            .execute(
+                serde_json::json!({"pattern": "fn main", "path": "src", "glob": "*.rs"}),
+                &ctx(),
+            )
+            .await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_grep_invalid_regex() {
-        let result = GrepTool.execute(
-            serde_json::json!({"pattern": "[invalid(", "path": "."}),
-            &ctx(),
-        ).await;
+        let result = GrepTool
+            .execute(
+                serde_json::json!({"pattern": "[invalid(", "path": "."}),
+                &ctx(),
+            )
+            .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_grep_no_matches() {
-        let result = GrepTool.execute(
-            serde_json::json!({"pattern": "ZZZNOMATCHZZZ", "path": "Cargo.toml"}),
-            &ctx(),
-        ).await;
+        let result = GrepTool
+            .execute(
+                serde_json::json!({"pattern": "ZZZNOMATCHZZZ", "path": "Cargo.toml"}),
+                &ctx(),
+            )
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("No matches"));
     }

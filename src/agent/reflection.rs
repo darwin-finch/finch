@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::claude::ClaudeClient;
 use crate::claude::types::{Message, MessageRequest};
+use crate::claude::ClaudeClient;
 use crate::config::persona::Persona;
 
 /// Sends completed task summaries to the teacher API and patches the persona file
@@ -185,7 +185,10 @@ git_email = "vesper@local.finch"
         let persona = Persona::load(f.path()).unwrap();
         assert_eq!(persona.behavior.system_prompt, "Updated.");
         assert_eq!(persona.behavior.git_name.as_deref(), Some("Vesper"));
-        assert_eq!(persona.behavior.git_email.as_deref(), Some("vesper@local.finch"));
+        assert_eq!(
+            persona.behavior.git_email.as_deref(),
+            Some("vesper@local.finch")
+        );
     }
 
     #[test]
@@ -240,10 +243,10 @@ git_email = "vesper@local.finch"
     async fn test_reflect_empty_tasks_returns_early_without_api_call() {
         // The early-exit path (empty tasks) returns before calling the teacher API.
         // We use a mock provider that panics if called, proving no API call is made.
-        use anyhow::Result;
         use crate::claude::ClaudeClient;
-        use crate::providers::LlmProvider;
         use crate::providers::types::{ProviderRequest, ProviderResponse, StreamChunk};
+        use crate::providers::LlmProvider;
+        use anyhow::Result;
         use tokio::sync::mpsc::Receiver;
 
         struct PanicProvider;
@@ -259,8 +262,12 @@ git_email = "vesper@local.finch"
             ) -> Result<Receiver<Result<StreamChunk>>> {
                 panic!("send_message_stream should not be called for empty task list");
             }
-            fn name(&self) -> &str { "panic" }
-            fn default_model(&self) -> &str { "none" }
+            fn name(&self) -> &str {
+                "panic"
+            }
+            fn default_model(&self) -> &str {
+                "none"
+            }
         }
 
         let client = ClaudeClient::with_provider(Box::new(PanicProvider));
@@ -268,6 +275,9 @@ git_email = "vesper@local.finch"
         let persona = Persona::default();
 
         let result = eng.reflect(&persona, None, &[]).await.unwrap();
-        assert!(result.is_empty(), "expected empty string for empty task list");
+        assert!(
+            result.is_empty(),
+            "expected empty string for empty task list"
+        );
     }
 }

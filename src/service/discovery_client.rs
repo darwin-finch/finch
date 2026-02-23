@@ -27,8 +27,7 @@ pub struct ServiceDiscoveryClient {
 impl ServiceDiscoveryClient {
     /// Create new service discovery client
     pub fn new() -> Result<Self> {
-        let daemon = ServiceDaemon::new()
-            .context("Failed to create mDNS service daemon")?;
+        let daemon = ServiceDaemon::new().context("Failed to create mDNS service daemon")?;
 
         Ok(Self { daemon })
     }

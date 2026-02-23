@@ -9,7 +9,6 @@ pub mod patterns;
 pub use generator::{GeneratedResponse, TemplateGenerator};
 pub use patterns::{PatternClassifier, QueryPattern};
 
-
 use crate::claude::Message;
 use crate::generators::GeneratorResponse;
 use crate::models::adapters::LocalModelAdapter;
@@ -36,9 +35,7 @@ impl LocalGenerator {
     }
 
     /// Create local generator with optional neural models
-    pub fn with_models(
-        neural_generator: Option<Arc<RwLock<GeneratorModel>>>,
-    ) -> Self {
+    pub fn with_models(neural_generator: Option<Arc<RwLock<GeneratorModel>>>) -> Self {
         let pattern_classifier = PatternClassifier::new();
 
         // Extract actual model name from GeneratorModel if available
@@ -56,8 +53,11 @@ impl LocalGenerator {
             Self::extract_model_name_from_config()
         };
 
-        let response_generator =
-            TemplateGenerator::with_models(pattern_classifier.clone(), neural_generator, &model_name);
+        let response_generator = TemplateGenerator::with_models(
+            pattern_classifier.clone(),
+            neural_generator,
+            &model_name,
+        );
 
         Self {
             pattern_classifier,
@@ -82,7 +82,7 @@ impl LocalGenerator {
             let family_name = config.backend.model_family.name();
             return family_name.to_string();
         }
-        "LocalModel".to_string()  // Final fallback
+        "LocalModel".to_string() // Final fallback
     }
 
     /// Try to generate a local response from patterns
@@ -133,7 +133,8 @@ impl LocalGenerator {
         }
 
         // Delegate to response generator with streaming callback
-        self.response_generator.generate_streaming(messages, token_callback)
+        self.response_generator
+            .generate_streaming(messages, token_callback)
     }
 
     /// Try to generate a response from patterns with tools
@@ -222,7 +223,10 @@ impl LocalGenerator {
     }
 
     /// Find the most recent adapter in the adapters directory
-    fn find_latest_adapter(&self, adapters_dir: &std::path::Path) -> Result<Option<std::path::PathBuf>> {
+    fn find_latest_adapter(
+        &self,
+        adapters_dir: &std::path::Path,
+    ) -> Result<Option<std::path::PathBuf>> {
         use std::fs;
 
         let mut latest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;

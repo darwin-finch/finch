@@ -423,7 +423,9 @@ impl TrainingCoordinator {
 
     /// Add example to buffer, returns true if training threshold reached
     pub fn add_example(&self, example: WeightedExample) -> Result<bool> {
-        let mut buffer = self.buffer.write()
+        let mut buffer = self
+            .buffer
+            .write()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
         buffer.add(example);
@@ -435,7 +437,9 @@ impl TrainingCoordinator {
     }
 
     pub fn buffer(&self) -> Result<std::sync::RwLockReadGuard<'_, ExampleBuffer>> {
-        self.buffer.read().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))
+        self.buffer
+            .read()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))
     }
 
     pub fn should_train(&self) -> bool {
@@ -448,7 +452,9 @@ impl TrainingCoordinator {
 
     /// Write buffered examples to JSONL queue file
     pub fn write_training_queue(&self) -> Result<usize> {
-        let buffer = self.buffer.read()
+        let buffer = self
+            .buffer
+            .read()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
         if buffer.is_empty() {
@@ -457,8 +463,7 @@ impl TrainingCoordinator {
 
         // Ensure directory exists
         if let Some(parent) = self.queue_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create training queue directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create training queue directory")?;
         }
 
         // Append examples to JSONL file
@@ -472,20 +477,24 @@ impl TrainingCoordinator {
 
         use std::io::Write;
         for example in buffer.examples() {
-            let json = serde_json::to_string(example)
-                .context("Failed to serialize example")?;
-            writeln!(file, "{}", json)
-                .context("Failed to write example to queue")?;
+            let json = serde_json::to_string(example).context("Failed to serialize example")?;
+            writeln!(file, "{}", json).context("Failed to write example to queue")?;
         }
 
-        tracing::info!("Wrote {} examples to training queue: {}", count, self.queue_path.display());
+        tracing::info!(
+            "Wrote {} examples to training queue: {}",
+            count,
+            self.queue_path.display()
+        );
 
         Ok(count)
     }
 
     /// Clear buffer after writing to queue
     pub fn clear_buffer(&self) -> Result<()> {
-        let mut buffer = self.buffer.write()
+        let mut buffer = self
+            .buffer
+            .write()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
         let count = buffer.len();

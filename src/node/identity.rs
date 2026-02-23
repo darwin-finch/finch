@@ -31,8 +31,8 @@ impl NodeIdentity {
         if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read node identity from {}", path.display()))?;
-            let id: Self = serde_json::from_str(&raw)
-                .with_context(|| "Failed to parse node identity JSON")?;
+            let id: Self =
+                serde_json::from_str(&raw).with_context(|| "Failed to parse node identity JSON")?;
             return Ok(id);
         }
 
@@ -64,8 +64,8 @@ impl NodeIdentity {
     pub fn device_uuid(fingerprint: &str) -> Uuid {
         // Fixed namespace UUID for finch (generated once, never changes)
         const FINCH_NAMESPACE: Uuid = Uuid::from_bytes([
-            0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1,
-            0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+            0x6b, 0xa7, 0xb8, 0x14, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4,
+            0x30, 0xc8,
         ]);
         Uuid::new_v5(&FINCH_NAMESPACE, fingerprint.as_bytes())
     }
@@ -73,11 +73,10 @@ impl NodeIdentity {
     fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create ~/.finch directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create ~/.finch directory")?;
         }
-        let json = serde_json::to_string_pretty(self)
-            .context("Failed to serialize node identity")?;
+        let json =
+            serde_json::to_string_pretty(self).context("Failed to serialize node identity")?;
         std::fs::write(&path, json)
             .with_context(|| format!("Failed to write node identity to {}", path.display()))?;
         Ok(())

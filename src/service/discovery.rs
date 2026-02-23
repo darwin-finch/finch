@@ -28,8 +28,7 @@ pub struct ServiceDiscovery {
 impl ServiceDiscovery {
     /// Create new service discovery
     pub fn new(config: ServiceConfig) -> Result<Self> {
-        let daemon = ServiceDaemon::new()
-            .context("Failed to create mDNS service daemon")?;
+        let daemon = ServiceDaemon::new().context("Failed to create mDNS service daemon")?;
 
         // Generate instance name from hostname
         let hostname = hostname::get()
@@ -43,7 +42,10 @@ impl ServiceDiscovery {
             config.name.clone()
         };
 
-        tracing::debug!("Created mDNS service daemon with instance: {}", instance_name);
+        tracing::debug!(
+            "Created mDNS service daemon with instance: {}",
+            instance_name
+        );
 
         Ok(Self {
             daemon,
@@ -75,7 +77,7 @@ impl ServiceDiscovery {
             SERVICE_TYPE,
             &self.instance_name,
             &format!("{}.", hostname),
-            (),  // Use default IP
+            (), // Use default IP
             port,
             Some(properties),
         )

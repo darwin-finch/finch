@@ -32,10 +32,30 @@ pub fn select_active_personas(plan_text: &str) -> Vec<&'static str> {
 
     // Security: activates on auth, crypto, and secrets-related keywords
     let security_keywords = [
-        "auth", "jwt", "token", "secret", "api_key", "apikey", "password",
-        "permission", "role", "bearer", "crypto", "encrypt", "decrypt", "tls",
-        "ssl", "https", "certificate", "hash", "hmac", "session", "csrf",
-        "cors", "oauth", "saml",
+        "auth",
+        "jwt",
+        "token",
+        "secret",
+        "api_key",
+        "apikey",
+        "password",
+        "permission",
+        "role",
+        "bearer",
+        "crypto",
+        "encrypt",
+        "decrypt",
+        "tls",
+        "ssl",
+        "https",
+        "certificate",
+        "hash",
+        "hmac",
+        "session",
+        "csrf",
+        "cors",
+        "oauth",
+        "saml",
     ];
     if security_keywords.iter().any(|kw| lower.contains(kw)) {
         personas.push("Security");
@@ -43,9 +63,22 @@ pub fn select_active_personas(plan_text: &str) -> Vec<&'static str> {
 
     // Architecture: activates on structural/module-level changes
     let arch_keywords = [
-        "refactor", "module", "mod ", "pub mod", "crate", "dependency",
-        "struct ", "trait ", "interface", "abstraction", "impl ", "pub ",
-        "pub(crate)", "architecture", "layer", "separation",
+        "refactor",
+        "module",
+        "mod ",
+        "pub mod",
+        "crate",
+        "dependency",
+        "struct ",
+        "trait ",
+        "interface",
+        "abstraction",
+        "impl ",
+        "pub ",
+        "pub(crate)",
+        "architecture",
+        "layer",
+        "separation",
     ];
     if arch_keywords.iter().any(|kw| lower.contains(kw)) {
         personas.push("Architecture");

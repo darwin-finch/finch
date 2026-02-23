@@ -103,7 +103,6 @@ impl MemTreeConsole {
 
     /// Generate a new unique node ID
     fn next_id(&mut self) -> NodeId {
-        
         self.nodes.len() as NodeId
     }
 
@@ -158,14 +157,21 @@ impl MemTreeConsole {
     }
 
     /// Add a tool call node
-    pub fn add_tool_call(&mut self, parent_id: NodeId, tool_name: String, description: String) -> Result<NodeId> {
+    pub fn add_tool_call(
+        &mut self,
+        parent_id: NodeId,
+        tool_name: String,
+        description: String,
+    ) -> Result<NodeId> {
         let node_id = self.next_id();
 
         let parent_depth = self.nodes.get(&parent_id).map(|n| n.depth).unwrap_or(0);
 
         let console_node = ConsoleNode {
             id: node_id,
-            node_type: ConsoleNodeType::ToolCall { tool_name: tool_name.clone() },
+            node_type: ConsoleNodeType::ToolCall {
+                tool_name: tool_name.clone(),
+            },
             text: description,
             children: Vec::new(),
             expanded: false, // Collapsed by default
@@ -183,7 +189,12 @@ impl MemTreeConsole {
     }
 
     /// Add a tool result node
-    pub fn add_tool_result(&mut self, parent_id: NodeId, success: bool, text: String) -> Result<NodeId> {
+    pub fn add_tool_result(
+        &mut self,
+        parent_id: NodeId,
+        success: bool,
+        text: String,
+    ) -> Result<NodeId> {
         let node_id = self.next_id();
 
         let parent_depth = self.nodes.get(&parent_id).map(|n| n.depth).unwrap_or(0);
@@ -208,7 +219,12 @@ impl MemTreeConsole {
     }
 
     /// Add a thinking/stats node
-    pub fn add_thinking(&mut self, parent_id: NodeId, duration_ms: u64, text: String) -> Result<NodeId> {
+    pub fn add_thinking(
+        &mut self,
+        parent_id: NodeId,
+        duration_ms: u64,
+        text: String,
+    ) -> Result<NodeId> {
         let node_id = self.next_id();
 
         let parent_depth = self.nodes.get(&parent_id).map(|n| n.depth).unwrap_or(0);
@@ -268,8 +284,8 @@ impl MemTreeConsole {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),      // Tree view
-                Constraint::Length(3),   // Input area
+                Constraint::Min(3),    // Tree view
+                Constraint::Length(3), // Input area
             ])
             .split(area);
 
@@ -288,16 +304,17 @@ impl MemTreeConsole {
             .iter()
             .skip(self.scroll_offset)
             .filter_map(|node_id| {
-                self.nodes.get(node_id).map(|node| {
-                    self.render_node(node, Some(*node_id) == self.selected)
-                })
+                self.nodes
+                    .get(node_id)
+                    .map(|node| self.render_node(node, Some(*node_id) == self.selected))
             })
             .collect();
 
-        let list = List::new(items)
-            .block(Block::default()
+        let list = List::new(items).block(
+            Block::default()
                 .borders(Borders::ALL)
-                .title("Conversation Tree"));
+                .title("Conversation Tree"),
+        );
 
         f.render_widget(list, area);
     }
@@ -306,7 +323,11 @@ impl MemTreeConsole {
     fn render_node(&self, node: &ConsoleNode, is_selected: bool) -> ListItem<'_> {
         let indent = "  ".repeat(node.depth);
         let expand_marker = if !node.children.is_empty() {
-            if node.expanded { "▼ " } else { "▶ " }
+            if node.expanded {
+                "▼ "
+            } else {
+                "▶ "
+            }
         } else {
             "  "
         };
@@ -316,14 +337,21 @@ impl MemTreeConsole {
             ConsoleNodeType::AssistantResponse => ("⏺", Color::Blue),
             ConsoleNodeType::ToolCall { tool_name: _ } => ("⏵", Color::Yellow),
             ConsoleNodeType::ToolResult { success } => {
-                if *success { ("✓", Color::Green) } else { ("✗", Color::Red) }
+                if *success {
+                    ("✓", Color::Green)
+                } else {
+                    ("✗", Color::Red)
+                }
             }
             ConsoleNodeType::System => ("ℹ", Color::DarkGray),
             ConsoleNodeType::Thinking { .. } => ("✻", Color::Magenta),
         };
 
         let style = if is_selected {
-            Style::default().bg(Color::Black).fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default()
+                .bg(Color::Black)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(color)
         };
@@ -399,10 +427,14 @@ mod tests {
         let user_id = console.add_user_message("Hello".to_string()).unwrap();
 
         // Add assistant response
-        let response_id = console.add_assistant_response(user_id, "Hi there!".to_string()).unwrap();
+        let response_id = console
+            .add_assistant_response(user_id, "Hi there!".to_string())
+            .unwrap();
 
         // Add tool call
-        let tool_id = console.add_tool_call(response_id, "Read".to_string(), "file.txt".to_string()).unwrap();
+        let tool_id = console
+            .add_tool_call(response_id, "Read".to_string(), "file.txt".to_string())
+            .unwrap();
 
         // Verify structure
         assert_eq!(console.nodes.len(), 3);
@@ -416,7 +448,9 @@ mod tests {
         let mut console = MemTreeConsole::new(tree);
 
         let user_id = console.add_user_message("Test".to_string()).unwrap();
-        let response_id = console.add_assistant_response(user_id, "Response".to_string()).unwrap();
+        let response_id = console
+            .add_assistant_response(user_id, "Response".to_string())
+            .unwrap();
 
         // Initially expanded
         assert!(console.nodes.get(&user_id).unwrap().expanded);

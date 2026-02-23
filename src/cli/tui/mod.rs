@@ -24,8 +24,8 @@ use crossterm::{
     execute,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType,
-        BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, Clear, ClearType,
+        EndSynchronizedUpdate,
     },
 };
 use std::collections::HashSet;
@@ -38,30 +38,30 @@ use super::{OutputManager, StatusBar};
 use crate::cli::messages::{MessageId, MessageRef, MessageStatus};
 // Sub-modules
 mod async_input;
+mod autocomplete_widget;
 mod dialog;
 mod dialog_widget;
+mod input_widget; // kept, used by wizard helpers
+mod scrollback; // kept for future use
+mod shadow_buffer; // kept – good architecture for future diffing
+mod status_widget;
 mod tabbed_dialog;
-mod tabbed_dialog_widget;
-mod autocomplete_widget;
-mod input_widget;    // kept, used by wizard helpers
-mod scrollback;      // kept for future use
-mod shadow_buffer;   // kept – good architecture for future diffing
-mod status_widget;   // kept for wizard helpers
+mod tabbed_dialog_widget; // kept for wizard helpers
 
 pub use async_input::spawn_input_task;
+pub use autocomplete_widget::AutocompleteState;
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
+pub use shadow_buffer::visible_length;
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
-pub use autocomplete_widget::AutocompleteState;
-pub use shadow_buffer::visible_length;
 // Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
 pub use crate::config::ColorScheme;
 
 // ─── ANSI helpers ─────────────────────────────────────────────────────────────
 
-const RESET:    &str = "\x1b[0m";
-const CYAN:     &str = "\x1b[36m";
+const RESET: &str = "\x1b[0m";
+const CYAN: &str = "\x1b[36m";
 const DIM_GRAY: &str = "\x1b[90m";
 
 // ─── CWD helper ───────────────────────────────────────────────────────────────
@@ -147,7 +147,8 @@ pub(crate) fn compute_effective_status(
     registry: &crate::cli::command_autocomplete::CommandRegistry,
 ) -> String {
     if ghost_text.is_some() {
-        let desc = registry.match_prefix(current_input)
+        let desc = registry
+            .match_prefix(current_input)
             .into_iter()
             .next()
             .map(|spec| {
@@ -173,14 +174,14 @@ pub(crate) fn compute_effective_status(
 #[allow(dead_code)]
 pub struct TuiRenderer {
     output_manager: Arc<OutputManager>,
-    status_bar:     Arc<StatusBar>,
-    colors:         ColorScheme,
+    status_bar: Arc<StatusBar>,
+    colors: ColorScheme,
 
     // Input — tui-textarea manages multi-line state; we render it manually.
-    pub(crate) input_textarea:  TextArea<'static>,
+    pub(crate) input_textarea: TextArea<'static>,
     pub(crate) command_history: Vec<String>,
-    pub(crate) history_index:   Option<usize>,
-    pub(crate) history_draft:   Option<String>,
+    pub(crate) history_index: Option<usize>,
+    pub(crate) history_draft: Option<String>,
 
     // How many rows the live area currently occupies at the bottom of the
     // terminal (WorkUnit + separator + input + status).  Cleared before each
@@ -197,29 +198,29 @@ pub struct TuiRenderer {
     printed_ids: HashSet<MessageId>,
 
     // Dialog state — tool-approval dialogs shown in the live area.
-    pub active_dialog:        Option<Dialog>,
+    pub active_dialog: Option<Dialog>,
     pub active_tabbed_dialog: Option<TabbedDialog>,
 
     // Generic flags
     is_active: bool,
     pub(crate) needs_full_refresh: bool,
-    pub(crate) last_render_error:  Option<String>,
-    pub pending_feedback:           Option<crate::feedback::FeedbackRating>,
-    pub pending_cancellation:       bool,
-    pub pending_dialog_result:      Option<DialogResult>,
+    pub(crate) last_render_error: Option<String>,
+    pub pending_feedback: Option<crate::feedback::FeedbackRating>,
+    pub pending_cancellation: bool,
+    pub pending_dialog_result: Option<DialogResult>,
 
     // Autocomplete / suggestions
-    pub(crate) ghost_text:    Option<String>,
-    suggestions:              crate::cli::suggestions::SuggestionManager,
-    command_registry:         crate::cli::command_autocomplete::CommandRegistry,
-    pub autocomplete_state:   AutocompleteState,
+    pub(crate) ghost_text: Option<String>,
+    suggestions: crate::cli::suggestions::SuggestionManager,
+    command_registry: crate::cli::command_autocomplete::CommandRegistry,
+    pub autocomplete_state: AutocompleteState,
 
     // Image paste support
     pub pending_images: Vec<(usize, String, String)>,
     pub(crate) image_counter: usize,
 
     // Rate limiting
-    last_render:     Instant,
+    last_render: Instant,
     render_interval: Duration,
 }
 
@@ -228,8 +229,8 @@ pub struct TuiRenderer {
 impl TuiRenderer {
     pub fn new(
         output_manager: Arc<OutputManager>,
-        status_bar:     Arc<StatusBar>,
-        colors:         ColorScheme,
+        status_bar: Arc<StatusBar>,
+        colors: ColorScheme,
     ) -> Result<Self> {
         enable_raw_mode().context("Failed to enable raw mode")?;
 
@@ -261,34 +262,34 @@ impl TuiRenderer {
             status_bar,
             colors,
 
-            input_textarea:  Self::create_clean_textarea(),
+            input_textarea: Self::create_clean_textarea(),
             command_history,
-            history_index:   None,
-            history_draft:   None,
+            history_index: None,
+            history_draft: None,
 
-            active_rows:          0,
-            cursor_row_from_top:  0,
-            printed_ids:          HashSet::new(),
+            active_rows: 0,
+            cursor_row_from_top: 0,
+            printed_ids: HashSet::new(),
 
-            active_dialog:        None,
+            active_dialog: None,
             active_tabbed_dialog: None,
 
-            is_active:            true,
-            needs_full_refresh:   false,
-            last_render_error:    None,
-            pending_feedback:     None,
+            is_active: true,
+            needs_full_refresh: false,
+            last_render_error: None,
+            pending_feedback: None,
             pending_cancellation: false,
             pending_dialog_result: None,
 
-            ghost_text:       None,
-            suggestions:      crate::cli::suggestions::SuggestionManager::new(),
+            ghost_text: None,
+            suggestions: crate::cli::suggestions::SuggestionManager::new(),
             command_registry: crate::cli::command_autocomplete::CommandRegistry::new(),
             autocomplete_state: AutocompleteState::default(),
 
             pending_images: Vec::new(),
-            image_counter:  0,
+            image_counter: 0,
 
-            last_render:     Instant::now(),
+            last_render: Instant::now(),
             render_interval: Duration::from_millis(100),
         })
     }
@@ -392,17 +393,19 @@ impl TuiRenderer {
         let label_vis = label_with_spaces.len();
         let suffix_len = term_width.saturating_sub(prefix_vis + label_vis);
         let suffix: String = "─".repeat(suffix_len);
-        execute!(stdout, Print(format!("{}{}{}{}{}\r\n",
-            DIM_GRAY, prefix, label_with_spaces, suffix, RESET)))?;
+        execute!(
+            stdout,
+            Print(format!(
+                "{}{}{}{}{}\r\n",
+                DIM_GRAY, prefix, label_with_spaces, suffix, RESET
+            ))
+        )?;
         rows += 1;
 
         // ── 3. Dialog or input ────────────────────────────────────────────────
         let cursor_row_from_top;
         if let Some(dialog) = &self.active_dialog {
-            let dialog_rows = Self::draw_dialog_inline_static(
-                &mut stdout,
-                dialog,
-            )?;
+            let dialog_rows = Self::draw_dialog_inline_static(&mut stdout, dialog)?;
             rows += dialog_rows;
             // Dialog drawing leaves the cursor at the last drawn row (no reposition).
             cursor_row_from_top = rows.saturating_sub(1);
@@ -461,7 +464,10 @@ impl TuiRenderer {
 
             // Thin separator between input area and status line(s) — full terminal width
             let status_sep: String = "─".repeat(term_width);
-            execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, status_sep, RESET)))?;
+            execute!(
+                stdout,
+                Print(format!("\r\n{}{}{}", DIM_GRAY, status_sep, RESET))
+            )?;
 
             let status_line_count = count_status_lines(&effective_status) + 1; // +1 for separator
             for line in effective_status.lines() {
@@ -484,7 +490,8 @@ impl TuiRenderer {
             };
             execute!(stdout, cursor::MoveToColumn(col as u16))?;
 
-            cursor_row_from_top = compute_cursor_row_from_top(rows, input_line_count, cursor_row, status_line_count);
+            cursor_row_from_top =
+                compute_cursor_row_from_top(rows, input_line_count, cursor_row, status_line_count);
         }
 
         execute!(stdout, EndSynchronizedUpdate)?;
@@ -701,15 +708,15 @@ impl TuiRenderer {
                             self.render()?;
                             return Ok(Some(input));
                         }
-                        (KeyCode::Esc, _)
-                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             return Ok(None);
                         }
                         (KeyCode::Tab, KeyModifiers::NONE) => {
                             if let Some(ghost) = self.ghost_text.take() {
                                 let current = self.input_textarea.lines().join("\n");
                                 let completed = format!("{}{}", current, ghost);
-                                self.input_textarea = Self::create_clean_textarea_with_text(&completed);
+                                self.input_textarea =
+                                    Self::create_clean_textarea_with_text(&completed);
                             } else {
                                 self.input_textarea.input(Event::Key(key));
                             }
@@ -761,8 +768,8 @@ impl TuiRenderer {
     /// Returns the number of terminal rows consumed.
     fn draw_dialog_inline_static(stdout: &mut io::Stdout, dialog: &Dialog) -> Result<usize> {
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let box_width  = term_width.min(72);
-        let inner      = box_width.saturating_sub(6); // │ + 2 spaces on each side + │ = 6
+        let box_width = term_width.min(72);
+        let inner = box_width.saturating_sub(6); // │ + 2 spaces on each side + │ = 6
 
         let mut rows = 0;
 
@@ -782,8 +789,16 @@ impl TuiRenderer {
 
         // Help message (from dialog field)
         if let Some(ref help) = dialog.help_message {
-            execute!(stdout, Print(format!("│  {}{:<w$}{}  │\r\n",
-                DIM_GRAY, help, RESET, w = inner)))?;
+            execute!(
+                stdout,
+                Print(format!(
+                    "│  {}{:<w$}{}  │\r\n",
+                    DIM_GRAY,
+                    help,
+                    RESET,
+                    w = inner
+                ))
+            )?;
             rows += 1;
         }
 
@@ -792,48 +807,102 @@ impl TuiRenderer {
 
         // Options
         match &dialog.dialog_type {
-            DialogType::Select { options, selected_index, .. } => {
+            DialogType::Select {
+                options,
+                selected_index,
+                ..
+            } => {
                 for (i, opt) in options.iter().enumerate() {
-                    let marker  = if i == *selected_index { "●" } else { "○" };
-                    let on  = if i == *selected_index { "\x1b[1;36m" } else { "" };
+                    let marker = if i == *selected_index { "●" } else { "○" };
+                    let on = if i == *selected_index {
+                        "\x1b[1;36m"
+                    } else {
+                        ""
+                    };
                     let off = if i == *selected_index { RESET } else { "" };
                     let label = format!("  {} {}", marker, opt.label);
-                    execute!(stdout, Print(format!("│  {}{:<w$}{}  │\r\n",
-                        on, label, off, w = inner)))?;
+                    execute!(
+                        stdout,
+                        Print(format!("│  {}{:<w$}{}  │\r\n", on, label, off, w = inner))
+                    )?;
                     rows += 1;
                 }
             }
-            DialogType::MultiSelect { options, selected_indices, cursor_index, .. } => {
+            DialogType::MultiSelect {
+                options,
+                selected_indices,
+                cursor_index,
+                ..
+            } => {
                 for (i, opt) in options.iter().enumerate() {
-                    let checked = if selected_indices.contains(&i) { "☑" } else { "☐" };
-                    let on  = if i == *cursor_index { "\x1b[1;36m" } else { "" };
+                    let checked = if selected_indices.contains(&i) {
+                        "☑"
+                    } else {
+                        "☐"
+                    };
+                    let on = if i == *cursor_index { "\x1b[1;36m" } else { "" };
                     let off = if i == *cursor_index { RESET } else { "" };
                     let label = format!("  {} {}", checked, opt.label);
-                    execute!(stdout, Print(format!("│  {}{:<w$}{}  │\r\n",
-                        on, label, off, w = inner)))?;
+                    execute!(
+                        stdout,
+                        Print(format!("│  {}{:<w$}{}  │\r\n", on, label, off, w = inner))
+                    )?;
                     rows += 1;
                 }
             }
-            DialogType::Confirm { prompt, selected, .. } => {
-                execute!(stdout, Print(format!("│  {:<w$}  │\r\n", prompt, w = inner)))?;
+            DialogType::Confirm {
+                prompt, selected, ..
+            } => {
+                execute!(
+                    stdout,
+                    Print(format!("│  {:<w$}  │\r\n", prompt, w = inner))
+                )?;
                 rows += 1;
                 let yes_style = if *selected { "\x1b[1;36m" } else { DIM_GRAY };
-                let no_style  = if !selected { "\x1b[1;36m" } else { DIM_GRAY };
-                execute!(stdout, Print(format!("│  {}Yes{}   {}No{}  {:<w$}  │\r\n",
-                    yes_style, RESET, no_style, RESET, "", w = inner.saturating_sub(12))))?;
+                let no_style = if !selected { "\x1b[1;36m" } else { DIM_GRAY };
+                execute!(
+                    stdout,
+                    Print(format!(
+                        "│  {}Yes{}   {}No{}  {:<w$}  │\r\n",
+                        yes_style,
+                        RESET,
+                        no_style,
+                        RESET,
+                        "",
+                        w = inner.saturating_sub(12)
+                    ))
+                )?;
                 rows += 1;
             }
             DialogType::TextInput { prompt, input, .. } => {
-                execute!(stdout, Print(format!("│  {:<w$}  │\r\n", prompt, w = inner)))?;
-                execute!(stdout, Print(format!("│  > {:<w$}  │\r\n", input, w = inner.saturating_sub(2))))?;
+                execute!(
+                    stdout,
+                    Print(format!("│  {:<w$}  │\r\n", prompt, w = inner))
+                )?;
+                execute!(
+                    stdout,
+                    Print(format!(
+                        "│  > {:<w$}  │\r\n",
+                        input,
+                        w = inner.saturating_sub(2)
+                    ))
+                )?;
                 rows += 2;
             }
         }
 
         execute!(stdout, Print(format!("{}\r\n", div)))?;
         let help = "↑/↓ Navigate  Enter Select  Esc Cancel";
-        execute!(stdout, Print(format!("│  {}{:<w$}{}  │\r\n",
-            DIM_GRAY, help, RESET, w = inner)))?;
+        execute!(
+            stdout,
+            Print(format!(
+                "│  {}{:<w$}{}  │\r\n",
+                DIM_GRAY,
+                help,
+                RESET,
+                w = inner
+            ))
+        )?;
         execute!(stdout, Print(&bot))?;
         rows += 3;
 
@@ -853,15 +922,16 @@ impl TuiRenderer {
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
                     match (key.code, key.modifiers) {
-                        (KeyCode::Esc, _)
-                        | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             self.active_dialog = None;
                             self.erase_live_area()?;
                             self.draw_live_area()?;
                             return Ok(DialogResult::Cancelled);
                         }
                         _ => {
-                            let result = self.active_dialog.as_mut()
+                            let result = self
+                                .active_dialog
+                                .as_mut()
                                 .and_then(|d| d.handle_key_event(key));
 
                             if let Some(r) = result {
@@ -884,11 +954,11 @@ impl TuiRenderer {
     /// Show the setup wizard using ratatui in an alternate screen.
     pub fn show_tabbed_dialog(&mut self, mut dialog: TabbedDialog) -> Result<TabbedDialogResult> {
         use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
-        use ratatui::{backend::CrosstermBackend, Terminal};
         use ratatui::widgets::Widget;
+        use ratatui::{backend::CrosstermBackend, Terminal};
 
         execute!(io::stdout(), EnterAlternateScreen)?;
-        let backend  = CrosstermBackend::new(io::stdout());
+        let backend = CrosstermBackend::new(io::stdout());
         let mut term = Terminal::new(backend).context("Failed to create wizard terminal")?;
 
         let result = loop {
@@ -947,8 +1017,8 @@ impl TuiRenderer {
         // Single question — inline dialog path
         let mut answers: HashMap<String, String> = HashMap::new();
         if let Some(question) = input.questions.first() {
-            let dialog  = llm_dialogs::question_to_dialog(question);
-            let result  = self.show_dialog(dialog)?;
+            let dialog = llm_dialogs::question_to_dialog(question);
+            let result = self.show_dialog(dialog)?;
             if let Some(answer) = llm_dialogs::extract_answer(question, &result) {
                 answers.insert(question.question.clone(), answer);
             }
@@ -971,7 +1041,7 @@ impl TuiRenderer {
     fn load_history() -> Vec<String> {
         let path = match Self::history_path() {
             Some(p) => p,
-            None    => return Vec::new(),
+            None => return Vec::new(),
         };
         std::fs::read_to_string(path)
             .unwrap_or_default()
@@ -985,7 +1055,7 @@ impl TuiRenderer {
     fn save_history(history: &[String]) {
         let path = match Self::history_path() {
             Some(p) => p,
-            None    => return,
+            None => return,
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1048,7 +1118,11 @@ mod tests {
 
     #[test]
     fn status_lines_empty_counts_as_one() {
-        assert_eq!(count_status_lines(""), 1, "empty string = 1 row (idle hint always shown)");
+        assert_eq!(
+            count_status_lines(""),
+            1,
+            "empty string = 1 row (idle hint always shown)"
+        );
     }
 
     #[test]
@@ -1178,7 +1252,11 @@ mod tests {
         // Simulate typing "/help" with ghost text
         let s = compute_effective_status(Some(""), "", "/help", &reg);
         // Should contain the description for /help
-        assert!(s.contains("/help"), "description should mention command: {}", s);
+        assert!(
+            s.contains("/help"),
+            "description should mention command: {}",
+            s
+        );
     }
 
     #[test]

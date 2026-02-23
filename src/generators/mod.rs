@@ -63,9 +63,9 @@ pub struct GeneratorResponse {
 
 #[derive(Debug, Clone)]
 pub struct ResponseMetadata {
-    pub generator: String,      // "claude" | "qwen"
-    pub model: String,          // specific model name
-    pub confidence: Option<f64>, // for Qwen
+    pub generator: String,           // "claude" | "qwen"
+    pub model: String,               // specific model name
+    pub confidence: Option<f64>,     // for Qwen
     pub stop_reason: Option<String>, // for Claude
     pub input_tokens: Option<u32>,   // Input token count (if available)
     pub output_tokens: Option<u32>,  // Output token count (if available)
@@ -75,8 +75,8 @@ pub struct ResponseMetadata {
 /// Streaming chunk (text delta or complete block)
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
-    TextDelta(String),                      // Incremental text
-    ContentBlockComplete(ContentBlock),     // Complete tool_use or text block
+    TextDelta(String),                  // Incremental text
+    ContentBlockComplete(ContentBlock), // Complete tool_use or text block
 }
 
 /// Tool use request from generator

@@ -34,9 +34,9 @@ impl Default for FeaturesConfig {
         Self {
             auto_approve_tools: false, // Safe default: require confirmations
             streaming_enabled: true,   // Enable by default for better UX
-            debug_logging: false,       // Disabled by default
+            debug_logging: false,      // Disabled by default
             #[cfg(target_os = "macos")]
-            gui_automation: false,     // Disabled by default (requires permissions)
+            gui_automation: false, // Disabled by default (requires permissions)
         }
     }
 }
@@ -156,8 +156,8 @@ impl Default for ServerConfig {
             session_timeout_minutes: 30,
             auth_enabled: false,
             api_keys: vec![],
-            mode: "full".to_string(),  // "full" (daemon + REPL) or "daemon-only"
-            advertise: false,           // Disabled by default
+            mode: "full".to_string(), // "full" (daemon + REPL) or "daemon-only"
+            advertise: false,         // Disabled by default
             service_name: String::new(), // Empty = auto-generate from hostname
             service_description: "Finch AI Assistant".to_string(),
         }
@@ -176,7 +176,6 @@ impl Default for ClientConfig {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // License configuration
@@ -236,7 +235,6 @@ pub struct TeacherEntry {
     pub name: Option<String>,
 }
 
-
 // ---------------------------------------------------------------------------
 // Conversion helpers between ProviderEntry and legacy types
 // (Defined here to avoid circular imports — TeacherEntry lives in this file)
@@ -247,42 +245,69 @@ impl ProviderEntry {
     /// Returns `None` for `Local` variants.
     pub fn to_teacher_entry(&self) -> Option<TeacherEntry> {
         match self {
-            Self::Claude { api_key, model, base_url, name } => Some(TeacherEntry {
+            Self::Claude {
+                api_key,
+                model,
+                base_url,
+                name,
+            } => Some(TeacherEntry {
                 provider: "claude".to_string(),
                 api_key: api_key.clone(),
                 model: model.clone(),
                 base_url: base_url.clone(),
                 name: name.clone(),
             }),
-            Self::Openai { api_key, model, base_url, name } => Some(TeacherEntry {
+            Self::Openai {
+                api_key,
+                model,
+                base_url,
+                name,
+            } => Some(TeacherEntry {
                 provider: "openai".to_string(),
                 api_key: api_key.clone(),
                 model: model.clone(),
                 base_url: base_url.clone(),
                 name: name.clone(),
             }),
-            Self::Grok { api_key, model, name } => Some(TeacherEntry {
+            Self::Grok {
+                api_key,
+                model,
+                name,
+            } => Some(TeacherEntry {
                 provider: "grok".to_string(),
                 api_key: api_key.clone(),
                 model: model.clone(),
                 base_url: None,
                 name: name.clone(),
             }),
-            Self::Gemini { api_key, model, name } => Some(TeacherEntry {
+            Self::Gemini {
+                api_key,
+                model,
+                name,
+            } => Some(TeacherEntry {
                 provider: "gemini".to_string(),
                 api_key: api_key.clone(),
                 model: model.clone(),
                 base_url: None,
                 name: name.clone(),
             }),
-            Self::Mistral { api_key, model, base_url, name } => Some(TeacherEntry {
+            Self::Mistral {
+                api_key,
+                model,
+                base_url,
+                name,
+            } => Some(TeacherEntry {
                 provider: "mistral".to_string(),
                 api_key: api_key.clone(),
                 model: model.clone(),
                 base_url: base_url.clone(),
                 name: name.clone(),
             }),
-            Self::Groq { api_key, model, name } => Some(TeacherEntry {
+            Self::Groq {
+                api_key,
+                model,
+                name,
+            } => Some(TeacherEntry {
                 provider: "groq".to_string(),
                 api_key: api_key.clone(),
                 model: model.clone(),
@@ -401,7 +426,10 @@ impl Config {
             let valid_providers = ["claude", "openai", "grok", "gemini", "mistral", "groq"];
             if !valid_providers.contains(&teacher.provider.as_str()) {
                 anyhow::bail!(errors::wrap_error_with_suggestion(
-                    format!("Invalid provider '{}' in teacher[{}]", teacher.provider, idx),
+                    format!(
+                        "Invalid provider '{}' in teacher[{}]",
+                        teacher.provider, idx
+                    ),
                     &format!(
                         "Valid providers: {}\n\n\
                          Update your config:\n  \
@@ -434,7 +462,10 @@ impl Config {
                 "openai" | "groq" => {
                     if !teacher.api_key.starts_with("sk-") {
                         anyhow::bail!(errors::wrap_error_with_suggestion(
-                            format!("{} API key has incorrect format (teacher[{}])", teacher.provider, idx),
+                            format!(
+                                "{} API key has incorrect format (teacher[{}])",
+                                teacher.provider, idx
+                            ),
                             &format!(
                                 "{} API keys start with 'sk-'\n\n\
                                  Get a valid key from:\n  \
@@ -480,7 +511,10 @@ impl Config {
 
         if self.server.max_sessions > 10000 {
             anyhow::bail!(errors::wrap_error_with_suggestion(
-                format!("max_sessions ({}) is unreasonably high", self.server.max_sessions),
+                format!(
+                    "max_sessions ({}) is unreasonably high",
+                    self.server.max_sessions
+                ),
                 "Recommended range: 1-1000\n\
                  High values may cause memory issues"
             ));
@@ -496,7 +530,10 @@ impl Config {
 
         if self.client.timeout_seconds > 3600 {
             anyhow::bail!(errors::wrap_error_with_suggestion(
-                format!("timeout_seconds ({}) is very high", self.client.timeout_seconds),
+                format!(
+                    "timeout_seconds ({}) is very high",
+                    self.client.timeout_seconds
+                ),
                 "Recommended range: 30-600 seconds\n\
                  High values may cause requests to hang"
             ));
@@ -605,7 +642,8 @@ impl Config {
     pub fn save(&self) -> anyhow::Result<()> {
         use std::fs;
 
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
         let config_dir = home.join(".finch");
         let config_path = config_dir.join("config.toml");
 
@@ -680,7 +718,10 @@ mod tests {
     fn test_features_config_safe_defaults() {
         let f = FeaturesConfig::default();
         // Safety-critical defaults
-        assert!(!f.auto_approve_tools, "auto_approve_tools must default to false");
+        assert!(
+            !f.auto_approve_tools,
+            "auto_approve_tools must default to false"
+        );
         assert!(f.streaming_enabled, "streaming should be on by default");
         assert!(!f.debug_logging, "debug logging should be off by default");
         #[cfg(target_os = "macos")]
@@ -722,14 +763,12 @@ mod tests {
     #[test]
     fn test_with_providers_derives_teachers() {
         use crate::config::ProviderEntry;
-        let providers = vec![
-            ProviderEntry::Claude {
-                api_key: "sk-ant-test".to_string(),
-                model: None,
-                base_url: None,
-                name: Some("Claude".to_string()),
-            },
-        ];
+        let providers = vec![ProviderEntry::Claude {
+            api_key: "sk-ant-test".to_string(),
+            model: None,
+            base_url: None,
+            name: Some("Claude".to_string()),
+        }];
         let config = Config::with_providers(providers);
         assert_eq!(config.teachers.len(), 1);
         assert_eq!(config.teachers[0].provider, "claude");
@@ -740,21 +779,19 @@ mod tests {
 
     #[test]
     fn test_with_providers_derives_backend_from_local() {
+        use crate::config::ExecutionTarget;
         use crate::config::ProviderEntry;
         use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
-        use crate::config::ExecutionTarget;
-        let providers = vec![
-            ProviderEntry::Local {
-                inference_provider: InferenceProvider::Onnx,
-                execution_target: ExecutionTarget::Auto,
-                model_family: ModelFamily::Qwen2,
-                model_size: ModelSize::Medium,
-                model_repo: None,
-                model_path: None,
-                enabled: true,
-                name: None,
-            },
-        ];
+        let providers = vec![ProviderEntry::Local {
+            inference_provider: InferenceProvider::Onnx,
+            execution_target: ExecutionTarget::Auto,
+            model_family: ModelFamily::Qwen2,
+            model_size: ModelSize::Medium,
+            model_repo: None,
+            model_path: None,
+            enabled: true,
+            name: None,
+        }];
         let config = Config::with_providers(providers);
         assert!(config.teachers.is_empty()); // no cloud providers
         assert!(config.backend.enabled);
@@ -765,9 +802,9 @@ mod tests {
 
     #[test]
     fn test_cloud_providers_filters_local() {
+        use crate::config::ExecutionTarget;
         use crate::config::ProviderEntry;
         use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
-        use crate::config::ExecutionTarget;
         let providers = vec![
             ProviderEntry::Grok {
                 api_key: "xai-key".to_string(),

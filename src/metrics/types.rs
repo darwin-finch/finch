@@ -148,7 +148,13 @@ mod tests {
         let metric = RequestMetric::new(
             "hash_roundtrip".to_string(),
             "local".to_string(),
-            None, None, None, 100, comparison, None, None,
+            None,
+            None,
+            None,
+            100,
+            comparison,
+            None,
+            None,
         );
         let json = serde_json::to_string(&metric).unwrap();
         let decoded: RequestMetric = serde_json::from_str(&json).unwrap();

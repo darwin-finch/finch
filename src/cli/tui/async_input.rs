@@ -25,11 +25,7 @@ fn encode_rgba_to_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8
     use std::io::Cursor;
     let mut buf = Vec::new();
     {
-        let mut encoder = png::Encoder::new(
-            Cursor::new(&mut buf),
-            width as u32,
-            height as u32,
-        );
+        let mut encoder = png::Encoder::new(Cursor::new(&mut buf), width as u32, height as u32);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().ok()?;
@@ -80,9 +76,7 @@ fn should_accept_key_event(key: &KeyEvent) -> bool {
 /// - Handles Enter key to submit input
 /// - Handles all other keys via TextArea
 /// - Renders TUI periodically
-pub fn spawn_input_task(
-    tui_renderer: Arc<Mutex<TuiRenderer>>,
-) -> mpsc::UnboundedReceiver<String> {
+pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::UnboundedReceiver<String> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
@@ -91,9 +85,7 @@ pub fn spawn_input_task(
                 let mut tui = tui_renderer.lock().await;
 
                 // Poll with short timeout (100ms) to avoid blocking
-                if crossterm::event::poll(Duration::from_millis(100))
-                    .unwrap_or(false)
-                {
+                if crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false) {
                     // Track if we need to render after processing first event
                     let mut first_event_modified_input = false;
 
@@ -102,7 +94,8 @@ pub fn spawn_input_task(
                         Ok(Event::Key(key)) => {
                             // Priority 1: Handle active dialog (if any)
                             if tui.active_dialog.is_some() {
-                                let dialog_result = if let Some(dialog) = tui.active_dialog.as_mut() {
+                                let dialog_result = if let Some(dialog) = tui.active_dialog.as_mut()
+                                {
                                     dialog.handle_key_event(key)
                                 } else {
                                     None
@@ -119,173 +112,197 @@ pub fn spawn_input_task(
 
                                 Ok(None) // Don't submit input while dialog is active
                             } else if key.code == KeyCode::Enter {
-                            // Check if Shift is held (Shift+Enter inserts newline, Enter submits)
-                            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                // Shift+Enter: Insert newline (pass to textarea)
-                                tui.input_textarea.input(Event::Key(key));
-                                first_event_modified_input = true; // Mark for render
-                                Ok(None)
-                            } else {
-                                // Enter without Shift: Submit input
-                                let input = tui.input_textarea.lines().join("\n");
-                                if !input.trim().is_empty() {
-                                    // Add to command history
-                                    tui.command_history.push(input.clone());
-                                    tui.history_index = None;
-                                    tui.history_draft = None; // Clear any saved draft
-
-                                    // Clear textarea for next input
-                                    tui.input_textarea = TuiRenderer::create_clean_textarea();
-                                    Ok(Some(input))
+                                // Check if Shift is held (Shift+Enter inserts newline, Enter submits)
+                                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    // Shift+Enter: Insert newline (pass to textarea)
+                                    tui.input_textarea.input(Event::Key(key));
+                                    first_event_modified_input = true; // Mark for render
+                                    Ok(None)
                                 } else {
-                                    Ok(None) // Empty input, ignore
+                                    // Enter without Shift: Submit input
+                                    let input = tui.input_textarea.lines().join("\n");
+                                    if !input.trim().is_empty() {
+                                        // Add to command history
+                                        tui.command_history.push(input.clone());
+                                        tui.history_index = None;
+                                        tui.history_draft = None; // Clear any saved draft
+
+                                        // Clear textarea for next input
+                                        tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                        Ok(Some(input))
+                                    } else {
+                                        Ok(None) // Empty input, ignore
+                                    }
                                 }
-                            }
                             } else {
-                            // Priority 3: Handle other keys (feedback shortcuts, history, input)
-                            // Check for feedback shortcuts when input is empty
-                            let _input_empty = tui.input_textarea.lines().join("").trim().is_empty();
+                                // Priority 3: Handle other keys (feedback shortcuts, history, input)
+                                // Check for feedback shortcuts when input is empty
+                                let _input_empty =
+                                    tui.input_textarea.lines().join("").trim().is_empty();
 
-                            // Check for special shortcuts and navigation (Ctrl+C, Ctrl+G, Ctrl+B, Up/Down)
-                            match (key.code, key.modifiers) {
-                                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                                    // Ctrl+C: Cancel query
-                                    tui.pending_cancellation = true;
-                                    Ok(None)
-                                }
-                                // Cmd+V on macOS / Ctrl+V: check clipboard for images
-                                (KeyCode::Char('v'), m)
-                                    if m.contains(KeyModifiers::SUPER)
-                                        || m.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    // Try to grab image from clipboard first
-                                    if let Some((b64, media_type)) = try_grab_clipboard_image() {
-                                        tui.image_counter += 1;
-                                        let idx = tui.image_counter;
-                                        tui.pending_images.push((idx, b64, media_type));
-
-                                        // Insert marker into textarea
-                                        let marker = format!("[Image #{}]", idx);
-                                        let current = tui.input_textarea.lines().join("\n");
-                                        let new_text = if current.trim().is_empty() {
-                                            marker
-                                        } else {
-                                            format!("{}\n{}", current, marker)
-                                        };
-                                        tui.input_textarea =
-                                            TuiRenderer::create_clean_textarea_with_text(&new_text);
-                                        first_event_modified_input = true;
-                                    } else {
-                                        // No image - pass V to textarea for text paste
-                                        tui.input_textarea.input(Event::Key(key));
-                                        first_event_modified_input = true;
+                                // Check for special shortcuts and navigation (Ctrl+C, Ctrl+G, Ctrl+B, Up/Down)
+                                match (key.code, key.modifiers) {
+                                    (KeyCode::Char('c'), m)
+                                        if m.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // Ctrl+C: Cancel query
+                                        tui.pending_cancellation = true;
+                                        Ok(None)
                                     }
-                                    Ok(None)
-                                }
-                                (KeyCode::Char('g'), m) if m.contains(KeyModifiers::CONTROL) => {
-                                    // Ctrl+G: Good feedback
-                                    tui.pending_feedback = Some(crate::feedback::FeedbackRating::Good);
-                                    Ok(None)
-                                }
-                                (KeyCode::Char('b'), m) if m.contains(KeyModifiers::CONTROL) => {
-                                    // Ctrl+B: Bad feedback
-                                    tui.pending_feedback = Some(crate::feedback::FeedbackRating::Bad);
-                                    Ok(None)
-                                }
-                                (KeyCode::Char('/'), m) if m.contains(KeyModifiers::CONTROL) => {
-                                    // Ctrl+/: Show help (send as command)
-                                    Ok(Some("/help".to_string()))
-                                }
-                                (KeyCode::BackTab, _) => {
-                                    // Shift+Tab: Toggle plan mode (send as command)
-                                    Ok(Some("/plan".to_string()))
-                                }
-                                (KeyCode::Up, KeyModifiers::NONE) => {
-                                    // Check cursor position - only navigate history if at top line
-                                    let (cursor_row, _cursor_col) = tui.input_textarea.cursor();
+                                    // Cmd+V on macOS / Ctrl+V: check clipboard for images
+                                    (KeyCode::Char('v'), m)
+                                        if m.contains(KeyModifiers::SUPER)
+                                            || m.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // Try to grab image from clipboard first
+                                        if let Some((b64, media_type)) = try_grab_clipboard_image()
+                                        {
+                                            tui.image_counter += 1;
+                                            let idx = tui.image_counter;
+                                            tui.pending_images.push((idx, b64, media_type));
 
-                                    if cursor_row == 0 {
-                                        // At top line - navigate history backwards (older commands)
-                                        if let Some(idx) = tui.history_index {
-                                            if idx > 0 {
-                                                tui.history_index = Some(idx - 1);
-                                                let cmd = &tui.command_history[idx - 1];
-                                                tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
-                                            }
-                                        } else if !tui.command_history.is_empty() {
-                                            // Save current input as draft before entering history
-                                            let current_text = tui.input_textarea.lines().join("\n");
-                                            if !current_text.trim().is_empty() {
-                                                tui.history_draft = Some(current_text);
-                                            }
-
-                                            tui.history_index = Some(tui.command_history.len() - 1);
-                                            let cmd = &tui.command_history[tui.command_history.len() - 1];
-                                            tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
-                                        }
-                                    } else {
-                                        // Not at top - move cursor up within textarea
-                                        tui.input_textarea.input(Event::Key(key));
-                                        first_event_modified_input = true;
-                                    }
-                                    Ok(None)
-                                }
-                                (KeyCode::Down, KeyModifiers::NONE) => {
-                                    // Check cursor position - only navigate history if at bottom line
-                                    let (cursor_row, _cursor_col) = tui.input_textarea.cursor();
-                                    let num_lines = tui.input_textarea.lines().len();
-                                    let last_line = num_lines.saturating_sub(1);
-
-                                    if cursor_row >= last_line {
-                                        // At bottom line - navigate history forwards (newer commands)
-                                        if let Some(idx) = tui.history_index {
-                                            if idx < tui.command_history.len() - 1 {
-                                                tui.history_index = Some(idx + 1);
-                                                let cmd = &tui.command_history[idx + 1];
-                                                tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
+                                            // Insert marker into textarea
+                                            let marker = format!("[Image #{}]", idx);
+                                            let current = tui.input_textarea.lines().join("\n");
+                                            let new_text = if current.trim().is_empty() {
+                                                marker
                                             } else {
-                                                // At newest entry - restore draft or clear
-                                                tui.history_index = None;
-                                                if let Some(draft) = tui.history_draft.take() {
-                                                    // Restore the saved draft
-                                                    tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&draft);
+                                                format!("{}\n{}", current, marker)
+                                            };
+                                            tui.input_textarea =
+                                                TuiRenderer::create_clean_textarea_with_text(
+                                                    &new_text,
+                                                );
+                                            first_event_modified_input = true;
+                                        } else {
+                                            // No image - pass V to textarea for text paste
+                                            tui.input_textarea.input(Event::Key(key));
+                                            first_event_modified_input = true;
+                                        }
+                                        Ok(None)
+                                    }
+                                    (KeyCode::Char('g'), m)
+                                        if m.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // Ctrl+G: Good feedback
+                                        tui.pending_feedback =
+                                            Some(crate::feedback::FeedbackRating::Good);
+                                        Ok(None)
+                                    }
+                                    (KeyCode::Char('b'), m)
+                                        if m.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // Ctrl+B: Bad feedback
+                                        tui.pending_feedback =
+                                            Some(crate::feedback::FeedbackRating::Bad);
+                                        Ok(None)
+                                    }
+                                    (KeyCode::Char('/'), m)
+                                        if m.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // Ctrl+/: Show help (send as command)
+                                        Ok(Some("/help".to_string()))
+                                    }
+                                    (KeyCode::BackTab, _) => {
+                                        // Shift+Tab: Toggle plan mode (send as command)
+                                        Ok(Some("/plan".to_string()))
+                                    }
+                                    (KeyCode::Up, KeyModifiers::NONE) => {
+                                        // Check cursor position - only navigate history if at top line
+                                        let (cursor_row, _cursor_col) = tui.input_textarea.cursor();
+
+                                        if cursor_row == 0 {
+                                            // At top line - navigate history backwards (older commands)
+                                            if let Some(idx) = tui.history_index {
+                                                if idx > 0 {
+                                                    tui.history_index = Some(idx - 1);
+                                                    let cmd = &tui.command_history[idx - 1];
+                                                    tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
+                                                }
+                                            } else if !tui.command_history.is_empty() {
+                                                // Save current input as draft before entering history
+                                                let current_text =
+                                                    tui.input_textarea.lines().join("\n");
+                                                if !current_text.trim().is_empty() {
+                                                    tui.history_draft = Some(current_text);
+                                                }
+
+                                                tui.history_index =
+                                                    Some(tui.command_history.len() - 1);
+                                                let cmd = &tui.command_history
+                                                    [tui.command_history.len() - 1];
+                                                tui.input_textarea =
+                                                    TuiRenderer::create_clean_textarea_with_text(
+                                                        cmd,
+                                                    );
+                                            }
+                                        } else {
+                                            // Not at top - move cursor up within textarea
+                                            tui.input_textarea.input(Event::Key(key));
+                                            first_event_modified_input = true;
+                                        }
+                                        Ok(None)
+                                    }
+                                    (KeyCode::Down, KeyModifiers::NONE) => {
+                                        // Check cursor position - only navigate history if at bottom line
+                                        let (cursor_row, _cursor_col) = tui.input_textarea.cursor();
+                                        let num_lines = tui.input_textarea.lines().len();
+                                        let last_line = num_lines.saturating_sub(1);
+
+                                        if cursor_row >= last_line {
+                                            // At bottom line - navigate history forwards (newer commands)
+                                            if let Some(idx) = tui.history_index {
+                                                if idx < tui.command_history.len() - 1 {
+                                                    tui.history_index = Some(idx + 1);
+                                                    let cmd = &tui.command_history[idx + 1];
+                                                    tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
                                                 } else {
-                                                    // No draft - clear input
-                                                    tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                                    // At newest entry - restore draft or clear
+                                                    tui.history_index = None;
+                                                    if let Some(draft) = tui.history_draft.take() {
+                                                        // Restore the saved draft
+                                                        tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&draft);
+                                                    } else {
+                                                        // No draft - clear input
+                                                        tui.input_textarea =
+                                                            TuiRenderer::create_clean_textarea();
+                                                    }
                                                 }
                                             }
+                                        } else {
+                                            // Not at bottom - move cursor down within textarea
+                                            tui.input_textarea.input(Event::Key(key));
+                                            first_event_modified_input = true;
                                         }
-                                    } else {
-                                        // Not at bottom - move cursor down within textarea
-                                        tui.input_textarea.input(Event::Key(key));
-                                        first_event_modified_input = true;
+                                        Ok(None)
                                     }
-                                    Ok(None)
-                                }
-                                (KeyCode::Tab, KeyModifiers::NONE) => {
-                                    // Tab: Accept ghost text suggestion if available
-                                    if let Some(ghost) = tui.ghost_text.take() {
-                                        // Append ghost text to current input
-                                        let current = tui.input_textarea.lines().join("\n");
-                                        let completed = format!("{}{}", current, ghost);
-                                        tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&completed);
-                                        first_event_modified_input = true;
-                                    } else {
-                                        // No ghost text - pass Tab to textarea (insert tab char)
-                                        tui.input_textarea.input(Event::Key(key));
-                                        first_event_modified_input = true;
+                                    (KeyCode::Tab, KeyModifiers::NONE) => {
+                                        // Tab: Accept ghost text suggestion if available
+                                        if let Some(ghost) = tui.ghost_text.take() {
+                                            // Append ghost text to current input
+                                            let current = tui.input_textarea.lines().join("\n");
+                                            let completed = format!("{}{}", current, ghost);
+                                            tui.input_textarea =
+                                                TuiRenderer::create_clean_textarea_with_text(
+                                                    &completed,
+                                                );
+                                            first_event_modified_input = true;
+                                        } else {
+                                            // No ghost text - pass Tab to textarea (insert tab char)
+                                            tui.input_textarea.input(Event::Key(key));
+                                            first_event_modified_input = true;
+                                        }
+                                        Ok(None)
                                     }
-                                    Ok(None)
-                                }
-                                _ => {
-                                    // Pass key event to textarea (with sanitization)
-                                    if should_accept_key_event(&key) {
-                                        tui.input_textarea.input(Event::Key(key));
-                                        first_event_modified_input = true; // Mark for render
+                                    _ => {
+                                        // Pass key event to textarea (with sanitization)
+                                        if should_accept_key_event(&key) {
+                                            tui.input_textarea.input(Event::Key(key));
+                                            first_event_modified_input = true; // Mark for render
+                                        }
+                                        Ok(None)
                                     }
-                                    Ok(None)
                                 }
-                            }
                             }
                         }
                         Ok(_) => Ok(None), // Ignore other events (mouse, resize, etc.)
@@ -315,7 +332,7 @@ pub fn spawn_input_task(
                                 }
                                 // Silently ignore problematic characters
                             }
-                            Ok(_) => {} // Ignore other events
+                            Ok(_) => {}      // Ignore other events
                             Err(_) => break, // Error, stop batching
                         }
                     }
@@ -387,7 +404,10 @@ mod tests {
     fn test_allows_printable_ascii() {
         // All printable ASCII 0x20–0x7E should be allowed
         for c in ' '..='~' {
-            assert!(sanitize_paste_char(c), "printable ASCII {c:?} should be allowed");
+            assert!(
+                sanitize_paste_char(c),
+                "printable ASCII {c:?} should be allowed"
+            );
         }
     }
 
@@ -395,7 +415,10 @@ mod tests {
     fn test_allows_common_whitespace() {
         assert!(sanitize_paste_char('\t'), "tab should be allowed");
         assert!(sanitize_paste_char('\n'), "newline should be allowed");
-        assert!(sanitize_paste_char('\r'), "carriage return should be allowed");
+        assert!(
+            sanitize_paste_char('\r'),
+            "carriage return should be allowed"
+        );
     }
 
     #[test]
@@ -407,7 +430,10 @@ mod tests {
             if allowed_whitespace.contains(&c) {
                 assert!(sanitize_paste_char(c), "whitespace {c:?} should be allowed");
             } else {
-                assert!(!sanitize_paste_char(c), "control char {c:?} should be blocked");
+                assert!(
+                    !sanitize_paste_char(c),
+                    "control char {c:?} should be blocked"
+                );
             }
         }
     }
@@ -415,9 +441,18 @@ mod tests {
     #[test]
     fn test_blocks_private_use_area_unicode() {
         // Private use area E000–F8FF is used for image rendering
-        assert!(!sanitize_paste_char('\u{E000}'), "private use start should be blocked");
-        assert!(!sanitize_paste_char('\u{F8FF}'), "private use end should be blocked");
-        assert!(!sanitize_paste_char('\u{E100}'), "mid private use should be blocked");
+        assert!(
+            !sanitize_paste_char('\u{E000}'),
+            "private use start should be blocked"
+        );
+        assert!(
+            !sanitize_paste_char('\u{F8FF}'),
+            "private use end should be blocked"
+        );
+        assert!(
+            !sanitize_paste_char('\u{E100}'),
+            "mid private use should be blocked"
+        );
     }
 
     #[test]
@@ -445,7 +480,10 @@ mod tests {
         // Normal alphanumeric keys should all be accepted
         for c in 'a'..='z' {
             let event = key(KeyCode::Char(c));
-            assert!(should_accept_key_event(&event), "char {c} should be accepted");
+            assert!(
+                should_accept_key_event(&event),
+                "char {c} should be accepted"
+            );
         }
     }
 
@@ -474,14 +512,20 @@ mod tests {
     #[test]
     fn test_encode_rgba_to_png_produces_png_signature() {
         // 2x2 red pixels (RGBA)
-        let rgba = vec![255u8, 0, 0, 255,  // pixel 0
-                        255,   0, 0, 255,  // pixel 1
-                        255,   0, 0, 255,  // pixel 2
-                        255,   0, 0, 255]; // pixel 3
+        let rgba = vec![
+            255u8, 0, 0, 255, // pixel 0
+            255, 0, 0, 255, // pixel 1
+            255, 0, 0, 255, // pixel 2
+            255, 0, 0, 255,
+        ]; // pixel 3
         let png = encode_rgba_to_png(2, 2, &rgba).unwrap();
 
         // PNG files start with the 8-byte PNG signature
-        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "output should start with PNG signature");
+        assert_eq!(
+            &png[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "output should start with PNG signature"
+        );
     }
 
     #[test]

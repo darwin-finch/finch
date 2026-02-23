@@ -76,9 +76,7 @@ impl GeminiProvider {
                     .content
                     .iter()
                     .map(|block| match block {
-                        ContentBlock::Text { text } => GeminiPart::Text {
-                            text: text.clone(),
-                        },
+                        ContentBlock::Text { text } => GeminiPart::Text { text: text.clone() },
                         ContentBlock::ToolUse { id: _, name, input } => GeminiPart::FunctionCall {
                             function_call: GeminiFunctionCall {
                                 name: name.clone(),
@@ -317,27 +315,45 @@ impl GeminiProvider {
                                 if let Ok(stream_response) =
                                     serde_json::from_str::<GeminiResponse>(json_str)
                                 {
-                                    if let Some(candidate) = stream_response.candidates.into_iter().next() {
+                                    if let Some(candidate) =
+                                        stream_response.candidates.into_iter().next()
+                                    {
                                         for part in candidate.content.parts {
                                             match part {
                                                 GeminiPart::Text { text } => {
                                                     accumulated_text.push_str(&text);
                                                     // Send delta immediately
-                                                    if tx.send(Ok(StreamChunk::TextDelta(text))).await.is_err() {
+                                                    if tx
+                                                        .send(Ok(StreamChunk::TextDelta(text)))
+                                                        .await
+                                                        .is_err()
+                                                    {
                                                         done = true;
                                                         break;
                                                     }
                                                 }
                                                 GeminiPart::FunctionCall { function_call } => {
                                                     // Generate unique ID for tool call
-                                                    let unique_id = format!("gemini_{}_{}", function_call.name, Uuid::new_v4());
+                                                    let unique_id = format!(
+                                                        "gemini_{}_{}",
+                                                        function_call.name,
+                                                        Uuid::new_v4()
+                                                    );
                                                     let tool_use = ContentBlock::ToolUse {
                                                         id: unique_id,
                                                         name: function_call.name,
                                                         input: function_call.args,
                                                     };
                                                     // Send complete tool use block
-                                                    if tx.send(Ok(StreamChunk::ContentBlockComplete(tool_use))).await.is_err() {
+                                                    if tx
+                                                        .send(Ok(
+                                                            StreamChunk::ContentBlockComplete(
+                                                                tool_use,
+                                                            ),
+                                                        ))
+                                                        .await
+                                                        .is_err()
+                                                    {
                                                         done = true;
                                                         break;
                                                     }

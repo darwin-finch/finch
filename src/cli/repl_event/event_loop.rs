@@ -8,13 +8,13 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::cli::commands::{Command, format_help};
+use crate::claude::ContentBlock;
+use crate::cli::commands::{format_help, Command};
 use crate::cli::conversation::ConversationHistory;
 use crate::cli::output_manager::OutputManager;
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::{spawn_input_task, TuiRenderer};
-use crate::claude::ContentBlock;
 use crate::feedback::{FeedbackEntry, FeedbackLogger, FeedbackRating};
 use crate::generators::{Generator, StreamChunk};
 use crate::local::LocalGenerator;
@@ -86,7 +86,17 @@ pub struct EventLoop {
     active_query_id: Arc<RwLock<Option<Uuid>>>,
 
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
-    pending_approvals: Arc<RwLock<std::collections::HashMap<Uuid, (crate::tools::types::ToolUse, tokio::sync::oneshot::Sender<super::events::ConfirmationResult>)>>>,
+    pending_approvals: Arc<
+        RwLock<
+            std::collections::HashMap<
+                Uuid,
+                (
+                    crate::tools::types::ToolUse,
+                    tokio::sync::oneshot::Sender<super::events::ConfirmationResult>,
+                ),
+            >,
+        >,
+    >,
 
     /// Daemon client (for /local command)
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
@@ -109,7 +119,19 @@ pub struct EventLoop {
     /// Active tool calls: tool_id -> (tool_name, input, work_unit, row_idx)
     /// All tools in one generation turn share the same WorkUnit; each
     /// tool occupies one row identified by its index.
-    active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::WorkUnit>, usize)>>>,
+    active_tool_uses: Arc<
+        RwLock<
+            std::collections::HashMap<
+                String,
+                (
+                    String,
+                    serde_json::Value,
+                    Arc<crate::cli::messages::WorkUnit>,
+                    usize,
+                ),
+            >,
+        >,
+    >,
 
     /// Feedback logger — writes rated responses to ~/.finch/feedback.jsonl
     feedback_logger: Option<FeedbackLogger>,
@@ -262,7 +284,9 @@ impl EventLoop {
             if let Ok(mut cfg) = load_config() {
                 if cfg.license.license_type == LicenseType::Noncommercial {
                     let today = chrono::Local::now().date_naive();
-                    let suppress_until = cfg.license.notice_suppress_until
+                    let suppress_until = cfg
+                        .license
+                        .notice_suppress_until
                         .as_deref()
                         .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
                     let should_show = suppress_until.is_none_or(|d| today > d);
@@ -270,10 +294,11 @@ impl EventLoop {
                         self.output_manager.write_info(
                             "Using Finch commercially? $10/yr supports development.\n  \
                              Purchase: https://polar.sh/darwin-finch\n  \
-                             Activate: finch license activate --key <key>"
+                             Activate: finch license activate --key <key>",
                         );
                         let new_date = (today + chrono::Duration::days(7))
-                            .format("%Y-%m-%d").to_string();
+                            .format("%Y-%m-%d")
+                            .to_string();
                         cfg.license.notice_suppress_until = Some(new_date);
                         let _ = cfg.save(); // non-fatal if save fails
                     }
@@ -443,9 +468,9 @@ impl EventLoop {
                         let router_ref = router.as_ref();
                         match format_training(Some(router_ref), None) {
                             Ok(s) => self.output_manager.write_info(s),
-                            Err(e) => self.output_manager.write_info(
-                                format!("⚠️  Failed to read training stats: {}", e)
-                            ),
+                            Err(e) => self
+                                .output_manager
+                                .write_info(format!("⚠️  Failed to read training stats: {}", e)),
                         }
                         self.render_tui().await?;
                     }
@@ -468,7 +493,8 @@ impl EventLoop {
                         match current_mode {
                             ReplMode::Normal => {
                                 // Enter plan mode manually
-                                let plan_path = std::env::temp_dir().join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+                                let plan_path = std::env::temp_dir()
+                                    .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
                                 let new_mode = ReplMode::Planning {
                                     task: "Manual exploration".to_string(),
                                     plan_path: plan_path.clone(),
@@ -480,7 +506,7 @@ impl EventLoop {
                                      You can explore the codebase using read-only tools:\n\
                                      - Read files, glob, grep, web_fetch are allowed\n\
                                      - Write, edit, bash are restricted\n\
-                                     Use /plan to exit plan mode."
+                                     Use /plan to exit plan mode.",
                                 );
                                 // Update status bar indicator
                                 self.update_plan_mode_indicator(&new_mode);
@@ -488,9 +514,8 @@ impl EventLoop {
                             ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
                                 // Exit plan mode, return to normal
                                 *self.mode.write().await = ReplMode::Normal;
-                                self.output_manager.write_info(
-                                    "✅ Exited plan mode. Returned to normal mode."
-                                );
+                                self.output_manager
+                                    .write_info("✅ Exited plan mode. Returned to normal mode.");
                                 // Update status bar indicator
                                 self.update_plan_mode_indicator(&ReplMode::Normal);
                             }
@@ -514,17 +539,21 @@ impl EventLoop {
                         self.handle_mcp_reload().await?;
                     }
                     Command::FeedbackCritical(note) => {
-                        self.handle_feedback_command(10.0, FeedbackRating::Bad, note).await?;
+                        self.handle_feedback_command(10.0, FeedbackRating::Bad, note)
+                            .await?;
                     }
                     Command::FeedbackMedium(note) => {
-                        self.handle_feedback_command(3.0, FeedbackRating::Bad, note).await?;
+                        self.handle_feedback_command(3.0, FeedbackRating::Bad, note)
+                            .await?;
                     }
                     Command::FeedbackGood(note) => {
-                        self.handle_feedback_command(1.0, FeedbackRating::Good, note).await?;
+                        self.handle_feedback_command(1.0, FeedbackRating::Good, note)
+                            .await?;
                     }
                     Command::ModelShow => {
                         let name = self.cloud_gen.read().await.name().to_string();
-                        self.output_manager.write_info(format!("Active cloud provider: {}", name));
+                        self.output_manager
+                            .write_info(format!("Active cloud provider: {}", name));
                         self.render_tui().await?;
                     }
                     Command::ModelList => {
@@ -532,15 +561,33 @@ impl EventLoop {
                         let current = self.cloud_gen.read().await.name().to_string();
                         let mut lines = vec!["Available providers:".to_string()];
                         for entry in &self.available_providers {
-                            let marker = if entry.provider_type() == current { "→" } else { " " };
+                            let marker = if entry.provider_type() == current {
+                                "→"
+                            } else {
+                                " "
+                            };
                             let tag = if entry.is_local() { "local" } else { "cloud" };
                             // Show availability: cloud entries are available if we can build a provider
-                            let available = !entry.is_local() && create_provider_from_entry(entry).is_ok();
-                            let avail_tag = if entry.is_local() || available { "" } else { " (no API key)" };
-                            lines.push(format!("{} [{}] {}{}", marker, tag, entry.display_name(), avail_tag));
+                            let available =
+                                !entry.is_local() && create_provider_from_entry(entry).is_ok();
+                            let avail_tag = if entry.is_local() || available {
+                                ""
+                            } else {
+                                " (no API key)"
+                            };
+                            lines.push(format!(
+                                "{} [{}] {}{}",
+                                marker,
+                                tag,
+                                entry.display_name(),
+                                avail_tag
+                            ));
                         }
                         if self.available_providers.is_empty() {
-                            lines.push("  (none configured — add [[providers]] to ~/.finch/config.toml)".to_string());
+                            lines.push(
+                                "  (none configured — add [[providers]] to ~/.finch/config.toml)"
+                                    .to_string(),
+                            );
                         }
                         self.output_manager.write_info(lines.join("\n"));
                         self.render_tui().await?;
@@ -550,7 +597,8 @@ impl EventLoop {
                     }
                     Command::LicenseStatus => {
                         use crate::config::{load_config, LicenseType};
-                        let cfg = load_config().unwrap_or_else(|_| crate::config::Config::new(vec![]));
+                        let cfg =
+                            load_config().unwrap_or_else(|_| crate::config::Config::new(vec![]));
                         let text = match &cfg.license.license_type {
                             LicenseType::Commercial => {
                                 let name = cfg.license.licensee_name.as_deref().unwrap_or("(unknown)");
@@ -578,15 +626,20 @@ impl EventLoop {
                                     cfg.license = LicenseConfig {
                                         key: Some(key),
                                         license_type: LicenseType::Commercial,
-                                        verified_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-                                        expires_at: Some(parsed.expires_at.format("%Y-%m-%d").to_string()),
+                                        verified_at: Some(
+                                            chrono::Local::now().format("%Y-%m-%d").to_string(),
+                                        ),
+                                        expires_at: Some(
+                                            parsed.expires_at.format("%Y-%m-%d").to_string(),
+                                        ),
                                         licensee_name: Some(parsed.name.clone()),
                                         notice_suppress_until: None,
                                     };
                                     if let Err(e) = cfg.save() {
-                                        self.output_manager.write_info(
-                                            format!("✓ License validated but could not save: {}", e)
-                                        );
+                                        self.output_manager.write_info(format!(
+                                            "✓ License validated but could not save: {}",
+                                            e
+                                        ));
                                     } else {
                                         self.output_manager.write_info(format!(
                                             "✓ License activated\n  Licensee: {} ({})\n  Expires:  {}",
@@ -596,7 +649,8 @@ impl EventLoop {
                                 }
                             }
                             Err(e) => {
-                                self.output_manager.write_info(format!("✗ License activation failed: {}", e));
+                                self.output_manager
+                                    .write_info(format!("✗ License activation failed: {}", e));
                             }
                         }
                         self.render_tui().await?;
@@ -606,9 +660,12 @@ impl EventLoop {
                         if let Ok(mut cfg) = load_config() {
                             cfg.license = LicenseConfig::default();
                             if let Err(e) = cfg.save() {
-                                self.output_manager.write_info(format!("⚠️  Could not save config: {}", e));
+                                self.output_manager
+                                    .write_info(format!("⚠️  Could not save config: {}", e));
                             } else {
-                                self.output_manager.write_info("✓ License removed. Now using noncommercial license.");
+                                self.output_manager.write_info(
+                                    "✓ License removed. Now using noncommercial license.",
+                                );
                             }
                         }
                         self.render_tui().await?;
@@ -633,9 +690,7 @@ impl EventLoop {
         }
 
         // Check if it's a quit command (legacy support)
-        if input.trim().eq_ignore_ascii_case("quit")
-            || input.trim().eq_ignore_ascii_case("exit")
-        {
+        if input.trim().eq_ignore_ascii_case("quit") || input.trim().eq_ignore_ascii_case("exit") {
             self.event_tx
                 .send(ReplEvent::Shutdown)
                 .context("Failed to send shutdown event")?;
@@ -697,9 +752,8 @@ impl EventLoop {
         let (last_query, last_response) = find_last_exchange(&messages);
 
         if last_response.is_empty() {
-            self.output_manager.write_info(
-                "No recent response to rate. Ask a question first.",
-            );
+            self.output_manager
+                .write_info("No recent response to rate. Ask a question first.");
             self.render_tui().await?;
             return Ok(());
         }
@@ -707,8 +761,8 @@ impl EventLoop {
         // Build and log the entry
         let (emoji, label) = match (weight as u64, &rating) {
             (10, _) => ("🔴", "critical (10×)"),
-            (3, _)  => ("🟡", "medium (3×)"),
-            _       => ("🟢", "good (1×)"),
+            (3, _) => ("🟡", "medium (3×)"),
+            _ => ("🟢", "good (1×)"),
         };
 
         let mut entry = FeedbackEntry::new(last_query, last_response, rating);
@@ -728,9 +782,8 @@ impl EventLoop {
                     self.output_manager.write_info(msg);
                 }
                 Err(e) => {
-                    self.output_manager.write_info(format!(
-                        "⚠️  Failed to log feedback: {}", e
-                    ));
+                    self.output_manager
+                        .write_info(format!("⚠️  Failed to log feedback: {}", e));
                 }
             }
         } else {
@@ -753,7 +806,8 @@ impl EventLoop {
             // Create streaming response message with info header prepended
             let msg = Arc::new(StreamingResponseMessage::new());
             msg.append_chunk("🔧 Local Model Query (bypassing routing)\n\n");
-            self.output_manager.add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
+            self.output_manager
+                .add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
             self.render_tui().await?;
 
             // Spawn streaming query in background so event loop continues running
@@ -763,10 +817,13 @@ impl EventLoop {
             let output_mgr = self.output_manager.clone();
 
             tokio::spawn(async move {
-                match daemon_client.query_local_only_streaming_with_callback(&query, move |token_text| {
-                    tracing::debug!("[/local] Received chunk: {:?}", token_text);
-                    msg_clone.append_chunk(token_text);
-                }).await {
+                match daemon_client
+                    .query_local_only_streaming_with_callback(&query, move |token_text| {
+                        tracing::debug!("[/local] Received chunk: {:?}", token_text);
+                        msg_clone.append_chunk(token_text);
+                    })
+                    .await
+                {
                     Ok(_) => {
                         // Append status indicator to the response message itself
                         msg.append_chunk("\n✓ Local model (bypassed routing)");
@@ -782,8 +839,10 @@ impl EventLoop {
             // Return immediately - event loop continues, TUI keeps rendering
         } else {
             // No daemon mode - show error
-            self.output_manager.write_error("Error: /local requires daemon mode.");
-            self.output_manager.write_info("    Start the daemon: finch daemon --bind 127.0.0.1:11435");
+            self.output_manager
+                .write_error("Error: /local requires daemon mode.");
+            self.output_manager
+                .write_info("    Start the daemon: finch daemon --bind 127.0.0.1:11435");
             self.render_tui().await?;
         }
 
@@ -827,10 +886,8 @@ impl EventLoop {
                     let new_gen: Arc<dyn Generator> =
                         Arc::new(ClaudeGenerator::new(Arc::new(client)));
                     *self.cloud_gen.write().await = new_gen;
-                    self.output_manager.write_info(format!(
-                        "✓ Switched to provider: {}",
-                        entry.provider_type()
-                    ));
+                    self.output_manager
+                        .write_info(format!("✓ Switched to provider: {}", entry.provider_type()));
                 }
             },
         }
@@ -856,7 +913,7 @@ impl EventLoop {
         } else {
             self.output_manager.write_info(
                 "MCP plugin system not configured.\n\
-                 Add MCP servers to ~/.finch/config.toml to get started."
+                 Add MCP servers to ~/.finch/config.toml to get started.",
             );
         }
 
@@ -911,7 +968,7 @@ impl EventLoop {
         } else {
             self.output_manager.write_info(
                 "MCP plugin system not configured.\n\
-                 Add MCP servers to ~/.finch/config.toml to get started."
+                 Add MCP servers to ~/.finch/config.toml to get started.",
             );
         }
 
@@ -937,10 +994,8 @@ impl EventLoop {
                     ));
                 }
                 Err(e) => {
-                    self.output_manager.write_error(format!(
-                        "Failed to refresh MCP tools: {}",
-                        e
-                    ));
+                    self.output_manager
+                        .write_error(format!("Failed to refresh MCP tools: {}", e));
                 }
             }
         } else {
@@ -956,7 +1011,7 @@ impl EventLoop {
         self.output_manager.write_info(
             "/mcp reload not yet implemented.\n\
              This command will reconnect to all MCP servers.\n\
-             For now, restart the REPL to reconnect."
+             For now, restart the REPL to reconnect.",
         );
         self.render_tui().await?;
         Ok(())
@@ -1020,9 +1075,24 @@ impl EventLoop {
         mode: Arc<RwLock<ReplMode>>,
         output_manager: Arc<OutputManager>,
         status_bar: Arc<crate::cli::StatusBar>,
-        active_tool_uses: Arc<RwLock<std::collections::HashMap<String, (String, serde_json::Value, Arc<crate::cli::messages::WorkUnit>, usize)>>>,
+        active_tool_uses: Arc<
+            RwLock<
+                std::collections::HashMap<
+                    String,
+                    (
+                        String,
+                        serde_json::Value,
+                        Arc<crate::cli::messages::WorkUnit>,
+                        usize,
+                    ),
+                >,
+            >,
+        >,
     ) {
-        tracing::debug!("process_query_with_tools starting for query_id: {:?}", query_id);
+        tracing::debug!(
+            "process_query_with_tools starting for query_id: {:?}",
+            query_id
+        );
 
         // Step 1: Routing decision
         let generator: Arc<dyn Generator> = {
@@ -1038,12 +1108,17 @@ impl EventLoop {
                 match router.route(&query) {
                     crate::router::RouteDecision::Local { confidence, .. } if confidence > 0.7 => {
                         // Use Qwen
-                        tracing::debug!("Client-side routing: Qwen (confidence: {:.2})", confidence);
+                        tracing::debug!(
+                            "Client-side routing: Qwen (confidence: {:.2})",
+                            confidence
+                        );
                         Arc::clone(&qwen_gen)
                     }
                     _ => {
                         // Use Claude
-                        tracing::debug!("Client-side routing: teacher (low confidence or no match)");
+                        tracing::debug!(
+                            "Client-side routing: teacher (low confidence or no match)"
+                        );
                         Arc::clone(&claude_gen)
                     }
                 }
@@ -1055,278 +1130,127 @@ impl EventLoop {
         };
 
         // Get conversation context
-            let messages = conversation.read().await.get_messages();
-            let caps = generator.capabilities();
+        let messages = conversation.read().await.get_messages();
+        let caps = generator.capabilities();
 
-            // Try streaming first if supported
-            if caps.supports_streaming {
-                tracing::debug!("Generator supports streaming, attempting to stream");
+        // Try streaming first if supported
+        if caps.supports_streaming {
+            tracing::debug!("Generator supports streaming, attempting to stream");
 
-                // Create a WorkUnit for this generation turn BEFORE streaming begins.
-                // The shadow-buffer / insert_before architecture requires the message to
-                // exist in output_manager before any blit cycles run — the WorkUnit's
-                // time-driven animation will be visible during streaming.
-                let work_unit = output_manager.start_work_unit("Channeling");
-
-                let stream_start = std::time::Instant::now();
-                let mut token_count: usize = 0;
-                let mut throb_idx: usize = 0;
-                status_bar.update_operation("✳ Channeling…");
-
-                match generator
-                    .generate_stream(messages.clone(), Some((*tool_definitions).clone()))
-                    .await
-                {
-                    Ok(Some(mut rx)) => {
-                        tracing::debug!("[EVENT_LOOP] Streaming started, entering receive loop");
-                        tracing::debug!("Streaming started successfully");
-
-                        // Process stream (handles tools via StreamChunk::ContentBlockComplete)
-                        let mut blocks = Vec::new();
-                        let mut text = String::new();
-
-                        while let Some(result) = rx.recv().await {
-                            match result {
-                                Ok(StreamChunk::TextDelta(delta)) => {
-                                    tracing::debug!("Received TextDelta: {} bytes", delta.len());
-                                    text.push_str(&delta);
-                                    let delta_tokens = delta.split_whitespace().count();
-                                    token_count += delta_tokens;
-                                    // WorkUnit accumulates tokens for its own animated display
-                                    work_unit.add_tokens(&delta);
-                                    // Status bar also shows throb animation
-                                    throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
-                                    let icon = THROB_FRAMES[throb_idx];
-                                    let secs = stream_start.elapsed().as_secs();
-                                    let elapsed_str = format_elapsed(secs);
-                                    let tokens_str = format_token_count(token_count);
-                                    status_bar.update_operation(format!(
-                                        "{} Channeling… ({} · ↓ {} tokens)",
-                                        icon, elapsed_str, tokens_str
-                                    ));
-                                }
-                                Ok(StreamChunk::ContentBlockComplete(block)) => {
-                                    tracing::debug!("Received ContentBlockComplete: {:?}", block);
-                                    // Advance throb during thinking phase (before text arrives)
-                                    throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
-                                    if token_count == 0 {
-                                        let icon = THROB_FRAMES[throb_idx];
-                                        let secs = stream_start.elapsed().as_secs();
-                                        status_bar.update_operation(format!(
-                                            "{} Channeling… ({} · thinking)",
-                                            icon, format_elapsed(secs)
-                                        ));
-                                    }
-                                    blocks.push(block);
-                                }
-                                Err(e) => {
-                                    tracing::error!("Stream error in event loop: {}", e);
-                                    work_unit.set_failed();
-                                    let _ = event_tx.send(ReplEvent::QueryFailed {
-                                        query_id,
-                                        error: format!("{}", e),
-                                    });
-                                    return;
-                                }
-                            }
-                        }
-
-                        tracing::debug!("[EVENT_LOOP] Stream receive loop ended, {} blocks received", blocks.len());
-                        tracing::debug!("Stream receive loop ended");
-
-                        // Stream complete — set the final response text on the WorkUnit.
-                        // If tools follow, set_complete() will be called after all tools finish.
-                        // If no tools, set_complete() is called below.
-                        if !text.is_empty() {
-                            work_unit.set_response(&text);
-                        }
-
-                        // Send stats update
-                        let _ = event_tx.send(ReplEvent::StatsUpdate {
-                            model: generator.name().to_string(),
-                            input_tokens: None,
-                            output_tokens: Some(token_count as u32),
-                            latency_ms: Some(stream_start.elapsed().as_millis() as u64),
-                        });
-
-                        tracing::debug!("[EVENT_LOOP] Streaming complete");
-
-                        // Extract tools from blocks
-                        tracing::debug!("[EVENT_LOOP] Extracting tools from blocks");
-                        let tool_uses: Vec<ToolUse> = blocks
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::ToolUse { id, name, input } => Some(ToolUse {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    input: input.clone(),
-                                }),
-                                _ => None,
-                            })
-                            .collect();
-
-                        tracing::debug!("[EVENT_LOOP] Found {} tool uses", tool_uses.len());
-
-                        // Clear streaming status
-                        status_bar.clear_operation();
-
-                        if !tool_uses.is_empty() {
-                            tracing::debug!("[EVENT_LOOP] Tools detected, updating query state");
-                            // Update state: executing tools
-                            query_states
-                                .update_state(
-                                    query_id,
-                                    QueryState::ExecutingTools {
-                                        tools_pending: tool_uses.len(),
-                                        tools_completed: 0,
-                                    },
-                                )
-                                .await;
-
-                            tracing::debug!("[EVENT_LOOP] Query state updated, adding assistant message");
-                            // Add assistant message with ALL content blocks (text + tool uses)
-                            // This is critical for proper conversation structure
-                            let assistant_message = crate::claude::Message {
-                                role: "assistant".to_string(),
-                                content: blocks.clone(),
-                            };
-                            tracing::debug!("[EVENT_LOOP] Acquiring conversation write lock...");
-                            conversation.write().await.add_message(assistant_message);
-                            tracing::debug!("[EVENT_LOOP] Assistant message added, spawning tool executions");
-
-                            // Tool calls share the WorkUnit that was created before streaming.
-                            // Each tool gets its own sub-row within the same WorkUnit.
-
-                            // Execute tools (check for AskUserQuestion first, then mode restrictions)
-                            let current_mode = mode.read().await;
-                            for tool_use in tool_uses {
-                                // Check if tool is allowed in current mode
-                                if !Self::is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
-                                    // Tool blocked by plan mode - add error row and send result
-                                    let label = format_tool_label(&tool_use.name, &tool_use.input);
-                                    let row_idx = work_unit.add_row(label);
-                                    let error_msg = format!(
-                                        "Tool '{}' is not allowed in planning mode.\n\
-                                         Reason: This tool can modify system state.\n\
-                                         Available tools: read, glob, grep, web_fetch\n\
-                                         Type /approve to execute your plan with all tools enabled.",
-                                        tool_use.name
-                                    );
-                                    work_unit.fail_row(row_idx, "blocked in plan mode");
-                                    let _ = event_tx.send(ReplEvent::ToolResult {
-                                        query_id,
-                                        tool_id: tool_use.id.clone(),
-                                        result: Err(anyhow::anyhow!("{}", error_msg)),
-                                    });
-                                    continue;
-                                }
-
-                                // Add a running row for this tool to the shared WorkUnit
-                                let label = format_tool_label(&tool_use.name, &tool_use.input);
-                                let row_idx = work_unit.add_row(&label);
-
-                                // Store (name, input, work_unit, row_idx) for result lookup
-                                active_tool_uses.write().await.insert(
-                                    tool_use.id.clone(),
-                                    (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&work_unit), row_idx),
-                                );
-
-                                // Check if this is AskUserQuestion (handle specially)
-                                if let Some(result) = handle_ask_user_question(&tool_use, Arc::clone(&tui_renderer)).await {
-                                    // Send result immediately
-                                    let _ = event_tx.send(ReplEvent::ToolResult {
-                                        query_id,
-                                        tool_id: tool_use.id.clone(),
-                                        result,
-                                    });
-                                } else if let Some(result) = handle_present_plan(
-                                    &tool_use,
-                                    Arc::clone(&tui_renderer),
-                                    Arc::clone(&mode),
-                                    Arc::clone(&conversation),
-                                    Arc::clone(&output_manager),
-                                ).await {
-                                    // Send result immediately
-                                    let _ = event_tx.send(ReplEvent::ToolResult {
-                                        query_id,
-                                        tool_id: tool_use.id.clone(),
-                                        result,
-                                    });
-                                } else {
-                                    // Regular tool execution
-                                    tool_coordinator.spawn_tool_execution(query_id, tool_use);
-                                }
-                            }
-                            drop(current_mode);
-                            tracing::debug!("[EVENT_LOOP] Tool executions spawned, returning");
-                            return;
-                        }
-
-                        // No tools — mark WorkUnit complete so blit shows final response
-                        work_unit.set_complete();
-
-                        // Add assistant message to conversation
-                        tracing::debug!("[EVENT_LOOP] No tools found, adding assistant message to conversation");
-                        conversation
-                            .write()
-                            .await
-                            .add_assistant_message(text.clone());
-
-                        // Update query state
-                        query_states
-                            .update_state(query_id, QueryState::Completed { response: text.clone() })
-                            .await;
-
-                        tracing::debug!("[EVENT_LOOP] Query complete, returning");
-                        return;
-                    }
-                    Ok(None) | Err(_) => {
-                        // Fall through to non-streaming
-                    }
-                }
-            }
-
-            // Non-streaming path (for Qwen or fallback)
-            // Create WorkUnit before the blocking generate call so the animated
-            // header is visible during the wait (blit cycle runs every ~100ms).
+            // Create a WorkUnit for this generation turn BEFORE streaming begins.
+            // The shadow-buffer / insert_before architecture requires the message to
+            // exist in output_manager before any blit cycles run — the WorkUnit's
+            // time-driven animation will be visible during streaming.
             let work_unit = output_manager.start_work_unit("Channeling");
+
+            let stream_start = std::time::Instant::now();
+            let mut token_count: usize = 0;
+            let mut throb_idx: usize = 0;
             status_bar.update_operation("✳ Channeling…");
+
             match generator
-                .generate(messages, Some((*tool_definitions).clone()))
+                .generate_stream(messages.clone(), Some((*tool_definitions).clone()))
                 .await
             {
-                Ok(response) => {
-                    // Set response text on the WorkUnit
-                    if !response.text.is_empty() {
-                        work_unit.set_response(&response.text);
+                Ok(Some(mut rx)) => {
+                    tracing::debug!("[EVENT_LOOP] Streaming started, entering receive loop");
+                    tracing::debug!("Streaming started successfully");
+
+                    // Process stream (handles tools via StreamChunk::ContentBlockComplete)
+                    let mut blocks = Vec::new();
+                    let mut text = String::new();
+
+                    while let Some(result) = rx.recv().await {
+                        match result {
+                            Ok(StreamChunk::TextDelta(delta)) => {
+                                tracing::debug!("Received TextDelta: {} bytes", delta.len());
+                                text.push_str(&delta);
+                                let delta_tokens = delta.split_whitespace().count();
+                                token_count += delta_tokens;
+                                // WorkUnit accumulates tokens for its own animated display
+                                work_unit.add_tokens(&delta);
+                                // Status bar also shows throb animation
+                                throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
+                                let icon = THROB_FRAMES[throb_idx];
+                                let secs = stream_start.elapsed().as_secs();
+                                let elapsed_str = format_elapsed(secs);
+                                let tokens_str = format_token_count(token_count);
+                                status_bar.update_operation(format!(
+                                    "{} Channeling… ({} · ↓ {} tokens)",
+                                    icon, elapsed_str, tokens_str
+                                ));
+                            }
+                            Ok(StreamChunk::ContentBlockComplete(block)) => {
+                                tracing::debug!("Received ContentBlockComplete: {:?}", block);
+                                // Advance throb during thinking phase (before text arrives)
+                                throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
+                                if token_count == 0 {
+                                    let icon = THROB_FRAMES[throb_idx];
+                                    let secs = stream_start.elapsed().as_secs();
+                                    status_bar.update_operation(format!(
+                                        "{} Channeling… ({} · thinking)",
+                                        icon,
+                                        format_elapsed(secs)
+                                    ));
+                                }
+                                blocks.push(block);
+                            }
+                            Err(e) => {
+                                tracing::error!("Stream error in event loop: {}", e);
+                                work_unit.set_failed();
+                                let _ = event_tx.send(ReplEvent::QueryFailed {
+                                    query_id,
+                                    error: format!("{}", e),
+                                });
+                                return;
+                            }
+                        }
+                    }
+
+                    tracing::debug!(
+                        "[EVENT_LOOP] Stream receive loop ended, {} blocks received",
+                        blocks.len()
+                    );
+                    tracing::debug!("Stream receive loop ended");
+
+                    // Stream complete — set the final response text on the WorkUnit.
+                    // If tools follow, set_complete() will be called after all tools finish.
+                    // If no tools, set_complete() is called below.
+                    if !text.is_empty() {
+                        work_unit.set_response(&text);
                     }
 
                     // Send stats update
                     let _ = event_tx.send(ReplEvent::StatsUpdate {
-                        model: response.metadata.model.clone(),
-                        input_tokens: response.metadata.input_tokens,
-                        output_tokens: response.metadata.output_tokens,
-                        latency_ms: response.metadata.latency_ms,
+                        model: generator.name().to_string(),
+                        input_tokens: None,
+                        output_tokens: Some(token_count as u32),
+                        latency_ms: Some(stream_start.elapsed().as_millis() as u64),
                     });
 
-                    // Send response (StreamingComplete works for non-streaming too)
-                    let _ = event_tx.send(ReplEvent::StreamingComplete {
-                        query_id,
-                        full_response: response.text.clone(),
-                    });
+                    tracing::debug!("[EVENT_LOOP] Streaming complete");
 
-                    // Convert GenToolUse to ToolUse
-                    let tool_uses: Vec<ToolUse> = response
-                        .tool_uses
-                        .into_iter()
-                        .map(|gen_tool| ToolUse {
-                            id: gen_tool.id,
-                            name: gen_tool.name,
-                            input: gen_tool.input,
+                    // Extract tools from blocks
+                    tracing::debug!("[EVENT_LOOP] Extracting tools from blocks");
+                    let tool_uses: Vec<ToolUse> = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolUse { id, name, input } => Some(ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            }),
+                            _ => None,
                         })
                         .collect();
 
+                    tracing::debug!("[EVENT_LOOP] Found {} tool uses", tool_uses.len());
+
+                    // Clear streaming status
+                    status_bar.clear_operation();
+
                     if !tool_uses.is_empty() {
+                        tracing::debug!("[EVENT_LOOP] Tools detected, updating query state");
                         // Update state: executing tools
                         query_states
                             .update_state(
@@ -1338,31 +1262,40 @@ impl EventLoop {
                             )
                             .await;
 
+                        tracing::debug!(
+                            "[EVENT_LOOP] Query state updated, adding assistant message"
+                        );
                         // Add assistant message with ALL content blocks (text + tool uses)
                         // This is critical for proper conversation structure
                         let assistant_message = crate::claude::Message {
                             role: "assistant".to_string(),
-                            content: response.content_blocks.clone(),
+                            content: blocks.clone(),
                         };
+                        tracing::debug!("[EVENT_LOOP] Acquiring conversation write lock...");
                         conversation.write().await.add_message(assistant_message);
+                        tracing::debug!(
+                            "[EVENT_LOOP] Assistant message added, spawning tool executions"
+                        );
 
-                        // Tool calls share the WorkUnit created before generate().
+                        // Tool calls share the WorkUnit that was created before streaming.
+                        // Each tool gets its own sub-row within the same WorkUnit.
 
                         // Execute tools (check for AskUserQuestion first, then mode restrictions)
                         let current_mode = mode.read().await;
                         for tool_use in tool_uses {
                             // Check if tool is allowed in current mode
                             if !Self::is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
+                                // Tool blocked by plan mode - add error row and send result
                                 let label = format_tool_label(&tool_use.name, &tool_use.input);
                                 let row_idx = work_unit.add_row(label);
-                                work_unit.fail_row(row_idx, "blocked in plan mode");
                                 let error_msg = format!(
-                                    "Tool '{}' is not allowed in planning mode.\n\
-                                     Reason: This tool can modify system state.\n\
-                                     Available tools: read, glob, grep, web_fetch\n\
-                                     Type /approve to execute your plan with all tools enabled.",
-                                    tool_use.name
-                                );
+                                        "Tool '{}' is not allowed in planning mode.\n\
+                                         Reason: This tool can modify system state.\n\
+                                         Available tools: read, glob, grep, web_fetch\n\
+                                         Type /approve to execute your plan with all tools enabled.",
+                                        tool_use.name
+                                    );
+                                work_unit.fail_row(row_idx, "blocked in plan mode");
                                 let _ = event_tx.send(ReplEvent::ToolResult {
                                     query_id,
                                     tool_id: tool_use.id.clone(),
@@ -1371,16 +1304,25 @@ impl EventLoop {
                                 continue;
                             }
 
-                            // Add a running row for this tool
+                            // Add a running row for this tool to the shared WorkUnit
                             let label = format_tool_label(&tool_use.name, &tool_use.input);
                             let row_idx = work_unit.add_row(&label);
+
+                            // Store (name, input, work_unit, row_idx) for result lookup
                             active_tool_uses.write().await.insert(
                                 tool_use.id.clone(),
-                                (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(&work_unit), row_idx),
+                                (
+                                    tool_use.name.clone(),
+                                    tool_use.input.clone(),
+                                    Arc::clone(&work_unit),
+                                    row_idx,
+                                ),
                             );
 
                             // Check if this is AskUserQuestion (handle specially)
-                            if let Some(result) = handle_ask_user_question(&tool_use, Arc::clone(&tui_renderer)).await {
+                            if let Some(result) =
+                                handle_ask_user_question(&tool_use, Arc::clone(&tui_renderer)).await
+                            {
                                 // Send result immediately
                                 let _ = event_tx.send(ReplEvent::ToolResult {
                                     query_id,
@@ -1393,7 +1335,9 @@ impl EventLoop {
                                 Arc::clone(&mode),
                                 Arc::clone(&conversation),
                                 Arc::clone(&output_manager),
-                            ).await {
+                            )
+                            .await
+                            {
                                 // Send result immediately
                                 let _ = event_tx.send(ReplEvent::ToolResult {
                                     query_id,
@@ -1406,20 +1350,184 @@ impl EventLoop {
                             }
                         }
                         drop(current_mode);
+                        tracing::debug!("[EVENT_LOOP] Tool executions spawned, returning");
                         return;
                     }
 
-                    // No tools — mark WorkUnit complete
+                    // No tools — mark WorkUnit complete so blit shows final response
                     work_unit.set_complete();
-                    tracing::debug!("Query complete (no tools), non-streaming finished");
+
+                    // Add assistant message to conversation
+                    tracing::debug!(
+                        "[EVENT_LOOP] No tools found, adding assistant message to conversation"
+                    );
+                    conversation
+                        .write()
+                        .await
+                        .add_assistant_message(text.clone());
+
+                    // Update query state
+                    query_states
+                        .update_state(
+                            query_id,
+                            QueryState::Completed {
+                                response: text.clone(),
+                            },
+                        )
+                        .await;
+
+                    tracing::debug!("[EVENT_LOOP] Query complete, returning");
+                    return;
                 }
-                Err(e) => {
-                    let _ = event_tx.send(ReplEvent::QueryFailed {
-                        query_id,
-                        error: format!("{}", e),
-                    });
+                Ok(None) | Err(_) => {
+                    // Fall through to non-streaming
                 }
             }
+        }
+
+        // Non-streaming path (for Qwen or fallback)
+        // Create WorkUnit before the blocking generate call so the animated
+        // header is visible during the wait (blit cycle runs every ~100ms).
+        let work_unit = output_manager.start_work_unit("Channeling");
+        status_bar.update_operation("✳ Channeling…");
+        match generator
+            .generate(messages, Some((*tool_definitions).clone()))
+            .await
+        {
+            Ok(response) => {
+                // Set response text on the WorkUnit
+                if !response.text.is_empty() {
+                    work_unit.set_response(&response.text);
+                }
+
+                // Send stats update
+                let _ = event_tx.send(ReplEvent::StatsUpdate {
+                    model: response.metadata.model.clone(),
+                    input_tokens: response.metadata.input_tokens,
+                    output_tokens: response.metadata.output_tokens,
+                    latency_ms: response.metadata.latency_ms,
+                });
+
+                // Send response (StreamingComplete works for non-streaming too)
+                let _ = event_tx.send(ReplEvent::StreamingComplete {
+                    query_id,
+                    full_response: response.text.clone(),
+                });
+
+                // Convert GenToolUse to ToolUse
+                let tool_uses: Vec<ToolUse> = response
+                    .tool_uses
+                    .into_iter()
+                    .map(|gen_tool| ToolUse {
+                        id: gen_tool.id,
+                        name: gen_tool.name,
+                        input: gen_tool.input,
+                    })
+                    .collect();
+
+                if !tool_uses.is_empty() {
+                    // Update state: executing tools
+                    query_states
+                        .update_state(
+                            query_id,
+                            QueryState::ExecutingTools {
+                                tools_pending: tool_uses.len(),
+                                tools_completed: 0,
+                            },
+                        )
+                        .await;
+
+                    // Add assistant message with ALL content blocks (text + tool uses)
+                    // This is critical for proper conversation structure
+                    let assistant_message = crate::claude::Message {
+                        role: "assistant".to_string(),
+                        content: response.content_blocks.clone(),
+                    };
+                    conversation.write().await.add_message(assistant_message);
+
+                    // Tool calls share the WorkUnit created before generate().
+
+                    // Execute tools (check for AskUserQuestion first, then mode restrictions)
+                    let current_mode = mode.read().await;
+                    for tool_use in tool_uses {
+                        // Check if tool is allowed in current mode
+                        if !Self::is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
+                            let label = format_tool_label(&tool_use.name, &tool_use.input);
+                            let row_idx = work_unit.add_row(label);
+                            work_unit.fail_row(row_idx, "blocked in plan mode");
+                            let error_msg = format!(
+                                "Tool '{}' is not allowed in planning mode.\n\
+                                     Reason: This tool can modify system state.\n\
+                                     Available tools: read, glob, grep, web_fetch\n\
+                                     Type /approve to execute your plan with all tools enabled.",
+                                tool_use.name
+                            );
+                            let _ = event_tx.send(ReplEvent::ToolResult {
+                                query_id,
+                                tool_id: tool_use.id.clone(),
+                                result: Err(anyhow::anyhow!("{}", error_msg)),
+                            });
+                            continue;
+                        }
+
+                        // Add a running row for this tool
+                        let label = format_tool_label(&tool_use.name, &tool_use.input);
+                        let row_idx = work_unit.add_row(&label);
+                        active_tool_uses.write().await.insert(
+                            tool_use.id.clone(),
+                            (
+                                tool_use.name.clone(),
+                                tool_use.input.clone(),
+                                Arc::clone(&work_unit),
+                                row_idx,
+                            ),
+                        );
+
+                        // Check if this is AskUserQuestion (handle specially)
+                        if let Some(result) =
+                            handle_ask_user_question(&tool_use, Arc::clone(&tui_renderer)).await
+                        {
+                            // Send result immediately
+                            let _ = event_tx.send(ReplEvent::ToolResult {
+                                query_id,
+                                tool_id: tool_use.id.clone(),
+                                result,
+                            });
+                        } else if let Some(result) = handle_present_plan(
+                            &tool_use,
+                            Arc::clone(&tui_renderer),
+                            Arc::clone(&mode),
+                            Arc::clone(&conversation),
+                            Arc::clone(&output_manager),
+                        )
+                        .await
+                        {
+                            // Send result immediately
+                            let _ = event_tx.send(ReplEvent::ToolResult {
+                                query_id,
+                                tool_id: tool_use.id.clone(),
+                                result,
+                            });
+                        } else {
+                            // Regular tool execution
+                            tool_coordinator.spawn_tool_execution(query_id, tool_use);
+                        }
+                    }
+                    drop(current_mode);
+                    return;
+                }
+
+                // No tools — mark WorkUnit complete
+                work_unit.set_complete();
+                tracing::debug!("Query complete (no tools), non-streaming finished");
+            }
+            Err(e) => {
+                let _ = event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: format!("{}", e),
+                });
+            }
+        }
     }
 
     /// Handle an event from the event channel
@@ -1441,7 +1549,12 @@ impl EventLoop {
 
                 // Update query state
                 self.query_states
-                    .update_state(query_id, QueryState::Completed { response: response.clone() })
+                    .update_state(
+                        query_id,
+                        QueryState::Completed {
+                            response: response.clone(),
+                        },
+                    )
                     .await;
 
                 // Display response
@@ -1454,11 +1567,17 @@ impl EventLoop {
 
                 // Update query state
                 self.query_states
-                    .update_state(query_id, QueryState::Failed { error: error.clone() })
+                    .update_state(
+                        query_id,
+                        QueryState::Failed {
+                            error: error.clone(),
+                        },
+                    )
                     .await;
 
                 // Display error
-                self.output_manager.write_error(format!("Query failed: {}", error));
+                self.output_manager
+                    .write_error(format!("Query failed: {}", error));
 
                 // Render TUI to ensure viewport is redrawn after error message
                 if let Err(e) = self.render_tui().await {
@@ -1490,22 +1609,30 @@ impl EventLoop {
                 self.output_manager.write_status(message);
             }
 
-            ReplEvent::StreamingComplete { query_id, full_response } => {
-                tracing::debug!("[EVENT_LOOP] Handling StreamingComplete event (non-streaming path)");
+            ReplEvent::StreamingComplete {
+                query_id,
+                full_response,
+            } => {
+                tracing::debug!(
+                    "[EVENT_LOOP] Handling StreamingComplete event (non-streaming path)"
+                );
 
                 // Clear streaming status
                 self.status_bar.clear_operation();
 
                 // Check if this query is executing tools
                 // If so, the assistant message was already added with ToolUse blocks
-                let is_executing_tools = if let Some(metadata) = self.query_states.get_metadata(query_id).await {
-                    matches!(metadata.state, QueryState::ExecutingTools { .. })
-                } else {
-                    false
-                };
+                let is_executing_tools =
+                    if let Some(metadata) = self.query_states.get_metadata(query_id).await {
+                        matches!(metadata.state, QueryState::ExecutingTools { .. })
+                    } else {
+                        false
+                    };
 
                 if !is_executing_tools {
-                    tracing::debug!("[EVENT_LOOP] No tools, adding assistant message to conversation");
+                    tracing::debug!(
+                        "[EVENT_LOOP] No tools, adding assistant message to conversation"
+                    );
                     // Add complete response to conversation (only if not executing tools)
                     self.conversation
                         .write()
@@ -1515,7 +1642,12 @@ impl EventLoop {
 
                     // Update query state
                     self.query_states
-                        .update_state(query_id, QueryState::Completed { response: full_response.clone() })
+                        .update_state(
+                            query_id,
+                            QueryState::Completed {
+                                response: full_response.clone(),
+                            },
+                        )
                         .await;
                     tracing::debug!("[EVENT_LOOP] Updated query state");
                 } else {
@@ -1542,12 +1674,8 @@ impl EventLoop {
                 latency_ms,
             } => {
                 // Update status bar with live stats
-                self.status_bar.update_live_stats(
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    latency_ms,
-                );
+                self.status_bar
+                    .update_live_stats(model, input_tokens, output_tokens, latency_ms);
                 // Render to display updated stats
                 self.render_tui().await?;
             }
@@ -1562,16 +1690,20 @@ impl EventLoop {
                 if let Some(qid) = query_id {
                     // Update query state to cancelled
                     self.query_states
-                        .update_state(qid, QueryState::Failed {
-                            error: "Cancelled by user".to_string(),
-                        })
+                        .update_state(
+                            qid,
+                            QueryState::Failed {
+                                error: "Cancelled by user".to_string(),
+                            },
+                        )
                         .await;
 
                     // Clear active query
                     *self.active_query_id.write().await = None;
 
                     // Show cancellation message
-                    self.output_manager.write_info("⚠️  Query cancelled by user (Ctrl+C)");
+                    self.output_manager
+                        .write_info("⚠️  Query cancelled by user (Ctrl+C)");
                     self.status_bar.clear_operation();
                     self.render_tui().await?;
 
@@ -1775,7 +1907,14 @@ impl EventLoop {
         let summary = match tool_name.as_str() {
             "bash" | "Bash" => {
                 if let Some(cmd) = tool_use.input.get("command").and_then(|v| v.as_str()) {
-                    format!("Command: {}", if cmd.len() > 60 { format!("{}...", &cmd[..60]) } else { cmd.to_string() })
+                    format!(
+                        "Command: {}",
+                        if cmd.len() > 60 {
+                            format!("{}...", &cmd[..60])
+                        } else {
+                            cmd.to_string()
+                        }
+                    )
                 } else {
                     "Execute shell command".to_string()
                 }
@@ -1789,7 +1928,14 @@ impl EventLoop {
             }
             "grep" | "Grep" => {
                 if let Some(pattern) = tool_use.input.get("pattern").and_then(|v| v.as_str()) {
-                    format!("Pattern: {}", if pattern.len() > 40 { format!("{}...", &pattern[..40]) } else { pattern.to_string() })
+                    format!(
+                        "Pattern: {}",
+                        if pattern.len() > 40 {
+                            format!("{}...", &pattern[..40])
+                        } else {
+                            pattern.to_string()
+                        }
+                    )
                 } else {
                     "Search files".to_string()
                 }
@@ -1803,20 +1949,42 @@ impl EventLoop {
             }
             "EnterPlanMode" => {
                 if let Some(reason) = tool_use.input.get("reason").and_then(|v| v.as_str()) {
-                    format!("Reason: {}", if reason.len() > 50 { format!("{}...", &reason[..50]) } else { reason.to_string() })
+                    format!(
+                        "Reason: {}",
+                        if reason.len() > 50 {
+                            format!("{}...", &reason[..50])
+                        } else {
+                            reason.to_string()
+                        }
+                    )
                 } else {
                     "Enter planning mode".to_string()
                 }
             }
-            _ => format!("Execute {} tool", tool_name)
+            _ => format!("Execute {} tool", tool_name),
         };
 
         let options = vec![
-            DialogOption::with_description("Allow Once", "Execute this tool once without saving approval"),
-            DialogOption::with_description("Allow Exact (Session)", "Allow this exact tool call for this session"),
-            DialogOption::with_description("Allow Pattern (Session)", "Allow similar tool calls for this session"),
-            DialogOption::with_description("Allow Exact (Persistent)", "Always allow this exact tool call"),
-            DialogOption::with_description("Allow Pattern (Persistent)", "Always allow similar tool calls"),
+            DialogOption::with_description(
+                "Allow Once",
+                "Execute this tool once without saving approval",
+            ),
+            DialogOption::with_description(
+                "Allow Exact (Session)",
+                "Allow this exact tool call for this session",
+            ),
+            DialogOption::with_description(
+                "Allow Pattern (Session)",
+                "Allow similar tool calls for this session",
+            ),
+            DialogOption::with_description(
+                "Allow Exact (Persistent)",
+                "Always allow this exact tool call",
+            ),
+            DialogOption::with_description(
+                "Allow Pattern (Persistent)",
+                "Always allow similar tool calls",
+            ),
             DialogOption::with_description("Deny", "Do not execute this tool"),
         ];
 
@@ -1837,7 +2005,10 @@ impl EventLoop {
 
         // Store the response channel and tool_use for when dialog completes
         // We'll check pending_dialog_result in the event loop and send the response then
-        self.pending_approvals.write().await.insert(query_id, (tool_use, response_tx));
+        self.pending_approvals
+            .write()
+            .await
+            .insert(query_id, (tool_use, response_tx));
 
         tracing::debug!("[EVENT_LOOP] Tool approval dialog shown, waiting for user response");
 
@@ -1906,10 +2077,8 @@ impl EventLoop {
             ReplMode::Executing { .. } => "▶ executing plan (shift+tab disabled)",
         };
 
-        self.status_bar.update_line(
-            StatusLineType::Custom("plan_mode".to_string()),
-            indicator,
-        );
+        self.status_bar
+            .update_line(StatusLineType::Custom("plan_mode".to_string()), indicator);
     }
 
     /// Check if a tool is allowed in the current mode
@@ -1973,16 +2142,22 @@ impl EventLoop {
         // Update status bar
         self.update_plan_mode_indicator(&new_mode);
 
-        self.output_manager.write_info(format!("{}", "✓ Entered planning mode".blue().bold()));
+        self.output_manager
+            .write_info(format!("{}", "✓ Entered planning mode".blue().bold()));
         self.output_manager.write_info(format!("📋 Task: {}", task));
-        self.output_manager.write_info(format!("📁 Plan will be saved to: {}", plan_path.display()));
+        self.output_manager
+            .write_info(format!("📁 Plan will be saved to: {}", plan_path.display()));
         self.output_manager.write_info("");
-        self.output_manager.write_info(format!("{}", "Available tools:".green()));
-        self.output_manager.write_info("  read, glob, grep, web_fetch");
-        self.output_manager.write_info(format!("{}", "Blocked tools:".red()));
+        self.output_manager
+            .write_info(format!("{}", "Available tools:".green()));
+        self.output_manager
+            .write_info("  read, glob, grep, web_fetch");
+        self.output_manager
+            .write_info(format!("{}", "Blocked tools:".red()));
         self.output_manager.write_info("  bash, save_and_exec");
         self.output_manager.write_info("");
-        self.output_manager.write_info("Ask me to explore the codebase and generate a plan.");
+        self.output_manager
+            .write_info("Ask me to explore the codebase and generate a plan.");
         self.output_manager.write_info(format!(
             "{}",
             "Type /show-plan to view, /approve to execute, /reject to cancel.".dark_grey()
@@ -2015,7 +2190,10 @@ impl EventLoop {
         // Guard: already planning or executing
         {
             let mode = self.mode.read().await;
-            if matches!(*mode, ReplMode::Planning { .. } | ReplMode::Executing { .. }) {
+            if matches!(
+                *mode,
+                ReplMode::Planning { .. } | ReplMode::Executing { .. }
+            ) {
                 let name = match &*mode {
                     ReplMode::Planning { .. } => "planning",
                     ReplMode::Executing { .. } => "executing",
@@ -2063,9 +2241,7 @@ impl EventLoop {
             Arc::clone(&self.output_manager),
             ImpcpdConfig::default(),
         );
-        let result = plan_loop
-            .run(&task, Arc::clone(&self.tui_renderer))
-            .await?;
+        let result = plan_loop.run(&task, Arc::clone(&self.tui_renderer)).await?;
 
         // ── Handle loop result ────────────────────────────────────────────────
         match result {
@@ -2082,19 +2258,20 @@ impl EventLoop {
 
                 // Save final plan to disk
                 if let Err(e) = std::fs::write(&plan_path, &final_plan) {
-                    self.output_manager.write_info(format!(
-                        "⚠️  Could not save plan file: {}",
-                        e
-                    ));
+                    self.output_manager
+                        .write_info(format!("⚠️  Could not save plan file: {}", e));
                 }
 
                 // Show the plan for final human review
-                self.output_manager.write_info(format!("\n{}", "━".repeat(70)));
+                self.output_manager
+                    .write_info(format!("\n{}", "━".repeat(70)));
                 self.output_manager
                     .write_info(format!("{}", "📋 FINAL IMPLEMENTATION PLAN".bold()));
-                self.output_manager.write_info(format!("{}\n", "━".repeat(70)));
+                self.output_manager
+                    .write_info(format!("{}\n", "━".repeat(70)));
                 self.output_manager.write_info(final_plan.clone());
-                self.output_manager.write_info(format!("\n{}\n", "━".repeat(70)));
+                self.output_manager
+                    .write_info(format!("\n{}\n", "━".repeat(70)));
                 self.render_tui().await?;
 
                 // Final approval dialog
@@ -2188,15 +2365,25 @@ async fn handle_present_plan(
     // Extract plan content
     let plan_content = match tool_use.input["plan"].as_str() {
         Some(content) => content,
-        None => return Some(Err(anyhow::anyhow!("Missing 'plan' field in PresentPlan input"))),
+        None => {
+            return Some(Err(anyhow::anyhow!(
+                "Missing 'plan' field in PresentPlan input"
+            )))
+        }
     };
 
     // Verify we're in planning mode and get plan path
     let (task, plan_path) = {
         let current_mode = mode.read().await;
         match &*current_mode {
-            crate::cli::ReplMode::Planning { task, plan_path, .. } => (task.clone(), plan_path.clone()),
-            _ => return Some(Ok("⚠️  Not in planning mode. Use EnterPlanMode first.".to_string())),
+            crate::cli::ReplMode::Planning {
+                task, plan_path, ..
+            } => (task.clone(), plan_path.clone()),
+            _ => {
+                return Some(Ok(
+                    "⚠️  Not in planning mode. Use EnterPlanMode first.".to_string()
+                ))
+            }
         }
     };
 
@@ -2229,7 +2416,10 @@ async fn handle_present_plan(
                 "Exit plan mode and return to normal conversation",
             ),
         ],
-    ).with_help("Use ↑↓ or j/k to navigate, Enter to select, 'o' for custom feedback, Esc to cancel");
+    )
+    .with_help(
+        "Use ↑↓ or j/k to navigate, Enter to select, 'o' for custom feedback, Esc to cancel",
+    );
 
     let mut tui = tui_renderer.lock().await;
     let dialog_result = tui.show_dialog(dialog);
@@ -2237,7 +2427,12 @@ async fn handle_present_plan(
 
     let dialog_result = match dialog_result {
         Ok(result) => result,
-        Err(e) => return Some(Err(anyhow::anyhow!("Failed to show approval dialog: {}", e))),
+        Err(e) => {
+            return Some(Err(anyhow::anyhow!(
+                "Failed to show approval dialog: {}",
+                e
+            )))
+        }
     };
 
     // Handle dialog result
@@ -2283,7 +2478,10 @@ async fn handle_present_plan(
                     "[System: Plan approved! Execute this plan:]\n\n{}",
                     plan_content
                 ));
-                output_manager.write_info(format!("{}", "✓ Context cleared. Plan loaded as execution guide.".green()));
+                output_manager.write_info(format!(
+                    "{}",
+                    "✓ Context cleared. Plan loaded as execution guide.".green()
+                ));
             } else {
                 // Keep history, just add approval message
                 conversation.write().await.add_user_message(
@@ -2291,11 +2489,15 @@ async fn handle_present_plan(
                 );
             }
 
-            output_manager.write_info(format!("{}", "✓ Plan approved! All tools enabled.".green().bold()));
+            output_manager.write_info(format!(
+                "{}",
+                "✓ Plan approved! All tools enabled.".green().bold()
+            ));
 
             Some(Ok("Plan approved by user. Context has been prepared. You may now proceed with implementation using all available tools (Bash, Write, Edit, etc.).".to_string()))
         }
-        crate::cli::tui::DialogResult::Selected(1) | crate::cli::tui::DialogResult::CustomText(_) => {
+        crate::cli::tui::DialogResult::Selected(1)
+        | crate::cli::tui::DialogResult::CustomText(_) => {
             // Request changes
             let feedback = if let crate::cli::tui::DialogResult::CustomText(text) = dialog_result {
                 text
@@ -2316,7 +2518,10 @@ async fn handle_present_plan(
                 }
             };
 
-            output_manager.write_info(format!("{}", "📝 Changes requested. Revising plan...".yellow()));
+            output_manager.write_info(format!(
+                "{}",
+                "📝 Changes requested. Revising plan...".yellow()
+            ));
 
             Some(Ok(format!(
                 "User reviewed the plan and requests the following changes:\n\n{}\n\n\
@@ -2327,14 +2532,22 @@ async fn handle_present_plan(
         crate::cli::tui::DialogResult::Selected(2) => {
             // Rejected
             *mode.write().await = crate::cli::ReplMode::Normal;
-            output_manager.write_info(format!("{}", "✗ Plan rejected. Returning to normal mode.".yellow()));
-            conversation.write().await.add_user_message("[System: Plan rejected by user. Returning to normal conversation.]".to_string());
+            output_manager.write_info(format!(
+                "{}",
+                "✗ Plan rejected. Returning to normal mode.".yellow()
+            ));
+            conversation.write().await.add_user_message(
+                "[System: Plan rejected by user. Returning to normal conversation.]".to_string(),
+            );
 
-            Some(Ok("Plan rejected by user. Exiting plan mode and returning to normal conversation.".to_string()))
+            Some(Ok(
+                "Plan rejected by user. Exiting plan mode and returning to normal conversation."
+                    .to_string(),
+            ))
         }
-        crate::cli::tui::DialogResult::Cancelled => {
-            Some(Ok("Plan approval cancelled. Staying in planning mode.".to_string()))
-        }
+        crate::cli::tui::DialogResult::Cancelled => Some(Ok(
+            "Plan approval cancelled. Staying in planning mode.".to_string(),
+        )),
         _ => Some(Ok("Invalid dialog result.".to_string())),
     }
 }
@@ -2399,12 +2612,16 @@ async fn handle_ask_user_question(
     tracing::debug!("[EVENT_LOOP] Detected AskUserQuestion tool call");
 
     // Parse input
-    let input: crate::cli::AskUserQuestionInput = match serde_json::from_value(tool_use.input.clone()) {
-        Ok(input) => input,
-        Err(e) => {
-            return Some(Err(anyhow::anyhow!("Failed to parse AskUserQuestion input: {}", e)));
-        }
-    };
+    let input: crate::cli::AskUserQuestionInput =
+        match serde_json::from_value(tool_use.input.clone()) {
+            Ok(input) => input,
+            Err(e) => {
+                return Some(Err(anyhow::anyhow!(
+                    "Failed to parse AskUserQuestion input: {}",
+                    e
+                )));
+            }
+        };
 
     // Show dialog and collect answers
     let mut tui = tui_renderer.lock().await;
@@ -2419,9 +2636,7 @@ async fn handle_ask_user_question(
                 Err(e) => Some(Err(anyhow::anyhow!("Failed to serialize output: {}", e))),
             }
         }
-        Err(e) => {
-            Some(Err(anyhow::anyhow!("Failed to show LLM question: {}", e)))
-        }
+        Err(e) => Some(Err(anyhow::anyhow!("Failed to show LLM question: {}", e))),
     }
 }
 
@@ -2512,7 +2727,10 @@ mod tests {
         let elapsed_str = format_elapsed(secs);
         let tokens_str = format_token_count(tokens);
         let icon = THROB_FRAMES[1]; // "✳"
-        let status = format!("{} Channeling… ({} · ↓ {} tokens)", icon, elapsed_str, tokens_str);
+        let status = format!(
+            "{} Channeling… ({} · ↓ {} tokens)",
+            icon, elapsed_str, tokens_str
+        );
         assert_eq!(status, "✳ Channeling… (1m 15s · ↓ 1.6k tokens)");
     }
 
@@ -2579,14 +2797,18 @@ mod tests {
     fn user_msg(text: &str) -> crate::claude::Message {
         crate::claude::Message {
             role: "user".to_string(),
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
         }
     }
 
     fn assistant_msg(text: &str) -> crate::claude::Message {
         crate::claude::Message {
             role: "assistant".to_string(),
-            content: vec![ContentBlock::Text { text: text.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
         }
     }
 
@@ -2601,7 +2823,11 @@ mod tests {
     fn find_last_exchange_only_user_messages() {
         let msgs = vec![user_msg("hello"), user_msg("world")];
         let (q, r) = find_last_exchange(&msgs);
-        assert!(r.is_empty(), "no assistant msg → response should be empty: {:?}", r);
+        assert!(
+            r.is_empty(),
+            "no assistant msg → response should be empty: {:?}",
+            r
+        );
         assert!(q.is_empty());
     }
 
@@ -2635,7 +2861,9 @@ mod tests {
             // Assistant message with empty text (e.g., tool-only response)
             crate::claude::Message {
                 role: "assistant".to_string(),
-                content: vec![ContentBlock::Text { text: "   ".to_string() }],
+                content: vec![ContentBlock::Text {
+                    text: "   ".to_string(),
+                }],
             },
         ];
         let (q, r) = find_last_exchange(&msgs);

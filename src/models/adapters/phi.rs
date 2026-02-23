@@ -6,7 +6,7 @@
 // Phi-3 uses ChatML format similar to Qwen, but with some differences.
 // Reference: https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
 
-use super::{LocalModelAdapter, GenerationConfig};
+use super::{GenerationConfig, LocalModelAdapter};
 
 /// Adapter for Phi model family (Phi-2, Phi-3, Phi-3.5)
 pub struct PhiAdapter;
@@ -102,10 +102,7 @@ mod tests {
     #[test]
     fn test_phi_format() {
         let adapter = PhiAdapter;
-        let prompt = adapter.format_chat_prompt(
-            "You are a helpful assistant.",
-            "What is 2+2?"
-        );
+        let prompt = adapter.format_chat_prompt("You are a helpful assistant.", "What is 2+2?");
 
         assert!(prompt.contains("<|system|>"));
         assert!(prompt.contains("You are a helpful assistant."));

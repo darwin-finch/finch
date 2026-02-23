@@ -6,7 +6,7 @@
 // DeepSeek uses a simple chat template format.
 // Reference: https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-instruct
 
-use super::{LocalModelAdapter, GenerationConfig};
+use super::{GenerationConfig, LocalModelAdapter};
 
 /// Adapter for DeepSeek model family (DeepSeek-Coder, DeepSeek-V2, etc.)
 pub struct DeepSeekAdapter;
@@ -125,12 +125,21 @@ impl LocalModelAdapter for DeepSeekAdapter {
 
         // Step 8: ONLY do aggressive constitution removal if we ACTUALLY have a prompt echo
         // Check if output starts with constitution AND contains the question/instruction
-        let has_prompt_echo = (cleaned.starts_with("You are Shammah") || cleaned.starts_with("# Shammah Constitution"))
-            && (cleaned.contains("### Instruction:") || cleaned.contains("What is") || cleaned.contains("Explain"));
+        let has_prompt_echo = (cleaned.starts_with("You are Shammah")
+            || cleaned.starts_with("# Shammah Constitution"))
+            && (cleaned.contains("### Instruction:")
+                || cleaned.contains("What is")
+                || cleaned.contains("Explain"));
 
         if has_prompt_echo {
             // Strategy 1: Look for common question-answer separators
-            for separator in &["\n\n##", "\n\nExamples", "\n\nRemember:", "---\n", "## Examples"] {
+            for separator in &[
+                "\n\n##",
+                "\n\nExamples",
+                "\n\nRemember:",
+                "---\n",
+                "## Examples",
+            ] {
                 if let Some(sep_pos) = cleaned.find(separator) {
                     // Answer is likely after this section
                     cleaned = cleaned[sep_pos..].to_string();
@@ -148,7 +157,11 @@ impl LocalModelAdapter for DeepSeekAdapter {
         }
 
         // Step 10: Remove any remaining "### Instruction:" sections
-        cleaned = cleaned.split("### Instruction:").last().unwrap_or(&cleaned).to_string();
+        cleaned = cleaned
+            .split("### Instruction:")
+            .last()
+            .unwrap_or(&cleaned)
+            .to_string();
 
         // Step 11: Remove markdown code block markers (DeepSeek-Coder specific)
         if cleaned.starts_with("```") {
@@ -157,7 +170,7 @@ impl LocalModelAdapter for DeepSeekAdapter {
                 // Check if last line is closing ```
                 if lines.last().map(|l| l.trim()) == Some("```") {
                     // Extract content between markers
-                    cleaned = lines[1..lines.len()-1].join("\n");
+                    cleaned = lines[1..lines.len() - 1].join("\n");
                 }
             }
         }
@@ -171,11 +184,11 @@ impl LocalModelAdapter for DeepSeekAdapter {
 
     fn generation_config(&self) -> GenerationConfig {
         GenerationConfig {
-            temperature: 0.8,  // Slightly higher for creative code generation
+            temperature: 0.8, // Slightly higher for creative code generation
             top_p: 0.95,
             top_k: 50,
-            repetition_penalty: 1.05,  // Lower penalty for code (repetition is natural)
-            max_tokens: 2048,  // Longer for code generation
+            repetition_penalty: 1.05, // Lower penalty for code (repetition is natural)
+            max_tokens: 2048,         // Longer for code generation
         }
     }
 }
@@ -189,7 +202,7 @@ mod tests {
         let adapter = DeepSeekAdapter;
         let prompt = adapter.format_chat_prompt(
             "You are a helpful coding assistant.",
-            "Write a function to check if a number is prime"
+            "Write a function to check if a number is prime",
         );
 
         assert!(prompt.contains("<｜begin▁of▁sentence｜>"));
@@ -277,7 +290,8 @@ mod tests {
         assert_eq!(cleaned, "4");
 
         // Test with constitution at start
-        let raw2 = "You are Shammah, a helpful AI assistant.\n\nWhat is your name?\n\nMy name is Shammah.";
+        let raw2 =
+            "You are Shammah, a helpful AI assistant.\n\nWhat is your name?\n\nMy name is Shammah.";
         let cleaned2 = adapter.clean_output(raw2);
         assert!(cleaned2.contains("Shammah")); // Should extract the answer
         assert!(!cleaned2.starts_with("You are Shammah")); // Constitution should be removed

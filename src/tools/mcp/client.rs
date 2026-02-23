@@ -131,12 +131,7 @@ impl McpClient {
 
     /// Get list of connected server names
     pub async fn list_servers(&self) -> Vec<String> {
-        self.connections
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect()
+        self.connections.read().await.keys().cloned().collect()
     }
 
     /// Check if a server is connected
@@ -150,9 +145,7 @@ impl McpClient {
 
         if let Some(conn) = connections.remove(name) {
             let mut conn = conn.write().await;
-            conn.shutdown()
-                .await
-                .context("Failed to shutdown server")?;
+            conn.shutdown().await.context("Failed to shutdown server")?;
             tracing::info!("Disconnected from MCP server: {}", name);
         }
 
@@ -182,13 +175,19 @@ impl McpClient {
 fn convert_mcp_schema(mcp_schema: &Value) -> ToolInputSchema {
     // MCP schemas are JSON Schema format
     // Extract properties and required fields
-    let properties = mcp_schema.get("properties")
+    let properties = mcp_schema
+        .get("properties")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let required = mcp_schema.get("required")
+    let required = mcp_schema
+        .get("required")
         .and_then(|r| r.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     ToolInputSchema {

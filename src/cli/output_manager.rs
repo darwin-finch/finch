@@ -9,8 +9,8 @@ use std::io::{self, Write};
 use std::sync::{Arc, RwLock};
 
 use crate::cli::messages::{
-    LiveToolMessage, MessageRef, OperationMessage,
-    UserQueryMessage, StreamingResponseMessage, StaticMessage, WorkUnit,
+    LiveToolMessage, MessageRef, OperationMessage, StaticMessage, StreamingResponseMessage,
+    UserQueryMessage, WorkUnit,
 };
 
 /// Maximum number of messages to keep in the circular buffer

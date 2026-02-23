@@ -38,11 +38,7 @@ impl EventHandler {
     }
 
     /// Handle a REPL event and update the console tree
-    pub fn handle_event(
-        &mut self,
-        console: &mut MemTreeConsole,
-        event: &ReplEvent,
-    ) -> Result<()> {
+    pub fn handle_event(&mut self, console: &mut MemTreeConsole, event: &ReplEvent) -> Result<()> {
         match event {
             ReplEvent::UserInput { input } => {
                 self.handle_user_input(console, input)?;
@@ -56,16 +52,33 @@ impl EventHandler {
                 self.handle_query_failed(console, *query_id, error)?;
             }
 
-            ReplEvent::ToolResult { query_id, tool_id, result } => {
+            ReplEvent::ToolResult {
+                query_id,
+                tool_id,
+                result,
+            } => {
                 self.handle_tool_result(console, *query_id, tool_id, result)?;
             }
 
-            ReplEvent::ToolApprovalNeeded { query_id, tool_use, .. } => {
+            ReplEvent::ToolApprovalNeeded {
+                query_id, tool_use, ..
+            } => {
                 self.handle_tool_call(console, *query_id, tool_use)?;
             }
 
-            ReplEvent::StatsUpdate { model, input_tokens, output_tokens, latency_ms } => {
-                self.handle_stats_update(console, model, *input_tokens, *output_tokens, *latency_ms)?;
+            ReplEvent::StatsUpdate {
+                model,
+                input_tokens,
+                output_tokens,
+                latency_ms,
+            } => {
+                self.handle_stats_update(
+                    console,
+                    model,
+                    *input_tokens,
+                    *output_tokens,
+                    *latency_ms,
+                )?;
             }
 
             // Ignore these events (they don't affect tree structure)
@@ -115,10 +128,7 @@ impl EventHandler {
     ) -> Result<()> {
         if let Some(&parent_id) = self.query_to_node.get(&query_id) {
             // Add error as assistant response with special styling
-            console.add_assistant_response(
-                parent_id,
-                format!("❌ Error: {}", error),
-            )?;
+            console.add_assistant_response(parent_id, format!("❌ Error: {}", error))?;
         }
 
         Ok(())
@@ -136,14 +146,11 @@ impl EventHandler {
             let description = format_tool_description(tool_use);
 
             // Add tool call node (collapsed by default)
-            let tool_node_id = console.add_tool_call(
-                parent_id,
-                tool_name.clone(),
-                description,
-            )?;
+            let tool_node_id = console.add_tool_call(parent_id, tool_name.clone(), description)?;
 
             // Track pending tool call
-            self.pending_tools.insert((query_id, tool_use.id.clone()), tool_node_id);
+            self.pending_tools
+                .insert((query_id, tool_use.id.clone()), tool_node_id);
         }
 
         Ok(())
@@ -290,7 +297,9 @@ mod tests {
 
         // Simulate query complete
         handler.query_to_node.insert(query_id, 0); // Map to first node
-        handler.handle_query_complete(&mut console, query_id, "Response").unwrap();
+        handler
+            .handle_query_complete(&mut console, query_id, "Response")
+            .unwrap();
 
         // Should have user message + response
         let visible = console.get_visible_nodes();

@@ -16,7 +16,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-14]
         rust: [stable]
 
     steps:
@@ -88,10 +88,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
+          # Note: x86_64-apple-darwin is NOT supported — ort has no prebuilt
+          # binaries for Intel macOS and GitHub deprecated Intel Mac runners.
 
     steps:
     - name: Checkout code
@@ -118,7 +118,8 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Install cargo-audit
+      run: cargo install cargo-audit --locked
+
     - name: Run cargo audit
-      uses: rustsec/audit-check@v1
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
+      run: cargo audit

@@ -5,9 +5,9 @@ use crossterm::style::Stylize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::cli::OutputManager;
-use crate::cli::tui::{Dialog, DialogOption, DialogResult, TuiRenderer};
 use crate::claude::Message;
+use crate::cli::tui::{Dialog, DialogOption, DialogResult, TuiRenderer};
+use crate::cli::OutputManager;
 use crate::generators::Generator;
 
 use super::personas::select_active_personas;
@@ -47,11 +47,7 @@ impl PlanLoop {
     ///
     /// `task` — the user's task description (e.g. "add JWT auth to the route handler")
     /// `tui`  — shared TUI renderer for showing blocking dialogs
-    pub async fn run(
-        &self,
-        task: &str,
-        tui: Arc<Mutex<TuiRenderer>>,
-    ) -> Result<PlanResult> {
+    pub async fn run(&self, task: &str, tui: Arc<Mutex<TuiRenderer>>) -> Result<PlanResult> {
         let mut history: Vec<PlanIteration> = Vec::new();
         let mut steering_feedback: Option<String> = None;
 
@@ -92,7 +88,9 @@ impl PlanLoop {
                                 critiques,
                                 user_feedback: None,
                             });
-                            return Ok(PlanResult::Converged { iterations: history });
+                            return Ok(PlanResult::Converged {
+                                iterations: history,
+                            });
                         }
                         ConvergenceResult::ScopeRunaway => {
                             self.output_manager.write_info(format!(
@@ -128,7 +126,9 @@ impl PlanLoop {
                         critiques,
                         user_feedback: None,
                     });
-                    return Ok(PlanResult::UserApproved { iterations: history });
+                    return Ok(PlanResult::UserApproved {
+                        iterations: history,
+                    });
                 }
                 UserFeedback::Cancel => {
                     return Ok(PlanResult::Cancelled);
@@ -146,7 +146,9 @@ impl PlanLoop {
         }
 
         // Hard cap reached — return the last plan
-        Ok(PlanResult::IterationCap { iterations: history })
+        Ok(PlanResult::IterationCap {
+            iterations: history,
+        })
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────
@@ -184,8 +186,11 @@ impl PlanLoop {
                 ));
 
                 // Include the must-address critiques so the LLM knows what to fix
-                let must_address: Vec<&CritiqueItem> =
-                    iter.critiques.iter().filter(|c| c.is_must_address).collect();
+                let must_address: Vec<&CritiqueItem> = iter
+                    .critiques
+                    .iter()
+                    .filter(|c| c.is_must_address)
+                    .collect();
                 if !must_address.is_empty() {
                     initial.push_str("\n\nMust-address issues from critique:");
                     for item in must_address {
@@ -193,10 +198,8 @@ impl PlanLoop {
                             .step_ref
                             .map(|s| format!(" (step {})", s))
                             .unwrap_or_default();
-                        initial.push_str(&format!(
-                            "\n- [{}{}] {}",
-                            item.persona, step, item.concern
-                        ));
+                        initial
+                            .push_str(&format!("\n- [{}{}] {}", item.persona, step, item.concern));
                     }
                 }
 
@@ -226,11 +229,7 @@ impl PlanLoop {
     }
 
     /// Critique the plan using the active personas and the embedded IMPCPD methodology.
-    async fn critique_plan(
-        &self,
-        plan: &str,
-        personas: &[&str],
-    ) -> Result<Vec<CritiqueItem>> {
+    async fn critique_plan(&self, plan: &str, personas: &[&str]) -> Result<Vec<CritiqueItem>> {
         let prompt = format!(
             "{alignment}\n\n\
              {methodology}\n\n\
@@ -267,10 +266,8 @@ impl PlanLoop {
             iteration,
             self.config.max_iterations
         ));
-        self.output_manager.write_info(format!(
-            "{}",
-            "─".repeat(60).dark_grey()
-        ));
+        self.output_manager
+            .write_info(format!("{}", "─".repeat(60).dark_grey()));
     }
 
     /// Display the current plan draft in the output area
@@ -292,10 +289,8 @@ impl PlanLoop {
     /// Display critique results, grouped into must-address vs other
     fn show_critiques(&self, critiques: &[CritiqueItem]) {
         if critiques.is_empty() {
-            self.output_manager.write_info(format!(
-                "  {} No issues found.",
-                "✓".green()
-            ));
+            self.output_manager
+                .write_info(format!("  {} No issues found.", "✓".green()));
             return;
         }
 
@@ -526,7 +521,13 @@ impl From<RawCritiqueItem> for CritiqueItem {
         // Always recompute derived fields from raw severity/confidence
         // (never trust what the LLM computed — it sometimes gets it wrong)
         let _ = (raw.signal, raw.is_must_address, raw.is_minority_risk);
-        CritiqueItem::new(raw.persona, raw.concern, raw.step_ref, raw.severity, raw.confidence)
+        CritiqueItem::new(
+            raw.persona,
+            raw.concern,
+            raw.step_ref,
+            raw.severity,
+            raw.confidence,
+        )
     }
 }
 

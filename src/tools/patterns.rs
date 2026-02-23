@@ -21,7 +21,6 @@ pub enum PatternType {
     Structured,
 }
 
-
 /// A pattern that can match multiple tool signatures using wildcards or regex
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolPattern {
@@ -632,7 +631,7 @@ mod tests {
             context_key: "cargo test in /project".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         let approval = ExactApproval::new(sig.clone());
@@ -644,7 +643,7 @@ mod tests {
             context_key: "cargo build in /project".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         assert!(!approval.matches(&different_sig));
@@ -659,7 +658,7 @@ mod tests {
             context_key: "cargo test in /project".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         // Add pattern
@@ -722,7 +721,7 @@ mod tests {
             context_key: "cargo test in /project".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         // Should match specific pattern (0 wildcards) over general (2 wildcards)
@@ -748,7 +747,7 @@ mod tests {
             context_key: "cargo test".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         let sig2 = ToolSignature {
@@ -756,7 +755,7 @@ mod tests {
             context_key: "cargo build".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         let sig3 = ToolSignature {
@@ -764,7 +763,7 @@ mod tests {
             context_key: "cargo run".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         assert!(pattern.matches(&sig1));
@@ -786,7 +785,7 @@ mod tests {
             context_key: "reading /project/src/main.rs".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         let sig2 = ToolSignature {
@@ -794,7 +793,7 @@ mod tests {
             context_key: "reading /project/src/lib.rs".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         let sig3 = ToolSignature {
@@ -802,7 +801,7 @@ mod tests {
             context_key: "reading /project/src/test.txt".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         assert!(pattern.matches(&sig1));
@@ -976,7 +975,7 @@ mod tests {
             context_key: "test123".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         let sig2 = ToolSignature {
@@ -984,7 +983,7 @@ mod tests {
             context_key: "testABC".to_string(),
             command: None,
             args: None,
-            directory: None
+            directory: None,
         };
 
         // Should match test123 but not testABC
@@ -1015,4 +1014,3 @@ mod tests {
         assert_eq!(pattern.created_by.as_deref(), Some("user@example.com"));
     }
 }
-

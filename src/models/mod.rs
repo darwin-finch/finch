@@ -1,7 +1,7 @@
 // Machine learning models
 // All models support online learning (update after each forward to Claude)
 
-pub mod adapters;  // Local model adapters (chat templates, token IDs)
+pub mod adapters; // Local model adapters (chat templates, token IDs)
 pub mod bootstrap; // Progressive bootstrap for instant startup
 pub mod common;
 pub mod compatibility; // Model compatibility matrix (which models work with which targets)
@@ -17,16 +17,18 @@ pub mod sampling; // Context-aware sampling system
 pub mod threshold_router;
 pub mod threshold_validator;
 pub mod tokenizer; // Phase 4: Stub for compatibility
-pub mod tool_parser;  // Phase 6: Parse tool calls from model output (XML)
-pub mod tool_prompt;  // Phase 6: Format tool definitions for model prompts
+pub mod tool_parser; // Phase 6: Parse tool calls from model output (XML)
+pub mod tool_prompt; // Phase 6: Format tool definitions for model prompts
 pub mod unified_loader; // Generic loader for ONNX models
 
-pub use adapters::{AdapterRegistry, LocalModelAdapter, GenerationConfig as AdapterGenerationConfig};
+pub use adapters::{
+    AdapterRegistry, GenerationConfig as AdapterGenerationConfig, LocalModelAdapter,
+};
 pub use bootstrap::{BootstrapLoader, DownloadProgressSnapshot, GeneratorState};
 #[allow(deprecated)]
 pub use common::{
-    device_info, get_device_with_preference, is_metal_available, DevicePreference,
-    GeneratorConfig, ModelConfig, Saveable,
+    device_info, get_device_with_preference, is_metal_available, DevicePreference, GeneratorConfig,
+    ModelConfig, Saveable,
 };
 pub use compatibility::{
     get_available_sizes, get_compatible_families, get_repository, get_supported_targets,
@@ -36,8 +38,8 @@ pub use download::{DownloadProgress, ModelDownloader};
 pub use generator_new::{GeneratorModel, TextGeneration, TokenCallback};
 pub use learning::{LearningModel, ModelExpectation, ModelPrediction, ModelStats, PredictionData};
 pub use lora::{
-    LoRATrainingAdapter, LoRAConfig, LoRATrainer, TrainingCoordinator, TrainingStats, WeightedExample,
-    ExampleBuffer,
+    ExampleBuffer, LoRAConfig, LoRATrainer, LoRATrainingAdapter, TrainingCoordinator,
+    TrainingStats, WeightedExample,
 };
 pub use manager::{ModelManager, OverallStats, TrainingReport};
 pub use model_selector::{ModelSelector, QwenSize};
@@ -49,8 +51,8 @@ pub use threshold_router::{
 };
 pub use threshold_validator::{QualitySignal, ThresholdValidator, ValidatorStats};
 pub use tokenizer::TextTokenizer; // Phase 4: Stub for compatibility
-pub use tool_parser::ToolCallParser;  // Phase 6: Parse tool calls from model output
-pub use tool_prompt::ToolPromptFormatter;  // Phase 6: Format tool definitions for prompts
+pub use tool_parser::ToolCallParser; // Phase 6: Parse tool calls from model output
+pub use tool_prompt::ToolPromptFormatter; // Phase 6: Format tool definitions for prompts
 pub use unified_loader::{ModelFamily, ModelLoadConfig, ModelSize, UnifiedModelLoader};
 
 /// Stub for removed RouterModel (Phase 4: Candle-based)
@@ -167,7 +169,12 @@ impl ModelEnsemble {
         anyhow::bail!("ModelEnsemble removed in Phase 4 (Candle-based)")
     }
 
-    pub fn learn_from_claude(&mut self, _query: &str, _response: &str, _was_forwarded: bool) -> anyhow::Result<()> {
+    pub fn learn_from_claude(
+        &mut self,
+        _query: &str,
+        _response: &str,
+        _was_forwarded: bool,
+    ) -> anyhow::Result<()> {
         anyhow::bail!("ModelEnsemble removed in Phase 4 (Candle-based)")
     }
 }

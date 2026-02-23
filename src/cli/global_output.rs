@@ -13,8 +13,8 @@ use once_cell::sync::Lazy;
 use std::io::{self, IsTerminal};
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::{OutputManager, StatusBar};
 use super::tui::TuiRenderer;
+use super::{OutputManager, StatusBar};
 use crate::config::ColorScheme;
 
 /// Global singleton OutputManager (swappable - set by main())
@@ -239,7 +239,9 @@ macro_rules! status_training {
             if $crate::cli::global_output::logging_enabled() {
                 eprintln!(
                     "[STATUS] Training: {} queries | Local: {:.0}% | Quality: {:.2}",
-                    $queries, $local_pct * 100.0, $quality
+                    $queries,
+                    $local_pct * 100.0,
+                    $quality
                 );
             }
         } else {
@@ -258,7 +260,10 @@ macro_rules! status_download {
             if $crate::cli::global_output::logging_enabled() {
                 eprintln!(
                     "[STATUS] Downloading {}: {:.0}% ({}/{})",
-                    $name, $pct * 100.0, $downloaded, $total
+                    $name,
+                    $pct * 100.0,
+                    $downloaded,
+                    $total
                 );
             }
         } else {
@@ -315,7 +320,10 @@ mod tests {
         output_user!("Hello");
         output_response!("Response");
         output_status!("Status message");
-        assert!(global_output().len() >= before + 1, "output_user! must write to buffer");
+        assert!(
+            global_output().len() >= before + 1,
+            "output_user! must write to buffer"
+        );
     }
 
     #[test]
@@ -325,8 +333,12 @@ mod tests {
         status.update_training_stats(10, 0.5, 0.8);
         status.update_operation("Testing");
         let lines = status.get_lines();
-        let has_training = lines.iter().any(|l| matches!(l.line_type, StatusLineType::TrainingStats));
-        let has_operation = lines.iter().any(|l| matches!(l.line_type, StatusLineType::OperationStatus));
+        let has_training = lines
+            .iter()
+            .any(|l| matches!(l.line_type, StatusLineType::TrainingStats));
+        let has_operation = lines
+            .iter()
+            .any(|l| matches!(l.line_type, StatusLineType::OperationStatus));
         assert!(has_training, "Expected TrainingStats line");
         assert!(has_operation, "Expected OperationStatus line");
     }

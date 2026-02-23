@@ -27,10 +27,7 @@ impl MemoryInfo {
 
         // Get current process memory
         let pid = sysinfo::get_current_pid().unwrap();
-        let process_memory = system
-            .process(pid)
-            .map(|p| p.memory())
-            .unwrap_or(0);
+        let process_memory = system.process(pid).map(|p| p.memory()).unwrap_or(0);
 
         Self {
             total_memory: total,
@@ -42,7 +39,7 @@ impl MemoryInfo {
 
     /// Format total memory as human-readable string
     pub fn total_gb(&self) -> f64 {
-        self.total_memory as f64 / 1_073_741_824.0  // bytes to GB
+        self.total_memory as f64 / 1_073_741_824.0 // bytes to GB
     }
 
     /// Format available memory as human-readable string
@@ -57,7 +54,7 @@ impl MemoryInfo {
 
     /// Format process memory as human-readable string
     pub fn process_mb(&self) -> f64 {
-        self.process_memory as f64 / 1_048_576.0  // bytes to MB
+        self.process_memory as f64 / 1_048_576.0 // bytes to MB
     }
 
     /// Get memory usage percentage
@@ -106,7 +103,7 @@ mod tests {
     #[test]
     fn test_memory_info() {
         let info = MemoryInfo::current();
-        
+
         // Basic sanity checks
         assert!(info.total_memory > 0);
         assert!(info.available_memory <= info.total_memory);
@@ -118,7 +115,7 @@ mod tests {
     fn test_format() {
         let info = MemoryInfo::current();
         let status = info.format_status();
-        
+
         // Should contain expected components
         assert!(status.contains("Memory:"));
         assert!(status.contains("GB"));
@@ -129,8 +126,8 @@ mod tests {
     #[test]
     fn test_thresholds() {
         let info = MemoryInfo {
-            total_memory: 16_000_000_000,  // 16GB
-            available_memory: 1_000_000_000,  // 1GB (< 10%, critical)
+            total_memory: 16_000_000_000,    // 16GB
+            available_memory: 1_000_000_000, // 1GB (< 10%, critical)
             used_memory: 15_000_000_000,
             process_memory: 500_000_000,
         };

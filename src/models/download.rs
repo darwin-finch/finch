@@ -66,8 +66,8 @@ impl ModelDownloader {
         repo_id: &str,
         estimated_size_gb: f64,
     ) -> Result<(PathBuf, mpsc::Receiver<DownloadProgress>)> {
-        use crate::cli::messages::ProgressMessage;
         use crate::cli::global_output::global_output;
+        use crate::cli::messages::ProgressMessage;
         use std::sync::Arc;
 
         let (tx, rx) = mpsc::channel();
@@ -98,7 +98,7 @@ impl ModelDownloader {
 
         // Download config files first (with required vs optional distinction)
         let config_files = vec![
-            ("config.json", true),           // Required
+            ("config.json", true),            // Required
             ("tokenizer.json", true),         // Required
             ("tokenizer_config.json", false), // Optional
             ("meta.yaml", false),             // Optional - CoreML component mapping
@@ -197,8 +197,8 @@ impl ModelDownloader {
             tracing::debug!("Checking for ONNX model files in onnx/ subdirectory...");
 
             let onnx_files = vec![
-                "onnx/model.onnx",       // Main model file
-                "onnx/model.onnx_data",  // Optional: external data for large models
+                "onnx/model.onnx",      // Main model file
+                "onnx/model.onnx_data", // Optional: external data for large models
             ];
 
             for file in &onnx_files {
@@ -265,7 +265,9 @@ impl ModelDownloader {
                         if !found_this_shard {
                             // No more shards found
                             if shard_idx == 1 {
-                                tracing::error!("No model files found (neither single nor sharded)");
+                                tracing::error!(
+                                    "No model files found (neither single nor sharded)"
+                                );
                             } else {
                                 tracing::info!("✓ Found {} total shards", shard_idx - 1);
                             }
@@ -319,7 +321,6 @@ impl ModelDownloader {
         let size_gb = model_size.download_size_gb();
         self.download_model(model_id, size_gb)
     }
-
 
     /// Check if model is already cached
     pub fn is_cached(&self, model_size: QwenSize) -> bool {

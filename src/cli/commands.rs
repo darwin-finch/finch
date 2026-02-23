@@ -8,8 +8,8 @@ use crate::router::Router;
 
 /// Output destination for commands
 pub enum CommandOutput {
-    Status(String),    // Short messages for status bar
-    Message(String),   // Long content for scrollback area
+    Status(String),  // Short messages for status bar
+    Message(String), // Long content for scrollback area
 }
 
 #[derive(Debug)]
@@ -27,7 +27,7 @@ pub enum Command {
     PatternsClear,
     PatternsAdd,
     // Plan mode commands
-    PlanModeToggle,  // Toggle plan mode on/off (Shift+Tab or /plan without args)
+    PlanModeToggle, // Toggle plan mode on/off (Shift+Tab or /plan without args)
     Plan(String),
     // Feedback commands for weighted LoRA training
     FeedbackCritical(Option<String>), // High-weight (10x) - critical strategy errors
@@ -41,19 +41,19 @@ pub enum Command {
     McpRefresh,               // Refresh tools from all servers
     McpReload,                // Reconnect to all servers
     // Persona management (Phase 2)
-    PersonaList,              // List available personas
-    PersonaSelect(String),    // Switch to a different persona
-    PersonaShow,              // Show current persona and system prompt
+    PersonaList,           // List available personas
+    PersonaSelect(String), // Switch to a different persona
+    PersonaShow,           // Show current persona and system prompt
     // Provider switching (/provider is canonical; /model and /teacher are silent aliases)
-    ModelList,                // /provider list
-    ModelSwitch(String),      // /provider <name>  e.g. /provider grok
-    ModelShow,                // /provider  (show current active provider)
+    ModelList,           // /provider list
+    ModelSwitch(String), // /provider <name>  e.g. /provider grok
+    ModelShow,           // /provider  (show current active provider)
     // Service discovery (Phase 3)
-    Discover,                 // Discover Finch daemons on local network
+    Discover, // Discover Finch daemons on local network
     // License management
-    LicenseStatus,            // /license or /license status
-    LicenseActivate(String),  // /license activate <key>
-    LicenseRemove,            // /license remove
+    LicenseStatus,           // /license or /license status
+    LicenseActivate(String), // /license activate <key>
+    LicenseRemove,           // /license remove
 }
 
 impl Command {
@@ -78,7 +78,8 @@ impl Command {
             "/persona" | "/persona list" => return Some(Command::PersonaList),
             "/persona show" => return Some(Command::PersonaShow),
             // Provider commands (/provider canonical; /model and /teacher are aliases)
-            "/provider" | "/provider show" | "/model" | "/model show" | "/teacher" | "/teacher show" => return Some(Command::ModelShow),
+            "/provider" | "/provider show" | "/model" | "/model show" | "/teacher"
+            | "/teacher show" => return Some(Command::ModelShow),
             "/provider list" | "/model list" | "/teacher list" => return Some(Command::ModelList),
             // Service discovery
             "/discover" => return Some(Command::Discover),
@@ -105,7 +106,11 @@ impl Command {
         }
 
         // Handle /provider <name> (canonical), /model <name>, /teacher <name> (aliases)
-        if let Some(rest) = trimmed.strip_prefix("/provider ").or_else(|| trimmed.strip_prefix("/model ")).or_else(|| trimmed.strip_prefix("/teacher ")) {
+        if let Some(rest) = trimmed
+            .strip_prefix("/provider ")
+            .or_else(|| trimmed.strip_prefix("/model "))
+            .or_else(|| trimmed.strip_prefix("/teacher "))
+        {
             let teacher_name = rest.trim();
             // Filter out subcommands
             if teacher_name != "list" && teacher_name != "show" && !teacher_name.is_empty() {
@@ -279,46 +284,45 @@ pub fn handle_command(
         Command::PatternsList
         | Command::PatternsRemove(_)
         | Command::PatternsClear
-        | Command::PatternsAdd => {
-            Ok(CommandOutput::Status("Pattern management commands should be handled in REPL.".to_string()))
-        }
+        | Command::PatternsAdd => Ok(CommandOutput::Status(
+            "Pattern management commands should be handled in REPL.".to_string(),
+        )),
         // Plan mode commands are handled directly in REPL
-        Command::PlanModeToggle
-        | Command::Plan(_) => {
-            Ok(CommandOutput::Status("Plan mode commands should be handled in REPL.".to_string()))
-        }
+        Command::PlanModeToggle | Command::Plan(_) => Ok(CommandOutput::Status(
+            "Plan mode commands should be handled in REPL.".to_string(),
+        )),
         // Feedback commands are handled directly in REPL
-        Command::FeedbackCritical(_) | Command::FeedbackMedium(_) | Command::FeedbackGood(_) => {
-            Ok(CommandOutput::Status("Feedback commands should be handled in REPL.".to_string()))
-        }
+        Command::FeedbackCritical(_) | Command::FeedbackMedium(_) | Command::FeedbackGood(_) => Ok(
+            CommandOutput::Status("Feedback commands should be handled in REPL.".to_string()),
+        ),
         // Local command is handled directly in REPL
-        Command::Local { .. } => {
-            Ok(CommandOutput::Status("Local command should be handled in REPL.".to_string()))
-        }
+        Command::Local { .. } => Ok(CommandOutput::Status(
+            "Local command should be handled in REPL.".to_string(),
+        )),
         // Memory command is handled directly in REPL
-        Command::Memory => {
-            Ok(CommandOutput::Status("Memory command should be handled in REPL.".to_string()))
-        }
+        Command::Memory => Ok(CommandOutput::Status(
+            "Memory command should be handled in REPL.".to_string(),
+        )),
         // MCP commands are handled directly in REPL
-        Command::McpList | Command::McpTools(_) | Command::McpRefresh | Command::McpReload => {
-            Ok(CommandOutput::Status("MCP commands should be handled in REPL.".to_string()))
-        }
+        Command::McpList | Command::McpTools(_) | Command::McpRefresh | Command::McpReload => Ok(
+            CommandOutput::Status("MCP commands should be handled in REPL.".to_string()),
+        ),
         // Persona commands are handled directly in REPL (Phase 2)
-        Command::PersonaList | Command::PersonaSelect(_) | Command::PersonaShow => {
-            Ok(CommandOutput::Status("Persona commands should be handled in REPL.".to_string()))
-        }
+        Command::PersonaList | Command::PersonaSelect(_) | Command::PersonaShow => Ok(
+            CommandOutput::Status("Persona commands should be handled in REPL.".to_string()),
+        ),
         // Model/Teacher switching commands are handled directly in REPL
-        Command::ModelList | Command::ModelSwitch(_) | Command::ModelShow => {
-            Ok(CommandOutput::Status("Model commands should be handled in REPL.".to_string()))
-        }
+        Command::ModelList | Command::ModelSwitch(_) | Command::ModelShow => Ok(
+            CommandOutput::Status("Model commands should be handled in REPL.".to_string()),
+        ),
         // Service discovery is handled directly in REPL (Phase 3)
-        Command::Discover => {
-            Ok(CommandOutput::Status("Discover command should be handled in REPL.".to_string()))
-        }
+        Command::Discover => Ok(CommandOutput::Status(
+            "Discover command should be handled in REPL.".to_string(),
+        )),
         // License commands are handled directly in REPL
-        Command::LicenseStatus | Command::LicenseActivate(_) | Command::LicenseRemove => {
-            Ok(CommandOutput::Status("License commands should be handled in REPL.".to_string()))
-        }
+        Command::LicenseStatus | Command::LicenseActivate(_) | Command::LicenseRemove => Ok(
+            CommandOutput::Status("License commands should be handled in REPL.".to_string()),
+        ),
     }
 }
 
@@ -629,9 +633,18 @@ mod tests {
     #[test]
     fn test_parse_provider_commands() {
         // /provider is canonical
-        assert!(matches!(Command::parse("/provider"), Some(Command::ModelShow)));
-        assert!(matches!(Command::parse("/provider show"), Some(Command::ModelShow)));
-        assert!(matches!(Command::parse("/provider list"), Some(Command::ModelList)));
+        assert!(matches!(
+            Command::parse("/provider"),
+            Some(Command::ModelShow)
+        ));
+        assert!(matches!(
+            Command::parse("/provider show"),
+            Some(Command::ModelShow)
+        ));
+        assert!(matches!(
+            Command::parse("/provider list"),
+            Some(Command::ModelList)
+        ));
         // switch
         match Command::parse("/provider grok") {
             Some(Command::ModelSwitch(name)) => assert_eq!(name, "grok"),
@@ -643,8 +656,14 @@ mod tests {
         }
         // Legacy aliases still work
         assert!(matches!(Command::parse("/model"), Some(Command::ModelShow)));
-        assert!(matches!(Command::parse("/teacher"), Some(Command::ModelShow)));
-        assert!(matches!(Command::parse("/teacher list"), Some(Command::ModelList)));
+        assert!(matches!(
+            Command::parse("/teacher"),
+            Some(Command::ModelShow)
+        ));
+        assert!(matches!(
+            Command::parse("/teacher list"),
+            Some(Command::ModelList)
+        ));
         match Command::parse("/teacher grok") {
             Some(Command::ModelSwitch(name)) => assert_eq!(name, "grok"),
             _ => panic!("Expected ModelSwitch(grok) via /teacher alias"),
@@ -709,10 +728,7 @@ mod tests {
     #[test]
     fn test_parse_mcp_list() {
         // Both /mcp and /mcp list should work
-        assert!(matches!(
-            Command::parse("/mcp"),
-            Some(Command::McpList)
-        ));
+        assert!(matches!(Command::parse("/mcp"), Some(Command::McpList)));
         assert!(matches!(
             Command::parse("/mcp list"),
             Some(Command::McpList)

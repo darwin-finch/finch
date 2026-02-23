@@ -54,13 +54,12 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(&config_path)
-        .map_err(|_e| {
-            anyhow::anyhow!(errors::file_not_found_error(
-                &config_path.display().to_string(),
-                "Configuration file"
-            ))
-        })?;
+    let contents = fs::read_to_string(&config_path).map_err(|_e| {
+        anyhow::anyhow!(errors::file_not_found_error(
+            &config_path.display().to_string(),
+            "Configuration file"
+        ))
+    })?;
 
     // Parse TOML into a struct that accepts both the old and new formats.
     #[derive(serde::Deserialize)]

@@ -185,15 +185,23 @@ mod tests {
         let emb1 = engine.embed("rust lifetimes borrow checker").unwrap();
         let emb2 = engine.embed("rust lifetimes borrow checker").unwrap();
         let sim = cosine_similarity(&emb1, &emb2);
-        assert!((sim - 1.0).abs() < 0.001, "Identical texts should have similarity ~1.0, got {}", sim);
+        assert!(
+            (sim - 1.0).abs() < 0.001,
+            "Identical texts should have similarity ~1.0, got {}",
+            sim
+        );
     }
 
     #[test]
     fn test_cosine_similarity_related() {
         let engine = TfIdfEmbedding::new();
         let emb1 = engine.embed("rust async await tokio").unwrap();
-        let emb2 = engine.embed("rust async programming tokio runtime").unwrap();
-        let emb3 = engine.embed("python machine learning pandas numpy").unwrap();
+        let emb2 = engine
+            .embed("rust async programming tokio runtime")
+            .unwrap();
+        let emb3 = engine
+            .embed("python machine learning pandas numpy")
+            .unwrap();
 
         let sim_related = cosine_similarity(&emb1, &emb2);
         let sim_unrelated = cosine_similarity(&emb1, &emb3);
@@ -221,9 +229,15 @@ mod tests {
     #[test]
     fn test_embedding_is_unit_vector() {
         let engine = TfIdfEmbedding::new();
-        let emb = engine.embed("the quick brown fox jumps over the lazy dog").unwrap();
+        let emb = engine
+            .embed("the quick brown fox jumps over the lazy dog")
+            .unwrap();
         let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 0.001, "Embedding should be a unit vector, norm={}", norm);
+        assert!(
+            (norm - 1.0).abs() < 0.001,
+            "Embedding should be a unit vector, norm={}",
+            norm
+        );
     }
 
     #[test]
@@ -253,9 +267,13 @@ mod tests {
         let engine = TfIdfEmbedding::new();
 
         // Two descriptions of the same concept should score well
-        let e1 = engine.embed("authentication JWT token bearer header").unwrap();
+        let e1 = engine
+            .embed("authentication JWT token bearer header")
+            .unwrap();
         let e2 = engine.embed("auth JWT bearer token authorization").unwrap();
-        let e3 = engine.embed("database migration schema alter table column").unwrap();
+        let e3 = engine
+            .embed("database migration schema alter table column")
+            .unwrap();
 
         let sim_auth = cosine_similarity(&e1, &e2);
         let sim_cross = cosine_similarity(&e1, &e3);

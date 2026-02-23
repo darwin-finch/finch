@@ -14,14 +14,14 @@ pub enum DialogType {
     Select {
         options: Vec<DialogOption>,
         selected_index: usize,
-        allow_custom: bool,  // Enable "Other" option with text input
+        allow_custom: bool, // Enable "Other" option with text input
     },
     /// Multi-select menu with checkboxes and space to toggle
     MultiSelect {
         options: Vec<DialogOption>,
         selected_indices: HashSet<usize>,
         cursor_index: usize,
-        allow_custom: bool,  // Enable "Other" option with text input
+        allow_custom: bool, // Enable "Other" option with text input
     },
     /// Text input with cursor and editing support
     TextInput {
@@ -69,9 +69,9 @@ pub struct Dialog {
     pub title: String,
     pub dialog_type: DialogType,
     pub help_message: Option<String>,
-    pub custom_input: Option<String>,  // Stores custom text if "Other" is being entered
-    pub custom_mode_active: bool,       // Whether user is currently typing custom text
-    pub custom_cursor_pos: usize,       // Char-index cursor in custom_input
+    pub custom_input: Option<String>, // Stores custom text if "Other" is being entered
+    pub custom_mode_active: bool,     // Whether user is currently typing custom text
+    pub custom_cursor_pos: usize,     // Char-index cursor in custom_input
 }
 
 impl Dialog {
@@ -219,9 +219,7 @@ impl Dialog {
             } => Self::handle_multiselect_key(key, options, selected_indices, cursor_index),
 
             DialogType::TextInput {
-                input,
-                cursor_pos,
-                ..
+                input, cursor_pos, ..
             } => Self::handle_text_input_key(key, input, cursor_pos),
 
             DialogType::Confirm { selected, .. } => Self::handle_confirm_key(key, selected),
@@ -503,10 +501,7 @@ mod tests {
     fn test_select_dialog_creation() {
         let dialog = Dialog::select(
             "Choose one",
-            vec![
-                DialogOption::new("Option 1"),
-                DialogOption::new("Option 2"),
-            ],
+            vec![DialogOption::new("Option 1"), DialogOption::new("Option 2")],
         );
         assert_eq!(dialog.title, "Choose one");
         assert!(matches!(dialog.dialog_type, DialogType::Select { .. }));
@@ -534,13 +529,8 @@ mod tests {
 
     #[test]
     fn test_select_number_keys() {
-        let mut dialog = Dialog::select(
-            "Test",
-            vec![
-                DialogOption::new("A"),
-                DialogOption::new("B"),
-            ],
-        );
+        let mut dialog =
+            Dialog::select("Test", vec![DialogOption::new("A"), DialogOption::new("B")]);
 
         // Press '2' for second option
         let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('2')));
@@ -549,13 +539,8 @@ mod tests {
 
     #[test]
     fn test_multiselect_toggle() {
-        let mut dialog = Dialog::multiselect(
-            "Test",
-            vec![
-                DialogOption::new("A"),
-                DialogOption::new("B"),
-            ],
-        );
+        let mut dialog =
+            Dialog::multiselect("Test", vec![DialogOption::new("A"), DialogOption::new("B")]);
 
         // Toggle selection with space
         let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
@@ -657,11 +642,14 @@ mod tests {
 
     #[test]
     fn test_select_vim_keys_j_and_k() {
-        let mut dialog = Dialog::select("T", vec![
-            DialogOption::new("A"),
-            DialogOption::new("B"),
-            DialogOption::new("C"),
-        ]);
+        let mut dialog = Dialog::select(
+            "T",
+            vec![
+                DialogOption::new("A"),
+                DialogOption::new("B"),
+                DialogOption::new("C"),
+            ],
+        );
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('j')));
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('j')));
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('k')));
@@ -706,11 +694,14 @@ mod tests {
 
     #[test]
     fn test_multiselect_result_is_sorted() {
-        let mut dialog = Dialog::multiselect("T", vec![
-            DialogOption::new("A"),
-            DialogOption::new("B"),
-            DialogOption::new("C"),
-        ]);
+        let mut dialog = Dialog::multiselect(
+            "T",
+            vec![
+                DialogOption::new("A"),
+                DialogOption::new("B"),
+                DialogOption::new("C"),
+            ],
+        );
         // Select C then B (reverse order)
         dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
         dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
@@ -764,7 +755,10 @@ mod tests {
         dialog.handle_key_event(KeyEvent::from(KeyCode::Home));
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('!')));
         let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        assert_eq!(result, Some(DialogResult::TextEntered("!hello".to_string())));
+        assert_eq!(
+            result,
+            Some(DialogResult::TextEntered("!hello".to_string()))
+        );
     }
 
     #[test]
@@ -860,7 +854,10 @@ mod tests {
             dialog.handle_key_event(KeyEvent::from(KeyCode::Char(c)));
         }
         let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        assert_eq!(result, Some(DialogResult::CustomText("myvalue".to_string())));
+        assert_eq!(
+            result,
+            Some(DialogResult::CustomText("myvalue".to_string()))
+        );
     }
 
     #[test]
@@ -895,7 +892,7 @@ mod tests {
     fn test_custom_text_cursor_insert_at_position() {
         let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o'))); // enter custom mode
-        // Type "ac"
+                                                                     // Type "ac"
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('a')));
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('c')));
         // Move to position 1 (between 'a' and 'c'), insert 'b'
@@ -989,9 +986,12 @@ mod tests {
 
     #[test]
     fn test_dialog_with_help_message() {
-        let dialog = Dialog::select("T", vec![DialogOption::new("A")])
-            .with_help("Press Enter to confirm");
-        assert_eq!(dialog.help_message.as_deref(), Some("Press Enter to confirm"));
+        let dialog =
+            Dialog::select("T", vec![DialogOption::new("A")]).with_help("Press Enter to confirm");
+        assert_eq!(
+            dialog.help_message.as_deref(),
+            Some("Press Enter to confirm")
+        );
     }
 
     #[test]

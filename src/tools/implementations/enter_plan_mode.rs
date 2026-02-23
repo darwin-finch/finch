@@ -25,24 +25,28 @@ impl Tool for EnterPlanModeTool {
     fn input_schema(&self) -> ToolInputSchema {
         ToolInputSchema::simple(vec![(
             "reason",
-            "Brief explanation of why planning is needed (optional)"
+            "Brief explanation of why planning is needed (optional)",
         )])
     }
 
     async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
         use chrono::Utc;
-        
 
         let reason = input["reason"].as_str().unwrap_or("Planning session");
 
         // Check if repl_mode is available
-        let mode = context.repl_mode.as_ref()
+        let mode = context
+            .repl_mode
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Plan mode not available in this context"))?;
 
         // Check if already in plan mode
         {
             let current_mode = mode.read().await;
-            if matches!(*current_mode, crate::cli::ReplMode::Planning { .. } | crate::cli::ReplMode::Executing { .. }) {
+            if matches!(
+                *current_mode,
+                crate::cli::ReplMode::Planning { .. } | crate::cli::ReplMode::Executing { .. }
+            ) {
                 let mode_name = match *current_mode {
                     crate::cli::ReplMode::Planning { .. } => "planning",
                     crate::cli::ReplMode::Executing { .. } => "executing",
@@ -99,9 +103,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute() {
         let tool = EnterPlanModeTool;
+        use crate::cli::ReplMode;
         use std::sync::Arc;
         use tokio::sync::RwLock;
-        use crate::cli::ReplMode;
 
         let repl_mode = Arc::new(RwLock::new(ReplMode::Normal));
         let plan_content = Arc::new(RwLock::new(None));

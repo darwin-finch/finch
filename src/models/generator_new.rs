@@ -233,10 +233,16 @@ mod tests {
             String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("{}", e))
         }
 
-        fn name(&self) -> &str { "mock" }
+        fn name(&self) -> &str {
+            "mock"
+        }
 
-        fn as_any(&self) -> &dyn std::any::Any { self }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
     }
 
     #[test]
@@ -253,19 +259,29 @@ mod tests {
     fn test_generate_text_uses_trait_not_downcast() {
         // Regression: generate_text() must work via trait methods, not downcast to
         // LoadedOnnxModel. A non-ONNX backend should succeed here.
-        use crate::models::GeneratorConfig;
         use crate::models::unified_loader::ModelLoadConfig;
+        use crate::models::GeneratorConfig;
 
         struct EchoBackend;
         impl TextGeneration for EchoBackend {
             fn generate(&mut self, _ids: &[u32], _max: usize) -> Result<Vec<u32>> {
                 Ok(vec![104, 105]) // "hi"
             }
-            fn tokenize(&self, _text: &str) -> Result<Vec<u32>> { Ok(vec![104, 105]) }
-            fn decode_tokens(&self, _tokens: &[u32]) -> Result<String> { Ok("hi".into()) }
-            fn name(&self) -> &str { "echo" }
-            fn as_any(&self) -> &dyn std::any::Any { self }
-            fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+            fn tokenize(&self, _text: &str) -> Result<Vec<u32>> {
+                Ok(vec![104, 105])
+            }
+            fn decode_tokens(&self, _tokens: &[u32]) -> Result<String> {
+                Ok("hi".into())
+            }
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
         }
 
         // We can't call GeneratorModel::new() without a model file, but we can
@@ -298,8 +314,8 @@ mod tests {
     #[test]
     #[ignore] // Requires downloaded Qwen model
     fn test_generator_qwen_onnx() {
-        use crate::models::unified_loader::{ModelLoadConfig, ModelFamily, ModelSize};
         use crate::config::ExecutionTarget;
+        use crate::models::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
 
         let config = GeneratorConfig::Pretrained(ModelLoadConfig {
             provider: crate::models::unified_loader::InferenceProvider::Onnx,

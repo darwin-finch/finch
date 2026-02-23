@@ -122,7 +122,10 @@ impl ModelSelector {
 
         let selection = match ram_gb {
             ram if ram < MIN_LOCAL_MODEL_RAM_GB => {
-                tracing::warn!("Only {}GB RAM — running in cloud-only mode (teacher API)", ram);
+                tracing::warn!(
+                    "Only {}GB RAM — running in cloud-only mode (teacher API)",
+                    ram
+                );
                 ModelSelection::CloudOnly { ram_gb: ram }
             }
             ram if ram < 6 => {

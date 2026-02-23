@@ -35,9 +35,7 @@ pub struct Router {
 
 impl Router {
     pub fn new(threshold_router: ThresholdRouter) -> Self {
-        Self {
-            threshold_router,
-        }
+        Self { threshold_router }
     }
 
     /// Make a routing decision for a query
@@ -149,10 +147,20 @@ mod tests {
     fn test_route_with_generator_not_ready_always_forwards() {
         let router = make_router();
         // When generator isn't ready, ALL queries must forward
-        for query in &["hello", "what is Rust?", "how do I fix this error?", "explain ownership"] {
+        for query in &[
+            "hello",
+            "what is Rust?",
+            "how do I fix this error?",
+            "explain ownership",
+        ] {
             match router.route_with_generator_check(query, false) {
-                RouteDecision::Forward { reason: ForwardReason::ModelNotReady } => {}
-                other => panic!("Expected ModelNotReady forward for {:?}, got {:?}", query, other),
+                RouteDecision::Forward {
+                    reason: ForwardReason::ModelNotReady,
+                } => {}
+                other => panic!(
+                    "Expected ModelNotReady forward for {:?}, got {:?}",
+                    query, other
+                ),
             }
         }
     }
@@ -163,7 +171,9 @@ mod tests {
         // When generator is ready, routing is driven by ThresholdRouter stats
         // We just verify we get a valid decision — not ModelNotReady
         match router.route_with_generator_check("hello", true) {
-            RouteDecision::Forward { reason: ForwardReason::ModelNotReady } => {
+            RouteDecision::Forward {
+                reason: ForwardReason::ModelNotReady,
+            } => {
                 panic!("Should not return ModelNotReady when generator IS ready")
             }
             RouteDecision::Local { .. } | RouteDecision::Forward { .. } => {}

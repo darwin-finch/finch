@@ -1,8 +1,8 @@
 // Glob tool - finds files matching glob patterns
 
+use crate::output_error;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
-use crate::output_error;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use glob::glob;

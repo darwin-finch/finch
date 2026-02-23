@@ -171,7 +171,13 @@ mod tests {
     #[test]
     fn test_record_training_appends_event() {
         let mut manager = make_manager();
-        manager.record_training("router".to_string(), "test query".to_string(), None, "expected".to_string(), true);
+        manager.record_training(
+            "router".to_string(),
+            "test query".to_string(),
+            None,
+            "expected".to_string(),
+            true,
+        );
         assert_eq!(manager.training_log.len(), 1);
         let event = &manager.training_log[0];
         assert_eq!(event.model_name, "router");
@@ -183,10 +189,19 @@ mod tests {
     fn test_record_training_timestamp_is_recent() {
         let mut manager = make_manager();
         let before = chrono::Utc::now();
-        manager.record_training("m".to_string(), "q".to_string(), None, "e".to_string(), false);
+        manager.record_training(
+            "m".to_string(),
+            "q".to_string(),
+            None,
+            "e".to_string(),
+            false,
+        );
         let after = chrono::Utc::now();
         let ts = manager.training_log[0].timestamp;
-        assert!(ts >= before && ts <= after, "timestamp should be between before and after");
+        assert!(
+            ts >= before && ts <= after,
+            "timestamp should be between before and after"
+        );
     }
 
     #[test]
@@ -204,7 +219,10 @@ mod tests {
         }
         // After 1050 inserts: first trim at 1001 removes 100 → 901, then continues to 1001 again...
         // The log should be ≤ max_log_size (1000) + 100 (trim removes 100 at a time)
-        assert!(manager.training_log.len() <= 1000, "log should not exceed max after trim");
+        assert!(
+            manager.training_log.len() <= 1000,
+            "log should not exceed max after trim"
+        );
     }
 
     // --- recent_events ---
@@ -212,21 +230,61 @@ mod tests {
     #[test]
     fn test_recent_events_filters_by_model_name() {
         let mut manager = make_manager();
-        manager.record_training("router".to_string(), "q1".to_string(), None, "e".to_string(), true);
-        manager.record_training("validator".to_string(), "q2".to_string(), None, "e".to_string(), true);
-        manager.record_training("router".to_string(), "q3".to_string(), None, "e".to_string(), false);
+        manager.record_training(
+            "router".to_string(),
+            "q1".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
+        manager.record_training(
+            "validator".to_string(),
+            "q2".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
+        manager.record_training(
+            "router".to_string(),
+            "q3".to_string(),
+            None,
+            "e".to_string(),
+            false,
+        );
 
         let router_events = manager.recent_events("router", 10);
-        assert_eq!(router_events.len(), 2, "only router events should be returned");
+        assert_eq!(
+            router_events.len(),
+            2,
+            "only router events should be returned"
+        );
         assert!(router_events.iter().all(|e| e.model_name == "router"));
     }
 
     #[test]
     fn test_recent_events_returns_in_reverse_order() {
         let mut manager = make_manager();
-        manager.record_training("m".to_string(), "first".to_string(), None, "e".to_string(), true);
-        manager.record_training("m".to_string(), "second".to_string(), None, "e".to_string(), true);
-        manager.record_training("m".to_string(), "third".to_string(), None, "e".to_string(), true);
+        manager.record_training(
+            "m".to_string(),
+            "first".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
+        manager.record_training(
+            "m".to_string(),
+            "second".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
+        manager.record_training(
+            "m".to_string(),
+            "third".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
 
         let events = manager.recent_events("m", 10);
         assert_eq!(events[0].query, "third", "most recent should come first");
@@ -237,7 +295,13 @@ mod tests {
     fn test_recent_events_respects_limit() {
         let mut manager = make_manager();
         for i in 0..10 {
-            manager.record_training("m".to_string(), format!("q{i}"), None, "e".to_string(), true);
+            manager.record_training(
+                "m".to_string(),
+                format!("q{i}"),
+                None,
+                "e".to_string(),
+                true,
+            );
         }
         let events = manager.recent_events("m", 3);
         assert_eq!(events.len(), 3);
@@ -246,7 +310,13 @@ mod tests {
     #[test]
     fn test_recent_events_empty_for_unknown_model() {
         let mut manager = make_manager();
-        manager.record_training("known".to_string(), "q".to_string(), None, "e".to_string(), true);
+        manager.record_training(
+            "known".to_string(),
+            "q".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
         assert!(manager.recent_events("unknown", 10).is_empty());
     }
 
@@ -264,9 +334,27 @@ mod tests {
     #[test]
     fn test_overall_stats_success_rate_calculation() {
         let mut manager = make_manager();
-        manager.record_training("m".to_string(), "q1".to_string(), None, "e".to_string(), true);
-        manager.record_training("m".to_string(), "q2".to_string(), None, "e".to_string(), true);
-        manager.record_training("m".to_string(), "q3".to_string(), None, "e".to_string(), false);
+        manager.record_training(
+            "m".to_string(),
+            "q1".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
+        manager.record_training(
+            "m".to_string(),
+            "q2".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
+        manager.record_training(
+            "m".to_string(),
+            "q3".to_string(),
+            None,
+            "e".to_string(),
+            false,
+        );
 
         let stats = manager.overall_stats();
         assert_eq!(stats.total_training_events, 3);
@@ -276,9 +364,27 @@ mod tests {
     #[test]
     fn test_overall_stats_counts_unique_models() {
         let mut manager = make_manager();
-        manager.record_training("router".to_string(), "q".to_string(), None, "e".to_string(), true);
-        manager.record_training("router".to_string(), "q".to_string(), None, "e".to_string(), true);
-        manager.record_training("validator".to_string(), "q".to_string(), None, "e".to_string(), true);
+        manager.record_training(
+            "router".to_string(),
+            "q".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
+        manager.record_training(
+            "router".to_string(),
+            "q".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
+        manager.record_training(
+            "validator".to_string(),
+            "q".to_string(),
+            None,
+            "e".to_string(),
+            true,
+        );
 
         let stats = manager.overall_stats();
         assert_eq!(stats.models_trained, 2, "should count unique model names");

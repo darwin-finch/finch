@@ -28,8 +28,8 @@ use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
-    AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
-    PatchTool, PresentPlanTool, ReadTool, RestartTool, SaveAndExecTool, WebFetchTool, WriteTool,
+    AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool, PatchTool,
+    PresentPlanTool, ReadTool, RestartTool, SaveAndExecTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
@@ -173,7 +173,8 @@ impl Repl {
         let models_dir = dirs::home_dir().map(|home| home.join(".finch").join("models"));
 
         // Load validator only (router is now in Router)
-        let threshold_validator = Self::load_validator(models_dir.as_ref(), is_interactive, daemon_mode);
+        let threshold_validator =
+            Self::load_validator(models_dir.as_ref(), is_interactive, daemon_mode);
 
         // Initialize input handler for interactive mode
         let input_handler = if is_interactive {
@@ -263,7 +264,10 @@ impl Repl {
                 tool_registry.register(tool);
             }
             if is_interactive && !daemon_mode {
-                output_status!("✓ LLM delegation tools registered ({} tools)", registry.tool_names().len());
+                output_status!(
+                    "✓ LLM delegation tools registered ({} tools)",
+                    registry.tool_names().len()
+                );
             }
         }
 
@@ -280,7 +284,9 @@ impl Repl {
 
         // Phase 4: Register memory tools if memory system is enabled
         if let Some(ref memory) = memory_system {
-            use crate::tools::implementations::{SearchMemoryTool, CreateMemoryTool, ListRecentTool};
+            use crate::tools::implementations::{
+                CreateMemoryTool, ListRecentTool, SearchMemoryTool,
+            };
             tool_registry.register(Box::new(SearchMemoryTool::new(memory.clone())));
             tool_registry.register(Box::new(CreateMemoryTool::new(memory.clone())));
             tool_registry.register(Box::new(ListRecentTool::new(memory.clone())));
@@ -304,8 +310,8 @@ impl Repl {
             .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
 
         // Create tool executor
-        let executor = ToolExecutor::new(tool_registry, permissions, patterns_path)
-            .unwrap_or_else(|e| {
+        let executor =
+            ToolExecutor::new(tool_registry, permissions, patterns_path).unwrap_or_else(|e| {
                 output_status!("⚠️  Failed to initialize tool executor: {}", e);
                 output_status!("   Tool pattern persistence may not work correctly");
                 // Create fresh registry and try with temp path
@@ -347,11 +353,8 @@ impl Repl {
         let streaming_enabled = config.features.streaming_enabled;
 
         // Generate tool definitions from registry (includes built-in + MCP tools)
-        let tool_definitions: Vec<ToolDefinition> = tool_executor
-            .lock()
-            .await
-            .list_all_tools()
-            .await;
+        let tool_definitions: Vec<ToolDefinition> =
+            tool_executor.lock().await.list_all_tools().await;
 
         // Get global OutputManager and StatusBar (created in main.rs)
         // DO NOT create new instances - that would break stdout control!
@@ -428,8 +431,8 @@ impl Repl {
 
         // Initialize TeacherSession with context optimization
         let teacher_config = TeacherContextConfig {
-            max_context_turns: 15,           // Keep last 15 turns
-            tool_result_retention_turns: 5,  // Keep last 5 turns of tool results
+            max_context_turns: 15,          // Keep last 15 turns
+            tool_result_retention_turns: 5, // Keep last 5 turns of tool results
             prompt_caching_enabled: true,
         };
 
@@ -469,11 +472,10 @@ impl Repl {
             .map(|home| home.join(".finch").join("conversations.jsonl"))
             .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl"));
         let conversation_logger = Arc::new(tokio::sync::Mutex::new(
-            crate::logging::ConversationLogger::new(log_path)
-                .unwrap_or_else(|e| {
-                    output_status!("⚠️  Failed to create conversation logger: {}", e);
-                    panic!("Cannot create conversation logger")
-                })
+            crate::logging::ConversationLogger::new(log_path).unwrap_or_else(|e| {
+                output_status!("⚠️  Failed to create conversation logger: {}", e);
+                panic!("Cannot create conversation logger")
+            }),
         ));
         if is_interactive && !daemon_mode {
             output_status!("✓ Conversation logging enabled (for future LoRA training)");
@@ -488,7 +490,11 @@ impl Repl {
                 Arc::new(RwLock::new(persona))
             }
             Err(e) => {
-                output_status!("⚠️  Failed to load persona '{}': {}", config.active_persona, e);
+                output_status!(
+                    "⚠️  Failed to load persona '{}': {}",
+                    config.active_persona,
+                    e
+                );
                 output_status!("   Using default persona");
                 Arc::new(RwLock::new(crate::config::Persona::default()))
             }
@@ -503,7 +509,7 @@ impl Repl {
             available_teachers,
             active_provider_index: 0,
             active_teacher_index: 0, // First teacher is active by default
-            router, // Contains ThresholdRouter now
+            router,                  // Contains ThresholdRouter now
             metrics_logger,
             threshold_validator,
             local_generator,
@@ -566,7 +572,10 @@ impl Repl {
     }
 
     /// Call teacher with context optimization (helper for MessageRequest → ProviderRequest conversion)
-    async fn call_teacher(&self, request: &MessageRequest) -> Result<crate::claude::types::MessageResponse> {
+    async fn call_teacher(
+        &self,
+        request: &MessageRequest,
+    ) -> Result<crate::claude::types::MessageResponse> {
         use crate::providers::ProviderRequest;
 
         // Convert MessageRequest to ProviderRequest
@@ -582,14 +591,19 @@ impl Repl {
 
         // Send with Level 3 optimization (smart strategies)
         let mut session = self.teacher_session.write().await;
-        let response = session.send_message_with_optimization(&provider_request).await?;
+        let response = session
+            .send_message_with_optimization(&provider_request)
+            .await?;
 
         // Convert ProviderResponse back to MessageResponse
         Ok(response.into())
     }
 
     /// Call teacher with streaming and context optimization
-    async fn call_teacher_stream(&self, request: &MessageRequest) -> Result<tokio::sync::mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
+    async fn call_teacher_stream(
+        &self,
+        request: &MessageRequest,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
         use crate::providers::ProviderRequest;
 
         // Convert MessageRequest to ProviderRequest
@@ -655,7 +669,11 @@ impl Repl {
     }
 
     /// Load validator from disk or create new one
-    fn load_validator(models_dir: Option<&PathBuf>, is_interactive: bool, daemon_mode: bool) -> ThresholdValidator {
+    fn load_validator(
+        models_dir: Option<&PathBuf>,
+        is_interactive: bool,
+        daemon_mode: bool,
+    ) -> ThresholdValidator {
         let Some(models_dir) = models_dir else {
             return ThresholdValidator::new();
         };
@@ -977,8 +995,16 @@ impl Repl {
                         let is_plan_mode = matches!(self.mode, ReplMode::Planning { .. });
                         let is_readonly_tool = matches!(
                             tool_name,
-                            "read" | "Read" | "glob" | "Glob" | "grep" | "Grep" | "web_fetch" | "WebFetch" |
-                            "AskUserQuestion" | "ask_user_question"
+                            "read"
+                                | "Read"
+                                | "glob"
+                                | "Glob"
+                                | "grep"
+                                | "Grep"
+                                | "web_fetch"
+                                | "WebFetch"
+                                | "AskUserQuestion"
+                                | "ask_user_question"
                         );
 
                         is_plan_mode && is_readonly_tool
@@ -998,37 +1024,72 @@ impl Repl {
                                 }
                                 ConfirmationResult::ApproveExactSession(sig) => {
                                     self.tool_executor.lock().await.approve_exact_session(sig);
-                                    self.output_tool(&tool_use.name, "  ✓ Approved (remembered for session)");
+                                    self.output_tool(
+                                        &tool_use.name,
+                                        "  ✓ Approved (remembered for session)",
+                                    );
                                 }
                                 ConfirmationResult::ApprovePatternSession(pattern) => {
-                                    self.output_tool(&tool_use.name, format!("  ✓ Approved pattern: {} (session)", pattern.pattern));
-                                    self.tool_executor.lock().await.approve_pattern_session(pattern);
+                                    self.output_tool(
+                                        &tool_use.name,
+                                        format!(
+                                            "  ✓ Approved pattern: {} (session)",
+                                            pattern.pattern
+                                        ),
+                                    );
+                                    self.tool_executor
+                                        .lock()
+                                        .await
+                                        .approve_pattern_session(pattern);
                                 }
                                 ConfirmationResult::ApproveExactPersistent(sig) => {
-                                    self.tool_executor.lock().await.approve_exact_persistent(sig);
+                                    self.tool_executor
+                                        .lock()
+                                        .await
+                                        .approve_exact_persistent(sig);
                                     // IMMEDIATE SAVE: Don't wait for checkpoint
-                                    if let Err(e) = self.tool_executor.lock().await.save_patterns() {
-                                        self.output_status(format!("  ⚠️  Warning: Failed to save pattern: {}", e));
-                                        self.output_tool(&tool_use.name, "  ✓ Approved (this session only - save failed)");
+                                    if let Err(e) = self.tool_executor.lock().await.save_patterns()
+                                    {
+                                        self.output_status(format!(
+                                            "  ⚠️  Warning: Failed to save pattern: {}",
+                                            e
+                                        ));
+                                        self.output_tool(
+                                            &tool_use.name,
+                                            "  ✓ Approved (this session only - save failed)",
+                                        );
                                     } else {
-                                        self.output_tool(&tool_use.name, "  ✓ Approved (saved permanently)");
+                                        self.output_tool(
+                                            &tool_use.name,
+                                            "  ✓ Approved (saved permanently)",
+                                        );
                                     }
                                 }
                                 ConfirmationResult::ApprovePatternPersistent(pattern) => {
                                     let pattern_str = pattern.pattern.clone();
-                                    self.tool_executor.lock().await.approve_pattern_persistent(pattern);
+                                    self.tool_executor
+                                        .lock()
+                                        .await
+                                        .approve_pattern_persistent(pattern);
                                     // IMMEDIATE SAVE: Don't wait for checkpoint
-                                    if let Err(e) = self.tool_executor.lock().await.save_patterns() {
-                                        self.output_status(format!("  ⚠️  Warning: Failed to save pattern: {}", e));
+                                    if let Err(e) = self.tool_executor.lock().await.save_patterns()
+                                    {
+                                        self.output_status(format!(
+                                            "  ⚠️  Warning: Failed to save pattern: {}",
+                                            e
+                                        ));
                                         self.output_tool(&tool_use.name, format!(
                                             "  ✓ Approved pattern: {} (this session only - save failed)",
                                             pattern_str
                                         ));
                                     } else {
-                                        self.output_tool(&tool_use.name, format!(
-                                            "  ✓ Approved pattern: {} (saved permanently)",
-                                            pattern_str
-                                        ));
+                                        self.output_tool(
+                                            &tool_use.name,
+                                            format!(
+                                                "  ✓ Approved pattern: {} (saved permanently)",
+                                                pattern_str
+                                            ),
+                                        );
                                     }
                                 }
                                 ConfirmationResult::Deny => {
@@ -1053,7 +1114,10 @@ impl Repl {
                     }
                     ApprovalSource::SessionPattern(ref id) => {
                         if self.is_interactive {
-                            self.output_tool(&tool_use.name, format!("  ✓ Matched session pattern ({})", &id[..8]));
+                            self.output_tool(
+                                &tool_use.name,
+                                format!("  ✓ Matched session pattern ({})", &id[..8]),
+                            );
                         }
                     }
                     ApprovalSource::PersistentExact => {
@@ -1063,7 +1127,10 @@ impl Repl {
                     }
                     ApprovalSource::PersistentPattern(ref id) => {
                         if self.is_interactive {
-                            self.output_tool(&tool_use.name, format!("  ✓ Matched saved pattern ({})", &id[..8]));
+                            self.output_tool(
+                                &tool_use.name,
+                                format!("  ✓ Matched saved pattern ({})", &id[..8]),
+                            );
                         }
                     }
                 }
@@ -1101,7 +1168,10 @@ impl Repl {
                 // Display tool result to user (Phase 1: Visibility)
                 if self.is_interactive {
                     if result.is_error {
-                        self.output_tool(&tool_use.name, format!("    ✗ Error: {}", result.content));
+                        self.output_tool(
+                            &tool_use.name,
+                            format!("    ✗ Error: {}", result.content),
+                        );
                     } else {
                         self.output_tool(&tool_use.name, "    ✓ Success");
 
@@ -1174,14 +1244,20 @@ impl Repl {
             if assistant_text.is_empty() {
                 // Response contains ONLY tool_use blocks, no text
                 // We MUST add something to maintain conversation alternation
-                self.conversation.write().await.add_assistant_message("[Tool request]".to_string());
+                self.conversation
+                    .write()
+                    .await
+                    .add_assistant_message("[Tool request]".to_string());
 
                 if self.is_interactive {
                     self.output_status("    (Claude requesting tool execution)");
                 }
             } else {
                 // Response has both text and tool_use blocks
-                self.conversation.write().await.add_assistant_message(assistant_text.clone());
+                self.conversation
+                    .write()
+                    .await
+                    .add_assistant_message(assistant_text.clone());
 
                 if self.is_interactive && !assistant_text.trim().is_empty() {
                     self.output_response(format!("    Claude: {}", assistant_text));
@@ -1189,11 +1265,15 @@ impl Repl {
             }
 
             // Then add tool results as a user message
-            self.conversation.write().await.add_user_message(tool_result_text);
+            self.conversation
+                .write()
+                .await
+                .add_user_message(tool_result_text);
 
             // Re-invoke teacher with tool results (using optimized context)
-            let request = MessageRequest::with_context(self.conversation.read().await.get_messages())
-                .with_tools(self.tool_definitions.clone());
+            let request =
+                MessageRequest::with_context(self.conversation.read().await.get_messages())
+                    .with_tools(self.tool_definitions.clone());
 
             current_response = self.call_teacher(&request).await?;
         }
@@ -1212,7 +1292,10 @@ impl Repl {
             // Even if we hit max iterations, we need to maintain conversation state
             let final_text = current_response.text();
             if !final_text.is_empty() {
-                self.conversation.write().await.add_assistant_message(final_text.clone());
+                self.conversation
+                    .write()
+                    .await
+                    .add_assistant_message(final_text.clone());
             }
         }
 
@@ -1347,7 +1430,10 @@ impl Repl {
         let generator_state = Arc::clone(self.bootstrap_loader.state());
 
         // Extract mode to Arc (replace with Normal temporarily)
-        let mode = Arc::new(RwLock::new(std::mem::replace(&mut self.mode, ReplMode::Normal)));
+        let mode = Arc::new(RwLock::new(std::mem::replace(
+            &mut self.mode,
+            ReplMode::Normal,
+        )));
 
         // Create EventLoop with all dependencies
         let mut event_loop = EventLoop::new(
@@ -1452,17 +1538,18 @@ impl Repl {
 
                 // Acquire lock, read a line, then release lock before any async work.
                 // Distinguishing None (Ctrl+C) from None (lock failed) via Option<Option<_>>.
-                let line_result: Option<Option<String>> = if let Ok(mut tui_lock) = tui_renderer.lock() {
-                    let result = if let Some(ref mut tui) = *tui_lock {
-                        tui.read_line()?
+                let line_result: Option<Option<String>> =
+                    if let Ok(mut tui_lock) = tui_renderer.lock() {
+                        let result = if let Some(ref mut tui) = *tui_lock {
+                            tui.read_line()?
+                        } else {
+                            None
+                        };
+                        drop(tui_lock); // Release lock before any async work below
+                        Some(result)
                     } else {
                         None
                     };
-                    drop(tui_lock); // Release lock before any async work below
-                    Some(result)
-                } else {
-                    None
-                };
 
                 match line_result {
                     Some(Some(text)) => text,
@@ -1495,7 +1582,10 @@ impl Repl {
                 }
 
                 let prompt = self.get_prompt();
-                let handler = self.input_handler.as_mut().expect("input_handler is Some — guarded by is_some() above");
+                let handler = self
+                    .input_handler
+                    .as_mut()
+                    .expect("input_handler is Some — guarded by is_some() above");
                 let line = handler.read_line(&prompt)?;
 
                 match line {
@@ -2193,7 +2283,11 @@ impl Repl {
             return Ok("No patterns to clear.".to_string());
         }
 
-        self.output_status(format!("This will remove {} pattern(s) and {} exact approval(s).", store.patterns.len(), store.exact_approvals.len()));
+        self.output_status(format!(
+            "This will remove {} pattern(s) and {} exact approval(s).",
+            store.patterns.len(),
+            store.exact_approvals.len()
+        ));
 
         if !Menu::confirm("Are you sure?", false)? {
             return Ok("Clear cancelled.".to_string());
@@ -2475,17 +2569,22 @@ impl Repl {
                 };
 
                 // Add as a Message with system role
-                use crate::claude::{Message, ContentBlock};
+                use crate::claude::{ContentBlock, Message};
                 let system_msg = Message {
                     role: "system".to_string(),
-                    content: vec![ContentBlock::Text { text: system_prompt }],
+                    content: vec![ContentBlock::Text {
+                        text: system_prompt,
+                    }],
                 };
                 self.conversation.write().await.add_message(system_msg);
             }
         }
 
         // Add user message to conversation history
-        self.conversation.write().await.add_user_message(query.to_string());
+        self.conversation
+            .write()
+            .await
+            .add_user_message(query.to_string());
 
         if self.is_interactive {
             print!("{}", "Analyzing...".dark_grey());
@@ -2504,11 +2603,17 @@ impl Repl {
             match daemon_client.query_text(query).await {
                 Ok(response) => {
                     // Add assistant response to conversation
-                    self.conversation.write().await.add_assistant_message(response.clone());
+                    self.conversation
+                        .write()
+                        .await
+                        .add_assistant_message(response.clone());
 
                     if self.is_interactive {
                         let elapsed = start_time.elapsed();
-                        self.output_status(format!("✓ Query completed in {:.2}s (via daemon)", elapsed.as_secs_f64()));
+                        self.output_status(format!(
+                            "✓ Query completed in {:.2}s (via daemon)",
+                            elapsed.as_secs_f64()
+                        ));
                     }
 
                     return Ok(response);
@@ -2531,7 +2636,9 @@ impl Repl {
             *self.bootstrap_loader.state().read().await,
             GeneratorState::Ready { .. }
         );
-        let decision = self.router.route_with_generator_check(query, generator_ready);
+        let decision = self
+            .router
+            .route_with_generator_check(query, generator_ready);
 
         if self.is_interactive {
             io::stdout()
@@ -2554,7 +2661,10 @@ impl Repl {
             } => {
                 if self.is_interactive {
                     self.output_status("✓ Crisis check: PASS");
-                    self.output_status(format!("✓ Threshold check: PASS (confidence: {:.2})", confidence));
+                    self.output_status(format!(
+                        "✓ Threshold check: PASS (confidence: {:.2})",
+                        confidence
+                    ));
                     self.output_status("→ Routing: LOCAL GENERATION");
                 }
 
@@ -2564,7 +2674,10 @@ impl Repl {
                     let state = self.bootstrap_loader.state().read().await;
                     let ready = matches!(*state, GeneratorState::Ready { .. });
                     if !ready && self.is_interactive {
-                        self.output_status(format!("⚠ Model not ready: {}", state.status_message()));
+                        self.output_status(format!(
+                            "⚠ Model not ready: {}",
+                            state.status_message()
+                        ));
                         self.output_status("→ Forwarding to Claude");
                     }
                     ready
@@ -2587,12 +2700,17 @@ impl Repl {
                             }
                             Err(e) if e.to_string().contains("TOOLS_DETECTED") => {
                                 if self.is_interactive {
-                                    self.output_status("\n🔧 Tools needed - switching to buffered mode...");
+                                    self.output_status(
+                                        "\n🔧 Tools needed - switching to buffered mode...",
+                                    );
                                 }
                                 let response = self.call_teacher(&request).await?;
                                 let elapsed = start_time.elapsed().as_millis();
                                 if self.is_interactive {
-                                    self.output_status(format!("✓ Received response ({}ms)", elapsed));
+                                    self.output_status(format!(
+                                        "✓ Received response ({}ms)",
+                                        elapsed
+                                    ));
                                 }
                                 claude_response = self.execute_tool_loop(response).await?;
                             }
@@ -2618,73 +2736,84 @@ impl Repl {
                     // Try local generation
                     let mut gen = self.local_generator.write().await;
                     match gen.try_generate_from_pattern(query) {
-                    Ok(Some(response_text)) => {
-                        // Successfully generated locally
-                        if self.is_interactive {
-                            self.output_status(format!("✓ Generated locally (confidence: {:.2})", confidence));
-                        }
-                        local_response = Some(response_text.clone());
-                        claude_response = response_text;
-                        routing_decision_str = "local".to_string();
-                        pattern_id = Some(local_pattern_id);
-                        routing_confidence = Some(confidence);
-                    }
-                    Ok(None) | Err(_) => {
-                        // Local generation insufficient or failed - forward to Claude
-                        drop(gen); // Drop the read lock before forwarding to Claude
-
-                        if self.is_interactive {
-                            self.output_status("⚠️  Local generation insufficient confidence");
-                            self.output_status("→ Forwarding to Claude");
-                        }
-
-                        // Forward to Claude
-                        let request =
-                            MessageRequest::with_context(self.conversation.read().await.get_messages())
-                                .with_tools(self.tool_definitions.clone());
-
-                        // Try streaming first, fallback to buffered if tools detected
-                        let use_streaming = self.streaming_enabled && self.is_interactive;
-
-                        if use_streaming {
-                            let rx = self.call_teacher_stream(&request).await?;
-                            match self.display_streaming_response(rx).await {
-                                Ok(text) => {
-                                    claude_response = text;
-                                }
-                                Err(e) if e.to_string().contains("TOOLS_DETECTED") => {
-                                    if self.is_interactive {
-                                        self.output_status("
-🔧 Tools needed - switching to buffered mode...");
-                                    }
-                                    let response =
-                                        self.call_teacher(&request).await?;
-                                    let elapsed = start_time.elapsed().as_millis();
-                                    if self.is_interactive {
-                                        self.output_status(format!("✓ Received response ({}ms)", elapsed));
-                                    }
-                                    claude_response = self.execute_tool_loop(response).await?;
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        } else {
-                            let response = self.call_teacher(&request).await?;
-                            let elapsed = start_time.elapsed().as_millis();
+                        Ok(Some(response_text)) => {
+                            // Successfully generated locally
                             if self.is_interactive {
-                                self.output_status(format!("✓ Received response ({}ms)", elapsed));
+                                self.output_status(format!(
+                                    "✓ Generated locally (confidence: {:.2})",
+                                    confidence
+                                ));
                             }
-                            if response.has_tool_uses() {
-                                claude_response = self.execute_tool_loop(response).await?;
-                            } else {
-                                claude_response = response.text();
-                            }
+                            local_response = Some(response_text.clone());
+                            claude_response = response_text;
+                            routing_decision_str = "local".to_string();
+                            pattern_id = Some(local_pattern_id);
+                            routing_confidence = Some(confidence);
                         }
+                        Ok(None) | Err(_) => {
+                            // Local generation insufficient or failed - forward to Claude
+                            drop(gen); // Drop the read lock before forwarding to Claude
 
-                        routing_decision_str = "local_attempted".to_string();
-                        pattern_id = Some(local_pattern_id);
-                        routing_confidence = Some(confidence);
-                        forward_reason = Some("insufficient_confidence".to_string());
-                    }
+                            if self.is_interactive {
+                                self.output_status("⚠️  Local generation insufficient confidence");
+                                self.output_status("→ Forwarding to Claude");
+                            }
+
+                            // Forward to Claude
+                            let request = MessageRequest::with_context(
+                                self.conversation.read().await.get_messages(),
+                            )
+                            .with_tools(self.tool_definitions.clone());
+
+                            // Try streaming first, fallback to buffered if tools detected
+                            let use_streaming = self.streaming_enabled && self.is_interactive;
+
+                            if use_streaming {
+                                let rx = self.call_teacher_stream(&request).await?;
+                                match self.display_streaming_response(rx).await {
+                                    Ok(text) => {
+                                        claude_response = text;
+                                    }
+                                    Err(e) if e.to_string().contains("TOOLS_DETECTED") => {
+                                        if self.is_interactive {
+                                            self.output_status(
+                                                "
+🔧 Tools needed - switching to buffered mode...",
+                                            );
+                                        }
+                                        let response = self.call_teacher(&request).await?;
+                                        let elapsed = start_time.elapsed().as_millis();
+                                        if self.is_interactive {
+                                            self.output_status(format!(
+                                                "✓ Received response ({}ms)",
+                                                elapsed
+                                            ));
+                                        }
+                                        claude_response = self.execute_tool_loop(response).await?;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            } else {
+                                let response = self.call_teacher(&request).await?;
+                                let elapsed = start_time.elapsed().as_millis();
+                                if self.is_interactive {
+                                    self.output_status(format!(
+                                        "✓ Received response ({}ms)",
+                                        elapsed
+                                    ));
+                                }
+                                if response.has_tool_uses() {
+                                    claude_response = self.execute_tool_loop(response).await?;
+                                } else {
+                                    claude_response = response.text();
+                                }
+                            }
+
+                            routing_decision_str = "local_attempted".to_string();
+                            pattern_id = Some(local_pattern_id);
+                            routing_confidence = Some(confidence);
+                            forward_reason = Some("insufficient_confidence".to_string());
+                        }
                     } // Close the else block for generator readiness check
                 }
             }
@@ -2707,8 +2836,9 @@ impl Repl {
                 }
 
                 // Use full conversation context with tool definitions
-                let request = MessageRequest::with_context(self.conversation.read().await.get_messages())
-                    .with_tools(self.tool_definitions.clone());
+                let request =
+                    MessageRequest::with_context(self.conversation.read().await.get_messages())
+                        .with_tools(self.tool_definitions.clone());
 
                 // Try streaming first, fallback to buffered if tools detected
                 let use_streaming = self.streaming_enabled && self.is_interactive;
@@ -2724,7 +2854,9 @@ impl Repl {
                         Err(e) if e.to_string().contains("TOOLS_DETECTED") => {
                             // Tools detected in stream - fallback to buffered mode
                             if self.is_interactive {
-                                self.output_status("\n🔧 Tools needed - switching to buffered mode...");
+                                self.output_status(
+                                    "\n🔧 Tools needed - switching to buffered mode...",
+                                );
                             }
                             let response = self.call_teacher(&request).await?;
 
@@ -2852,7 +2984,8 @@ impl Repl {
             "teacher".to_string()
         };
         let tools_used = vec![]; // TODO: Track tools used during execution
-        if let Err(e) = self.conversation_logger
+        if let Err(e) = self
+            .conversation_logger
             .lock()
             .await
             .log_interaction(query, &claude_response, &model_name, &tools_used)
@@ -2888,20 +3021,31 @@ impl Repl {
                     self.output_error(format!("Warning: Failed to save plan: {}", e));
                 } else if self.is_interactive {
                     self.output_status(format!("\n✓ Plan saved to: {}", plan_path.display()));
-                    self.output_status("Type /show-plan to review, /approve to execute, /reject to cancel.");
+                    self.output_status(
+                        "Type /show-plan to review, /approve to execute, /reject to cancel.",
+                    );
                 }
             }
         }
 
         // Add assistant response to conversation history
-        self.conversation.write().await.add_assistant_message(claude_response.clone());
+        self.conversation
+            .write()
+            .await
+            .add_assistant_message(claude_response.clone());
 
         // Phase 4: Store conversation in memory automatically
         if let Some(ref memory) = self.memory_system {
-            if let Err(e) = memory.insert_conversation("user", query, Some(&model_name), None).await {
+            if let Err(e) = memory
+                .insert_conversation("user", query, Some(&model_name), None)
+                .await
+            {
                 tracing::warn!("Failed to store user message in memory: {}", e);
             }
-            if let Err(e) = memory.insert_conversation("assistant", &claude_response, Some(&model_name), None).await {
+            if let Err(e) = memory
+                .insert_conversation("assistant", &claude_response, Some(&model_name), None)
+                .await
+            {
                 tracing::warn!("Failed to store assistant message in memory: {}", e);
             }
         }
@@ -2935,13 +3079,12 @@ impl Repl {
         };
 
         // Create feedback message
-        let feedback = note.clone()
-            .unwrap_or_else(|| match weight as i32 {
-                10 => "Critical issue that needs correction".to_string(),
-                3 => "Could be improved".to_string(),
-                1 => "Good example to remember".to_string(),
-                _ => "User feedback".to_string(),
-            });
+        let feedback = note.clone().unwrap_or_else(|| match weight as i32 {
+            10 => "Critical issue that needs correction".to_string(),
+            3 => "Could be improved".to_string(),
+            1 => "Good example to remember".to_string(),
+            _ => "User feedback".to_string(),
+        });
 
         // Create weighted example
         let example = match weight as i32 {
@@ -2970,7 +3113,10 @@ impl Repl {
             _ => "⚪",
         };
 
-        self.output_status(format!("{} Feedback recorded (weight: {}x)", weight_emoji, weight));
+        self.output_status(format!(
+            "{} Feedback recorded (weight: {}x)",
+            weight_emoji, weight
+        ));
         if let Some(note_text) = note {
             self.output_status(format!("   Note: {}", note_text));
         }
@@ -2998,9 +3144,15 @@ impl Repl {
             tokio::spawn(async move {
                 match Self::run_background_training(coordinator, models_dir).await {
                     Ok(stats) => {
-                        output_status!("\n✓ {} examples queued for offline training", stats.examples_trained);
+                        output_status!(
+                            "\n✓ {} examples queued for offline training",
+                            stats.examples_trained
+                        );
                         output_status!("   Queue: {}", stats.queue_path);
-                        output_status!("   To train: python3 scripts/train_lora.py {} \\", stats.queue_path);
+                        output_status!(
+                            "   To train: python3 scripts/train_lora.py {} \\",
+                            stats.queue_path
+                        );
                         output_status!("             ~/.finch/adapters/latest.safetensors");
                         output_status!("   (See GitHub Issue #1 for adapter re-loading into ONNX)");
                     }
@@ -3045,7 +3197,10 @@ impl Repl {
 
                     // Show timing
                     if self.is_interactive {
-                        self.output_status(format!("✓ Local model ({:.2}s)", elapsed.as_secs_f64()));
+                        self.output_status(format!(
+                            "✓ Local model ({:.2}s)",
+                            elapsed.as_secs_f64()
+                        ));
                     }
                 }
                 Err(e) => {
@@ -3083,7 +3238,10 @@ impl Repl {
             ("expert-coder", "Code review focus, best practices"),
             ("teacher", "Patient, educational, step-by-step"),
             ("analyst", "Data-focused, structured, citations"),
-            ("creative", "Brainstorming, storytelling, creative solutions"),
+            (
+                "creative",
+                "Brainstorming, storytelling, creative solutions",
+            ),
             ("researcher", "Deep research, citations, fact-checking"),
         ];
 
@@ -3151,14 +3309,31 @@ impl Repl {
         self.output_status("📋 Available Providers:\n");
 
         for (idx, provider) in self.available_providers.iter().enumerate() {
-            let marker = if idx == self.active_provider_index { "→ " } else { "  " };
-            let tag = if provider.is_local() { "[local]" } else { "[cloud]" };
+            let marker = if idx == self.active_provider_index {
+                "→ "
+            } else {
+                "  "
+            };
+            let tag = if provider.is_local() {
+                "[local]"
+            } else {
+                "[cloud]"
+            };
             let name = provider.display_name();
             let ptype = provider.provider_type();
 
             let detail = if provider.is_local() {
-                if let crate::config::ProviderEntry::Local { model_family, model_size, execution_target, .. } = provider {
-                    format!("{:?} {:?} on {:?}", model_family, model_size, execution_target)
+                if let crate::config::ProviderEntry::Local {
+                    model_family,
+                    model_size,
+                    execution_target,
+                    ..
+                } = provider
+                {
+                    format!(
+                        "{:?} {:?} on {:?}",
+                        model_family, model_size, execution_target
+                    )
                 } else {
                     String::new()
                 }
@@ -3358,7 +3533,10 @@ impl Repl {
                     self.output_status(format!("   Description: {}", service.description));
                 }
                 if !service.capabilities.is_empty() {
-                    self.output_status(format!("   Capabilities: {}", service.capabilities.join(", ")));
+                    self.output_status(format!(
+                        "   Capabilities: {}",
+                        service.capabilities.join(", ")
+                    ));
                 }
                 self.output_status("");
             }
@@ -3378,7 +3556,10 @@ impl Repl {
             let stats = memory.stats().await?;
 
             self.output_status("📚 Memory System Statistics:\n");
-            self.output_status(format!("Conversations stored: {}", stats.conversation_count));
+            self.output_status(format!(
+                "Conversations stored: {}",
+                stats.conversation_count
+            ));
             self.output_status(format!("MemTree nodes: {}", stats.tree_node_count));
             self.output_status("");
 
@@ -3474,9 +3655,10 @@ impl Repl {
                 // Add summary as a system message to maintain context
                 let system_msg = Message::with_content(
                     "system",
-                    vec![crate::claude::types::ContentBlock::text(
-                        format!("Previous conversation summary: {}", summary.trim())
-                    )]
+                    vec![crate::claude::types::ContentBlock::text(format!(
+                        "Previous conversation summary: {}",
+                        summary.trim()
+                    ))],
                 );
                 self.conversation.write().await.add_message(system_msg);
 

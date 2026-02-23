@@ -6,8 +6,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cli::ReplMode;
 use crate::cli::ConversationHistory;
+use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::training::batch_trainer::BatchTrainer;
@@ -268,7 +268,11 @@ mod tests {
     fn test_tool_use_id_prefix() {
         for _ in 0..10 {
             let id = ToolUse::generate_id();
-            assert!(id.starts_with("toolu_"), "ID must start with 'toolu_': {}", id);
+            assert!(
+                id.starts_with("toolu_"),
+                "ID must start with 'toolu_': {}",
+                id
+            );
         }
     }
 
@@ -298,7 +302,9 @@ mod tests {
 
     #[test]
     fn test_content_block_is_text() {
-        let text = ContentBlock::Text { text: "hi".to_string() };
+        let text = ContentBlock::Text {
+            text: "hi".to_string(),
+        };
         assert!(text.is_text());
         assert!(!text.is_tool_use());
         assert!(!text.is_tool_result());
@@ -306,7 +312,11 @@ mod tests {
 
     #[test]
     fn test_content_block_is_tool_use() {
-        let tu = ContentBlock::ToolUse { id: "x".to_string(), name: "bash".to_string(), input: serde_json::json!({}) };
+        let tu = ContentBlock::ToolUse {
+            id: "x".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({}),
+        };
         assert!(tu.is_tool_use());
         assert!(!tu.is_text());
         assert!(!tu.is_tool_result());
@@ -314,7 +324,11 @@ mod tests {
 
     #[test]
     fn test_content_block_is_tool_result() {
-        let tr = ContentBlock::ToolResult { tool_use_id: "x".to_string(), content: "ok".to_string(), is_error: None };
+        let tr = ContentBlock::ToolResult {
+            tool_use_id: "x".to_string(),
+            content: "ok".to_string(),
+            is_error: None,
+        };
         assert!(tr.is_tool_result());
         assert!(!tr.is_text());
         assert!(!tr.is_tool_use());
@@ -322,13 +336,19 @@ mod tests {
 
     #[test]
     fn test_content_block_as_text_some() {
-        let block = ContentBlock::Text { text: "hello".to_string() };
+        let block = ContentBlock::Text {
+            text: "hello".to_string(),
+        };
         assert_eq!(block.as_text(), Some("hello"));
     }
 
     #[test]
     fn test_content_block_as_text_none_for_non_text() {
-        let block = ContentBlock::ToolUse { id: "x".to_string(), name: "y".to_string(), input: serde_json::json!({}) };
+        let block = ContentBlock::ToolUse {
+            id: "x".to_string(),
+            name: "y".to_string(),
+            input: serde_json::json!({}),
+        };
         assert!(block.as_text().is_none());
     }
 
@@ -347,7 +367,9 @@ mod tests {
 
     #[test]
     fn test_content_block_as_tool_use_none_for_non_tool_use() {
-        let block = ContentBlock::Text { text: "hi".to_string() };
+        let block = ContentBlock::Text {
+            text: "hi".to_string(),
+        };
         assert!(block.as_tool_use().is_none());
     }
 

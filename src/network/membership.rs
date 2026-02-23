@@ -76,8 +76,8 @@ impl DeviceMembership {
         if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read membership from {}", path.display()))?;
-            let m: Self = serde_json::from_str(&raw)
-                .with_context(|| "Failed to parse membership JSON")?;
+            let m: Self =
+                serde_json::from_str(&raw).with_context(|| "Failed to parse membership JSON")?;
             return Ok(m);
         }
 
@@ -94,11 +94,9 @@ impl DeviceMembership {
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create ~/.finch directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create ~/.finch directory")?;
         }
-        let json = serde_json::to_string_pretty(self)
-            .context("Failed to serialize membership")?;
+        let json = serde_json::to_string_pretty(self).context("Failed to serialize membership")?;
         std::fs::write(&path, json)
             .with_context(|| format!("Failed to write membership to {}", path.display()))?;
         Ok(())
@@ -125,7 +123,9 @@ mod tests {
 
     #[test]
     fn test_anonymous_is_registered() {
-        let s = MembershipStatus::Anonymous { device_token: "tok".to_string() };
+        let s = MembershipStatus::Anonymous {
+            device_token: "tok".to_string(),
+        };
         assert!(s.is_registered());
         assert_eq!(s.device_token(), Some("tok"));
         assert!(s.account_id().is_none());
@@ -145,7 +145,9 @@ mod tests {
 
     #[test]
     fn test_membership_status_serde_roundtrip_anonymous() {
-        let s = MembershipStatus::Anonymous { device_token: "t".to_string() };
+        let s = MembershipStatus::Anonymous {
+            device_token: "t".to_string(),
+        };
         let json = serde_json::to_string(&s).unwrap();
         let back: MembershipStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);

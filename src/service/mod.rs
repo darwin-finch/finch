@@ -5,5 +5,5 @@
 pub mod discovery;
 pub mod discovery_client;
 
-pub use discovery::{ServiceDiscovery, ServiceConfig};
+pub use discovery::{ServiceConfig, ServiceDiscovery};
 pub use discovery_client::{DiscoveredService, ServiceDiscoveryClient};

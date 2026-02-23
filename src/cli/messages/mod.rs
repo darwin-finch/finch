@@ -17,7 +17,7 @@ pub mod concrete;
 pub mod work_unit;
 
 pub use concrete::*;
-pub use work_unit::{WorkUnit, WorkRow, WorkRowStatus};
+pub use work_unit::{WorkRow, WorkRowStatus, WorkUnit};
 
 /// Unique identifier for messages
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

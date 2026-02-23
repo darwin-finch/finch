@@ -4,15 +4,15 @@
 // plan, then runs multi-persona adversarial critique passes until the plan converges
 // or the user approves it.
 
-pub mod types;
-pub mod personas;
 pub mod loop_runner;
+pub mod personas;
+pub mod types;
 
+pub use loop_runner::PlanLoop;
+pub use personas::select_active_personas;
 pub use types::{
     ConvergenceResult, CritiqueItem, ImpcpdConfig, PlanIteration, PlanResult, UserFeedback,
 };
-pub use personas::select_active_personas;
-pub use loop_runner::PlanLoop;
 
 /// The IMPCPD runtime methodology spec, embedded at compile time.
 ///

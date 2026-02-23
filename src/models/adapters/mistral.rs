@@ -3,7 +3,7 @@
 // Handles Mistral-specific chat template and token IDs.
 // Mistral models: Mistral 7B, Mixtral 8x7B, Mistral Small/Medium/Large
 
-use super::{LocalModelAdapter, GenerationConfig};
+use super::{GenerationConfig, LocalModelAdapter};
 
 /// Adapter for Mistral model family
 pub struct MistralAdapter;
@@ -72,10 +72,7 @@ mod tests {
     #[test]
     fn test_mistral_format() {
         let adapter = MistralAdapter;
-        let prompt = adapter.format_chat_prompt(
-            "You are a helpful assistant.",
-            "What is 2+2?"
-        );
+        let prompt = adapter.format_chat_prompt("You are a helpful assistant.", "What is 2+2?");
 
         assert!(prompt.starts_with("<s>[INST]"));
         assert!(prompt.contains("You are a helpful assistant."));

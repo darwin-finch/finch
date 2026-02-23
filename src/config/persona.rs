@@ -75,8 +75,7 @@ impl Persona {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read persona from {}", path.display()))?;
 
-        toml::from_str(&contents)
-            .context("Failed to parse persona TOML")
+        toml::from_str(&contents).context("Failed to parse persona TOML")
     }
 
     /// Load built-in persona by name
@@ -118,7 +117,10 @@ impl Persona {
             let mut prompt = self.behavior.system_prompt.clone();
             prompt.push_str("\n\nExample interactions:\n");
             for example in &self.behavior.examples {
-                prompt.push_str(&format!("\nUser: {}\nAssistant: {}\n", example.user, example.assistant));
+                prompt.push_str(&format!(
+                    "\nUser: {}\nAssistant: {}\n",
+                    example.user, example.assistant
+                ));
             }
             prompt
         }
@@ -146,7 +148,15 @@ impl Persona {
 
     /// List available builtin personas
     pub fn list_builtins() -> Vec<&'static str> {
-        vec!["default", "expert-coder", "teacher", "analyst", "creative", "researcher", "autonomous"]
+        vec![
+            "default",
+            "expert-coder",
+            "teacher",
+            "analyst",
+            "creative",
+            "researcher",
+            "autonomous",
+        ]
     }
 }
 
@@ -263,7 +273,10 @@ tone = "Casual"
         let f = write_persona(toml);
         let persona = Persona::load(f.path()).unwrap();
         assert_eq!(persona.name(), "Custom");
-        assert_eq!(persona.behavior.system_prompt, "You are a custom assistant.");
+        assert_eq!(
+            persona.behavior.system_prompt,
+            "You are a custom assistant."
+        );
         assert_eq!(persona.behavior.tone, "Casual");
     }
 
@@ -282,7 +295,10 @@ git_email = "vesper@example.com"
         let f = write_persona(toml);
         let persona = Persona::load(f.path()).unwrap();
         assert_eq!(persona.behavior.git_name.as_deref(), Some("Vesper"));
-        assert_eq!(persona.behavior.git_email.as_deref(), Some("vesper@example.com"));
+        assert_eq!(
+            persona.behavior.git_email.as_deref(),
+            Some("vesper@example.com")
+        );
     }
 
     #[test]
@@ -368,8 +384,14 @@ system_prompt = "Simple assistant."
         let persona = Persona::default();
         // Serialize via toml and ensure git_name/git_email don't appear
         let toml_str = toml::to_string(&persona).unwrap();
-        assert!(!toml_str.contains("git_name"), "git_name should be absent when None");
-        assert!(!toml_str.contains("git_email"), "git_email should be absent when None");
+        assert!(
+            !toml_str.contains("git_name"),
+            "git_name should be absent when None"
+        );
+        assert!(
+            !toml_str.contains("git_email"),
+            "git_email should be absent when None"
+        );
     }
 
     #[test]
@@ -379,6 +401,9 @@ system_prompt = "Simple assistant."
         persona.behavior.git_email = Some("bot@finch".to_string());
         let toml_str = toml::to_string(&persona).unwrap();
         assert!(toml_str.contains("git_name"), "git_name should be present");
-        assert!(toml_str.contains("git_email"), "git_email should be present");
+        assert!(
+            toml_str.contains("git_email"),
+            "git_email should be present"
+        );
     }
 }

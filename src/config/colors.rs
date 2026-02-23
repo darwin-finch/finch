@@ -134,23 +134,23 @@ impl ColorTheme {
         ColorScheme {
             status: StatusColors {
                 live_stats: ColorSpec::Rgb(133, 153, 0), // Solarized green
-                training: ColorSpec::Rgb(88, 110, 117), // Solarized base01
-                download: ColorSpec::Rgb(38, 139, 210), // Solarized blue
-                operation: ColorSpec::Rgb(181, 137, 0), // Solarized yellow
-                border: ColorSpec::Rgb(101, 123, 131), // Solarized base0
+                training: ColorSpec::Rgb(88, 110, 117),  // Solarized base01
+                download: ColorSpec::Rgb(38, 139, 210),  // Solarized blue
+                operation: ColorSpec::Rgb(181, 137, 0),  // Solarized yellow
+                border: ColorSpec::Rgb(101, 123, 131),   // Solarized base0
             },
             messages: MessageColors {
-                user: ColorSpec::Rgb(38, 139, 210), // Solarized blue
+                user: ColorSpec::Rgb(38, 139, 210),       // Solarized blue
                 assistant: ColorSpec::Rgb(147, 161, 161), // Solarized base1
-                system: ColorSpec::Rgb(88, 110, 117), // Solarized base01
-                error: ColorSpec::Rgb(220, 50, 47), // Solarized red
-                tool: ColorSpec::Rgb(181, 137, 0), // Solarized yellow
+                system: ColorSpec::Rgb(88, 110, 117),     // Solarized base01
+                error: ColorSpec::Rgb(220, 50, 47),       // Solarized red
+                tool: ColorSpec::Rgb(181, 137, 0),        // Solarized yellow
             },
             ui: UiColors {
-                border: ColorSpec::Rgb(101, 123, 131), // Solarized base0
+                border: ColorSpec::Rgb(101, 123, 131),   // Solarized base0
                 separator: ColorSpec::Rgb(88, 110, 117), // Solarized base01
-                input: ColorSpec::Rgb(147, 161, 161), // Solarized base1
-                cursor: ColorSpec::Rgb(38, 139, 210), // Solarized blue
+                input: ColorSpec::Rgb(147, 161, 161),    // Solarized base1
+                cursor: ColorSpec::Rgb(38, 139, 210),    // Solarized blue
             },
             dialog: DialogColors {
                 border: ColorSpec::Rgb(38, 139, 210), // Solarized blue
@@ -187,7 +187,6 @@ impl ColorTheme {
         }
     }
 }
-
 
 /// Color scheme for TUI elements
 #[derive(Debug, Clone, Serialize, Deserialize)]

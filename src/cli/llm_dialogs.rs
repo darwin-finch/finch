@@ -111,13 +111,16 @@ pub fn validate_input(input: &AskUserQuestionInput) -> Result<(), ValidationErro
     for question in &input.questions {
         // Check required fields
         if question.question.trim().is_empty() {
-            return Err(ValidationError::InvalidQuestion("Empty question text".to_string()));
+            return Err(ValidationError::InvalidQuestion(
+                "Empty question text".to_string(),
+            ));
         }
 
         if question.header.trim().is_empty() {
-            return Err(ValidationError::InvalidQuestion(
-                format!("Question '{}' has empty header", question.question)
-            ));
+            return Err(ValidationError::InvalidQuestion(format!(
+                "Question '{}' has empty header",
+                question.question
+            )));
         }
 
         // Check header length
@@ -137,9 +140,10 @@ pub fn validate_input(input: &AskUserQuestionInput) -> Result<(), ValidationErro
         // Check option content
         for option in &question.options {
             if option.label.trim().is_empty() {
-                return Err(ValidationError::InvalidQuestion(
-                    format!("Question '{}' has option with empty label", question.question)
-                ));
+                return Err(ValidationError::InvalidQuestion(format!(
+                    "Question '{}' has option with empty label",
+                    question.question
+                )));
             }
         }
     }
@@ -152,11 +156,10 @@ pub fn question_to_dialog(question: &Question) -> crate::cli::tui::Dialog {
     use crate::cli::tui::{Dialog, DialogOption};
 
     // Convert our QuestionOptions to DialogOptions
-    let dialog_options: Vec<DialogOption> = question.options.iter()
-        .map(|opt| DialogOption::with_description(
-            opt.label.clone(),
-            opt.description.clone()
-        ))
+    let dialog_options: Vec<DialogOption> = question
+        .options
+        .iter()
+        .map(|opt| DialogOption::with_description(opt.label.clone(), opt.description.clone()))
         .collect();
 
     if question.multi_select {
@@ -189,7 +192,8 @@ pub fn extract_answer(
         }
         DialogResult::MultiSelected(indices) => {
             // Multi-select: join all selected labels
-            let labels: Vec<String> = indices.iter()
+            let labels: Vec<String> = indices
+                .iter()
                 .filter_map(|&idx| {
                     if idx < question.options.len() {
                         Some(question.options[idx].label.clone())
@@ -242,9 +246,7 @@ mod tests {
 
     #[test]
     fn test_validate_input_no_questions() {
-        let input = AskUserQuestionInput {
-            questions: vec![],
-        };
+        let input = AskUserQuestionInput { questions: vec![] };
 
         assert!(matches!(
             validate_input(&input),
@@ -260,8 +262,14 @@ mod tests {
                     question: "Q1".to_string(),
                     header: "H1".to_string(),
                     options: vec![
-                        QuestionOption { label: "A".to_string(), description: "D".to_string() },
-                        QuestionOption { label: "B".to_string(), description: "D".to_string() },
+                        QuestionOption {
+                            label: "A".to_string(),
+                            description: "D".to_string(),
+                        },
+                        QuestionOption {
+                            label: "B".to_string(),
+                            description: "D".to_string(),
+                        },
                     ],
                     multi_select: false,
                 },
@@ -269,8 +277,14 @@ mod tests {
                     question: "Q2".to_string(),
                     header: "H2".to_string(),
                     options: vec![
-                        QuestionOption { label: "A".to_string(), description: "D".to_string() },
-                        QuestionOption { label: "B".to_string(), description: "D".to_string() },
+                        QuestionOption {
+                            label: "A".to_string(),
+                            description: "D".to_string(),
+                        },
+                        QuestionOption {
+                            label: "B".to_string(),
+                            description: "D".to_string(),
+                        },
                     ],
                     multi_select: false,
                 },
@@ -278,8 +292,14 @@ mod tests {
                     question: "Q3".to_string(),
                     header: "H3".to_string(),
                     options: vec![
-                        QuestionOption { label: "A".to_string(), description: "D".to_string() },
-                        QuestionOption { label: "B".to_string(), description: "D".to_string() },
+                        QuestionOption {
+                            label: "A".to_string(),
+                            description: "D".to_string(),
+                        },
+                        QuestionOption {
+                            label: "B".to_string(),
+                            description: "D".to_string(),
+                        },
                     ],
                     multi_select: false,
                 },
@@ -287,8 +307,14 @@ mod tests {
                     question: "Q4".to_string(),
                     header: "H4".to_string(),
                     options: vec![
-                        QuestionOption { label: "A".to_string(), description: "D".to_string() },
-                        QuestionOption { label: "B".to_string(), description: "D".to_string() },
+                        QuestionOption {
+                            label: "A".to_string(),
+                            description: "D".to_string(),
+                        },
+                        QuestionOption {
+                            label: "B".to_string(),
+                            description: "D".to_string(),
+                        },
                     ],
                     multi_select: false,
                 },
@@ -296,8 +322,14 @@ mod tests {
                     question: "Q5".to_string(),
                     header: "H5".to_string(),
                     options: vec![
-                        QuestionOption { label: "A".to_string(), description: "D".to_string() },
-                        QuestionOption { label: "B".to_string(), description: "D".to_string() },
+                        QuestionOption {
+                            label: "A".to_string(),
+                            description: "D".to_string(),
+                        },
+                        QuestionOption {
+                            label: "B".to_string(),
+                            description: "D".to_string(),
+                        },
                     ],
                     multi_select: false,
                 },

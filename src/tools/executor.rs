@@ -212,11 +212,17 @@ impl ToolExecutor {
     /// Always returns Self (never fails) - gracefully handles MCP connection errors
     pub async fn with_mcp(mut self, config: &crate::config::Config) -> Self {
         if !config.mcp_servers.is_empty() {
-            info!("Initializing MCP client with {} servers", config.mcp_servers.len());
+            info!(
+                "Initializing MCP client with {} servers",
+                config.mcp_servers.len()
+            );
             match crate::tools::mcp::McpClient::from_config(&config.mcp_servers).await {
                 Ok(mcp_client) => {
                     let connected_servers = mcp_client.list_servers().await;
-                    info!("MCP client initialized with {} connected servers", connected_servers.len());
+                    info!(
+                        "MCP client initialized with {} connected servers",
+                        connected_servers.len()
+                    );
                     self.mcp_client = Some(Arc::new(mcp_client));
                 }
                 Err(e) => {
@@ -332,7 +338,10 @@ impl ToolExecutor {
         if tool_use.name.starts_with("mcp_") {
             if let Some(mcp) = &self.mcp_client {
                 info!("Routing to MCP client: {}", tool_use.name);
-                match mcp.execute_tool(&tool_use.name, tool_use.input.clone()).await {
+                match mcp
+                    .execute_tool(&tool_use.name, tool_use.input.clone())
+                    .await
+                {
                     Ok(output) => {
                         info!("MCP tool executed successfully");
                         return Ok(ToolResult::success(tool_use.id.clone(), output));
@@ -386,7 +395,14 @@ impl ToolExecutor {
             let current_mode = mode.read().await;
             if let crate::cli::ReplMode::Planning { .. } = &*current_mode {
                 // In planning mode, only allow read-only tools
-                let allowed_tools = ["read", "glob", "grep", "web_fetch", "enter_plan_mode", "present_plan"];
+                let allowed_tools = [
+                    "read",
+                    "glob",
+                    "grep",
+                    "web_fetch",
+                    "enter_plan_mode",
+                    "present_plan",
+                ];
                 if !allowed_tools.contains(&tool_use.name.as_str()) {
                     drop(current_mode);
                     warn!("Tool '{}' blocked in planning mode", tool_use.name);

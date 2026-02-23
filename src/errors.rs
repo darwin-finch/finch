@@ -65,7 +65,7 @@ fn t(key: &str) -> String {
             "possible_causes" => "Possible causes:",
             "error" => "Error:",
             _ => key,
-        }
+        },
     };
 
     text.to_string()
@@ -89,7 +89,9 @@ impl<T> UserFriendlyError for Result<T> {
         self.with_context(|| {
             format!(
                 "{}\n\n\x1b[1;33m{}:\x1b[0m {}",
-                problem, t("suggestion"), suggestion
+                problem,
+                t("suggestion"),
+                suggestion
             )
         })
     }
@@ -110,7 +112,9 @@ pub fn connection_refused_error(address: &str) -> String {
            \x1b[36mtail -f ~/.finch/daemon.log\x1b[0m\n\n\
         3. Check if daemon is running:\n\
            \x1b[36mps aux | grep \"finch daemon\"\x1b[0m",
-        address, t("possible_causes"), t("try")
+        address,
+        t("possible_causes"),
+        t("try")
     )
 }
 
@@ -259,7 +263,9 @@ pub fn wrap_error_with_suggestion(error: impl fmt::Display, suggestion: &str) ->
     format!(
         "{}\n\n\
         \x1b[1;33m{}:\x1b[0m {}",
-        error, t("suggestion"), suggestion
+        error,
+        t("suggestion"),
+        suggestion
     )
 }
 

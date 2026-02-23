@@ -7,10 +7,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::generator_new::GeneratorModel;
-use crate::config::ExecutionTarget;
 use super::unified_loader::{ModelFamily, ModelLoadConfig, ModelSize};
 use super::GeneratorConfig;
 use crate::cli::OutputManager;
+use crate::config::ExecutionTarget;
 
 /// Generator loading state for progressive bootstrap
 #[derive(Debug, Clone)]
@@ -20,7 +20,7 @@ pub enum GeneratorState {
 
     /// Downloading model (first time only)
     Downloading {
-        model_name: String,  // e.g., "Qwen 2.5 3B" or "Gemma 2 9B"
+        model_name: String, // e.g., "Qwen 2.5 3B" or "Gemma 2 9B"
         progress: DownloadProgressSnapshot,
     },
 
@@ -64,10 +64,7 @@ impl GeneratorState {
             } => {
                 format!(
                     "Downloading {} ({}/{}): {}",
-                    model_name,
-                    progress.current_file,
-                    progress.total_files,
-                    progress.file_name
+                    model_name, progress.current_file, progress.total_files, progress.file_name
                 )
             }
             GeneratorState::Loading { model_name } => {
@@ -185,7 +182,10 @@ impl BootstrapLoader {
 
         // Check HF token before attempting (UnifiedModelLoader will download if needed)
         if let Err(e) = Self::check_hf_token() {
-            tracing::warn!("HuggingFace token check failed: {}. Model must be cached.", e);
+            tracing::warn!(
+                "HuggingFace token check failed: {}. Model must be cached.",
+                e
+            );
             // Don't fail here - model might be cached
         }
 

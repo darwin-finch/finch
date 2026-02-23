@@ -85,23 +85,18 @@ impl CandleLoader {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
         let config_path = model_path.join("config.json");
-        let config_str = std::fs::read_to_string(&config_path)
-            .context("Failed to read config.json")?;
-        let config: models::qwen2::Config = serde_json::from_str(&config_str)
-            .context("Failed to parse config.json")?;
+        let config_str =
+            std::fs::read_to_string(&config_path).context("Failed to read config.json")?;
+        let config: models::qwen2::Config =
+            serde_json::from_str(&config_str).context("Failed to parse config.json")?;
 
         let weights_path = model_path.join("model.safetensors");
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[weights_path],
-                candle_core::DType::F32,
-                &device,
-            )
-            .context("Failed to load model weights")?
+            VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
+                .context("Failed to load model weights")?
         };
 
-        let model = models::qwen2::Model::new(&config, vb)
-            .context("Failed to build Qwen model")?;
+        let model = models::qwen2::Model::new(&config, vb).context("Failed to build Qwen model")?;
 
         Ok(Box::new(LoadedCandleModel {
             model: CandleModel::Qwen(model),
@@ -164,7 +159,8 @@ impl TextGeneration for LoadedCandleModel {
         use candle_core::IndexOp;
 
         // Qwen EOS tokens: <|endoftext|> = 151643, <|im_end|> = 151645
-        let eos_id = self.tokenizer
+        let eos_id = self
+            .tokenizer
             .token_to_id("<|endoftext|>")
             .or_else(|| self.tokenizer.token_to_id("<|im_end|>"))
             .unwrap_or(151643);
@@ -201,8 +197,7 @@ impl TextGeneration for LoadedCandleModel {
         let mut prev_token = first_token;
 
         for _ in 1..max_new_tokens {
-            let token_tensor = Tensor::new(&[prev_token], &self.device)?
-                .unsqueeze(0)?;
+            let token_tensor = Tensor::new(&[prev_token], &self.device)?.unsqueeze(0)?;
 
             let logits = match &mut self.model {
                 CandleModel::Qwen(model) => model
@@ -225,7 +220,8 @@ impl TextGeneration for LoadedCandleModel {
     }
 
     fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self.tokenizer
+        let encoding = self
+            .tokenizer
             .encode(text, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         Ok(encoding.get_ids().to_vec())
@@ -264,8 +260,8 @@ impl CandleLoader {
 #[cfg(all(test, feature = "candle"))]
 mod tests {
     use super::*;
-    use crate::models::unified_loader::{ModelFamily, ModelSize};
     use crate::config::ExecutionTarget;
+    use crate::models::unified_loader::{ModelFamily, ModelSize};
 
     // --- Regression: unimplemented families must return errors, not panic ---
     //
@@ -273,58 +269,115 @@ mod tests {
     // a clear error at load time rather than silently doing nothing or panicking.
 
     fn loader_with_dummy_path() -> (CandleLoader, std::path::PathBuf) {
-        (CandleLoader::new(), std::path::PathBuf::from("/nonexistent"))
+        (
+            CandleLoader::new(),
+            std::path::PathBuf::from("/nonexistent"),
+        )
     }
 
     #[test]
     fn test_candle_llama_stub_returns_error() {
         let (loader, path) = loader_with_dummy_path();
-        let result = loader.load(&path, ModelFamily::Llama3, ModelSize::Small, ExecutionTarget::Cpu);
+        let result = loader.load(
+            &path,
+            ModelFamily::Llama3,
+            ModelSize::Small,
+            ExecutionTarget::Cpu,
+        );
         assert!(result.is_err());
         let msg = result.err().expect("expected an error").to_string();
-        assert!(msg.contains("not yet implemented"), "Expected stub error, got: {}", msg);
+        assert!(
+            msg.contains("not yet implemented"),
+            "Expected stub error, got: {}",
+            msg
+        );
     }
 
     #[test]
     fn test_candle_gemma_stub_returns_error() {
         let (loader, path) = loader_with_dummy_path();
-        let result = loader.load(&path, ModelFamily::Gemma2, ModelSize::Small, ExecutionTarget::Cpu);
+        let result = loader.load(
+            &path,
+            ModelFamily::Gemma2,
+            ModelSize::Small,
+            ExecutionTarget::Cpu,
+        );
         assert!(result.is_err());
-        assert!(result.err().expect("expected an error").to_string().contains("not yet implemented"));
+        assert!(result
+            .err()
+            .expect("expected an error")
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[test]
     fn test_candle_mistral_stub_returns_error() {
         let (loader, path) = loader_with_dummy_path();
-        let result = loader.load(&path, ModelFamily::Mistral, ModelSize::Small, ExecutionTarget::Cpu);
+        let result = loader.load(
+            &path,
+            ModelFamily::Mistral,
+            ModelSize::Small,
+            ExecutionTarget::Cpu,
+        );
         assert!(result.is_err());
-        assert!(result.err().expect("expected an error").to_string().contains("not yet implemented"));
+        assert!(result
+            .err()
+            .expect("expected an error")
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[test]
     fn test_candle_phi_stub_returns_error() {
         let (loader, path) = loader_with_dummy_path();
-        let result = loader.load(&path, ModelFamily::Phi, ModelSize::Small, ExecutionTarget::Cpu);
+        let result = loader.load(
+            &path,
+            ModelFamily::Phi,
+            ModelSize::Small,
+            ExecutionTarget::Cpu,
+        );
         assert!(result.is_err());
-        assert!(result.err().expect("expected an error").to_string().contains("not yet implemented"));
+        assert!(result
+            .err()
+            .expect("expected an error")
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[test]
     fn test_candle_deepseek_stub_returns_error() {
         let (loader, path) = loader_with_dummy_path();
-        let result = loader.load(&path, ModelFamily::DeepSeek, ModelSize::Small, ExecutionTarget::Cpu);
+        let result = loader.load(
+            &path,
+            ModelFamily::DeepSeek,
+            ModelSize::Small,
+            ExecutionTarget::Cpu,
+        );
         assert!(result.is_err());
-        assert!(result.err().expect("expected an error").to_string().contains("not yet implemented"));
+        assert!(result
+            .err()
+            .expect("expected an error")
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[test]
     fn test_candle_qwen_missing_files_returns_error() {
         // Qwen IS implemented; loading from a nonexistent path must fail gracefully
         let (loader, path) = loader_with_dummy_path();
-        let result = loader.load(&path, ModelFamily::Qwen2, ModelSize::Small, ExecutionTarget::Cpu);
+        let result = loader.load(
+            &path,
+            ModelFamily::Qwen2,
+            ModelSize::Small,
+            ExecutionTarget::Cpu,
+        );
         assert!(result.is_err());
         // Should fail on tokenizer/config/weights load, not a stub error
         let msg = result.err().expect("expected an error").to_string();
-        assert!(!msg.contains("not yet implemented"), "Qwen should attempt to load, not stub: {}", msg);
+        assert!(
+            !msg.contains("not yet implemented"),
+            "Qwen should attempt to load, not stub: {}",
+            msg
+        );
     }
 }

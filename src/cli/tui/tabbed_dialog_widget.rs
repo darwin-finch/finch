@@ -77,8 +77,7 @@ impl<'a> TabbedDialogWidget<'a> {
                     .add_modifier(Modifier::BOLD)
             } else if tab_state.answered {
                 // Answered tab: dimmed with checkmark (use green-ish color)
-                Style::default()
-                    .fg(ratatui::style::Color::Green)
+                Style::default().fg(ratatui::style::Color::Green)
             } else {
                 // Unanswered tab: normal
                 Style::default().fg(self.colors.dialog.option.to_color())
@@ -88,7 +87,10 @@ impl<'a> TabbedDialogWidget<'a> {
 
             // Add separator between tabs
             if idx < self.dialog.tabs().len() - 1 {
-                tab_spans.push(Span::styled(" │ ", Style::default().fg(self.colors.ui.separator.to_color())));
+                tab_spans.push(Span::styled(
+                    " │ ",
+                    Style::default().fg(self.colors.ui.separator.to_color()),
+                ));
             }
         }
 
@@ -166,11 +168,16 @@ impl<'a> TabbedDialogWidget<'a> {
             let cursor_pos = tab_state.custom_cursor_pos;
             let mut spans = vec![Span::styled(
                 "❯ ",
-                Style::default().fg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(self.colors.ui.cursor.to_color())
+                    .add_modifier(Modifier::BOLD),
             )];
             if cursor_pos > 0 {
                 let before: String = input_text.chars().take(cursor_pos).collect();
-                spans.push(Span::styled(before, Style::default().fg(self.colors.dialog.option.to_color())));
+                spans.push(Span::styled(
+                    before,
+                    Style::default().fg(self.colors.dialog.option.to_color()),
+                ));
             }
             if let Some(cursor_ch) = input_text.chars().nth(cursor_pos) {
                 spans.push(Span::styled(
@@ -182,12 +189,17 @@ impl<'a> TabbedDialogWidget<'a> {
                 ));
                 let after: String = input_text.chars().skip(cursor_pos + 1).collect();
                 if !after.is_empty() {
-                    spans.push(Span::styled(after, Style::default().fg(self.colors.dialog.option.to_color())));
+                    spans.push(Span::styled(
+                        after,
+                        Style::default().fg(self.colors.dialog.option.to_color()),
+                    ));
                 }
             } else {
                 spans.push(Span::styled(
                     " ",
-                    Style::default().bg(self.colors.ui.cursor.to_color()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .bg(self.colors.ui.cursor.to_color())
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
             lines.push(Line::from(spans));
@@ -231,7 +243,9 @@ impl<'a> TabbedDialogWidget<'a> {
 impl Widget for TabbedDialogWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Create border block
-        let title = self.dialog.title()
+        let title = self
+            .dialog
+            .title()
             .map(|t| format!(" {} ", t))
             .unwrap_or_else(|| " Questions ".to_string());
 

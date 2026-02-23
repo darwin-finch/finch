@@ -70,7 +70,8 @@ impl Tool for ReadTool {
             if start >= total_lines {
                 return Ok(format!(
                     "File has {} lines. Offset {} is past the end.",
-                    total_lines, start + 1
+                    total_lines,
+                    start + 1
                 ));
             }
 
@@ -79,7 +80,14 @@ impl Tool for ReadTool {
             let numbered: String = slice
                 .iter()
                 .enumerate()
-                .map(|(i, line)| format!("{:>width$}\t{}", start + i + 1, line, width = line_num_width))
+                .map(|(i, line)| {
+                    format!(
+                        "{:>width$}\t{}",
+                        start + i + 1,
+                        line,
+                        width = line_num_width
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -124,23 +132,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_existing_file() {
-        let result = ReadTool.execute(serde_json::json!({"file_path": "Cargo.toml"}), &ctx()).await;
+        let result = ReadTool
+            .execute(serde_json::json!({"file_path": "Cargo.toml"}), &ctx())
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("[package]"));
     }
 
     #[tokio::test]
     async fn test_read_nonexistent_file() {
-        let result = ReadTool.execute(serde_json::json!({"file_path": "/nonexistent/file.txt"}), &ctx()).await;
+        let result = ReadTool
+            .execute(
+                serde_json::json!({"file_path": "/nonexistent/file.txt"}),
+                &ctx(),
+            )
+            .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_read_with_offset_and_limit() {
-        let result = ReadTool.execute(
-            serde_json::json!({"file_path": "Cargo.toml", "offset": 1, "limit": 3}),
-            &ctx(),
-        ).await;
+        let result = ReadTool
+            .execute(
+                serde_json::json!({"file_path": "Cargo.toml", "offset": 1, "limit": 3}),
+                &ctx(),
+            )
+            .await;
         assert!(result.is_ok());
         let out = result.unwrap();
         assert!(out.contains("Lines 1-3"), "got: {}", out);
@@ -150,10 +167,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_with_offset_only() {
-        let result = ReadTool.execute(
-            serde_json::json!({"file_path": "Cargo.toml", "offset": 1}),
-            &ctx(),
-        ).await;
+        let result = ReadTool
+            .execute(
+                serde_json::json!({"file_path": "Cargo.toml", "offset": 1}),
+                &ctx(),
+            )
+            .await;
         assert!(result.is_ok());
         let out = result.unwrap();
         assert!(out.contains("Lines 1-"), "got: {}", out);

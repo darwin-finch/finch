@@ -192,7 +192,11 @@ fn inspect_screen() -> Result<String> {
         bounds.origin.x as i32,
         bounds.origin.y as i32,
         main_display.id,
-        if main_display.is_active() { "Yes" } else { "No" }
+        if main_display.is_active() {
+            "Yes"
+        } else {
+            "No"
+        }
     ))
 }
 
@@ -207,7 +211,10 @@ fn perform_click(x: f64, y: f64, button: &str, double_click: bool) -> Result<()>
         "left" => CGMouseButton::Left,
         "right" => CGMouseButton::Right,
         "middle" => CGMouseButton::Center,
-        _ => anyhow::bail!("Invalid button type: {}. Use 'left', 'right', or 'middle'", button),
+        _ => anyhow::bail!(
+            "Invalid button type: {}. Use 'left', 'right', or 'middle'",
+            button
+        ),
     };
 
     // Determine event types based on button
@@ -219,13 +226,16 @@ fn perform_click(x: f64, y: f64, button: &str, double_click: bool) -> Result<()>
 
     let point = CGPoint::new(x, y);
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .ok().context("Failed to create event source - check Accessibility permissions")?;
+        .ok()
+        .context("Failed to create event source - check Accessibility permissions")?;
 
     // First click
     let mouse_down = CGEvent::new_mouse_event(source.clone(), mouse_down_type, point, mouse_button)
-        .ok().context("Failed to create mouse down event")?;
+        .ok()
+        .context("Failed to create mouse down event")?;
     let mouse_up = CGEvent::new_mouse_event(source.clone(), mouse_up_type, point, mouse_button)
-        .ok().context("Failed to create mouse up event")?;
+        .ok()
+        .context("Failed to create mouse up event")?;
 
     mouse_down.post(CGEventTapLocation::HID);
     mouse_up.post(CGEventTapLocation::HID);
@@ -234,10 +244,13 @@ fn perform_click(x: f64, y: f64, button: &str, double_click: bool) -> Result<()>
     if double_click {
         std::thread::sleep(std::time::Duration::from_millis(50)); // Brief delay between clicks
 
-        let mouse_down2 = CGEvent::new_mouse_event(source.clone(), mouse_down_type, point, mouse_button)
-            .ok().context("Failed to create second mouse down event")?;
+        let mouse_down2 =
+            CGEvent::new_mouse_event(source.clone(), mouse_down_type, point, mouse_button)
+                .ok()
+                .context("Failed to create second mouse down event")?;
         let mouse_up2 = CGEvent::new_mouse_event(source, mouse_up_type, point, mouse_button)
-            .ok().context("Failed to create second mouse up event")?;
+            .ok()
+            .context("Failed to create second mouse up event")?;
 
         mouse_down2.post(CGEventTapLocation::HID);
         mouse_up2.post(CGEventTapLocation::HID);
@@ -252,17 +265,20 @@ fn type_text(text: &str, delay_ms: u64) -> Result<()> {
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .ok().context("Failed to create event source - check Accessibility permissions")?;
+        .ok()
+        .context("Failed to create event source - check Accessibility permissions")?;
 
     for ch in text.chars() {
         // Type the character using Unicode
         let key_down = CGEvent::new_keyboard_event(source.clone(), 0, true)
-            .ok().context("Failed to create key down event")?;
+            .ok()
+            .context("Failed to create key down event")?;
         key_down.set_string(ch.to_string().as_str());
         key_down.post(CGEventTapLocation::HID);
 
         let key_up = CGEvent::new_keyboard_event(source.clone(), 0, false)
-            .ok().context("Failed to create key up event")?;
+            .ok()
+            .context("Failed to create key up event")?;
         key_up.set_string(ch.to_string().as_str());
         key_up.post(CGEventTapLocation::HID);
 
@@ -280,13 +296,15 @@ fn inspect_windows() -> Result<String> {
     // Use AppleScript to query window information
     let output = std::process::Command::new("osascript")
         .arg("-e")
-        .arg(r#"
+        .arg(
+            r#"
             tell application "System Events"
                 set frontApp to name of first application process whose frontmost is true
                 set appWindows to name of every window of application process frontApp
                 return frontApp & "|" & (appWindows as string)
             end tell
-        "#)
+        "#,
+        )
         .output()
         .context("Failed to execute AppleScript - check permissions")?;
 
@@ -360,8 +378,7 @@ fn inspect_focused() -> Result<String> {
              • Element: {}\n\
              \n\
              Use this information to determine where gui_type will send text.",
-            app_name,
-            focused
+            app_name, focused
         ))
     } else {
         Ok(format!(

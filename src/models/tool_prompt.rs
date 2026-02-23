@@ -78,10 +78,17 @@ impl ToolPromptFormatter {
 
         prompt.push_str("## Important Rules:\n\n");
         prompt.push_str("1. **Think before acting**: Explain your reasoning before using tools\n");
-        prompt.push_str("2. **Parameters must be valid JSON**: Ensure proper quoting and escaping\n");
-        prompt.push_str("3. **One tool at a time**: Call one tool, wait for results, then continue\n");
-        prompt.push_str("4. **Use results**: After receiving tool results, incorporate them into your answer\n");
-        prompt.push_str("5. **Provide final answer**: After using tools, give the user a clear response\n\n");
+        prompt
+            .push_str("2. **Parameters must be valid JSON**: Ensure proper quoting and escaping\n");
+        prompt.push_str(
+            "3. **One tool at a time**: Call one tool, wait for results, then continue\n",
+        );
+        prompt.push_str(
+            "4. **Use results**: After receiving tool results, incorporate them into your answer\n",
+        );
+        prompt.push_str(
+            "5. **Provide final answer**: After using tools, give the user a clear response\n\n",
+        );
 
         prompt
     }
@@ -109,9 +116,11 @@ impl ToolPromptFormatter {
 
             // Truncate very long results
             let content = if result.content.len() > 2000 {
-                format!("{}...\n\n(truncated, {} total characters)",
+                format!(
+                    "{}...\n\n(truncated, {} total characters)",
                     &result.content[..2000],
-                    result.content.len())
+                    result.content.len()
+                )
             } else {
                 result.content.clone()
             };

@@ -91,7 +91,6 @@ pub enum DevicePreference {
     Metal,
 }
 
-
 // Phase 4: Device functions removed (Candle-based)
 // ONNX Runtime handles device selection via execution providers
 
@@ -161,7 +160,10 @@ mod tests {
     #[allow(deprecated)]
     #[test]
     fn test_device_preference_default_is_auto() {
-        assert!(matches!(DevicePreference::default(), DevicePreference::Auto));
+        assert!(matches!(
+            DevicePreference::default(),
+            DevicePreference::Auto
+        ));
     }
 
     #[allow(deprecated)]

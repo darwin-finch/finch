@@ -72,7 +72,9 @@ impl NodeInfo {
 
     /// One-line summary for status display
     pub fn summary(&self) -> String {
-        let model = self.capabilities.local_model
+        let model = self
+            .capabilities
+            .local_model
             .as_deref()
             .unwrap_or("cloud-only");
         format!(

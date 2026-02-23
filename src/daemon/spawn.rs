@@ -48,7 +48,10 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
         warn!("Daemon process exists but not responding to health checks");
         let pid = lifecycle.read_pid()?;
         bail!(errors::wrap_error_with_suggestion(
-            format!("Daemon is running (PID: {}) but not responding to health checks", pid),
+            format!(
+                "Daemon is running (PID: {}) but not responding to health checks",
+                pid
+            ),
             "Try stopping and restarting:\n\
              1. finch daemon-stop\n\
              2. finch daemon-start\n\n\
@@ -91,8 +94,8 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
 /// - Unix: Standard spawn with log file redirection
 /// - Windows: Uses CREATE_NO_WINDOW flag to avoid console
 pub fn spawn_daemon(bind_address: &str) -> Result<()> {
-    let exe_path = std::env::current_exe()
-        .context("Failed to determine current executable path")?;
+    let exe_path =
+        std::env::current_exe().context("Failed to determine current executable path")?;
 
     // Create log file in ~/.finch/daemon.log
     let log_path = dirs::home_dir()
@@ -127,7 +130,11 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
             .arg("--bind")
             .arg(bind_address)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file.try_clone().context("Failed to clone log file handle")?))
+            .stdout(Stdio::from(
+                log_file
+                    .try_clone()
+                    .context("Failed to clone log file handle")?,
+            ))
             .stderr(Stdio::from(log_file))
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
@@ -144,7 +151,11 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
             .arg(bind_address)
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file.try_clone().context("Failed to clone log file handle")?))
+            .stdout(Stdio::from(
+                log_file
+                    .try_clone()
+                    .context("Failed to clone log file handle")?,
+            ))
             .stderr(Stdio::from(log_file))
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;

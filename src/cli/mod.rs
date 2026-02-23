@@ -25,7 +25,10 @@ pub use input::InputHandler;
 pub use llm_dialogs::{AskUserQuestionInput, AskUserQuestionOutput, Question, QuestionOption};
 pub use memtree_console::{ConsoleNode, ConsoleNodeType, MemTreeConsole};
 pub use messages::{Message, MessageId, MessageRef, MessageStatus};
-pub use messages::{ProgressMessage, StaticMessage, StreamingResponseMessage, ToolExecutionMessage, UserQueryMessage};
+pub use messages::{
+    ProgressMessage, StaticMessage, StreamingResponseMessage, ToolExecutionMessage,
+    UserQueryMessage,
+};
 pub use output_manager::OutputManager;
 pub use repl::{Repl, ReplMode};
 pub use setup_wizard::show_setup_wizard;

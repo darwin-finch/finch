@@ -110,7 +110,11 @@ mod tests {
     #[test]
     fn loads_claude_md_from_cwd() {
         let tmp = TempDir::new().unwrap();
-        write(tmp.path(), "CLAUDE.md", "# Project Instructions\nDo the thing.");
+        write(
+            tmp.path(),
+            "CLAUDE.md",
+            "# Project Instructions\nDo the thing.",
+        );
 
         let result = collect_claude_md_context(tmp.path());
         assert!(result.is_some());
@@ -120,7 +124,11 @@ mod tests {
     #[test]
     fn loads_finch_md_from_cwd() {
         let tmp = TempDir::new().unwrap();
-        write(tmp.path(), "FINCH.md", "# Finch Instructions\nUse iterators.");
+        write(
+            tmp.path(),
+            "FINCH.md",
+            "# Finch Instructions\nUse iterators.",
+        );
 
         let result = collect_claude_md_context(tmp.path());
         assert!(result.is_some());
@@ -141,7 +149,10 @@ mod tests {
         // CLAUDE.md comes before FINCH.md within the same directory
         let claude_pos = text.find("claude instructions").unwrap();
         let finch_pos = text.find("finch instructions").unwrap();
-        assert!(claude_pos < finch_pos, "CLAUDE.md should appear before FINCH.md");
+        assert!(
+            claude_pos < finch_pos,
+            "CLAUDE.md should appear before FINCH.md"
+        );
     }
 
     #[test]

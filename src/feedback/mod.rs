@@ -23,8 +23,8 @@ impl FeedbackRating {
     /// Get the LoRA training weight for this feedback
     pub fn training_weight(&self) -> f64 {
         match self {
-            FeedbackRating::Good => 1.0,   // Normal weight (1x)
-            FeedbackRating::Bad => 10.0,   // High weight (10x) - learn from mistakes
+            FeedbackRating::Good => 1.0, // Normal weight (1x)
+            FeedbackRating::Bad => 10.0, // High weight (10x) - learn from mistakes
         }
     }
 
@@ -90,8 +90,7 @@ impl FeedbackLogger {
             .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
 
         let finch_dir = home.join(".finch");
-        fs::create_dir_all(&finch_dir)
-            .context("Failed to create ~/.finch directory")?;
+        fs::create_dir_all(&finch_dir).context("Failed to create ~/.finch directory")?;
 
         let file_path = finch_dir.join("feedback.jsonl");
 
@@ -104,13 +103,13 @@ impl FeedbackLogger {
             .create(true)
             .append(true)
             .open(&self.file_path)
-            .with_context(|| format!("Failed to open feedback log: {}", self.file_path.display()))?;
+            .with_context(|| {
+                format!("Failed to open feedback log: {}", self.file_path.display())
+            })?;
 
-        let json = serde_json::to_string(entry)
-            .context("Failed to serialize feedback entry")?;
+        let json = serde_json::to_string(entry).context("Failed to serialize feedback entry")?;
 
-        writeln!(file, "{}", json)
-            .context("Failed to write feedback entry")?;
+        writeln!(file, "{}", json).context("Failed to write feedback entry")?;
 
         Ok(())
     }
@@ -126,8 +125,8 @@ impl FeedbackLogger {
             return Ok(0);
         }
 
-        let contents = fs::read_to_string(&self.file_path)
-            .context("Failed to read feedback log")?;
+        let contents =
+            fs::read_to_string(&self.file_path).context("Failed to read feedback log")?;
 
         Ok(contents.lines().filter(|l| !l.trim().is_empty()).count())
     }
@@ -138,8 +137,8 @@ impl FeedbackLogger {
             return Ok(Vec::new());
         }
 
-        let contents = fs::read_to_string(&self.file_path)
-            .context("Failed to read feedback log")?;
+        let contents =
+            fs::read_to_string(&self.file_path).context("Failed to read feedback log")?;
 
         let mut entries = Vec::new();
         for line in contents.lines() {
@@ -147,8 +146,8 @@ impl FeedbackLogger {
                 continue;
             }
 
-            let entry: FeedbackEntry = serde_json::from_str(line)
-                .context("Failed to parse feedback entry")?;
+            let entry: FeedbackEntry =
+                serde_json::from_str(line).context("Failed to parse feedback entry")?;
             entries.push(entry);
         }
 
@@ -187,7 +186,8 @@ mod tests {
             "Test".to_string(),
             "Response".to_string(),
             FeedbackRating::Bad,
-        ).with_note("Wrong algorithm".to_string());
+        )
+        .with_note("Wrong algorithm".to_string());
 
         assert_eq!(entry.note, Some("Wrong algorithm".to_string()));
     }

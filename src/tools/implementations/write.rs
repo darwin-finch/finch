@@ -88,8 +88,8 @@ impl Tool for WriteTool {
             let delta: i64 = new_lines as i64 - old_lines as i64;
             let delta_str = match delta.cmp(&0) {
                 std::cmp::Ordering::Greater => format!("+{} lines", delta),
-                std::cmp::Ordering::Less   => format!("{} lines", delta),
-                std::cmp::Ordering::Equal  => "unchanged line count".to_string(),
+                std::cmp::Ordering::Less => format!("{} lines", delta),
+                std::cmp::Ordering::Equal => "unchanged line count".to_string(),
             };
             Ok(format!(
                 "Updated {} ({} → {} lines, {})\n",

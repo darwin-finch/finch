@@ -75,7 +75,10 @@ mod tests {
         let config = McpServerConfig {
             transport: TransportType::Stdio,
             command: Some("npx".to_string()),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+            ],
             env: HashMap::new(),
             url: None,
             enabled: true,
@@ -131,7 +134,10 @@ mod tests {
         let config = McpServerConfig {
             transport: TransportType::Stdio,
             command: Some("npx".to_string()),
-            args: vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()],
+            args: vec![
+                "-y".to_string(),
+                "@modelcontextprotocol/server-filesystem".to_string(),
+            ],
             env: HashMap::new(),
             url: None,
             enabled: true,
@@ -164,7 +170,10 @@ mod tests {
 
         assert!(config.validate("github").is_ok());
         assert_eq!(config.env.len(), 2);
-        assert_eq!(config.env.get("GITHUB_TOKEN"), Some(&"test_token".to_string()));
+        assert_eq!(
+            config.env.get("GITHUB_TOKEN"),
+            Some(&"test_token".to_string())
+        );
     }
 
     #[test]

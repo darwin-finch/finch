@@ -255,7 +255,10 @@ mod tests {
             completion_tokens: 20,
             total_tokens: 30,
         };
-        assert_eq!(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
     }
 
     #[test]
@@ -270,7 +273,11 @@ mod tests {
                 message: ChatMessage::assistant("4"),
                 finish_reason: "stop".to_string(),
             }],
-            usage: Usage { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+            usage: Usage {
+                prompt_tokens: 5,
+                completion_tokens: 1,
+                total_tokens: 6,
+            },
         };
         let json = serde_json::to_string(&response).unwrap();
         let decoded: ChatCompletionResponse = serde_json::from_str(&json).unwrap();
@@ -300,8 +307,18 @@ mod tests {
         let resp = ModelsResponse {
             object: "list".to_string(),
             data: vec![
-                Model { id: "qwen-local".to_string(), object: "model".to_string(), created: 0, owned_by: "finch".to_string() },
-                Model { id: "claude-3".to_string(), object: "model".to_string(), created: 0, owned_by: "anthropic".to_string() },
+                Model {
+                    id: "qwen-local".to_string(),
+                    object: "model".to_string(),
+                    created: 0,
+                    owned_by: "finch".to_string(),
+                },
+                Model {
+                    id: "claude-3".to_string(),
+                    object: "model".to_string(),
+                    created: 0,
+                    owned_by: "anthropic".to_string(),
+                },
             ],
         };
         assert_eq!(resp.data.len(), 2);

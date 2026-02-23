@@ -159,7 +159,12 @@ impl OpenAIProvider {
     }
 
     /// Create a provider with custom settings
-    fn new(api_key: String, base_url: String, default_model: String, provider_name: String) -> Result<Self> {
+    fn new(
+        api_key: String,
+        base_url: String,
+        default_model: String,
+        provider_name: String,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
@@ -198,12 +203,16 @@ impl OpenAIProvider {
                     // Collect text and tool_calls into a single assistant message.
                     // The OpenAI API requires tool_calls to be in the assistant message
                     // (not silently dropped), otherwise subsequent tool results are orphaned.
-                    let text: String = msg.content.iter()
+                    let text: String = msg
+                        .content
+                        .iter()
                         .filter_map(|b| b.as_text())
                         .collect::<Vec<_>>()
                         .join("");
 
-                    let tool_calls: Vec<OpenAIRequestToolCall> = msg.content.iter()
+                    let tool_calls: Vec<OpenAIRequestToolCall> = msg
+                        .content
+                        .iter()
                         .filter_map(|b| match b {
                             ContentBlock::ToolUse { id, name, input } => {
                                 let arguments = serde_json::to_string(input)
@@ -231,7 +240,11 @@ impl OpenAIProvider {
                     messages.push(OpenAIMessage::Assistant {
                         role: "assistant".to_string(),
                         content,
-                        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                        tool_calls: if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls)
+                        },
                     });
                 }
                 _ => {
@@ -244,7 +257,11 @@ impl OpenAIProvider {
                             ContentBlock::Text { text } => {
                                 text_parts.push(text.as_str());
                             }
-                            ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                ..
+                            } => {
                                 tool_results.push((tool_use_id.clone(), content.clone()));
                             }
                             ContentBlock::Image { .. } => {
@@ -477,8 +494,15 @@ impl OpenAIProvider {
 
                                     // Convert accumulated tool call deltas to ToolUse blocks
                                     for block in finalize_tool_calls(&tool_call_acc) {
-                                        if let ContentBlock::ToolUse { ref name, ref id, .. } = block {
-                                            tracing::debug!("[STREAM] Sending tool call: {} ({})", name, id);
+                                        if let ContentBlock::ToolUse {
+                                            ref name, ref id, ..
+                                        } = block
+                                        {
+                                            tracing::debug!(
+                                                "[STREAM] Sending tool call: {} ({})",
+                                                name,
+                                                id
+                                            );
                                         }
                                         if tx
                                             .send(Ok(StreamChunk::ContentBlockComplete(block)))
@@ -501,7 +525,11 @@ impl OpenAIProvider {
                                         if let Some(content) = choice.delta.content {
                                             accumulated_text.push_str(&content);
                                             // Send delta immediately
-                                            if tx.send(Ok(StreamChunk::TextDelta(content))).await.is_err() {
+                                            if tx
+                                                .send(Ok(StreamChunk::TextDelta(content)))
+                                                .await
+                                                .is_err()
+                                            {
                                                 done = true;
                                                 break;
                                             }
@@ -607,10 +635,7 @@ enum OpenAIMessage {
         tool_calls: Option<Vec<OpenAIRequestToolCall>>,
     },
     /// Plain user / system message
-    Regular {
-        role: String,
-        content: String,
-    },
+    Regular { role: String, content: String },
 }
 
 /// Tool call entry inside an assistant message (request format)
@@ -758,13 +783,15 @@ mod tests {
     #[test]
     fn test_to_openai_request_system_prompt() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        use crate::providers::types::ProviderRequest;
         use crate::claude::types::Message;
-        let req = ProviderRequest::new(vec![Message::user("hello")])
-            .with_system("You are helpful.");
+        use crate::providers::types::ProviderRequest;
+        let req =
+            ProviderRequest::new(vec![Message::user("hello")]).with_system("You are helpful.");
         let openai_req = provider.to_openai_request(&req);
         // System message should be first
-        assert!(matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "system"));
+        assert!(
+            matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "system")
+        );
         if let OpenAIMessage::Regular { content, .. } = &openai_req.messages[0] {
             assert_eq!(content, "You are helpful.");
         }
@@ -773,32 +800,38 @@ mod tests {
     #[test]
     fn test_to_openai_request_no_system_prompt() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        use crate::providers::types::ProviderRequest;
         use crate::claude::types::Message;
+        use crate::providers::types::ProviderRequest;
         let req = ProviderRequest::new(vec![Message::user("hello")]);
         let openai_req = provider.to_openai_request(&req);
         // No system message — first message is user
-        assert!(matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "user"));
+        assert!(
+            matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "user")
+        );
     }
 
     #[test]
     fn test_to_openai_request_tool_calls_included() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::claude::types::{ContentBlock, Message};
         use crate::providers::types::ProviderRequest;
-        use crate::claude::types::{Message, ContentBlock};
         let req = ProviderRequest::new(vec![
             Message::user("run ls"),
-            Message::with_content("assistant", vec![
-                ContentBlock::ToolUse {
+            Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "ls"}),
-                },
-            ]),
+                }],
+            ),
         ]);
         let openai_req = provider.to_openai_request(&req);
         // Assistant message should have tool_calls
-        let assistant_msg = openai_req.messages.iter().find(|m| matches!(m, OpenAIMessage::Assistant { .. }));
+        let assistant_msg = openai_req
+            .messages
+            .iter()
+            .find(|m| matches!(m, OpenAIMessage::Assistant { .. }));
         assert!(assistant_msg.is_some());
         if let Some(OpenAIMessage::Assistant { tool_calls, .. }) = assistant_msg {
             let calls = tool_calls.as_ref().unwrap();
@@ -811,30 +844,40 @@ mod tests {
     #[test]
     fn test_to_openai_request_tool_result_becomes_tool_role() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::claude::types::{ContentBlock, Message};
         use crate::providers::types::ProviderRequest;
-        use crate::claude::types::{Message, ContentBlock};
         let req = ProviderRequest::new(vec![
             Message::user("run ls"),
-            Message::with_content("assistant", vec![
-                ContentBlock::ToolUse {
+            Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
                     id: "call_1".to_string(),
                     name: "bash".to_string(),
                     input: serde_json::json!({}),
-                },
-            ]),
-            Message::with_content("user", vec![
-                ContentBlock::ToolResult {
+                }],
+            ),
+            Message::with_content(
+                "user",
+                vec![ContentBlock::ToolResult {
                     tool_use_id: "call_1".to_string(),
                     content: "file.txt".to_string(),
                     is_error: None,
-                },
-            ]),
+                }],
+            ),
         ]);
         let openai_req = provider.to_openai_request(&req);
         // There should be a "tool" role message
-        let tool_msg = openai_req.messages.iter().find(|m| matches!(m, OpenAIMessage::Tool { .. }));
+        let tool_msg = openai_req
+            .messages
+            .iter()
+            .find(|m| matches!(m, OpenAIMessage::Tool { .. }));
         assert!(tool_msg.is_some());
-        if let Some(OpenAIMessage::Tool { tool_call_id, content, .. }) = tool_msg {
+        if let Some(OpenAIMessage::Tool {
+            tool_call_id,
+            content,
+            ..
+        }) = tool_msg
+        {
             assert_eq!(tool_call_id, "call_1");
             assert_eq!(content, "file.txt");
         }
@@ -843,19 +886,22 @@ mod tests {
     #[test]
     fn test_empty_tool_result_gets_placeholder() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::claude::types::{ContentBlock, Message};
         use crate::providers::types::ProviderRequest;
-        use crate::claude::types::{Message, ContentBlock};
-        let req = ProviderRequest::new(vec![
-            Message::with_content("user", vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "call_1".to_string(),
-                    content: "  ".to_string(), // whitespace-only
-                    is_error: None,
-                },
-            ]),
-        ]);
+        let req = ProviderRequest::new(vec![Message::with_content(
+            "user",
+            vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "  ".to_string(), // whitespace-only
+                is_error: None,
+            }],
+        )]);
         let openai_req = provider.to_openai_request(&req);
-        if let Some(OpenAIMessage::Tool { content, .. }) = openai_req.messages.iter().find(|m| matches!(m, OpenAIMessage::Tool { .. })) {
+        if let Some(OpenAIMessage::Tool { content, .. }) = openai_req
+            .messages
+            .iter()
+            .find(|m| matches!(m, OpenAIMessage::Tool { .. }))
+        {
             assert_eq!(content, "(no output)");
         } else {
             panic!("Expected a tool message");
@@ -865,14 +911,15 @@ mod tests {
     #[test]
     fn test_to_openai_request_empty_user_text_skipped() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        use crate::claude::types::{ContentBlock, Message};
         use crate::providers::types::ProviderRequest;
-        use crate::claude::types::{Message, ContentBlock};
         // A user message with only whitespace text should not generate a "user" message
-        let req = ProviderRequest::new(vec![
-            Message::with_content("user", vec![
-                ContentBlock::Text { text: "   ".to_string() },
-            ]),
-        ]);
+        let req = ProviderRequest::new(vec![Message::with_content(
+            "user",
+            vec![ContentBlock::Text {
+                text: "   ".to_string(),
+            }],
+        )]);
         let openai_req = provider.to_openai_request(&req);
         assert!(openai_req.messages.is_empty());
     }
@@ -926,25 +973,31 @@ mod tests {
         // OpenAI often sends the arguments JSON in multiple fragments.
         let mut acc: Vec<(String, String, String)> = Vec::new();
         // First delta: has id and name
-        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
-            index: Some(0),
-            id: Some("call_1".to_string()),
-            tool_type: None,
-            function: Some(OpenAIFunctionDelta {
-                name: Some("read".to_string()),
-                arguments: Some(r#"{"file_"#.to_string()),
-            }),
-        });
+        accumulate_tool_call_delta(
+            &mut acc,
+            &OpenAIToolCallDelta {
+                index: Some(0),
+                id: Some("call_1".to_string()),
+                tool_type: None,
+                function: Some(OpenAIFunctionDelta {
+                    name: Some("read".to_string()),
+                    arguments: Some(r#"{"file_"#.to_string()),
+                }),
+            },
+        );
         // Second delta: continues arguments
-        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
-            index: Some(0),
-            id: None,
-            tool_type: None,
-            function: Some(OpenAIFunctionDelta {
-                name: None,
-                arguments: Some(r#"path":"src/main.rs"}"#.to_string()),
-            }),
-        });
+        accumulate_tool_call_delta(
+            &mut acc,
+            &OpenAIToolCallDelta {
+                index: Some(0),
+                id: None,
+                tool_type: None,
+                function: Some(OpenAIFunctionDelta {
+                    name: None,
+                    arguments: Some(r#"path":"src/main.rs"}"#.to_string()),
+                }),
+            },
+        );
         assert_eq!(acc.len(), 1);
         assert_eq!(acc[0].0, "call_1");
         assert_eq!(acc[0].1, "read");
@@ -955,24 +1008,30 @@ mod tests {
     fn test_accumulate_multiple_tool_calls() {
         // Two tool calls with different indices.
         let mut acc: Vec<(String, String, String)> = Vec::new();
-        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
-            index: Some(0),
-            id: Some("call_0".to_string()),
-            tool_type: None,
-            function: Some(OpenAIFunctionDelta {
-                name: Some("bash".to_string()),
-                arguments: Some(r#"{}"#.to_string()),
-            }),
-        });
-        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
-            index: Some(1),
-            id: Some("call_1".to_string()),
-            tool_type: None,
-            function: Some(OpenAIFunctionDelta {
-                name: Some("read".to_string()),
-                arguments: Some(r#"{"file_path":"x"}"#.to_string()),
-            }),
-        });
+        accumulate_tool_call_delta(
+            &mut acc,
+            &OpenAIToolCallDelta {
+                index: Some(0),
+                id: Some("call_0".to_string()),
+                tool_type: None,
+                function: Some(OpenAIFunctionDelta {
+                    name: Some("bash".to_string()),
+                    arguments: Some(r#"{}"#.to_string()),
+                }),
+            },
+        );
+        accumulate_tool_call_delta(
+            &mut acc,
+            &OpenAIToolCallDelta {
+                index: Some(1),
+                id: Some("call_1".to_string()),
+                tool_type: None,
+                function: Some(OpenAIFunctionDelta {
+                    name: Some("read".to_string()),
+                    arguments: Some(r#"{"file_path":"x"}"#.to_string()),
+                }),
+            },
+        );
         assert_eq!(acc.len(), 2);
         assert_eq!(acc[0].1, "bash");
         assert_eq!(acc[1].1, "read");
@@ -980,9 +1039,11 @@ mod tests {
 
     #[test]
     fn test_finalize_tool_calls_parses_json() {
-        let acc = vec![
-            ("call_1".to_string(), "bash".to_string(), r#"{"command":"ls"}"#.to_string()),
-        ];
+        let acc = vec![(
+            "call_1".to_string(),
+            "bash".to_string(),
+            r#"{"command":"ls"}"#.to_string(),
+        )];
         let blocks = finalize_tool_calls(&acc);
         assert_eq!(blocks.len(), 1);
         if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
@@ -996,9 +1057,11 @@ mod tests {
 
     #[test]
     fn test_finalize_tool_calls_invalid_json_falls_back_to_empty_object() {
-        let acc = vec![
-            ("call_x".to_string(), "glob".to_string(), "NOT_VALID_JSON".to_string()),
-        ];
+        let acc = vec![(
+            "call_x".to_string(),
+            "glob".to_string(),
+            "NOT_VALID_JSON".to_string(),
+        )];
         let blocks = finalize_tool_calls(&acc);
         assert_eq!(blocks.len(), 1);
         if let crate::claude::types::ContentBlock::ToolUse { input, .. } = &blocks[0] {
@@ -1019,15 +1082,18 @@ mod tests {
     fn test_accumulate_default_index_zero() {
         // Delta without an explicit index should go to slot 0.
         let mut acc: Vec<(String, String, String)> = Vec::new();
-        accumulate_tool_call_delta(&mut acc, &OpenAIToolCallDelta {
-            index: None, // no index — should default to 0
-            id: Some("call_no_idx".to_string()),
-            tool_type: None,
-            function: Some(OpenAIFunctionDelta {
-                name: Some("grep".to_string()),
-                arguments: Some(r#"{"pattern":"TODO"}"#.to_string()),
-            }),
-        });
+        accumulate_tool_call_delta(
+            &mut acc,
+            &OpenAIToolCallDelta {
+                index: None, // no index — should default to 0
+                id: Some("call_no_idx".to_string()),
+                tool_type: None,
+                function: Some(OpenAIFunctionDelta {
+                    name: Some("grep".to_string()),
+                    arguments: Some(r#"{"pattern":"TODO"}"#.to_string()),
+                }),
+            },
+        );
         assert_eq!(acc.len(), 1);
         assert_eq!(acc[0].0, "call_no_idx");
         assert_eq!(acc[0].1, "grep");

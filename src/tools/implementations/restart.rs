@@ -1,8 +1,8 @@
 // Restart tool - allows Claude to restart Shammah with a new binary
 
+use crate::output_status;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
-use crate::output_status;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;

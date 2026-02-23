@@ -301,23 +301,25 @@ mod tests {
     // ─── sanitize_messages ───────────────────────────────────────────────────
 
     fn make_tool_use_msg(id: &str, name: &str) -> Message {
-        Message::with_content("assistant", vec![
-            ContentBlock::ToolUse {
+        Message::with_content(
+            "assistant",
+            vec![ContentBlock::ToolUse {
                 id: id.to_string(),
                 name: name.to_string(),
                 input: serde_json::json!({}),
-            },
-        ])
+            }],
+        )
     }
 
     fn make_tool_result_msg(tool_use_id: &str, content: &str) -> Message {
-        Message::with_content("user", vec![
-            ContentBlock::ToolResult {
+        Message::with_content(
+            "user",
+            vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.to_string(),
                 content: content.to_string(),
                 is_error: None,
-            },
-        ])
+            }],
+        )
     }
 
     #[test]
@@ -369,18 +371,21 @@ mod tests {
         // Two tool_uses but only one has a result — orphaned pair removed
         let mut req = ProviderRequest::new(vec![
             Message::user("do work"),
-            Message::with_content("assistant", vec![
-                ContentBlock::ToolUse {
-                    id: "call_1".to_string(),
-                    name: "bash".to_string(),
-                    input: serde_json::json!({}),
-                },
-                ContentBlock::ToolUse {
-                    id: "call_2".to_string(),
-                    name: "read".to_string(),
-                    input: serde_json::json!({}),
-                },
-            ]),
+            Message::with_content(
+                "assistant",
+                vec![
+                    ContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_2".to_string(),
+                        name: "read".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            ),
             // Only one result — not all matched
             make_tool_result_msg("call_1", "done"),
         ]);
@@ -394,11 +399,10 @@ mod tests {
         use crate::claude::types::ContentBlock;
         // Create a base64 string larger than 4 MB limit
         let large_data = "A".repeat(5_000_000);
-        let mut req = ProviderRequest::new(vec![
-            Message::with_content("user", vec![
-                ContentBlock::image("image/png", large_data),
-            ]),
-        ]);
+        let mut req = ProviderRequest::new(vec![Message::with_content(
+            "user",
+            vec![ContentBlock::image("image/png", large_data)],
+        )]);
         req.sanitize_messages();
         // Image block should be replaced with a text placeholder
         assert_eq!(req.messages.len(), 1);
@@ -413,14 +417,16 @@ mod tests {
     fn test_sanitize_small_image_kept() {
         use crate::claude::types::ContentBlock;
         let small_data = "iVBORw0KGgo="; // tiny valid base64
-        let mut req = ProviderRequest::new(vec![
-            Message::with_content("user", vec![
-                ContentBlock::image("image/png", small_data),
-            ]),
-        ]);
+        let mut req = ProviderRequest::new(vec![Message::with_content(
+            "user",
+            vec![ContentBlock::image("image/png", small_data)],
+        )]);
         req.sanitize_messages();
         // Small image kept as-is
-        assert!(matches!(req.messages[0].content[0], ContentBlock::Image { .. }));
+        assert!(matches!(
+            req.messages[0].content[0],
+            ContentBlock::Image { .. }
+        ));
     }
 
     // ─── ProviderResponse ─────────────────────────────────────────────────────
@@ -439,8 +445,12 @@ mod tests {
     #[test]
     fn test_provider_response_text_extracts_text_blocks() {
         let resp = make_response(vec![
-            ContentBlock::Text { text: "Hello".to_string() },
-            ContentBlock::Text { text: " world".to_string() },
+            ContentBlock::Text {
+                text: "Hello".to_string(),
+            },
+            ContentBlock::Text {
+                text: " world".to_string(),
+            },
         ]);
         let text = resp.text();
         assert!(text.contains("Hello"));
@@ -449,35 +459,35 @@ mod tests {
 
     #[test]
     fn test_provider_response_text_skips_non_text() {
-        let resp = make_response(vec![
-            ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "bash".to_string(),
-                input: serde_json::json!({}),
-            },
-        ]);
+        let resp = make_response(vec![ContentBlock::ToolUse {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({}),
+        }]);
         assert_eq!(resp.text(), "");
     }
 
     #[test]
     fn test_provider_response_has_tool_uses() {
-        let resp_with = make_response(vec![
-            ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "bash".to_string(),
-                input: serde_json::json!({"command": "ls"}),
-            },
-        ]);
+        let resp_with = make_response(vec![ContentBlock::ToolUse {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+        }]);
         assert!(resp_with.has_tool_uses());
 
-        let resp_without = make_response(vec![ContentBlock::Text { text: "done".to_string() }]);
+        let resp_without = make_response(vec![ContentBlock::Text {
+            text: "done".to_string(),
+        }]);
         assert!(!resp_without.has_tool_uses());
     }
 
     #[test]
     fn test_provider_response_tool_uses_extraction() {
         let resp = make_response(vec![
-            ContentBlock::Text { text: "I'll run that".to_string() },
+            ContentBlock::Text {
+                text: "I'll run that".to_string(),
+            },
             ContentBlock::ToolUse {
                 id: "call_abc".to_string(),
                 name: "bash".to_string(),
@@ -492,7 +502,9 @@ mod tests {
 
     #[test]
     fn test_provider_response_to_message() {
-        let resp = make_response(vec![ContentBlock::Text { text: "hi".to_string() }]);
+        let resp = make_response(vec![ContentBlock::Text {
+            text: "hi".to_string(),
+        }]);
         let msg = resp.to_message();
         assert_eq!(msg.role, "assistant");
         assert_eq!(msg.content.len(), 1);
@@ -500,8 +512,7 @@ mod tests {
 
     #[test]
     fn test_provider_request_system_prompt() {
-        let req = ProviderRequest::new(vec![])
-            .with_system("You are a helpful assistant.");
+        let req = ProviderRequest::new(vec![]).with_system("You are a helpful assistant.");
         assert_eq!(req.system.as_deref(), Some("You are a helpful assistant."));
     }
 

@@ -196,9 +196,7 @@ impl SuggestionManager {
                     self.get_hardcoded_suggestions()
                 }
             }
-            SuggestionSource::Hardcoded => {
-                self.get_hardcoded_suggestions()
-            }
+            SuggestionSource::Hardcoded => self.get_hardcoded_suggestions(),
         };
 
         // Sort by priority (highest first)
@@ -231,11 +229,7 @@ impl SuggestionManager {
         }
 
         // Join first 2-3 suggestions with " • "
-        let formatted: Vec<String> = suggestions
-            .iter()
-            .take(2)
-            .map(|s| s.format())
-            .collect();
+        let formatted: Vec<String> = suggestions.iter().take(2).map(|s| s.format()).collect();
 
         Some(format!("💡 {}", formatted.join(" • ")))
     }
@@ -256,13 +250,11 @@ impl SuggestionManager {
 
     fn first_run_suggestions(&self) -> Vec<Suggestion> {
         vec![
-            Suggestion::new("Type a question to get started")
-                .with_priority(100),
+            Suggestion::new("Type a question to get started").with_priority(100),
             Suggestion::new("Try /help for available commands")
                 .with_shortcut("Ctrl+/")
                 .with_priority(90),
-            Suggestion::new("Use /local to check local model status")
-                .with_priority(80),
+            Suggestion::new("Use /local to check local model status").with_priority(80),
         ]
     }
 
@@ -272,31 +264,25 @@ impl SuggestionManager {
         if time_idle > Duration::from_secs(30) {
             // User idle for 30+ seconds
             vec![
-                Suggestion::new("Ask a coding question")
-                    .with_priority(70),
+                Suggestion::new("Ask a coding question").with_priority(70),
                 Suggestion::new("Try /help to see available commands")
                     .with_shortcut("Ctrl+/")
                     .with_priority(60),
-                Suggestion::new("Press Shift+Enter for multi-line input")
-                    .with_priority(50),
+                Suggestion::new("Press Shift+Enter for multi-line input").with_priority(50),
             ]
         } else {
             // Recently idle
             vec![
-                Suggestion::new("Press Shift+Enter for multi-line input")
-                    .with_priority(60),
-                Suggestion::new("Use ↑/↓ to navigate command history")
-                    .with_priority(50),
+                Suggestion::new("Press Shift+Enter for multi-line input").with_priority(60),
+                Suggestion::new("Use ↑/↓ to navigate command history").with_priority(50),
             ]
         }
     }
 
     fn query_complete_suggestions(&self) -> Vec<Suggestion> {
         vec![
-            Suggestion::new("Rate response with 'g' (good) or 'b' (bad)")
-                .with_priority(80),
-            Suggestion::new("Ask a follow-up question")
-                .with_priority(70),
+            Suggestion::new("Rate response with 'g' (good) or 'b' (bad)").with_priority(80),
+            Suggestion::new("Ask a follow-up question").with_priority(70),
             Suggestion::new("Use /clear to start a new conversation")
                 .with_shortcut("Ctrl+L")
                 .with_priority(60),
@@ -305,10 +291,8 @@ impl SuggestionManager {
 
     fn error_suggestions(&self) -> Vec<Suggestion> {
         vec![
-            Suggestion::new("Try rephrasing your query")
-                .with_priority(90),
-            Suggestion::new("Check /local status if using local model")
-                .with_priority(80),
+            Suggestion::new("Try rephrasing your query").with_priority(90),
+            Suggestion::new("Check /local status if using local model").with_priority(80),
             Suggestion::new("Use /help for troubleshooting tips")
                 .with_shortcut("Ctrl+/")
                 .with_priority(70),
@@ -328,19 +312,15 @@ impl SuggestionManager {
 
     fn model_loading_suggestions(&self) -> Vec<Suggestion> {
         vec![
-            Suggestion::new("Model is loading... queries will use teacher API")
-                .with_priority(100),
-            Suggestion::new("First download may take 5-30 minutes")
-                .with_priority(90),
-            Suggestion::new("You can still ask questions while loading")
-                .with_priority(80),
+            Suggestion::new("Model is loading... queries will use teacher API").with_priority(100),
+            Suggestion::new("First download may take 5-30 minutes").with_priority(90),
+            Suggestion::new("You can still ask questions while loading").with_priority(80),
         ]
     }
 
     fn tool_execution_suggestions(&self) -> Vec<Suggestion> {
         vec![
-            Suggestion::new("Tools are executing... please wait")
-                .with_priority(90),
+            Suggestion::new("Tools are executing... please wait").with_priority(90),
             Suggestion::new("Press Ctrl+C to cancel if needed")
                 .with_shortcut("Ctrl+C")
                 .with_priority(80),
@@ -405,7 +385,7 @@ mod tests {
 
         // Check that suggestions are sorted by priority
         for i in 1..suggestions.len() {
-            assert!(suggestions[i-1].priority >= suggestions[i].priority);
+            assert!(suggestions[i - 1].priority >= suggestions[i].priority);
         }
     }
 
@@ -461,7 +441,11 @@ mod tests {
             test_manager.set_context(context);
             let suggestions = test_manager.get_suggestions();
 
-            assert!(!suggestions.is_empty(), "Context {:?} should have suggestions", context);
+            assert!(
+                !suggestions.is_empty(),
+                "Context {:?} should have suggestions",
+                context
+            );
         }
     }
 }

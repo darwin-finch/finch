@@ -4,9 +4,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
+use super::events::ConfirmationResult;
 use crate::cli::conversation::ConversationHistory;
 use crate::cli::ReplMode;
-use super::events::ConfirmationResult;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::tools::executor::{generate_tool_signature, ToolExecutor};
@@ -99,11 +99,20 @@ impl ToolExecutionCoordinator {
                 } else {
                     // Auto-approve read-only tools and user interaction tools when in plan mode
                     let current_mode = repl_mode.read().await;
-                    let is_plan_mode = matches!(*current_mode, crate::cli::ReplMode::Planning { .. });
+                    let is_plan_mode =
+                        matches!(*current_mode, crate::cli::ReplMode::Planning { .. });
                     let is_readonly_tool = matches!(
                         tool_name,
-                        "read" | "Read" | "glob" | "Glob" | "grep" | "Grep" | "web_fetch" | "WebFetch" |
-                        "AskUserQuestion" | "ask_user_question"
+                        "read"
+                            | "Read"
+                            | "glob"
+                            | "Glob"
+                            | "grep"
+                            | "Grep"
+                            | "web_fetch"
+                            | "WebFetch"
+                            | "AskUserQuestion"
+                            | "ask_user_question"
                     );
 
                     is_plan_mode && is_readonly_tool
@@ -111,7 +120,10 @@ impl ToolExecutionCoordinator {
             };
 
             let needs_approval = !is_auto_approved
-                && matches!(approval_source, crate::tools::executor::ApprovalSource::NotApproved);
+                && matches!(
+                    approval_source,
+                    crate::tools::executor::ApprovalSource::NotApproved
+                );
 
             if needs_approval {
                 // Request approval from user (non-blocking for other queries)
@@ -210,7 +222,7 @@ impl ToolExecutionCoordinator {
                         Some(Arc::clone(&tokenizer)),
                         Some(Arc::clone(&repl_mode)),
                         Some(Arc::clone(&plan_content)),
-                    )
+                    ),
             )
             .await;
 
@@ -218,8 +230,11 @@ impl ToolExecutionCoordinator {
             match result {
                 Ok(Ok(tool_result)) => {
                     // Tool executed successfully within timeout
-                    tracing::info!("[tool_exec] Tool {} succeeded, sending result ({} chars)",
-                        tool_use.name, tool_result.content.len());
+                    tracing::info!(
+                        "[tool_exec] Tool {} succeeded, sending result ({} chars)",
+                        tool_use.name,
+                        tool_result.content.len()
+                    );
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
                         tool_id: tool_use.id.clone(),
@@ -237,8 +252,11 @@ impl ToolExecutionCoordinator {
                 }
                 Err(_) => {
                     // Timeout elapsed
-                    tracing::error!("[tool_exec] Tool {} timed out after {} seconds",
-                        tool_use.name, timeout_duration.as_secs());
+                    tracing::error!(
+                        "[tool_exec] Tool {} timed out after {} seconds",
+                        tool_use.name,
+                        timeout_duration.as_secs()
+                    );
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
                         tool_id: tool_use.id.clone(),

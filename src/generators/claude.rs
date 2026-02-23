@@ -66,9 +66,7 @@ pub struct ClaudeGenerator {
 impl ClaudeGenerator {
     pub fn new(client: Arc<ClaudeClient>) -> Self {
         let cwd = std::env::current_dir().ok();
-        let claude_md_context = cwd
-            .as_deref()
-            .and_then(collect_claude_md_context);
+        let claude_md_context = cwd.as_deref().and_then(collect_claude_md_context);
         let cwd_str = cwd.map(|p| p.display().to_string());
         Self {
             client,
@@ -88,10 +86,7 @@ impl ClaudeGenerator {
     }
 
     /// Convert Claude MessageResponse to unified GeneratorResponse
-    fn convert_to_unified(
-        &self,
-        response: crate::claude::MessageResponse,
-    ) -> GeneratorResponse {
+    fn convert_to_unified(&self, response: crate::claude::MessageResponse) -> GeneratorResponse {
         let text = response
             .content
             .iter()
@@ -139,8 +134,7 @@ impl Generator for ClaudeGenerator {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<GeneratorResponse> {
-        let mut request = MessageRequest::with_context(messages)
-            .with_system(self.system_prompt());
+        let mut request = MessageRequest::with_context(messages).with_system(self.system_prompt());
         if let Some(tools) = tools {
             request = request.with_tools(tools);
         }
@@ -154,8 +148,7 @@ impl Generator for ClaudeGenerator {
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
-        let mut request = MessageRequest::with_context(messages)
-            .with_system(self.system_prompt());
+        let mut request = MessageRequest::with_context(messages).with_system(self.system_prompt());
         if let Some(tools) = tools {
             request = request.with_tools(tools);
         }

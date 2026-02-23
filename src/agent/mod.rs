@@ -12,13 +12,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::claude::ClaudeClient;
 use crate::claude::types::{ContentBlock, Message, MessageRequest};
+use crate::claude::ClaudeClient;
 use crate::config::{persona::Persona, Config};
 use crate::generators::claude::CODING_SYSTEM_PROMPT;
-use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
-use crate::tools::implementations::{BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool};
+use crate::tools::implementations::{
+    BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
+};
 use crate::tools::types::ToolDefinition;
+use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
 
 use activity_log::{ActivityLogger, AgentEvent};
 use backlog::{AgentTask, TaskBacklog};
@@ -76,9 +78,14 @@ impl AgentLoop {
         let (persona, persona_path) = self.load_persona()?;
         println!("Agent persona: {}", persona.name());
         if let Some(ref git_name) = persona.behavior.git_name {
-            println!("  Git identity: {} <{}>",
+            println!(
+                "  Git identity: {} <{}>",
                 git_name,
-                persona.behavior.git_email.as_deref().unwrap_or("agent@local.finch")
+                persona
+                    .behavior
+                    .git_email
+                    .as_deref()
+                    .unwrap_or("agent@local.finch")
             );
         }
 
@@ -86,9 +93,11 @@ impl AgentLoop {
         let mut backlog = TaskBacklog::load(self.agent_config.tasks_path.clone())
             .context("Failed to load task backlog")?;
 
-        let pending_count = backlog.tasks().iter().filter(|t| {
-            t.status == backlog::TaskStatus::Pending
-        }).count();
+        let pending_count = backlog
+            .tasks()
+            .iter()
+            .filter(|t| t.status == backlog::TaskStatus::Pending)
+            .count();
         println!("Task backlog: {} pending tasks", pending_count);
         println!("Log: {}", ActivityLogger::new()?.today_path().display());
         println!();
@@ -99,14 +108,12 @@ impl AgentLoop {
         let client = create_client(&self.config)?;
 
         // Set up reflection engine
-        let model = self.config
+        let model = self
+            .config
             .active_teacher()
             .and_then(|t| t.model.clone())
             .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
-        let reflector = ReflectionEngine::new(
-            create_client(&self.config)?,
-            model.clone(),
-        );
+        let reflector = ReflectionEngine::new(create_client(&self.config)?, model.clone());
 
         let mut completed_count: usize = 0;
         let mut completed_descs: Vec<String> = Vec::new();
@@ -190,7 +197,11 @@ impl AgentLoop {
                 }
                 Err(e) => {
                     let reason = format!("{:#}", e);
-                    println!("[Task {}] Failed: {}", task.id, &reason[..reason.len().min(200)]);
+                    println!(
+                        "[Task {}] Failed: {}",
+                        task.id,
+                        &reason[..reason.len().min(200)]
+                    );
                     let _ = logger.log(AgentEvent::TaskFailed {
                         id: task.id.clone(),
                         duration_s,
@@ -223,7 +234,10 @@ impl AgentLoop {
     ) -> Result<()> {
         // Build system prompt: coding base + persona + task context
         let repo_cwd = task.repo.as_deref().unwrap_or(".");
-        let mut system = format!("{}\n\nWorking directory: {}", CODING_SYSTEM_PROMPT, repo_cwd);
+        let mut system = format!(
+            "{}\n\nWorking directory: {}",
+            CODING_SYSTEM_PROMPT, repo_cwd
+        );
         let persona_msg = persona.to_system_message();
         if !persona_msg.is_empty() {
             system.push_str("\n\n");
@@ -280,7 +294,9 @@ impl AgentLoop {
 
             for tu in &tool_uses {
                 // Log tool use
-                let cmd_preview = tu.input.get("command")
+                let cmd_preview = tu
+                    .input
+                    .get("command")
                     .or_else(|| tu.input.get("pattern"))
                     .or_else(|| tu.input.get("path"))
                     .and_then(|v| v.as_str())
@@ -301,8 +317,7 @@ impl AgentLoop {
                     let guard = executor.lock().await;
                     guard
                         .execute_tool::<fn() -> anyhow::Result<()>>(
-                            &tool_use,
-                            None, // conversation
+                            &tool_use, None, // conversation
                             None, // save_models_fn
                             None, // batch_trainer
                             None, // local_generator
@@ -327,7 +342,10 @@ impl AgentLoop {
             messages.push(Message::with_content("user", result_blocks));
         }
 
-        anyhow::bail!("Reached max tool turns ({}) without completing task", MAX_TURNS)
+        anyhow::bail!(
+            "Reached max tool turns ({}) without completing task",
+            MAX_TURNS
+        )
     }
 
     /// Commit any staged/unstaged changes in the repo with the persona's git identity
@@ -357,10 +375,7 @@ impl AgentLoop {
             .context("Failed to run git add")?;
 
         if !add.status.success() {
-            anyhow::bail!(
-                "git add failed: {}",
-                String::from_utf8_lossy(&add.stderr)
-            );
+            anyhow::bail!("git add failed: {}", String::from_utf8_lossy(&add.stderr));
         }
 
         // Build commit message
@@ -372,17 +387,29 @@ impl AgentLoop {
         );
 
         // Determine git identity
-        let git_name = persona.behavior.git_name.as_deref().unwrap_or("Finch Agent");
-        let git_email = persona.behavior.git_email.as_deref().unwrap_or("agent@local.finch");
+        let git_name = persona
+            .behavior
+            .git_name
+            .as_deref()
+            .unwrap_or("Finch Agent");
+        let git_email = persona
+            .behavior
+            .git_email
+            .as_deref()
+            .unwrap_or("agent@local.finch");
 
         // Commit with persona identity
         let commit = Command::new("git")
             .args([
-                "-C", repo_path,
-                "-c", &format!("user.name={}", git_name),
-                "-c", &format!("user.email={}", git_email),
+                "-C",
+                repo_path,
+                "-c",
+                &format!("user.name={}", git_name),
+                "-c",
+                &format!("user.email={}", git_email),
                 "commit",
-                "-m", &commit_msg,
+                "-m",
+                &commit_msg,
             ])
             .output()
             .context("Failed to run git commit")?;
@@ -402,7 +429,11 @@ impl AgentLoop {
             .context("Failed to get commit hash")?;
         let hash = String::from_utf8_lossy(&log.stdout).trim().to_string();
 
-        println!("  Committed: {} ({})", &commit_msg.lines().next().unwrap_or(""), hash);
+        println!(
+            "  Committed: {} ({})",
+            &commit_msg.lines().next().unwrap_or(""),
+            hash
+        );
         let _ = logger.log(AgentEvent::Commit {
             repo: repo_path.to_string(),
             hash,
@@ -419,9 +450,8 @@ impl AgentLoop {
         // 1. Check if it's an absolute or relative path
         let as_path = PathBuf::from(spec);
         if as_path.exists() {
-            let persona = Persona::load(&as_path).with_context(|| {
-                format!("Failed to load persona from {}", as_path.display())
-            })?;
+            let persona = Persona::load(&as_path)
+                .with_context(|| format!("Failed to load persona from {}", as_path.display()))?;
             return Ok((persona, Some(as_path)));
         }
 
@@ -437,8 +467,8 @@ impl AgentLoop {
         }
 
         // 3. Fall back to built-in
-        let persona = Persona::load_builtin(spec)
-            .with_context(|| format!("Unknown persona: '{}'", spec))?;
+        let persona =
+            Persona::load_builtin(spec).with_context(|| format!("Unknown persona: '{}'", spec))?;
         Ok((persona, None))
     }
 }

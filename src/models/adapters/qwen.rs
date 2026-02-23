@@ -3,7 +3,7 @@
 // Handles Qwen-specific chat template (ChatML format) and token IDs.
 // Qwen models: Qwen2.5, Qwen2, Qwen1.5
 
-use super::{LocalModelAdapter, GenerationConfig};
+use super::{GenerationConfig, LocalModelAdapter};
 
 /// Adapter for Qwen model family (ChatML format)
 pub struct QwenAdapter;
@@ -160,7 +160,13 @@ impl QwenAdapter {
             // Try multiple strategies:
 
             // Strategy 1: Look for common question-answer separators
-            for separator in &["\n\n##", "\n\nExamples", "\n\nRemember:", "---\n", "## Examples"] {
+            for separator in &[
+                "\n\n##",
+                "\n\nExamples",
+                "\n\nRemember:",
+                "---\n",
+                "## Examples",
+            ] {
                 if let Some(sep_pos) = cleaned.find(separator) {
                     // Answer is likely after this section, so skip the rest of constitution
                     cleaned = &cleaned[sep_pos..];
@@ -173,7 +179,11 @@ impl QwenAdapter {
             if cleaned.len() > 200 {
                 // Split by double newline and take the last non-empty paragraph
                 let paragraphs: Vec<&str> = cleaned.split("\n\n").collect();
-                if let Some(last_para) = paragraphs.iter().rev().find(|p| !p.trim().is_empty() && p.len() < 100) {
+                if let Some(last_para) = paragraphs
+                    .iter()
+                    .rev()
+                    .find(|p| !p.trim().is_empty() && p.len() < 100)
+                {
                     cleaned = last_para.trim();
                 }
             }
@@ -199,10 +209,7 @@ mod tests {
     #[test]
     fn test_qwen_format() {
         let adapter = QwenAdapter;
-        let prompt = adapter.format_chat_prompt(
-            "You are a helpful assistant.",
-            "What is 2+2?"
-        );
+        let prompt = adapter.format_chat_prompt("You are a helpful assistant.", "What is 2+2?");
 
         assert!(prompt.contains("<|im_start|>system"));
         assert!(prompt.contains("You are a helpful assistant."));
@@ -270,7 +277,8 @@ mod tests {
         assert_eq!(cleaned, "Rust is a systems programming language");
 
         // Test case 2: Question with multi-line answer
-        let raw2 = "How do I print in Rust?\nYou can use println! macro\nExample: println!(\"Hello\");";
+        let raw2 =
+            "How do I print in Rust?\nYou can use println! macro\nExample: println!(\"Hello\");";
         let cleaned2 = adapter.clean_output(raw2);
         // Should extract the answer (not the question)
         assert!(cleaned2.contains("println!"));

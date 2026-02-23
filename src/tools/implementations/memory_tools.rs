@@ -59,10 +59,7 @@ impl Tool for SearchMemoryTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: query"))?;
 
-        let limit = params["limit"]
-            .as_u64()
-            .unwrap_or(3)
-            .min(10) as usize;
+        let limit = params["limit"].as_u64().unwrap_or(3).min(10) as usize;
 
         tracing::info!("Searching memory: query='{}', limit={}", query, limit);
 
@@ -76,7 +73,8 @@ impl Tool for SearchMemoryTool {
             "Found {} relevant memor{}:\n\n{}",
             results.len(),
             if results.len() == 1 { "y" } else { "ies" },
-            results.iter()
+            results
+                .iter()
                 .enumerate()
                 .map(|(i, text)| {
                     // Truncate very long memories
@@ -141,9 +139,7 @@ impl Tool for CreateMemoryTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: content"))?;
 
-        let context = params["context"]
-            .as_str()
-            .map(|s| s.to_string());
+        let context = params["context"].as_str().map(|s| s.to_string());
 
         // Store as a system note (not attributed to user or assistant)
         let role = "system";
@@ -155,12 +151,9 @@ impl Tool for CreateMemoryTool {
 
         tracing::info!("Creating explicit memory: {}", full_content);
 
-        self.memory_system.insert_conversation(
-            role,
-            &full_content,
-            Some("memory-tool"),
-            None,
-        ).await?;
+        self.memory_system
+            .insert_conversation(role, &full_content, Some("memory-tool"), None)
+            .await?;
 
         Ok(format!(
             "Memory created: {}",
@@ -210,10 +203,7 @@ impl Tool for ListRecentTool {
     }
 
     async fn execute(&self, params: Value, _context: &ToolContext<'_>) -> Result<String> {
-        let limit = params["limit"]
-            .as_u64()
-            .unwrap_or(5)
-            .min(20) as usize;
+        let limit = params["limit"].as_u64().unwrap_or(5).min(20) as usize;
 
         tracing::info!("Listing recent memories: limit={}", limit);
 
@@ -227,7 +217,8 @@ impl Tool for ListRecentTool {
             "Recent {} conversation{}:\n\n{}",
             recent.len(),
             if recent.len() == 1 { "" } else { "s" },
-            recent.iter()
+            recent
+                .iter()
                 .enumerate()
                 .map(|(i, (role, content))| {
                     // Truncate very long messages
@@ -263,8 +254,17 @@ mod tests {
         let memory = Arc::new(MemorySystem::new(config)?);
 
         // Insert test data
-        memory.insert_conversation("user", "How do I use Rust lifetimes?", Some("test"), None).await?;
-        memory.insert_conversation("assistant", "Lifetimes in Rust ensure references are valid...", Some("test"), None).await?;
+        memory
+            .insert_conversation("user", "How do I use Rust lifetimes?", Some("test"), None)
+            .await?;
+        memory
+            .insert_conversation(
+                "assistant",
+                "Lifetimes in Rust ensure references are valid...",
+                Some("test"),
+                None,
+            )
+            .await?;
 
         // Create tool and search
         let tool = SearchMemoryTool::new(memory);
@@ -277,10 +277,15 @@ mod tests {
             repl_mode: None,
             plan_content: None,
         };
-        let result = tool.execute(serde_json::json!({
-            "query": "rust lifetimes",
-            "limit": 2
-        }), &context).await?;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "query": "rust lifetimes",
+                    "limit": 2
+                }),
+                &context,
+            )
+            .await?;
 
         assert!(result.contains("relevant"));
         assert!(result.contains("Rust") || result.contains("lifetimes"));
@@ -309,10 +314,15 @@ mod tests {
             plan_content: None,
         };
 
-        let result = tool.execute(serde_json::json!({
-            "content": "User prefers early-exit code style",
-            "context": "code-style"
-        }), &context).await?;
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "content": "User prefers early-exit code style",
+                    "context": "code-style"
+                }),
+                &context,
+            )
+            .await?;
 
         assert!(result.contains("Memory created"));
 
@@ -335,7 +345,9 @@ mod tests {
 
         // Insert test data
         for i in 1..=5 {
-            memory.insert_conversation("user", &format!("Message {}", i), Some("test"), None).await?;
+            memory
+                .insert_conversation("user", &format!("Message {}", i), Some("test"), None)
+                .await?;
         }
 
         let tool = ListRecentTool::new(memory);
@@ -348,7 +360,9 @@ mod tests {
             repl_mode: None,
             plan_content: None,
         };
-        let result = tool.execute(serde_json::json!({"limit": 3}), &context).await?;
+        let result = tool
+            .execute(serde_json::json!({"limit": 3}), &context)
+            .await?;
 
         assert!(result.contains("Recent 3"));
         assert!(result.contains("Message 5")); // Most recent

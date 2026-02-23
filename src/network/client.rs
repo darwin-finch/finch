@@ -74,14 +74,21 @@ impl LotusClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("Failed to build HTTP client")?;
-        Ok(Self { base_url: base_url.into(), http })
+        Ok(Self {
+            base_url: base_url.into(),
+            http,
+        })
     }
 
     /// Register this device with the Lotus Network (anonymous — no account needed).
     /// Returns a device token for future API calls.
-    pub async fn register_device(&self, req: RegisterDeviceRequest) -> Result<RegisterDeviceResponse> {
+    pub async fn register_device(
+        &self,
+        req: RegisterDeviceRequest,
+    ) -> Result<RegisterDeviceResponse> {
         let url = format!("{}/v1/devices/register", self.base_url);
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .json(&req)
             .send()
@@ -108,10 +115,13 @@ impl LotusClient {
         invite_code: &str,
     ) -> Result<JoinAccountResponse> {
         let url = format!("{}/v1/devices/join-account", self.base_url);
-        let resp = self.http
+        let resp = self
+            .http
             .post(&url)
             .bearer_auth(device_token)
-            .json(&JoinAccountRequest { invite_code: invite_code.to_string() })
+            .json(&JoinAccountRequest {
+                invite_code: invite_code.to_string(),
+            })
             .send()
             .await
             .context("Failed to reach Lotus Network")?;
@@ -130,7 +140,8 @@ impl LotusClient {
     /// Fetch this device's current status from Lotus.
     pub async fn device_info(&self, device_token: &str) -> Result<DeviceInfo> {
         let url = format!("{}/v1/devices/me", self.base_url);
-        let resp = self.http
+        let resp = self
+            .http
             .get(&url)
             .bearer_auth(device_token)
             .send()
@@ -175,7 +186,9 @@ mod tests {
 
     #[test]
     fn test_join_account_request_serializes() {
-        let req = JoinAccountRequest { invite_code: "ABC-123".to_string() };
+        let req = JoinAccountRequest {
+            invite_code: "ABC-123".to_string(),
+        };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("ABC-123"));
     }

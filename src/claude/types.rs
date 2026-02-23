@@ -15,9 +15,7 @@ pub enum ContentBlock {
 
     /// Base64-encoded image (for pasted images, screenshots, etc.)
     #[serde(rename = "image")]
-    Image {
-        source: ImageSource,
-    },
+    Image { source: ImageSource },
 
     #[serde(rename = "tool_use")]
     ToolUse {
@@ -39,9 +37,9 @@ pub enum ContentBlock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
-    pub source_type: String,        // "base64"
-    pub media_type: String,         // "image/png", "image/jpeg", etc.
-    pub data: String,               // Base64-encoded image data
+    pub source_type: String, // "base64"
+    pub media_type: String, // "image/png", "image/jpeg", etc.
+    pub data: String,       // Base64-encoded image data
 }
 
 impl ContentBlock {
@@ -361,9 +359,14 @@ mod tests {
 
     #[test]
     fn test_tool_result_with_error_flag() {
-        let block = ContentBlock::tool_result("id1".to_string(), "error msg".to_string(), Some(true));
+        let block =
+            ContentBlock::tool_result("id1".to_string(), "error msg".to_string(), Some(true));
         match block {
-            ContentBlock::ToolResult { is_error, content, tool_use_id } => {
+            ContentBlock::ToolResult {
+                is_error,
+                content,
+                tool_use_id,
+            } => {
                 assert_eq!(is_error, Some(true));
                 assert_eq!(content, "error msg");
                 assert_eq!(tool_use_id, "id1");
@@ -466,7 +469,8 @@ mod tests {
 
     #[test]
     fn test_message_add_tool_result_success() {
-        let msg = Message::user("query").add_tool_result("id1".to_string(), "output".to_string(), false);
+        let msg =
+            Message::user("query").add_tool_result("id1".to_string(), "output".to_string(), false);
         assert!(msg.has_tool_results());
         // is_error should be None when false (skipped by serde)
         match &msg.content[1] {
@@ -477,7 +481,8 @@ mod tests {
 
     #[test]
     fn test_message_add_tool_result_error() {
-        let msg = Message::user("query").add_tool_result("id1".to_string(), "oops".to_string(), true);
+        let msg =
+            Message::user("query").add_tool_result("id1".to_string(), "oops".to_string(), true);
         match &msg.content[1] {
             ContentBlock::ToolResult { is_error, .. } => assert_eq!(*is_error, Some(true)),
             _ => panic!("Expected ToolResult"),

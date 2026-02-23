@@ -54,7 +54,9 @@ impl ExecutionTarget {
     pub fn description(&self) -> &'static str {
         match self {
             #[cfg(target_os = "macos")]
-            ExecutionTarget::CoreML => "Apple Neural Engine (CoreML) - Fastest on Mac, best battery life",
+            ExecutionTarget::CoreML => {
+                "Apple Neural Engine (CoreML) - Fastest on Mac, best battery life"
+            }
             #[cfg(feature = "cuda")]
             ExecutionTarget::Cuda => "NVIDIA GPU (CUDA) - Very fast on supported hardware",
             ExecutionTarget::Cpu => "CPU (Universal Fallback) - Slower than specialized hardware",
@@ -72,7 +74,7 @@ impl ExecutionTarget {
             ExecutionTarget::CoreML => true, // Assume CoreML available on all macOS
             #[cfg(feature = "cuda")]
             ExecutionTarget::Cuda => true, // Assume CUDA available if compiled with feature
-            ExecutionTarget::Cpu => true, // Always available
+            ExecutionTarget::Cpu => true,  // Always available
             ExecutionTarget::Auto => true, // Always available
         }
     }
@@ -157,7 +159,10 @@ pub struct BackendConfig {
     pub model_path: Option<PathBuf>,
 
     /// Fallback execution target chain
-    #[serde(default = "default_fallback_chain", deserialize_with = "deserialize_fallback_chain")]
+    #[serde(
+        default = "default_fallback_chain",
+        deserialize_with = "deserialize_fallback_chain"
+    )]
     pub fallback_chain: Vec<ExecutionTarget>,
 
     /// Legacy field alias for backward compatibility
@@ -171,7 +176,7 @@ fn default_backend_enabled() -> bool {
 }
 
 fn default_inference_provider() -> crate::models::unified_loader::InferenceProvider {
-    crate::models::unified_loader::InferenceProvider::Onnx  // ONNX Runtime is the default
+    crate::models::unified_loader::InferenceProvider::Onnx // ONNX Runtime is the default
 }
 
 fn default_model_family() -> ModelFamily {
@@ -184,16 +189,10 @@ fn default_model_size() -> ModelSize {
 
 fn default_fallback_chain() -> Vec<ExecutionTarget> {
     #[cfg(target_os = "macos")]
-    return vec![
-        ExecutionTarget::CoreML,
-        ExecutionTarget::Cpu,
-    ];
+    return vec![ExecutionTarget::CoreML, ExecutionTarget::Cpu];
 
     #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
-    return vec![
-        ExecutionTarget::Cuda,
-        ExecutionTarget::Cpu,
-    ];
+    return vec![ExecutionTarget::Cuda, ExecutionTarget::Cpu];
 
     #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
     return vec![ExecutionTarget::Cpu];
@@ -227,7 +226,10 @@ where
                 tracing::warn!("Skipping deprecated 'metal' execution target in config");
             }
             other => {
-                tracing::warn!("Skipping unknown execution target '{}' in fallback_chain", other);
+                tracing::warn!(
+                    "Skipping unknown execution target '{}' in fallback_chain",
+                    other
+                );
             }
         }
     }
