@@ -39,18 +39,26 @@ pub struct MemTree {
 }
 
 impl MemTree {
-    /// Create a new empty MemTree
+    /// Create a new empty MemTree with the TF-IDF default embedding dimension (2048).
     pub fn new() -> Self {
+        Self::new_with_dim(2048)
+    }
+
+    /// Create a new empty MemTree with a specified root embedding dimension.
+    ///
+    /// Use this when swapping in a neural embedding engine whose dimension
+    /// differs from the TF-IDF default (e.g. 384 for all-MiniLM-L6-v2).
+    pub fn new_with_dim(dim: usize) -> Self {
         let root_id = 0;
         let mut nodes = HashMap::new();
 
-        // Create root node (placeholder)
+        // Create root node (placeholder) — zero vector of the given dimension
         let root = TreeNode {
             id: root_id,
             parent: None,
             children: Vec::new(),
             text: String::from("ROOT"),
-            embedding: vec![0.0; 2048], // Zero vector — matches TfIdfEmbedding dimension
+            embedding: vec![0.0; dim],
             level: 0,
             created_at: chrono::Utc::now().timestamp(),
         };

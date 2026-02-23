@@ -14,6 +14,7 @@ async fn test_memory_system_creation() -> Result<()> {
         enabled: true,
         max_context_items: 5,
         checkpoint_interval_secs: 300,
+        ..Default::default()
     };
 
     let memory = MemorySystem::new(config)?;

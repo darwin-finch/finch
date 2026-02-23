@@ -223,7 +223,7 @@ mod tests {
         let emb1 = engine.embed("quicksort algorithm").unwrap();
         let emb2 = engine.embed("ONNX runtime ort").unwrap();
         let sim = cosine_similarity(&emb1, &emb2);
-        assert!(sim >= 0.0 && sim <= 1.0);
+        assert!((0.0..=1.0).contains(&sim));
     }
 
     #[test]

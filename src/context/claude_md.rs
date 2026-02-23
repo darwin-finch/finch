@@ -180,9 +180,18 @@ mod tests {
         let finch_pos = text.find("finch instructions").unwrap();
         let context_pos = text.find("context instructions").unwrap();
         let readme_pos = text.find("readme instructions").unwrap();
-        assert!(claude_pos < finch_pos, "CLAUDE.md should appear before FINCH.md");
-        assert!(finch_pos < context_pos, "FINCH.md should appear before CONTEXT.md");
-        assert!(context_pos < readme_pos, "CONTEXT.md should appear before README.md");
+        assert!(
+            claude_pos < finch_pos,
+            "CLAUDE.md should appear before FINCH.md"
+        );
+        assert!(
+            finch_pos < context_pos,
+            "FINCH.md should appear before CONTEXT.md"
+        );
+        assert!(
+            context_pos < readme_pos,
+            "CONTEXT.md should appear before README.md"
+        );
     }
 
     #[test]

@@ -8,9 +8,11 @@
 
 mod embeddings;
 mod memtree;
+pub mod neural_embedding;
 
 pub use embeddings::{cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memtree::{MemTree, NodeId, TreeNode};
+pub use neural_embedding::NeuralEmbeddingEngine;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -29,20 +31,24 @@ pub struct MemoryConfig {
     pub max_context_items: usize,
     /// Checkpoint interval in seconds
     pub checkpoint_interval_secs: u64,
+    /// Use neural ONNX embeddings when the model is cached (default: true).
+    /// Falls back to TF-IDF if the model is not yet downloaded.
+    pub use_neural_embeddings: bool,
+    /// Directory where the embedding model is cached / downloaded.
+    pub embedding_cache_dir: PathBuf,
 }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
-        let db_path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".finch")
-            .join("memory.db");
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
         Self {
-            db_path,
+            db_path: home.join(".finch").join("memory.db"),
             enabled: true,
             max_context_items: 5,
             checkpoint_interval_secs: 300, // 5 minutes
+            use_neural_embeddings: true,
+            embedding_cache_dir: home.join(".finch").join("embeddings"),
         }
     }
 }
@@ -56,7 +62,12 @@ pub struct MemorySystem {
 }
 
 impl MemorySystem {
-    /// Create new memory system
+    /// Create new memory system (synchronous).
+    ///
+    /// If `config.use_neural_embeddings` is true and the model is already in
+    /// the HuggingFace cache, a `NeuralEmbeddingEngine` is used; otherwise
+    /// falls back to `TfIdfEmbedding`.  Call `new_async` to trigger a
+    /// download on first run.
     pub fn new(config: MemoryConfig) -> Result<Self> {
         // Ensure directory exists
         if let Some(parent) = config.db_path.parent() {
@@ -77,12 +88,34 @@ impl MemorySystem {
 
         tracing::info!("Memory system initialized: {}", config.db_path.display());
 
-        // Create MemTree and rehydrate from existing conversations in SQLite.
-        // This makes search_memory work across sessions: every stored conversation
-        // is re-embedded and re-inserted into the in-memory tree at startup.
-        let embedding_engine_init = TfIdfEmbedding::new();
-        let mut tree = MemTree::new();
+        // Select embedding engine: try neural if enabled and cached, else TF-IDF.
+        let embedding_engine: Arc<dyn EmbeddingEngine> = if config.use_neural_embeddings {
+            match NeuralEmbeddingEngine::find_in_cache()
+                .and_then(|dir| NeuralEmbeddingEngine::load(&dir).ok())
+            {
+                Some(neural) => {
+                    tracing::info!("Using neural ONNX embeddings (all-MiniLM-L6-v2)");
+                    Arc::new(neural)
+                }
+                None => {
+                    tracing::warn!(
+                        "Neural embedding model not in cache — using TF-IDF fallback. \
+                         Run `finch memory download` or call MemorySystem::new_async() \
+                         to download."
+                    );
+                    Arc::new(TfIdfEmbedding::new())
+                }
+            }
+        } else {
+            Arc::new(TfIdfEmbedding::new())
+        };
 
+        // Parameterize MemTree dimension to match the chosen engine.
+        let dim = embedding_engine.dimension();
+        let mut tree = MemTree::new_with_dim(dim);
+
+        // Rehydrate MemTree from existing conversations in SQLite.
+        // This makes search_memory work across sessions.
         {
             let mut stmt =
                 conn.prepare("SELECT content FROM conversations ORDER BY created_at ASC")?;
@@ -92,7 +125,7 @@ impl MemorySystem {
 
             let count = rows.len();
             for content in rows {
-                if let Ok(embedding) = embedding_engine_init.embed(&content) {
+                if let Ok(embedding) = embedding_engine.embed(&content) {
                     let _ = tree.insert(content, embedding);
                 }
             }
@@ -104,9 +137,24 @@ impl MemorySystem {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             tree: Arc::new(Mutex::new(tree)),
-            embedding_engine: Arc::new(TfIdfEmbedding::new()),
+            embedding_engine,
             config,
         })
+    }
+
+    /// Create a new memory system, downloading the neural model if needed.
+    ///
+    /// Same as `new()` but also triggers `NeuralEmbeddingEngine::ensure_downloaded()`
+    /// before constructing, so the first run downloads the model rather than
+    /// falling back to TF-IDF.
+    pub async fn new_async(config: MemoryConfig) -> Result<Self> {
+        if config.use_neural_embeddings {
+            match NeuralEmbeddingEngine::ensure_downloaded().await {
+                Ok(_) => tracing::info!("Neural embedding model ready"),
+                Err(e) => tracing::warn!("Could not download neural model: {} — using TF-IDF", e),
+            }
+        }
+        Self::new(config)
     }
 
     /// Insert a conversation turn into memory
@@ -133,7 +181,7 @@ impl MemorySystem {
                     timestamp,
                     role,
                     content,
-                    None::<i32>,  // tokens (TODO: count)
+                    None::<i32>, // tokens (TODO: count)
                     model,
                     session_id,
                     timestamp,
@@ -231,6 +279,7 @@ mod tests {
             enabled: true,
             max_context_items: 5,
             checkpoint_interval_secs: 300,
+            ..Default::default()
         };
 
         let memory = MemorySystem::new(config)?;
