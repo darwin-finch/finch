@@ -967,7 +967,7 @@ impl Repl {
                         format!(
                             "Tool '{}' is not allowed in planning mode.\n\
                              Reason: This tool can modify system state.\n\
-                             Available tools: read, glob, grep, web_fetch\n\
+                             Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
                              Type /approve to execute your plan with all tools enabled.",
                             tool_use.name
                         ),
@@ -2020,8 +2020,18 @@ impl Repl {
                 true
             }
             ReplMode::Planning { .. } => {
-                // Only inspection tools allowed
-                matches!(tool_name, "read" | "glob" | "grep" | "web_fetch")
+                // Inspection tools + plan completion tools allowed
+                matches!(
+                    tool_name,
+                    "read"
+                        | "glob"
+                        | "grep"
+                        | "web_fetch"
+                        | "present_plan"
+                        | "PresentPlan"
+                        | "ask_user_question"
+                        | "AskUserQuestion"
+                )
             }
         }
     }
@@ -3779,7 +3789,7 @@ impl Repl {
         // Add mode change notification to conversation
         self.conversation.write().await.add_user_message(format!(
             "[System: Entered planning mode for task: {}]\n\
-             Available tools: read, glob, grep, web_fetch\n\
+             Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
              Blocked tools: bash, save_and_exec\n\
              Please explore the codebase and generate a detailed plan.",
             task

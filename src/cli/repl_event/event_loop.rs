@@ -1291,7 +1291,7 @@ impl EventLoop {
                                 let error_msg = format!(
                                         "Tool '{}' is not allowed in planning mode.\n\
                                          Reason: This tool can modify system state.\n\
-                                         Available tools: read, glob, grep, web_fetch\n\
+                                         Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
                                          Type /approve to execute your plan with all tools enabled.",
                                         tool_use.name
                                     );
@@ -1468,7 +1468,7 @@ impl EventLoop {
                             let error_msg = format!(
                                 "Tool '{}' is not allowed in planning mode.\n\
                                      Reason: This tool can modify system state.\n\
-                                     Available tools: read, glob, grep, web_fetch\n\
+                                     Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
                                      Type /approve to execute your plan with all tools enabled.",
                                 tool_use.name
                             );
@@ -2102,8 +2102,18 @@ impl EventLoop {
                 true
             }
             ReplMode::Planning { .. } => {
-                // Only inspection tools allowed
-                matches!(tool_name, "read" | "glob" | "grep" | "web_fetch")
+                // Inspection tools + plan completion tools allowed
+                matches!(
+                    tool_name,
+                    "read"
+                        | "glob"
+                        | "grep"
+                        | "web_fetch"
+                        | "present_plan"
+                        | "PresentPlan"
+                        | "ask_user_question"
+                        | "AskUserQuestion"
+                )
             }
         }
     }
@@ -2179,7 +2189,7 @@ impl EventLoop {
         // Add mode change notification to conversation
         self.conversation.write().await.add_user_message(format!(
             "[System: Entered planning mode for task: {}]\n\
-             Available tools: read, glob, grep, web_fetch\n\
+             Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
              Blocked tools: bash, save_and_exec\n\
              Please explore the codebase and generate a detailed plan.",
             task
@@ -2892,5 +2902,94 @@ mod tests {
         assert_eq!(r, "Unprompted response");
         // No user message precedes it
         assert!(q.is_empty(), "query should be empty: {:?}", q);
+    }
+
+    // --- is_tool_allowed_in_mode: regression tests ---
+    // Previously PresentPlan and AskUserQuestion were missing from the allow-list,
+    // causing them to be blocked in planning mode with "not allowed in planning mode".
+
+    #[test]
+    fn test_plan_mode_allows_present_plan() {
+        let mode = ReplMode::Planning {
+            task: String::new(),
+            plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+            created_at: chrono::Utc::now(),
+        };
+        assert!(
+            EventLoop::is_tool_allowed_in_mode("PresentPlan", &mode),
+            "PresentPlan must be allowed in planning mode"
+        );
+        assert!(
+            EventLoop::is_tool_allowed_in_mode("present_plan", &mode),
+            "present_plan (snake_case) must be allowed in planning mode"
+        );
+    }
+
+    #[test]
+    fn test_plan_mode_allows_ask_user_question() {
+        let mode = ReplMode::Planning {
+            task: String::new(),
+            plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+            created_at: chrono::Utc::now(),
+        };
+        assert!(
+            EventLoop::is_tool_allowed_in_mode("AskUserQuestion", &mode),
+            "AskUserQuestion must be allowed in planning mode"
+        );
+        assert!(
+            EventLoop::is_tool_allowed_in_mode("ask_user_question", &mode),
+            "ask_user_question (snake_case) must be allowed in planning mode"
+        );
+    }
+
+    #[test]
+    fn test_plan_mode_allows_read_only_tools() {
+        let mode = ReplMode::Planning {
+            task: String::new(),
+            plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+            created_at: chrono::Utc::now(),
+        };
+        for tool in &["read", "glob", "grep", "web_fetch"] {
+            assert!(
+                EventLoop::is_tool_allowed_in_mode(tool, &mode),
+                "{} must be allowed in planning mode",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_mode_blocks_destructive_tools() {
+        let mode = ReplMode::Planning {
+            task: String::new(),
+            plan_path: std::path::PathBuf::from("/tmp/plan.md"),
+            created_at: chrono::Utc::now(),
+        };
+        for tool in &["bash", "Bash", "write", "Write", "edit", "Edit"] {
+            assert!(
+                !EventLoop::is_tool_allowed_in_mode(tool, &mode),
+                "{} must NOT be allowed in planning mode",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_normal_mode_allows_all_tools() {
+        let mode = ReplMode::Normal;
+        for tool in &[
+            "bash",
+            "write",
+            "edit",
+            "PresentPlan",
+            "AskUserQuestion",
+            "read",
+        ] {
+            assert!(
+                EventLoop::is_tool_allowed_in_mode(tool, &mode),
+                "{} must be allowed in normal mode",
+                tool
+            );
+        }
     }
 }

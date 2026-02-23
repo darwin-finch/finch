@@ -401,7 +401,11 @@ impl ToolExecutor {
                     "grep",
                     "web_fetch",
                     "enter_plan_mode",
+                    "EnterPlanMode",
                     "present_plan",
+                    "PresentPlan",
+                    "ask_user_question",
+                    "AskUserQuestion",
                 ];
                 if !allowed_tools.contains(&tool_use.name.as_str()) {
                     drop(current_mode);
@@ -410,7 +414,7 @@ impl ToolExecutor {
                         tool_use.id.clone(),
                         format!(
                             "Tool '{}' is not allowed in planning mode.\n\
-                             Available tools: read, glob, grep, web_fetch\n\
+                             Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
                              Use PresentPlan to show your plan for approval.",
                             tool_use.name
                         ),
