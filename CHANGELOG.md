@@ -11,19 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Universal alignment prompt** (`src/providers/alignment.rs`): `UNIVERSAL_ALIGNMENT_PROMPT`
   constant and `with_alignment(system)` helper enforce consistent JSON output, numbered-format
   adherence, and schema fidelity across all LLM providers — the key enabler for safely swapping
-  to the cheapest available provider without breaking IMCPD or other structured-output workflows
+  to the cheapest available provider without breaking IMPCPD or other structured-output workflows
 - **Live LLM test suite** (`tests/live.rs`, `tests/live/`): opt-in integration tests
   (gated by `FINCH_LIVE_TESTS=1`, all `#[ignore]` by default) that verify real API contracts:
   - `tests/live/providers.rs` — per-provider smoke tests (one per provider, 6 total)
   - `tests/live/parity.rs` — cross-provider behavioral parity (non-empty response, bare JSON
     with alignment, max_tokens respected)
-  - `tests/live/imcpd.rs` — IMCPD JSON schema contract (critique parses to `Vec<CritiqueItem>`,
+  - `tests/live/impcpd.rs` — IMPCPD JSON schema contract (critique parses to `Vec<CritiqueItem>`,
     plan generates numbered steps, critique parity across all providers)
   - Keys resolved from env vars first (CI), then `~/.finch/config.toml` (local dev)
   - Run: `FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_`
 
 ### Changed
-- **IMCPD plan loop** (`src/planning/loop_runner.rs`): alignment prompt now prepended to both
+- **IMPCPD plan loop** (`src/planning/loop_runner.rs`): alignment prompt now prepended to both
   `generate_plan` and `critique_plan` prompts, reducing JSON-format failures across non-Claude
   providers
 

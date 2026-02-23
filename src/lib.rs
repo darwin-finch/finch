@@ -28,4 +28,4 @@ pub mod node;    // Node identity and work statistics (distributed worker)
 pub mod service; // Service discovery (Phase 3)
 pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2)
-pub mod planning; // IMCPD iterative plan refinement loop
+pub mod planning; // IMPCPD iterative plan refinement loop

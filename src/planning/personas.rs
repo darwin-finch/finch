@@ -1,4 +1,4 @@
-// IMCPD persona selection — deterministic keyword-based activation
+// IMPCPD persona selection — deterministic keyword-based activation
 
 /// Return the active critique personas for the given plan text.
 ///

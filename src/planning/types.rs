@@ -1,4 +1,4 @@
-// IMCPD types — CritiqueItem, PlanIteration, ConvergenceResult, ImcpdConfig
+// IMPCPD types — CritiqueItem, PlanIteration, ConvergenceResult, ImpcpdConfig
 
 use serde::{Deserialize, Serialize};
 
@@ -94,16 +94,16 @@ impl PlanResult {
     }
 }
 
-/// Configuration for the IMCPD loop
+/// Configuration for the IMPCPD loop
 #[derive(Debug, Clone)]
-pub struct ImcpdConfig {
+pub struct ImpcpdConfig {
     /// Maximum number of plan-critique iterations before stopping
     pub max_iterations: usize,
     /// Percentage character delta below which the plan is considered stable
     pub convergence_pct: f32,
 }
 
-impl Default for ImcpdConfig {
+impl Default for ImpcpdConfig {
     fn default() -> Self {
         Self {
             max_iterations: 3,
@@ -177,8 +177,8 @@ mod tests {
     }
 
     #[test]
-    fn test_imcpd_config_defaults() {
-        let cfg = ImcpdConfig::default();
+    fn test_impcpd_config_defaults() {
+        let cfg = ImpcpdConfig::default();
         assert_eq!(cfg.max_iterations, 3);
         assert!((cfg.convergence_pct - 15.0).abs() < f32::EPSILON);
     }

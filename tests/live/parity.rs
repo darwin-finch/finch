@@ -43,7 +43,7 @@ async fn live_parity_nonempty_response() {
 /// and the user explicitly requests JSON output.
 ///
 /// This validates the core "alignment prompt works" contract that lets us safely
-/// swap providers in the IMCPD critique loop.
+/// swap providers in the IMPCPD critique loop.
 #[tokio::test]
 #[ignore = "live — set FINCH_LIVE_TESTS=1"]
 async fn live_parity_returns_bare_json_with_alignment() {

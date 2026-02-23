@@ -1851,16 +1851,16 @@ impl EventLoop {
         Ok(())
     }
 
-    /// Handle `/plan <task>` — run the IMCPD iterative plan refinement loop.
+    /// Handle `/plan <task>` — run the IMPCPD iterative plan refinement loop.
     ///
     /// 1. Guard against being called while already in Planning/Executing mode.
     /// 2. Transition to `ReplMode::Planning`.
-    /// 3. Run the IMCPD loop (generate → critique → steer, up to 3 iterations).
+    /// 3. Run the IMPCPD loop (generate → critique → steer, up to 3 iterations).
     /// 4. On convergence or user approval, show the final plan and ask for
     ///    a last confirmation before transitioning to `ReplMode::Executing`.
     async fn handle_plan_task(&mut self, task: String) -> Result<()> {
         use crate::cli::tui::{Dialog, DialogOption, DialogResult};
-        use crate::planning::{ImcpdConfig, PlanLoop, PlanResult};
+        use crate::planning::{ImpcpdConfig, PlanLoop, PlanResult};
 
         // Guard: already planning or executing
         {
@@ -1900,18 +1900,18 @@ impl EventLoop {
         self.update_plan_mode_indicator(&planning_mode);
 
         self.output_manager.write_info(format!(
-            "{} IMCPD plan refinement starting\n{} Task: {}",
+            "{} IMPCPD plan refinement starting\n{} Task: {}",
             "📋",
             " ".repeat(3),
             task.clone().cyan().bold()
         ));
         self.render_tui().await?;
 
-        // ── Run the IMCPD loop ────────────────────────────────────────────────
+        // ── Run the IMPCPD loop ────────────────────────────────────────────────
         let plan_loop = PlanLoop::new(
             Arc::clone(&self.claude_gen),
             Arc::clone(&self.output_manager),
-            ImcpdConfig::default(),
+            ImpcpdConfig::default(),
         );
         let result = plan_loop
             .run(&task, Arc::clone(&self.tui_renderer))

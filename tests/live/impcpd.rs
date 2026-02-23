@@ -1,4 +1,4 @@
-// IMCPD live contract tests
+// IMPCPD live contract tests
 //
 // These verify the structural contracts between Finch's prompts and real LLMs:
 // - Critique prompts produce parseable Vec<CritiqueItem> JSON
@@ -8,21 +8,21 @@
 // These are the tests that unit tests _cannot_ cover — they depend on the LLM
 // actually following the instruction format.
 //
-// Run: FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_imcpd
+// Run: FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_impcpd
 
 use finch::claude::Message;
-use finch::planning::{CritiqueItem, IMCPD_METHODOLOGY};
+use finch::planning::{CritiqueItem, IMPCPD_METHODOLOGY};
 use finch::providers::ProviderRequest;
 
 use crate::{all_available_providers, live_tests_enabled, make_provider, resolve_api_key};
 
-/// The IMCPD critique prompt must produce parseable `Vec<CritiqueItem>` from a real LLM.
+/// The IMPCPD critique prompt must produce parseable `Vec<CritiqueItem>` from a real LLM.
 ///
 /// This validates the JSON contract that the critique parser depends on. If the LLM
-/// doesn't follow the schema, the IMCPD loop silently degrades to no critiques.
+/// doesn't follow the schema, the IMPCPD loop silently degrades to no critiques.
 #[tokio::test]
 #[ignore = "live — set FINCH_LIVE_TESTS=1"]
-async fn live_imcpd_critique_parses_to_critique_items() {
+async fn live_impcpd_critique_parses_to_critique_items() {
     if !live_tests_enabled() {
         return;
     }
@@ -37,7 +37,7 @@ async fn live_imcpd_critique_parses_to_critique_items() {
                         2. Update Config to include jwt_secret field\n\
                         3. cargo test";
 
-    let system = finch::providers::with_alignment(Some(IMCPD_METHODOLOGY));
+    let system = finch::providers::with_alignment(Some(IMPCPD_METHODOLOGY));
     let user = format!(
         "Active personas: Security, Regression, Completeness\n\n\
          Critique this plan:\n\n{sample_plan}\n\n\
@@ -88,7 +88,7 @@ async fn live_imcpd_critique_parses_to_critique_items() {
 /// structured output that can be used as input to the critique step.
 #[tokio::test]
 #[ignore = "live — set FINCH_LIVE_TESTS=1"]
-async fn live_imcpd_plan_generation_produces_numbered_steps() {
+async fn live_impcpd_plan_generation_produces_numbered_steps() {
     if !live_tests_enabled() {
         return;
     }
@@ -137,10 +137,10 @@ async fn live_imcpd_plan_generation_produces_numbered_steps() {
 /// Cross-provider: the critique JSON contract holds for every configured provider.
 ///
 /// All providers must return a valid JSON array (possibly empty) when given the
-/// IMCPD critique prompt with alignment instructions active.
+/// IMPCPD critique prompt with alignment instructions active.
 #[tokio::test]
 #[ignore = "live — set FINCH_LIVE_TESTS=1"]
-async fn live_imcpd_critique_parity_all_providers() {
+async fn live_impcpd_critique_parity_all_providers() {
     if !live_tests_enabled() {
         return;
     }
@@ -151,7 +151,7 @@ async fn live_imcpd_critique_parity_all_providers() {
     }
 
     let sample_plan = "1. Add auth middleware\n2. Update tests\n3. Commit";
-    let system = finch::providers::with_alignment(Some(IMCPD_METHODOLOGY));
+    let system = finch::providers::with_alignment(Some(IMPCPD_METHODOLOGY));
 
     for (name, provider) in providers {
         let user = format!(

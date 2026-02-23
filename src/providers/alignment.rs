@@ -3,7 +3,7 @@
 // Different LLM providers (Claude, GPT-4, Grok, Gemini, Mistral, Groq) have different
 // default styles. The universal alignment prompt enforces consistent structural behavior
 // so that Finch can swap to the cheapest available provider without breaking features
-// that depend on structured output (e.g. IMCPD critique JSON, numbered plan steps).
+// that depend on structured output (e.g. IMPCPD critique JSON, numbered plan steps).
 
 /// Prompt that normalizes output discipline across all LLM providers.
 ///

@@ -1,4 +1,4 @@
-# IMCPD — Iterative Multi-Perspective Code Plan Debugging
+# IMPCPD — Iterative Multi-Perspective Code Plan Debugging
 
 ## Purpose
 
@@ -137,7 +137,7 @@ Plans that modify files must include a surgical commit step. Raise a must-addres
 - The commit step must include the actual commit message text, not just "commit the
   changes" or "write a descriptive message". The message must follow the repo's convention:
   `<type>: <subject>` (e.g. `feat:`, `fix:`, `chore:`, `refactor:`, `docs:`).
-- Good: `git commit -m "feat: add Git Discipline persona to IMCPD"`
+- Good: `git commit -m "feat: add Git Discipline persona to IMPCPD"`
 - Bad: "commit all changes with an appropriate message"
 
 **Pre-commit verification step:**

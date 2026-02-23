@@ -163,7 +163,7 @@ These felt like oversight numbers left over from early testing. A coding agent t
 
 In rough priority order:
 
-*Update (v0.5.2, Feb 2026): The list below reflects the state at time of writing. Several items have since shipped: `/plan` is live (7-persona IMCPD loop), Phi and DeepSeek ONNX support is in, and the universal alignment prompt lets the planning loop swap providers mid-session. LoRA and MemTree persistence remain open.*
+*Update (v0.5.2, Feb 2026): The list below reflects the state at time of writing. Several items have since shipped: `/plan` is live (7-persona IMPCPD loop), Phi and DeepSeek ONNX support is in, and the universal alignment prompt lets the planning loop swap providers mid-session. LoRA and MemTree persistence remain open.*
 
 **Short term:**
 - MemTree TUI rendering and keyboard navigation (the thing that should be visible now but isn't)

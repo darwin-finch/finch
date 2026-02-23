@@ -17,7 +17,7 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained loc
 - ✅ Multi-provider teacher support (6 providers)
 - ✅ Unified `[[providers]]` config with transparent migration
 - ✅ Tabbed setup wizard with ONNX model selection
-- ✅ IMCPD iterative planning loop (`/plan` command)
+- ✅ IMPCPD iterative planning loop (`/plan` command)
 - ✅ Universal alignment prompt (JSON normalization across providers)
 - ✅ Live LLM test suite (gated by `FINCH_LIVE_TESTS=1`)
 - 🚧 MCP plugin system (partial)
@@ -234,7 +234,7 @@ Repeat up to 5 iterations
 - `src/tools/permissions.rs` - PermissionManager, approval patterns
 - `src/cli/repl_event/tool_execution.rs` - Client-side execution
 
-### 4. IMCPD Planning Loop
+### 4. IMPCPD Planning Loop
 
 **Purpose:** Generate high-quality implementation plans through an iterative adversarial critique loop before any code is written.
 
@@ -258,7 +258,7 @@ Iteration 1–3:
     Approved → ReplMode::Executing, cleared conversation context
 ```
 
-**Seven Adversarial Personas** (defined in `imcpd_methodology.md`, sent verbatim to LLM):
+**Seven Adversarial Personas** (defined in `impcpd_methodology.md`, sent verbatim to LLM):
 - Always-active: Regression, Edge Cases, Completeness, Tests & Docs, Repo Hygiene, Git Discipline
 - Keyword-activated: Security, Architecture, Scope Creep
 
@@ -278,7 +278,7 @@ Iteration 1–3:
 - `src/planning/loop_runner.rs` — `PlanLoop`, `generate_plan()`, `critique_plan()`
 - `src/planning/types.rs` — `CritiqueItem`, `ImcpdConfig`, `PlanIteration`
 - `src/planning/personas.rs` — `PersonaSelector`, persona definitions
-- `src/planning/imcpd_methodology.md` — full methodology spec (embedded via `include_str!`)
+- `src/planning/impcpd_methodology.md` — full methodology spec (embedded via `include_str!`)
 
 ### 5. Universal Alignment Prompt
 

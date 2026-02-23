@@ -11,14 +11,14 @@
 //   tests/live.rs            <- this file (shared helpers + submodule declarations)
 //   tests/live/providers.rs  <- per-provider smoke tests
 //   tests/live/parity.rs     <- cross-provider behavioral parity tests
-//   tests/live/imcpd.rs      <- IMCPD JSON contract tests
+//   tests/live/impcpd.rs     <- IMPCPD JSON contract tests
 
 #[path = "live/providers.rs"]
 pub mod providers;
 #[path = "live/parity.rs"]
 pub mod parity;
-#[path = "live/imcpd.rs"]
-pub mod imcpd;
+#[path = "live/impcpd.rs"]
+pub mod impcpd;
 
 use finch::config::TeacherEntry;
 use finch::providers::LlmProvider;

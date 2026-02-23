@@ -18,7 +18,7 @@ Core infrastructure is complete and production-ready.
 - 6 tools — Read, Glob, Grep, WebFetch, Bash, Restart — with permission system
 - Auto-spawning daemon with OpenAI-compatible API and mDNS/Bonjour discovery
 - Professional TUI — scrollback, streaming, ghost text, plan mode, Ctrl+G/B feedback
-- IMCPD iterative planning loop (`/plan <task>`) with 7 adversarial personas
+- IMPCPD iterative planning loop (`/plan <task>`) with 7 adversarial personas
 - Universal alignment prompt — JSON normalization across all 6 providers
 - Live LLM test suite (`FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_`)
 - LoRA weighted feedback collection + JSONL queue (adapter loading still pending)

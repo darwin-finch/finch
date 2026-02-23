@@ -1,4 +1,4 @@
-// IMCPD loop runner — iterative plan generation + adversarial critique
+// IMPCPD loop runner — iterative plan generation + adversarial critique
 
 use anyhow::{Context, Result};
 use crossterm::style::Stylize;
@@ -12,11 +12,11 @@ use crate::generators::Generator;
 
 use super::personas::select_active_personas;
 use super::types::{
-    ConvergenceResult, CritiqueItem, ImcpdConfig, PlanIteration, PlanResult, UserFeedback,
+    ConvergenceResult, CritiqueItem, ImpcpdConfig, PlanIteration, PlanResult, UserFeedback,
 };
-use super::IMCPD_METHODOLOGY;
+use super::IMPCPD_METHODOLOGY;
 
-/// The IMCPD plan loop.
+/// The IMPCPD plan loop.
 ///
 /// Drives iterative plan generation and adversarial multi-persona critique
 /// until one of the following conditions is met:
@@ -27,14 +27,14 @@ use super::IMCPD_METHODOLOGY;
 pub struct PlanLoop {
     generator: Arc<dyn Generator>,
     output_manager: Arc<OutputManager>,
-    config: ImcpdConfig,
+    config: ImpcpdConfig,
 }
 
 impl PlanLoop {
     pub fn new(
         generator: Arc<dyn Generator>,
         output_manager: Arc<OutputManager>,
-        config: ImcpdConfig,
+        config: ImpcpdConfig,
     ) -> Self {
         Self {
             generator,
@@ -43,7 +43,7 @@ impl PlanLoop {
         }
     }
 
-    /// Run the full IMCPD loop for a planning task.
+    /// Run the full IMPCPD loop for a planning task.
     ///
     /// `task` — the user's task description (e.g. "add JWT auth to the route handler")
     /// `tui`  — shared TUI renderer for showing blocking dialogs
@@ -225,7 +225,7 @@ impl PlanLoop {
         Ok(response.text.trim().to_string())
     }
 
-    /// Critique the plan using the active personas and the embedded IMCPD methodology.
+    /// Critique the plan using the active personas and the embedded IMPCPD methodology.
     async fn critique_plan(
         &self,
         plan: &str,
@@ -243,7 +243,7 @@ impl PlanLoop {
              Do not wrap in markdown code fences. \
              If there are no issues, return [].",
             alignment = crate::providers::UNIVERSAL_ALIGNMENT_PROMPT.trim(),
-            methodology = IMCPD_METHODOLOGY,
+            methodology = IMPCPD_METHODOLOGY,
             persona_list = personas.join(", "),
             plan = plan,
         );
@@ -431,7 +431,7 @@ fn check_convergence(
     prev: &str,
     curr: &str,
     critiques: &[CritiqueItem],
-    config: &ImcpdConfig,
+    config: &ImpcpdConfig,
 ) -> ConvergenceResult {
     let delta = char_delta_pct(prev, curr);
     let must_count = critiques.iter().filter(|c| c.is_must_address).count();
@@ -552,14 +552,14 @@ mod tests {
 
     #[test]
     fn test_convergence_stable_no_issues() {
-        let cfg = ImcpdConfig::default();
+        let cfg = ImpcpdConfig::default();
         let result = check_convergence("hello world", "hello world", &[], &cfg);
         assert!(matches!(result, ConvergenceResult::Stable { delta_pct } if delta_pct < 1.0));
     }
 
     #[test]
     fn test_convergence_stable_blocked_by_must_address() {
-        let cfg = ImcpdConfig::default();
+        let cfg = ImpcpdConfig::default();
         let critiques = vec![CritiqueItem::new("Security", "Missing auth", None, 9, 8)];
         // Plan unchanged, but there's a must-address item → not stable
         let result = check_convergence("hello world", "hello world", &critiques, &cfg);
@@ -568,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_convergence_scope_runaway() {
-        let cfg = ImcpdConfig::default();
+        let cfg = ImpcpdConfig::default();
         let prev = "short";
         let curr = "a".repeat(10); // much longer
         let critiques = vec![CritiqueItem::new("Regression", "Breaks thing", None, 9, 9)];
