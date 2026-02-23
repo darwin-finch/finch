@@ -428,7 +428,10 @@ impl EventLoop {
                         // Handle /local command - query local model directly (bypass routing)
                         self.handle_local_query(query).await?;
                     }
-                    Command::PlanModeToggle | Command::Plan(_) => {
+                    Command::Plan(task) => {
+                        self.handle_plan_task(task).await?;
+                    }
+                    Command::PlanModeToggle => {
                         // Check current mode and toggle
                         let current_mode = self.mode.read().await.clone();
                         match current_mode {
@@ -1843,6 +1846,169 @@ impl EventLoop {
              Please explore the codebase and generate a detailed plan.",
             task
         ));
+
+        self.render_tui().await?;
+        Ok(())
+    }
+
+    /// Handle `/plan <task>` — run the IMCPD iterative plan refinement loop.
+    ///
+    /// 1. Guard against being called while already in Planning/Executing mode.
+    /// 2. Transition to `ReplMode::Planning`.
+    /// 3. Run the IMCPD loop (generate → critique → steer, up to 3 iterations).
+    /// 4. On convergence or user approval, show the final plan and ask for
+    ///    a last confirmation before transitioning to `ReplMode::Executing`.
+    async fn handle_plan_task(&mut self, task: String) -> Result<()> {
+        use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+        use crate::planning::{ImcpdConfig, PlanLoop, PlanResult};
+
+        // Guard: already planning or executing
+        {
+            let mode = self.mode.read().await;
+            if matches!(*mode, ReplMode::Planning { .. } | ReplMode::Executing { .. }) {
+                let name = match &*mode {
+                    ReplMode::Planning { .. } => "planning",
+                    ReplMode::Executing { .. } => "executing",
+                    _ => unreachable!(),
+                };
+                drop(mode);
+                self.output_manager.write_info(format!(
+                    "⚠️  Already in {} mode. Use /plan (no args) to exit first.",
+                    name
+                ));
+                self.render_tui().await?;
+                return Ok(());
+            }
+        }
+
+        // Create plan directory and timestamped path
+        let plans_dir = dirs::home_dir()
+            .context("Home directory not found")?
+            .join(".finch")
+            .join("plans");
+        std::fs::create_dir_all(&plans_dir)?;
+        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+        let plan_path = plans_dir.join(format!("plan_{}.md", timestamp));
+
+        // Transition to Planning mode
+        let planning_mode = ReplMode::Planning {
+            task: task.clone(),
+            plan_path: plan_path.clone(),
+            created_at: Utc::now(),
+        };
+        *self.mode.write().await = planning_mode.clone();
+        self.update_plan_mode_indicator(&planning_mode);
+
+        self.output_manager.write_info(format!(
+            "{} IMCPD plan refinement starting\n{} Task: {}",
+            "📋",
+            " ".repeat(3),
+            task.clone().cyan().bold()
+        ));
+        self.render_tui().await?;
+
+        // ── Run the IMCPD loop ────────────────────────────────────────────────
+        let plan_loop = PlanLoop::new(
+            Arc::clone(&self.claude_gen),
+            Arc::clone(&self.output_manager),
+            ImcpdConfig::default(),
+        );
+        let result = plan_loop
+            .run(&task, Arc::clone(&self.tui_renderer))
+            .await?;
+
+        // ── Handle loop result ────────────────────────────────────────────────
+        match result {
+            PlanResult::Converged { ref iterations }
+            | PlanResult::UserApproved { ref iterations }
+            | PlanResult::IterationCap { ref iterations } => {
+                let Some(last) = iterations.last() else {
+                    *self.mode.write().await = ReplMode::Normal;
+                    self.update_plan_mode_indicator(&ReplMode::Normal);
+                    self.render_tui().await?;
+                    return Ok(());
+                };
+                let final_plan = last.plan_text.clone();
+
+                // Save final plan to disk
+                if let Err(e) = std::fs::write(&plan_path, &final_plan) {
+                    self.output_manager.write_info(format!(
+                        "⚠️  Could not save plan file: {}",
+                        e
+                    ));
+                }
+
+                // Show the plan for final human review
+                self.output_manager.write_info(format!("\n{}", "━".repeat(70)));
+                self.output_manager
+                    .write_info(format!("{}", "📋 FINAL IMPLEMENTATION PLAN".bold()));
+                self.output_manager.write_info(format!("{}\n", "━".repeat(70)));
+                self.output_manager.write_info(final_plan.clone());
+                self.output_manager.write_info(format!("\n{}\n", "━".repeat(70)));
+                self.render_tui().await?;
+
+                // Final approval dialog
+                let approval_dialog = Dialog::select(
+                    "Review Final Plan".to_string(),
+                    vec![
+                        DialogOption::with_description(
+                            "Approve and execute",
+                            "All tools enabled — proceed with implementation",
+                        ),
+                        DialogOption::with_description(
+                            "Reject",
+                            "Exit plan mode without executing",
+                        ),
+                    ],
+                )
+                .with_help("↑↓/j/k = navigate · Enter = select · Esc = cancel");
+
+                let approval = {
+                    let mut tui = self.tui_renderer.lock().await;
+                    tui.show_dialog(approval_dialog)
+                        .context("Failed to show approval dialog")?
+                };
+
+                match approval {
+                    DialogResult::Selected(0) => {
+                        // Approved → transition to Executing
+                        let exec_mode = ReplMode::Executing {
+                            task: task.clone(),
+                            plan_path: plan_path.clone(),
+                            approved_at: Utc::now(),
+                        };
+                        *self.mode.write().await = exec_mode.clone();
+                        self.update_plan_mode_indicator(&exec_mode);
+
+                        // Replace conversation context with the plan so the LLM
+                        // knows exactly what to execute next.
+                        self.conversation.write().await.clear();
+                        self.conversation.write().await.add_user_message(format!(
+                            "[System: Plan approved. Execute this plan step by step:]\n\n{}",
+                            final_plan
+                        ));
+
+                        self.output_manager.write_info(format!(
+                            "{}",
+                            "✓ Plan approved! All tools are now enabled.".green().bold()
+                        ));
+                    }
+                    _ => {
+                        // Rejected or cancelled
+                        *self.mode.write().await = ReplMode::Normal;
+                        self.update_plan_mode_indicator(&ReplMode::Normal);
+                        self.output_manager
+                            .write_info("Plan rejected. Returned to normal mode.");
+                    }
+                }
+            }
+            PlanResult::Cancelled => {
+                *self.mode.write().await = ReplMode::Normal;
+                self.update_plan_mode_indicator(&ReplMode::Normal);
+                self.output_manager
+                    .write_info("Planning cancelled. Returned to normal mode.");
+            }
+        }
 
         self.render_tui().await?;
         Ok(())
