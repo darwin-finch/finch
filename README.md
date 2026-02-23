@@ -7,7 +7,7 @@ A terminal AI coding assistant with persistent memory and tool use.
 - Answers coding questions, reads your files, runs commands, and searches your codebase — with your permission before every action
 - Remembers context across sessions using a hierarchical memory tree (MemTree), automatically injected into each conversation
 - Works with any of the major AI providers: Grok, Claude, GPT-4, Gemini, Mistral, Groq
-- Optionally runs a local model (Qwen 2.5) on your machine for offline use
+- Optionally runs a local model on your machine for offline use — Qwen, Llama, Gemma, Mistral, Phi, DeepSeek via ONNX Runtime
 
 ## Quick Start
 
@@ -82,7 +82,7 @@ Ask questions in plain English. finch has access to tools and will ask your perm
 
 ## Local model (offline use)
 
-If you want finch to run without any cloud provider, it can download and run a Qwen 2.5 model locally via ONNX Runtime. The model is selected automatically based on your available RAM:
+If you want finch to run without any cloud provider, it can download and run a local model via ONNX Runtime. Six model families are supported (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek). Qwen 2.5 is the default, selected automatically based on your available RAM:
 
 | RAM    | Model  | Download size |
 |--------|--------|---------------|
@@ -91,7 +91,7 @@ If you want finch to run without any cloud provider, it can download and run a Q
 | 32 GB  | 7B     | ~7 GB         |
 | 64 GB+ | 14B    | ~14 GB        |
 
-The download happens in the background on first run. On Apple Silicon, inference uses Metal acceleration via CoreML.
+The download happens in the background on first run. On Apple Silicon, inference uses ONNX Runtime's CoreML execution provider, which dispatches ops to ANE or GPU where supported.
 
 To use the local model, run `finch` without `--cloud-only`. The REPL starts immediately; queries fall back to your cloud provider while the model loads.
 
@@ -104,6 +104,7 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 | `finch`              | Start the interactive REPL (with local model if ready) |
 | `finch setup`        | Run the interactive setup wizard                       |
 | `finch --cloud-only` | Start REPL using only cloud providers, no local model  |
+| `/plan <task>`       | Run iterative planning loop (7-persona critique, 3 rounds) |
 | `/teacher grok`      | Switch teacher to Grok for the current session         |
 | `/teacher claude`    | Switch teacher to Claude for the current session       |
 | `/teacher list`      | List all configured teacher providers                  |

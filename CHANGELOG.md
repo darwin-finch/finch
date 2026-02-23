@@ -174,7 +174,7 @@ Initial release of Shammah - Local-first AI coding assistant.
 ### Added
 - **Core Features**:
   - Pre-trained local model support (Qwen, Llama, Mistral, Phi via ONNX)
-  - Weighted LoRA fine-tuning for continuous improvement
+  - Weighted feedback collection infrastructure (Ctrl+G/B, JSONL queue) for future LoRA fine-tuning
   - Progressive bootstrap (instant startup with background loading)
   - Tool execution system (Read, Glob, Grep, WebFetch, Bash, Restart)
   - HTTP daemon mode with OpenAI-compatible API

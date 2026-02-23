@@ -50,7 +50,7 @@ This skips the model download, skips the daemon, and routes everything directly 
 
 For our friend with the old Intel MacBook Pro: he gets his Grok API key from `console.x.ai`, runs `finch setup`, picks Grok, and uses `finch --cloud-only`. No model download. No daemon. No Rust toolchain.
 
-The release workflow now builds native binaries for both Apple Silicon (`macos-14`) and Intel (`macos-13`) via GitHub Actions.
+The release workflow builds native binaries for Apple Silicon (`macos-14`) and Linux x86_64 (`ubuntu-24.04`) via GitHub Actions. Intel macOS support was dropped in February 2026: ONNX Runtime has no prebuilt binaries for `x86_64-apple-darwin`, and GitHub deprecated Intel Mac runners.
 
 ---
 
@@ -163,6 +163,8 @@ These felt like oversight numbers left over from early testing. A coding agent t
 
 In rough priority order:
 
+*Update (v0.5.2, Feb 2026): The list below reflects the state at time of writing. Several items have since shipped: `/plan` is live (7-persona IMCPD loop), Phi and DeepSeek ONNX support is in, and the universal alignment prompt lets the planning loop swap providers mid-session. LoRA and MemTree persistence remain open.*
+
 **Short term:**
 - MemTree TUI rendering and keyboard navigation (the thing that should be visible now but isn't)
 - Real embeddings via a small local ONNX sentence transformer
@@ -174,9 +176,7 @@ In rough priority order:
 - Autonomous agent mode: run Finch headlessly overnight on a task backlog, commit with a custom git identity (persona), log everything to JSONL, periodically reflect on completed work to update the agent's own system prompt. The data structures and CLI command are already there; it needs end-to-end testing.
 
 **Longer term:**
-- LoRA adapter loading at inference time (the training infrastructure exists; the runtime loading doesn't)
-- Plan mode (structured multi-step planning before execution, like Claude Code's plan approval flow)
-- Additional model families (Phi, DeepSeek)
+- LoRA adapter loading at inference time: planned pipeline is MLX/PEFT training → Olive conversion → onnxruntime-genai Adapters API at inference (tracked as GitHub Issue #1)
 
 ---
 
@@ -196,4 +196,4 @@ The Grok work made one thing clear: building for multiple providers forces you t
 
 ---
 
-*Finch is written in Rust. The current release supports macOS (Apple Silicon and Intel), with Linux support in progress. Source at [github.com/darwin-finch/finch](https://github.com/darwin-finch/finch).*
+*Finch is written in Rust. The current release (v0.5.2) supports macOS Apple Silicon and Linux x86_64. Source at [github.com/darwin-finch/finch](https://github.com/darwin-finch/finch).*
