@@ -77,6 +77,9 @@ pub struct ResponseMetadata {
 pub enum StreamChunk {
     TextDelta(String),                  // Incremental text
     ContentBlockComplete(ContentBlock), // Complete tool_use or text block
+    /// Usage metadata from message_start — carries the input token count
+    /// reported by the API before any text arrives.
+    Usage { input_tokens: u32 },
 }
 
 /// Tool use request from generator
@@ -231,6 +234,15 @@ mod tests {
                 assert_eq!(text, "final answer");
             }
             _ => panic!("Expected ContentBlockComplete with Text"),
+        }
+    }
+
+    #[test]
+    fn test_stream_chunk_usage() {
+        let chunk = StreamChunk::Usage { input_tokens: 1024 };
+        match chunk {
+            StreamChunk::Usage { input_tokens } => assert_eq!(input_tokens, 1024),
+            _ => panic!("Expected Usage"),
         }
     }
 

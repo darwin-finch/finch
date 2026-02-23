@@ -1390,6 +1390,9 @@ impl Repl {
                 Ok(crate::generators::StreamChunk::ContentBlockComplete(_block)) => {
                     // Tool block completed - ignore for now (event loop handles tools)
                 }
+                Ok(crate::generators::StreamChunk::Usage { .. }) => {
+                    // Usage metadata (input token count) — not used in this path
+                }
                 Err(e) => {
                     return Err(e);
                 }

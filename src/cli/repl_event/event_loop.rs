@@ -1285,6 +1285,7 @@ impl EventLoop {
             let stream_start = std::time::Instant::now();
             let mut token_count: usize = 0;
             let mut throb_idx: usize = 0;
+            let mut input_token_count: Option<u32> = None;
             status_bar.update_operation(format!("✳ {}…", verb));
             {
                 use std::io::Write as _;
@@ -1309,6 +1310,20 @@ impl EventLoop {
 
                     while let Some(result) = rx.recv().await {
                         match result {
+                            Ok(StreamChunk::Usage { input_tokens }) => {
+                                input_token_count = Some(input_tokens);
+                                // Update status bar with real input token count immediately
+                                let icon = THROB_FRAMES[throb_idx];
+                                let secs = stream_start.elapsed().as_secs();
+                                let input_str = format_token_count(input_tokens as usize);
+                                status_bar.update_operation(format!(
+                                    "{} {}… ({} · ↑ {} · thinking)",
+                                    icon,
+                                    verb,
+                                    format_elapsed(secs),
+                                    input_str
+                                ));
+                            }
                             Ok(StreamChunk::TextDelta(delta)) => {
                                 tracing::debug!("Received TextDelta: {} bytes", delta.len());
                                 text.push_str(&delta);
@@ -1321,11 +1336,22 @@ impl EventLoop {
                                 let icon = THROB_FRAMES[throb_idx];
                                 let secs = stream_start.elapsed().as_secs();
                                 let elapsed_str = format_elapsed(secs);
-                                let tokens_str = format_token_count(token_count);
-                                status_bar.update_operation(format!(
-                                    "{} {}… ({} · ↓ {} tokens)",
-                                    icon, verb, elapsed_str, tokens_str
-                                ));
+                                let output_str = format_token_count(token_count);
+                                let status = match input_token_count {
+                                    Some(n) => format!(
+                                        "{} {}… ({} · ↑ {} · ↓ {} tokens)",
+                                        icon,
+                                        verb,
+                                        elapsed_str,
+                                        format_token_count(n as usize),
+                                        output_str
+                                    ),
+                                    None => format!(
+                                        "{} {}… ({} · ↓ {} tokens)",
+                                        icon, verb, elapsed_str, output_str
+                                    ),
+                                };
+                                status_bar.update_operation(status);
                             }
                             Ok(StreamChunk::ContentBlockComplete(block)) => {
                                 tracing::debug!("Received ContentBlockComplete: {:?}", block);
@@ -1334,12 +1360,22 @@ impl EventLoop {
                                 if token_count == 0 {
                                     let icon = THROB_FRAMES[throb_idx];
                                     let secs = stream_start.elapsed().as_secs();
-                                    status_bar.update_operation(format!(
-                                        "{} {}… ({} · thinking)",
-                                        icon,
-                                        verb,
-                                        format_elapsed(secs)
-                                    ));
+                                    let status = match input_token_count {
+                                        Some(n) => format!(
+                                            "{} {}… ({} · ↑ {} · thinking)",
+                                            icon,
+                                            verb,
+                                            format_elapsed(secs),
+                                            format_token_count(n as usize)
+                                        ),
+                                        None => format!(
+                                            "{} {}… ({} · thinking)",
+                                            icon,
+                                            verb,
+                                            format_elapsed(secs)
+                                        ),
+                                    };
+                                    status_bar.update_operation(status);
                                 }
                                 blocks.push(block);
                             }
@@ -1371,7 +1407,7 @@ impl EventLoop {
                     // Send stats update
                     let _ = event_tx.send(ReplEvent::StatsUpdate {
                         model: generator.name().to_string(),
-                        input_tokens: None,
+                        input_tokens: input_token_count,
                         output_tokens: Some(token_count as u32),
                         latency_ms: Some(stream_start.elapsed().as_millis() as u64),
                     });
@@ -3001,6 +3037,42 @@ mod tests {
         let icon = THROB_FRAMES[2]; // "✼"
         let status = format!("{} {}… ({} · thinking)", icon, verb, format_elapsed(secs));
         assert_eq!(status, "✼ Thinking… (15s · thinking)");
+    }
+
+    #[test]
+    fn test_streaming_status_with_input_tokens() {
+        // With input token count available, show ↑ input · ↓ output
+        let verb = "Thinking";
+        let input_tokens: u32 = 1250;
+        let output_tokens = 300usize;
+        let secs = 10u64;
+        let icon = THROB_FRAMES[1]; // "✳"
+        let status = format!(
+            "{} {}… ({} · ↑ {} · ↓ {} tokens)",
+            icon,
+            verb,
+            format_elapsed(secs),
+            format_token_count(input_tokens as usize),
+            format_token_count(output_tokens),
+        );
+        assert_eq!(status, "✳ Thinking… (10s · ↑ 1.2k · ↓ 300 tokens)");
+    }
+
+    #[test]
+    fn test_streaming_status_thinking_with_input_tokens() {
+        // Usage arrives before text — show ↑ input · thinking
+        let verb = "Thinking";
+        let input_tokens: u32 = 800;
+        let secs = 3u64;
+        let icon = THROB_FRAMES[0]; // "✦"
+        let status = format!(
+            "{} {}… ({} · ↑ {} · thinking)",
+            icon,
+            verb,
+            format_elapsed(secs),
+            format_token_count(input_tokens as usize),
+        );
+        assert_eq!(status, "✦ Thinking… (3s · ↑ 800 · thinking)");
     }
 
     #[test]

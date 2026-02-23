@@ -218,6 +218,24 @@ impl ClaudeProvider {
                                 if let Ok(event) = serde_json::from_str::<StreamEvent>(json_str) {
                                     tracing::debug!("Stream event: {}", event.event_type);
                                     match event.event_type.as_str() {
+                                        "message_start" => {
+                                            // Extract input_tokens from message.usage
+                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                                if let Some(n) = v
+                                                    .get("message")
+                                                    .and_then(|m| m.get("usage"))
+                                                    .and_then(|u| u.get("input_tokens"))
+                                                    .and_then(|t| t.as_u64())
+                                                {
+                                                    let _ = tx
+                                                        .send(Ok(StreamChunk::Usage {
+                                                            input_tokens: n as u32,
+                                                        }))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+
                                         "content_block_start" => {
                                             if let Some(cb) = event.content_block {
                                                 let index = event.index.unwrap_or(0);
