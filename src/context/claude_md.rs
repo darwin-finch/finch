@@ -1,27 +1,28 @@
-// Auto-loading of CLAUDE.md / FINCH.md / CONTEXT.md files into the system prompt
+// Auto-loading of CLAUDE.md / FINCH.md / CONTEXT.md / README.md files into the system prompt
 //
 // Matches Claude Code behavior: load ~/.claude/CLAUDE.md (user-level) first,
-// then walk upward from cwd to root collecting any CLAUDE.md, FINCH.md, or
-// CONTEXT.md found, and concatenate them outermost-first so project-specific
-// instructions win.
+// then walk upward from cwd to root collecting any CLAUDE.md, FINCH.md,
+// CONTEXT.md, or README.md found, and concatenate them outermost-first so
+// project-specific instructions win.
 //
 // FINCH.md is supported as an open, tool-agnostic alternative to CLAUDE.md.
 // CONTEXT.md is a neutral name that works across any AI assistant.
+// README.md is loaded last as general project overview context.
 // When multiple files exist in the same directory, all are loaded in order.
 
 use std::path::Path;
 use tracing::{debug, info};
 
 /// Filenames we look for, in the order they are loaded within a single directory.
-const CONTEXT_FILENAMES: &[&str] = &["CLAUDE.md", "FINCH.md", "CONTEXT.md"];
+const CONTEXT_FILENAMES: &[&str] = &["CLAUDE.md", "FINCH.md", "CONTEXT.md", "README.md"];
 
-/// Collect all CLAUDE.md / FINCH.md / CONTEXT.md context visible from `cwd`.
+/// Collect all CLAUDE.md / FINCH.md / CONTEXT.md / README.md context visible from `cwd`.
 ///
 /// Load order (lowest → highest priority):
 /// 1. `~/.claude/CLAUDE.md` — user-level defaults (Claude Code convention)
 /// 2. `~/.finch/FINCH.md`   — user-level defaults (Finch-specific)
-/// 3. Each `CLAUDE.md` / `FINCH.md` / `CONTEXT.md` found walking from root
-///    down to `cwd` (outermost first, in filename order within the same dir)
+/// 3. Each `CLAUDE.md` / `FINCH.md` / `CONTEXT.md` / `README.md` found walking
+///    from root down to `cwd` (outermost first, in filename order within same dir)
 ///
 /// Returns `None` if no files were found or all were empty.
 pub fn collect_claude_md_context(cwd: &Path) -> Option<String> {
@@ -62,7 +63,7 @@ pub fn collect_claude_md_context(cwd: &Path) -> Option<String> {
     }
 
     if sections.is_empty() {
-        debug!("No CLAUDE.md/FINCH.md files found from {}", cwd.display());
+        debug!("No context files found from {}", cwd.display());
         return None;
     }
 
@@ -102,7 +103,7 @@ mod tests {
     #[test]
     fn returns_none_when_no_context_files() {
         let tmp = TempDir::new().unwrap();
-        // No CLAUDE.md or FINCH.md in tmp or any ancestor (the user-level ones may
+        // No context files in tmp or any ancestor (the user-level ones may
         // exist, but we can't control that in tests — just check no panic).
         let _ = collect_claude_md_context(tmp.path());
     }
@@ -150,11 +151,22 @@ mod tests {
     }
 
     #[test]
+    fn loads_readme_md_from_cwd() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "README.md", "# My Project\nDoes cool things.");
+
+        let result = collect_claude_md_context(tmp.path());
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Does cool things."));
+    }
+
+    #[test]
     fn loads_all_names_in_same_directory() {
         let tmp = TempDir::new().unwrap();
         write(tmp.path(), "CLAUDE.md", "claude instructions");
         write(tmp.path(), "FINCH.md", "finch instructions");
         write(tmp.path(), "CONTEXT.md", "context instructions");
+        write(tmp.path(), "README.md", "readme instructions");
 
         let result = collect_claude_md_context(tmp.path());
         assert!(result.is_some());
@@ -162,12 +174,15 @@ mod tests {
         assert!(text.contains("claude instructions"));
         assert!(text.contains("finch instructions"));
         assert!(text.contains("context instructions"));
-        // Load order: CLAUDE.md → FINCH.md → CONTEXT.md
+        assert!(text.contains("readme instructions"));
+        // Load order: CLAUDE.md → FINCH.md → CONTEXT.md → README.md
         let claude_pos = text.find("claude instructions").unwrap();
         let finch_pos = text.find("finch instructions").unwrap();
         let context_pos = text.find("context instructions").unwrap();
+        let readme_pos = text.find("readme instructions").unwrap();
         assert!(claude_pos < finch_pos, "CLAUDE.md should appear before FINCH.md");
         assert!(finch_pos < context_pos, "FINCH.md should appear before CONTEXT.md");
+        assert!(context_pos < readme_pos, "CONTEXT.md should appear before README.md");
     }
 
     #[test]
