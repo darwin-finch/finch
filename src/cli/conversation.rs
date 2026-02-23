@@ -287,6 +287,7 @@ impl Default for ConversationHistory {
 ///     });
 /// }
 /// ```
+#[allow(dead_code)]
 pub struct ConversationCompactor<'a> {
     /// Fallback chain for API calls
     fallback_chain: &'a crate::providers::fallback_chain::FallbackChain,
@@ -296,6 +297,7 @@ pub struct ConversationCompactor<'a> {
     threshold_percent: f32,
 }
 
+#[allow(dead_code)]
 impl<'a> ConversationCompactor<'a> {
     /// Create a new conversation compactor
     pub fn new(fallback_chain: &'a crate::providers::fallback_chain::FallbackChain) -> Self {

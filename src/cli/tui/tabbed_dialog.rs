@@ -3,7 +3,9 @@
 // Allows Claude to ask multiple questions simultaneously with tab-based navigation
 // similar to Claude Code's implementation.
 
-use crate::cli::llm_dialogs::{Question, QuestionOption};
+use crate::cli::llm_dialogs::Question;
+#[cfg(test)]
+use crate::cli::llm_dialogs::QuestionOption;
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::{HashMap, HashSet};
 

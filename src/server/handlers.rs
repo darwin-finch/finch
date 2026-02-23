@@ -50,6 +50,7 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
 
 /// Request body for /v1/messages endpoint (Claude-compatible)
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct MessageRequest {
     /// Model to use (e.g., "claude-sonnet-4-5-20250929")
     pub model: String,

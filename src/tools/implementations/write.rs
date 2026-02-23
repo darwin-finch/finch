@@ -4,7 +4,6 @@
 //   Created src/foo.rs (42 lines)
 //   Updated src/bar.rs (Added 10 lines, removed 3 lines)
 
-use crate::tools::implementations::edit::generate_edit_diff;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};

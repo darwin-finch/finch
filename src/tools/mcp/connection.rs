@@ -24,6 +24,7 @@ struct JsonRpcRequest {
 
 /// JSON-RPC 2.0 response
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct JsonRpcResponse {
     jsonrpc: String,
     id: u64,
@@ -35,6 +36,7 @@ struct JsonRpcResponse {
 
 /// JSON-RPC 2.0 error
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct JsonRpcError {
     code: i32,
     message: String,
@@ -59,6 +61,7 @@ pub struct McpServerInfo {
 }
 
 /// A single MCP server connection over STDIO
+#[allow(dead_code)]
 pub struct McpConnection {
     /// Server name
     name: String,

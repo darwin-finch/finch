@@ -87,6 +87,7 @@ pub enum ReplMode {
     },
 }
 
+#[allow(dead_code)]
 pub struct Repl {
     _config: Config,
     claude_client: ClaudeClient,
@@ -150,10 +151,10 @@ pub struct Repl {
 /// Background training statistics
 struct BackgroundTrainingStats {
     examples_trained: usize,
-    final_loss: f64,
-    adapter_path: String,
+    queue_path: String,
 }
 
+#[allow(dead_code)]
 impl Repl {
     pub async fn new(
         config: Config,
@@ -2995,13 +2996,14 @@ impl Repl {
             tokio::spawn(async move {
                 match Self::run_background_training(coordinator, models_dir).await {
                     Ok(stats) => {
-                        output_status!("\n✓ Background training completed!");
-                        output_status!("   Trained on {} examples", stats.examples_trained);
-                        output_status!("   Final loss: {:.4}", stats.final_loss);
-                        output_status!("   Adapter saved to: {}", stats.adapter_path);
+                        output_status!("\n✓ {} examples queued for offline training", stats.examples_trained);
+                        output_status!("   Queue: {}", stats.queue_path);
+                        output_status!("   To train: python3 scripts/train_lora.py {} \\", stats.queue_path);
+                        output_status!("             ~/.finch/adapters/latest.safetensors");
+                        output_status!("   (See GitHub Issue #1 for adapter re-loading into ONNX)");
                     }
                     Err(e) => {
-                        output_error!("\n⚠️  Background training failed: {}", e);
+                        output_error!("\n⚠️  Training queue export failed: {}", e);
                     }
                 }
             });
@@ -3491,100 +3493,49 @@ impl Repl {
         Ok(())
     }
 
-    /// Run LoRA training in background
+    /// Export training examples to the offline queue (JSONL) for later Python-based LoRA training.
+    ///
+    /// In-process Rust LoRA training is not implemented because ONNX Runtime is inference-only
+    /// and cannot be used for gradient-based weight updates. The full training pipeline uses a
+    /// separate Python script (`scripts/train_lora.py`) that loads the base model via PyTorch +
+    /// PEFT, trains LoRA adapters, and exports them as safetensors.
+    ///
+    /// Adapter re-loading back into ONNX after training is tracked in:
+    ///   GitHub Issue #1 — https://github.com/darwin-finch/finch/issues/1
     async fn run_background_training(
         coordinator: Arc<TrainingCoordinator>,
-        models_dir: Option<PathBuf>,
+        _models_dir: Option<PathBuf>,
     ) -> Result<BackgroundTrainingStats> {
-        use crate::models::{LoRATrainingAdapter, LoRAConfig, LoRATrainer};
-        use std::sync::Arc as StdArc;
+        tracing::info!("Exporting training examples to offline queue");
 
-        tracing::info!("Starting background LoRA training");
-
-        // Get training examples from buffer
-        let examples = {
+        // Verify the buffer has examples before writing
+        let num_examples = {
             let buffer = coordinator.buffer()?;
-            buffer.examples().to_vec()
+            let n = buffer.examples().len();
+            if n == 0 {
+                anyhow::bail!("No training examples in buffer");
+            }
+            n
         };
 
-        if examples.is_empty() {
-            anyhow::bail!("No training examples in buffer");
-        }
+        // Write examples to ~/.finch/training_queue.jsonl for the Python training pipeline.
+        // This is the only part of the training flow that works end-to-end in Rust today.
+        coordinator.write_training_queue()?;
 
-        let num_examples = examples.len();
-        tracing::info!("Training on {} examples", num_examples);
+        let queue_path = dirs::home_dir()
+            .map(|h| {
+                h.join(".finch")
+                    .join("training_queue.jsonl")
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_else(|| "~/.finch/training_queue.jsonl".to_string());
 
-        // Create LoRA configuration
-        let lora_config = LoRAConfig {
-            rank: 16,
-            alpha: 32.0,
-            dropout: 0.1,
-            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
-        };
-
-        // Determine device
-        use crate::models::{get_device_with_preference, DevicePreference};
-        let device = get_device_with_preference(DevicePreference::Auto)?;
-
-        // Create LoRA adapter
-        let adapter = LoRATrainingAdapter::new(lora_config.clone(), device.clone())?;
-
-        // Create tokenizer
-        // TODO: Get tokenizer from actual Qwen model for production
-        // For now, use a simple GPT-2 tokenizer as placeholder
-        let tokenizer = StdArc::new({
-            use tokenizers::models::bpe::BPE;
-            let bpe = BPE::default();
-            tokenizers::Tokenizer::new(bpe)
-        });
-
-        // Create trainer
-        let mut trainer = LoRATrainer::new(
-            adapter, tokenizer, 1e-4, // learning_rate
-            4,    // batch_size
-            3,    // epochs
-        );
-
-        // Convert WeightedExample to ExampleBuffer
-        use crate::models::ExampleBuffer;
-        let mut buffer = ExampleBuffer::new(examples.len());
-        for example in examples {
-            buffer.add(example);
-        }
-
-        // Train the adapter
-        tracing::info!("Starting LoRA training...");
-        let training_stats = trainer.train(&buffer)?;
-
-        let final_loss = training_stats.last().map(|s| s.loss).unwrap_or(0.0);
-
-        // Save adapter weights
-        let adapters_dir = if let Some(ref dir) = models_dir {
-            dir.parent().unwrap().join("adapters")
-        } else {
-            dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-                .join(".finch")
-                .join("adapters")
-        };
-
-        std::fs::create_dir_all(&adapters_dir)?;
-
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let adapter_filename = format!("lora_adapter_{}.safetensors", timestamp);
-        let adapter_path = adapters_dir.join(&adapter_filename);
-
-        trainer.adapter()?.save(&adapter_path)?;
-
-        tracing::info!(
-            "LoRA training completed. Adapter saved to: {}",
-            adapter_path.display()
-        );
+        tracing::info!("Queued {} examples → {}", num_examples, queue_path);
 
         Ok(BackgroundTrainingStats {
             examples_trained: num_examples,
-            final_loss,
-            adapter_path: adapter_path.display().to_string(),
+            queue_path,
         })
     }
 

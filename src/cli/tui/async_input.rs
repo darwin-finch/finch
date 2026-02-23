@@ -493,6 +493,7 @@ mod tests {
 }
 
 /// Helper to create a clean text area (needs to be accessible)
+#[allow(dead_code)]
 fn create_clean_textarea() -> tui_textarea::TextArea<'static> {
     let mut textarea = tui_textarea::TextArea::default();
     textarea.set_placeholder_text("Type your message...");

@@ -170,6 +170,7 @@ pub(crate) fn compute_effective_status(
 
 // ─── TuiRenderer ──────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub struct TuiRenderer {
     output_manager: Arc<OutputManager>,
     status_bar:     Arc<StatusBar>,

@@ -1,3 +1,5 @@
+//! Components not yet wired into the main render path.
+#![allow(dead_code)]
 // Shadow Buffer - 2D character array for proper text wrapping and rendering
 //
 // This module implements a double-buffering system for terminal rendering:

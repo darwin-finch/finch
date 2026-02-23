@@ -15,6 +15,7 @@ use tui_textarea::TextArea;
 use crate::config::ColorScheme;
 
 /// Render a TextArea with a colored prompt prefix and optional ghost text
+#[allow(dead_code)]
 pub fn render_input_widget<'a>(
     frame: &mut Frame,
     textarea: &'a TextArea<'a>,

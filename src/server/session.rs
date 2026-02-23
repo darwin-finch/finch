@@ -126,6 +126,7 @@ impl SessionManager {
     }
 
     /// Cleanup expired sessions
+    #[allow(dead_code)]
     fn cleanup_expired(&self) {
         let mut removed_count = 0;
         let expired_sessions: Vec<String> = self

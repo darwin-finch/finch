@@ -41,6 +41,7 @@ pub use lora::{
 };
 pub use manager::{ModelManager, OverallStats, TrainingReport};
 pub use model_selector::{ModelSelector, QwenSize};
+#[allow(deprecated)]
 pub use persistence::{load_model_metadata, model_exists, save_model_with_metadata, ModelMetadata};
 pub use sampling::{ComparisonResult, QueryCategory, Sampler, SamplingConfig, SamplingDecision};
 pub use threshold_router::{

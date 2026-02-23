@@ -204,12 +204,12 @@ impl BatchTrainer {
         _router: Arc<RwLock<RouterModel>>,
         _generator: Arc<RwLock<GeneratorModel>>,
         _validator: Arc<RwLock<ValidatorModel>>,
-        total_trained: Arc<Mutex<usize>>,
-        last_training: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+        _total_trained: Arc<Mutex<usize>>,
+        _last_training: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
         batch_size: usize,
         _learning_rate: f64,
     ) -> Result<TrainingResult> {
-        let start_time = std::time::Instant::now();
+        let _start_time = std::time::Instant::now();
 
         // Extract batch from queue
         let batch = {

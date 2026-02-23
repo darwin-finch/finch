@@ -16,6 +16,7 @@ use crate::models::download::{DownloadProgress, ModelDownloader};
 use crate::models::generator_new::TextGeneration;
 
 /// ONNX model loader - downloads and loads models from HuggingFace
+#[allow(dead_code)]
 pub struct OnnxLoader {
     cache_dir: PathBuf,
 }
@@ -560,6 +561,7 @@ impl LoadedOnnxModel {
     }
 
     /// Sample next token from logits (greedy sampling) - static to avoid borrowing issues
+    #[allow(dead_code)]
     fn sample_token_static(logits: &[f32]) -> Result<u32> {
         Self::sample_token_with_params(logits, &[], 0.7, 0.9, 1.1)
     }

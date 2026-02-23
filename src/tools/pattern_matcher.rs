@@ -20,7 +20,7 @@ pub struct ToolPattern {
 }
 
 /// Parameter extractor - extracts tool parameters from regex captures
-struct ParamExtractor {
+pub struct ParamExtractor {
     /// Parameter name in tool input
     param_name: String,
     /// Capture group index (1-based)
@@ -88,6 +88,7 @@ impl ParamExtractor {
         }
     }
 
+    #[allow(dead_code)]
     /// Create extractor with default value
     pub fn with_default(param_name: String, default_value: String) -> Self {
         Self {

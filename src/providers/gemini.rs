@@ -493,6 +493,7 @@ struct GeminiResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct GeminiCandidate {
     content: GeminiContent,
     #[serde(rename = "finishReason")]
@@ -502,6 +503,7 @@ struct GeminiCandidate {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct GeminiSafetyRating {
     category: String,
     probability: String,

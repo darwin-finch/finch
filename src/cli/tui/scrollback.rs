@@ -1,3 +1,5 @@
+//! Components not yet wired into the main render path.
+#![allow(dead_code)]
 // Scrollback Buffer - Internal message storage with trait-based messages
 //
 // Provides full control over conversation history with:

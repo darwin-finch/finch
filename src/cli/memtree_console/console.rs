@@ -67,6 +67,7 @@ pub enum ConsoleNodeType {
 }
 
 /// MemTree Console state
+#[allow(dead_code)]
 pub struct MemTreeConsole {
     /// The underlying memory tree
     tree: Arc<RwLock<MemTree>>,

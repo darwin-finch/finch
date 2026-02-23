@@ -30,6 +30,7 @@ use super::tool_display::format_tool_label;
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// Main event loop for concurrent REPL
+#[allow(dead_code)]
 pub struct EventLoop {
     /// Channel for receiving events
     event_rx: mpsc::UnboundedReceiver<ReplEvent>,
@@ -895,6 +896,7 @@ impl EventLoop {
             }
 
             iteration += 1;
+            let _ = iteration; // suppress unused_assignment warning
 
             // Get conversation context
             let messages = conversation.read().await.get_messages();
@@ -1771,6 +1773,7 @@ impl EventLoop {
         }
     }
 
+    #[allow(dead_code)]
     /// Handle /plan command - enter planning mode
     async fn handle_plan_command(&mut self, task: String) -> Result<()> {
         // Check if already in plan mode

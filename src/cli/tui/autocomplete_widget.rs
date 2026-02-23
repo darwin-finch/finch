@@ -1,3 +1,5 @@
+//! Components not yet wired into the main render path.
+#![allow(dead_code)]
 // Autocomplete Dropdown Widget - Beautiful command suggestions with descriptions
 //
 // Renders a dropdown menu above the input area showing matching commands

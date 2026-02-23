@@ -501,6 +501,7 @@ impl Config {
         Self::new_with_all(teachers, backend, providers)
     }
 
+    #[allow(deprecated)]
     fn new_with_all(
         teachers: Vec<TeacherEntry>,
         backend: BackendConfig,

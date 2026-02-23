@@ -1,3 +1,5 @@
+//! Components not yet wired into the main render path.
+#![allow(dead_code)]
 // Status Widget - Renders the multi-line status bar
 //
 // Displays status lines from StatusBar in the bottom section of the TUI

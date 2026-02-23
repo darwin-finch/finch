@@ -102,6 +102,7 @@ impl RateLimiter {
 /// Extracts the source IP from the `X-Forwarded-For` header (proxy-aware)
 /// and falls back to the socket address. Returns 429 Too Many Requests when
 /// the bucket for that IP is exhausted.
+#[allow(dead_code)]
 pub async fn rate_limit_middleware(
     request: Request<Body>,
     next: Next,
@@ -124,6 +125,7 @@ pub async fn rate_limit_middleware(
 }
 
 /// Extract client IP from request headers or connection info.
+#[allow(dead_code)]
 fn extract_ip(request: &Request<Body>) -> Option<IpAddr> {
     // Check X-Forwarded-For (set by reverse proxies like nginx, Caddy)
     if let Some(forwarded_for) = request.headers().get("x-forwarded-for") {

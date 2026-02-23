@@ -29,6 +29,7 @@ pub struct ScheduledTask {
 }
 
 /// Task queue backed by SQLite
+#[allow(dead_code)]
 pub struct TaskQueue {
     db_path: PathBuf,
 }

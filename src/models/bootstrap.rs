@@ -234,6 +234,7 @@ impl BootstrapLoader {
     }
 
     /// Find snapshot directory within cache path
+    #[allow(dead_code)]
     fn find_snapshot_dir(cache_path: &PathBuf) -> Result<PathBuf> {
         // Check if cache_path itself is valid
         if cache_path.join("config.json").exists() {

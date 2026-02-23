@@ -1,5 +1,7 @@
 // Common model utilities and types
 // Phase 4: Candle removed, ONNX only
+// DevicePreference is deprecated but kept for config backward-compat and tests.
+#![allow(deprecated)]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

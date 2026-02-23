@@ -650,6 +650,7 @@ struct OpenAIResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIChoice {
     index: usize,
     message: OpenAIResponseMessage,
@@ -657,6 +658,7 @@ struct OpenAIChoice {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIResponseMessage {
     role: String,
     content: Option<String>,
@@ -664,6 +666,7 @@ struct OpenAIResponseMessage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIToolCall {
     id: String,
     #[serde(rename = "type")]
@@ -680,12 +683,14 @@ struct OpenAIToolFunction {
 // Streaming types
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIStreamChunk {
     id: String,
     choices: Vec<OpenAIStreamChoice>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIStreamChoice {
     index: usize,
     delta: OpenAIDelta,
@@ -693,6 +698,7 @@ struct OpenAIStreamChoice {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIDelta {
     role: Option<String>,
     content: Option<String>,
@@ -700,6 +706,7 @@ struct OpenAIDelta {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct OpenAIToolCallDelta {
     index: Option<usize>,
     id: Option<String>,
