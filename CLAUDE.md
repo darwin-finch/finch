@@ -490,15 +490,24 @@ On startup, `ClaudeGenerator::new()` calls `collect_claude_md_context(cwd)` whic
 
 1. Reads `~/.claude/CLAUDE.md` — user-level Claude Code defaults
 2. Reads `~/.finch/FINCH.md` — user-level Finch defaults
-3. Walks from filesystem root down to `cwd`, loading any `CLAUDE.md` then `FINCH.md` found in each directory (outermost first; cwd wins)
+3. Walks from filesystem root down to `cwd`, loading any `CLAUDE.md`, `FINCH.md`, `CONTEXT.md`, or `README.md` found in each directory (outermost first; cwd wins)
 4. Joins non-empty sections with `\n\n---\n\n`
 5. Injects the result into the system prompt under `## Project Instructions`
 
-**FINCH.md as an Open Standard:**
+Load order within a single directory: `CLAUDE.md` → `FINCH.md` → `CONTEXT.md` → `README.md`
 
-`FINCH.md` is supported as a vendor-neutral alternative to the Anthropic-specific `CLAUDE.md` name. Teams that want their AI-assistant instructions to work across multiple tools (Finch, Cursor, other assistants) can use `FINCH.md` instead. When both exist in the same directory, both are loaded (`CLAUDE.md` first).
+**Supported context filenames:**
 
-**Example project instruction file (`~/myproject/FINCH.md`):**
+| Filename | Purpose |
+|----------|---------|
+| `CLAUDE.md` | Anthropic/Claude Code convention |
+| `FINCH.md` | Finch-specific; vendor-neutral open standard |
+| `CONTEXT.md` | Neutral name, works across any AI assistant |
+| `README.md` | General project overview |
+
+All four are loaded when present. Use whichever name fits your workflow — `CONTEXT.md` is recommended for projects that want tool-agnostic instructions.
+
+**Example project instruction file (`~/myproject/CONTEXT.md`):**
 ```markdown
 Always prefer iterator chains over manual loops.
 Never use .unwrap() in production code.
@@ -1081,7 +1090,7 @@ Key open items:
 - [#9](https://github.com/darwin-finch/finch/issues/9) .unwrap() panics — **CLOSED** (replaced in 0.5.2)
 - [#10](https://github.com/darwin-finch/finch/issues/10) Hardcoded ports — **CLOSED** (constants in 0.5.2)
 - [#11](https://github.com/darwin-finch/finch/issues/11) batch_trainer fake loss — **CLOSED** (honest error in 0.5.2)
-- [#21](https://github.com/darwin-finch/finch/issues/21) CLAUDE.md/FINCH.md auto-loading — **CLOSED** (implemented in 6353f3b)
+- [#21](https://github.com/darwin-finch/finch/issues/21) CLAUDE.md/FINCH.md auto-loading — **CLOSED** (implemented in 6353f3b; CONTEXT.md + README.md added in 60c76a2)
 
 ## Reference Documents
 
