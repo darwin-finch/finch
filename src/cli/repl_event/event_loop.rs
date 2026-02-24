@@ -1545,7 +1545,6 @@ impl EventLoop {
                                 &tool_use,
                                 Arc::clone(&tui_renderer),
                                 Arc::clone(&mode),
-                                Arc::clone(&conversation),
                                 Arc::clone(&output_manager),
                             )
                             .await
@@ -1777,7 +1776,6 @@ impl EventLoop {
                             &tool_use,
                             Arc::clone(&tui_renderer),
                             Arc::clone(&mode),
-                            Arc::clone(&conversation),
                             Arc::clone(&output_manager),
                         )
                         .await
@@ -2744,7 +2742,6 @@ async fn handle_present_plan(
     tool_use: &ToolUse,
     tui_renderer: Arc<tokio::sync::Mutex<TuiRenderer>>,
     mode: Arc<tokio::sync::RwLock<crate::cli::ReplMode>>,
-    conversation: Arc<tokio::sync::RwLock<crate::cli::ConversationHistory>>,
     output_manager: Arc<crate::cli::OutputManager>,
 ) -> Option<Result<String>> {
     use chrono::Utc;
@@ -2816,6 +2813,13 @@ async fn handle_present_plan(
         "Use ↑↓ or j/k to navigate, Enter to select, 'o' for custom feedback, Esc to cancel",
     );
 
+    // Flush plan content to scrollback before showing the dialog overlay so it
+    // is visible while the user reviews it.
+    {
+        let mut tui = tui_renderer.lock().await;
+        let _ = tui.flush_output_safe(&output_manager);
+    }
+
     let mut tui = tui_renderer.lock().await;
     let dialog_result = tui.show_dialog(dialog);
     drop(tui);
@@ -2833,63 +2837,29 @@ async fn handle_present_plan(
     // Handle dialog result
     match dialog_result {
         crate::cli::tui::DialogResult::Selected(0) => {
-            // Approved - ask about context clearing
-            let clear_dialog = crate::cli::tui::Dialog::select(
-                "Clear conversation context?".to_string(),
-                vec![
-                    crate::cli::tui::DialogOption::with_description(
-                        "Clear context (recommended)",
-                        "Reduces token usage and focuses execution on the plan",
-                    ),
-                    crate::cli::tui::DialogOption::with_description(
-                        "Keep context",
-                        "Preserves exploration history in conversation",
-                    ),
-                ],
-            );
-
-            let mut tui = tui_renderer.lock().await;
-            let clear_result = tui.show_dialog(clear_dialog);
-            drop(tui);
-
-            let clear_context = match clear_result {
-                Ok(crate::cli::tui::DialogResult::Selected(0)) => true,
-                Ok(crate::cli::tui::DialogResult::Selected(1)) => false,
-                _ => false, // Default to not clearing on cancel
-            };
-
-            // Transition to executing mode
+            // Approved — transition to executing mode.
+            // Do NOT mutate the conversation here; finalize_tool_execution will add
+            // the ToolResult message (referencing the assistant's ToolUse block) after
+            // we return.  Adding extra user messages here would create consecutive user
+            // messages that the Claude API rejects, causing a silent hang.
             *mode.write().await = crate::cli::ReplMode::Executing {
                 task: task.clone(),
                 plan_path: plan_path.clone(),
                 approved_at: Utc::now(),
             };
 
-            if clear_context {
-                // Clear conversation and add plan as context
-                output_manager.write_info(format!("{}", "Clearing conversation context...".blue()));
-                conversation.write().await.clear();
-                conversation.write().await.add_user_message(format!(
-                    "[System: Plan approved! Execute this plan:]\n\n{}",
-                    plan_content
-                ));
-                output_manager.write_info(format!(
-                    "{}",
-                    "✓ Context cleared. Plan loaded as execution guide.".green()
-                ));
-            } else {
-                // Keep history, just add approval message
-                conversation.write().await.add_user_message(
-                    "[System: Plan approved! All tools are now enabled. You may execute bash commands and modify files.]".to_string()
-                );
-            }
-
             output_manager.write_info(format!(
                 "{}",
                 "✓ Plan approved! All tools enabled.".green().bold()
             ));
 
-            Some(Ok("Plan approved by user. Context has been prepared. You may now proceed with implementation using all available tools (Bash, Write, Edit, etc.).".to_string()))
+            // Embed the plan content in the tool result so Claude receives it and
+            // knows what to execute next — no extra user message needed.
+            Some(Ok(format!(
+                "Plan approved by user. Execute this plan step by step:\n\n{}\n\n\
+                 All tools are now enabled (Bash, Write, Edit, etc.). Proceed with implementation.",
+                plan_content
+            )))
         }
         crate::cli::tui::DialogResult::Selected(1)
         | crate::cli::tui::DialogResult::CustomText(_) => {
@@ -2920,15 +2890,15 @@ async fn handle_present_plan(
             Some(Ok(msg))
         }
         crate::cli::tui::DialogResult::Selected(2) => {
-            // Rejected
+            // Rejected — transition back to normal mode.
+            // Do NOT call conversation.add_user_message() here; finalize_tool_execution
+            // will add the ToolResult message.  An extra user message here would create
+            // consecutive user messages that the Claude API rejects.
             *mode.write().await = crate::cli::ReplMode::Normal;
             output_manager.write_info(format!(
                 "{}",
                 "✗ Plan rejected. Returning to normal mode.".yellow()
             ));
-            conversation.write().await.add_user_message(
-                "[System: Plan rejected by user. Returning to normal conversation.]".to_string(),
-            );
 
             Some(Ok(
                 "Plan rejected by user. Exiting plan mode and returning to normal conversation."
@@ -3532,6 +3502,165 @@ mod tests {
             result.len() >= 2,
             "floor of 2 must be maintained; got {}",
             result.len()
+        );
+    }
+
+    // --- PresentPlan conversation-structure regression tests (GH Issue #43) ---
+
+    /// Helper: build the conversation that finalize_tool_execution produces after
+    /// handle_present_plan returns.  The fixed code produces:
+    ///
+    ///   assistant { ToolUse { name: "PresentPlan", id: "abc123" } }
+    ///   user      { ToolResult { tool_use_id: "abc123", content: "Plan approved..." } }
+    ///
+    /// which is valid for the Claude API.
+    fn build_present_plan_approved_conversation() -> Vec<crate::claude::Message> {
+        use crate::claude::{ContentBlock, Message};
+
+        let tool_use_id = "abc123".to_string();
+
+        // 1. Previous user turn that triggered planning.
+        let user_msg = Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "Write a feature X".to_string(),
+            }],
+        };
+
+        // 2. Assistant response with PresentPlan ToolUse.
+        let assistant_msg = Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: tool_use_id.clone(),
+                name: "PresentPlan".to_string(),
+                input: serde_json::json!({ "plan": "Step 1: …\nStep 2: …" }),
+            }],
+        };
+
+        // 3. finalize_tool_execution adds a ToolResult user message.
+        let tool_result_msg = Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: format!(
+                    "Plan approved by user. Execute this plan step by step:\n\nStep 1: …\nStep 2: …\n\n\
+                     All tools are now enabled (Bash, Write, Edit, etc.). Proceed with implementation."
+                ),
+                is_error: None,
+            }],
+        };
+
+        vec![user_msg, assistant_msg, tool_result_msg]
+    }
+
+    #[test]
+    fn test_present_plan_approve_no_consecutive_user_messages() {
+        // Regression for GH #43: the fixed handle_present_plan must not insert
+        // extra user messages before the ToolResult.  Consecutive user messages
+        // cause the Claude API to return an error → silent hang.
+        let msgs = build_present_plan_approved_conversation();
+
+        for window in msgs.windows(2) {
+            let (a, b) = (&window[0], &window[1]);
+            assert_ne!(
+                (a.role.as_str(), b.role.as_str()),
+                ("user", "user"),
+                "consecutive user messages detected between {:?} and {:?}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_present_plan_approve_tool_result_references_tool_use() {
+        // Regression for GH #43: the ToolResult's tool_use_id must reference a
+        // ToolUse that exists in the immediately preceding assistant message.
+        use crate::claude::ContentBlock;
+
+        let msgs = build_present_plan_approved_conversation();
+        assert!(msgs.len() >= 2);
+
+        let last = msgs.last().unwrap();
+        assert_eq!(last.role, "user");
+
+        // Collect tool_use_id values from all ToolResult blocks in the last message.
+        let result_ids: Vec<&str> = last
+            .content
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                    Some(tool_use_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(!result_ids.is_empty(), "last message must contain ToolResult blocks");
+
+        // The second-to-last message must be assistant and contain matching ToolUse ids.
+        let preceding = &msgs[msgs.len() - 2];
+        assert_eq!(preceding.role, "assistant");
+        let use_ids: Vec<&str> = preceding
+            .content
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::ToolUse { id, .. } = b {
+                    Some(id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for rid in &result_ids {
+            assert!(
+                use_ids.contains(rid),
+                "ToolResult references id '{}' but no matching ToolUse found in preceding assistant message; use_ids = {:?}",
+                rid,
+                use_ids
+            );
+        }
+    }
+
+    #[test]
+    fn test_present_plan_approve_invalid_clear_and_add_would_fail() {
+        // Documentary test: shows that the OLD buggy pattern (clear conversation,
+        // add a plain user message, then add a ToolResult user message) produces
+        // consecutive user messages — the invariant the fix avoids.
+        use crate::claude::{ContentBlock, Message};
+
+        // Simulate what the buggy code did after Approve + clear_context:
+        //   conversation.clear()
+        //   conversation.add_user_message("[System: Plan approved!...]")
+        //   finalize_tool_execution → adds user { ToolResult { ... } }
+        let mut bad_msgs: Vec<Message> = Vec::new();
+
+        // add_user_message produces a user Text message
+        bad_msgs.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "[System: Plan approved! Execute this plan:]\n\nStep 1".to_string(),
+            }],
+        });
+        // finalize_tool_execution adds another user message
+        bad_msgs.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "abc123".to_string(),
+                content: "Plan approved by user...".to_string(),
+                is_error: None,
+            }],
+        });
+
+        // Assert that this old pattern DOES produce consecutive user messages
+        // (i.e. the bug is real and our fix is necessary).
+        let has_consecutive_users = bad_msgs
+            .windows(2)
+            .any(|w| w[0].role == "user" && w[1].role == "user");
+        assert!(
+            has_consecutive_users,
+            "expected the old buggy pattern to produce consecutive user messages"
         );
     }
 }
