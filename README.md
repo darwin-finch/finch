@@ -110,11 +110,17 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 | `/teacher list`      | List all configured teacher providers                  |
 | `/model list`        | List available local models                            |
 | `/model <name>`      | Switch local model for the current session             |
+| `/license status`    | Show current license type                              |
+| `/license activate <key>` | Activate a commercial license key                 |
 | `/help`              | Show available commands                                |
 | `spawn_task`         | (tool) Delegate a subtask to an isolated subagent loop |
 | `Ctrl+C`             | Cancel the current query                               |
 | `Ctrl+G`             | Mark the last response as good (training signal)       |
 | `Ctrl+B`             | Mark the last response as bad (training signal)        |
+| **In dialogs:** ↑↓   | Navigate between options                               |
+| **In dialogs:** Space | Toggle selection (MultiSelect)                        |
+| **In dialogs:** o/O  | Jump to "Other" row and start typing                   |
+| **In dialogs:** Shift+Enter | Insert newline in custom text field             |
 
 ---
 

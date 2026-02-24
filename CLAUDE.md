@@ -426,11 +426,12 @@ pub struct Cell {
 - **Professional UX**: No text ghosting, proper wrapping, synchronized updates
 
 **Key Files:**
-- `src/cli/tui/mod.rs` - TuiRenderer, flush_output_safe(), blit_visible_area()
+- `src/cli/tui/mod.rs` - TuiRenderer, flush_output_safe(), blit_visible_area(), draw_dialog_inline_static()
 - `src/cli/tui/shadow_buffer.rs` - ShadowBuffer, diff_buffers(), visible_length()
 - `src/cli/tui/scrollback.rs` - ScrollbackBuffer (message tracking)
 - `src/cli/tui/input_widget.rs` - Input area rendering (tui-textarea)
 - `src/cli/tui/status_widget.rs` - Status bar rendering
+- `src/cli/tui/dialog.rs` - Dialog state machine (Select, MultiSelect, TextInput, Confirm)
 
 **Implementation Details:**
 
@@ -439,6 +440,40 @@ See `TUI_SCROLLBACK_FIX_COMPLETE.md` for:
 - Flow diagrams
 - Testing procedures
 - Architecture verification
+
+**Dialog System (`src/cli/tui/dialog.rs`):**
+
+Dialogs are drawn inline into the raw terminal (outside Ratatui's viewport) via crossterm.
+
+**Dialog types:**
+- `Select` — single-choice; Enter submits immediately (no Submit button); ↑↓ navigate; `o`/`O` or pressing any char on the "Other" row activates custom text entry
+- `MultiSelect` — multi-choice via Space; has **Submit** and **Cancel** virtual rows navigable with ↑↓; Enter on Submit emits `DialogResult::Selected`
+- `TextInput` — free-form text; Enter submits
+- `Confirm` — yes/no; `y`/`n` or Enter/Esc
+
+**"Other" row (custom response) design (v0.7.4):**
+- When cursor moves to the Other row, typing any printable char immediately activates custom mode and inserts that char — no Enter required (priority-2.5 in key dispatch)
+- The `o`/`O` shortcut also works from any row and moves the cursor to Other
+- The Other row renders inline as `◌ Other: > {before}█{after}` showing the cursor position
+- Shift+Enter or Option+Enter (macOS) inserts a newline into the custom input (multi-line support)
+- `render_other_row_inline()` free function handles this rendering
+
+**Virtual row helpers:**
+```rust
+dialog.submit_virtual_index()  // MultiSelect only: options.len() + (1 if allow_custom)
+dialog.cancel_virtual_index()  // Select: options.len(); MultiSelect: submit+1
+dialog.cursor_on_other_row()   // true when cursor is at the Other row
+dialog.current_cursor()        // pub; returns the cursor index for the current dialog type
+```
+
+**Regression tests in `dialog.rs`:**
+- `test_o_key_moves_cursor_to_other_row`
+- `test_select_other_row_char_activates_custom_mode`
+- `test_select_other_row_char_accumulates_without_enter`
+- `test_multiselect_cancel_button_navigable`
+- `test_multiselect_submit_button_emits_selection`
+- `test_custom_mode_shift_enter_inserts_newline`
+- `test_custom_mode_alt_enter_inserts_newline`
 
 #### 6. **Tool Execution System** (`src/tools/`)
 
@@ -1055,7 +1090,7 @@ git push origin vX.Y.Z
 
 ## Current Project Status
 
-**Version**: 0.6.0
+**Version**: 0.7.4
 **Last updated**: Feb 2026
 
 Core infrastructure is complete and production-ready. The project is a fully functional local-first AI coding assistant with ONNX Runtime inference, multi-turn tool execution, daemon architecture, LoRA fine-tuning infrastructure, and a professional TUI.
@@ -1069,7 +1104,7 @@ Core infrastructure is complete and production-ready. The project is a fully fun
 - **Subagent `spawn_task`** — delegates subtasks to isolated headless agentic loops with named types (general/explore/researcher/coder/bash); no recursion; parallelisable
 - **Semantic memory** — `NeuralEmbeddingEngine` (`all-MiniLM-L6-v2`, ~23MB ONNX) produces 384-dim embeddings for the MemTree; falls back to TF-IDF when model not yet cached; downloads from HuggingFace on first use via `hf-hub`
 - **Daemon** — Auto-spawning, OpenAI-compatible API, mDNS/Bonjour discovery, VS Code integration, cross-machine local model sharing
-- **TUI** — Scrollback, streaming, ghost text, plan mode, feedback (Ctrl+G/B), history
+- **TUI** — Scrollback, streaming, ghost text, plan mode, feedback (Ctrl+G/B), history; dialogs with inline Other-row typing, Submit/Cancel virtual rows, Shift+Enter multi-line custom input
 - **LoRA** — Weighted feedback collection + Python training pipeline (adapter loading pending)
 - **Runtime switching** — `/model` and `/teacher` commands mid-session
 - **Setup wizard** — Auto-detects API keys, tabbed UI, model preview, ONNX config

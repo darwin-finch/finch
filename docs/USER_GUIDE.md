@@ -1,7 +1,7 @@
 # Shammah User Guide
 
-**Version:** 0.4.0
-**Last Updated:** 2026-02-12
+**Version:** 0.7.4
+**Last Updated:** 2026-02-24
 
 ## Table of Contents
 
@@ -182,13 +182,25 @@ Runs a single query and exits - useful for scripts.
 
 ### Keyboard Shortcuts
 
+**In the REPL:**
+
 - **Enter:** Submit query
 - **Shift+Enter:** New line (multi-line input)
 - **Ctrl+C:** Cancel in-progress query
 - **Ctrl+G:** Mark response as good (for training)
 - **Ctrl+B:** Mark response as bad (for training)
 - **Up/Down:** Navigate command history
-- **Esc:** (In dialogs) Cancel
+
+**In dialogs (tool confirmations, plan approval, etc.):**
+
+- **↑/↓:** Navigate between options
+- **Space:** Toggle selection (MultiSelect dialogs)
+- **Enter:** Submit / confirm highlighted option
+- **Esc:** Cancel dialog
+- **o / O:** Jump to the "Other (custom response)" row and activate text entry
+- **Any printable char** (when cursor is on the Other row): immediately start typing your custom response — no Enter needed to activate the field
+- **Shift+Enter / Option+Enter:** Insert a newline in the custom text field (multi-line custom responses)
+- **Backspace / ← →:** Edit the custom text field as normal
 
 ---
 

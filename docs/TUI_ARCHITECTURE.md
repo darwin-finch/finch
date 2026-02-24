@@ -868,7 +868,8 @@ src/cli/
 ├── output_manager.rs    # OutputManager (dual storage)
 │
 └── tui/
-    ├── mod.rs           # TuiRenderer (main coordinator)
+    ├── mod.rs           # TuiRenderer (main coordinator); draw_dialog_inline_static()
+    ├── dialog.rs        # Dialog state machine (Select/MultiSelect/TextInput/Confirm)
     ├── scrollback.rs    # ScrollbackBuffer (message storage)
     ├── async_input.rs   # Input handling (tui-textarea integration)
     ├── status_widget.rs # Status bar rendering
@@ -887,6 +888,96 @@ src/cli/
 
 ---
 
-**Last Updated:** 2026-02-08
-**Document Version:** 1.0
+## Dialog System (`tui/dialog.rs`)
+
+Dialogs render inline into the raw terminal via crossterm, outside Ratatui's viewport.
+
+### Dialog Types
+
+| Type | Description |
+|------|-------------|
+| `Select` | Single-choice list; Enter submits immediately |
+| `MultiSelect` | Multi-choice with Space; Submit/Cancel virtual rows |
+| `TextInput` | Free-form text input |
+| `Confirm` | Yes/No with y/n or Enter/Esc |
+
+### Key Design: Inline Other Row (v0.7.4)
+
+The "Other (custom response)" row renders inline with a visible cursor:
+
+```
+  ◌ Other: > hel█lo world
+```
+
+When the cursor is on the Other row, pressing any printable character immediately activates custom mode and inserts that character — no Enter required. The `o`/`O` shortcut also activates custom mode and moves the cursor to the Other row from anywhere in the list.
+
+Rendering is handled by `render_other_row_inline()`, a free function in `mod.rs`:
+
+```rust
+fn render_other_row_inline(
+    stdout: &mut impl Write,
+    inner: Rect,
+    is_on_other: bool,
+    dialog: &Dialog,
+) -> Result<usize>
+```
+
+The visible length calculation accounts for the cursor block character:
+
+```rust
+let visible_len = 3 + input_text.chars().count(); // "> " + chars + cursor block
+```
+
+### Submit/Cancel Virtual Rows
+
+`MultiSelect` dialogs have navigable Submit and Cancel buttons below the option list:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Review Implementation Plan                                          │
+│  ↑↓ navigate · Space toggle · Enter submit · Esc cancel             │
+├──────────────────────────────────────────────────────────────────────┤
+│    ○ Approve and execute                                             │
+│    ○ Request changes                                                 │
+│    ◌ Other: ___________                                              │
+├──────────────────────────────────────────────────────────────────────┤
+│    [ Submit ]   [ Cancel ]                                           │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Virtual index helpers:
+
+```rust
+dialog.submit_virtual_index()  // options.len() + (1 if allow_custom) — MultiSelect only
+dialog.cancel_virtual_index()  // options.len() + (0/1) for Select; submit+1 for MultiSelect
+dialog.cursor_on_other_row()   // true when cursor is at the Other row
+dialog.current_cursor()        // returns current cursor index (pub)
+```
+
+### Key Dispatch Priority
+
+1. **Priority 1** — Custom mode active: character insertion, backspace, arrow keys, Shift+Enter (insert `\n`), Alt+Enter (macOS Option+Enter, also inserts `\n`), Enter (submit), Esc (clear)
+2. **Priority 2** — `o`/`O` shortcut: if `allow_custom` and not already on Other row, activate custom mode and move cursor to Other row
+3. **Priority 2.5** — Printable char on Other row (not in custom mode yet): activate custom mode and insert the char
+4. **Priority 2.7** — Enter on Cancel/Submit virtual rows
+5. **Priority 3** — Normal navigation (↑↓, Space, Enter, Esc)
+
+### Regression Tests
+
+All dialog regression tests live in `src/cli/tui/dialog.rs` `#[cfg(test)] mod tests`:
+
+| Test | Covers |
+|------|--------|
+| `test_o_key_moves_cursor_to_other_row` | `o` shortcut navigates to Other row |
+| `test_select_other_row_char_activates_custom_mode` | Immediate char activates mode |
+| `test_select_other_row_char_accumulates_without_enter` | Multiple chars accumulate |
+| `test_multiselect_cancel_button_navigable` | Cancel virtual row reachable |
+| `test_multiselect_submit_button_emits_selection` | Submit virtual row emits result |
+| `test_custom_mode_shift_enter_inserts_newline` | Shift+Enter inserts `\n` |
+| `test_custom_mode_alt_enter_inserts_newline` | Alt+Enter (macOS) inserts `\n` |
+
+---
+
+**Last Updated:** 2026-02-24
+**Document Version:** 1.1
 **Author:** Claude Sonnet 4.5 (with human guidance)
