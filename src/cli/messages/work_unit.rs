@@ -89,6 +89,8 @@ pub struct WorkRow {
     started_at: Instant,
     /// Elapsed time captured at the moment the row completed (not recalculated)
     elapsed_at_finish: Option<std::time::Duration>,
+    /// Optional body lines shown indented below the summary line (e.g. diff content, command output)
+    pub body_lines: Vec<String>,
 }
 
 // ============================================================================
@@ -191,6 +193,7 @@ impl WorkUnit {
             status: WorkRowStatus::Running,
             started_at: Instant::now(),
             elapsed_at_finish: None,
+            body_lines: Vec::new(),
         });
         idx
     }
@@ -201,6 +204,24 @@ impl WorkUnit {
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
             row.status = WorkRowStatus::Complete(summary.into());
+        }
+    }
+
+    /// Mark a sub-row complete with a one-line summary and body lines shown below it.
+    ///
+    /// Body lines are rendered indented beneath the `⎿ label  summary` line —
+    /// used for diff content (Edit), command output (Bash), match results (Grep), etc.
+    pub fn complete_row_with_body(
+        &self,
+        idx: usize,
+        summary: impl Into<String>,
+        body_lines: Vec<String>,
+    ) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = inner.rows.get_mut(idx) {
+            row.elapsed_at_finish = Some(row.started_at.elapsed());
+            row.status = WorkRowStatus::Complete(summary.into());
+            row.body_lines = body_lines;
         }
     }
 
@@ -336,14 +357,20 @@ fn format_row(row: &WorkRow) -> String {
                 .filter(|d| d.as_secs() >= 1)
                 .map(|d| format!(" {}({}){}", GRAY_DIM, fmt_elapsed(d.as_secs()), RESET))
                 .unwrap_or_default();
-            if summary.is_empty() {
+            let mut out = if summary.is_empty() {
                 format!("  {}⎿{} {}{}", GRAY, RESET, row.label, timing)
             } else {
                 format!(
                     "  {}⎿{} {} {}{}{}{}",
                     GRAY, RESET, row.label, GRAY_DIM, summary, RESET, timing
                 )
+            };
+            // Render body lines (diff, bash output, grep matches, etc.) indented below
+            for line in &row.body_lines {
+                out.push('\n');
+                out.push_str(&format!("    {}", line));
             }
+            out
         }
         WorkRowStatus::Error(err) => {
             let timing = row
@@ -610,6 +637,7 @@ mod tests {
             status: WorkRowStatus::Running,
             started_at: Instant::now(),
             elapsed_at_finish: None,
+            body_lines: Vec::new(),
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -624,6 +652,7 @@ mod tests {
             status: WorkRowStatus::Complete("42 lines".into()),
             started_at: Instant::now(),
             elapsed_at_finish: None,
+            body_lines: Vec::new(),
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -638,6 +667,7 @@ mod tests {
             status: WorkRowStatus::Complete(String::new()),
             started_at: Instant::now(),
             elapsed_at_finish: None,
+            body_lines: Vec::new(),
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -653,12 +683,45 @@ mod tests {
             status: WorkRowStatus::Error("exit 1".into()),
             started_at: Instant::now(),
             elapsed_at_finish: None,
+            body_lines: Vec::new(),
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
         assert!(f.contains("bash(bad cmd)"));
         assert!(f.contains("❌"));
         assert!(f.contains("exit 1"));
+    }
+
+    // ── complete_row_with_body ───────────────────────────────────────────────
+
+    #[test]
+    fn test_complete_row_with_body_renders_below_summary() {
+        let wu = WorkUnit::new("X");
+        let idx = wu.add_row("Edit(…/event_loop.rs)");
+        wu.complete_row_with_body(
+            idx,
+            "Removed 3 lines",
+            vec!["  line A".to_string(), "  line B".to_string()],
+        );
+        wu.set_complete();
+        let f = wu.format(&ColorScheme::default());
+        assert!(f.contains("Removed 3 lines"), "summary missing: {}", f);
+        assert!(f.contains("line A"), "body line A missing: {}", f);
+        assert!(f.contains("line B"), "body line B missing: {}", f);
+        // Body lines must appear AFTER the summary line
+        let summary_pos = f.find("Removed 3 lines").unwrap();
+        let body_pos = f.find("line A").unwrap();
+        assert!(body_pos > summary_pos, "body should follow summary");
+    }
+
+    #[test]
+    fn test_complete_row_with_body_empty_body_is_fine() {
+        let wu = WorkUnit::new("X");
+        let idx = wu.add_row("Read(foo.rs)");
+        wu.complete_row_with_body(idx, "42 lines", Vec::new());
+        wu.set_complete();
+        let f = wu.format(&ColorScheme::default());
+        assert!(f.contains("42 lines"));
     }
 
     // ── fmt_elapsed / fmt_tokens ─────────────────────────────────────────────
@@ -780,6 +843,7 @@ mod tests {
             status: WorkRowStatus::Complete("ok".into()),
             started_at: Instant::now(),
             elapsed_at_finish: Some(std::time::Duration::from_millis(800)),
+            body_lines: Vec::new(),
         };
         let f = format_row(&row);
         // The label contains "(true)" but timing should NOT appear as "(0s)" pattern
@@ -803,6 +867,7 @@ mod tests {
             status: WorkRowStatus::Complete("done".into()),
             started_at: Instant::now(),
             elapsed_at_finish: Some(std::time::Duration::from_secs(3)),
+            body_lines: Vec::new(),
         };
         let f = format_row(&row);
         assert!(f.contains("3s"), "3-second row should show timing: {}", f);

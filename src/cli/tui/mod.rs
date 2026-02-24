@@ -372,7 +372,7 @@ impl TuiRenderer {
     /// After draw_live_area() the cursor is parked at `cursor_row_from_top`
     /// (not necessarily at the bottom row), so we must use that field — not
     /// `active_rows - 1` — to reach the top correctly.
-    fn erase_live_area(&mut self) -> Result<()> {
+    pub fn erase_live_area(&mut self) -> Result<()> {
         if self.active_rows == 0 {
             return Ok(());
         }
@@ -388,7 +388,7 @@ impl TuiRenderer {
     }
 
     /// Draw the live area from scratch and track `active_rows`.
-    fn draw_live_area(&mut self) -> Result<()> {
+    pub fn draw_live_area(&mut self) -> Result<()> {
         let mut stdout = io::stdout();
         execute!(stdout, BeginSynchronizedUpdate)?;
 

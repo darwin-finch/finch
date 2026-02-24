@@ -2136,7 +2136,7 @@ impl EventLoop {
         result: Result<String>,
     ) -> Result<()> {
         // Look up the tool's WorkUnit and row index
-        let (_tool_name, _tool_input, work_unit, row_idx) = {
+        let (tool_name, _tool_input, work_unit, row_idx) = {
             let mut map = self.active_tool_uses.write().await;
             map.remove(&tool_id).unwrap_or_else(|| {
                 // Fallback: create a standalone WorkUnit for untracked tools
@@ -2146,10 +2146,11 @@ impl EventLoop {
             })
         };
 
-        // Update the row in the WorkUnit with a compact summary
+        // Update the row in the WorkUnit with a semantic summary + optional body
         match &result {
             Ok(content) => {
-                work_unit.complete_row(row_idx, compact_tool_summary(content));
+                let (summary, body) = tool_result_to_display(&tool_name, content);
+                work_unit.complete_row_with_body(row_idx, summary, body);
             }
             Err(e) => {
                 // Truncate very long error messages for the row display
@@ -2848,18 +2849,37 @@ async fn handle_present_plan(
         let _ = tui.flush_output_safe(&output_manager);
     }
 
-    let mut tui = tui_renderer.lock().await;
-    let dialog_result = tui.show_dialog(dialog);
-    drop(tui);
+    // Show the approval dialog using the async path so we never hold the tokio
+    // async mutex across a blocking crossterm::event::poll syscall.  The old
+    // approach (calling show_dialog while holding the mutex) caused the dialog
+    // to freeze on macOS because spawn_input_task was suspended waiting for the
+    // same mutex, leaving no task free to process keyboard events (GH #43).
+    //
+    // New approach: set active_dialog, release the mutex, let spawn_input_task
+    // handle keypresses normally, and poll here for pending_dialog_result.
+    {
+        let mut tui = tui_renderer.lock().await;
+        tui.active_dialog = Some(dialog);
+        tui.pending_dialog_result = None;
+        let _ = tui.erase_live_area();
+        let _ = tui.draw_live_area();
+    }
 
-    let dialog_result = match dialog_result {
-        Ok(result) => result,
-        Err(e) => {
-            return Some(Err(anyhow::anyhow!(
-                "Failed to show approval dialog: {}",
-                e
-            )))
+    let dialog_result: crate::cli::tui::DialogResult = loop {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut tui = tui_renderer.lock().await;
+        // Ctrl+C while dialog is open → cancel (set by spawn_input_task)
+        if tui.pending_cancellation {
+            tui.pending_cancellation = false;
+            tui.active_dialog = None;
+            break crate::cli::tui::DialogResult::Cancelled;
         }
+        if let Some(result) = tui.pending_dialog_result.take() {
+            tui.active_dialog = None;
+            break result;
+        }
+        // Re-render so the dialog stays visible while we wait
+        let _ = tui.draw_live_area();
     };
 
     // Handle dialog result
@@ -2965,6 +2985,126 @@ pub fn format_token_count(n: usize) -> String {
 
 /// Produce a compact one-line summary of tool output for display in an OperationMessage row.
 ///
+/// Maximum number of body lines to show beneath a tool row before adding an overflow hint.
+const MAX_TOOL_BODY_LINES: usize = 20;
+
+/// Produce a semantic (summary, body_lines) pair for a tool result.
+///
+/// The summary is a compact one-liner shown on the `⎿ label  summary` line.
+/// The body_lines are rendered indented below it — diff content for Edit,
+/// command output for Bash, file paths for Glob, match lines for Grep, etc.
+///
+/// Matches Claude Code's display style:
+///   Edit  → "Removed 16 lines" + colored diff body
+///   Read  → "N lines"  (body suppressed — file content is too large to show inline)
+///   Write → "Created foo.rs (N lines)" or "Updated foo.rs (N → M lines, +X)"
+///   Glob  → "N files" + first 8 paths
+///   Grep  → "N matches" + first 8 match lines
+///   Bash  → first output line as summary + remaining lines as body
+fn tool_result_to_display(tool_name: &str, content: &str) -> (String, Vec<String>) {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    match tool_name.to_lowercase().as_str() {
+        "edit" => {
+            // Edit returns "Added N lines, removed M lines\n<colored diff>"
+            // First line is already a semantic summary; rest is the diff to show inline.
+            let mut lines_iter = trimmed.lines();
+            let summary = lines_iter.next().unwrap_or("").trim().to_string();
+            let body_lines: Vec<String> = lines_iter.map(|l| l.to_string()).collect();
+            let total = body_lines.len();
+            let mut body: Vec<String> = body_lines.into_iter().take(MAX_TOOL_BODY_LINES).collect();
+            if total > MAX_TOOL_BODY_LINES {
+                body.push(format!(
+                    "\x1b[90m… +{} lines (ctrl+o to expand)\x1b[0m",
+                    total - MAX_TOOL_BODY_LINES
+                ));
+            }
+            (summary, body)
+        }
+
+        "read" => {
+            // Content is raw file text — too large to show inline.
+            // Show a line-count summary only; the model has the full content.
+            let count = trimmed.lines().count();
+            let summary = if count == 1 {
+                "1 line".to_string()
+            } else {
+                format!("{} lines", count)
+            };
+            (summary, Vec::new())
+        }
+
+        "write" => {
+            // Write returns a single-line status like "Created foo.rs (N lines)"
+            (compact_tool_summary(content), Vec::new())
+        }
+
+        "glob" => {
+            // Content is newline-separated file paths
+            let lines: Vec<&str> = trimmed.lines().collect();
+            let count = lines.len();
+            let summary = if lines[0].starts_with("No files") {
+                lines[0].to_string()
+            } else if count == 1 {
+                "1 file".to_string()
+            } else {
+                format!("{} files", count)
+            };
+            let body: Vec<String> = lines.iter().take(8).map(|l| l.to_string()).collect();
+            (summary, body)
+        }
+
+        "grep" => {
+            // Content is match lines (file:line:content format)
+            let lines: Vec<&str> = trimmed.lines().collect();
+            let count = lines.len();
+            let summary = if count == 1 {
+                "1 match".to_string()
+            } else {
+                format!("{} matches", count)
+            };
+            let total = lines.len();
+            let mut body: Vec<String> = lines.iter().take(8).map(|l| l.to_string()).collect();
+            if total > 8 {
+                body.push(format!(
+                    "\x1b[90m… +{} more (ctrl+o to expand)\x1b[0m",
+                    total - 8
+                ));
+            }
+            (summary, body)
+        }
+
+        "bash" => {
+            // Show first line as summary, rest as body
+            let lines: Vec<&str> = trimmed.lines().collect();
+            let first = lines[0].trim();
+            let summary = if first.len() > 60 {
+                format!("{}…", &first[..57])
+            } else {
+                first.to_string()
+            };
+            let total = lines.len();
+            let mut body: Vec<String> = lines[1..]
+                .iter()
+                .take(MAX_TOOL_BODY_LINES)
+                .map(|l| l.to_string())
+                .collect();
+            if total > 1 + MAX_TOOL_BODY_LINES {
+                body.push(format!(
+                    "\x1b[90m… +{} lines (ctrl+o to expand)\x1b[0m",
+                    total - 1 - MAX_TOOL_BODY_LINES
+                ));
+            }
+            (summary, body)
+        }
+
+        _ => (compact_tool_summary(content), Vec::new()),
+    }
+}
+
 /// - Empty content → ""
 /// - Single line   → the line, truncated to 60 chars
 /// - Multi-line    → "<N> lines"
@@ -3250,6 +3390,74 @@ mod tests {
     fn test_compact_tool_summary_multi_line() {
         let multi = "line1\nline2\nline3";
         assert_eq!(compact_tool_summary(multi), "3 lines");
+    }
+
+    // --- tool_result_to_display ---
+
+    #[test]
+    fn test_tool_result_edit_extracts_summary_and_diff() {
+        let content = "Removed 3 lines\n  line 1\n  line 2\n  line 3";
+        let (summary, body) = tool_result_to_display("edit", content);
+        assert_eq!(summary, "Removed 3 lines");
+        assert_eq!(body.len(), 3);
+        assert!(body[0].contains("line 1"));
+    }
+
+    #[test]
+    fn test_tool_result_read_returns_line_count_no_body() {
+        let content = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let (summary, body) = tool_result_to_display("read", &content);
+        assert_eq!(summary, "50 lines");
+        assert!(body.is_empty(), "Read should not show body content");
+    }
+
+    #[test]
+    fn test_tool_result_glob_counts_files() {
+        let content = "src/main.rs\nsrc/lib.rs\nsrc/foo.rs";
+        let (summary, body) = tool_result_to_display("glob", content);
+        assert_eq!(summary, "3 files");
+        assert_eq!(body.len(), 3);
+    }
+
+    #[test]
+    fn test_tool_result_grep_counts_matches() {
+        let content = "src/foo.rs:10: match A\nsrc/bar.rs:20: match B";
+        let (summary, body) = tool_result_to_display("grep", content);
+        assert_eq!(summary, "2 matches");
+        assert_eq!(body.len(), 2);
+    }
+
+    #[test]
+    fn test_tool_result_bash_first_line_as_summary() {
+        let content = "running tests\ntest foo ... ok\ntest bar ... ok";
+        let (summary, body) = tool_result_to_display("bash", content);
+        assert_eq!(summary, "running tests");
+        assert_eq!(body.len(), 2);
+        assert!(body[0].contains("test foo"));
+    }
+
+    #[test]
+    fn test_tool_result_empty_returns_empty() {
+        let (summary, body) = tool_result_to_display("bash", "");
+        assert!(summary.is_empty());
+        assert!(body.is_empty());
+
+        let (summary, body) = tool_result_to_display("read", "   ");
+        assert!(summary.is_empty());
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn test_tool_result_edit_truncates_large_diff() {
+        // A diff larger than MAX_TOOL_BODY_LINES should add an overflow hint
+        let summary_line = "Removed 30 lines";
+        let diff_lines: Vec<String> = (0..30).map(|i| format!("  diff line {}", i)).collect();
+        let content = format!("{}\n{}", summary_line, diff_lines.join("\n"));
+        let (summary, body) = tool_result_to_display("edit", &content);
+        assert_eq!(summary, summary_line);
+        // Should have MAX_TOOL_BODY_LINES + 1 overflow hint
+        assert_eq!(body.len(), MAX_TOOL_BODY_LINES + 1);
+        assert!(body.last().unwrap().contains("ctrl+o to expand"));
     }
 
     // --- find_last_exchange ---
