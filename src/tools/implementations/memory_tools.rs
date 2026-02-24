@@ -31,9 +31,10 @@ impl Tool for SearchMemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Search your memory for relevant past conversations and context. Use this when you need to recall \
-         previous discussions, decisions, or information from earlier sessions. Searches using semantic \
-         similarity to find the most relevant matches."
+        "Search your memory for relevant past conversations and context. Only call this when the user \
+         explicitly asks you to recall something from a previous session, or when a task genuinely requires \
+         information that is unlikely to be in the current conversation. Do NOT call this proactively at the \
+         start of every turn or as a routine step before coding tasks."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -184,8 +185,9 @@ impl Tool for ListRecentTool {
     }
 
     fn description(&self) -> &str {
-        "List recent conversations from memory in chronological order. Use this to see what was \
-         discussed recently or to get a timeline of recent interactions."
+        "List recent conversations from memory in chronological order. Only call this when the user \
+         explicitly asks to review history (e.g. 'what did we work on last time?'). Do NOT call this \
+         proactively or as a startup check before handling a coding task."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
