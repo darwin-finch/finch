@@ -1951,4 +1951,50 @@ mod tests {
             "renderer must use cyan highlight when cursor is on 'Other' in MultiSelect"
         );
     }
+
+    // ── other_row_content_visible_width regression tests ──────────────────────
+    // Regression: render_other_row_inline used `2 + input_text.chars().count()`
+    // for the content visible width, which omitted the cursor block character
+    // (one visible cell rendered by `\x1b[7m \x1b[m`).  The fix is `3 + count`.
+    //
+    // These tests verify the invariant by measuring the actual visible length of
+    // the string returned by format_custom_input_content() and asserting it
+    // matches the formula used for padding in render_other_row_inline.
+
+    #[test]
+    fn other_row_content_vis_width_empty_input_is_3() {
+        // "> " (2) + cursor block (1) = 3 with no text
+        let s = format_custom_input_content("", 0);
+        let vis = visible_length(&s);
+        assert_eq!(
+            vis, 3,
+            "empty input: visible length must be 3 (got {}); formula was previously 2 (off by 1)",
+            vis
+        );
+    }
+
+    #[test]
+    fn other_row_content_vis_width_matches_3_plus_char_count() {
+        // The padding formula in render_other_row_inline is:
+        //   content_vis = 3 + input_text.chars().count()
+        // Verify it holds for a range of inputs and cursor positions.
+        let cases: &[(&str, usize)] = &[
+            ("hello", 5),   // cursor at end
+            ("hello", 0),   // cursor at start
+            ("hello", 2),   // cursor in middle
+            ("a",     1),
+            ("abcdefgh", 8),
+        ];
+        for (input, cursor) in cases {
+            let s = format_custom_input_content(input, *cursor);
+            let vis = visible_length(&s);
+            let expected = 3 + input.chars().count();
+            assert_eq!(
+                vis, expected,
+                "input={:?} cursor={}: visible_length={} but formula gives {} \
+                 (off-by-one regression: old formula gave {})",
+                input, cursor, vis, expected, expected - 1
+            );
+        }
+    }
 }
