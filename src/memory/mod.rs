@@ -301,8 +301,16 @@ impl MemorySystem {
         // Compute the window sizes for the requested depth
         let windows = context_windows(depth, num_leaves);
 
+        // The last window is always the "now" slot. Pin it to the most-recent
+        // leaf's actual text so it is guaranteed to show something fresh and
+        // distinct, even when all centroid queries converge on the same node.
+        let now_text = truncate_str(leaves[0].2, 70);
+
         let mut lines: Vec<String> = Vec::new();
-        for window in &windows {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Centroid queries for all windows except the last ("now") slot.
+        for window in windows.iter().take(windows.len().saturating_sub(1)) {
             let slice: Vec<&Vec<f32>> = leaves
                 .iter()
                 .take(*window)
@@ -311,14 +319,16 @@ impl MemorySystem {
             let centroid = average_embeddings(&slice);
             if let Some((_, text, _)) = tree.retrieve(&centroid, 1).into_iter().next() {
                 let s = truncate_str(&text, 70);
-                if !s.trim().is_empty() {
+                if !s.trim().is_empty() && s != now_text && seen.insert(s.clone()) {
                     lines.push(s);
                 }
             }
         }
 
-        // De-duplicate consecutive identical lines (happens with few leaves)
-        lines.dedup();
+        // "Now" slot: always the most-recent leaf — pinned, not a centroid query.
+        if !now_text.trim().is_empty() {
+            lines.push(now_text);
+        }
 
         Ok(ConversationSummaryLines { lines })
     }
