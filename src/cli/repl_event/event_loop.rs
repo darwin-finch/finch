@@ -2272,36 +2272,18 @@ impl EventLoop {
 
         tracing::debug!("[EVENT_LOOP] Requesting tool approval: {}", tool_use.name);
 
-        // Create approval dialog
+        // Create approval dialog — compact 3-option style matching Claude Code UX
         let tool_name = &tool_use.name;
         let summary = tool_approval_summary(&tool_use);
 
         let options = vec![
-            DialogOption::with_description(
-                "Allow Once",
-                "Execute this tool once without saving approval",
-            ),
-            DialogOption::with_description(
-                "Allow Exact (Session)",
-                "Allow this exact tool call for this session",
-            ),
-            DialogOption::with_description(
-                "Allow All (Session)",
-                "Allow all calls to this tool for this session",
-            ),
-            DialogOption::with_description(
-                "Allow Exact (Persistent)",
-                "Always allow this exact tool call",
-            ),
-            DialogOption::with_description(
-                "Allow All (Persistent)",
-                "Always allow all calls to this tool",
-            ),
-            DialogOption::with_description("Deny", "Do not execute this tool"),
+            DialogOption::new("1. Yes"),
+            DialogOption::new(format!("2. Yes, and don't ask again for: {}:*", tool_name)),
+            DialogOption::new("3. No"),
         ];
 
-        let dialog = Dialog::select_with_custom(
-            format!("Tool '{}' requires approval\n{}", tool_name, summary),
+        let dialog = Dialog::select(
+            format!("{}\n{}", tool_name, summary),
             options,
         );
 
@@ -3328,13 +3310,10 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> 
 
 /// Convert a dialog selection to a `ConfirmationResult` for tool approval.
 ///
-/// Mapping:
-///   - `Selected(0)` → `ApproveOnce`
-///   - `Selected(1)` → `ApproveExactSession` (exact signature, session-scoped)
-///   - `Selected(2)` → `ApprovePatternSession` (wildcard for this tool, session-scoped)
-///   - `Selected(3)` → `ApproveExactPersistent` (exact signature, persistent)
-///   - `Selected(4)` → `ApprovePatternPersistent` (wildcard for this tool, persistent)
-///   - `Selected(5+)` / `Cancelled` / `CustomText` → `Deny`
+/// 3-option mapping (Claude Code style):
+///   - `Selected(0)` → `ApproveOnce`            ("1. Yes")
+///   - `Selected(1)` → `ApprovePatternSession`   ("2. Yes, and don't ask again for: tool:*")
+///   - `Selected(2+)` / `Cancelled` → `Deny`     ("3. No")
 ///
 /// Exported `pub(crate)` so it can be unit-tested directly.
 pub(crate) fn dialog_result_to_confirmation(
@@ -3342,18 +3321,13 @@ pub(crate) fn dialog_result_to_confirmation(
     tool_use: &crate::tools::types::ToolUse,
 ) -> super::events::ConfirmationResult {
     use super::events::ConfirmationResult;
-    use crate::tools::executor::generate_tool_signature;
     use crate::tools::patterns::ToolPattern;
 
     match dialog_result {
         crate::cli::tui::DialogResult::Selected(index) => match index {
             0 => ConfirmationResult::ApproveOnce,
             1 => {
-                let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
-                ConfirmationResult::ApproveExactSession(signature)
-            }
-            2 => {
-                // Wildcard pattern: allow any call to this tool this session.
+                // Session-wide wildcard: don't ask again for any call to this tool.
                 let pattern = ToolPattern::new(
                     "*".to_string(),
                     tool_use.name.clone(),
@@ -3361,26 +3335,8 @@ pub(crate) fn dialog_result_to_confirmation(
                 );
                 ConfirmationResult::ApprovePatternSession(pattern)
             }
-            3 => {
-                let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
-                ConfirmationResult::ApproveExactPersistent(signature)
-            }
-            4 => {
-                // Wildcard pattern: always allow any call to this tool.
-                let pattern = ToolPattern::new(
-                    "*".to_string(),
-                    tool_use.name.clone(),
-                    format!("Allow all {} calls (persistent)", tool_use.name),
-                );
-                ConfirmationResult::ApprovePatternPersistent(pattern)
-            }
-            _ => ConfirmationResult::Deny, // Index 5 = Deny option; anything higher is also Deny
+            _ => ConfirmationResult::Deny, // "3. No" or anything beyond
         },
-        crate::cli::tui::DialogResult::CustomText(text) => {
-            // User typed a custom response — log it and deny for safety
-            tracing::info!("Tool approval custom response: {}", text);
-            ConfirmationResult::Deny
-        }
         _ => ConfirmationResult::Deny,
     }
 }
@@ -4526,10 +4482,11 @@ mod tests {
         assert_eq!(tool_approval_summary(&tool), "Execute WebFetch tool");
     }
 
-    // ── dialog_result_to_confirmation ────────────────────────────────────────
+    // ── dialog_result_to_confirmation (3-option Claude Code style) ───────────
 
     #[test]
     fn test_dialog_result_selected_0_approve_once() {
+        // Option "1. Yes" → ApproveOnce
         let tool = make_tool_use("bash", serde_json::json!({"command": "ls"}));
         let result = dialog_result_to_confirmation(
             crate::cli::tui::DialogResult::Selected(0),
@@ -4537,33 +4494,17 @@ mod tests {
         );
         assert!(
             matches!(result, crate::cli::repl_event::events::ConfirmationResult::ApproveOnce),
-            "index 0 should be ApproveOnce, got {:?}",
+            "index 0 (Yes) should be ApproveOnce, got {:?}",
             result
         );
     }
 
     #[test]
-    fn test_dialog_result_selected_1_approve_exact_session() {
-        let tool = make_tool_use("bash", serde_json::json!({"command": "cargo test"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(1),
-            &tool,
-        );
-        assert!(
-            matches!(
-                result,
-                crate::cli::repl_event::events::ConfirmationResult::ApproveExactSession(_)
-            ),
-            "index 1 should be ApproveExactSession, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_dialog_result_selected_2_approve_pattern_session() {
+    fn test_dialog_result_selected_1_approve_pattern_session() {
+        // Option "2. Yes, and don't ask again for: bash:*" → ApprovePatternSession
         let tool = make_tool_use("bash", serde_json::json!({"command": "git status"}));
         let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(2),
+            crate::cli::tui::DialogResult::Selected(1),
             &tool,
         );
         match result {
@@ -4577,53 +4518,16 @@ mod tests {
     }
 
     #[test]
-    fn test_dialog_result_selected_3_approve_exact_persistent() {
-        let tool = make_tool_use("read", serde_json::json!({"file_path": "Cargo.toml"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(3),
-            &tool,
-        );
-        assert!(
-            matches!(
-                result,
-                crate::cli::repl_event::events::ConfirmationResult::ApproveExactPersistent(_)
-            ),
-            "index 3 should be ApproveExactPersistent, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_dialog_result_selected_4_approve_pattern_persistent() {
-        let tool = make_tool_use("glob", serde_json::json!({"pattern": "**/*.rs"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(4),
-            &tool,
-        );
-        match result {
-            crate::cli::repl_event::events::ConfirmationResult::ApprovePatternPersistent(p) => {
-                assert_eq!(p.tool_name, "glob");
-                assert_eq!(p.pattern, "*");
-                assert!(
-                    p.description.contains("persistent"),
-                    "description: {}",
-                    p.description
-                );
-            }
-            other => panic!("expected ApprovePatternPersistent, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_dialog_result_selected_5_deny() {
+    fn test_dialog_result_selected_2_deny() {
+        // Option "3. No" → Deny
         let tool = make_tool_use("bash", serde_json::json!({"command": "rm -rf /"}));
         let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(5),
+            crate::cli::tui::DialogResult::Selected(2),
             &tool,
         );
         assert!(
             matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
-            "index 5 (Deny option) should return Deny, got {:?}",
+            "index 2 (No) should be Deny, got {:?}",
             result
         );
     }
@@ -4671,12 +4575,29 @@ mod tests {
     }
 
     #[test]
+    fn test_dialog_result_pattern_session_uses_tool_name() {
+        // Verify the "don't ask again" pattern uses the actual tool name
+        let tool = make_tool_use("grep", serde_json::json!({"pattern": "TODO"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(1),
+            &tool,
+        );
+        match result {
+            crate::cli::repl_event::events::ConfirmationResult::ApprovePatternSession(p) => {
+                assert_eq!(p.tool_name, "grep", "pattern tool_name should match tool: {}", p.tool_name);
+            }
+            other => panic!("expected ApprovePatternSession, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_pattern_session_tool_name_matches_tool_use() {
         // The pattern's tool_name must match the tool being approved —
         // otherwise the cache won't recognise future calls to the same tool.
+        // Index 1 = "2. Yes, and don't ask again for: Bash:*"
         let tool = make_tool_use("Bash", serde_json::json!({"command": "cargo fmt"}));
         let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(2),
+            crate::cli::tui::DialogResult::Selected(1),
             &tool,
         );
         match result {
@@ -4692,16 +4613,17 @@ mod tests {
 
     #[test]
     fn test_pattern_persistent_tool_name_matches_tool_use() {
+        // Persistent approval is no longer in the 3-option dialog.
+        // Index 2 → Deny; index 99 → Deny. Just verify nothing panics.
         let tool = make_tool_use("read", serde_json::json!({"file_path": "src/lib.rs"}));
         let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(4),
+            crate::cli::tui::DialogResult::Selected(2),
             &tool,
         );
-        match result {
-            crate::cli::repl_event::events::ConfirmationResult::ApprovePatternPersistent(p) => {
-                assert_eq!(p.tool_name, "read");
-            }
-            other => panic!("expected ApprovePatternPersistent, got {:?}", other),
-        }
+        assert!(
+            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            "index 2 is No/Deny in 3-option dialog, got {:?}",
+            result
+        );
     }
 }
