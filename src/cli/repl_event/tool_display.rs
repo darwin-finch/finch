@@ -116,6 +116,14 @@ fn extract_key_param(tool_name: &str, input: &Value) -> String {
         "write" => shorten_path(input["file_path"].as_str().unwrap_or("")),
         "edit" => shorten_path(input["file_path"].as_str().unwrap_or("")),
         "task" => input["description"].as_str().unwrap_or("").to_string(),
+        "presentplan" | "present_plan" => {
+            // Show the plan title (first # heading) rather than raw markdown content
+            let plan = input["plan"].as_str().unwrap_or("");
+            plan.lines()
+                .find(|l| l.starts_with('#'))
+                .map(|l| l.trim_start_matches('#').trim().to_string())
+                .unwrap_or_else(|| "proposing plan".to_string())
+        }
         "askuserquestion" | "ask_user_question" => {
             // Show the question text
             input["questions"]

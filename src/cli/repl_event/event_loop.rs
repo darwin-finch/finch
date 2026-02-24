@@ -2037,6 +2037,16 @@ impl EventLoop {
                     // Clear active query
                     *self.active_query_id.write().await = None;
 
+                    // If we were in plan/executing mode, cancel that too so the
+                    // user doesn't have to press Ctrl+C again to escape.
+                    {
+                        let mode = self.mode.read().await.clone();
+                        if !matches!(mode, ReplMode::Normal) {
+                            *self.mode.write().await = ReplMode::Normal;
+                            self.update_plan_mode_indicator(&ReplMode::Normal);
+                        }
+                    }
+
                     // Show cancellation message
                     self.output_manager
                         .write_info("⚠️  Query cancelled by user (Ctrl+C)");
@@ -2044,7 +2054,19 @@ impl EventLoop {
 
                     tracing::info!("Query {} cancelled by user", qid);
                 } else {
-                    tracing::debug!("Ctrl+C pressed but no active query to cancel");
+                    // No active query — Ctrl+C when idle:
+                    //   • in plan/executing mode → exit that mode, stay in finch
+                    //   • in normal mode → exit finch entirely (like Ctrl+D or /quit)
+                    let mode = self.mode.read().await.clone();
+                    if !matches!(mode, ReplMode::Normal) {
+                        *self.mode.write().await = ReplMode::Normal;
+                        self.update_plan_mode_indicator(&ReplMode::Normal);
+                        self.output_manager
+                            .write_info("Plan mode cancelled (Ctrl+C).");
+                        self.render_tui().await?;
+                    } else {
+                        let _ = self.event_tx.send(ReplEvent::Shutdown);
+                    }
                 }
             }
 
