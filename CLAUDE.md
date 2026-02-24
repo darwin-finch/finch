@@ -1076,21 +1076,7 @@ Core infrastructure is complete and production-ready. The project is a fully fun
 
 ### Open Issues
 
-Tracked as GitHub Issues: **https://github.com/darwin-finch/finch/issues**
-
-Key open items:
-- [#1](https://github.com/darwin-finch/finch/issues/1) LoRA adapter loading at ONNX runtime (40-80h, complex)
-- [#2](https://github.com/darwin-finch/finch/issues/2) Mistral ONNX support (blocked on onnx-community publishing models)
-- [#3](https://github.com/darwin-finch/finch/issues/3) Additional model adapters (CodeLlama, Yi, StarCoder)
-- [#4](https://github.com/darwin-finch/finch/issues/4) Update ARCHITECTURE.md
-- [#5](https://github.com/darwin-finch/finch/issues/5) Integration tests (daemon, LoRA, multi-provider, tool pass-through)
-- [#6](https://github.com/darwin-finch/finch/issues/6) Remove unused Candle imports (good first issue)
-- [#7](https://github.com/darwin-finch/finch/issues/7) LoRA training memory efficiency
-- [#8](https://github.com/darwin-finch/finch/issues/8) src/scheduling/ stubs — **CLOSED** (return honest errors in 0.5.2)
-- [#9](https://github.com/darwin-finch/finch/issues/9) .unwrap() panics — **CLOSED** (replaced in 0.5.2)
-- [#10](https://github.com/darwin-finch/finch/issues/10) Hardcoded ports — **CLOSED** (constants in 0.5.2)
-- [#11](https://github.com/darwin-finch/finch/issues/11) batch_trainer fake loss — **CLOSED** (honest error in 0.5.2)
-- [#21](https://github.com/darwin-finch/finch/issues/21) CLAUDE.md/FINCH.md auto-loading — **CLOSED** (implemented in 6353f3b; CONTEXT.md + README.md added in 60c76a2)
+See **https://github.com/darwin-finch/finch/issues** for the current issue list.
 
 ## Reference Documents
 
