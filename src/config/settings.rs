@@ -25,7 +25,7 @@ pub struct FeaturesConfig {
 
     /// Number of context-summary lines shown in the status strip.
     /// 1 = 🧠 stats only; 2 = stats + "now"; 3 = stats + overall + "now";
-    /// 4 (default) = stats + overall + mid + "now"; max 8.
+    /// 4 = stats + overall + mid + "now"; 5 (default) = same + extra mid; max 8.
     #[serde(default = "default_context_lines")]
     pub memory_context_lines: usize,
 
@@ -66,7 +66,7 @@ impl Default for FeaturesConfig {
             auto_approve_tools: false,
             streaming_enabled: true,
             debug_logging: false,
-            memory_context_lines: 4,
+            memory_context_lines: 5,
             max_verbatim_messages: 20,
             context_recall_k: 5,
             enable_summarization: false,
@@ -82,7 +82,7 @@ fn default_true() -> bool {
 }
 
 fn default_context_lines() -> usize {
-    4
+    5
 }
 
 fn default_max_verbatim_messages() -> usize {

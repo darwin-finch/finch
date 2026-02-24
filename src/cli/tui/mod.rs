@@ -440,25 +440,27 @@ impl TuiRenderer {
             }
         }
 
-        // ── 2. Separator with embedded session name + CWD ────────────────────
+        // ── 2. Separator: "──  ~/repos/finch ──────── jade-river ──" ──────────
+        // CWD is left-anchored; session name is right-anchored.
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let cwd_label = tilde_cwd();
-        // Format: "──  calm-cliff  ·  ~/repos/finch ──────────────..."
-        let label_with_spaces = if self.session_label.is_empty() {
-            format!(" {} ", cwd_label)
-        } else {
-            format!(" {}  ·  {} ", self.session_label, cwd_label)
-        };
         let prefix = "── ";
         let prefix_vis = 3_usize;
-        let label_vis = label_with_spaces.chars().count();
-        let suffix_len = term_width.saturating_sub(prefix_vis + label_vis);
-        let suffix: String = "─".repeat(suffix_len);
+        let cwd_part = format!(" {} ", cwd_label);
+        let right_part = if self.session_label.is_empty() {
+            " ──".to_string()
+        } else {
+            format!(" {} ──", self.session_label)
+        };
+        let left_vis = prefix_vis + cwd_part.chars().count();
+        let right_vis = right_part.chars().count();
+        let mid_len = term_width.saturating_sub(left_vis + right_vis);
+        let mid: String = "─".repeat(mid_len);
         execute!(
             stdout,
             Print(format!(
-                "{}{}{}{}{}\r\n",
-                DIM_GRAY, prefix, label_with_spaces, suffix, RESET
+                "{}{}{}{}{}{}\r\n",
+                DIM_GRAY, prefix, cwd_part, mid, right_part, RESET
             ))
         )?;
         rows += 1;
