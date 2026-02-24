@@ -249,6 +249,7 @@ impl Dialog {
 
         // Priority 2: 'o'/'O' activates custom mode — but NOT when already on the "Other"
         // row (priority 2.5 handles that case, inserting the char directly).
+        // Also moves the cursor to the Other row so the inline input is visible.
         if matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
             let (allow_custom, is_on_other) = match &self.dialog_type {
                 DialogType::Select { allow_custom, options, selected_index, .. } => {
@@ -262,6 +263,16 @@ impl Dialog {
 
             if allow_custom && !is_on_other {
                 self.custom_mode_active = true;
+                // Move cursor to the Other row so the inline input is visible.
+                match &mut self.dialog_type {
+                    DialogType::Select { selected_index, options, .. } => {
+                        *selected_index = options.len();
+                    }
+                    DialogType::MultiSelect { cursor_index, options, .. } => {
+                        *cursor_index = options.len();
+                    }
+                    _ => {}
+                }
                 return None;
             }
         }
@@ -410,8 +421,11 @@ impl Dialog {
             }
             KeyCode::Enter => {
                 use crossterm::event::KeyModifiers;
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    // Shift+Enter: insert a newline instead of submitting.
+                // Shift+Enter or Alt/Option+Enter inserts a newline.
+                // On macOS standard VT100 raw mode, Option+Enter arrives as
+                // KeyCode::Enter + KeyModifiers::ALT (same as the main textarea).
+                if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                    // Insert a newline instead of submitting.
                     if let Some(ref mut input) = self.custom_input {
                         let byte_pos = Self::char_to_byte_offset(input, self.custom_cursor_pos);
                         input.insert(byte_pos, '\n');
@@ -1406,6 +1420,30 @@ mod tests {
         );
     }
 
+    // ─── 'o' shortcut cursor-jump regression ─────────────────────────────────
+
+    /// Regression: pressing 'o' from a non-Other row must also move the cursor
+    /// to the Other row so the inline input is visible.
+    #[test]
+    fn test_o_key_moves_cursor_to_other_row() {
+        let mut dialog = Dialog::select_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        // Cursor starts at index 0, press 'o'
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(dialog.custom_mode_active, "'o' must activate custom mode");
+        if let DialogType::Select { selected_index, options, .. } = &dialog.dialog_type {
+            assert_eq!(
+                *selected_index,
+                options.len(),
+                "'o' must move cursor to Other row (options.len())"
+            );
+        } else {
+            panic!("expected Select");
+        }
+    }
+
     // ─── WS1b: immediate typing on "Other" row ────────────────────────────────
 
     /// Regression: navigating to the "Other" row and pressing a printable char
@@ -1480,14 +1518,13 @@ mod tests {
 
     // ─── WS2: Shift+Enter inserts newline in custom mode ─────────────────────
 
-    /// Pressing Shift+Enter while in custom text mode must insert '\n' rather
-    /// than submitting the text.
+    /// Pressing Shift+Enter (or Alt+Enter, which macOS sends in standard VT100 mode)
+    /// while in custom text mode must insert '\n' rather than submitting the text.
     #[test]
     fn test_custom_mode_shift_enter_inserts_newline() {
         use crossterm::event::{KeyEvent, KeyModifiers};
         let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o'))); // activate custom mode
-        // Type "hello"
         for c in "hello".chars() {
             dialog.handle_key_event(KeyEvent::from(KeyCode::Char(c)));
         }
@@ -1499,6 +1536,24 @@ mod tests {
             dialog.custom_input.as_deref(),
             Some("hello\n"),
             "Shift+Enter must insert newline into custom_input"
+        );
+    }
+
+    /// Alt+Enter (Option+Enter on macOS in standard VT100 raw mode) must also
+    /// insert a newline — same as Shift+Enter.
+    #[test]
+    fn test_custom_mode_alt_enter_inserts_newline() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        let result = dialog.handle_key_event(alt_enter);
+        assert!(result.is_none(), "Alt+Enter must not submit");
+        assert_eq!(
+            dialog.custom_input.as_deref(),
+            Some("x\n"),
+            "Alt+Enter must insert newline into custom_input"
         );
     }
 }
