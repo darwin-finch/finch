@@ -898,6 +898,31 @@ impl TuiRenderer {
 
 // ─── Crossterm dialog rendering ───────────────────────────────────────────────
 
+/// Returns `(ansi_on, marker)` for the "Other (custom response)" row.
+///
+/// When the row is selected, returns cyan bold + filled marker.
+/// When unselected, returns dim gray + hollow marker.
+/// This is extracted so it can be unit-tested without a real terminal.
+pub(crate) fn other_row_parts(is_selected: bool) -> (&'static str, &'static str) {
+    if is_selected {
+        ("\x1b[1;36m", "●")
+    } else {
+        (DIM_GRAY, "◌")
+    }
+}
+
+/// Formats the visible content of the custom-input line (no box borders).
+///
+/// Returns `"> {before}█{after}"` where the block cursor sits at `cursor` and
+/// the typed text (`before`) carries **no** extra ANSI colour — it renders in the
+/// terminal's default foreground so it is always readable.
+/// This is extracted so it can be unit-tested without a real terminal.
+pub(crate) fn format_custom_input_content(input: &str, cursor: usize) -> String {
+    let before: String = input.chars().take(cursor).collect();
+    let after: String = input.chars().skip(cursor).collect();
+    format!("> {}\x1b[7m \x1b[m{}", before, after)
+}
+
 impl TuiRenderer {
     /// Draw a `Dialog` inline using crossterm box-drawing characters.
     /// Returns the number of terminal rows consumed.
@@ -950,20 +975,15 @@ impl TuiRenderer {
             rows += 1;
             // Show input field with cursor marker
             let cursor = dialog.custom_cursor_pos;
-            let before: String = input_text.chars().take(cursor).collect();
-            let after: String = input_text.chars().skip(cursor).collect();
-            let with_cursor = format!("{}\x1b[7m \x1b[m{}", before, after); // block cursor
-            let visible = format!("> {}", input_text);
-            let _ = with_cursor; // used below for display
+            let content = format_custom_input_content(input_text, cursor);
+            let visible_len = 2 + input_text.chars().count(); // "> " + input chars
             execute!(
                 stdout,
                 Print(format!(
-                    "│  > {}{}\x1b[7m \x1b[m{}{:<w$}  │\r\n",
-                    DIM_GRAY,
-                    before,
-                    RESET,
-                    after,
-                    w = inner.saturating_sub(3 + visible.len())
+                    "│  {}{:<w$}  │\r\n",
+                    content,
+                    "",
+                    w = inner.saturating_sub(visible_len)
                 ))
             )?;
             rows += 1;
@@ -990,12 +1010,14 @@ impl TuiRenderer {
                     rows += 1;
                 }
                 if *allow_custom {
-                    let other_label = "  ◌ Other (custom response)";
+                    let is_other_selected = *selected_index == options.len();
+                    let (on, marker) = other_row_parts(is_other_selected);
+                    let other_label = format!("  {} Other (custom response)", marker);
                     execute!(
                         stdout,
                         Print(format!(
                             "│  {}{:<w$}{}  │\r\n",
-                            DIM_GRAY,
+                            on,
                             other_label,
                             RESET,
                             w = inner
@@ -1026,12 +1048,14 @@ impl TuiRenderer {
                     rows += 1;
                 }
                 if *allow_custom {
-                    let other_label = "  ◌ Other (custom response)";
+                    let is_other_selected = *cursor_index == options.len();
+                    let (on, marker) = other_row_parts(is_other_selected);
+                    let other_label = format!("  {} Other (custom response)", marker);
                     execute!(
                         stdout,
                         Print(format!(
                             "│  {}{:<w$}{}  │\r\n",
-                            DIM_GRAY,
+                            on,
                             other_label,
                             RESET,
                             w = inner
@@ -1703,5 +1727,185 @@ mod tests {
         // text should be cleared
         let text = d.custom_input.as_deref().unwrap_or("");
         assert!(text.is_empty(), "Esc must clear custom_input: {:?}", text);
+    }
+
+    // ── other_row_parts regression tests ──────────────────────────────────────
+    // Regression: draw_dialog_inline_static used DIM_GRAY unconditionally for
+    // the "Other" row, so navigating to it showed no highlight.  The fix moves
+    // the colour selection into `other_row_parts()` which is pinned by these tests.
+
+    #[test]
+    fn other_row_unselected_uses_dim_gray_and_hollow_marker() {
+        let (ansi, marker) = other_row_parts(false);
+        assert_eq!(
+            ansi, DIM_GRAY,
+            "unselected Other row must use DIM_GRAY, got: {:?}",
+            ansi
+        );
+        assert_eq!(marker, "◌", "unselected Other row must use hollow marker ◌");
+    }
+
+    #[test]
+    fn other_row_selected_uses_cyan_and_filled_marker() {
+        let (ansi, marker) = other_row_parts(true);
+        assert_eq!(
+            ansi, "\x1b[1;36m",
+            "selected Other row must use cyan bold (\\x1b[1;36m), got: {:?}",
+            ansi
+        );
+        assert_eq!(marker, "●", "selected Other row must use filled marker ●");
+    }
+
+    #[test]
+    fn other_row_selected_is_not_dim_gray() {
+        // Regression: the bug was using DIM_GRAY even when selected.
+        let (ansi, _) = other_row_parts(true);
+        assert_ne!(
+            ansi, DIM_GRAY,
+            "selected Other row must NOT use DIM_GRAY (regression guard)"
+        );
+    }
+
+    // ── format_custom_input_content regression tests ───────────────────────────
+    // Regression: draw_dialog_inline_static wrapped `before` in DIM_GRAY/RESET,
+    // making typed text invisible on dark terminals.  The fix removes those codes.
+    // `format_custom_input_content` is now the single source of truth for the row
+    // content, pinned by these tests.
+
+    #[test]
+    fn custom_input_content_contains_typed_text() {
+        let s = format_custom_input_content("hello", 5);
+        assert!(
+            s.contains("hello"),
+            "typed text must appear in formatted content, got: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn custom_input_content_does_not_wrap_text_in_dim_gray() {
+        // Regression: DIM_GRAY before + RESET after made typed text invisible.
+        let s = format_custom_input_content("hello", 5);
+        // DIM_GRAY = "\x1b[2m"
+        assert!(
+            !s.contains("\x1b[2m"),
+            "typed text must NOT be wrapped in DIM_GRAY (\\x1b[2m), got: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn custom_input_content_has_block_cursor() {
+        // Cursor is represented as reverse-video space: \x1b[7m \x1b[m
+        let s = format_custom_input_content("ab", 1);
+        assert!(
+            s.contains("\x1b[7m \x1b[m"),
+            "cursor block (\\x1b[7m \\x1b[m) must appear in formatted content, got: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn custom_input_content_cursor_at_start_puts_all_text_after_cursor() {
+        let s = format_custom_input_content("abc", 0);
+        // before = "", after = "abc"; expect "> █abc"
+        let idx = s.find("\x1b[7m \x1b[m").expect("cursor not found");
+        let after_cursor = &s[idx + "\x1b[7m \x1b[m".len()..];
+        assert_eq!(
+            after_cursor, "abc",
+            "text after cursor must be 'abc', got: {:?}",
+            after_cursor
+        );
+    }
+
+    #[test]
+    fn custom_input_content_cursor_at_end_puts_all_text_before_cursor() {
+        let s = format_custom_input_content("abc", 3);
+        // before = "abc", after = ""; expect "> abc█"
+        assert!(
+            s.starts_with("> abc\x1b[7m"),
+            "with cursor at end, content must start '> abc<cursor>', got: {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn custom_input_content_empty_input_just_shows_cursor() {
+        let s = format_custom_input_content("", 0);
+        assert!(
+            s.starts_with("> \x1b[7m"),
+            "empty input must start '> <cursor>', got: {:?}",
+            s
+        );
+    }
+
+    // ── Select "Other" row state regression ───────────────────────────────────
+    // Verifies that the Dialog state machine produces selected_index == options.len()
+    // when the user navigates down past the last real option (prerequisite for the
+    // renderer to call other_row_parts(true)).
+
+    #[test]
+    fn select_navigate_to_other_sets_index_to_options_len() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut d = Dialog::select_with_custom(
+            "Title",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        // Navigate down twice to reach "Other" (index 2 == options.len())
+        d.handle_key_event(KeyEvent::from(KeyCode::Down));
+        d.handle_key_event(KeyEvent::from(KeyCode::Down));
+        if let DialogType::Select { selected_index, options, .. } = &d.dialog_type {
+            assert_eq!(
+                *selected_index,
+                options.len(),
+                "selected_index must equal options.len() when 'Other' is highlighted"
+            );
+        } else {
+            panic!("expected Select dialog type");
+        }
+        // other_row_parts must return the highlighted style for this state
+        let options_len = if let DialogType::Select { options, .. } = &d.dialog_type {
+            options.len()
+        } else { unreachable!() };
+        let selected_index = if let DialogType::Select { selected_index, .. } = &d.dialog_type {
+            *selected_index
+        } else { unreachable!() };
+        let (ansi, _) = other_row_parts(selected_index == options_len);
+        assert_eq!(
+            ansi, "\x1b[1;36m",
+            "renderer must use cyan highlight when cursor is on 'Other'"
+        );
+    }
+
+    // ── MultiSelect "Other" row state regression ───────────────────────────────
+
+    #[test]
+    fn multiselect_navigate_to_other_sets_cursor_to_options_len() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut d = Dialog::multiselect_with_custom(
+            "Title",
+            vec![DialogOption::new("X"), DialogOption::new("Y")],
+        );
+        // Navigate down twice to reach "Other" (cursor_index 2 == options.len())
+        d.handle_key_event(KeyEvent::from(KeyCode::Down));
+        d.handle_key_event(KeyEvent::from(KeyCode::Down));
+        if let DialogType::MultiSelect { cursor_index, options, .. } = &d.dialog_type {
+            assert_eq!(
+                *cursor_index,
+                options.len(),
+                "cursor_index must equal options.len() when 'Other' is highlighted"
+            );
+        } else {
+            panic!("expected MultiSelect dialog type");
+        }
+        // other_row_parts must return the highlighted style for this state
+        let (cursor_index, options_len) = if let DialogType::MultiSelect { cursor_index, options, .. } = &d.dialog_type {
+            (*cursor_index, options.len())
+        } else { unreachable!() };
+        let (ansi, _) = other_row_parts(cursor_index == options_len);
+        assert_eq!(
+            ansi, "\x1b[1;36m",
+            "renderer must use cyan highlight when cursor is on 'Other' in MultiSelect"
+        );
     }
 }
