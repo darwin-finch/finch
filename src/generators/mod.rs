@@ -79,7 +79,9 @@ pub enum StreamChunk {
     ContentBlockComplete(ContentBlock), // Complete tool_use or text block
     /// Usage metadata from message_start — carries the input token count
     /// reported by the API before any text arrives.
-    Usage { input_tokens: u32 },
+    Usage {
+        input_tokens: u32,
+    },
 }
 
 /// Tool use request from generator

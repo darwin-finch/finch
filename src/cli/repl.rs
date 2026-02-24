@@ -171,16 +171,14 @@ pub struct Repl {
 
 /// Adjectives used for session labels
 const SESSION_ADJECTIVES: &[&str] = &[
-    "swift", "amber", "calm", "bright", "crisp", "dark", "eager", "fair",
-    "glad", "hard", "idle", "jade", "keen", "lush", "mild", "neat",
-    "open", "pale", "quiet", "rare",
+    "swift", "amber", "calm", "bright", "crisp", "dark", "eager", "fair", "glad", "hard", "idle",
+    "jade", "keen", "lush", "mild", "neat", "open", "pale", "quiet", "rare",
 ];
 
 /// Nouns used for session labels
 const SESSION_NOUNS: &[&str] = &[
-    "falcon", "creek", "ridge", "stone", "river", "grove", "brook", "field",
-    "cliff", "dune", "fern", "gate", "hill", "isle", "lake", "moon",
-    "nest", "oak", "peak", "reef",
+    "falcon", "creek", "ridge", "stone", "river", "grove", "brook", "field", "cliff", "dune",
+    "fern", "gate", "hill", "isle", "lake", "moon", "nest", "oak", "peak", "reef",
 ];
 
 /// Generate a short human-readable session label seeded by the current timestamp.

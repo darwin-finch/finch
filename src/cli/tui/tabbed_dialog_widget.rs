@@ -271,17 +271,17 @@ mod tests {
         let w = TabbedDialogWidget::new(&dialog, &colors);
         let text = lines_to_text(&w.render_content());
 
-        assert!(text.contains("Alpha"), "Option Alpha must be visible: {text}");
+        assert!(
+            text.contains("Alpha"),
+            "Option Alpha must be visible: {text}"
+        );
         assert!(text.contains("Beta"), "Option Beta must be visible: {text}");
     }
 
     /// Regression #19: separator must appear between questions.
     #[test]
     fn test_render_content_shows_separator_between_questions() {
-        let dialog = TabbedDialog::new(
-            vec![make_q("Q1?", &["A"]), make_q("Q2?", &["B"])],
-            None,
-        );
+        let dialog = TabbedDialog::new(vec![make_q("Q1?", &["A"]), make_q("Q2?", &["B"])], None);
         let colors = ColorScheme::default();
         let w = TabbedDialogWidget::new(&dialog, &colors);
         let text = lines_to_text(&w.render_content());

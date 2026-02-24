@@ -426,7 +426,9 @@ mod tests {
         status.update_live_stats("Qwen-3B", Some(100), Some(50), Some(1200));
         let lines = status.get_lines();
         assert!(
-            lines.iter().all(|l| l.line_type != StatusLineType::LiveStats),
+            lines
+                .iter()
+                .all(|l| l.line_type != StatusLineType::LiveStats),
             "LiveStats must not appear in rendered output"
         );
     }

@@ -117,7 +117,10 @@ pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::Unbounde
                                 // Terminal/iTerm2 — Option+Enter sends \x1b\r, reported as
                                 // KeyCode::Enter + KeyModifiers::ALT, which is what we check.
                                 // SHIFT is also accepted for terminals that implement it.
-                                if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                                if key
+                                    .modifiers
+                                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                                {
                                     // Shift+Enter / Alt(Option)+Enter: Insert newline (pass to textarea)
                                     tui.input_textarea.input(Event::Key(key));
                                     first_event_modified_input = true; // Mark for render
@@ -319,7 +322,10 @@ pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::Unbounde
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
                             Ok(Event::Key(key)) if key.code == KeyCode::Enter => {
-                                if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
+                                if key
+                                    .modifiers
+                                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                                {
                                     // Shift+Enter / Alt(Option)+Enter: Insert newline
                                     tui.input_textarea.input(Event::Key(key));
                                     had_input = true;

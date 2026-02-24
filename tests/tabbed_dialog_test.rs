@@ -61,13 +61,19 @@ fn test_tab_navigation() {
         Question {
             question: "Question 1?".to_string(),
             header: "Q1".to_string(),
-            options: vec![opt("Option A", "First option"), opt("Option B", "Second option")],
+            options: vec![
+                opt("Option A", "First option"),
+                opt("Option B", "Second option"),
+            ],
             multi_select: false,
         },
         Question {
             question: "Question 2?".to_string(),
             header: "Q2".to_string(),
-            options: vec![opt("Option X", "First option"), opt("Option Y", "Second option")],
+            options: vec![
+                opt("Option X", "First option"),
+                opt("Option Y", "Second option"),
+            ],
             multi_select: false,
         },
     ];
@@ -87,10 +93,7 @@ fn test_answer_submission() {
     let questions = vec![Question {
         question: "Pick one?".to_string(),
         header: "Choice".to_string(),
-        options: vec![
-            opt("Yes", "Affirmative"),
-            opt("No", "Negative"),
-        ],
+        options: vec![opt("Yes", "Affirmative"), opt("No", "Negative")],
         multi_select: false,
     }];
 
@@ -153,11 +156,7 @@ fn test_multi_select() {
     let questions = vec![Question {
         question: "Select multiple?".to_string(),
         header: "Multi".to_string(),
-        options: vec![
-            opt("A", "First"),
-            opt("B", "Second"),
-            opt("C", "Third"),
-        ],
+        options: vec![opt("A", "First"), opt("B", "Second"), opt("C", "Third")],
         multi_select: true,
     }];
 

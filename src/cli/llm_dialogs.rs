@@ -206,8 +206,7 @@ pub fn question_to_dialog(question: &Question) -> crate::cli::tui::Dialog {
         .options
         .iter()
         .map(|opt| {
-            let mut d =
-                DialogOption::with_description(opt.label.clone(), opt.description.clone());
+            let mut d = DialogOption::with_description(opt.label.clone(), opt.description.clone());
             if let Some(ref md) = opt.markdown {
                 d = d.with_markdown(md.clone());
             }
@@ -480,7 +479,10 @@ mod tests {
             markdown: None,
         };
         let json = serde_json::to_string(&opt).unwrap();
-        assert!(!json.contains("markdown"), "markdown key should be omitted when None");
+        assert!(
+            !json.contains("markdown"),
+            "markdown key should be omitted when None"
+        );
     }
 
     #[test]

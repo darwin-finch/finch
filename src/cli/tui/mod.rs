@@ -410,8 +410,7 @@ impl TuiRenderer {
             if let Ok(todo) = todo_arc.try_read() {
                 let active = todo.active_items();
                 if !active.is_empty() {
-                    let term_w =
-                        crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                    let term_w = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
                     for item in &active {
                         let (symbol, color) = match item.status {
                             crate::tools::todo::TodoStatus::InProgress => ("●", CYAN),
@@ -423,10 +422,8 @@ impl TuiRenderer {
                             _ => "",
                         };
                         // Truncate: "● " prefix (2 chars) + optional " [!]" suffix
-                        let max_content =
-                            term_w.saturating_sub(2 + priority_tag.len());
-                        let content: String =
-                            item.content.chars().take(max_content).collect();
+                        let max_content = term_w.saturating_sub(2 + priority_tag.len());
+                        let content: String = item.content.chars().take(max_content).collect();
                         execute!(
                             stdout,
                             Print(format!(
@@ -567,7 +564,11 @@ impl TuiRenderer {
             // that amount.  This correctly handles lines that wrap across multiple
             // terminal rows.
 
-            let cursor_prefix_vis = if cursor_row == 0 { prompt_vis_len } else { cont_vis_len };
+            let cursor_prefix_vis = if cursor_row == 0 {
+                prompt_vis_len
+            } else {
+                cont_vis_len
+            };
 
             // Which physical sub-row within cursor_row's logical line is the cursor on?
             let cursor_sub_row = if term_width > 0 {
@@ -581,11 +582,9 @@ impl TuiRenderer {
             let rows_in_cursor_line_below = phys_in_cursor_line.saturating_sub(1 + cursor_sub_row);
 
             // Physical rows in input lines that come after cursor_row.
-            let input_below_phys: usize = input_phys_rows
-                .iter()
-                .skip(cursor_row + 1)
-                .sum::<usize>()
-                + rows_in_cursor_line_below;
+            let input_below_phys: usize =
+                input_phys_rows.iter().skip(cursor_row + 1).sum::<usize>()
+                    + rows_in_cursor_line_below;
 
             let rows_below_cursor = input_below_phys + status_line_count;
             if rows_below_cursor > 0 {
@@ -691,7 +690,12 @@ impl TuiRenderer {
 // ─── Startup header ───────────────────────────────────────────────────────────
 
 impl TuiRenderer {
-    pub fn print_startup_header(&mut self, model: &str, cwd: &str, session_label: &str) -> Result<()> {
+    pub fn print_startup_header(
+        &mut self,
+        model: &str,
+        cwd: &str,
+        session_label: &str,
+    ) -> Result<()> {
         let version = env!("CARGO_PKG_VERSION");
 
         // Store session label so blit_visible_area() can embed it in the separator.
@@ -813,7 +817,9 @@ impl TuiRenderer {
                         // Shift+Enter or Alt/Option+Enter: insert newline instead of submit.
                         // Standard VT100 raw mode never sends SHIFT for Enter on macOS —
                         // Option+Enter arrives as KeyCode::Enter + KeyModifiers::ALT.
-                        (KeyCode::Enter, m) if m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                        (KeyCode::Enter, m)
+                            if m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                        {
                             self.input_textarea.input(Event::Key(key));
                         }
                         (KeyCode::Enter, _) => {
@@ -1039,9 +1045,7 @@ impl TuiRenderer {
                 }
                 if *allow_custom {
                     let is_on_other = *selected_index == options.len();
-                    rows += render_other_row_inline(
-                        stdout, inner, is_on_other, dialog,
-                    )?;
+                    rows += render_other_row_inline(stdout, inner, is_on_other, dialog)?;
                 }
             }
             DialogType::MultiSelect {
@@ -1067,9 +1071,7 @@ impl TuiRenderer {
                 }
                 if *allow_custom {
                     let is_on_other = *cursor_index == options.len();
-                    rows += render_other_row_inline(
-                        stdout, inner, is_on_other, dialog,
-                    )?;
+                    rows += render_other_row_inline(stdout, inner, is_on_other, dialog)?;
                 }
             }
             DialogType::Confirm {
@@ -1140,7 +1142,10 @@ impl TuiRenderer {
 
             // Strip leading/trailing blank lines and collect non-empty content
             let raw_lines: Vec<&str> = md.lines().collect();
-            let start = raw_lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+            let start = raw_lines
+                .iter()
+                .position(|l| !l.trim().is_empty())
+                .unwrap_or(0);
             let end = raw_lines
                 .iter()
                 .rposition(|l| !l.trim().is_empty())
@@ -1165,7 +1170,8 @@ impl TuiRenderer {
                     format!("│  {:<w$}  │\r\n", line, w = inner)
                 } else {
                     // Truncate by chars (ANSI codes make byte slicing unsafe)
-                    let truncated_line: String = line.chars().take(inner.saturating_sub(1)).collect();
+                    let truncated_line: String =
+                        line.chars().take(inner.saturating_sub(1)).collect();
                     format!("│  {}…  │\r\n", truncated_line)
                 };
                 execute!(stdout, Print(display))?;
@@ -1199,8 +1205,16 @@ impl TuiRenderer {
 
         if is_multiselect {
             // MultiSelect: [ Submit ]   [ Cancel ]
-            let submit_on = if cursor == submit_idx { "\x1b[1;36m" } else { DIM_GRAY };
-            let cancel_on = if cursor == cancel_idx { "\x1b[1;36m" } else { DIM_GRAY };
+            let submit_on = if cursor == submit_idx {
+                "\x1b[1;36m"
+            } else {
+                DIM_GRAY
+            };
+            let cancel_on = if cursor == cancel_idx {
+                "\x1b[1;36m"
+            } else {
+                DIM_GRAY
+            };
             let btn_row = format!(
                 "  {}[ Submit ]{}   {}[ Cancel ]{}",
                 submit_on, RESET, cancel_on, RESET
@@ -1218,7 +1232,11 @@ impl TuiRenderer {
             )?;
         } else if matches!(&dialog.dialog_type, DialogType::Select { .. }) {
             // Select: [ Cancel ]  (no Submit — Enter on an option submits directly)
-            let cancel_on = if cursor == cancel_idx { "\x1b[1;36m" } else { DIM_GRAY };
+            let cancel_on = if cursor == cancel_idx {
+                "\x1b[1;36m"
+            } else {
+                DIM_GRAY
+            };
             let btn_row = format!("  {}[ Cancel ]{}", cancel_on, RESET);
             let btn_vis = 12_usize; // "  [ Cancel ]" = 12 chars
             let hint = if dialog.custom_mode_active {
@@ -1729,7 +1747,10 @@ mod tests {
         let mut d = Dialog::select_with_custom("Title", vec![DialogOption::new("Option A")]);
         assert!(!d.custom_mode_active);
         d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
-        assert!(d.custom_mode_active, "pressing 'o' must activate custom input mode");
+        assert!(
+            d.custom_mode_active,
+            "pressing 'o' must activate custom input mode"
+        );
     }
 
     #[test]
@@ -1897,7 +1918,12 @@ mod tests {
         // Navigate down twice to reach "Other" (index 2 == options.len())
         d.handle_key_event(KeyEvent::from(KeyCode::Down));
         d.handle_key_event(KeyEvent::from(KeyCode::Down));
-        if let DialogType::Select { selected_index, options, .. } = &d.dialog_type {
+        if let DialogType::Select {
+            selected_index,
+            options,
+            ..
+        } = &d.dialog_type
+        {
             assert_eq!(
                 *selected_index,
                 options.len(),
@@ -1909,10 +1935,14 @@ mod tests {
         // other_row_parts must return the highlighted style for this state
         let options_len = if let DialogType::Select { options, .. } = &d.dialog_type {
             options.len()
-        } else { unreachable!() };
+        } else {
+            unreachable!()
+        };
         let selected_index = if let DialogType::Select { selected_index, .. } = &d.dialog_type {
             *selected_index
-        } else { unreachable!() };
+        } else {
+            unreachable!()
+        };
         let (ansi, _) = other_row_parts(selected_index == options_len);
         assert_eq!(
             ansi, "\x1b[1;36m",
@@ -1932,7 +1962,12 @@ mod tests {
         // Navigate down twice to reach "Other" (cursor_index 2 == options.len())
         d.handle_key_event(KeyEvent::from(KeyCode::Down));
         d.handle_key_event(KeyEvent::from(KeyCode::Down));
-        if let DialogType::MultiSelect { cursor_index, options, .. } = &d.dialog_type {
+        if let DialogType::MultiSelect {
+            cursor_index,
+            options,
+            ..
+        } = &d.dialog_type
+        {
             assert_eq!(
                 *cursor_index,
                 options.len(),
@@ -1942,9 +1977,16 @@ mod tests {
             panic!("expected MultiSelect dialog type");
         }
         // other_row_parts must return the highlighted style for this state
-        let (cursor_index, options_len) = if let DialogType::MultiSelect { cursor_index, options, .. } = &d.dialog_type {
+        let (cursor_index, options_len) = if let DialogType::MultiSelect {
+            cursor_index,
+            options,
+            ..
+        } = &d.dialog_type
+        {
             (*cursor_index, options.len())
-        } else { unreachable!() };
+        } else {
+            unreachable!()
+        };
         let (ansi, _) = other_row_parts(cursor_index == options_len);
         assert_eq!(
             ansi, "\x1b[1;36m",
@@ -1979,10 +2021,10 @@ mod tests {
         //   content_vis = 3 + input_text.chars().count()
         // Verify it holds for a range of inputs and cursor positions.
         let cases: &[(&str, usize)] = &[
-            ("hello", 5),   // cursor at end
-            ("hello", 0),   // cursor at start
-            ("hello", 2),   // cursor in middle
-            ("a",     1),
+            ("hello", 5), // cursor at end
+            ("hello", 0), // cursor at start
+            ("hello", 2), // cursor in middle
+            ("a", 1),
             ("abcdefgh", 8),
         ];
         for (input, cursor) in cases {
@@ -1990,10 +2032,15 @@ mod tests {
             let vis = visible_length(&s);
             let expected = 3 + input.chars().count();
             assert_eq!(
-                vis, expected,
+                vis,
+                expected,
                 "input={:?} cursor={}: visible_length={} but formula gives {} \
                  (off-by-one regression: old formula gave {})",
-                input, cursor, vis, expected, expected - 1
+                input,
+                cursor,
+                vis,
+                expected,
+                expected - 1
             );
         }
     }

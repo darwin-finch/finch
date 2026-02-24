@@ -457,7 +457,14 @@ impl EventLoop {
 
         // Attempt initial summary — populates on restart from previous memory
         if let Some(ref mem) = self.memory_system {
-            refresh_context_strip(mem, &self.session_label, &cwd, &self.status_bar, self.context_lines).await;
+            refresh_context_strip(
+                mem,
+                &self.session_label,
+                &cwd,
+                &self.status_bar,
+                self.context_lines,
+            )
+            .await;
         }
 
         // Render interval (100ms) - blit overwrites visible area with shadow buffer
@@ -1313,29 +1320,25 @@ impl EventLoop {
             // When summarization is enabled and messages have been dropped by the
             // sliding window, summarise them and inject as a prefix so the LLM
             // retains awareness of earlier turns.
-            let mut msgs = if enable_summarization
-                && max_verbatim > 0
-                && all_msgs.len() > max_verbatim
-            {
-                let drop_end = all_msgs.len() - max_verbatim;
-                // Clone the dropped slice so we can pass all_msgs by value to apply_sliding_window.
-                let dropped: Vec<_> = all_msgs[..drop_end].to_vec();
-                let window = apply_sliding_window(all_msgs, max_verbatim);
-                let compactor =
-                    crate::cli::conversation_compactor::ConversationCompactor::new(summary_gen);
-                compactor.compact(&dropped, window).await
-            } else {
-                apply_sliding_window(all_msgs, max_verbatim)
-            };
+            let mut msgs =
+                if enable_summarization && max_verbatim > 0 && all_msgs.len() > max_verbatim {
+                    let drop_end = all_msgs.len() - max_verbatim;
+                    // Clone the dropped slice so we can pass all_msgs by value to apply_sliding_window.
+                    let dropped: Vec<_> = all_msgs[..drop_end].to_vec();
+                    let window = apply_sliding_window(all_msgs, max_verbatim);
+                    let compactor =
+                        crate::cli::conversation_compactor::ConversationCompactor::new(summary_gen);
+                    compactor.compact(&dropped, window).await
+                } else {
+                    apply_sliding_window(all_msgs, max_verbatim)
+                };
             if let Some(ref mem) = memory_system {
                 if let Ok(memories) = mem.query(&query, Some(recall_k)).await {
                     if !memories.is_empty() {
                         memory_recall_count = memories.len();
                         let mem_block = memories.join("\n\n---\n\n");
                         // Inject into the last user message so the LLM sees the recalled context
-                        if let Some(last_user) =
-                            msgs.iter_mut().rev().find(|m| m.role == "user")
-                        {
+                        if let Some(last_user) = msgs.iter_mut().rev().find(|m| m.role == "user") {
                             if let Some(ContentBlock::Text { ref mut text }) =
                                 last_user.content.first_mut()
                             {
@@ -1564,10 +1567,20 @@ impl EventLoop {
                             if let Ok(stats) = mem.stats().await {
                                 status_bar.update_line(
                                     crate::cli::status_bar::StatusLineType::MemoryContext,
-                                    format!("🧠 recalled {}  ·  {} memories", memory_recall_count, stats.conversation_count),
+                                    format!(
+                                        "🧠 recalled {}  ·  {} memories",
+                                        memory_recall_count, stats.conversation_count
+                                    ),
                                 );
                             }
-                            refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
+                            refresh_context_strip(
+                                mem,
+                                &session_label,
+                                &cwd,
+                                &status_bar,
+                                context_lines,
+                            )
+                            .await;
                         }
                         tracing::debug!("[EVENT_LOOP] Tool executions spawned, returning");
                         return;
@@ -1613,7 +1626,14 @@ impl EventLoop {
                                 ),
                             );
                         }
-                        refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
+                        refresh_context_strip(
+                            mem,
+                            &session_label,
+                            &cwd,
+                            &status_bar,
+                            context_lines,
+                        )
+                        .await;
                     }
 
                     // Update context usage indicator (suppressed when auto-compact disabled)
@@ -1779,10 +1799,20 @@ impl EventLoop {
                         if let Ok(stats) = mem.stats().await {
                             status_bar.update_line(
                                 crate::cli::status_bar::StatusLineType::MemoryContext,
-                                format!("🧠 recalled {}  ·  {} memories", memory_recall_count, stats.conversation_count),
+                                format!(
+                                    "🧠 recalled {}  ·  {} memories",
+                                    memory_recall_count, stats.conversation_count
+                                ),
                             );
                         }
-                        refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
+                        refresh_context_strip(
+                            mem,
+                            &session_label,
+                            &cwd,
+                            &status_bar,
+                            context_lines,
+                        )
+                        .await;
                     }
                     return;
                 }
@@ -1819,7 +1849,8 @@ impl EventLoop {
                             ),
                         );
                     }
-                    refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
+                    refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines)
+                        .await;
                 }
             }
             Err(e) => {
@@ -3108,7 +3139,10 @@ mod tests {
         let elapsed_str = format_elapsed(secs);
         let tokens_str = format_token_count(tokens);
         let icon = THROB_FRAMES[1]; // "✳"
-        let status = format!("{} {}… ({} · ↓ {} tokens)", icon, verb, elapsed_str, tokens_str);
+        let status = format!(
+            "{} {}… ({} · ↓ {} tokens)",
+            icon, verb, elapsed_str, tokens_str
+        );
         assert_eq!(status, "✳ Thinking… (1m 15s · ↓ 1.6k tokens)");
     }
 
@@ -3444,7 +3478,9 @@ mod tests {
     #[test]
     fn test_sliding_window_trims_to_max_verbatim() {
         // 30 alternating messages, max 20 → 20 returned, first is user
-        let roles: Vec<&str> = (0..30).map(|i| if i % 2 == 0 { "user" } else { "assistant" }).collect();
+        let roles: Vec<&str> = (0..30)
+            .map(|i| if i % 2 == 0 { "user" } else { "assistant" })
+            .collect();
         let msgs = make_msgs(&roles);
         let result = apply_sliding_window(msgs, 20);
         assert_eq!(result.len(), 20);

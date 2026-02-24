@@ -133,8 +133,8 @@ async fn test_read_output_is_valid_json_roundtrip() {
 
     let raw = read.execute(serde_json::json!({}), &ctx).await.unwrap();
     // Must parse as a JSON array
-    let parsed: Vec<TodoItem> = serde_json::from_str(&raw)
-        .expect("TodoRead output must be valid JSON array of TodoItem");
+    let parsed: Vec<TodoItem> =
+        serde_json::from_str(&raw).expect("TodoRead output must be valid JSON array of TodoItem");
 
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0].id, "a");

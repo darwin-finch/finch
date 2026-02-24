@@ -184,7 +184,10 @@ mod tests {
             .execute(serde_json::json!({ "todos": [] }), &ctx)
             .await
             .unwrap();
-        assert!(result.contains("0 tasks") || result.contains("0 task"), "{result}");
+        assert!(
+            result.contains("0 tasks") || result.contains("0 task"),
+            "{result}"
+        );
         assert!(list.read().await.is_empty());
     }
 

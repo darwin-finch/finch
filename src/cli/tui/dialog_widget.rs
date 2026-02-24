@@ -718,8 +718,8 @@ mod tests {
                 DialogOption::new("B"),
                 DialogOption::new("C"),
             ],
-            0,     // selected_index
-            true,  // allow_custom
+            0,    // selected_index
+            true, // allow_custom
             &Some(String::new()),
             false, // custom_mode_active
             0,
@@ -755,8 +755,8 @@ mod tests {
         // selected_index = 1 = options.len() → Other row should be highlighted
         let lines = widget.render_select(
             &[DialogOption::new("A")],
-            1,     // selected_index == options.len()
-            true,  // allow_custom
+            1,    // selected_index == options.len()
+            true, // allow_custom
             &Some(String::new()),
             false, // custom_mode_active
             0,
@@ -769,7 +769,10 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("Other"));
 
-        assert!(other_span.is_some(), "Other span must exist in rendered lines");
+        assert!(
+            other_span.is_some(),
+            "Other span must exist in rendered lines"
+        );
         let span = other_span.unwrap();
         assert!(
             span.style.add_modifier.contains(Modifier::BOLD),

@@ -220,7 +220,9 @@ impl ClaudeProvider {
                                     match event.event_type.as_str() {
                                         "message_start" => {
                                             // Extract input_tokens from message.usage
-                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                            if let Ok(v) =
+                                                serde_json::from_str::<serde_json::Value>(json_str)
+                                            {
                                                 if let Some(n) = v
                                                     .get("message")
                                                     .and_then(|m| m.get("usage"))

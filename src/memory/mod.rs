@@ -311,11 +311,7 @@ impl MemorySystem {
 
         // Centroid queries for all windows except the last ("now") slot.
         for window in windows.iter().take(windows.len().saturating_sub(1)) {
-            let slice: Vec<&Vec<f32>> = leaves
-                .iter()
-                .take(*window)
-                .map(|(_, e, _)| *e)
-                .collect();
+            let slice: Vec<&Vec<f32>> = leaves.iter().take(*window).map(|(_, e, _)| *e).collect();
             let centroid = average_embeddings(&slice);
             if let Some((_, text, _)) = tree.retrieve(&centroid, 1).into_iter().next() {
                 let s = truncate_str(&text, 70);
@@ -558,7 +554,7 @@ mod tests {
         let ws = context_windows(2, 100);
         assert_eq!(ws.len(), 2);
         assert_eq!(ws[0], 100); // all leaves = overall
-        assert_eq!(ws[1], 3);   // most recent
+        assert_eq!(ws[1], 3); // most recent
     }
 
     #[test]

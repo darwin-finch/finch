@@ -3,8 +3,8 @@
 
 pub mod command_autocomplete;
 mod commands;
-pub mod conversation_compactor; // Infinite context: summarise dropped messages
 mod conversation;
+pub mod conversation_compactor; // Infinite context: summarise dropped messages
 pub mod global_output; // Phase 3.5: Global output system with macros
 mod input;
 pub mod llm_dialogs; // LLM-prompted user dialogs (AskUserQuestion)

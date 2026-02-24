@@ -6,11 +6,11 @@
 pub mod executor;
 pub mod implementations;
 pub mod mcp;
-pub mod todo;
 pub mod pattern_matcher;
 pub mod patterns;
 pub mod permissions;
 pub mod registry;
+pub mod todo;
 pub mod types;
 
 pub use executor::{generate_tool_signature, ApprovalSource, ToolExecutor, ToolSignature};

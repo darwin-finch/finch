@@ -193,7 +193,10 @@ mod tests {
         let msgs = vec![user("Q1"), user("Q2")];
         let out = format_messages_for_summary(&msgs);
         // Double newline between messages
-        assert!(out.contains("\n\n"), "messages should be separated by blank line: {out}");
+        assert!(
+            out.contains("\n\n"),
+            "messages should be separated by blank line: {out}"
+        );
     }
 
     // ── inject_summary_prefix ────────────────────────────────────────────────
