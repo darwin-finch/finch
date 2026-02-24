@@ -71,13 +71,20 @@ fn test_non_interactive_mode() {
 /// E2E: tool message format uses correct Unicode characters (⏺, ⎿)
 ///
 /// This verifies the fix for the old ●/└ characters that caused visual regressions.
-/// Tested via the public formatting functions directly (no terminal needed).
+/// Uses the WorkUnit API (the live rendering path) — no terminal needed.
 #[test]
 fn test_tool_display_uses_correct_unicode() {
-    use finch::cli::repl_event::tool_display::{format_tool_label, format_tool_result};
+    use finch::cli::messages::{Message, WorkUnit};
+    use finch::cli::repl_event::tool_display::format_tool_label;
+    use finch::config::ColorScheme;
 
     let label = format_tool_label("bash", &serde_json::json!({"command": "echo hi"}));
-    let result = format_tool_result(&label, "hi\n", false);
+    let unit = WorkUnit::new("Running");
+    let row_idx = unit.add_row(label);
+    unit.complete_row(row_idx, "hi");
+    unit.set_complete();
+
+    let result = unit.format(&ColorScheme::default());
 
     // Must use ⏺ (U+23FA) as bullet, NOT ● (U+25CF)
     assert!(

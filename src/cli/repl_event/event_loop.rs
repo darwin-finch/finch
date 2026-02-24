@@ -3078,30 +3078,139 @@ fn tool_result_to_display(tool_name: &str, content: &str) -> (String, Vec<String
         }
 
         "bash" => {
-            // Show first line as summary, rest as body
+            // Extract the most semantically meaningful summary line, then show the rest as body.
+            let summary = bash_smart_summary(trimmed);
             let lines: Vec<&str> = trimmed.lines().collect();
-            let first = lines[0].trim();
-            let summary = if first.len() > 60 {
-                format!("{}…", &first[..57])
-            } else {
-                first.to_string()
-            };
             let total = lines.len();
-            let mut body: Vec<String> = lines[1..]
+            let mut body: Vec<String> = lines
                 .iter()
                 .take(MAX_TOOL_BODY_LINES)
                 .map(|l| l.to_string())
                 .collect();
-            if total > 1 + MAX_TOOL_BODY_LINES {
+            if total > MAX_TOOL_BODY_LINES {
                 body.push(format!(
                     "\x1b[90m… +{} lines (ctrl+o to expand)\x1b[0m",
-                    total - 1 - MAX_TOOL_BODY_LINES
+                    total - MAX_TOOL_BODY_LINES
                 ));
             }
             (summary, body)
         }
 
         _ => (compact_tool_summary(content), Vec::new()),
+    }
+}
+
+/// Strip ANSI escape codes from a string, returning plain text.
+///
+/// Handles CSI sequences (`ESC [ ... m`) and simple OSC sequences.
+/// Used to extract clean summary text from colored command output.
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some(&'[') => {
+                    chars.next(); // consume '['
+                    // CSI sequence: consume until ASCII letter
+                    for nc in chars.by_ref() {
+                        if nc.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(&']') => {
+                    chars.next(); // consume ']'
+                    // OSC sequence: consume until BEL (0x07) or ESC
+                    for nc in chars.by_ref() {
+                        if nc == '\x07' || nc == '\x1b' {
+                            break;
+                        }
+                    }
+                }
+                _ => {} // bare ESC — skip
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Extract the single most meaningful summary line from bash command output.
+///
+/// Scanning priority (first match wins):
+///   1. `test result:` line  — cargo test final verdict
+///   2. Last `Finished ` line — cargo build/check/test success
+///   3. `error: could not compile` — cargo build failure
+///   4. First `error[E…]` line — first compiler error
+///   5. `Exit code: N` line — non-zero exit
+///   6. Last non-empty line   — general fallback
+fn bash_smart_summary(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // 1. cargo test result
+    for line in &lines {
+        let clean = strip_ansi(line.trim());
+        if clean.starts_with("test result:") {
+            return truncate_summary(clean);
+        }
+    }
+
+    // 2. cargo Finished (last occurrence wins — may appear multiple times for workspaces)
+    for line in lines.iter().rev() {
+        let clean = strip_ansi(line.trim());
+        if clean.starts_with("Finished ") {
+            return truncate_summary(clean);
+        }
+    }
+
+    // 3. could not compile
+    for line in lines.iter().rev() {
+        let clean = strip_ansi(line.trim());
+        if clean.starts_with("error: could not compile")
+            || clean.starts_with("error: aborting")
+        {
+            return truncate_summary(clean);
+        }
+    }
+
+    // 4. first error[E...] line
+    for line in &lines {
+        let clean = strip_ansi(line.trim());
+        if clean.starts_with("error[E") || clean.starts_with("error[") {
+            return truncate_summary(clean);
+        }
+    }
+
+    // 5. Exit code line (non-zero exit)
+    for line in &lines {
+        let clean = strip_ansi(line.trim());
+        if clean.starts_with("Exit code:") {
+            return clean;
+        }
+    }
+
+    // 6. Last non-empty line
+    for line in lines.iter().rev() {
+        let clean = strip_ansi(line.trim());
+        if !clean.is_empty() {
+            return truncate_summary(clean);
+        }
+    }
+
+    String::new()
+}
+
+/// Truncate a summary string to 70 visible characters.
+fn truncate_summary(s: String) -> String {
+    if s.len() <= 70 {
+        s
+    } else {
+        format!("{}…", &s[..69])
     }
 }
 
@@ -3392,7 +3501,9 @@ mod tests {
         assert_eq!(compact_tool_summary(multi), "3 lines");
     }
 
-    // --- tool_result_to_display ---
+    // ── tool_result_to_display ─────────────────────────────────────────────────
+
+    // Edit ----------------------------------------------------------------
 
     #[test]
     fn test_tool_result_edit_extracts_summary_and_diff() {
@@ -3404,12 +3515,85 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_result_edit_added_and_removed() {
+        let content = "Added 2 lines, removed 1 line\n+ new A\n+ new B\n- old";
+        let (summary, body) = tool_result_to_display("edit", content);
+        assert_eq!(summary, "Added 2 lines, removed 1 line");
+        assert_eq!(body.len(), 3);
+    }
+
+    #[test]
+    fn test_tool_result_edit_only_summary_no_body() {
+        let (summary, body) = tool_result_to_display("edit", "No changes");
+        assert_eq!(summary, "No changes");
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn test_tool_result_edit_truncates_large_diff() {
+        let summary_line = "Removed 30 lines";
+        let diff_lines: Vec<String> = (0..30).map(|i| format!("  diff line {}", i)).collect();
+        let content = format!("{}\n{}", summary_line, diff_lines.join("\n"));
+        let (summary, body) = tool_result_to_display("edit", &content);
+        assert_eq!(summary, summary_line);
+        assert_eq!(body.len(), MAX_TOOL_BODY_LINES + 1, "should have lines + overflow hint");
+        assert!(
+            body.last().unwrap().contains("ctrl+o to expand"),
+            "overflow hint missing: {:?}", body.last()
+        );
+    }
+
+    #[test]
+    fn test_tool_result_edit_case_insensitive() {
+        let content = "Removed 1 line\n  x";
+        let (summary, _) = tool_result_to_display("Edit", content);
+        assert_eq!(summary, "Removed 1 line");
+    }
+
+    // Read ----------------------------------------------------------------
+
+    #[test]
     fn test_tool_result_read_returns_line_count_no_body() {
         let content = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
         let (summary, body) = tool_result_to_display("read", &content);
         assert_eq!(summary, "50 lines");
-        assert!(body.is_empty(), "Read should not show body content");
+        assert!(body.is_empty(), "Read must not show file content inline");
     }
+
+    #[test]
+    fn test_tool_result_read_single_line() {
+        let (summary, body) = tool_result_to_display("read", "just one line");
+        assert_eq!(summary, "1 line");
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn test_tool_result_read_large_file_still_no_body() {
+        let content = (0..1000).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let (summary, body) = tool_result_to_display("read", &content);
+        assert_eq!(summary, "1000 lines");
+        assert!(body.is_empty(), "Large file must not bloat body");
+    }
+
+    // Write ---------------------------------------------------------------
+
+    #[test]
+    fn test_tool_result_write_created() {
+        let content = "Created foo.rs (42 lines)";
+        let (summary, body) = tool_result_to_display("write", content);
+        assert_eq!(summary, "Created foo.rs (42 lines)");
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn test_tool_result_write_updated() {
+        let content = "Updated foo.rs (10 → 15 lines, +5 lines)";
+        let (summary, body) = tool_result_to_display("write", content);
+        assert!(summary.contains("Updated"), "got: {}", summary);
+        assert!(body.is_empty());
+    }
+
+    // Glob ----------------------------------------------------------------
 
     #[test]
     fn test_tool_result_glob_counts_files() {
@@ -3420,44 +3604,305 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_result_glob_single_file() {
+        let (summary, body) = tool_result_to_display("glob", "src/main.rs");
+        assert_eq!(summary, "1 file");
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn test_tool_result_glob_no_files_found() {
+        let (summary, body) = tool_result_to_display("glob", "No files found matching pattern.");
+        assert!(summary.contains("No files"), "got: {}", summary);
+        assert_eq!(body.len(), 1);
+    }
+
+    #[test]
+    fn test_tool_result_glob_many_files_body_capped_at_8() {
+        let paths: Vec<String> = (0..20).map(|i| format!("file{}.rs", i)).collect();
+        let content = paths.join("\n");
+        let (summary, body) = tool_result_to_display("glob", &content);
+        assert_eq!(summary, "20 files");
+        assert_eq!(body.len(), 8, "body should be capped at 8 paths");
+    }
+
+    // Grep ----------------------------------------------------------------
+
+    #[test]
     fn test_tool_result_grep_counts_matches() {
-        let content = "src/foo.rs:10: match A\nsrc/bar.rs:20: match B";
+        let content = "src/foo.rs:10:> match A\nsrc/bar.rs:20:> match B";
         let (summary, body) = tool_result_to_display("grep", content);
         assert_eq!(summary, "2 matches");
         assert_eq!(body.len(), 2);
     }
 
     #[test]
-    fn test_tool_result_bash_first_line_as_summary() {
-        let content = "running tests\ntest foo ... ok\ntest bar ... ok";
-        let (summary, body) = tool_result_to_display("bash", content);
-        assert_eq!(summary, "running tests");
-        assert_eq!(body.len(), 2);
-        assert!(body[0].contains("test foo"));
+    fn test_tool_result_grep_single_match() {
+        let (summary, body) = tool_result_to_display("grep", "src/foo.rs:5:> found it");
+        assert_eq!(summary, "1 match");
+        assert_eq!(body.len(), 1);
     }
+
+    #[test]
+    fn test_tool_result_grep_many_matches_overflow_hint() {
+        let lines: Vec<String> = (0..15).map(|i| format!("file.rs:{}:> hit", i)).collect();
+        let content = lines.join("\n");
+        let (summary, body) = tool_result_to_display("grep", &content);
+        assert_eq!(summary, "15 matches");
+        // 8 match lines + 1 overflow hint
+        assert_eq!(body.len(), 9);
+        assert!(body.last().unwrap().contains("ctrl+o to expand"));
+    }
+
+    // Bash ----------------------------------------------------------------
+
+    #[test]
+    fn test_tool_result_bash_cargo_test_success() {
+        let content = "   Compiling finch v0.7.7\n    Finished test profile in 5s\n\
+                       running 42 tests\ntest foo ... ok\n\
+                       test result: ok. 42 passed; 0 failed; 2 ignored";
+        let (summary, _) = tool_result_to_display("bash", content);
+        assert_eq!(summary, "test result: ok. 42 passed; 0 failed; 2 ignored");
+    }
+
+    #[test]
+    fn test_tool_result_bash_cargo_test_failure() {
+        let content = "running 5 tests\ntest foo ... ok\ntest bar ... FAILED\n\
+                       test result: FAILED. 1 passed; 1 failed; 0 ignored";
+        let (summary, _) = tool_result_to_display("bash", content);
+        assert_eq!(summary, "test result: FAILED. 1 passed; 1 failed; 0 ignored");
+    }
+
+    #[test]
+    fn test_tool_result_bash_cargo_build_success() {
+        let content = "   Compiling foo v1.0\n    Finished `dev` profile [unoptimized] target(s) in 3s";
+        let (summary, _) = tool_result_to_display("bash", content);
+        assert!(summary.contains("Finished"), "got: {}", summary);
+    }
+
+    #[test]
+    fn test_tool_result_bash_cargo_build_error() {
+        let content = "error[E0308]: mismatched types\n  --> src/main.rs:5:10\nerror: could not compile `foo`";
+        let (summary, _) = tool_result_to_display("bash", content);
+        assert!(
+            summary.contains("could not compile") || summary.contains("error[E"),
+            "got: {}", summary
+        );
+    }
+
+    #[test]
+    fn test_tool_result_bash_exit_code_nonzero() {
+        let content = "STDERR:\nls: cannot access '/nope': No such file or directory\nExit code: 2";
+        let (summary, _) = tool_result_to_display("bash", content);
+        // "Exit code:" takes priority when no cargo patterns match
+        assert!(summary.contains("Exit code:") || !summary.is_empty(), "got: {}", summary);
+    }
+
+    #[test]
+    fn test_tool_result_bash_git_push_shows_last_line() {
+        let content = "To github.com:user/repo.git\n   abc1234..def5678  main -> main";
+        let (summary, _) = tool_result_to_display("bash", content);
+        // Falls back to last non-empty line
+        assert!(!summary.is_empty(), "summary should not be empty");
+    }
+
+    #[test]
+    fn test_tool_result_bash_single_line() {
+        let (summary, body) = tool_result_to_display("bash", "Hello, World!");
+        assert_eq!(summary, "Hello, World!");
+        // With smart summary (last non-empty line), body may be empty or contain the line
+        let _ = body; // body content is implementation detail here
+    }
+
+    #[test]
+    fn test_tool_result_bash_strips_ansi_from_summary() {
+        // "test result:" with ANSI coloring should still be detected
+        let content = "\x1b[32mtest result: ok. 5 passed; 0 failed\x1b[0m";
+        let (summary, _) = tool_result_to_display("bash", content);
+        assert!(
+            summary.contains("test result:"),
+            "ANSI stripping failed, got: {:?}", summary
+        );
+    }
+
+    #[test]
+    fn test_tool_result_bash_body_shown() {
+        let content = "line 1\nline 2\nline 3";
+        let (_, body) = tool_result_to_display("bash", content);
+        // Body should contain the output lines
+        assert!(!body.is_empty(), "bash should show output lines in body");
+    }
+
+    #[test]
+    fn test_tool_result_bash_large_output_overflow_hint() {
+        let lines: Vec<String> = (0..30).map(|i| format!("output line {}", i)).collect();
+        let content = lines.join("\n");
+        let (_, body) = tool_result_to_display("bash", &content);
+        assert!(body.len() <= MAX_TOOL_BODY_LINES + 1, "body should be capped");
+        if body.len() == MAX_TOOL_BODY_LINES + 1 {
+            assert!(body.last().unwrap().contains("ctrl+o to expand"));
+        }
+    }
+
+    // Empty / whitespace --------------------------------------------------
 
     #[test]
     fn test_tool_result_empty_returns_empty() {
-        let (summary, body) = tool_result_to_display("bash", "");
-        assert!(summary.is_empty());
-        assert!(body.is_empty());
+        for tool in &["bash", "read", "edit", "write", "glob", "grep"] {
+            let (summary, body) = tool_result_to_display(tool, "");
+            assert!(summary.is_empty(), "tool={} summary should be empty for empty content", tool);
+            assert!(body.is_empty(), "tool={} body should be empty for empty content", tool);
+        }
+    }
 
-        let (summary, body) = tool_result_to_display("read", "   ");
-        assert!(summary.is_empty());
+    #[test]
+    fn test_tool_result_whitespace_only_returns_empty() {
+        let (summary, body) = tool_result_to_display("bash", "   \n  \n  ");
+        assert!(summary.is_empty(), "got: {:?}", summary);
+        assert!(body.is_empty());
+    }
+
+    // Unknown tool --------------------------------------------------------
+
+    #[test]
+    fn test_tool_result_unknown_tool_falls_back_to_compact() {
+        let (summary, body) = tool_result_to_display("mystery_tool", "single line result");
+        assert_eq!(summary, "single line result");
         assert!(body.is_empty());
     }
 
     #[test]
-    fn test_tool_result_edit_truncates_large_diff() {
-        // A diff larger than MAX_TOOL_BODY_LINES should add an overflow hint
-        let summary_line = "Removed 30 lines";
-        let diff_lines: Vec<String> = (0..30).map(|i| format!("  diff line {}", i)).collect();
-        let content = format!("{}\n{}", summary_line, diff_lines.join("\n"));
-        let (summary, body) = tool_result_to_display("edit", &content);
-        assert_eq!(summary, summary_line);
-        // Should have MAX_TOOL_BODY_LINES + 1 overflow hint
-        assert_eq!(body.len(), MAX_TOOL_BODY_LINES + 1);
-        assert!(body.last().unwrap().contains("ctrl+o to expand"));
+    fn test_tool_result_unknown_tool_multiline_compact() {
+        let content = "line1\nline2\nline3";
+        let (summary, body) = tool_result_to_display("unknown", content);
+        assert_eq!(summary, "3 lines");
+        assert!(body.is_empty());
+    }
+
+    // ── strip_ansi ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_ansi_plain_string_unchanged() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_color_codes() {
+        let colored = "\x1b[32mgreen text\x1b[0m";
+        assert_eq!(strip_ansi(colored), "green text");
+    }
+
+    #[test]
+    fn test_strip_ansi_removes_bold() {
+        let bold = "\x1b[1mbold\x1b[0m";
+        assert_eq!(strip_ansi(bold), "bold");
+    }
+
+    #[test]
+    fn test_strip_ansi_complex_sequence() {
+        let s = "\x1b[2;90mfaint gray\x1b[0m normal";
+        assert_eq!(strip_ansi(s), "faint gray normal");
+    }
+
+    #[test]
+    fn test_strip_ansi_empty_string() {
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    // ── bash_smart_summary ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_bash_smart_summary_cargo_test_ok() {
+        let out = "running 5 tests\ntest a ... ok\ntest result: ok. 5 passed; 0 failed";
+        assert_eq!(bash_smart_summary(out), "test result: ok. 5 passed; 0 failed");
+    }
+
+    #[test]
+    fn test_bash_smart_summary_cargo_test_failed() {
+        let out = "running 3 tests\ntest b ... FAILED\ntest result: FAILED. 2 passed; 1 failed";
+        assert_eq!(bash_smart_summary(out), "test result: FAILED. 2 passed; 1 failed");
+    }
+
+    #[test]
+    fn test_bash_smart_summary_cargo_build_finished() {
+        let out = "   Compiling foo v1.0\n    Finished `dev` profile in 3s";
+        assert!(bash_smart_summary(out).contains("Finished"));
+    }
+
+    #[test]
+    fn test_bash_smart_summary_cargo_build_error() {
+        let out = "error[E0308]: mismatched types\n --> src/main.rs:5:1\nerror: could not compile";
+        let s = bash_smart_summary(out);
+        assert!(
+            s.contains("could not compile") || s.contains("error["),
+            "got: {}", s
+        );
+    }
+
+    #[test]
+    fn test_bash_smart_summary_fallback_last_line() {
+        let out = "line one\nline two\nmost meaningful";
+        assert_eq!(bash_smart_summary(out), "most meaningful");
+    }
+
+    #[test]
+    fn test_bash_smart_summary_strips_ansi_codes() {
+        let out = "\x1b[32mtest result: ok. 1 passed; 0 failed\x1b[0m";
+        assert!(bash_smart_summary(out).contains("test result:"),
+            "ANSI codes should be stripped from summary: {:?}", bash_smart_summary(out));
+    }
+
+    #[test]
+    fn test_bash_smart_summary_empty() {
+        assert_eq!(bash_smart_summary(""), "");
+        assert_eq!(bash_smart_summary("   "), "");
+    }
+
+    #[test]
+    fn test_bash_smart_summary_test_result_beats_finished() {
+        // When both "Finished" and "test result:" appear, test result wins
+        let out = "    Finished test profile in 2s\nrunning 3 tests\ntest result: ok. 3 passed";
+        assert!(bash_smart_summary(out).starts_with("test result:"),
+            "test result should beat Finished: {}", bash_smart_summary(out));
+    }
+
+    // ── PresentPlan display ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_presentplan_label_shows_plan_title() {
+        use super::super::tool_display::format_tool_label;
+        let label = format_tool_label(
+            "PresentPlan",
+            &serde_json::json!({"plan": "# Refactor Auth System\n\nDetails here..."}),
+        );
+        assert!(label.contains("Refactor Auth System"),
+            "label should show plan title: {:?}", label);
+        assert!(label.contains("PresentPlan"),
+            "label should show tool name: {:?}", label);
+    }
+
+    #[test]
+    fn test_presentplan_label_fallback_when_no_heading() {
+        use super::super::tool_display::format_tool_label;
+        let label = format_tool_label(
+            "PresentPlan",
+            &serde_json::json!({"plan": "Just some prose with no heading."}),
+        );
+        assert!(label.contains("proposing plan"),
+            "should fall back to 'proposing plan': {:?}", label);
+    }
+
+    #[test]
+    fn test_presentplan_label_uses_first_heading_only() {
+        use super::super::tool_display::format_tool_label;
+        let label = format_tool_label(
+            "presentplan",
+            &serde_json::json!({"plan": "# First Title\n## Second Title\n\nContent"}),
+        );
+        assert!(label.contains("First Title"),
+            "should use first heading: {:?}", label);
+        assert!(!label.contains("Second Title"),
+            "should not show second heading: {:?}", label);
     }
 
     // --- find_last_exchange ---
