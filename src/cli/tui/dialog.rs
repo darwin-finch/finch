@@ -999,4 +999,33 @@ mod tests {
         let dialog = Dialog::select("T", vec![DialogOption::new("A")]);
         assert!(dialog.help_message.is_none());
     }
+
+    // ─── regression tests for #18 ────────────────────────────────────────────
+
+    /// Regression #18: Esc in custom mode must return None (not Cancelled),
+    /// keeping the dialog open and only exiting custom input mode.
+    #[test]
+    fn test_custom_mode_esc_exits_mode_not_dialog() {
+        let mut d = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(d.custom_mode_active);
+        let result = d.handle_key_event(KeyEvent::from(KeyCode::Esc));
+        assert!(
+            result.is_none(),
+            "Esc in custom mode must return None, not Cancelled: {:?}",
+            result
+        );
+        assert!(!d.custom_mode_active, "Custom mode must be inactive after Esc");
+    }
+
+    /// Regression #18: allow_custom=false must not activate custom mode on 'o'.
+    #[test]
+    fn test_custom_mode_not_activated_when_disallowed() {
+        let mut d = Dialog::select("T", vec![DialogOption::new("A")]);
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(
+            !d.custom_mode_active,
+            "Custom mode must not activate when allow_custom=false"
+        );
+    }
 }

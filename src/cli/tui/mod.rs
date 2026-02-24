@@ -945,7 +945,7 @@ impl TuiRenderer {
             DialogType::Select {
                 options,
                 selected_index,
-                ..
+                allow_custom,
             } => {
                 for (i, opt) in options.iter().enumerate() {
                     let marker = if i == *selected_index { "●" } else { "○" };
@@ -962,12 +962,26 @@ impl TuiRenderer {
                     )?;
                     rows += 1;
                 }
+                if *allow_custom {
+                    let other_label = "  ◌ Other (custom response)";
+                    execute!(
+                        stdout,
+                        Print(format!(
+                            "│  {}{:<w$}{}  │\r\n",
+                            DIM_GRAY,
+                            other_label,
+                            RESET,
+                            w = inner
+                        ))
+                    )?;
+                    rows += 1;
+                }
             }
             DialogType::MultiSelect {
                 options,
                 selected_indices,
                 cursor_index,
-                ..
+                allow_custom,
             } => {
                 for (i, opt) in options.iter().enumerate() {
                     let checked = if selected_indices.contains(&i) {
@@ -981,6 +995,20 @@ impl TuiRenderer {
                     execute!(
                         stdout,
                         Print(format!("│  {}{:<w$}{}  │\r\n", on, label, off, w = inner))
+                    )?;
+                    rows += 1;
+                }
+                if *allow_custom {
+                    let other_label = "  ◌ Other (custom response)";
+                    execute!(
+                        stdout,
+                        Print(format!(
+                            "│  {}{:<w$}{}  │\r\n",
+                            DIM_GRAY,
+                            other_label,
+                            RESET,
+                            w = inner
+                        ))
                     )?;
                     rows += 1;
                 }
@@ -1029,8 +1057,15 @@ impl TuiRenderer {
         } // end else (custom_mode_active)
 
         execute!(stdout, Print(format!("{}\r\n", div)))?;
+        let allow_custom = matches!(
+            &dialog.dialog_type,
+            DialogType::Select { allow_custom: true, .. }
+                | DialogType::MultiSelect { allow_custom: true, .. }
+        );
         let help = if dialog.custom_mode_active {
-            "Enter Submit  Esc Cancel"
+            "Enter Submit  Esc Cancel mode"
+        } else if allow_custom {
+            "↑/↓ Navigate  Enter Select  o: Other  Esc Cancel"
         } else {
             "↑/↓ Navigate  Enter Select  Esc Cancel"
         };
@@ -1064,10 +1099,25 @@ impl TuiRenderer {
                 if let Event::Key(key) = event::read()? {
                     match (key.code, key.modifiers) {
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            self.active_dialog = None;
-                            self.erase_live_area()?;
-                            self.draw_live_area()?;
-                            return Ok(DialogResult::Cancelled);
+                            let is_custom_mode = self
+                                .active_dialog
+                                .as_ref()
+                                .is_some_and(|d| d.custom_mode_active);
+                            let is_plain_esc = matches!(key.code, KeyCode::Esc);
+
+                            if is_custom_mode && is_plain_esc {
+                                // Exit custom mode, keep dialog open
+                                if let Some(ref mut d) = self.active_dialog {
+                                    d.handle_key_event(key);
+                                }
+                                self.erase_live_area()?;
+                                self.draw_live_area()?;
+                            } else {
+                                self.active_dialog = None;
+                                self.erase_live_area()?;
+                                self.draw_live_area()?;
+                                return Ok(DialogResult::Cancelled);
+                            }
                         }
                         _ => {
                             let result = self
