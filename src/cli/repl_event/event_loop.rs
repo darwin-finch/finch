@@ -2776,8 +2776,12 @@ async fn handle_present_plan(
             tui.active_dialog = None;
             break result;
         }
-        // Re-render so the dialog stays visible while we wait
-        let _ = tui.draw_live_area();
+        // Do NOT call draw_live_area() here.  The main event loop's render
+        // tick already calls flush_output_safe() → erase_live_area() +
+        // draw_live_area() on its own interval.  Calling draw_live_area()
+        // here WITHOUT erase_live_area() prints the dialog box to stdout on
+        // every 50ms tick, permanently pushing each copy into terminal
+        // scrollback and producing the cascading duplicates the user sees.
     };
 
     // Handle dialog result
