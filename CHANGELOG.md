@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-02-24
+
 ### Added
 - **Neural ONNX embeddings for memory** (`src/memory/neural_embedding.rs`): `all-MiniLM-L6-v2`
   sentence transformer (Apache 2.0, ~23MB quantized) runs in-process via ONNX Runtime to
@@ -31,6 +33,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `bash` — Bash only
   Subagents cannot call `spawn_task` recursively. Multiple `spawn_task` calls in one
   model response can be executed in parallel by the executor.
+- **`TodoWrite` / `TodoRead` tools + live task list in TUI** (issue #32): the model can
+  maintain a persistent in-session task list. `TodoWrite` atomically replaces the list;
+  `TodoRead` returns all items as JSON. Active items (in-progress then pending, high priority
+  first) are rendered live in the TUI between the spinner and the CWD separator.
+  Both tools are auto-approved (pure in-memory, no filesystem side effects).
+- **Configurable context-strip depth** (`config.features.memory_context_lines`, default 4,
+  range 1–8): depth-sliced MemTree centroid summaries populate the status strip at multiple
+  time-window granularities. Adjustable in the setup wizard Settings screen with `◀ N ▶`.
+- **Input token count in spinner** (`↑ N.Nk`): the Anthropic SSE `message_start` event
+  carries the exact prompt token count; it is now captured and shown in the status bar
+  throughout streaming (e.g. `✳ Thinking… (3s · ↑ 1.2k · thinking)`). Degrades gracefully
+  for providers that don't emit usage events.
+- **Rotating spinner verb**: the 27-word verb list (Analyzing, Brainstorming, Building, …)
+  is cycled round-robin per WorkUnit via a global `AtomicUsize` counter — no extra dependency.
+
+### Fixed
+- **`AskUserQuestion` "Other" option invisible** (#18): the `◌ Other (custom response)` row
+  is now rendered at the bottom of Select/MultiSelect option lists when `allow_custom=true`.
+  Help text updated to show `o: Other`. Esc while typing a custom response now exits custom
+  input mode instead of cancelling the whole dialog; Ctrl+C still cancels unconditionally.
+- **Multi-question dialog shows only first question** (#19): `render_content()` now iterates
+  all tabs and renders each question's full text and options simultaneously. Numbered section
+  headers (bold = active, dimmed = others) replace the old tab strip; `────` separators
+  appear between consecutive questions. Help text updated: "Switch tabs" → "Switch question".
+- **`PresentPlan` and `AskUserQuestion` blocked in planning mode**: both tools were missing
+  from the allowed-tool list in `is_tool_allowed_in_mode`, causing a hard error when the
+  model tried to present its plan or ask a clarifying question.
+- **Option+Enter inserts newline** (was broken on macOS): standard VT100 raw mode never sets
+  SHIFT for Enter; Option+Enter arrives as `KeyModifiers::ALT`. Modifier check changed from
+  `contains(SHIFT)` to `intersects(SHIFT | ALT)` in both the async and blocking input paths.
+- **Status strip always visible**: conversation topic/focus lines are no longer erased when
+  the MemTree summary returns `None` — values persist between queries. Strip also updates
+  during agentic (tool-calling) turns, not just after final responses.
 
 ## [0.6.0] - 2026-02-22
 
@@ -279,7 +314,10 @@ Initial release of Shammah - Local-first AI coding assistant.
 - Model caching (~/.cache/huggingface/hub/)
 - Adapter storage (~/.finch/adapters/)
 
-[0.5.1]: https://github.com/darwin-finch/finch/compare/v0.5.0...HEAD
+[0.7.0]: https://github.com/darwin-finch/finch/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/darwin-finch/finch/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/darwin-finch/finch/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/darwin-finch/finch/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/darwin-finch/finch/compare/v0.2.2...v0.5.0
 [0.2.2]: https://github.com/darwin-finch/finch/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/darwin-finch/finch/compare/v0.2.0...v0.2.1
