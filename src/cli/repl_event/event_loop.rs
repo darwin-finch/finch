@@ -231,6 +231,10 @@ pub struct EventLoop {
 
     /// Session task list shared with TodoWrite / TodoRead tools
     todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
+
+    /// Whether to summarise dropped messages (Infinite Context Phase 2).
+    /// From config.features.enable_summarization.
+    enable_summarization: bool,
 }
 
 /// View mode for the REPL
@@ -268,6 +272,7 @@ impl EventLoop {
         max_verbatim_messages: usize,
         context_recall_k: usize,
         todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
+        enable_summarization: bool,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -344,6 +349,7 @@ impl EventLoop {
             max_verbatim_messages,
             context_recall_k,
             todo_list,
+            enable_summarization,
         }
     }
 
@@ -1174,6 +1180,10 @@ impl EventLoop {
         let context_lines = self.context_lines;
         let max_verbatim = self.max_verbatim_messages;
         let recall_k = self.context_recall_k;
+        let enable_summarization = self.enable_summarization;
+        // Keep a reference to the cloud generator for summarisation calls
+        // (we always want a capable model for summarisation, regardless of routing).
+        let summary_gen = Arc::clone(&claude_gen);
 
         tokio::spawn(async move {
             Self::process_query_with_tools(
@@ -1199,6 +1209,8 @@ impl EventLoop {
                 context_lines,
                 max_verbatim,
                 recall_k,
+                enable_summarization,
+                summary_gen,
             )
             .await;
         });
@@ -1241,6 +1253,8 @@ impl EventLoop {
         context_lines: usize,
         max_verbatim: usize,
         recall_k: usize,
+        enable_summarization: bool,
+        summary_gen: Arc<dyn Generator>,
     ) {
         tracing::debug!(
             "process_query_with_tools starting for query_id: {:?}",
@@ -1286,7 +1300,23 @@ impl EventLoop {
         let mut memory_recall_count: usize = 0;
         let messages = {
             let all_msgs = conversation.read().await.get_messages();
-            let mut msgs = apply_sliding_window(all_msgs, max_verbatim);
+            // When summarization is enabled and messages have been dropped by the
+            // sliding window, summarise them and inject as a prefix so the LLM
+            // retains awareness of earlier turns.
+            let mut msgs = if enable_summarization
+                && max_verbatim > 0
+                && all_msgs.len() > max_verbatim
+            {
+                let drop_end = all_msgs.len() - max_verbatim;
+                // Clone the dropped slice so we can pass all_msgs by value to apply_sliding_window.
+                let dropped: Vec<_> = all_msgs[..drop_end].to_vec();
+                let window = apply_sliding_window(all_msgs, max_verbatim);
+                let compactor =
+                    crate::cli::conversation_compactor::ConversationCompactor::new(summary_gen);
+                compactor.compact(&dropped, window).await
+            } else {
+                apply_sliding_window(all_msgs, max_verbatim)
+            };
             if let Some(ref mem) = memory_system {
                 if let Ok(memories) = mem.query(&query, Some(recall_k)).await {
                     if !memories.is_empty() {

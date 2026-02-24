@@ -408,6 +408,7 @@ async fn main() -> Result<()> {
                             memory_context_lines: result.memory_context_lines,
                             max_verbatim_messages: new_config.features.max_verbatim_messages,
                             context_recall_k: new_config.features.context_recall_k,
+                            enable_summarization: new_config.features.enable_summarization,
                         };
                         if daemon_only_mode {
                             new_config.server.mode = "daemon-only".to_string();
@@ -1343,6 +1344,7 @@ async fn run_setup() -> Result<()> {
         memory_context_lines: result.memory_context_lines,
         max_verbatim_messages: config.features.max_verbatim_messages,
         context_recall_k: config.features.context_recall_k,
+        enable_summarization: config.features.enable_summarization,
     };
     #[allow(deprecated)]
     {

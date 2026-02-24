@@ -104,6 +104,46 @@ fn test_tool_display_uses_correct_unicode() {
     );
 }
 
+/// Input token count — the `↑ N.Nk` status-bar format
+///
+/// Verifies that `format_token_count` (used to render the status bar during
+/// streaming) produces the expected compact representation from the public API.
+/// The function is also tested internally; this is an integration-level smoke
+/// test confirming the public export is stable.
+#[test]
+fn test_format_token_count_public_api() {
+    use finch::cli::repl_event::event_loop::format_token_count;
+
+    // Below 1000 → plain decimal
+    assert_eq!(format_token_count(0), "0");
+    assert_eq!(format_token_count(999), "999");
+
+    // At 1000 → switch to "N.Nk" notation
+    assert_eq!(format_token_count(1000), "1.0k");
+    assert_eq!(format_token_count(1500), "1.5k");
+    assert_eq!(format_token_count(8192), "8.2k"); // common context window chunk
+
+    // Large counts
+    assert_eq!(format_token_count(100_000), "100.0k");
+}
+
+/// The status-bar "↑ input" format is correctly assembled from format_token_count.
+#[test]
+fn test_input_token_status_bar_format() {
+    use finch::cli::repl_event::event_loop::format_token_count;
+
+    let input_tokens: u32 = 1250;
+    let output_tokens: usize = 300;
+
+    // Simulate the status-bar assembly used in event_loop.rs during streaming
+    let status = format!(
+        "↑ {} · ↓ {} tokens",
+        format_token_count(input_tokens as usize),
+        format_token_count(output_tokens),
+    );
+    assert_eq!(status, "↑ 1.2k · ↓ 300 tokens");
+}
+
 /// E2E: binary exits cleanly without panicking when invoked with --version
 #[test]
 fn test_binary_exits_cleanly() {

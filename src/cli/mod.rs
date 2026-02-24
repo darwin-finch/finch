@@ -3,6 +3,7 @@
 
 pub mod command_autocomplete;
 mod commands;
+pub mod conversation_compactor; // Infinite context: summarise dropped messages
 mod conversation;
 pub mod global_output; // Phase 3.5: Global output system with macros
 mod input;

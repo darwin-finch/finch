@@ -161,6 +161,9 @@ pub struct Repl {
 
     // Number of MemTree results recalled per query
     context_recall_k: usize,
+
+    // Enable conversation summarization (Infinite Context Phase 2)
+    enable_summarization: bool,
 }
 
 /// Adjectives used for session labels
@@ -409,6 +412,7 @@ impl Repl {
         let memory_context_lines = config.features.memory_context_lines;
         let max_verbatim_messages = config.features.max_verbatim_messages;
         let context_recall_k = config.features.context_recall_k;
+        let enable_summarization = config.features.enable_summarization;
 
         // Generate tool definitions from registry (includes built-in + MCP tools)
         let tool_definitions: Vec<ToolDefinition> =
@@ -610,6 +614,7 @@ impl Repl {
             memory_context_lines,
             max_verbatim_messages,
             context_recall_k,
+            enable_summarization,
         }
     }
 
@@ -1529,6 +1534,7 @@ impl Repl {
             self.max_verbatim_messages,
             self.context_recall_k,
             Arc::clone(&self.todo_list),
+            self.enable_summarization,
         );
 
         // Run the event loop

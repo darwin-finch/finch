@@ -40,6 +40,14 @@ pub struct FeaturesConfig {
     #[serde(default = "default_context_recall_k")]
     pub context_recall_k: usize,
 
+    /// Enable conversation summarization when messages slide off the window.
+    /// When enabled, dropped messages are summarised via the active provider
+    /// and injected as a `[Summary of earlier context: ...]` user+assistant
+    /// prefix so that the LLM retains awareness of earlier context.
+    /// Default: false (uses MemTree recall instead).
+    #[serde(default)]
+    pub enable_summarization: bool,
+
     /// Enable GUI automation tools (macOS only)
     #[cfg(target_os = "macos")]
     #[serde(default)]
@@ -55,6 +63,7 @@ impl Default for FeaturesConfig {
             memory_context_lines: 4,
             max_verbatim_messages: 20,
             context_recall_k: 5,
+            enable_summarization: false,
             #[cfg(target_os = "macos")]
             gui_automation: false,
         }

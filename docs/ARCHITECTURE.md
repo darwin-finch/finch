@@ -6,21 +6,29 @@ This document describes the technical architecture of Shammah, a local-first AI 
 
 Shammah provides **immediate, high-quality AI assistance** using pre-trained local models (Qwen via ONNX Runtime) or cloud fallback (Claude, GPT-4, Gemini, Grok), then continuously improves through weighted LoRA fine-tuning to adapt to your specific coding patterns.
 
-**Current State (v0.5.2):**
+**Current State (v0.7.0):**
 - ✅ ONNX Runtime with KV cache support
 - ✅ Pre-trained Qwen models (1.5B/3B/7B/14B) + 5 other families
-- ✅ Daemon architecture with auto-spawn
-- ✅ OpenAI-compatible HTTP API
-- ✅ Tool execution with pass-through
+- ✅ Daemon architecture with auto-spawn, mDNS/Bonjour discovery
+- ✅ OpenAI-compatible HTTP API (VS Code / Continue.dev integration)
+- ✅ Tool execution with pass-through (Read, Glob, Grep, Bash, WebFetch, Edit, Write, Patch)
 - ✅ SSE streaming for local and remote
 - ✅ LoRA fine-tuning infrastructure (feedback collection + JSONL queue)
-- ✅ Multi-provider teacher support (6 providers)
-- ✅ Unified `[[providers]]` config with transparent migration
-- ✅ Tabbed setup wizard with ONNX model selection
-- ✅ IMPCPD iterative planning loop (`/plan` command)
+- ✅ Multi-provider teacher support (6 providers: Claude, GPT-4, Gemini, Grok, Mistral, Groq)
+- ✅ Unified `[[providers]]` config with transparent migration from `[[teachers]]`
+- ✅ Tabbed setup wizard with ONNX model selection and markdown preview dialogs
+- ✅ IMPCPD iterative planning loop (`/plan` command, 7 adversarial personas)
 - ✅ Universal alignment prompt (JSON normalization across providers)
 - ✅ Live LLM test suite (gated by `FINCH_LIVE_TESTS=1`)
+- ✅ `spawn_task` subagent tool (isolated headless agentic loops, 5 agent types)
+- ✅ Semantic memory (`NeuralEmbeddingEngine`, all-MiniLM-L6-v2 ONNX, 384-dim embeddings)
+- ✅ TodoWrite / TodoRead tools (session-scoped task list displayed in TUI live area)
+- ✅ AskUserQuestion tool (LLM-prompted tabbed dialogs with markdown preview, annotation echoing)
+- ✅ Ed25519 commercial license key system (`finch license activate`)
+- ✅ Sliding window context (configurable, default 20 messages) with optional summarization
+- ✅ Input token count in status bar (`↑ N.Nk`)
 - 🚧 MCP plugin system (partial)
+- 🚧 LoRA adapter loading at inference time (Issue #1)
 
 **Key Innovation:** Pre-trained models + weighted LoRA fine-tuning = immediate quality + continuous improvement.
 
@@ -176,7 +184,12 @@ for layer in 0..28 {
 - **Grep** - Search with regex (`TODO.*`)
 - **WebFetch** - Fetch URLs (documentation, examples)
 - **Bash** - Execute commands (tests, build, etc.)
+- **Edit / Write / Patch** - Modify files (exact-string replacement, create, unified-diff patch)
 - **Restart** - Self-improvement (modify code, rebuild, restart)
+- **AskUserQuestion** - Prompt user with structured single/multi-select dialogs and markdown previews
+- **TodoWrite / TodoRead** - Session-scoped task list (visible in TUI live area; LLM tracks work in progress)
+- **spawn_task** - Delegate subtasks to isolated headless agentic loops (general/explore/researcher/coder/bash types; no recursion; parallelisable)
+- **Memory tools** - `SearchMemory`, `CreateMemory`, `ListRecent` (semantic recall across sessions via NeuralEmbeddingEngine)
 
 **Tool Pass-Through Architecture:**
 ```
@@ -603,9 +616,16 @@ The `rust-mcp-sdk` crate has private internal types (`ClientRuntime`) that can't
 
 Within the same directory, `CLAUDE.md` is loaded before `FINCH.md`. All non-empty sections are joined with `\n\n---\n\n` and injected into the system prompt under `## Project Instructions`.
 
-**`FINCH.md` — Vendor-Neutral Convention:**
+**Supported filenames (all loaded when present, in order):**
 
-`FINCH.md` is supported as a tool-agnostic alternative to the Anthropic-specific `CLAUDE.md` name. Teams can use `FINCH.md` for AI instructions that should work across multiple tools (Finch, Cursor, etc.).
+| Filename | Purpose |
+|----------|---------|
+| `CLAUDE.md` | Claude Code convention (Anthropic) |
+| `FINCH.md` | Finch-specific; vendor-neutral open standard |
+| `CONTEXT.md` | Neutral name — works across any AI assistant |
+| `README.md` | General project overview |
+
+`CONTEXT.md` is the recommended name for projects that want tool-agnostic instructions.
 
 **System Prompt Injection:**
 
@@ -633,32 +653,111 @@ Match the code style in src/lib.rs.
 - `src/context/mod.rs` - public re-export
 - `src/generators/claude.rs` - `ClaudeGenerator`, `build_system_prompt()`
 
-### 12. Conversation Management
+### 12. Conversation Management & Infinite Context
 
-**Purpose:** Manage multi-turn conversation history with context window limits.
+**Purpose:** Manage multi-turn conversation history with context window limits and optional summarization.
 
-**Features:**
-- Automatic message trimming (last 20 messages)
-- Token-based limits (~8K tokens per conversation)
-- Session persistence (save/restore)
-- Conversation compaction (auto-summarization)
+**Sliding Window (Phase 1 — active):**
+- `apply_sliding_window(msgs, max)` trims to the most recent N messages (default: 20)
+- Older messages are accessible via MemTree semantic recall (injected per-query)
+- Set `max_verbatim_messages = 0` in config to disable windowing
 
-**Compaction Architecture:**
+**Conversation Summarization (Phase 2 — opt-in):**
+
+When `enable_summarization = true` in `[features]`, messages dropped by the sliding window are summarised via a provider call and injected as a `[Summary of earlier context: ...]` prefix:
+
 ```
-Conversation grows → 80% of max tokens
-    ↓
-Trigger auto-compaction
-    ↓
-Summarize older messages (keep recent intact)
-    ↓
-Replace old messages with summary
-    ↓
-Continue conversation with reduced token count
+all_msgs (full history)
+    │
+    ├─ dropped (older msgs) ──► ConversationCompactor.summarize()
+    │                                   ↓
+    │                        [Summary of earlier context: ...]  (user msg)
+    │                        "Understood."                      (assistant ack)
+    │
+    └─ window (recent N) ───► [window messages]
+                                   │
+                                   └─► final_msgs = [prefix pair] + [window]
 ```
+
+The prefix pair keeps the required alternating user→assistant role ordering expected by all providers. Failure is non-fatal: if the summarisation call fails, the plain window is used and a warning is logged.
 
 **Key Files:**
-- `src/cli/conversation.rs` - ConversationHistory
-- `src/conversation/compactor.rs` - ConversationCompactor (to be implemented)
+- `src/cli/conversation.rs` - `ConversationHistory`
+- `src/cli/conversation_compactor.rs` - `ConversationCompactor`, `inject_summary_prefix()`, `format_messages_for_summary()`
+- `src/cli/repl_event/event_loop.rs` - `apply_sliding_window()`, compactor hook (line ~1295)
+
+### 13. Semantic Memory (`NeuralEmbeddingEngine`)
+
+**Purpose:** Cross-session semantic recall so the LLM can draw on insights from previous conversations without exceeding the context window.
+
+**Architecture:**
+```
+User query
+    ↓
+NeuralEmbeddingEngine.embed(query)   ← all-MiniLM-L6-v2 ONNX (384-dim)
+    ↓
+MemTree ANN search (cosine similarity)
+    ↓
+Top-K recalled snippets (default k=5)
+    ↓
+Injected into last user message:
+  [Relevant memories from past sessions:
+   <snippet 1>
+   ---
+   <snippet 2> ...]
+```
+
+**Model:** `sentence-transformers/all-MiniLM-L6-v2` (~23 MB ONNX)
+- Downloaded from HuggingFace on first use via `hf-hub`
+- Falls back to TF-IDF keyword matching when model not yet cached
+
+**REPL tools:**
+- `SearchMemory` — semantic search over saved memories
+- `CreateMemory` — save a new memory entry
+- `ListRecent` — list most recent memory entries
+
+**Config:** `context_recall_k = 5` in `[features]` (number of results recalled per query)
+
+**Key Files:**
+- `src/memory/neural_embedding.rs` — `NeuralEmbeddingEngine`, 384-dim ONNX inference
+- `src/memory/mod.rs` — `MemorySystem`, `MemTree` ANN index
+- `src/tools/implementations/memory_tools.rs` — `SearchMemoryTool`, `CreateMemoryTool`, `ListRecentTool`
+
+### 14. License System
+
+**Purpose:** Offline Ed25519 commercial license key validation with weekly non-commercial user notice.
+
+**Key Format:**
+```
+FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)>
+```
+
+**Payload JSON:**
+```json
+{"sub":"user@example.com","name":"Jane Doe","tier":"commercial","iss":"2026-01-15","exp":"2027-01-15"}
+```
+
+**Validation flow (fully offline):**
+1. Strip `FINCH-` prefix
+2. Split on `.` → `payload_b64`, `sig_b64`
+3. Decode base64url; reject malformed keys (never panic)
+4. Verify Ed25519 signature against embedded public key
+5. Parse JSON payload; check `exp` against today's date
+6. Return `ParsedLicense { name, email, expiry }`
+
+**CLI commands:**
+- `finch license status` — show current license type
+- `finch license activate --key <FINCH-...>` — validate and save to config
+- `finch license remove` — revert to Noncommercial
+
+**REPL commands:** `/license`, `/license activate <key>`, `/license remove`
+
+**Enforcement:** Honor system — no blocking; weekly startup notice for Noncommercial users (suppressed by `notice_suppress_until` date in config).
+
+**Key Files:**
+- `src/license/mod.rs` — `validate_key()`, `ParsedLicense`; 8 unit tests
+- `src/config/settings.rs` — `LicenseConfig`, `LicenseType`
+- `scripts/issue_license.py` — key signing script (Ed25519, requires `cryptography` pip package)
 
 ## System Flow
 
@@ -900,5 +999,5 @@ Stored in: `~/.finch/training_queue.jsonl`
 
 ---
 
-**Current Version:** 0.5.2
-**Last Updated:** 2026-02-22
+**Current Version:** 0.7.0
+**Last Updated:** 2026-02-24
