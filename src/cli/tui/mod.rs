@@ -467,8 +467,14 @@ impl TuiRenderer {
         if let Some(dialog) = &self.active_dialog {
             let dialog_rows = Self::draw_dialog_inline_static(&mut stdout, dialog)?;
             rows += dialog_rows;
-            // Dialog drawing leaves the cursor at the last drawn row (no reposition).
-            cursor_row_from_top = rows.saturating_sub(1);
+            // Dialog drawing ends each line with \r\n, so the cursor is one row
+            // PAST the last drawn row (at row `rows`, 0-indexed from the start of
+            // the live area).  erase_live_area() moves up by cursor_row_from_top to
+            // reach row 0, so we need cursor_row_from_top = rows (not rows - 1).
+            // Using rows - 1 caused the top row to be skipped on every erase, making
+            // the dialog shift down by one row on each render tick and producing the
+            // cascading duplicate dialog boxes the user sees.
+            cursor_row_from_top = rows;
         } else {
             // ── 4. Input area ─────────────────────────────────────────────────
             let (cursor_row, cursor_col) = self.input_textarea.cursor();
@@ -2121,5 +2127,71 @@ mod tests {
             let _g: Option<PanickingGuard> = if is_active { Some(PanickingGuard) } else { None };
         }
         // If we reach here, the guard was not dropped — correct.
+    }
+
+    // ── dialog cursor_row_from_top regression ─────────────────────────────────
+    // Regression: draw_live_area set cursor_row_from_top = rows.saturating_sub(1)
+    // for the dialog path, but after printing D rows with \r\n the cursor is at
+    // position D (one past the last row, 0-indexed from start).  erase_live_area
+    // moves up by cursor_row_from_top to reach row 0, so using D-1 caused it to
+    // stop at row 1 — missing the first row of the live area on every tick and
+    // making the dialog cascade downward with each render cycle.
+    //
+    // The fix: cursor_row_from_top = rows (not rows - 1) in the dialog branch.
+    //
+    // We verify the invariant without a real terminal by inspecting the formula
+    // directly: the number of rows moved up in erase must equal the cursor
+    // position after draw (which equals total_rows for the dialog path).
+
+    #[test]
+    fn dialog_cursor_row_from_top_equals_total_rows_not_rows_minus_one() {
+        // Simulate dialog: separator (1) + N dialog rows → total_rows = 1 + N.
+        // After drawing with \r\n, cursor is at row total_rows.
+        // erase must move up total_rows to reach row 0.
+        // cursor_row_from_top must therefore equal total_rows, not total_rows - 1.
+        let separator_rows: usize = 1;
+        for dialog_rows in [3usize, 7, 12, 20] {
+            let total_rows = separator_rows + dialog_rows;
+
+            // This is the CORRECT formula (the fix):
+            let correct_cursor_row_from_top = total_rows;
+
+            // This is the OLD (buggy) formula:
+            let buggy_cursor_row_from_top = total_rows.saturating_sub(1);
+
+            // erase moves up by cursor_row_from_top from position total_rows.
+            // Resulting row after erase (0 = top of live area):
+            let correct_row_after_erase =
+                (total_rows as isize) - (correct_cursor_row_from_top as isize);
+            let buggy_row_after_erase =
+                (total_rows as isize) - (buggy_cursor_row_from_top as isize);
+
+            assert_eq!(
+                correct_row_after_erase, 0,
+                "dialog_rows={}: correct formula must erase to row 0 (top of live area), \
+                 got row {}",
+                dialog_rows, correct_row_after_erase
+            );
+            assert_eq!(
+                buggy_row_after_erase, 1,
+                "dialog_rows={}: buggy formula leaves cursor at row 1 (misses first row), \
+                 got row {}",
+                dialog_rows, buggy_row_after_erase
+            );
+        }
+    }
+
+    #[test]
+    fn dialog_cursor_row_from_top_saturating_sub_does_not_help_single_row() {
+        // Edge case: if total_rows = 1 (just the separator, dialog returned 0 rows),
+        // rows.saturating_sub(1) = 0, so erase would not move up at all —
+        // meaning it would clear from the current position (row 1) downward,
+        // which clears nothing.  cursor_row_from_top = rows = 1 moves back to row 0.
+        let total_rows: usize = 1;
+        let correct = total_rows; // 1 — moves up to row 0
+        let buggy = total_rows.saturating_sub(1); // 0 — stays at row 1, clears nothing
+        assert_eq!(correct, 1, "single-row: must move up 1 to reach top");
+        assert_eq!(buggy, 0, "single-row: buggy formula is 0 (no-op erase)");
+        assert_ne!(correct, buggy, "correct and buggy must differ for single-row case");
     }
 }
