@@ -112,10 +112,10 @@ impl Tool for CreateMemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Store important facts, preferences, or notes in memory for future reference. Use this to remember \
-         key information like user preferences, project decisions, coding patterns, or anything important \
-         that should be recalled later. Conversations are automatically stored, so only use this for \
-         explicit facts/notes you want to emphasize."
+        "Store an explicit fact, preference, or decision in memory. Only call this when the user \
+         explicitly asks you to remember something, or when a specific non-obvious fact should persist \
+         across sessions (e.g. 'always use bun', 'never auto-commit'). Do NOT call this proactively \
+         after routine tasks — conversations are already stored automatically."
     }
 
     fn input_schema(&self) -> ToolInputSchema {

@@ -36,7 +36,8 @@ pub struct FeaturesConfig {
     pub max_verbatim_messages: usize,
 
     /// Number of MemTree results recalled and injected per query.
-    /// Default: 5.
+    /// Default: 2. Keep this low — injecting many memories on every turn pollutes
+    /// the context and causes the model to over-rely on past sessions for simple tasks.
     #[serde(default = "default_context_recall_k")]
     pub context_recall_k: usize,
 
@@ -68,7 +69,7 @@ impl Default for FeaturesConfig {
             debug_logging: false,
             memory_context_lines: 5,
             max_verbatim_messages: 20,
-            context_recall_k: 5,
+            context_recall_k: 2,
             enable_summarization: false,
             auto_compact_enabled: false,
             #[cfg(target_os = "macos")]
@@ -90,7 +91,7 @@ fn default_max_verbatim_messages() -> usize {
 }
 
 fn default_context_recall_k() -> usize {
-    5
+    2
 }
 
 #[derive(Debug, Clone)]
