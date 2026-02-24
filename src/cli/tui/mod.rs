@@ -923,6 +923,55 @@ pub(crate) fn format_custom_input_content(input: &str, cursor: usize) -> String 
     format!("> {}\x1b[7m \x1b[m{}", before, after)
 }
 
+/// Render the "Other (custom response)" row inline inside the dialog box.
+///
+/// When `is_on_other` is true the row shows an inline cursor with any typed
+/// text so the user can start typing immediately without a mode switch.
+/// When false it renders the normal hollow-marker label.
+///
+/// Returns the number of terminal rows consumed (always 1).
+fn render_other_row_inline(
+    stdout: &mut io::Stdout,
+    inner: usize,
+    is_on_other: bool,
+    dialog: &Dialog,
+) -> Result<usize> {
+    if is_on_other {
+        // Inline input: "  ● Other: > {before}█{after}"
+        let input_text = dialog.custom_input.as_deref().unwrap_or("");
+        let cursor = dialog.custom_cursor_pos;
+        let content = format_custom_input_content(input_text, cursor);
+        // Prefix: "  ● Other: " = 11 visible chars
+        let prefix_vis = 11_usize;
+        // Content visible width: "> " (2) + input chars + cursor block (1)
+        let content_vis = 3 + input_text.chars().count();
+        let total_vis = prefix_vis + content_vis;
+        execute!(
+            stdout,
+            Print(format!(
+                "│  \x1b[1;36m  \u{25cf} Other: \x1b[0m{}{:<w$}\x1b[0m  │\r\n",
+                content,
+                "",
+                w = inner.saturating_sub(total_vis)
+            ))
+        )?;
+    } else {
+        let (on, marker) = other_row_parts(false);
+        let other_label = format!("  {} Other (custom response)", marker);
+        execute!(
+            stdout,
+            Print(format!(
+                "│  {}{:<w$}{}  │\r\n",
+                on,
+                other_label,
+                RESET,
+                w = inner
+            ))
+        )?;
+    }
+    Ok(1)
+}
+
 impl TuiRenderer {
     /// Draw a `Dialog` inline using crossterm box-drawing characters.
     /// Returns the number of terminal rows consumed.
@@ -965,29 +1014,8 @@ impl TuiRenderer {
         execute!(stdout, Print(format!("{}\r\n", div)))?;
         rows += 1;
 
-        // Options — when custom text mode is active, show text input instead
-        if dialog.custom_mode_active {
-            let input_text = dialog.custom_input.as_deref().unwrap_or("");
-            execute!(
-                stdout,
-                Print(format!("│  {:<w$}  │\r\n", "Enter your response:", w = inner))
-            )?;
-            rows += 1;
-            // Show input field with cursor marker
-            let cursor = dialog.custom_cursor_pos;
-            let content = format_custom_input_content(input_text, cursor);
-            let visible_len = 2 + input_text.chars().count(); // "> " + input chars
-            execute!(
-                stdout,
-                Print(format!(
-                    "│  {}{:<w$}  │\r\n",
-                    content,
-                    "",
-                    w = inner.saturating_sub(visible_len)
-                ))
-            )?;
-            rows += 1;
-        } else {
+        // Options — always render the full option list inline.
+        // When the cursor is on the "Other" row, show it with an inline input cursor.
         match &dialog.dialog_type {
             DialogType::Select {
                 options,
@@ -1010,20 +1038,10 @@ impl TuiRenderer {
                     rows += 1;
                 }
                 if *allow_custom {
-                    let is_other_selected = *selected_index == options.len();
-                    let (on, marker) = other_row_parts(is_other_selected);
-                    let other_label = format!("  {} Other (custom response)", marker);
-                    execute!(
-                        stdout,
-                        Print(format!(
-                            "│  {}{:<w$}{}  │\r\n",
-                            on,
-                            other_label,
-                            RESET,
-                            w = inner
-                        ))
+                    let is_on_other = *selected_index == options.len();
+                    rows += render_other_row_inline(
+                        stdout, inner, is_on_other, dialog,
                     )?;
-                    rows += 1;
                 }
             }
             DialogType::MultiSelect {
@@ -1048,20 +1066,10 @@ impl TuiRenderer {
                     rows += 1;
                 }
                 if *allow_custom {
-                    let is_other_selected = *cursor_index == options.len();
-                    let (on, marker) = other_row_parts(is_other_selected);
-                    let other_label = format!("  {} Other (custom response)", marker);
-                    execute!(
-                        stdout,
-                        Print(format!(
-                            "│  {}{:<w$}{}  │\r\n",
-                            on,
-                            other_label,
-                            RESET,
-                            w = inner
-                        ))
+                    let is_on_other = *cursor_index == options.len();
+                    rows += render_other_row_inline(
+                        stdout, inner, is_on_other, dialog,
                     )?;
-                    rows += 1;
                 }
             }
             DialogType::Confirm {
@@ -1105,31 +1113,25 @@ impl TuiRenderer {
             }
         }
 
-        } // end else (custom_mode_active)
-
         // ── Preview pane ─────────────────────────────────────────────────────
         // If the focused option has a `markdown` field, render it in a bordered
-        // preview section between the options and the keybindings hint.
-        let focused_markdown: Option<&str> = if !dialog.custom_mode_active {
-            match &dialog.dialog_type {
-                DialogType::Select {
-                    options,
-                    selected_index,
-                    ..
-                } => options
-                    .get(*selected_index)
-                    .and_then(|o| o.markdown.as_deref()),
-                DialogType::MultiSelect {
-                    options,
-                    cursor_index,
-                    ..
-                } => options
-                    .get(*cursor_index)
-                    .and_then(|o| o.markdown.as_deref()),
-                _ => None,
-            }
-        } else {
-            None
+        // preview section between the options and the Submit/Cancel row.
+        let focused_markdown: Option<&str> = match &dialog.dialog_type {
+            DialogType::Select {
+                options,
+                selected_index,
+                ..
+            } => options
+                .get(*selected_index)
+                .and_then(|o| o.markdown.as_deref()),
+            DialogType::MultiSelect {
+                options,
+                cursor_index,
+                ..
+            } => options
+                .get(*cursor_index)
+                .and_then(|o| o.markdown.as_deref()),
+            _ => None,
         };
 
         if let Some(md) = focused_markdown {
@@ -1187,30 +1189,71 @@ impl TuiRenderer {
         // ── End preview pane ─────────────────────────────────────────────────
 
         execute!(stdout, Print(format!("{}\r\n", div)))?;
-        let allow_custom = matches!(
-            &dialog.dialog_type,
-            DialogType::Select { allow_custom: true, .. }
-                | DialogType::MultiSelect { allow_custom: true, .. }
-        );
-        let help = if dialog.custom_mode_active {
-            "Enter Submit  Esc Cancel mode"
-        } else if allow_custom {
-            "↑/↓ Navigate  Enter Select  o: Other  Esc Cancel"
+        rows += 1;
+
+        // ── Submit / Cancel buttons ───────────────────────────────────────────
+        let is_multiselect = matches!(&dialog.dialog_type, DialogType::MultiSelect { .. });
+        let submit_idx = dialog.submit_virtual_index();
+        let cancel_idx = dialog.cancel_virtual_index();
+        let cursor = dialog.current_cursor();
+
+        if is_multiselect {
+            // MultiSelect: [ Submit ]   [ Cancel ]
+            let submit_on = if cursor == submit_idx { "\x1b[1;36m" } else { DIM_GRAY };
+            let cancel_on = if cursor == cancel_idx { "\x1b[1;36m" } else { DIM_GRAY };
+            let btn_row = format!(
+                "  {}[ Submit ]{}   {}[ Cancel ]{}",
+                submit_on, RESET, cancel_on, RESET
+            );
+            // visible width: "  [ Submit ]   [ Cancel ]" = 26 chars
+            let btn_vis = 26_usize;
+            execute!(
+                stdout,
+                Print(format!(
+                    "│  {}{:<w$}  │\r\n",
+                    btn_row,
+                    "",
+                    w = inner.saturating_sub(btn_vis)
+                ))
+            )?;
+        } else if matches!(&dialog.dialog_type, DialogType::Select { .. }) {
+            // Select: [ Cancel ]  (no Submit — Enter on an option submits directly)
+            let cancel_on = if cursor == cancel_idx { "\x1b[1;36m" } else { DIM_GRAY };
+            let btn_row = format!("  {}[ Cancel ]{}", cancel_on, RESET);
+            let btn_vis = 12_usize; // "  [ Cancel ]" = 12 chars
+            let hint = if dialog.custom_mode_active {
+                "  Enter↵ submit · Esc clear"
+            } else {
+                "  ↑↓ nav · Enter select · Esc cancel"
+            };
+            let hint_vis = hint.len();
+            execute!(
+                stdout,
+                Print(format!(
+                    "│  {}{}{}{:<w$}  │\r\n",
+                    btn_row,
+                    DIM_GRAY,
+                    hint,
+                    RESET,
+                    w = inner.saturating_sub(btn_vis + hint_vis)
+                ))
+            )?;
         } else {
-            "↑/↓ Navigate  Enter Select  Esc Cancel"
-        };
-        execute!(
-            stdout,
-            Print(format!(
-                "│  {}{:<w$}{}  │\r\n",
-                DIM_GRAY,
-                help,
-                RESET,
-                w = inner
-            ))
-        )?;
+            // Confirm / TextInput: just a keybinding hint
+            let help = "↑/↓ Navigate  Enter Select  Esc Cancel";
+            execute!(
+                stdout,
+                Print(format!(
+                    "│  {}{:<w$}{}  │\r\n",
+                    DIM_GRAY,
+                    help,
+                    RESET,
+                    w = inner
+                ))
+            )?;
+        }
         execute!(stdout, Print(&bot))?;
-        rows += 3;
+        rows += 2; // buttons row + bot border
 
         Ok(rows)
     }

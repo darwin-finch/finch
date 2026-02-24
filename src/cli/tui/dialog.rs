@@ -192,6 +192,54 @@ impl Dialog {
         self
     }
 
+    /// Returns the virtual index of the Cancel button for Select/MultiSelect dialogs.
+    ///
+    /// Layout (Select):   real_options | Other? | Cancel
+    /// Layout (MultiSelect): real_options | Other? | Submit | Cancel
+    pub fn cancel_virtual_index(&self) -> Option<usize> {
+        match &self.dialog_type {
+            DialogType::Select { options, allow_custom, .. } => {
+                Some(options.len() + if *allow_custom { 1 } else { 0 })
+            }
+            DialogType::MultiSelect { options, allow_custom, .. } => {
+                Some(options.len() + if *allow_custom { 2 } else { 1 })
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the virtual index of the Submit button (MultiSelect only).
+    pub fn submit_virtual_index(&self) -> Option<usize> {
+        match &self.dialog_type {
+            DialogType::MultiSelect { options, allow_custom, .. } => {
+                Some(options.len() + if *allow_custom { 1 } else { 0 })
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true when the cursor is on the virtual "Other" row.
+    fn cursor_on_other_row(&self) -> bool {
+        match &self.dialog_type {
+            DialogType::Select { options, selected_index, allow_custom, .. } => {
+                *allow_custom && *selected_index == options.len()
+            }
+            DialogType::MultiSelect { options, cursor_index, allow_custom, .. } => {
+                *allow_custom && *cursor_index == options.len()
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns the current cursor index for Select/MultiSelect dialogs.
+    pub fn current_cursor(&self) -> Option<usize> {
+        match &self.dialog_type {
+            DialogType::Select { selected_index, .. } => Some(*selected_index),
+            DialogType::MultiSelect { cursor_index, .. } => Some(*cursor_index),
+            _ => None,
+        }
+    }
+
     /// Handle a key event and return a result if the dialog should close
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<DialogResult> {
         // Priority 1: Handle custom text input mode
@@ -199,17 +247,53 @@ impl Dialog {
             return self.handle_custom_input_key(key);
         }
 
-        // Priority 2: Check for 'o' key to enter custom mode (if allowed)
+        // Priority 2: 'o'/'O' activates custom mode — but NOT when already on the "Other"
+        // row (priority 2.5 handles that case, inserting the char directly).
         if matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')) {
-            let allow_custom = match &self.dialog_type {
-                DialogType::Select { allow_custom, .. } => *allow_custom,
-                DialogType::MultiSelect { allow_custom, .. } => *allow_custom,
-                _ => false,
+            let (allow_custom, is_on_other) = match &self.dialog_type {
+                DialogType::Select { allow_custom, options, selected_index, .. } => {
+                    (*allow_custom, *selected_index == options.len())
+                }
+                DialogType::MultiSelect { allow_custom, options, cursor_index, .. } => {
+                    (*allow_custom, *cursor_index == options.len())
+                }
+                _ => (false, false),
             };
 
-            if allow_custom {
+            if allow_custom && !is_on_other {
                 self.custom_mode_active = true;
-                return None; // Don't close dialog, just enter custom mode
+                return None;
+            }
+        }
+
+        // Priority 2.5: Any printable char pressed while cursor is on the "Other" row
+        // → activate custom mode AND immediately insert the character.
+        if self.cursor_on_other_row() {
+            if let KeyCode::Char(c) = key.code {
+                self.custom_mode_active = true;
+                if let Some(ref mut input) = self.custom_input {
+                    let byte_pos = Self::char_to_byte_offset(input, self.custom_cursor_pos);
+                    input.insert(byte_pos, c);
+                    self.custom_cursor_pos += 1;
+                }
+                return None;
+            }
+        }
+
+        // Priority 2.7: Enter on Cancel or Submit virtual rows.
+        if matches!(key.code, KeyCode::Enter) {
+            if let Some(cursor) = self.current_cursor() {
+                if Some(cursor) == self.cancel_virtual_index() {
+                    return Some(DialogResult::Cancelled);
+                }
+                if Some(cursor) == self.submit_virtual_index() {
+                    // Submit for MultiSelect: emit the selected set.
+                    if let DialogType::MultiSelect { selected_indices, .. } = &self.dialog_type {
+                        let mut indices: Vec<usize> = selected_indices.iter().copied().collect();
+                        indices.sort_unstable();
+                        return Some(DialogResult::MultiSelected(indices));
+                    }
+                }
             }
         }
 
@@ -325,6 +409,16 @@ impl Dialog {
                 None
             }
             KeyCode::Enter => {
+                use crossterm::event::KeyModifiers;
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+Enter: insert a newline instead of submitting.
+                    if let Some(ref mut input) = self.custom_input {
+                        let byte_pos = Self::char_to_byte_offset(input, self.custom_cursor_pos);
+                        input.insert(byte_pos, '\n');
+                        self.custom_cursor_pos += 1;
+                    }
+                    return None;
+                }
                 // Submit custom text
                 if let Some(ref input) = self.custom_input {
                     if !input.trim().is_empty() {
@@ -359,12 +453,9 @@ impl Dialog {
         selected_index: &mut usize,
         allow_custom: bool,
     ) -> Option<DialogResult> {
-        // When allow_custom is true, the virtual "Other" row sits at index options.len().
-        let max_index = if allow_custom {
-            options.len()
-        } else {
-            options.len().saturating_sub(1)
-        };
+        // Virtual rows: Other? (if allow_custom) then Cancel.
+        // max_index is the Cancel button index.
+        let max_index = options.len() + if allow_custom { 1 } else { 0 };
 
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -409,11 +500,9 @@ impl Dialog {
         cursor_index: &mut usize,
         allow_custom: bool,
     ) -> Option<DialogResult> {
-        let max_index = if allow_custom {
-            options.len()
-        } else {
-            options.len().saturating_sub(1)
-        };
+        // Virtual rows: Other? (if allow_custom) then Submit then Cancel.
+        // max_index is the Cancel button index.
+        let max_index = options.len() + if allow_custom { 2 } else { 1 };
 
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -699,14 +788,36 @@ mod tests {
     }
 
     #[test]
-    fn test_select_down_at_bottom_stays() {
+    fn test_select_down_reaches_cancel_button() {
+        // With the Cancel virtual row, navigating past the last real option reaches
+        // the Cancel button; pressing Enter there returns Cancelled.
         let mut dialog = Dialog::select("T", vec![DialogOption::new("A"), DialogOption::new("B")]);
-        // Move past the end — should cap at last index
-        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        // 2 options, Cancel at index 2. Navigate down twice to reach it.
         dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
         dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
         let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::Cancelled));
+    }
+
+    #[test]
+    fn test_select_enter_on_real_option_still_works() {
+        // Regular option selection still works with Enter — no Submit step needed.
+        let mut dialog = Dialog::select("T", vec![DialogOption::new("A"), DialogOption::new("B")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
         assert_eq!(result, Some(DialogResult::Selected(1)));
+    }
+
+    #[test]
+    fn test_select_down_clamps_at_cancel() {
+        // Pressing Down many times must not exceed the Cancel button index.
+        let mut dialog = Dialog::select("T", vec![DialogOption::new("A"), DialogOption::new("B")]);
+        for _ in 0..10 {
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        }
+        // Cancel is at options.len() = 2 for no-custom Select.
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::Cancelled));
     }
 
     #[test]
@@ -1166,10 +1277,10 @@ mod tests {
         }
     }
 
-    /// Regression: pressing Down past the Other row must not advance further
-    /// (clamp at options.len()).
+    /// Pressing Down many times on a select_with_custom dialog must clamp at
+    /// the Cancel button (options.len() + 1 — Other is options.len()).
     #[test]
-    fn test_select_with_custom_down_clamps_at_other() {
+    fn test_select_with_custom_down_clamps_at_cancel() {
         let mut dialog = Dialog::select_with_custom(
             "T",
             vec![DialogOption::new("A"), DialogOption::new("B")],
@@ -1183,10 +1294,11 @@ mod tests {
             ..
         } = &dialog.dialog_type
         {
+            // Cancel is at options.len() + 1 for allow_custom Select.
             assert_eq!(
                 *selected_index,
-                options.len(),
-                "cursor must clamp at options.len() (the Other row)"
+                options.len() + 1,
+                "cursor must clamp at Cancel (options.len()+1)"
             );
         } else {
             panic!("unexpected dialog type");
@@ -1281,11 +1393,112 @@ mod tests {
     }
 
     /// Defensive guard: Enter with allow_custom=false and empty options must
-    /// return None (not panic or emit out-of-bounds Selected).
+    /// not panic. With the Cancel virtual row at index 0, Enter returns Cancelled.
     #[test]
     fn test_select_enter_empty_options_no_crash() {
         let mut dialog = Dialog::select("T", vec![]);
         let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
-        assert!(result.is_none(), "Enter on empty options must return None");
+        // Cancel is at index 0 for empty Select; Enter on Cancel → Cancelled.
+        assert_eq!(
+            result,
+            Some(DialogResult::Cancelled),
+            "Enter on empty options must return Cancelled (cursor on Cancel button)"
+        );
+    }
+
+    // ─── WS1b: immediate typing on "Other" row ────────────────────────────────
+
+    /// Regression: navigating to the "Other" row and pressing a printable char
+    /// must activate custom mode AND insert the character — no Enter required.
+    #[test]
+    fn test_select_other_row_char_activates_custom_mode() {
+        let mut dialog = Dialog::select_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        // Navigate to Other row (index 2 for 2-option dialog)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        // Press 'h' — should activate custom mode and insert 'h'
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('h')));
+        assert!(result.is_none(), "pressing char on Other must not close dialog");
+        assert!(dialog.custom_mode_active, "custom mode must activate on printable char");
+        assert_eq!(
+            dialog.custom_input.as_deref(),
+            Some("h"),
+            "char must be inserted into custom_input"
+        );
+    }
+
+    /// Regression: multiple chars typed on "Other" row accumulate without
+    /// requiring the user to press Enter first.
+    #[test]
+    fn test_select_other_row_char_accumulates_without_enter() {
+        let mut dialog = Dialog::select_with_custom(
+            "T",
+            vec![DialogOption::new("A")],
+        );
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // → Other (index 1)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('h')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('i')));
+        assert_eq!(
+            dialog.custom_input.as_deref(),
+            Some("hi"),
+            "chars typed on Other row must accumulate in custom_input"
+        );
+    }
+
+    // ─── WS2: Submit/Cancel virtual rows ─────────────────────────────────────
+
+    /// The Cancel button must be reachable by Down navigation and pressing
+    /// Enter there must return Cancelled (MultiSelect).
+    #[test]
+    fn test_multiselect_cancel_button_navigable() {
+        let mut dialog =
+            Dialog::multiselect("T", vec![DialogOption::new("A"), DialogOption::new("B")]);
+        // 2 options. Submit=2, Cancel=3.
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // →1
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // →2 (Submit)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // →3 (Cancel)
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::Cancelled));
+    }
+
+    /// The Submit button (MultiSelect) must emit MultiSelected when Enter is pressed.
+    #[test]
+    fn test_multiselect_submit_button_emits_selection() {
+        let mut dialog =
+            Dialog::multiselect("T", vec![DialogOption::new("A"), DialogOption::new("B")]);
+        // Toggle option 0
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+        // Navigate to Submit (index 2 for 2-option no-custom multiselect)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(result, Some(DialogResult::MultiSelected(vec![0])));
+    }
+
+    // ─── WS2: Shift+Enter inserts newline in custom mode ─────────────────────
+
+    /// Pressing Shift+Enter while in custom text mode must insert '\n' rather
+    /// than submitting the text.
+    #[test]
+    fn test_custom_mode_shift_enter_inserts_newline() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o'))); // activate custom mode
+        // Type "hello"
+        for c in "hello".chars() {
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Char(c)));
+        }
+        // Shift+Enter → insert newline, NOT submit
+        let shift_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        let result = dialog.handle_key_event(shift_enter);
+        assert!(result.is_none(), "Shift+Enter must not submit");
+        assert_eq!(
+            dialog.custom_input.as_deref(),
+            Some("hello\n"),
+            "Shift+Enter must insert newline into custom_input"
+        );
     }
 }
