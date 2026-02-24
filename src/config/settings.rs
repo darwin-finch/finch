@@ -29,6 +29,17 @@ pub struct FeaturesConfig {
     #[serde(default = "default_context_lines")]
     pub memory_context_lines: usize,
 
+    /// Maximum number of recent messages sent verbatim to the provider.
+    /// Older messages are accessible via MemTree semantic recall.
+    /// Default: 20 (≈10 turns). Set to 0 to disable windowing.
+    #[serde(default = "default_max_verbatim_messages")]
+    pub max_verbatim_messages: usize,
+
+    /// Number of MemTree results recalled and injected per query.
+    /// Default: 5.
+    #[serde(default = "default_context_recall_k")]
+    pub context_recall_k: usize,
+
     /// Enable GUI automation tools (macOS only)
     #[cfg(target_os = "macos")]
     #[serde(default)]
@@ -42,6 +53,8 @@ impl Default for FeaturesConfig {
             streaming_enabled: true,
             debug_logging: false,
             memory_context_lines: 4,
+            max_verbatim_messages: 20,
+            context_recall_k: 5,
             #[cfg(target_os = "macos")]
             gui_automation: false,
         }
@@ -54,6 +67,14 @@ fn default_true() -> bool {
 
 fn default_context_lines() -> usize {
     4
+}
+
+fn default_max_verbatim_messages() -> usize {
+    20
+}
+
+fn default_context_recall_k() -> usize {
+    5
 }
 
 #[derive(Debug, Clone)]

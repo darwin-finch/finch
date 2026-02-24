@@ -406,6 +406,8 @@ async fn main() -> Result<()> {
                             #[cfg(target_os = "macos")]
                             gui_automation: result.gui_automation,
                             memory_context_lines: result.memory_context_lines,
+                            max_verbatim_messages: new_config.features.max_verbatim_messages,
+                            context_recall_k: new_config.features.context_recall_k,
                         };
                         if daemon_only_mode {
                             new_config.server.mode = "daemon-only".to_string();
@@ -1339,6 +1341,8 @@ async fn run_setup() -> Result<()> {
         #[cfg(target_os = "macos")]
         gui_automation: false,
         memory_context_lines: result.memory_context_lines,
+        max_verbatim_messages: config.features.max_verbatim_messages,
+        context_recall_k: config.features.context_recall_k,
     };
     #[allow(deprecated)]
     {

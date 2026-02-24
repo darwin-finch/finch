@@ -221,6 +221,14 @@ pub struct EventLoop {
     /// Comes from config.features.memory_context_lines (default 4).
     context_lines: usize,
 
+    /// Maximum number of recent messages sent verbatim to the provider.
+    /// Set to 0 to disable windowing. From config.features.max_verbatim_messages.
+    max_verbatim_messages: usize,
+
+    /// Number of MemTree results recalled and injected per query.
+    /// From config.features.context_recall_k.
+    context_recall_k: usize,
+
     /// Session task list shared with TodoWrite / TodoRead tools
     todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
 }
@@ -257,6 +265,8 @@ impl EventLoop {
         session_label: String,
         available_providers: Vec<crate::config::ProviderEntry>,
         context_lines: usize,
+        max_verbatim_messages: usize,
+        context_recall_k: usize,
         todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -331,6 +341,8 @@ impl EventLoop {
             session_label,
             cwd: String::new(), // populated at the start of run()
             context_lines,
+            max_verbatim_messages,
+            context_recall_k,
             todo_list,
         }
     }
@@ -1160,6 +1172,8 @@ impl EventLoop {
         let session_label = self.session_label.clone();
         let cwd = self.cwd.clone();
         let context_lines = self.context_lines;
+        let max_verbatim = self.max_verbatim_messages;
+        let recall_k = self.context_recall_k;
 
         tokio::spawn(async move {
             Self::process_query_with_tools(
@@ -1183,6 +1197,8 @@ impl EventLoop {
                 session_label,
                 cwd,
                 context_lines,
+                max_verbatim,
+                recall_k,
             )
             .await;
         });
@@ -1223,6 +1239,8 @@ impl EventLoop {
         session_label: String,
         cwd: String,
         context_lines: usize,
+        max_verbatim: usize,
+        recall_k: usize,
     ) {
         tracing::debug!(
             "process_query_with_tools starting for query_id: {:?}",
@@ -1267,9 +1285,10 @@ impl EventLoop {
         // Get conversation context, optionally injecting relevant memories
         let mut memory_recall_count: usize = 0;
         let messages = {
-            let mut msgs = conversation.read().await.get_messages();
+            let all_msgs = conversation.read().await.get_messages();
+            let mut msgs = apply_sliding_window(all_msgs, max_verbatim);
             if let Some(ref mem) = memory_system {
-                if let Ok(memories) = mem.query(&query, Some(5)).await {
+                if let Ok(memories) = mem.query(&query, Some(recall_k)).await {
                     if !memories.is_empty() {
                         memory_recall_count = memories.len();
                         let mem_block = memories.join("\n\n---\n\n");
@@ -2996,6 +3015,27 @@ pub(crate) fn find_last_exchange(messages: &[crate::claude::Message]) -> (String
     (last_query, last_response)
 }
 
+/// Apply a sliding window to the message list, keeping only the last `max` messages
+/// verbatim. If `max` is 0 or the list is shorter than `max`, returns all messages.
+///
+/// After slicing, advances past any leading assistant messages so the window
+/// always starts with a user turn (required by all provider APIs). A floor of
+/// 2 messages is kept to avoid sending an empty window in degenerate cases.
+pub(crate) fn apply_sliding_window(
+    msgs: Vec<crate::claude::Message>,
+    max: usize,
+) -> Vec<crate::claude::Message> {
+    if max == 0 || msgs.len() <= max {
+        return msgs;
+    }
+    let mut window = msgs[msgs.len() - max..].to_vec();
+    // Ensure the window starts with a user message (API requirement).
+    while window.len() > 2 && window.first().map(|m| m.role.as_str()) == Some("assistant") {
+        window.remove(0);
+    }
+    window
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3360,5 +3400,80 @@ mod tests {
                 tool
             );
         }
+    }
+
+    // --- apply_sliding_window ---
+
+    fn make_msgs(roles: &[&str]) -> Vec<crate::claude::Message> {
+        roles
+            .iter()
+            .enumerate()
+            .map(|(i, &role)| {
+                let text = format!("msg {}", i);
+                if role == "user" {
+                    user_msg(&text)
+                } else {
+                    assistant_msg(&text)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_sliding_window_trims_to_max_verbatim() {
+        // 30 alternating messages, max 20 → 20 returned, first is user
+        let roles: Vec<&str> = (0..30).map(|i| if i % 2 == 0 { "user" } else { "assistant" }).collect();
+        let msgs = make_msgs(&roles);
+        let result = apply_sliding_window(msgs, 20);
+        assert_eq!(result.len(), 20);
+        assert_eq!(result.first().unwrap().role, "user");
+    }
+
+    #[test]
+    fn test_sliding_window_disabled_when_zero() {
+        let msgs = make_msgs(&["user", "assistant", "user", "assistant", "user"]);
+        let len = msgs.len();
+        let result = apply_sliding_window(msgs, 0);
+        assert_eq!(result.len(), len);
+    }
+
+    #[test]
+    fn test_sliding_window_no_op_when_under_limit() {
+        let msgs = make_msgs(&["user", "assistant", "user", "assistant"]);
+        let result = apply_sliding_window(msgs, 20);
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.first().unwrap().role, "user");
+    }
+
+    #[test]
+    fn test_sliding_window_skips_orphaned_assistant_at_boundary() {
+        // 5 messages: u a u a u, window=3 → last 3 are [a, u, a] (index 2,3,4)
+        // Leading 'a' gets skipped → result is [u, a] starting at index 3
+        let msgs = make_msgs(&["user", "assistant", "user", "assistant", "user"]);
+        // Swap last 3 to [assistant, user, assistant] by building manually:
+        let roles = ["user", "assistant", "user", "assistant", "user"];
+        // With window=3: last 3 = msgs[2..] = [user, assistant, user] → starts with user already
+        // To actually trigger the skip, build a window that starts with assistant:
+        let msgs2 = make_msgs(&["user", "assistant", "assistant", "user", "assistant"]);
+        // window=3 → last 3 = [assistant(idx2), user(idx3), assistant(idx4)]
+        // leading assistant removed → [user, assistant]
+        let result = apply_sliding_window(msgs2, 3);
+        assert_eq!(result.first().unwrap().role, "user");
+        assert!(result.len() < 3); // shortened due to skipping
+        let _ = roles; // silence unused warning
+        let _ = msgs;
+    }
+
+    #[test]
+    fn test_sliding_window_minimum_guard_prevents_empty() {
+        // All messages are assistant-role (pathological case)
+        let msgs = make_msgs(&["assistant", "assistant", "assistant", "assistant"]);
+        // window=3 → last 3 are all assistant; floor at 2 prevents empty
+        let result = apply_sliding_window(msgs, 3);
+        assert!(
+            result.len() >= 2,
+            "floor of 2 must be maintained; got {}",
+            result.len()
+        );
     }
 }

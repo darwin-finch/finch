@@ -65,7 +65,7 @@ impl FallbackChain {
             let dropped =
                 provider_request.truncate_to_context_limit(provider.context_limit_tokens());
             if dropped > 0 {
-                tracing::warn!(
+                tracing::debug!(
                     provider = provider.name(),
                     dropped_messages = dropped,
                     context_limit = provider.context_limit_tokens(),
@@ -139,7 +139,7 @@ impl FallbackChain {
             let dropped =
                 provider_request.truncate_to_context_limit(provider.context_limit_tokens());
             if dropped > 0 {
-                tracing::warn!(
+                tracing::debug!(
                     provider = provider.name(),
                     dropped_messages = dropped,
                     context_limit = provider.context_limit_tokens(),
