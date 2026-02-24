@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Dialog "Other" row is now navigable**: arrow keys (↑/↓) and j/k can reach the
+  "Other (custom response)" option; pressing Enter on it activates custom text input.
+  Previously the option was only reachable via the undiscoverable 'o' hotkey.
+- "Other" row renders as a numbered option ("N+1. Other (custom response)") and
+  highlights with selection style when focused, consistent with the other options.
+- MultiSelect dialogs receive the same navigation fix symmetrically.
+- Defensive guard prevents `Selected(N)` from being emitted for out-of-bounds indices
+  (e.g. empty options list + Enter).
+- **`auto_compact_enabled` now defaults to `false`**: new sessions no longer show the
+  "Context left until auto-compact: N%" status line; MemTree + ConversationCompactor
+  are the primary continuity mechanism. Existing configs with `auto_compact_enabled = true`
+  are unaffected.
+- **Removed duplicate "Crafting…" line from status bar**: the status bar no longer
+  shows the operation verb during queries — the WorkUnit in the live area already shows
+  verb + elapsed time + token counts. The `throb_idx` dead variable and associated
+  status-bar-only computation were removed from the streaming path.
+
 ## [0.7.1] - 2026-02-24
 
 ### Added

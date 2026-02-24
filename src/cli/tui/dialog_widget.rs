@@ -85,10 +85,14 @@ impl<'a> DialogWidget<'a> {
             lines.push(Line::from(spans));
         }
 
-        // Add "Other" option if enabled
+        // Add "Other" option if enabled — numbered N+1 and highlighted when
+        // the cursor has navigated to it (selected_index == options.len()) or
+        // when the user is actively typing custom text (custom_mode_active).
         if allow_custom {
             lines.push(Line::from(""));
-            let other_style = if custom_mode_active {
+            let other_number = options.len() + 1;
+            let other_label = format!("{}. Other (custom response)", other_number);
+            let other_style = if custom_mode_active || selected_index == options.len() {
                 Style::default()
                     .fg(self.colors.dialog.selected_fg.to_color())
                     .bg(self.colors.dialog.selected_bg.to_color())
@@ -96,10 +100,7 @@ impl<'a> DialogWidget<'a> {
             } else {
                 Style::default().fg(self.colors.dialog.option.to_color())
             };
-            lines.push(Line::from(Span::styled(
-                "Press 'o' for Other (custom response)",
-                other_style,
-            )));
+            lines.push(Line::from(Span::styled(other_label, other_style)));
         }
 
         // Show custom input field if active
@@ -207,10 +208,14 @@ impl<'a> DialogWidget<'a> {
             lines.push(Line::from(spans));
         }
 
-        // Add "Other" option if enabled
+        // Add "Other" option if enabled — numbered N+1 and highlighted when
+        // the cursor has navigated to it (cursor_index == options.len()) or
+        // when the user is actively typing custom text (custom_mode_active).
         if allow_custom {
             lines.push(Line::from(""));
-            let other_style = if custom_mode_active {
+            let other_number = options.len() + 1;
+            let other_label = format!("{}. Other (custom response)", other_number);
+            let other_style = if custom_mode_active || cursor_index == options.len() {
                 Style::default()
                     .fg(self.colors.dialog.selected_fg.to_color())
                     .bg(self.colors.dialog.selected_bg.to_color())
@@ -218,10 +223,7 @@ impl<'a> DialogWidget<'a> {
             } else {
                 Style::default().fg(self.colors.dialog.option.to_color())
             };
-            lines.push(Line::from(Span::styled(
-                "Press 'o' for Other (custom response)",
-                other_style,
-            )));
+            lines.push(Line::from(Span::styled(other_label, other_style)));
         }
 
         // Show custom input field if active
@@ -690,5 +692,88 @@ mod tests {
         // cursor at end
         let lines = widget.render_text_input("Prompt", input, input.chars().count(), &None, &None);
         assert!(!lines.is_empty());
+    }
+
+    // ─── "Other" row rendering ────────────────────────────────────────────────
+
+    /// The "Other" row must be numbered N+1 (where N = options count).
+    #[test]
+    fn test_select_render_other_is_numbered() {
+        use crate::config::ColorScheme;
+
+        let dialog = Dialog::select_with_custom(
+            "T",
+            vec![
+                DialogOption::new("A"),
+                DialogOption::new("B"),
+                DialogOption::new("C"),
+            ],
+        );
+        let colors = ColorScheme::default();
+        let widget = DialogWidget::new(&dialog, &colors);
+
+        let lines = widget.render_select(
+            &[
+                DialogOption::new("A"),
+                DialogOption::new("B"),
+                DialogOption::new("C"),
+            ],
+            0,     // selected_index
+            true,  // allow_custom
+            &Some(String::new()),
+            false, // custom_mode_active
+            0,
+            &None,
+        );
+
+        // Collect all span text across all lines
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            all_text.contains("4. Other"),
+            "Other row must be numbered 4 for a 3-option list, got: {}",
+            all_text
+        );
+    }
+
+    /// The "Other" row must render with selection highlight when
+    /// selected_index == options.len() and custom_mode_active is false.
+    #[test]
+    fn test_select_render_other_highlighted_when_navigated_to() {
+        use crate::config::ColorScheme;
+        use ratatui::style::Modifier;
+
+        let dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        let colors = ColorScheme::default();
+        let widget = DialogWidget::new(&dialog, &colors);
+
+        // selected_index = 1 = options.len() → Other row should be highlighted
+        let lines = widget.render_select(
+            &[DialogOption::new("A")],
+            1,     // selected_index == options.len()
+            true,  // allow_custom
+            &Some(String::new()),
+            false, // custom_mode_active
+            0,
+            &None,
+        );
+
+        // Find the "Other" span
+        let other_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("Other"));
+
+        assert!(other_span.is_some(), "Other span must exist in rendered lines");
+        let span = other_span.unwrap();
+        assert!(
+            span.style.add_modifier.contains(Modifier::BOLD),
+            "Other span must be BOLD when selected_index == options.len()"
+        );
     }
 }

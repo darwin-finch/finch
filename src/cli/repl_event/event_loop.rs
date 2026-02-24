@@ -1375,9 +1375,7 @@ impl EventLoop {
 
             let stream_start = std::time::Instant::now();
             let mut token_count: usize = 0;
-            let mut throb_idx: usize = 0;
             let mut input_token_count: Option<u32> = None;
-            status_bar.update_operation(format!("✳ {}…", verb));
             {
                 use std::io::Write as _;
                 print!(
@@ -1403,71 +1401,16 @@ impl EventLoop {
                         match result {
                             Ok(StreamChunk::Usage { input_tokens }) => {
                                 input_token_count = Some(input_tokens);
-                                // Update status bar with real input token count immediately
-                                let icon = THROB_FRAMES[throb_idx];
-                                let secs = stream_start.elapsed().as_secs();
-                                let input_str = format_token_count(input_tokens as usize);
-                                status_bar.update_operation(format!(
-                                    "{} {}… ({} · ↑ {} · thinking)",
-                                    icon,
-                                    verb,
-                                    format_elapsed(secs),
-                                    input_str
-                                ));
                             }
                             Ok(StreamChunk::TextDelta(delta)) => {
                                 tracing::debug!("Received TextDelta: {} bytes", delta.len());
                                 text.push_str(&delta);
-                                let delta_tokens = delta.split_whitespace().count();
-                                token_count += delta_tokens;
+                                token_count += delta.split_whitespace().count();
                                 // WorkUnit accumulates tokens for its own animated display
                                 work_unit.add_tokens(&delta);
-                                // Status bar also shows throb animation
-                                throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
-                                let icon = THROB_FRAMES[throb_idx];
-                                let secs = stream_start.elapsed().as_secs();
-                                let elapsed_str = format_elapsed(secs);
-                                let output_str = format_token_count(token_count);
-                                let status = match input_token_count {
-                                    Some(n) => format!(
-                                        "{} {}… ({} · ↑ {} · ↓ {} tokens)",
-                                        icon,
-                                        verb,
-                                        elapsed_str,
-                                        format_token_count(n as usize),
-                                        output_str
-                                    ),
-                                    None => format!(
-                                        "{} {}… ({} · ↓ {} tokens)",
-                                        icon, verb, elapsed_str, output_str
-                                    ),
-                                };
-                                status_bar.update_operation(status);
                             }
                             Ok(StreamChunk::ContentBlockComplete(block)) => {
                                 tracing::debug!("Received ContentBlockComplete: {:?}", block);
-                                // Advance throb during thinking phase (before text arrives)
-                                throb_idx = (throb_idx + 1) % THROB_FRAMES.len();
-                                if token_count == 0 {
-                                    let icon = THROB_FRAMES[throb_idx];
-                                    let secs = stream_start.elapsed().as_secs();
-                                    let status = match input_token_count {
-                                        Some(n) => format!(
-                                            "{} {}… ({} · ↑ {} · thinking)",
-                                            icon,
-                                            verb,
-                                            format_elapsed(secs),
-                                            format_token_count(n as usize)
-                                        ),
-                                        None => format!(
-                                            "{} {}… ({} · thinking)",
-                                            icon,
-                                            verb,
-                                            format_elapsed(secs)
-                                        ),
-                                    };
-                                    status_bar.update_operation(status);
-                                }
                                 blocks.push(block);
                             }
                             Err(e) => {
@@ -1520,9 +1463,6 @@ impl EventLoop {
                         .collect();
 
                     tracing::debug!("[EVENT_LOOP] Found {} tool uses", tool_uses.len());
-
-                    // Clear streaming status
-                    status_bar.clear_operation();
 
                     if !tool_uses.is_empty() {
                         tracing::debug!("[EVENT_LOOP] Tools detected, updating query state");
@@ -1716,7 +1656,6 @@ impl EventLoop {
         // header is visible during the wait (blit cycle runs every ~100ms).
         let verb = crate::cli::messages::random_spinner_verb();
         let work_unit = output_manager.start_work_unit(verb);
-        status_bar.update_operation(format!("✳ {}…", verb));
         match generator
             .generate(messages, Some((*tool_definitions).clone()))
             .await
@@ -1985,9 +1924,6 @@ impl EventLoop {
                     "[EVENT_LOOP] Handling StreamingComplete event (non-streaming path)"
                 );
 
-                // Clear streaming status
-                self.status_bar.clear_operation();
-
                 // Check if this query is executing tools
                 // If so, the assistant message was already added with ToolUse blocks
                 let is_executing_tools =
@@ -2075,7 +2011,6 @@ impl EventLoop {
                     // Show cancellation message
                     self.output_manager
                         .write_info("⚠️  Query cancelled by user (Ctrl+C)");
-                    self.status_bar.clear_operation();
                     self.render_tui().await?;
 
                     tracing::info!("Query {} cancelled by user", qid);
@@ -2983,8 +2918,8 @@ async fn handle_present_plan(
 }
 
 /// Handle AskUserQuestion tool call specially (shows dialog instead of executing as tool)
-/// Pulsing animation frames for the streaming status indicator.
-/// Cycles from small → large → small to create a "throb" effect.
+/// Pulsing animation frames used in status-bar tests.
+#[cfg(test)]
 const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
 
 /// Format elapsed seconds as "Xs" or "Xm Ys".

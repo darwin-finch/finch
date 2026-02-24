@@ -218,15 +218,41 @@ impl Dialog {
             DialogType::Select {
                 options,
                 selected_index,
-                ..
-            } => Self::handle_select_key(key, options, selected_index),
+                allow_custom,
+            } => {
+                // If the cursor is on the virtual "Other" row and Enter is pressed,
+                // activate custom text input instead of selecting a real option.
+                if matches!(key.code, KeyCode::Enter)
+                    && *allow_custom
+                    && *selected_index == options.len()
+                {
+                    self.custom_mode_active = true;
+                    return None;
+                }
+                Self::handle_select_key(key, options, selected_index, *allow_custom)
+            }
 
             DialogType::MultiSelect {
                 options,
                 selected_indices,
                 cursor_index,
-                ..
-            } => Self::handle_multiselect_key(key, options, selected_indices, cursor_index),
+                allow_custom,
+            } => {
+                if matches!(key.code, KeyCode::Enter)
+                    && *allow_custom
+                    && *cursor_index == options.len()
+                {
+                    self.custom_mode_active = true;
+                    return None;
+                }
+                Self::handle_multiselect_key(
+                    key,
+                    options,
+                    selected_indices,
+                    cursor_index,
+                    *allow_custom,
+                )
+            }
 
             DialogType::TextInput {
                 input, cursor_pos, ..
@@ -323,19 +349,30 @@ impl Dialog {
         }
     }
 
-    /// Handle key events for single-select dialogs
+    /// Handle key events for single-select dialogs.
+    ///
+    /// When `allow_custom` is true, index `options.len()` is the virtual "Other"
+    /// row. Navigation extends one step further to allow reaching it.
     fn handle_select_key(
         key: KeyEvent,
         options: &[DialogOption],
         selected_index: &mut usize,
+        allow_custom: bool,
     ) -> Option<DialogResult> {
+        // When allow_custom is true, the virtual "Other" row sits at index options.len().
+        let max_index = if allow_custom {
+            options.len()
+        } else {
+            options.len().saturating_sub(1)
+        };
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 *selected_index = selected_index.saturating_sub(1);
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                *selected_index = (*selected_index + 1).min(options.len().saturating_sub(1));
+                *selected_index = (*selected_index + 1).min(max_index);
                 None
             }
             KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -346,34 +383,56 @@ impl Dialog {
                     None
                 }
             }
-            KeyCode::Enter => Some(DialogResult::Selected(*selected_index)),
+            KeyCode::Enter => {
+                // Defensive guard: only emit Selected for real option indices.
+                // The "Other" row intercept in handle_key_event fires before we
+                // reach here, but guard anyway (e.g. empty options list).
+                if *selected_index < options.len() {
+                    Some(DialogResult::Selected(*selected_index))
+                } else {
+                    None
+                }
+            }
             KeyCode::Esc => Some(DialogResult::Cancelled),
             _ => None,
         }
     }
 
-    /// Handle key events for multi-select dialogs
+    /// Handle key events for multi-select dialogs.
+    ///
+    /// When `allow_custom` is true, index `options.len()` is the virtual "Other"
+    /// row. Navigation extends one step further to allow reaching it.
     fn handle_multiselect_key(
         key: KeyEvent,
         options: &[DialogOption],
         selected_indices: &mut HashSet<usize>,
         cursor_index: &mut usize,
+        allow_custom: bool,
     ) -> Option<DialogResult> {
+        let max_index = if allow_custom {
+            options.len()
+        } else {
+            options.len().saturating_sub(1)
+        };
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 *cursor_index = cursor_index.saturating_sub(1);
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                *cursor_index = (*cursor_index + 1).min(options.len().saturating_sub(1));
+                *cursor_index = (*cursor_index + 1).min(max_index);
                 None
             }
             KeyCode::Char(' ') => {
-                // Toggle selection at cursor
-                if selected_indices.contains(cursor_index) {
-                    selected_indices.remove(cursor_index);
-                } else {
-                    selected_indices.insert(*cursor_index);
+                // Only toggle real options — not the virtual "Other" row (which
+                // has no corresponding index in selected_indices).
+                if *cursor_index < options.len() {
+                    if selected_indices.contains(cursor_index) {
+                        selected_indices.remove(cursor_index);
+                    } else {
+                        selected_indices.insert(*cursor_index);
+                    }
                 }
                 None
             }
@@ -1085,5 +1144,148 @@ mod tests {
             Some(DialogResult::CustomText("Hello".to_string())),
             "custom text must be exactly 'Hello' (no leading 'o')"
         );
+    }
+
+    // ─── navigation to "Other" row ────────────────────────────────────────────
+
+    /// Regression: Down navigation must reach the virtual "Other" row
+    /// when allow_custom = true, stopping at index == options.len().
+    #[test]
+    fn test_select_navigate_down_reaches_other_when_allow_custom() {
+        let mut dialog = Dialog::select_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        // 2 real options → Other row is at index 2
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 1→2 (Other)
+        if let DialogType::Select { selected_index, .. } = &dialog.dialog_type {
+            assert_eq!(*selected_index, 2, "cursor must reach Other row (index 2)");
+        } else {
+            panic!("unexpected dialog type");
+        }
+    }
+
+    /// Regression: pressing Down past the Other row must not advance further
+    /// (clamp at options.len()).
+    #[test]
+    fn test_select_with_custom_down_clamps_at_other() {
+        let mut dialog = Dialog::select_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        for _ in 0..10 {
+            dialog.handle_key_event(KeyEvent::from(KeyCode::Down));
+        }
+        if let DialogType::Select {
+            selected_index,
+            options,
+            ..
+        } = &dialog.dialog_type
+        {
+            assert_eq!(
+                *selected_index,
+                options.len(),
+                "cursor must clamp at options.len() (the Other row)"
+            );
+        } else {
+            panic!("unexpected dialog type");
+        }
+    }
+
+    /// Regression: pressing Enter when cursor is on the "Other" row must
+    /// activate custom_mode_active and return None (not close the dialog).
+    #[test]
+    fn test_select_enter_on_other_activates_custom_mode() {
+        let mut dialog = Dialog::select_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 1→2 (Other)
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            result.is_none(),
+            "Enter on Other row must return None (not close dialog)"
+        );
+        assert!(
+            dialog.custom_mode_active,
+            "Enter on Other row must activate custom_mode_active"
+        );
+    }
+
+    /// Regression: same as above but for MultiSelect.
+    #[test]
+    fn test_multiselect_navigate_down_reaches_other_when_allow_custom() {
+        let mut dialog = Dialog::multiselect_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 1→2 (Other)
+        if let DialogType::MultiSelect {
+            cursor_index,
+            options,
+            ..
+        } = &dialog.dialog_type
+        {
+            assert_eq!(*cursor_index, options.len(), "cursor must reach Other row");
+        } else {
+            panic!("unexpected dialog type");
+        }
+    }
+
+    /// Regression: pressing Enter when MultiSelect cursor is on "Other" must
+    /// activate custom_mode_active.
+    #[test]
+    fn test_multiselect_enter_on_other_activates_custom_mode() {
+        let mut dialog = Dialog::multiselect_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 1→2 (Other)
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(result.is_none(), "Enter on Other row must not close dialog");
+        assert!(dialog.custom_mode_active, "must activate custom_mode_active");
+    }
+
+    /// Guard: Space on the "Other" row in MultiSelect must not insert
+    /// options.len() into selected_indices (would be an out-of-bounds index).
+    #[test]
+    fn test_multiselect_space_on_other_row_is_noop() {
+        let mut dialog = Dialog::multiselect_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 1→2 (Other)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char(' '))); // Space on Other row
+        // Verify selected_indices does NOT contain options.len() (= 2).
+        // NOTE: Enter at the Other row activates custom_mode_active (not MultiSelected),
+        // so we check the internal state directly.
+        if let DialogType::MultiSelect {
+            selected_indices,
+            options,
+            ..
+        } = &dialog.dialog_type
+        {
+            assert!(
+                !selected_indices.contains(&options.len()),
+                "Space on Other row must not add options.len() ({}) to selected_indices",
+                options.len()
+            );
+        } else {
+            panic!("unexpected dialog type");
+        }
+    }
+
+    /// Defensive guard: Enter with allow_custom=false and empty options must
+    /// return None (not panic or emit out-of-bounds Selected).
+    #[test]
+    fn test_select_enter_empty_options_no_crash() {
+        let mut dialog = Dialog::select("T", vec![]);
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert!(result.is_none(), "Enter on empty options must return None");
     }
 }

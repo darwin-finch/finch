@@ -49,9 +49,9 @@ pub struct FeaturesConfig {
     pub enable_summarization: bool,
 
     /// Enable sliding-window context auto-compaction.
-    /// Default: true. Set to false to rely on MemTree recall / summarization
-    /// instead and suppress the CompactionPercent status line.
-    #[serde(default = "default_true")]
+    /// Default: false. MemTree recall + summarization are the primary continuity
+    /// mechanism; enable this only to also show the CompactionPercent status line.
+    #[serde(default)]
     pub auto_compact_enabled: bool,
 
     /// Enable GUI automation tools (macOS only)
@@ -70,7 +70,7 @@ impl Default for FeaturesConfig {
             max_verbatim_messages: 20,
             context_recall_k: 5,
             enable_summarization: false,
-            auto_compact_enabled: true,
+            auto_compact_enabled: false,
             #[cfg(target_os = "macos")]
             gui_automation: false,
         }
@@ -773,8 +773,8 @@ mod tests {
         assert!(f.streaming_enabled, "streaming should be on by default");
         assert!(!f.debug_logging, "debug logging should be off by default");
         assert!(
-            f.auto_compact_enabled,
-            "auto_compact_enabled must default to true for backward compat"
+            !f.auto_compact_enabled,
+            "auto_compact_enabled must default to false (MemTree + summarization are primary)"
         );
         #[cfg(target_os = "macos")]
         assert!(!f.gui_automation, "gui automation should be off by default");
