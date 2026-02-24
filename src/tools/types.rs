@@ -36,6 +36,11 @@ pub struct ToolContext<'a> {
 
     /// Optional plan content storage
     pub plan_content: Option<Arc<RwLock<Option<String>>>>,
+
+    /// Optional live-output callback for streaming tools (e.g. bash).
+    /// Called once per output line while the tool is running.
+    /// Allows the WorkUnit row to show a live scrolling preview.
+    pub live_output: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 /// Tool definition (Claude API-compatible)

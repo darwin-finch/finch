@@ -278,6 +278,7 @@ mod tests {
             tokenizer: None,
             repl_mode: None,
             plan_content: None,
+            live_output: None,
         };
         let result = tool
             .execute(
@@ -314,6 +315,7 @@ mod tests {
             tokenizer: None,
             repl_mode: None,
             plan_content: None,
+            live_output: None,
         };
 
         let result = tool
@@ -361,6 +363,7 @@ mod tests {
             tokenizer: None,
             repl_mode: None,
             plan_content: None,
+            live_output: None,
         };
         let result = tool
             .execute(serde_json::json!({"limit": 3}), &context)

@@ -366,6 +366,7 @@ impl QwenGenerator {
                     Some(Arc::clone(&self.tokenizer)),       // tokenizer
                     None,                                    // repl_mode
                     None,                                    // plan_content
+                    None,                                    // live_output
                 )
                 .await
                 .unwrap_or_else(|e| {

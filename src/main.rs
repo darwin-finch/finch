@@ -1301,6 +1301,7 @@ async fn run_query_teacher_only(
                         None, // tokenizer
                         None, // repl_mode
                         None, // plan_content
+                        None, // live_output
                     )
                     .await
             };

@@ -1237,6 +1237,7 @@ impl Repl {
                         Some(Arc::clone(&self.tokenizer)),
                         None, // repl_mode (not available in raw mode)
                         None, // plan_content
+                        None, // live_output
                     )
                     .await?;
 

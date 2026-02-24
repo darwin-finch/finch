@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::events::ConfirmationResult;
 use crate::cli::conversation::ConversationHistory;
+use crate::cli::messages::WorkUnit;
 use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
@@ -71,9 +72,19 @@ impl ToolExecutionCoordinator {
     /// This spawns a background task that:
     /// 1. Checks if tool needs approval
     /// 2. If needed, requests approval via event (blocks only this task)
-    /// 3. Executes the tool
+    /// 3. Executes the tool (with live-output streaming for bash)
     /// 4. Sends result back via event channel
-    pub fn spawn_tool_execution(&self, query_id: Uuid, tool_use: ToolUse) {
+    ///
+    /// `work_unit` + `row_idx` are used to stream live bash output lines into the
+    /// WorkUnit row while the command runs, creating the scrolling preview in the
+    /// live area.
+    pub fn spawn_tool_execution(
+        &self,
+        query_id: Uuid,
+        tool_use: ToolUse,
+        work_unit: Arc<WorkUnit>,
+        row_idx: usize,
+    ) {
         let event_tx = self.event_tx.clone();
         let tool_executor = Arc::clone(&self.tool_executor);
         let conversation = Arc::clone(&self.conversation);
@@ -81,6 +92,16 @@ impl ToolExecutionCoordinator {
         let tokenizer = Arc::clone(&self.tokenizer);
         let repl_mode = Arc::clone(&self.repl_mode);
         let plan_content = Arc::clone(&self.plan_content);
+
+        // Build a live-output callback that streams stdout lines into the WorkUnit row.
+        // The format() method shows the last 3 body_lines for Running rows, so each
+        // new line automatically becomes visible on the next render tick (~100ms).
+        let live_output: Arc<dyn Fn(String) + Send + Sync> = {
+            let wu = Arc::clone(&work_unit);
+            Arc::new(move |line: String| {
+                wu.append_row_body_line(row_idx, line);
+            })
+        };
 
         tokio::spawn(async move {
             // Generate tool signature for approval checking
@@ -227,6 +248,7 @@ impl ToolExecutionCoordinator {
                         Some(Arc::clone(&tokenizer)),
                         Some(Arc::clone(&repl_mode)),
                         Some(Arc::clone(&plan_content)),
+                        Some(Arc::clone(&live_output)),
                     ),
             )
             .await;

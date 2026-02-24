@@ -1562,8 +1562,13 @@ impl EventLoop {
                                     result,
                                 });
                             } else {
-                                // Regular tool execution
-                                tool_coordinator.spawn_tool_execution(query_id, tool_use);
+                                // Regular tool execution (with live-output streaming)
+                                tool_coordinator.spawn_tool_execution(
+                                    query_id,
+                                    tool_use,
+                                    Arc::clone(&work_unit),
+                                    row_idx,
+                                );
                             }
                         }
                         drop(current_mode);
@@ -1793,8 +1798,13 @@ impl EventLoop {
                                 result,
                             });
                         } else {
-                            // Regular tool execution
-                            tool_coordinator.spawn_tool_execution(query_id, tool_use);
+                            // Regular tool execution (with live-output streaming)
+                            tool_coordinator.spawn_tool_execution(
+                                query_id,
+                                tool_use,
+                                Arc::clone(&work_unit),
+                                row_idx,
+                            );
                         }
                     }
                     drop(current_mode);

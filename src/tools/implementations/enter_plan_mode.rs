@@ -118,6 +118,7 @@ mod tests {
             tokenizer: None,
             repl_mode: Some(repl_mode),
             plan_content: Some(plan_content),
+            live_output: None,
         };
 
         let result = tool.execute(serde_json::json!({}), &context).await;

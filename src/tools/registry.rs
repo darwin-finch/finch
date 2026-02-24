@@ -179,6 +179,7 @@ mod tests {
             tokenizer: None,
             repl_mode: None,
             plan_content: None,
+            live_output: None,
         };
 
         let result = tool

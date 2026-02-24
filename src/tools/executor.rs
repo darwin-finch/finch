@@ -315,7 +315,7 @@ impl ToolExecutor {
     }
 
     /// Execute a single tool use
-    #[instrument(skip(self, tool_use, conversation, save_models_fn, batch_trainer, local_generator, tokenizer), fields(tool = %tool_use.name, id = %tool_use.id))]
+    #[instrument(skip(self, tool_use, conversation, save_models_fn, batch_trainer, local_generator, tokenizer, repl_mode, plan_content, live_output), fields(tool = %tool_use.name, id = %tool_use.id))]
     pub async fn execute_tool<F>(
         &self,
         tool_use: &ToolUse,
@@ -328,6 +328,7 @@ impl ToolExecutor {
         tokenizer: Option<Arc<crate::models::tokenizer::TextTokenizer>>,
         repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
+        live_output: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> Result<ToolResult>
     where
         F: Fn() -> Result<()> + Send + Sync,
@@ -435,6 +436,7 @@ impl ToolExecutor {
             tokenizer,
             repl_mode,
             plan_content,
+            live_output,
         };
 
         match tool.execute(tool_use.input.clone(), &context).await {
@@ -493,6 +495,7 @@ impl ToolExecutor {
                     tokenizer.clone(),
                     repl_mode.clone(),
                     plan_content.clone(),
+                    None,
                 )
                 .await?;
             results.push(result);
@@ -748,6 +751,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -775,6 +779,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
         assert!(result.is_err());
@@ -791,6 +796,7 @@ mod tests {
                 &tool_use,
                 None,
                 None::<fn() -> Result<()>>,
+                None,
                 None,
                 None,
                 None,
@@ -815,6 +821,7 @@ mod tests {
                 &tool_use,
                 None,
                 None::<fn() -> Result<()>>,
+                None,
                 None,
                 None,
                 None,

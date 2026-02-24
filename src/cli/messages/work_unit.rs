@@ -225,6 +225,18 @@ impl WorkUnit {
         }
     }
 
+    /// Append a live output line to a Running sub-row's body.
+    ///
+    /// Called by the bash tool's streaming path once per stdout line.
+    /// The `format()` method shows the last 3 lines for Running rows,
+    /// creating a live scrolling preview while the command executes.
+    pub fn append_row_body_line(&self, idx: usize, line: String) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = inner.rows.get_mut(idx) {
+            row.body_lines.push(line);
+        }
+    }
+
     /// Mark a sub-row as failed.
     pub fn fail_row(&self, idx: usize, error: impl Into<String>) {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
@@ -348,7 +360,16 @@ impl Message for WorkUnit {
 fn format_row(row: &WorkRow) -> String {
     match &row.status {
         WorkRowStatus::Running => {
-            format!("  {}⎿{} {}{}…{}", GRAY, RESET, row.label, GRAY_DIM, RESET)
+            let mut out = format!("  {}⎿{} {}{}…{}", GRAY, RESET, row.label, GRAY_DIM, RESET);
+            // Show last 3 live output lines (sliding window while command runs)
+            if !row.body_lines.is_empty() {
+                let start = row.body_lines.len().saturating_sub(3);
+                for line in &row.body_lines[start..] {
+                    out.push('\n');
+                    out.push_str(&format!("    {}{}{}", GRAY_DIM, line, RESET));
+                }
+            }
+            out
         }
         WorkRowStatus::Complete(summary) => {
             // Use captured elapsed time (not recalculated) so scrollback timing is stable
