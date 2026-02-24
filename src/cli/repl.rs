@@ -164,6 +164,9 @@ pub struct Repl {
 
     // Enable conversation summarization (Infinite Context Phase 2)
     enable_summarization: bool,
+
+    // Enable sliding-window auto-compaction (from config.features.auto_compact_enabled)
+    auto_compact_enabled: bool,
 }
 
 /// Adjectives used for session labels
@@ -413,6 +416,7 @@ impl Repl {
         let max_verbatim_messages = config.features.max_verbatim_messages;
         let context_recall_k = config.features.context_recall_k;
         let enable_summarization = config.features.enable_summarization;
+        let auto_compact_enabled = config.features.auto_compact_enabled;
 
         // Generate tool definitions from registry (includes built-in + MCP tools)
         let tool_definitions: Vec<ToolDefinition> =
@@ -615,6 +619,7 @@ impl Repl {
             max_verbatim_messages,
             context_recall_k,
             enable_summarization,
+            auto_compact_enabled,
         }
     }
 
@@ -1535,6 +1540,7 @@ impl Repl {
             self.context_recall_k,
             Arc::clone(&self.todo_list),
             self.enable_summarization,
+            self.auto_compact_enabled,
         );
 
         // Run the event loop

@@ -104,12 +104,35 @@ impl<'a> Widget for StatusWidget<'a> {
             .iter()
             .find(|sl| sl.line_type == StatusLineType::CompactionPercent);
 
-        // Convert to styled lines (excluding compaction line)
-        let lines: Vec<Line> = status_lines
+        // Convert to styled lines (excluding compaction line).
+        // Insert a dim "── Memory ──" separator between MemoryContext and the
+        // ConversationTopic/Focus block so the two sections are visually distinct.
+        let separator_line = Line::from(Span::styled(
+            "── Memory ──".to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+        let mut lines: Vec<Line> = Vec::new();
+        let mut prev_was_memory = false;
+        for sl in status_lines
             .iter()
             .filter(|sl| sl.line_type != StatusLineType::CompactionPercent)
-            .map(|sl| self.status_line_to_line(&sl.line_type, &sl.content))
-            .collect();
+        {
+            let is_memory = sl.line_type == StatusLineType::MemoryContext;
+            let is_conversation = matches!(
+                sl.line_type,
+                StatusLineType::ConversationTopic
+                    | StatusLineType::ConversationFocus
+                    | StatusLineType::ContextLine(_)
+            );
+            // Insert separator at the boundary: memory → conversation
+            if is_conversation && prev_was_memory {
+                lines.push(separator_line.clone());
+            }
+            lines.push(self.status_line_to_line(&sl.line_type, &sl.content));
+            prev_was_memory = is_memory;
+        }
 
         // If no status lines, show empty
         let lines = if lines.is_empty() {
@@ -198,5 +221,74 @@ mod tests {
         let widget = StatusWidget::new(&status_bar, &colors);
         // Just verify it creates without panic
         assert_eq!(widget.status_bar.len(), 0);
+    }
+
+    /// Test that the "── Memory ──" separator is inserted when MemoryContext
+    /// is immediately followed by a ConversationTopic line.
+    #[test]
+    fn test_memory_separator_inserted_between_memory_and_conversation() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        let status_bar = StatusBar::new();
+        status_bar.update_line(StatusLineType::MemoryContext, "🧠 neural · 10 memories");
+        status_bar.update_line(StatusLineType::ConversationTopic, "📋 Rust lifetimes");
+        let colors = ColorScheme::default();
+        let widget = StatusWidget::new(&status_bar, &colors);
+
+        // Render into a buffer large enough to hold the lines
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        // Collect all rendered text from the buffer
+        let rendered: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Memory"),
+            "Separator containing 'Memory' must appear between sections; got:\n{}",
+            rendered
+        );
+    }
+
+    /// Test that no separator is inserted when MemoryContext is absent.
+    #[test]
+    fn test_no_memory_separator_without_memory_context() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        let status_bar = StatusBar::new();
+        status_bar.update_line(StatusLineType::ConversationTopic, "📋 Rust lifetimes");
+        let colors = ColorScheme::default();
+        let widget = StatusWidget::new(&status_bar, &colors);
+
+        let area = Rect::new(0, 0, 80, 5);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+
+        let rendered: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // "── Memory ──" separator should NOT appear when only ConversationTopic is present
+        assert!(
+            !rendered.contains("── Memory ──"),
+            "Separator must not appear without MemoryContext; got:\n{}",
+            rendered
+        );
     }
 }

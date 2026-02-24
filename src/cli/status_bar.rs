@@ -139,13 +139,6 @@ impl StatusBar {
             });
         }
 
-        if let Some(content) = lines.get(&StatusLineType::LiveStats) {
-            result.push(StatusLine {
-                line_type: StatusLineType::LiveStats,
-                content: content.clone(),
-            });
-        }
-
         if let Some(content) = lines.get(&StatusLineType::TrainingStats) {
             result.push(StatusLine {
                 line_type: StatusLineType::TrainingStats,
@@ -414,17 +407,28 @@ mod tests {
     fn test_status_line_ordering_with_session_and_memory() {
         let status = StatusBar::new();
 
-        // Add in reverse order
-        status.update_line(StatusLineType::LiveStats, "Live");
+        // Add in reverse order — LiveStats is suppressed (not rendered)
         status.update_line(StatusLineType::MemoryContext, "Memory");
         status.update_line(StatusLineType::SessionLabel, "Session");
 
         let lines = status.get_lines();
 
-        // SessionLabel must be first, MemoryContext second, LiveStats third
+        // SessionLabel must be first, MemoryContext second
+        assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].line_type, StatusLineType::SessionLabel);
         assert_eq!(lines[1].line_type, StatusLineType::MemoryContext);
-        assert_eq!(lines[2].line_type, StatusLineType::LiveStats);
+    }
+
+    #[test]
+    fn test_live_stats_not_rendered() {
+        // LiveStats is suppressed — pushing it should not cause it to appear in get_lines()
+        let status = StatusBar::new();
+        status.update_live_stats("Qwen-3B", Some(100), Some(50), Some(1200));
+        let lines = status.get_lines();
+        assert!(
+            lines.iter().all(|l| l.line_type != StatusLineType::LiveStats),
+            "LiveStats must not appear in rendered output"
+        );
     }
 
     #[test]
@@ -470,8 +474,7 @@ mod tests {
     fn test_status_line_ordering_conversation_before_live_stats() {
         let status = StatusBar::new();
 
-        // Add in reverse order
-        status.update_line(StatusLineType::LiveStats, "Live");
+        // LiveStats is suppressed — only the non-Live lines appear
         status.update_line(StatusLineType::ConversationFocus, "Focus");
         status.update_line(StatusLineType::ConversationTopic, "Topic");
         status.update_line(StatusLineType::MemoryContext, "Memory");
@@ -483,7 +486,7 @@ mod tests {
         assert_eq!(lines[1].line_type, StatusLineType::MemoryContext);
         assert_eq!(lines[2].line_type, StatusLineType::ConversationTopic);
         assert_eq!(lines[3].line_type, StatusLineType::ConversationFocus);
-        assert_eq!(lines[4].line_type, StatusLineType::LiveStats);
+        assert_eq!(lines.len(), 4, "LiveStats must not appear");
     }
 
     #[test]

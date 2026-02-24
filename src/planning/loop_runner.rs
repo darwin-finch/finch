@@ -48,12 +48,23 @@ impl PlanLoop {
     /// `task` — the user's task description (e.g. "add JWT auth to the route handler")
     /// `tui`  — shared TUI renderer for showing blocking dialogs
     pub async fn run(&self, task: &str, tui: Arc<Mutex<TuiRenderer>>) -> Result<PlanResult> {
+        let result = self.run_inner(task, &tui).await;
+        // Always clear operation status, even on error
+        tui.lock().await.clear_operation_status();
+        result
+    }
+
+    async fn run_inner(&self, task: &str, tui: &Arc<Mutex<TuiRenderer>>) -> Result<PlanResult> {
         let mut history: Vec<PlanIteration> = Vec::new();
         let mut steering_feedback: Option<String> = None;
 
         for iteration in 1..=self.config.max_iterations {
             // ── 1. Generate plan ────────────────────────────────────────────
             self.show_iteration_header(iteration);
+            tui.lock().await.set_operation_status(format!(
+                "IMPCPD {}/{}: generating plan…",
+                iteration, self.config.max_iterations
+            ));
             let plan = self
                 .generate_plan(task, &history, steering_feedback.as_deref())
                 .await
@@ -65,6 +76,12 @@ impl PlanLoop {
             self.show_critique_header(iteration, &personas);
 
             // ── 3. Critique the plan ────────────────────────────────────────
+            tui.lock().await.set_operation_status(format!(
+                "IMPCPD {}/{}: critiquing ({} personas)…",
+                iteration,
+                self.config.max_iterations,
+                personas.len()
+            ));
             let critiques = self
                 .critique_plan(&plan, &personas)
                 .await
@@ -114,7 +131,7 @@ impl PlanLoop {
 
             // ── 6. Prompt user for steering or approval ──────────────────────
             let feedback = self
-                .prompt_user_feedback(&tui, iteration)
+                .prompt_user_feedback(tui, iteration)
                 .await
                 .context("Failed to get user feedback")?;
 

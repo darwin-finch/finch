@@ -681,7 +681,7 @@ impl TuiRenderer {
 // ─── Startup header ───────────────────────────────────────────────────────────
 
 impl TuiRenderer {
-    pub fn print_startup_header(&mut self, model: &str, cwd: &str) -> Result<()> {
+    pub fn print_startup_header(&mut self, model: &str, cwd: &str, session_label: &str) -> Result<()> {
         let version = env!("CARGO_PKG_VERSION");
 
         // Clear the visible terminal so we start from a clean slate.
@@ -727,14 +727,14 @@ impl TuiRenderer {
             Print("▐████████▌"),
             ResetColor,
             Print(format!("   {}\r\n", model)),
-            // Line 4 — lower body + cwd
+            // Line 4 — lower body + session · cwd
             Print("  "),
             SetForegroundColor(Color::DarkYellow),
             Print("▝▜██████▛▘"),
             ResetColor,
             Print("   "),
             SetForegroundColor(Color::DarkGrey),
-            Print(cwd),
+            Print(format!("{}  ·  {}", session_label, cwd)),
             ResetColor,
             Print("\r\n"),
             // Line 5 — legs
@@ -857,6 +857,20 @@ impl TuiRenderer {
         execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
         self.active_rows = 0;
         Ok(())
+    }
+}
+
+// ─── Operation status helpers (used by planning loop, etc.) ──────────────────
+
+impl TuiRenderer {
+    /// Set the OperationStatus line in the status bar (visible while queries run).
+    pub fn set_operation_status(&self, msg: impl Into<String>) {
+        self.status_bar.update_operation(msg.into());
+    }
+
+    /// Clear the OperationStatus line from the status bar.
+    pub fn clear_operation_status(&self) {
+        self.status_bar.clear_operation();
     }
 }
 
@@ -1167,7 +1181,7 @@ impl TuiRenderer {
     /// Show a blocking dialog (used when no async event loop is running).
     /// Returns `DialogResult::Cancelled` if Esc is pressed.
     pub fn show_dialog(&mut self, dialog: Dialog) -> Result<DialogResult> {
-        use crossterm::event::{KeyCode, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
         self.active_dialog = Some(dialog);
         self.erase_live_area()?;
@@ -1176,6 +1190,13 @@ impl TuiRenderer {
         loop {
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
+                    // Skip Release/Repeat events — only process Press.
+                    // Without this guard, terminals that emit both Press and Release
+                    // cause double-fire: e.g. pressing 'o' activates custom mode AND
+                    // immediately inserts 'o' into the text field via the Release event.
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
                     match (key.code, key.modifiers) {
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             let is_custom_mode = self
@@ -1239,6 +1260,9 @@ impl TuiRenderer {
 
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
+                    if key.kind != crossterm::event::KeyEventKind::Press {
+                        continue;
+                    }
                     if let Some(r) = dialog.handle_key_event(key) {
                         break r;
                     }

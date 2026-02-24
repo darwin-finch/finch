@@ -1038,4 +1038,52 @@ mod tests {
             "Custom mode must not activate when allow_custom=false"
         );
     }
+
+    // ─── regression: KeyEventKind::Press guard (issue #33-related) ───────────
+
+    /// Regression: pressing 'o' to activate custom mode then typing "Hello" and
+    /// pressing Enter must return `CustomText("Hello")`, NOT `CustomText("oHello")`.
+    ///
+    /// Root cause: `show_dialog` was processing both Press and Release events.
+    /// When 'o' was pressed, the Press event activated `custom_mode_active`.
+    /// The subsequent Release event then hit `handle_custom_input_key`, inserting
+    /// the literal 'o' character into the text field.
+    ///
+    /// The fix (KeyEventKind::Press guard in show_dialog) is in the TUI layer, but
+    /// we verify here that pressing 'o' then typing "Hello" works correctly at the
+    /// Dialog struct level — i.e., 'o' must not be double-inserted.
+    #[test]
+    fn test_steering_dialog_o_key_does_not_double_insert() {
+        let mut d = Dialog::select_with_custom(
+            "Steer",
+            vec![
+                DialogOption::with_description("Continue", "Run another pass"),
+                DialogOption::with_description("Approve", "Accept plan"),
+            ],
+        );
+
+        // Press 'o' — activates custom mode
+        d.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        assert!(d.custom_mode_active, "custom mode must be active after 'o'");
+
+        // Verify that the custom input is empty (no 'o' leaked in at Dialog level)
+        assert_eq!(
+            d.custom_input.as_deref(),
+            Some(""),
+            "custom input must be empty right after 'o' activates custom mode"
+        );
+
+        // Type "Hello"
+        for c in "Hello".chars() {
+            d.handle_key_event(KeyEvent::from(KeyCode::Char(c)));
+        }
+
+        // Enter submits the text
+        let result = d.handle_key_event(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            result,
+            Some(DialogResult::CustomText("Hello".to_string())),
+            "custom text must be exactly 'Hello' (no leading 'o')"
+        );
+    }
 }

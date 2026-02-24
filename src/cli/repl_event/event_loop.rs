@@ -235,6 +235,10 @@ pub struct EventLoop {
     /// Whether to summarise dropped messages (Infinite Context Phase 2).
     /// From config.features.enable_summarization.
     enable_summarization: bool,
+
+    /// Whether sliding-window auto-compaction is enabled.
+    /// From config.features.auto_compact_enabled. Default: true.
+    auto_compact_enabled: bool,
 }
 
 /// View mode for the REPL
@@ -273,6 +277,7 @@ impl EventLoop {
         context_recall_k: usize,
         todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
         enable_summarization: bool,
+        auto_compact_enabled: bool,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -350,6 +355,7 @@ impl EventLoop {
             context_recall_k,
             todo_list,
             enable_summarization,
+            auto_compact_enabled,
         }
     }
 
@@ -379,7 +385,7 @@ impl EventLoop {
 
         {
             let mut tui = self.tui_renderer.lock().await;
-            if let Err(e) = tui.print_startup_header(&model_name, &cwd) {
+            if let Err(e) = tui.print_startup_header(&model_name, &cwd, &self.session_label) {
                 tracing::warn!("Failed to print startup header: {}", e);
             }
         }
@@ -414,8 +420,15 @@ impl EventLoop {
             }
         }
 
-        // Initialize compaction status display
-        self.update_compaction_status().await;
+        // Apply auto-compact setting to the conversation history
+        if !self.auto_compact_enabled {
+            self.conversation.write().await.set_auto_compact(false);
+        }
+
+        // Initialize compaction status display (suppressed when auto-compact disabled)
+        if self.auto_compact_enabled {
+            self.update_compaction_status().await;
+        }
 
         // Initialize plan mode indicator (starts in Normal mode)
         self.update_plan_mode_indicator(&crate::cli::repl::ReplMode::Normal);
@@ -1181,6 +1194,7 @@ impl EventLoop {
         let max_verbatim = self.max_verbatim_messages;
         let recall_k = self.context_recall_k;
         let enable_summarization = self.enable_summarization;
+        let auto_compact_enabled = self.auto_compact_enabled;
         // Keep a reference to the cloud generator for summarisation calls
         // (we always want a capable model for summarisation, regardless of routing).
         let summary_gen = Arc::clone(&claude_gen);
@@ -1210,6 +1224,7 @@ impl EventLoop {
                 max_verbatim,
                 recall_k,
                 enable_summarization,
+                auto_compact_enabled,
                 summary_gen,
             )
             .await;
@@ -1254,6 +1269,7 @@ impl EventLoop {
         max_verbatim: usize,
         recall_k: usize,
         enable_summarization: bool,
+        auto_compact_enabled: bool,
         summary_gen: Arc<dyn Generator>,
     ) {
         tracing::debug!(
@@ -1666,8 +1682,8 @@ impl EventLoop {
                         refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
                     }
 
-                    // Update context usage indicator now that the message is committed
-                    {
+                    // Update context usage indicator (suppressed when auto-compact disabled)
+                    if auto_compact_enabled {
                         let conv = conversation.read().await;
                         let pct = (conv.compaction_percent_remaining() * 100.0) as u8;
                         status_bar.update_line(
@@ -2107,8 +2123,12 @@ impl EventLoop {
             .await;
     }
 
-    /// Update the compaction percentage in the status bar
+    /// Update the compaction percentage in the status bar.
+    /// No-op when auto_compact_enabled is false.
     async fn update_compaction_status(&self) {
+        if !self.auto_compact_enabled {
+            return;
+        }
         let conversation = self.conversation.read().await;
         let percent_remaining = conversation.compaction_percent_remaining();
 
@@ -2614,6 +2634,49 @@ impl EventLoop {
             ImpcpdConfig::default(),
         );
         let result = plan_loop.run(&task, Arc::clone(&self.tui_renderer)).await?;
+
+        // ── Emit convergence summary before the approval dialog ───────────────
+        {
+            let summary = match &result {
+                PlanResult::Converged { iterations } => {
+                    let n = iterations.len();
+                    let resolved: usize = iterations
+                        .iter()
+                        .map(|i| i.critiques.iter().filter(|c| c.is_must_address).count())
+                        .sum();
+                    format!(
+                        "{} IMPCPD: {} iteration{}, converged ✓  ({} issues resolved)",
+                        "✓".green().bold(),
+                        n,
+                        if n == 1 { "" } else { "s" },
+                        resolved
+                    )
+                }
+                PlanResult::IterationCap { iterations } => {
+                    let n = iterations.len();
+                    format!(
+                        "{} IMPCPD: {} iteration{} — hard cap reached, review carefully",
+                        "⚠".yellow().bold(),
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    )
+                }
+                PlanResult::UserApproved { iterations } => {
+                    let n = iterations.len();
+                    format!(
+                        "{} IMPCPD: {} iteration{}, user-approved mid-loop",
+                        "✓".green(),
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    )
+                }
+                PlanResult::Cancelled => String::new(),
+            };
+            if !summary.is_empty() {
+                self.output_manager.write_info(format!("\n{}\n", summary));
+                self.render_tui().await?;
+            }
+        }
 
         // ── Handle loop result ────────────────────────────────────────────────
         match result {
