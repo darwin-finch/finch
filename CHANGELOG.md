@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-02-24
+
 ### Fixed
 - **Dialog "Other" row is now navigable**: arrow keys (↑/↓) and j/k can reach the
   "Other (custom response)" option; pressing Enter on it activates custom text input.
