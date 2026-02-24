@@ -24,77 +24,46 @@ impl<'a> TabbedDialogWidget<'a> {
         Self { dialog, colors }
     }
 
-    /// Render the content lines (tabs, question, options, help)
+    /// Render the content lines (all questions visible simultaneously, with help)
     fn render_content(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
-        // Render tabs at the top
-        lines.extend(self.render_tabs());
-        lines.push(Line::from(""));
-
-        // Render current question
-        let current_tab = self.dialog.current_tab();
-
-        // Question text
-        lines.push(Line::from(Span::styled(
-            current_tab.question.question.clone(),
-            Style::default()
-                .fg(self.colors.dialog.title.to_color())
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-
-        // Always render options with inline custom input
-        lines.extend(self.render_options(current_tab));
-
-        // Render help/keybindings
-        lines.push(Line::from(""));
-        lines.extend(self.render_help(current_tab));
-
-        lines
-    }
-
-    /// Render tab headers
-    fn render_tabs(&self) -> Vec<Line<'static>> {
-        let mut tab_spans = Vec::new();
-
         for (idx, tab_state) in self.dialog.tabs().iter().enumerate() {
             let is_current = idx == self.dialog.current_tab_index();
-            let header = &tab_state.question.header;
 
-            // Add visual indicator for answered tabs
-            let label = if tab_state.answered {
-                format!("✓ {}", header)
-            } else {
-                header.clone()
-            };
-
-            let style = if is_current {
-                // Current tab: highlighted
+            // Section header — bold/highlighted when active, dimmed otherwise
+            let header_style = if is_current {
                 Style::default()
-                    .fg(self.colors.dialog.selected_fg.to_color())
-                    .bg(self.colors.dialog.selected_bg.to_color())
+                    .fg(self.colors.dialog.title.to_color())
                     .add_modifier(Modifier::BOLD)
-            } else if tab_state.answered {
-                // Answered tab: dimmed with checkmark (use green-ish color)
-                Style::default().fg(ratatui::style::Color::Green)
             } else {
-                // Unanswered tab: normal
-                Style::default().fg(self.colors.dialog.option.to_color())
+                Style::default().fg(self.colors.ui.separator.to_color())
             };
+            let label = if tab_state.answered {
+                format!("{}. {} ✓", idx + 1, tab_state.question.question)
+            } else {
+                format!("{}. {}", idx + 1, tab_state.question.question)
+            };
+            lines.push(Line::from(Span::styled(label, header_style)));
+            lines.push(Line::from(""));
 
-            tab_spans.push(Span::styled(format!(" {} ", label), style));
+            // Full options for every question (not just the active one)
+            lines.extend(self.render_options(tab_state));
 
-            // Add separator between tabs
+            // Separator between questions (omit after the last one)
             if idx < self.dialog.tabs().len() - 1 {
-                tab_spans.push(Span::styled(
-                    " │ ",
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(44),
                     Style::default().fg(self.colors.ui.separator.to_color()),
-                ));
+                )));
+                lines.push(Line::from(""));
             }
         }
 
-        vec![Line::from(tab_spans)]
+        lines.push(Line::from(""));
+        lines.extend(self.render_help(self.dialog.current_tab()));
+
+        lines
     }
 
     /// Render options for the current question
@@ -228,15 +197,98 @@ impl<'a> TabbedDialogWidget<'a> {
         let help_text = if tab_state.custom_mode_active {
             "Type | ←/→: Move cursor | Home/End | Del | Enter: Submit | Esc: Cancel"
         } else if tab_state.question.multi_select {
-            "←/→: Switch tabs | ↑/↓: Navigate | Space: Toggle | Enter: Submit | o: Other | Esc: Cancel"
+            "←/→: Switch question | ↑/↓: Navigate | Space: Toggle | Enter: Submit | o: Other | Esc: Cancel"
         } else {
-            "←/→: Switch tabs | ↑/↓ or j/k: Navigate | 1-9: Select | Enter: Submit | o: Other | Esc: Cancel"
+            "←/→: Switch question | ↑/↓ or j/k: Navigate | 1-9: Select | Enter: Submit | o: Other | Esc: Cancel"
         };
 
         vec![Line::from(Span::styled(
             help_text,
             Style::default().fg(self.colors.ui.separator.to_color()),
         ))]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::llm_dialogs::{Question, QuestionOption};
+    use crate::cli::tui::tabbed_dialog::TabbedDialog;
+    use crate::config::ColorScheme;
+
+    fn make_q(text: &str, opts: &[&str]) -> Question {
+        Question {
+            question: text.to_string(),
+            header: text[..text.len().min(12)].to_string(),
+            options: opts
+                .iter()
+                .map(|&l| QuestionOption {
+                    label: l.to_string(),
+                    description: format!("{l} desc"),
+                })
+                .collect(),
+            multi_select: false,
+        }
+    }
+
+    fn lines_to_text(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect()
+    }
+
+    /// Regression #19: all question texts must appear in rendered content,
+    /// not just the active tab.
+    #[test]
+    fn test_render_content_shows_all_question_texts() {
+        let dialog = TabbedDialog::new(
+            vec![
+                make_q("First question?", &["A", "B"]),
+                make_q("Second question?", &["X", "Y"]),
+            ],
+            None,
+        );
+        let colors = ColorScheme::default();
+        let w = TabbedDialogWidget::new(&dialog, &colors);
+        let text = lines_to_text(&w.render_content());
+
+        assert!(
+            text.contains("First question?"),
+            "First question must be visible"
+        );
+        assert!(
+            text.contains("Second question?"),
+            "Second question must be visible: {text}"
+        );
+    }
+
+    #[test]
+    fn test_render_content_single_question_shows_options() {
+        let dialog = TabbedDialog::new(vec![make_q("Pick one?", &["Alpha", "Beta"])], None);
+        let colors = ColorScheme::default();
+        let w = TabbedDialogWidget::new(&dialog, &colors);
+        let text = lines_to_text(&w.render_content());
+
+        assert!(text.contains("Alpha"), "Option Alpha must be visible: {text}");
+        assert!(text.contains("Beta"), "Option Beta must be visible: {text}");
+    }
+
+    /// Regression #19: separator must appear between questions.
+    #[test]
+    fn test_render_content_shows_separator_between_questions() {
+        let dialog = TabbedDialog::new(
+            vec![make_q("Q1?", &["A"]), make_q("Q2?", &["B"])],
+            None,
+        );
+        let colors = ColorScheme::default();
+        let w = TabbedDialogWidget::new(&dialog, &colors);
+        let text = lines_to_text(&w.render_content());
+
+        assert!(
+            text.contains("────"),
+            "Separator must appear between questions: {text}"
+        );
     }
 }
 
