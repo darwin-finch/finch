@@ -433,12 +433,6 @@ impl EventLoop {
         // Initialize plan mode indicator (starts in Normal mode)
         self.update_plan_mode_indicator(&crate::cli::repl::ReplMode::Normal);
 
-        // Set session label in status bar (permanent identity line)
-        self.status_bar.update_line(
-            crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ {}  ·  {}", self.session_label, cwd),
-        );
-
         // Set initial memory context in status bar
         if let Some(ref mem) = self.memory_system {
             if let Ok(stats) = mem.stats().await {

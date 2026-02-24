@@ -230,6 +230,9 @@ pub struct TuiRenderer {
 
     // Session task list (set after construction via set_todo_list)
     todo_list: Option<Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>>,
+
+    // Session identity — set by print_startup_header(); shown in separator line.
+    session_label: String,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -301,6 +304,8 @@ impl TuiRenderer {
             render_interval: Duration::from_millis(100),
 
             todo_list: None,
+
+            session_label: String::new(),
         })
     }
 
@@ -435,15 +440,18 @@ impl TuiRenderer {
             }
         }
 
-        // ── 2. Separator with embedded CWD ───────────────────────────────────
+        // ── 2. Separator with embedded session name + CWD ────────────────────
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let cwd_label = tilde_cwd();
-        // Format: "─── ~/repos/finch ──────────────..."
-        // Leave 2 dashes on the left and fill the rest on the right.
-        let label_with_spaces = format!(" {} ", cwd_label);
+        // Format: "──  calm-cliff  ·  ~/repos/finch ──────────────..."
+        let label_with_spaces = if self.session_label.is_empty() {
+            format!(" {} ", cwd_label)
+        } else {
+            format!(" {}  ·  {} ", self.session_label, cwd_label)
+        };
         let prefix = "── ";
         let prefix_vis = 3_usize;
-        let label_vis = label_with_spaces.len();
+        let label_vis = label_with_spaces.chars().count();
         let suffix_len = term_width.saturating_sub(prefix_vis + label_vis);
         let suffix: String = "─".repeat(suffix_len);
         execute!(
@@ -683,6 +691,9 @@ impl TuiRenderer {
 impl TuiRenderer {
     pub fn print_startup_header(&mut self, model: &str, cwd: &str, session_label: &str) -> Result<()> {
         let version = env!("CARGO_PKG_VERSION");
+
+        // Store session label so blit_visible_area() can embed it in the separator.
+        self.session_label = session_label.to_string();
 
         // Clear the visible terminal so we start from a clean slate.
         execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
