@@ -15,6 +15,7 @@ use std::sync::Arc;
 const CYAN: &str = "\x1b[36m";
 const GRAY: &str = "\x1b[90m";
 const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
@@ -202,26 +203,72 @@ pub fn stream_tool_output_to_message(
     });
 }
 
+/// Colorize a single diff line if it has no existing ANSI codes.
+fn colorize_diff_line(line: &str) -> String {
+    // Skip lines that already have ANSI escape codes.
+    if line.contains('\x1b') {
+        return line.to_string();
+    }
+    if line.starts_with('+') && !line.starts_with("+++") {
+        format!("{}{}{}", GREEN, line, RESET)
+    } else if line.starts_with('-') && !line.starts_with("---") {
+        format!("{}{}{}", RED, line, RESET)
+    } else if line.starts_with("@@") {
+        format!("{}{}{}", CYAN, line, RESET)
+    } else if line.starts_with("diff ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+    {
+        format!("{}{}{}{}", BOLD, GRAY, line, RESET)
+    } else {
+        line.to_string()
+    }
+}
+
+/// Returns true if the content looks like unified diff output.
+fn looks_like_diff(content: &str) -> bool {
+    let mut plus = 0u32;
+    let mut minus = 0u32;
+    for line in content.lines().take(20) {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            plus += 1;
+        }
+        if line.starts_with('-') && !line.starts_with("---") {
+            minus += 1;
+        }
+        if line.starts_with("@@") || line.starts_with("diff --git") {
+            return true;
+        }
+    }
+    plus + minus >= 2
+}
+
 /// Build the formatted content for a tool result (without the ● header - that's in the message)
 fn build_result_content(content: &str, is_error: bool) -> String {
     if content.trim().is_empty() {
         return String::new();
     }
 
+    let is_diff = !is_error && looks_like_diff(content);
     let lines: Vec<&str> = content.lines().collect();
     let shown = lines.len().min(MAX_OUTPUT_LINES);
     let mut result = String::new();
 
     for (i, line) in lines.iter().take(shown).enumerate() {
+        let colored = if is_diff {
+            colorize_diff_line(line)
+        } else {
+            line.to_string()
+        };
         if i == 0 {
             if is_error {
                 result.push_str(&format!("  {}⎿{} {}{}{}\n", GRAY, RESET, RED, line, RESET));
             } else {
-                result.push_str(&format!("  {}⎿{} {}\n", GRAY, RESET, line));
+                result.push_str(&format!("  {}⎿{} {}\n", GRAY, RESET, colored));
             }
         } else {
-            // Preserve existing ANSI colors in diff lines (don't add extra gray wrapping)
-            result.push_str(&format!("    {}\n", line));
+            result.push_str(&format!("    {}\n", colored));
         }
     }
 

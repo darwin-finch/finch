@@ -3018,6 +3018,17 @@ async fn handle_ask_user_question(
 
     match result {
         Ok(output) => {
+            // Empty answers means the user dismissed the dialog (Escape).
+            // Return a plain-text message so the model knows to stop asking
+            // rather than looping endlessly.
+            if output.answers.is_empty() {
+                return Some(Ok(
+                    "The user dismissed the dialog without answering (pressed Escape or cancelled). \
+                     Do NOT call AskUserQuestion again. Continue without asking, or ask your \
+                     question inline as plain text in your response."
+                        .to_string(),
+                ));
+            }
             // Serialize output as JSON
             match serde_json::to_string_pretty(&output) {
                 Ok(json) => Some(Ok(json)),

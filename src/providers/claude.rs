@@ -266,19 +266,24 @@ impl ClaudeProvider {
                                                         "text_delta" => {
                                                             if let Some(text) = delta.text {
                                                                 builder.accumulated.push_str(&text);
-                                                                // Send delta immediately
-                                                                if tx
-                                                                    .send(Ok(
-                                                                        StreamChunk::TextDelta(
-                                                                            text,
-                                                                        ),
-                                                                    ))
-                                                                    .await
-                                                                    .is_err()
-                                                                {
-                                                                    // Receiver dropped, stop streaming
-                                                                    done = true;
-                                                                    break;
+                                                                // Only stream visible text — skip
+                                                                // extended thinking blocks so the
+                                                                // model's chain-of-thought never
+                                                                // leaks into the TUI output.
+                                                                if builder.block_type != "thinking" {
+                                                                    if tx
+                                                                        .send(Ok(
+                                                                            StreamChunk::TextDelta(
+                                                                                text,
+                                                                            ),
+                                                                        ))
+                                                                        .await
+                                                                        .is_err()
+                                                                    {
+                                                                        // Receiver dropped, stop streaming
+                                                                        done = true;
+                                                                        break;
+                                                                    }
                                                                 }
                                                             }
                                                         }
