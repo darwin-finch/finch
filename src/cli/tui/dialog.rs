@@ -43,6 +43,8 @@ pub enum DialogType {
 pub struct DialogOption {
     pub label: String,
     pub description: Option<String>,
+    /// Optional markdown preview shown in a box when this option is focused.
+    pub markdown: Option<String>,
 }
 
 impl DialogOption {
@@ -51,6 +53,7 @@ impl DialogOption {
         Self {
             label: label.into(),
             description: None,
+            markdown: None,
         }
     }
 
@@ -59,7 +62,14 @@ impl DialogOption {
         Self {
             label: label.into(),
             description: Some(description.into()),
+            markdown: None,
         }
+    }
+
+    /// Attach a markdown preview to this option
+    pub fn with_markdown(mut self, markdown: impl Into<String>) -> Self {
+        self.markdown = Some(markdown.into());
+        self
     }
 }
 

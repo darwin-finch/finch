@@ -1056,6 +1056,85 @@ impl TuiRenderer {
 
         } // end else (custom_mode_active)
 
+        // ── Preview pane ─────────────────────────────────────────────────────
+        // If the focused option has a `markdown` field, render it in a bordered
+        // preview section between the options and the keybindings hint.
+        let focused_markdown: Option<&str> = if !dialog.custom_mode_active {
+            match &dialog.dialog_type {
+                DialogType::Select {
+                    options,
+                    selected_index,
+                    ..
+                } => options
+                    .get(*selected_index)
+                    .and_then(|o| o.markdown.as_deref()),
+                DialogType::MultiSelect {
+                    options,
+                    cursor_index,
+                    ..
+                } => options
+                    .get(*cursor_index)
+                    .and_then(|o| o.markdown.as_deref()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(md) = focused_markdown {
+            let term_height = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
+            let max_preview_lines = 10.min(term_height / 3).max(1);
+
+            // Strip leading/trailing blank lines and collect non-empty content
+            let raw_lines: Vec<&str> = md.lines().collect();
+            let start = raw_lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+            let end = raw_lines
+                .iter()
+                .rposition(|l| !l.trim().is_empty())
+                .map(|i| i + 1)
+                .unwrap_or(raw_lines.len());
+            let content_lines: Vec<&str> = raw_lines[start..end].to_vec();
+            let display_lines: Vec<&str> = content_lines
+                .iter()
+                .take(max_preview_lines)
+                .copied()
+                .collect();
+            let truncated = content_lines.len() > max_preview_lines;
+
+            let preview_div = format!("├─ Preview {}", "─".repeat(box_width.saturating_sub(12)));
+            execute!(stdout, Print(format!("{}\r\n", preview_div)))?;
+            rows += 1;
+
+            for line in &display_lines {
+                // Truncate to inner width using visible_length to handle ANSI codes
+                let vlen = shadow_buffer::visible_length(line);
+                let display = if vlen <= inner {
+                    format!("│  {:<w$}  │\r\n", line, w = inner)
+                } else {
+                    // Truncate by chars (ANSI codes make byte slicing unsafe)
+                    let truncated_line: String = line.chars().take(inner.saturating_sub(1)).collect();
+                    format!("│  {}…  │\r\n", truncated_line)
+                };
+                execute!(stdout, Print(display))?;
+                rows += 1;
+            }
+
+            if truncated {
+                execute!(
+                    stdout,
+                    Print(format!(
+                        "│  {}{:<w$}{}  │\r\n",
+                        DIM_GRAY,
+                        "…",
+                        RESET,
+                        w = inner
+                    ))
+                )?;
+                rows += 1;
+            }
+        }
+        // ── End preview pane ─────────────────────────────────────────────────
+
         execute!(stdout, Print(format!("{}\r\n", div)))?;
         let allow_custom = matches!(
             &dialog.dialog_type,
@@ -1199,9 +1278,11 @@ impl TuiRenderer {
                 TabbedDialogResult::Completed(answers) => answers,
                 TabbedDialogResult::Cancelled => HashMap::new(),
             };
+            let annotations = llm_dialogs::build_annotations(&input.questions, &answers);
             return Ok(crate::cli::AskUserQuestionOutput {
                 questions: input.questions.clone(),
                 answers,
+                annotations,
             });
         }
 
@@ -1215,9 +1296,11 @@ impl TuiRenderer {
             }
         }
 
+        let annotations = llm_dialogs::build_annotations(&input.questions, &answers);
         Ok(crate::cli::AskUserQuestionOutput {
             questions: input.questions.clone(),
             answers,
+            annotations,
         })
     }
 }

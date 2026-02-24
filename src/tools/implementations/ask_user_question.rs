@@ -29,7 +29,7 @@ impl Tool for AskUserQuestionTool {
                \"question\": \"Which approach?\",\n\
                \"header\": \"Approach\",\n\
                \"options\": [\n\
-                 {\"label\": \"A\", \"description\": \"Fast\"},\n\
+                 {\"label\": \"A\", \"description\": \"Fast\", \"markdown\": \"fn foo() {}\"},\n\
                  {\"label\": \"B\", \"description\": \"Simple\"}\n\
                ],\n\
                \"multi_select\": false\n\
@@ -39,6 +39,9 @@ impl Tool for AskUserQuestionTool {
          \
          Supports single-select, multi-select, and automatic 'Other' option \
          for free-form text input. Can ask 1-4 questions at once. \
+         Use `markdown` on options to show code previews when that option is focused; \
+         the selected option's markdown is echoed back in `annotations` so you know \
+         exactly which preview the user approved. \
          \
          Available in all modes including plan mode."
     }
@@ -73,6 +76,10 @@ impl Tool for AskUserQuestionTool {
                                     "description": {
                                         "type": "string",
                                         "description": "What this option means"
+                                    },
+                                    "markdown": {
+                                        "type": "string",
+                                        "description": "Optional preview content shown when this option is focused (code snippet, ASCII mockup, diff). Rendered in a monospace preview box."
                                     }
                                 },
                                 "required": ["label", "description"]
@@ -131,5 +138,33 @@ mod tests {
         // Verify schema structure
         assert_eq!(schema.schema_type, "object");
         assert_eq!(schema.required, vec!["questions"]);
+    }
+
+    #[test]
+    fn test_schema_options_contain_markdown_field() {
+        let tool = AskUserQuestionTool;
+        let schema = tool.input_schema();
+
+        let items = &schema.properties["questions"]["items"];
+        let option_props = &items["properties"]["options"]["items"]["properties"];
+        assert!(
+            option_props.get("markdown").is_some(),
+            "options schema must include 'markdown' property"
+        );
+        assert_eq!(option_props["markdown"]["type"], "string");
+    }
+
+    #[test]
+    fn test_schema_description_mentions_preview() {
+        let tool = AskUserQuestionTool;
+        let desc = tool.description();
+        assert!(
+            desc.contains("markdown") || desc.contains("preview"),
+            "description should mention markdown/preview feature"
+        );
+        assert!(
+            desc.contains("annotations"),
+            "description should mention annotations output field"
+        );
     }
 }

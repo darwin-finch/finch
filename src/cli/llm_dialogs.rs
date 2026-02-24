@@ -21,6 +21,11 @@ pub struct QuestionOption {
 
     /// Description explaining what this option means
     pub description: String,
+
+    /// Optional markdown preview shown when this option is focused.
+    /// Supports code blocks, ASCII diagrams, diffs. Rendered in a monospace preview box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
 }
 
 /// A single question to ask the user
@@ -47,8 +52,16 @@ pub struct AskUserQuestionInput {
     pub questions: Vec<Question>,
 }
 
+/// Per-question annotation echoing back the selected option's metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct AnnotationEntry {
+    /// The markdown of the option the user selected, echoed from `QuestionOption.markdown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+}
+
 /// Output from AskUserQuestion tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AskUserQuestionOutput {
     /// The questions that were asked (echoed back)
     pub questions: Vec<Question>,
@@ -57,6 +70,39 @@ pub struct AskUserQuestionOutput {
     /// For single-select: value is the label string
     /// For multi-select: value is comma-separated labels
     pub answers: HashMap<String, String>,
+
+    /// Per-question annotations keyed by question text.
+    /// Populated when the selected option has a `markdown` field.
+    /// Empty for multi-select questions (no single-label match).
+    #[serde(default)]
+    pub annotations: HashMap<String, AnnotationEntry>,
+}
+
+/// Build the annotations map from questions and user answers.
+///
+/// For each single-select question where the selected option has `markdown`,
+/// inserts an `AnnotationEntry` keyed by the question text. Multi-select
+/// questions are skipped (the answer is a comma-joined string that does not
+/// map to a single option label).
+pub fn build_annotations(
+    questions: &[Question],
+    answers: &HashMap<String, String>,
+) -> HashMap<String, AnnotationEntry> {
+    questions
+        .iter()
+        .filter(|q| !q.multi_select) // skip multi-select (no single-option lookup)
+        .filter_map(|q| {
+            let selected_label = answers.get(&q.question)?;
+            let opt = q.options.iter().find(|o| &o.label == selected_label)?;
+            opt.markdown.as_ref()?; // skip if no markdown
+            Some((
+                q.question.clone(),
+                AnnotationEntry {
+                    markdown: opt.markdown.clone(),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// Validation errors for AskUserQuestion input
@@ -155,11 +201,18 @@ pub fn validate_input(input: &AskUserQuestionInput) -> Result<(), ValidationErro
 pub fn question_to_dialog(question: &Question) -> crate::cli::tui::Dialog {
     use crate::cli::tui::{Dialog, DialogOption};
 
-    // Convert our QuestionOptions to DialogOptions
+    // Convert our QuestionOptions to DialogOptions, carrying markdown through
     let dialog_options: Vec<DialogOption> = question
         .options
         .iter()
-        .map(|opt| DialogOption::with_description(opt.label.clone(), opt.description.clone()))
+        .map(|opt| {
+            let mut d =
+                DialogOption::with_description(opt.label.clone(), opt.description.clone());
+            if let Some(ref md) = opt.markdown {
+                d = d.with_markdown(md.clone());
+            }
+            d
+        })
         .collect();
 
     if question.multi_select {
@@ -231,10 +284,12 @@ mod tests {
                     QuestionOption {
                         label: "Option A".to_string(),
                         description: "Description A".to_string(),
+                        markdown: None,
                     },
                     QuestionOption {
                         label: "Option B".to_string(),
                         description: "Description B".to_string(),
+                        markdown: None,
                     },
                 ],
                 multi_select: false,
@@ -254,83 +309,47 @@ mod tests {
         ));
     }
 
+    fn mk_opt(label: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.to_string(),
+            description: "D".to_string(),
+            markdown: None,
+        }
+    }
+
     #[test]
     fn test_validate_input_too_many_questions() {
+        let two_opts = || vec![mk_opt("A"), mk_opt("B")];
         let input = AskUserQuestionInput {
             questions: vec![
                 Question {
                     question: "Q1".to_string(),
                     header: "H1".to_string(),
-                    options: vec![
-                        QuestionOption {
-                            label: "A".to_string(),
-                            description: "D".to_string(),
-                        },
-                        QuestionOption {
-                            label: "B".to_string(),
-                            description: "D".to_string(),
-                        },
-                    ],
+                    options: two_opts(),
                     multi_select: false,
                 },
                 Question {
                     question: "Q2".to_string(),
                     header: "H2".to_string(),
-                    options: vec![
-                        QuestionOption {
-                            label: "A".to_string(),
-                            description: "D".to_string(),
-                        },
-                        QuestionOption {
-                            label: "B".to_string(),
-                            description: "D".to_string(),
-                        },
-                    ],
+                    options: two_opts(),
                     multi_select: false,
                 },
                 Question {
                     question: "Q3".to_string(),
                     header: "H3".to_string(),
-                    options: vec![
-                        QuestionOption {
-                            label: "A".to_string(),
-                            description: "D".to_string(),
-                        },
-                        QuestionOption {
-                            label: "B".to_string(),
-                            description: "D".to_string(),
-                        },
-                    ],
+                    options: two_opts(),
                     multi_select: false,
                 },
                 Question {
                     question: "Q4".to_string(),
                     header: "H4".to_string(),
-                    options: vec![
-                        QuestionOption {
-                            label: "A".to_string(),
-                            description: "D".to_string(),
-                        },
-                        QuestionOption {
-                            label: "B".to_string(),
-                            description: "D".to_string(),
-                        },
-                    ],
+                    options: two_opts(),
                     multi_select: false,
                 },
                 Question {
                     question: "Q5".to_string(),
                     header: "H5".to_string(),
-                    options: vec![
-                        QuestionOption {
-                            label: "A".to_string(),
-                            description: "D".to_string(),
-                        },
-                        QuestionOption {
-                            label: "B".to_string(),
-                            description: "D".to_string(),
-                        },
-                    ],
+                    options: two_opts(),
                     multi_select: false,
                 },
             ],
@@ -351,6 +370,7 @@ mod tests {
                 options: vec![QuestionOption {
                     label: "Only one".to_string(),
                     description: "Description".to_string(),
+                    markdown: None,
                 }],
                 multi_select: false,
             }],
@@ -368,16 +388,7 @@ mod tests {
             questions: vec![Question {
                 question: "Question".to_string(),
                 header: "This header is way too long for display".to_string(),
-                options: vec![
-                    QuestionOption {
-                        label: "A".to_string(),
-                        description: "D".to_string(),
-                    },
-                    QuestionOption {
-                        label: "B".to_string(),
-                        description: "D".to_string(),
-                    },
-                ],
+                options: vec![mk_opt("A"), mk_opt("B")],
                 multi_select: false,
             }],
         };
@@ -399,10 +410,12 @@ mod tests {
                 QuestionOption {
                     label: "Option A".to_string(),
                     description: "First".to_string(),
+                    markdown: None,
                 },
                 QuestionOption {
                     label: "Option B".to_string(),
                     description: "Second".to_string(),
+                    markdown: None,
                 },
             ],
             multi_select: false,
@@ -425,14 +438,17 @@ mod tests {
                 QuestionOption {
                     label: "Option A".to_string(),
                     description: "First".to_string(),
+                    markdown: None,
                 },
                 QuestionOption {
                     label: "Option B".to_string(),
                     description: "Second".to_string(),
+                    markdown: None,
                 },
                 QuestionOption {
                     label: "Option C".to_string(),
                     description: "Third".to_string(),
+                    markdown: None,
                 },
             ],
             multi_select: true,
@@ -442,5 +458,128 @@ mod tests {
         let answer = extract_answer(&question, &result);
 
         assert_eq!(answer, Some("Option A, Option C".to_string()));
+    }
+
+    #[test]
+    fn test_question_option_markdown_roundtrip() {
+        let opt = QuestionOption {
+            label: "Async".to_string(),
+            description: "Use async/await".to_string(),
+            markdown: Some("async fn foo() {}".to_string()),
+        };
+        let json = serde_json::to_string(&opt).unwrap();
+        let back: QuestionOption = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.markdown, Some("async fn foo() {}".to_string()));
+    }
+
+    #[test]
+    fn test_question_option_no_markdown_omitted_from_json() {
+        let opt = QuestionOption {
+            label: "Simple".to_string(),
+            description: "Simple approach".to_string(),
+            markdown: None,
+        };
+        let json = serde_json::to_string(&opt).unwrap();
+        assert!(!json.contains("markdown"), "markdown key should be omitted when None");
+    }
+
+    #[test]
+    fn test_build_annotations_single_select_with_markdown() {
+        let questions = vec![Question {
+            question: "Which impl?".to_string(),
+            header: "Impl".to_string(),
+            options: vec![
+                QuestionOption {
+                    label: "Async".to_string(),
+                    description: "Async approach".to_string(),
+                    markdown: Some("async fn foo() {}".to_string()),
+                },
+                QuestionOption {
+                    label: "Sync".to_string(),
+                    description: "Sync approach".to_string(),
+                    markdown: None,
+                },
+            ],
+            multi_select: false,
+        }];
+        let mut answers = HashMap::new();
+        answers.insert("Which impl?".to_string(), "Async".to_string());
+
+        let annotations = build_annotations(&questions, &answers);
+
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(
+            annotations["Which impl?"].markdown,
+            Some("async fn foo() {}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_annotations_single_select_no_markdown() {
+        let questions = vec![Question {
+            question: "Which impl?".to_string(),
+            header: "Impl".to_string(),
+            options: vec![
+                QuestionOption {
+                    label: "Async".to_string(),
+                    description: "Async approach".to_string(),
+                    markdown: None,
+                },
+                QuestionOption {
+                    label: "Sync".to_string(),
+                    description: "Sync approach".to_string(),
+                    markdown: None,
+                },
+            ],
+            multi_select: false,
+        }];
+        let mut answers = HashMap::new();
+        answers.insert("Which impl?".to_string(), "Async".to_string());
+
+        let annotations = build_annotations(&questions, &answers);
+
+        assert!(
+            annotations.is_empty(),
+            "should be empty when selected option has no markdown"
+        );
+    }
+
+    #[test]
+    fn test_build_annotations_multi_select_skipped() {
+        let questions = vec![Question {
+            question: "Which features?".to_string(),
+            header: "Features".to_string(),
+            options: vec![
+                QuestionOption {
+                    label: "Auth".to_string(),
+                    description: "Auth feature".to_string(),
+                    markdown: Some("// auth code".to_string()),
+                },
+                QuestionOption {
+                    label: "Cache".to_string(),
+                    description: "Cache feature".to_string(),
+                    markdown: Some("// cache code".to_string()),
+                },
+            ],
+            multi_select: true,
+        }];
+        let mut answers = HashMap::new();
+        // multi-select produces comma-joined answer — no single-option match
+        answers.insert("Which features?".to_string(), "Auth, Cache".to_string());
+
+        let annotations = build_annotations(&questions, &answers);
+
+        assert!(
+            annotations.is_empty(),
+            "multi-select questions should not produce annotations"
+        );
+    }
+
+    #[test]
+    fn test_ask_user_question_output_default_has_empty_annotations() {
+        let output = AskUserQuestionOutput::default();
+        assert!(output.annotations.is_empty());
+        assert!(output.answers.is_empty());
+        assert!(output.questions.is_empty());
     }
 }

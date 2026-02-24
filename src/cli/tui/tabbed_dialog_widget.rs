@@ -225,6 +225,7 @@ mod tests {
                 .map(|&l| QuestionOption {
                     label: l.to_string(),
                     description: format!("{l} desc"),
+                    markdown: None,
                 })
                 .collect(),
             multi_select: false,

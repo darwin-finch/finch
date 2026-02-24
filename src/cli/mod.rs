@@ -22,7 +22,9 @@ pub mod tui; // Phase 2: Terminal UI
 pub use commands::handle_command;
 pub use conversation::ConversationHistory;
 pub use input::InputHandler;
-pub use llm_dialogs::{AskUserQuestionInput, AskUserQuestionOutput, Question, QuestionOption};
+pub use llm_dialogs::{
+    AnnotationEntry, AskUserQuestionInput, AskUserQuestionOutput, Question, QuestionOption,
+};
 pub use memtree_console::{ConsoleNode, ConsoleNodeType, MemTreeConsole};
 pub use messages::{Message, MessageId, MessageRef, MessageStatus};
 pub use messages::{

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-02-24
+
+### Added
+- **AskUserQuestion option markdown previews**: add a `markdown` field to any `QuestionOption`
+  to show a live code/ASCII/diff preview box when that option is focused in the dialog.
+- **AskUserQuestion `annotations` response field**: the selected option's `markdown` is echoed
+  back in `annotations` (keyed by question text) so the LLM knows exactly which code preview
+  the user approved—not just the label string. Matches the Claude Code AskUserQuestion spec.
+- Multi-select support confirmed fully shipped (closes #20).
+
 ## [0.7.0] - 2026-02-24
 
 ### Added

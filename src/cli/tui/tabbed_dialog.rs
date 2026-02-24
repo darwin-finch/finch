@@ -391,6 +391,7 @@ mod tests {
                 .map(|&label| QuestionOption {
                     label: label.to_string(),
                     description: format!("{label} description"),
+                    markdown: None,
                 })
                 .collect(),
             multi_select: multi,
