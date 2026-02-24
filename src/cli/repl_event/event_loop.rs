@@ -582,6 +582,12 @@ impl EventLoop {
             }
         }
 
+        // Normal exit — shut down TUI and restore terminal before returning.
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            let _ = tui.shutdown();
+        }
+
         Ok(())
     }
 
