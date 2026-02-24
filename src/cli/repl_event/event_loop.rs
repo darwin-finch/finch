@@ -2264,67 +2264,7 @@ impl EventLoop {
 
         // Create approval dialog
         let tool_name = &tool_use.name;
-
-        // Create a concise summary of key parameters (not full JSON dump)
-        let summary = match tool_name.as_str() {
-            "bash" | "Bash" => {
-                if let Some(cmd) = tool_use.input.get("command").and_then(|v| v.as_str()) {
-                    format!(
-                        "Command: {}",
-                        if cmd.len() > 60 {
-                            format!("{}...", &cmd[..60])
-                        } else {
-                            cmd.to_string()
-                        }
-                    )
-                } else {
-                    "Execute shell command".to_string()
-                }
-            }
-            "read" | "Read" => {
-                if let Some(path) = tool_use.input.get("file_path").and_then(|v| v.as_str()) {
-                    format!("File: {}", path)
-                } else {
-                    "Read file".to_string()
-                }
-            }
-            "grep" | "Grep" => {
-                if let Some(pattern) = tool_use.input.get("pattern").and_then(|v| v.as_str()) {
-                    format!(
-                        "Pattern: {}",
-                        if pattern.len() > 40 {
-                            format!("{}...", &pattern[..40])
-                        } else {
-                            pattern.to_string()
-                        }
-                    )
-                } else {
-                    "Search files".to_string()
-                }
-            }
-            "glob" | "Glob" => {
-                if let Some(pattern) = tool_use.input.get("pattern").and_then(|v| v.as_str()) {
-                    format!("Pattern: {}", pattern)
-                } else {
-                    "Find files".to_string()
-                }
-            }
-            "EnterPlanMode" => {
-                if let Some(reason) = tool_use.input.get("reason").and_then(|v| v.as_str()) {
-                    format!(
-                        "Reason: {}",
-                        if reason.len() > 50 {
-                            format!("{}...", &reason[..50])
-                        } else {
-                            reason.to_string()
-                        }
-                    )
-                } else {
-                    "Enter planning mode".to_string()
-                }
-            }
-            _ => format!("Execute {} tool", tool_name),
-        };
+        let summary = tool_approval_summary(&tool_use);
 
         let options = vec![
             DialogOption::with_description(
@@ -2383,49 +2323,7 @@ impl EventLoop {
         dialog_result: crate::cli::tui::DialogResult,
         tool_use: &crate::tools::types::ToolUse,
     ) -> super::events::ConfirmationResult {
-        use super::events::ConfirmationResult;
-        use crate::tools::executor::generate_tool_signature;
-        use crate::tools::patterns::ToolPattern;
-
-        match dialog_result {
-            crate::cli::tui::DialogResult::Selected(index) => match index {
-                0 => ConfirmationResult::ApproveOnce,
-                1 => {
-                    let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
-                    ConfirmationResult::ApproveExactSession(signature)
-                }
-                2 => {
-                    // Wildcard pattern: allow any call to this tool this session.
-                    // Use "*" as the pattern so it matches any context_key.
-                    let pattern = ToolPattern::new(
-                        "*".to_string(),
-                        tool_use.name.clone(),
-                        format!("Allow all {} calls (session)", tool_use.name),
-                    );
-                    ConfirmationResult::ApprovePatternSession(pattern)
-                }
-                3 => {
-                    let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
-                    ConfirmationResult::ApproveExactPersistent(signature)
-                }
-                4 => {
-                    // Wildcard pattern: always allow any call to this tool.
-                    let pattern = ToolPattern::new(
-                        "*".to_string(),
-                        tool_use.name.clone(),
-                        format!("Allow all {} calls (persistent)", tool_use.name),
-                    );
-                    ConfirmationResult::ApprovePatternPersistent(pattern)
-                }
-                _ => ConfirmationResult::Deny, // Index 5 or cancelled
-            },
-            crate::cli::tui::DialogResult::CustomText(text) => {
-                // User provided custom response - log it and deny for safety
-                tracing::info!("Tool approval custom response: {}", text);
-                ConfirmationResult::Deny
-            }
-            _ => ConfirmationResult::Deny,
-        }
+        dialog_result_to_confirmation(dialog_result, tool_use)
     }
 
     // ========== Plan Mode Handlers ==========
@@ -3345,6 +3243,132 @@ pub(crate) fn apply_sliding_window(
         window.remove(0);
     }
     window
+}
+
+/// Build a concise human-readable summary of a tool call for the approval dialog.
+///
+/// Returns a single line such as `"Command: git push"` or `"File: src/main.rs"`.
+/// Exported `pub(crate)` so it can be unit-tested directly.
+pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> String {
+    let tool_name = &tool_use.name;
+    match tool_name.as_str() {
+        "bash" | "Bash" => {
+            if let Some(cmd) = tool_use.input.get("command").and_then(|v| v.as_str()) {
+                format!(
+                    "Command: {}",
+                    if cmd.len() > 60 {
+                        format!("{}...", &cmd[..60])
+                    } else {
+                        cmd.to_string()
+                    }
+                )
+            } else {
+                "Execute shell command".to_string()
+            }
+        }
+        "read" | "Read" => {
+            if let Some(path) = tool_use.input.get("file_path").and_then(|v| v.as_str()) {
+                format!("File: {}", path)
+            } else {
+                "Read file".to_string()
+            }
+        }
+        "grep" | "Grep" => {
+            if let Some(pattern) = tool_use.input.get("pattern").and_then(|v| v.as_str()) {
+                format!(
+                    "Pattern: {}",
+                    if pattern.len() > 40 {
+                        format!("{}...", &pattern[..40])
+                    } else {
+                        pattern.to_string()
+                    }
+                )
+            } else {
+                "Search files".to_string()
+            }
+        }
+        "glob" | "Glob" => {
+            if let Some(pattern) = tool_use.input.get("pattern").and_then(|v| v.as_str()) {
+                format!("Pattern: {}", pattern)
+            } else {
+                "Find files".to_string()
+            }
+        }
+        "EnterPlanMode" => {
+            if let Some(reason) = tool_use.input.get("reason").and_then(|v| v.as_str()) {
+                format!(
+                    "Reason: {}",
+                    if reason.len() > 50 {
+                        format!("{}...", &reason[..50])
+                    } else {
+                        reason.to_string()
+                    }
+                )
+            } else {
+                "Enter planning mode".to_string()
+            }
+        }
+        _ => format!("Execute {} tool", tool_name),
+    }
+}
+
+/// Convert a dialog selection to a `ConfirmationResult` for tool approval.
+///
+/// Mapping:
+///   - `Selected(0)` → `ApproveOnce`
+///   - `Selected(1)` → `ApproveExactSession` (exact signature, session-scoped)
+///   - `Selected(2)` → `ApprovePatternSession` (wildcard for this tool, session-scoped)
+///   - `Selected(3)` → `ApproveExactPersistent` (exact signature, persistent)
+///   - `Selected(4)` → `ApprovePatternPersistent` (wildcard for this tool, persistent)
+///   - `Selected(5+)` / `Cancelled` / `CustomText` → `Deny`
+///
+/// Exported `pub(crate)` so it can be unit-tested directly.
+pub(crate) fn dialog_result_to_confirmation(
+    dialog_result: crate::cli::tui::DialogResult,
+    tool_use: &crate::tools::types::ToolUse,
+) -> super::events::ConfirmationResult {
+    use super::events::ConfirmationResult;
+    use crate::tools::executor::generate_tool_signature;
+    use crate::tools::patterns::ToolPattern;
+
+    match dialog_result {
+        crate::cli::tui::DialogResult::Selected(index) => match index {
+            0 => ConfirmationResult::ApproveOnce,
+            1 => {
+                let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
+                ConfirmationResult::ApproveExactSession(signature)
+            }
+            2 => {
+                // Wildcard pattern: allow any call to this tool this session.
+                let pattern = ToolPattern::new(
+                    "*".to_string(),
+                    tool_use.name.clone(),
+                    format!("Allow all {} calls (session)", tool_use.name),
+                );
+                ConfirmationResult::ApprovePatternSession(pattern)
+            }
+            3 => {
+                let signature = generate_tool_signature(tool_use, std::path::Path::new("."));
+                ConfirmationResult::ApproveExactPersistent(signature)
+            }
+            4 => {
+                // Wildcard pattern: always allow any call to this tool.
+                let pattern = ToolPattern::new(
+                    "*".to_string(),
+                    tool_use.name.clone(),
+                    format!("Allow all {} calls (persistent)", tool_use.name),
+                );
+                ConfirmationResult::ApprovePatternPersistent(pattern)
+            }
+            _ => ConfirmationResult::Deny, // Index 5 = Deny option; anything higher is also Deny
+        },
+        crate::cli::tui::DialogResult::CustomText(text) => {
+            // User typed a custom response — log it and deny for safety
+            tracing::info!("Tool approval custom response: {}", text);
+            ConfirmationResult::Deny
+        }
+        _ => ConfirmationResult::Deny,
+    }
 }
 
 #[cfg(test)]
@@ -4354,5 +4378,316 @@ mod tests {
             has_consecutive_users,
             "expected the old buggy pattern to produce consecutive user messages"
         );
+    }
+
+    // ── tool_approval_summary ────────────────────────────────────────────────
+
+    fn make_tool_use(name: &str, input: serde_json::Value) -> crate::tools::types::ToolUse {
+        crate::tools::types::ToolUse {
+            id: "test_id".to_string(),
+            name: name.to_string(),
+            input,
+        }
+    }
+
+    #[test]
+    fn test_tool_approval_summary_bash_with_command() {
+        let tool = make_tool_use("bash", serde_json::json!({"command": "git push origin main"}));
+        assert_eq!(tool_approval_summary(&tool), "Command: git push origin main");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_bash_uppercase() {
+        let tool = make_tool_use("Bash", serde_json::json!({"command": "cargo test"}));
+        assert_eq!(tool_approval_summary(&tool), "Command: cargo test");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_bash_long_command_truncated() {
+        let long_cmd = "a".repeat(70);
+        let tool = make_tool_use("bash", serde_json::json!({"command": long_cmd}));
+        let result = tool_approval_summary(&tool);
+        assert!(
+            result.starts_with("Command: "),
+            "should start with 'Command: ': {}",
+            result
+        );
+        assert!(
+            result.contains("..."),
+            "long command should be truncated with '...': {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_tool_approval_summary_bash_no_command() {
+        let tool = make_tool_use("bash", serde_json::json!({}));
+        assert_eq!(tool_approval_summary(&tool), "Execute shell command");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_read_with_path() {
+        let tool = make_tool_use("read", serde_json::json!({"file_path": "src/main.rs"}));
+        assert_eq!(tool_approval_summary(&tool), "File: src/main.rs");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_read_uppercase() {
+        let tool = make_tool_use("Read", serde_json::json!({"file_path": "/a/b/c.rs"}));
+        assert_eq!(tool_approval_summary(&tool), "File: /a/b/c.rs");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_read_no_path() {
+        let tool = make_tool_use("read", serde_json::json!({}));
+        assert_eq!(tool_approval_summary(&tool), "Read file");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_grep_with_pattern() {
+        let tool = make_tool_use(
+            "grep",
+            serde_json::json!({"pattern": "fn main", "path": "src"}),
+        );
+        assert_eq!(tool_approval_summary(&tool), "Pattern: fn main");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_grep_long_pattern_truncated() {
+        let long = "x".repeat(50);
+        let tool = make_tool_use("grep", serde_json::json!({"pattern": long}));
+        let result = tool_approval_summary(&tool);
+        assert!(result.starts_with("Pattern: "), "got: {}", result);
+        assert!(result.contains("..."), "long pattern should truncate: {}", result);
+    }
+
+    #[test]
+    fn test_tool_approval_summary_grep_no_pattern() {
+        let tool = make_tool_use("Grep", serde_json::json!({}));
+        assert_eq!(tool_approval_summary(&tool), "Search files");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_glob_with_pattern() {
+        let tool = make_tool_use("glob", serde_json::json!({"pattern": "**/*.rs"}));
+        assert_eq!(tool_approval_summary(&tool), "Pattern: **/*.rs");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_glob_uppercase_no_pattern() {
+        let tool = make_tool_use("Glob", serde_json::json!({}));
+        assert_eq!(tool_approval_summary(&tool), "Find files");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_enter_plan_mode_with_reason() {
+        let tool = make_tool_use(
+            "EnterPlanMode",
+            serde_json::json!({"reason": "Need to research the codebase"}),
+        );
+        assert_eq!(
+            tool_approval_summary(&tool),
+            "Reason: Need to research the codebase"
+        );
+    }
+
+    #[test]
+    fn test_tool_approval_summary_enter_plan_mode_long_reason_truncated() {
+        let long_reason = "r".repeat(60);
+        let tool = make_tool_use("EnterPlanMode", serde_json::json!({"reason": long_reason}));
+        let result = tool_approval_summary(&tool);
+        assert!(result.starts_with("Reason: "), "got: {}", result);
+        assert!(result.contains("..."), "long reason should truncate: {}", result);
+    }
+
+    #[test]
+    fn test_tool_approval_summary_enter_plan_mode_no_reason() {
+        let tool = make_tool_use("EnterPlanMode", serde_json::json!({}));
+        assert_eq!(tool_approval_summary(&tool), "Enter planning mode");
+    }
+
+    #[test]
+    fn test_tool_approval_summary_unknown_tool() {
+        let tool = make_tool_use("WebFetch", serde_json::json!({"url": "https://docs.rs"}));
+        assert_eq!(tool_approval_summary(&tool), "Execute WebFetch tool");
+    }
+
+    // ── dialog_result_to_confirmation ────────────────────────────────────────
+
+    #[test]
+    fn test_dialog_result_selected_0_approve_once() {
+        let tool = make_tool_use("bash", serde_json::json!({"command": "ls"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(0),
+            &tool,
+        );
+        assert!(
+            matches!(result, crate::cli::repl_event::events::ConfirmationResult::ApproveOnce),
+            "index 0 should be ApproveOnce, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dialog_result_selected_1_approve_exact_session() {
+        let tool = make_tool_use("bash", serde_json::json!({"command": "cargo test"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(1),
+            &tool,
+        );
+        assert!(
+            matches!(
+                result,
+                crate::cli::repl_event::events::ConfirmationResult::ApproveExactSession(_)
+            ),
+            "index 1 should be ApproveExactSession, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dialog_result_selected_2_approve_pattern_session() {
+        let tool = make_tool_use("bash", serde_json::json!({"command": "git status"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(2),
+            &tool,
+        );
+        match result {
+            crate::cli::repl_event::events::ConfirmationResult::ApprovePatternSession(p) => {
+                assert_eq!(p.tool_name, "bash");
+                assert_eq!(p.pattern, "*");
+                assert!(p.description.contains("session"), "description: {}", p.description);
+            }
+            other => panic!("expected ApprovePatternSession, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_dialog_result_selected_3_approve_exact_persistent() {
+        let tool = make_tool_use("read", serde_json::json!({"file_path": "Cargo.toml"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(3),
+            &tool,
+        );
+        assert!(
+            matches!(
+                result,
+                crate::cli::repl_event::events::ConfirmationResult::ApproveExactPersistent(_)
+            ),
+            "index 3 should be ApproveExactPersistent, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dialog_result_selected_4_approve_pattern_persistent() {
+        let tool = make_tool_use("glob", serde_json::json!({"pattern": "**/*.rs"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(4),
+            &tool,
+        );
+        match result {
+            crate::cli::repl_event::events::ConfirmationResult::ApprovePatternPersistent(p) => {
+                assert_eq!(p.tool_name, "glob");
+                assert_eq!(p.pattern, "*");
+                assert!(
+                    p.description.contains("persistent"),
+                    "description: {}",
+                    p.description
+                );
+            }
+            other => panic!("expected ApprovePatternPersistent, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_dialog_result_selected_5_deny() {
+        let tool = make_tool_use("bash", serde_json::json!({"command": "rm -rf /"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(5),
+            &tool,
+        );
+        assert!(
+            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            "index 5 (Deny option) should return Deny, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dialog_result_selected_high_index_deny() {
+        let tool = make_tool_use("bash", serde_json::json!({"command": "echo hi"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(99),
+            &tool,
+        );
+        assert!(
+            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            "out-of-range index should be Deny, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dialog_result_cancelled_deny() {
+        let tool = make_tool_use("bash", serde_json::json!({"command": "echo hi"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Cancelled,
+            &tool,
+        );
+        assert!(
+            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            "Cancelled should be Deny, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_dialog_result_custom_text_deny() {
+        let tool = make_tool_use("bash", serde_json::json!({"command": "ls"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::CustomText("please allow".to_string()),
+            &tool,
+        );
+        assert!(
+            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            "CustomText should be Deny (safety), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_pattern_session_tool_name_matches_tool_use() {
+        // The pattern's tool_name must match the tool being approved —
+        // otherwise the cache won't recognise future calls to the same tool.
+        let tool = make_tool_use("Bash", serde_json::json!({"command": "cargo fmt"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(2),
+            &tool,
+        );
+        match result {
+            crate::cli::repl_event::events::ConfirmationResult::ApprovePatternSession(p) => {
+                assert_eq!(
+                    p.tool_name, "Bash",
+                    "pattern tool_name should match ToolUse.name"
+                );
+            }
+            other => panic!("expected ApprovePatternSession, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pattern_persistent_tool_name_matches_tool_use() {
+        let tool = make_tool_use("read", serde_json::json!({"file_path": "src/lib.rs"}));
+        let result = dialog_result_to_confirmation(
+            crate::cli::tui::DialogResult::Selected(4),
+            &tool,
+        );
+        match result {
+            crate::cli::repl_event::events::ConfirmationResult::ApprovePatternPersistent(p) => {
+                assert_eq!(p.tool_name, "read");
+            }
+            other => panic!("expected ApprovePatternPersistent, got {:?}", other),
+        }
     }
 }
