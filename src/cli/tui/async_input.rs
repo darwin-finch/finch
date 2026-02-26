@@ -3,10 +3,23 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 
 use super::TuiRenderer;
+
+// ---------------------------------------------------------------------------
+// InputEvent — discriminated input events sent to the event loop
+// ---------------------------------------------------------------------------
+
+/// Events produced by the async input task and consumed by the event loop.
+#[derive(Debug)]
+pub enum InputEvent {
+    /// User pressed Enter and submitted a complete query / command.
+    Submitted(String),
+    /// User is actively typing (debounced, fired at most once every 300 ms).
+    TypingStarted(String),
+}
 
 /// Check the system clipboard for image data and return it as (base64, media_type) if found.
 /// Uses the `arboard` crate for cross-platform clipboard access.
@@ -76,12 +89,18 @@ fn should_accept_key_event(key: &KeyEvent) -> bool {
 /// - Handles Enter key to submit input
 /// - Handles all other keys via TextArea
 /// - Renders TUI periodically
-pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::UnboundedReceiver<String> {
+/// - Sends `InputEvent::TypingStarted` (debounced, 300 ms) when input changes
+pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::UnboundedReceiver<InputEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
+        // Track last time we sent a TypingStarted event for debouncing.
+        let mut last_typing_signal: Option<Instant> = None;
+
         loop {
-            let input_result: Result<Option<String>> = {
+            // The lock block returns (input_result, typing_hint).
+            // typing_hint is Some(content) when text was modified but not submitted.
+            let (input_result, typing_hint): (Result<Option<String>>, Option<String>) = {
                 let mut tui = tui_renderer.lock().await;
 
                 // Poll with short timeout (100ms) to avoid blocking
@@ -348,7 +367,9 @@ pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::Unbounde
                     }
 
                     // Render immediately after input (event-driven, not polled)
-                    if had_input {
+                    // Capture typing hint BEFORE releasing lock, only when
+                    // text was modified but not submitted (had_input && no submit).
+                    let typing_hint = if had_input {
                         // Update ghost text suggestion based on new input
                         tui.update_ghost_text();
 
@@ -358,25 +379,45 @@ pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::Unbounde
                             tui.needs_full_refresh = true;
                             tui.last_render_error = Some(e.to_string());
                         }
-                    }
 
-                    first_event_result
+                        // Capture current content for typing hint.
+                        Some(tui.input_textarea.lines().join("\n"))
+                    } else {
+                        None
+                    };
+
+                    (first_event_result, typing_hint)
                 } else {
                     // No input available, just render
-                    Ok(None)
+                    (Ok(None), None)
                 }
             };
 
             match input_result {
                 Ok(Some(input)) => {
-                    // Send input to event loop
-                    if tx.send(input).is_err() {
+                    // Submit: reset typing signal, send Submitted event.
+                    last_typing_signal = None;
+                    if tx.send(InputEvent::Submitted(input)).is_err() {
                         // Channel closed, exit task
                         break;
                     }
                 }
                 Ok(None) => {
-                    // No input, continue polling
+                    // No submit — check if we should fire a TypingStarted event.
+                    if let Some(content) = typing_hint {
+                        if !content.trim().is_empty() {
+                            let now = Instant::now();
+                            let should_signal = last_typing_signal
+                                .map(|t| now.duration_since(t).as_millis() >= 300)
+                                .unwrap_or(true);
+                            if should_signal {
+                                if tx.send(InputEvent::TypingStarted(content)).is_err() {
+                                    break;
+                                }
+                                last_typing_signal = Some(now);
+                            }
+                        }
+                    }
                     // Check if channel is closed (event loop exited)
                     if tx.is_closed() {
                         break;
@@ -387,9 +428,6 @@ pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::Unbounde
                     eprintln!("Input error: {}", e);
                 }
             }
-
-            // Only render when input actually changed (event-driven, not polled)
-            // The render will be triggered by event_loop when needed
 
             // Small delay to prevent CPU spinning
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -587,6 +625,26 @@ mod tests {
         let rgba = vec![0u8; 4]; // 1x1 black pixel
         let png = encode_rgba_to_png(1, 1, &rgba).unwrap();
         assert!(!png.is_empty());
+    }
+
+    // --- InputEvent ---
+
+    #[test]
+    fn test_input_event_submitted_variant_holds_string() {
+        let event = InputEvent::Submitted("hello world".to_string());
+        match event {
+            InputEvent::Submitted(s) => assert_eq!(s, "hello world"),
+            _ => panic!("Expected Submitted variant"),
+        }
+    }
+
+    #[test]
+    fn test_input_event_typing_started_variant_holds_string() {
+        let event = InputEvent::TypingStarted("how do I use lifetimes".to_string());
+        match event {
+            InputEvent::TypingStarted(s) => assert_eq!(s, "how do I use lifetimes"),
+            _ => panic!("Expected TypingStarted variant"),
+        }
     }
 }
 

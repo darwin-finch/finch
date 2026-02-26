@@ -48,7 +48,7 @@ mod status_widget;
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
 
-pub use async_input::spawn_input_task;
+pub use async_input::{spawn_input_task, InputEvent};
 pub use autocomplete_widget::AutocompleteState;
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;

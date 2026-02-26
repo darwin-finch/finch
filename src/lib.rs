@@ -22,6 +22,7 @@ pub mod models; // Phase 2: Neural network models
 pub mod monitoring; // System monitoring (memory, CPU)
 pub mod network; // Lotus Network device registration and membership
 pub mod node; // Node identity and work statistics (distributed worker)
+pub mod brain; // Background context-gathering agent (spawned when user starts typing)
 pub mod planning; // IMPCPD iterative plan refinement loop
 pub mod providers; // Multi-provider LLM support
 pub mod router;

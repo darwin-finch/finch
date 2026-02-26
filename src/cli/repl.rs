@@ -1540,6 +1540,14 @@ impl Repl {
             Arc::clone(&self.todo_list),
             self.enable_summarization,
             self.auto_compact_enabled,
+            // Brain provider: same underlying provider as the teacher session.
+            // We create a fresh instance so the brain doesn't share context with
+            // the main conversation.
+            {
+                let brain_provider: Arc<dyn crate::providers::LlmProvider> =
+                    Arc::from(crate::providers::create_provider(&self.available_teachers)?);
+                brain_provider
+            },
         );
 
         // Run the event loop

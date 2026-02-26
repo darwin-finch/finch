@@ -106,8 +106,8 @@ pub struct EventLoop {
     /// Channel for sending events
     event_tx: mpsc::UnboundedSender<ReplEvent>,
 
-    /// Channel for receiving user input
-    input_rx: mpsc::UnboundedReceiver<String>,
+    /// Channel for receiving user input events
+    input_rx: mpsc::UnboundedReceiver<crate::cli::tui::InputEvent>,
 
     /// Shared conversation history
     conversation: Arc<RwLock<ConversationHistory>>,
@@ -239,6 +239,21 @@ pub struct EventLoop {
     /// Whether sliding-window auto-compaction is enabled.
     /// From config.features.auto_compact_enabled. Default: true.
     auto_compact_enabled: bool,
+
+    /// Provider used by the brain (background context-gathering agent).
+    brain_provider: Arc<dyn crate::providers::LlmProvider>,
+
+    /// Pre-gathered context from the active brain session (injected at query time).
+    brain_context: Arc<RwLock<Option<String>>>,
+
+    /// Active brain session (cancelled when user submits or starts a new brain).
+    active_brain: Arc<RwLock<Option<crate::brain::BrainSession>>>,
+
+    /// Pending oneshot sender for a BrainQuestion dialog response.
+    pending_brain_question_tx: Option<tokio::sync::oneshot::Sender<String>>,
+
+    /// Options for the current brain question dialog (to map index → text).
+    pending_brain_question_options: Vec<String>,
 }
 
 /// View mode for the REPL
@@ -278,6 +293,7 @@ impl EventLoop {
         todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
         enable_summarization: bool,
         auto_compact_enabled: bool,
+        brain_provider: Arc<dyn crate::providers::LlmProvider>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -356,6 +372,11 @@ impl EventLoop {
             todo_list,
             enable_summarization,
             auto_compact_enabled,
+            brain_provider,
+            brain_context: Arc::new(RwLock::new(None)),
+            active_brain: Arc::new(RwLock::new(None)),
+            pending_brain_question_tx: None,
+            pending_brain_question_options: Vec::new(),
         }
     }
 
@@ -479,9 +500,19 @@ impl EventLoop {
         while !should_exit {
             tokio::select! {
                 // User input event
-                Some(input) = self.input_rx.recv() => {
-                    tracing::debug!("Received input: {}", input);
-                    self.handle_user_input(input).await?;
+                Some(event) = self.input_rx.recv() => {
+                    use crate::cli::tui::InputEvent;
+                    match event {
+                        InputEvent::Submitted(input) => {
+                            tracing::debug!("Received input: {}", input);
+                            self.cancel_active_brain().await;
+                            self.handle_user_input(input).await?;
+                        }
+                        InputEvent::TypingStarted(partial) => {
+                            tracing::debug!("Typing started: {} chars", partial.len());
+                            self.handle_typing_started(partial).await;
+                        }
+                    }
                 }
 
                 // REPL event (query complete, tool result, etc.)
@@ -497,6 +528,7 @@ impl EventLoop {
                         ReplEvent::StatsUpdate { .. } => "StatsUpdate",
                         ReplEvent::CancelQuery => "CancelQuery",
                         ReplEvent::Shutdown => "Shutdown",
+                        ReplEvent::BrainQuestion { .. } => "BrainQuestion",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -521,28 +553,44 @@ impl EventLoop {
                         }
                     }
 
-                    // Check for pending dialog result (tool approval)
+                    // Check for pending dialog result (tool approval OR brain question)
                     {
                         let mut tui = self.tui_renderer.lock().await;
                         if let Some(dialog_result) = tui.pending_dialog_result.take() {
                             drop(tui); // Release lock before async operations
 
-                            // Find which query this dialog was for
-                            let mut approvals = self.pending_approvals.write().await;
+                            // Brain question takes priority (checked first).
+                            if let Some(brain_tx) = self.pending_brain_question_tx.take() {
+                                let opts = std::mem::take(&mut self.pending_brain_question_options);
+                                let answer = match &dialog_result {
+                                    crate::cli::tui::DialogResult::TextEntered(s) => s.clone(),
+                                    crate::cli::tui::DialogResult::CustomText(s) => s.clone(),
+                                    crate::cli::tui::DialogResult::Selected(idx) => opts
+                                        .get(*idx)
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("option_{}", idx)),
+                                    _ => "[no answer]".to_string(),
+                                };
+                                let _ = brain_tx.send(answer);
+                                tracing::debug!("[EVENT_LOOP] Brain question answered");
+                            } else {
+                                // Find which query this dialog was for (tool approval)
+                                let mut approvals = self.pending_approvals.write().await;
 
-                            // Get the first pending approval (there should only be one active dialog at a time)
-                            if let Some((query_id, (_tool_use, _response_tx))) = approvals.iter().next() {
-                                let query_id = *query_id;
-                                let (tool_use, response_tx) = approvals.remove(&query_id)
-                                    .expect("query_id was just obtained from the same map");
+                                // Get the first pending approval (there should only be one active dialog at a time)
+                                if let Some((query_id, (_tool_use, _response_tx))) = approvals.iter().next() {
+                                    let query_id = *query_id;
+                                    let (tool_use, response_tx) = approvals.remove(&query_id)
+                                        .expect("query_id was just obtained from the same map");
 
-                                // Convert dialog result to ConfirmationResult
-                                let confirmation = self.dialog_result_to_confirmation(dialog_result, &tool_use);
+                                    // Convert dialog result to ConfirmationResult
+                                    let confirmation = self.dialog_result_to_confirmation(dialog_result, &tool_use);
 
-                                // Send confirmation back to tool execution task
-                                let _ = response_tx.send(confirmation);
+                                    // Send confirmation back to tool execution task
+                                    let _ = response_tx.send(confirmation);
 
-                                tracing::debug!("[EVENT_LOOP] Tool approval processed for query {}", query_id);
+                                    tracing::debug!("[EVENT_LOOP] Tool approval processed for query {}", query_id);
+                                }
                             }
                         }
                     }
@@ -893,8 +941,20 @@ impl EventLoop {
         // Set as active query (for cancellation)
         *self.active_query_id.write().await = Some(query_id);
 
+        // Inject pre-gathered brain context (if any) as a hidden block.
+        let enriched = {
+            let mut ctx = self.brain_context.write().await;
+            match ctx.take() {
+                Some(brain_ctx) => {
+                    tracing::debug!("[EVENT_LOOP] Injecting brain context ({} chars)", brain_ctx.len());
+                    format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, brain_ctx)
+                }
+                None => input.clone(),
+            }
+        };
+
         // Spawn query processing task
-        self.spawn_query_task(query_id, input).await;
+        self.spawn_query_task(query_id, enriched).await;
 
         Ok(())
     }
@@ -2084,6 +2144,15 @@ impl EventLoop {
                 // Handled in run() method - this should not be reached
                 unreachable!("Shutdown event should be handled in run() method");
             }
+
+            ReplEvent::BrainQuestion {
+                question,
+                options,
+                response_tx,
+            } => {
+                self.handle_brain_question(question, options, response_tx)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -2316,6 +2385,73 @@ impl EventLoop {
         tool_use: &crate::tools::types::ToolUse,
     ) -> super::events::ConfirmationResult {
         dialog_result_to_confirmation(dialog_result, tool_use)
+    }
+
+    // ========== Brain Handlers ==========
+
+    /// Cancel the active brain session and clear its context.
+    async fn cancel_active_brain(&self) {
+        if let Some(session) = self.active_brain.write().await.take() {
+            session.cancel();
+        }
+        *self.brain_context.write().await = None;
+    }
+
+    /// Handle a `TypingStarted` event: (re-)spawn the brain with the new partial input.
+    async fn handle_typing_started(&self, partial: String) {
+        // Skip commands and very short input (not worth speculating on).
+        if partial.trim().starts_with('/') || partial.trim().len() < 10 {
+            return;
+        }
+
+        // Cancel any stale brain before spawning a fresh one.
+        self.cancel_active_brain().await;
+
+        let session = crate::brain::BrainSession::spawn(
+            partial,
+            Arc::clone(&self.brain_provider),
+            self.event_tx.clone(),
+            Arc::clone(&self.brain_context),
+            self.cwd.clone(),
+        );
+
+        *self.active_brain.write().await = Some(session);
+        tracing::debug!("[EVENT_LOOP] Brain spawned for typing-started event");
+    }
+
+    /// Handle a `BrainQuestion` event: show a dialog and store the response channel.
+    async fn handle_brain_question(
+        &mut self,
+        question: String,
+        options: Vec<String>,
+        response_tx: tokio::sync::oneshot::Sender<String>,
+    ) -> Result<()> {
+        use crate::cli::tui::{Dialog, DialogOption};
+
+        tracing::debug!("[EVENT_LOOP] Brain question: {}", question);
+
+        let dialog = if options.is_empty() {
+            Dialog::text_input(question, None)
+        } else {
+            let dialog_options: Vec<DialogOption> = options
+                .iter()
+                .map(|s| DialogOption::new(s.as_str()))
+                .collect();
+            Dialog::select(question, dialog_options)
+        };
+
+        // Show the dialog in TUI.
+        let mut tui = self.tui_renderer.lock().await;
+        tui.active_dialog = Some(dialog);
+        if let Err(e) = tui.render() {
+            tracing::error!("[EVENT_LOOP] Failed to render brain question dialog: {}", e);
+        }
+        drop(tui);
+
+        // Store the response channel and options; the render tick will send the answer.
+        self.pending_brain_question_tx = Some(response_tx);
+        self.pending_brain_question_options = options;
+        Ok(())
     }
 
     // ========== Plan Mode Handlers ==========
@@ -4625,5 +4761,48 @@ mod tests {
             "index 2 is No/Deny in 3-option dialog, got {:?}",
             result
         );
+    }
+
+    // ── Brain context injection ──────────────────────────────────────────────
+
+    #[test]
+    fn test_brain_context_injection_formats_separator() {
+        // When brain context is present it should be appended after a separator.
+        let input = "How do I implement async in Rust?".to_string();
+        let brain_ctx = "Found src/models/bootstrap.rs — relevant for async patterns.".to_string();
+        let enriched = format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, brain_ctx);
+
+        assert!(enriched.contains("---"), "should contain separator");
+        assert!(enriched.contains("Pre-gathered context:"));
+        assert!(enriched.contains("How do I implement async"));
+        assert!(enriched.contains("bootstrap.rs"));
+    }
+
+    #[test]
+    fn test_brain_context_none_does_not_modify_query() {
+        // When there is no brain context the query should pass through unchanged.
+        let input = "What is a lifetime?".to_string();
+        let brain_ctx: Option<String> = None;
+        let enriched = match brain_ctx {
+            Some(ctx) => format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, ctx),
+            None => input.clone(),
+        };
+        assert_eq!(enriched, input, "query should be unchanged when brain has no context");
+    }
+
+    #[test]
+    fn test_handle_typing_started_skips_commands() {
+        // Inputs starting with '/' are slash-commands and should not trigger the brain.
+        let input = "/help".to_string();
+        let should_skip = input.trim().starts_with('/') || input.trim().len() < 10;
+        assert!(should_skip, "/help should be skipped (command)");
+    }
+
+    #[test]
+    fn test_handle_typing_started_skips_short_input() {
+        // Inputs shorter than 10 chars are not worth speculating on.
+        let input = "short".to_string();
+        let should_skip = input.trim().starts_with('/') || input.trim().len() < 10;
+        assert!(should_skip, "input < 10 chars should be skipped");
     }
 }

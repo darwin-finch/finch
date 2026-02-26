@@ -86,6 +86,7 @@ impl EventHandler {
             ReplEvent::StreamingComplete { .. } => {}
             ReplEvent::CancelQuery => {}
             ReplEvent::Shutdown => {}
+            ReplEvent::BrainQuestion { .. } => {}
         }
 
         Ok(())
