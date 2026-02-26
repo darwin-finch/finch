@@ -20,6 +20,7 @@ use crate::tools::implementations::read::ReadTool;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolDefinition, ToolUse};
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -35,6 +36,12 @@ const BRAIN_MAX_TURNS: usize = 6;
 pub struct BrainSession {
     pub id: Uuid,
     cancel: CancellationToken,
+    /// Set to `true` by `cancel()` before the token fires.  The brain task
+    /// checks this flag before writing its summary so a stale session whose
+    /// `run_brain_loop` future happened to finish at the same instant as
+    /// cancellation doesn't overwrite the brain_context that now belongs to
+    /// a newer session.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl BrainSession {
@@ -52,11 +59,13 @@ impl BrainSession {
         let id = Uuid::new_v4();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_clone = Arc::clone(&cancelled);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
-                    debug!("Brain {} cancelled before starting", id);
+                    debug!("Brain {} cancelled", id);
                 }
                 result = run_brain_loop(
                     &partial_input,
@@ -66,8 +75,14 @@ impl BrainSession {
                 ) => {
                     match result {
                         Ok(summary) => {
-                            debug!("Brain {} finished, summary {} chars", id, summary.len());
-                            *brain_context.write().await = Some(summary);
+                            // Guard against post-cancel writes: if this session was
+                            // cancelled just as run_brain_loop completed, discard.
+                            if cancelled_clone.load(Ordering::Acquire) {
+                                debug!("Brain {} finished but was cancelled — discarding summary", id);
+                            } else {
+                                debug!("Brain {} finished, writing {} chars", id, summary.len());
+                                *brain_context.write().await = Some(summary);
+                            }
                         }
                         Err(e) => {
                             debug!("Brain {} error: {}", id, e);
@@ -77,11 +92,22 @@ impl BrainSession {
             }
         });
 
-        Self { id, cancel }
+        // Propagate task panics to the log so they aren't silently lost.
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                tracing::error!("Brain task panicked: {:?}", e);
+            }
+        });
+
+        Self { id, cancel, cancelled }
     }
 
     /// Cancel the brain session.  Idempotent.
+    ///
+    /// Sets the `cancelled` flag **before** firing the `CancellationToken` so
+    /// the task's write-guard check is guaranteed to be ordered correctly.
     pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
         self.cancel.cancel();
     }
 }

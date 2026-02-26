@@ -505,12 +505,27 @@ impl EventLoop {
                     match event {
                         InputEvent::Submitted(input) => {
                             tracing::debug!("Received input: {}", input);
+                            // Drop any pending brain question dialog so its oneshot sender
+                            // doesn't intercept a future tool-approval dialog result.
+                            if self.pending_brain_question_tx.take().is_some() {
+                                let mut tui = self.tui_renderer.lock().await;
+                                tui.active_dialog = None;
+                                let _ = tui.pending_dialog_result.take();
+                            }
+                            self.pending_brain_question_options.clear();
                             // Cancel the brain session but preserve its context for injection.
                             self.cancel_active_brain(false).await;
                             self.handle_user_input(input).await?;
                         }
                         InputEvent::TypingStarted(partial) => {
                             tracing::debug!("Typing started: {} chars", partial.len());
+                            // Drop any pending brain question dialog (brain is restarting).
+                            if self.pending_brain_question_tx.take().is_some() {
+                                let mut tui = self.tui_renderer.lock().await;
+                                tui.active_dialog = None;
+                                let _ = tui.pending_dialog_result.take();
+                            }
+                            self.pending_brain_question_options.clear();
                             self.handle_typing_started(partial).await;
                         }
                     }
@@ -943,14 +958,15 @@ impl EventLoop {
         *self.active_query_id.write().await = Some(query_id);
 
         // Inject pre-gathered brain context (if any) as a hidden block.
+        // Skip if the context is empty or whitespace-only.
         let enriched = {
             let mut ctx = self.brain_context.write().await;
             match ctx.take() {
-                Some(brain_ctx) => {
+                Some(brain_ctx) if !brain_ctx.trim().is_empty() => {
                     tracing::debug!("[EVENT_LOOP] Injecting brain context ({} chars)", brain_ctx.len());
                     format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, brain_ctx)
                 }
-                None => input.clone(),
+                _ => input.clone(),
             }
         };
 
@@ -2436,6 +2452,11 @@ impl EventLoop {
         use crate::cli::tui::{Dialog, DialogOption};
 
         tracing::debug!("[EVENT_LOOP] Brain question: {}", question);
+
+        // Drop any previous pending brain question (replaced by this new one).
+        // The old oneshot sender is dropped here, sending "[no answer]" implicitly.
+        let _ = self.pending_brain_question_tx.take();
+        self.pending_brain_question_options.clear();
 
         let dialog = if options.is_empty() {
             Dialog::text_input(question, None)
@@ -4791,10 +4812,50 @@ mod tests {
         let input = "What is a lifetime?".to_string();
         let brain_ctx: Option<String> = None;
         let enriched = match brain_ctx {
-            Some(ctx) => format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, ctx),
-            None => input.clone(),
+            Some(ctx) if !ctx.trim().is_empty() => {
+                format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, ctx)
+            }
+            _ => input.clone(),
         };
         assert_eq!(enriched, input, "query should be unchanged when brain has no context");
+    }
+
+    #[test]
+    fn test_brain_context_empty_not_injected() {
+        // Regression: an empty or whitespace-only brain context must NOT be injected.
+        let input = "What is a lifetime?".to_string();
+        for empty_ctx in ["", "  ", "\n", "\t\n "] {
+            let brain_ctx: Option<String> = Some(empty_ctx.to_string());
+            let enriched = match brain_ctx {
+                Some(ctx) if !ctx.trim().is_empty() => {
+                    format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, ctx)
+                }
+                _ => input.clone(),
+            };
+            assert_eq!(
+                enriched, input,
+                "whitespace-only brain context '{:?}' should not be injected",
+                empty_ctx
+            );
+        }
+    }
+
+    #[test]
+    fn test_pending_brain_question_tx_cleared_on_submit() {
+        // Regression: pending_brain_question_tx must be cleared when the user submits
+        // so a stale sender doesn't intercept the next tool-approval dialog result.
+        // We test the guard logic in isolation (can't drive the full EventLoop here).
+        let (tx, _rx) = tokio::sync::oneshot::channel::<String>();
+        let mut pending: Option<tokio::sync::oneshot::Sender<String>> = Some(tx);
+        let mut options: Vec<String> = vec!["Option A".to_string()];
+
+        // Simulate what the Submitted arm does
+        let was_pending = pending.take().is_some();
+        options.clear();
+
+        assert!(was_pending, "pending_brain_question_tx should have been Some");
+        assert!(pending.is_none(), "pending_brain_question_tx should be None after take");
+        assert!(options.is_empty(), "pending_brain_question_options should be cleared");
     }
 
     #[test]

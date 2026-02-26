@@ -89,13 +89,17 @@ fn should_accept_key_event(key: &KeyEvent) -> bool {
 /// - Handles Enter key to submit input
 /// - Handles all other keys via TextArea
 /// - Renders TUI periodically
-/// - Sends `InputEvent::TypingStarted` (debounced, 300 ms) when input changes
+/// - Sends `InputEvent::TypingStarted` after 300 ms of typing silence (true debounce)
 pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::UnboundedReceiver<InputEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        // Track last time we sent a TypingStarted event for debouncing.
-        let mut last_typing_signal: Option<Instant> = None;
+        // True debounce: fire TypingStarted only after the user has been idle for
+        // 300 ms.  last_keystroke records when the user last modified the textarea.
+        // pending_brain_content holds the content to fire with (captured at keystroke
+        // time so we don't need to re-acquire the lock in the idle check).
+        let mut last_keystroke: Option<Instant> = None;
+        let mut pending_brain_content: Option<String> = None;
 
         loop {
             // The lock block returns (input_result, typing_hint).
@@ -395,29 +399,37 @@ pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::Unbounde
 
             match input_result {
                 Ok(Some(input)) => {
-                    // Submit: reset typing signal, send Submitted event.
-                    last_typing_signal = None;
+                    // Submit: clear pending debounce state and send Submitted event.
+                    last_keystroke = None;
+                    pending_brain_content = None;
                     if tx.send(InputEvent::Submitted(input)).is_err() {
                         // Channel closed, exit task
                         break;
                     }
                 }
                 Ok(None) => {
-                    // No submit — check if we should fire a TypingStarted event.
+                    // Update debounce state if the user typed something this cycle.
                     if let Some(content) = typing_hint {
+                        last_keystroke = Some(Instant::now());
                         if !content.trim().is_empty() {
-                            let now = Instant::now();
-                            let should_signal = last_typing_signal
-                                .map(|t| now.duration_since(t).as_millis() >= 300)
-                                .unwrap_or(true);
-                            if should_signal {
-                                if tx.send(InputEvent::TypingStarted(content)).is_err() {
-                                    break;
-                                }
-                                last_typing_signal = Some(now);
-                            }
+                            pending_brain_content = Some(content);
                         }
                     }
+
+                    // Fire TypingStarted after 300 ms of silence (true debounce):
+                    // only trigger once per typing burst, when the user has stopped.
+                    if let (Some(content), Some(kst)) = (&pending_brain_content, last_keystroke) {
+                        if kst.elapsed().as_millis() >= 300 {
+                            let content = content.clone();
+                            if tx.send(InputEvent::TypingStarted(content)).is_err() {
+                                break;
+                            }
+                            // Clear so we don't fire again for the same burst.
+                            last_keystroke = None;
+                            pending_brain_content = None;
+                        }
+                    }
+
                     // Check if channel is closed (event loop exited)
                     if tx.is_closed() {
                         break;
