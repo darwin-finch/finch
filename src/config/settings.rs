@@ -55,6 +55,13 @@ pub struct FeaturesConfig {
     #[serde(default)]
     pub auto_compact_enabled: bool,
 
+    /// Enable the background brain (speculative context-gathering agent).
+    /// The brain fires after 300 ms of typing silence and pre-fetches relevant
+    /// codebase context so the main query has a head start.
+    /// Default: true. Set to false to disable (saves API calls on pay-per-token).
+    #[serde(default = "default_true")]
+    pub brain_enabled: bool,
+
     /// Enable GUI automation tools (macOS only)
     #[cfg(target_os = "macos")]
     #[serde(default)]
@@ -72,6 +79,7 @@ impl Default for FeaturesConfig {
             context_recall_k: 2,
             enable_summarization: false,
             auto_compact_enabled: false,
+            brain_enabled: true,
             #[cfg(target_os = "macos")]
             gui_automation: false,
         }

@@ -167,6 +167,9 @@ pub struct Repl {
 
     // Enable sliding-window auto-compaction (from config.features.auto_compact_enabled)
     auto_compact_enabled: bool,
+
+    // Enable the background brain agent (from config.features.brain_enabled)
+    brain_enabled: bool,
 }
 
 /// Adjectives used for session labels
@@ -415,6 +418,7 @@ impl Repl {
         let context_recall_k = config.features.context_recall_k;
         let enable_summarization = config.features.enable_summarization;
         let auto_compact_enabled = config.features.auto_compact_enabled;
+        let brain_enabled = config.features.brain_enabled;
 
         // Generate tool definitions from registry (includes built-in + MCP tools)
         let tool_definitions: Vec<ToolDefinition> =
@@ -618,6 +622,7 @@ impl Repl {
             context_recall_k,
             enable_summarization,
             auto_compact_enabled,
+            brain_enabled,
         }
     }
 
@@ -1542,11 +1547,19 @@ impl Repl {
             self.auto_compact_enabled,
             // Brain provider: same underlying provider as the teacher session.
             // We create a fresh instance so the brain doesn't share context with
-            // the main conversation.
-            {
-                let brain_provider: Arc<dyn crate::providers::LlmProvider> =
-                    Arc::from(crate::providers::create_provider(&self.available_teachers)?);
-                brain_provider
+            // the main conversation.  Returns None (brain silently disabled) if:
+            //   • brain_enabled is false in config, or
+            //   • no cloud teacher is configured (e.g. local-only setup).
+            if self.brain_enabled {
+                match crate::providers::create_provider(&self.available_teachers) {
+                    Ok(p) => Some(Arc::from(p) as Arc<dyn crate::providers::LlmProvider>),
+                    Err(e) => {
+                        tracing::warn!("Brain disabled: could not create provider: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
             },
         );
 

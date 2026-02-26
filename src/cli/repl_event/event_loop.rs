@@ -241,7 +241,8 @@ pub struct EventLoop {
     auto_compact_enabled: bool,
 
     /// Provider used by the brain (background context-gathering agent).
-    brain_provider: Arc<dyn crate::providers::LlmProvider>,
+    /// `None` when the brain is disabled (config flag) or no cloud provider is available.
+    brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
 
     /// Pre-gathered context from the active brain session (injected at query time).
     brain_context: Arc<RwLock<Option<String>>>,
@@ -293,7 +294,7 @@ impl EventLoop {
         todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
         enable_summarization: bool,
         auto_compact_enabled: bool,
-        brain_provider: Arc<dyn crate::providers::LlmProvider>,
+        brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -2422,6 +2423,12 @@ impl EventLoop {
 
     /// Handle a `TypingStarted` event: (re-)spawn the brain with the new partial input.
     async fn handle_typing_started(&self, partial: String) {
+        // No-op if brain is disabled or no cloud provider is available.
+        let provider = match &self.brain_provider {
+            Some(p) => Arc::clone(p),
+            None => return,
+        };
+
         // Skip commands and very short input (not worth speculating on).
         if partial.trim().starts_with('/') || partial.trim().len() < 10 {
             return;
@@ -2432,7 +2439,7 @@ impl EventLoop {
 
         let session = crate::brain::BrainSession::spawn(
             partial,
-            Arc::clone(&self.brain_provider),
+            provider,
             self.event_tx.clone(),
             Arc::clone(&self.brain_context),
             self.cwd.clone(),

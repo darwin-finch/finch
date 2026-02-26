@@ -410,6 +410,7 @@ async fn main() -> Result<()> {
                             context_recall_k: new_config.features.context_recall_k,
                             enable_summarization: new_config.features.enable_summarization,
                             auto_compact_enabled: new_config.features.auto_compact_enabled,
+                            brain_enabled: new_config.features.brain_enabled,
                         };
                         if daemon_only_mode {
                             new_config.server.mode = "daemon-only".to_string();
@@ -1348,6 +1349,7 @@ async fn run_setup() -> Result<()> {
         context_recall_k: config.features.context_recall_k,
         enable_summarization: config.features.enable_summarization,
         auto_compact_enabled: config.features.auto_compact_enabled,
+        brain_enabled: config.features.brain_enabled,
     };
     #[allow(deprecated)]
     {
