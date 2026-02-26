@@ -505,7 +505,8 @@ impl EventLoop {
                     match event {
                         InputEvent::Submitted(input) => {
                             tracing::debug!("Received input: {}", input);
-                            self.cancel_active_brain().await;
+                            // Cancel the brain session but preserve its context for injection.
+                            self.cancel_active_brain(false).await;
                             self.handle_user_input(input).await?;
                         }
                         InputEvent::TypingStarted(partial) => {
@@ -2389,12 +2390,18 @@ impl EventLoop {
 
     // ========== Brain Handlers ==========
 
-    /// Cancel the active brain session and clear its context.
-    async fn cancel_active_brain(&self) {
+    /// Cancel the active brain session.
+    ///
+    /// `clear_context` controls whether the pre-gathered context is discarded:
+    /// - `true`  — typing restarted (new partial query); old context is stale, discard it.
+    /// - `false` — user submitted; keep context so `handle_user_input` can inject it.
+    async fn cancel_active_brain(&self, clear_context: bool) {
         if let Some(session) = self.active_brain.write().await.take() {
             session.cancel();
         }
-        *self.brain_context.write().await = None;
+        if clear_context {
+            *self.brain_context.write().await = None;
+        }
     }
 
     /// Handle a `TypingStarted` event: (re-)spawn the brain with the new partial input.
@@ -2404,8 +2411,8 @@ impl EventLoop {
             return;
         }
 
-        // Cancel any stale brain before spawning a fresh one.
-        self.cancel_active_brain().await;
+        // Cancel stale brain AND clear its context (it was for a different partial input).
+        self.cancel_active_brain(true).await;
 
         let session = crate::brain::BrainSession::spawn(
             partial,
