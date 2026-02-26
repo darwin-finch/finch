@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.12] - 2026-02-26
+
+### Added
+- **Typing spawns a brain** (`src/brain/`): when the user types ≥10 characters, a
+  cancellable background agentic loop ("brain") starts immediately — reading and
+  searching the codebase with `read`, `glob`, and `grep` tools. By the time the
+  user hits Enter, the brain's summary is silently injected as a hidden context
+  block into the query, giving the main model a head start.
+- **`BrainSession`** (`src/brain/mod.rs`): lightweight agentic loop (max 6 turns)
+  backed by a `CancellationToken`; cancelled automatically on submit or when new
+  typing starts.
+- **`AskUserBrainTool`** (`src/brain/ask_user.rs`): brain tool that sends a
+  `ReplEvent::BrainQuestion` event; the event loop shows a TUI dialog and returns
+  the answer via a oneshot channel (30s timeout → `"[no answer]"`).
+- **`InputEvent` enum** (`src/cli/tui/async_input.rs`): `Submitted(String)` and
+  `TypingStarted(String)` — replaces the raw `String` channel so the event loop
+  can distinguish submits from mid-composition keystrokes.
+- Debounced `TypingStarted` signal (300ms) — fired at most once per 300ms while
+  the user is actively editing the input buffer.
+- `ReplEvent::BrainQuestion` variant — routes brain clarifying questions through
+  the existing TUI dialog infrastructure (`Select` for option lists, `TextInput`
+  for free-form answers).
+
 ## [0.7.2] - 2026-02-24
 
 ### Fixed
