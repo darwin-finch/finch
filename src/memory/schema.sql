@@ -14,14 +14,15 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 
 -- Tree nodes table (MemTree hierarchical structure)
+-- node_id matches the MemTree's own NodeId (u64) for round-trip fidelity.
 CREATE TABLE IF NOT EXISTS tree_nodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER PRIMARY KEY,
     parent_id INTEGER,
     text TEXT NOT NULL,
-    embedding BLOB NOT NULL,  -- Store as binary blob (f32 array)
+    embedding BLOB NOT NULL,  -- f32 array stored as little-endian bytes
     level INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
-    FOREIGN KEY (parent_id) REFERENCES tree_nodes(id)
+    FOREIGN KEY (parent_id) REFERENCES tree_nodes(node_id)
 );
 
 -- Metadata for tracking system state

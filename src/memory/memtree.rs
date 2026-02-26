@@ -223,6 +223,16 @@ impl MemTree {
         &self.nodes
     }
 
+    /// Mutable access to nodes map (used by persistence layer to reconstruct tree).
+    pub fn all_nodes_mut(&mut self) -> &mut HashMap<NodeId, TreeNode> {
+        &mut self.nodes
+    }
+
+    /// Set the next_id counter (used after loading from disk to avoid ID collisions).
+    pub fn set_next_id(&mut self, id: NodeId) {
+        self.next_id = id;
+    }
+
     /// Get tree size (number of nodes excluding root)
     pub fn size(&self) -> usize {
         self.nodes.len().saturating_sub(1)

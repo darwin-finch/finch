@@ -114,23 +114,19 @@ impl MemorySystem {
         let dim = embedding_engine.dimension();
         let mut tree = MemTree::new_with_dim(dim);
 
-        // Rehydrate MemTree from existing conversations in SQLite.
-        // This makes search_memory work across sessions.
+        // Load MemTree from persisted tree_nodes table.
+        // Falls back gracefully to empty tree if table is empty or data is missing.
         {
-            let mut stmt =
-                conn.prepare("SELECT content FROM conversations ORDER BY created_at ASC")?;
-            let rows: Vec<String> = stmt
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let count = rows.len();
-            for content in rows {
-                if let Ok(embedding) = embedding_engine.embed(&content) {
-                    let _ = tree.insert(content, embedding);
+            let node_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
+                    .unwrap_or(0);
+            if node_count > 0 {
+                if let Err(e) = Self::load_tree_from_db_conn(&conn, &mut tree) {
+                    tracing::warn!("Failed to load MemTree from DB (will start fresh): {}", e);
+                    tree = MemTree::new_with_dim(dim);
+                } else {
+                    tracing::info!("Loaded MemTree with {} nodes from disk", tree.size());
                 }
-            }
-            if count > 0 {
-                tracing::info!("Rehydrated MemTree with {} memories from database", count);
             }
         }
 
@@ -191,8 +187,13 @@ impl MemorySystem {
 
         // Insert into MemTree
         let embedding = self.embedding_engine.embed(content)?;
-        let mut tree = self.tree.lock().await;
-        tree.insert(content.to_string(), embedding)?;
+        let node_id = {
+            let mut tree = self.tree.lock().await;
+            tree.insert(content.to_string(), embedding)?
+        };
+
+        // Persist immediately so it survives process exit
+        self.save_node_to_db(node_id).await?;
 
         tracing::debug!("Inserted conversation into memory: {} chars", content.len());
 
@@ -250,11 +251,118 @@ impl MemorySystem {
         })
     }
 
-    /// Checkpoint tree to database (for persistence)
-    pub fn checkpoint(&self) -> Result<()> {
-        // TODO: Implement tree serialization to SQLite
-        // For now, tree is rebuilt on restart from conversations
-        tracing::debug!("Memory checkpoint requested (not yet implemented)");
+    /// Persist a single MemTree node to the tree_nodes table.
+    async fn save_node_to_db(&self, node_id: NodeId) -> Result<()> {
+        let node = {
+            let tree = self.tree.lock().await;
+            tree.all_nodes().get(&node_id).cloned()
+        };
+        let node = match node {
+            Some(n) => n,
+            None => return Ok(()),
+        };
+
+        let embedding_bytes: Vec<u8> = node
+            .embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        let conn = self.db.lock().await;
+        conn.execute(
+            "INSERT OR REPLACE INTO tree_nodes (node_id, parent_id, text, embedding, level, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                node.id as i64,
+                node.parent.map(|p| p as i64),
+                &node.text,
+                &embedding_bytes,
+                node.level as i64,
+                node.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reconstruct MemTree from the tree_nodes table at startup.
+    fn load_tree_from_db_conn(conn: &Connection, tree: &mut MemTree) -> Result<()> {
+        struct Row {
+            node_id: u64,
+            parent_id: Option<u64>,
+            text: String,
+            embedding: Vec<f32>,
+            level: usize,
+            created_at: i64,
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT node_id, parent_id, text, embedding, level, created_at
+             FROM tree_nodes ORDER BY node_id ASC",
+        )?;
+
+        let rows: Vec<Row> = stmt
+            .query_map([], |row| {
+                let node_id: i64 = row.get(0)?;
+                let parent_id: Option<i64> = row.get(1)?;
+                let text: String = row.get(2)?;
+                let embedding_bytes: Vec<u8> = row.get(3)?;
+                let level: i64 = row.get(4)?;
+                let created_at: i64 = row.get(5)?;
+                Ok((node_id, parent_id, text, embedding_bytes, level, created_at))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(node_id, parent_id, text, embedding_bytes, level, created_at)| Row {
+                node_id: node_id as u64,
+                parent_id: parent_id.map(|p| p as u64),
+                text,
+                embedding: embedding_bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect(),
+                level: level as usize,
+                created_at,
+            })
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let nodes = tree.all_nodes_mut();
+        let mut max_id: u64 = 0;
+
+        // First pass: insert all nodes
+        for row in &rows {
+            max_id = max_id.max(row.node_id);
+            nodes.insert(
+                row.node_id,
+                TreeNode {
+                    id: row.node_id,
+                    parent: row.parent_id,
+                    children: Vec::new(),
+                    text: row.text.clone(),
+                    embedding: row.embedding.clone(),
+                    level: row.level,
+                    created_at: row.created_at,
+                },
+            );
+        }
+
+        // Second pass: rebuild children lists
+        for row in &rows {
+            if let Some(parent_id) = row.parent_id {
+                if let Some(parent) = nodes.get_mut(&parent_id) {
+                    if !parent.children.contains(&row.node_id) {
+                        parent.children.push(row.node_id);
+                    }
+                }
+            }
+        }
+
+        // Advance next_id past all loaded IDs
+        tree.set_next_id(max_id + 1);
+
         Ok(())
     }
 
