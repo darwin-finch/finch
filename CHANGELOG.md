@@ -7,10 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.14] - 2026-02-26
+
+### Fixed
+- **CRITICAL** — Stale `pending_brain_question_tx` could intercept tool-approval
+  dialog results: when the user submits or restarts typing, the pending brain
+  question oneshot sender is now explicitly dropped and any open brain question
+  dialog is closed before the query runs.
+- **CRITICAL** — `handle_brain_question` overwrote the previous pending oneshot
+  sender without draining it; the old sender is now dropped before storing the
+  new one.
+- **MAJOR** — Post-cancel write race in `BrainSession`: added an `AtomicBool`
+  cancelled guard set in `cancel()` before firing the `CancellationToken`.
+  A stale session whose `run_brain_loop` future finished at the same instant as
+  cancellation can no longer overwrite `brain_context` belonging to a newer session.
+- **MAJOR** — Brain debounce was a rate-limiter (fire every 300ms while typing)
+  causing constant brain restarts during active typing. Changed to a true
+  "fire after 300ms of silence" debounce: `TypingStarted` fires exactly once per
+  typing burst, when the user pauses.
+- **MINOR** — Empty or whitespace-only brain context is no longer injected into
+  the query (it would add noise without value).
+- Brain task panics are now logged via a `JoinHandle` monitor instead of being
+  silently lost.
+
 ## [0.7.13] - 2026-02-26
 
-### Changed
-- Version bump (no functional changes).
+### Fixed
+- Brain context was never injected: `cancel_active_brain(false)` on submit now
+  preserves the context for `handle_user_input` to read, while `cancel_active_brain(true)`
+  on typing restart still discards stale context.
 
 ## [0.7.12] - 2026-02-26
 
