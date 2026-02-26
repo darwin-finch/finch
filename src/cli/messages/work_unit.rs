@@ -330,11 +330,6 @@ impl Message for WorkUnit {
                     format!("{}⏺{} {}{}", CYAN, RESET, inner.response_text, timing)
                 };
 
-                for row in &inner.rows {
-                    out.push('\n');
-                    out.push_str(&format_row(row));
-                }
-
                 out
             }
         }
