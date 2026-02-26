@@ -226,7 +226,7 @@ pub struct MessageRequest {
 impl MessageRequest {
     pub fn new(user_query: &str) -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             messages: vec![Message::user(user_query)],
             system: None,
@@ -237,7 +237,7 @@ impl MessageRequest {
     /// Create request with full conversation context
     pub fn with_context(messages: Vec<Message>) -> Self {
         Self {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             messages,
             system: None,

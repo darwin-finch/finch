@@ -74,7 +74,7 @@ impl ClaudeProvider {
         Ok(Self {
             client,
             api_key,
-            default_model: "claude-sonnet-4-20250514".to_string(),
+            default_model: "claude-sonnet-4-6".to_string(),
         })
     }
 
