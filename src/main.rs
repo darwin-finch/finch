@@ -1257,7 +1257,7 @@ async fn run_query_teacher_only(
     let model = config
         .active_teacher()
         .and_then(|t| t.model.clone())
-        .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+        .unwrap_or_else(|| finch::config::constants::DEFAULT_CLAUDE_MODEL.to_string());
 
     let mut messages = vec![Message::user(query)];
 

@@ -6,6 +6,8 @@ use serde_json::Value;
 // Re-export tool types for convenience
 pub use crate::tools::types::ToolDefinition;
 
+use crate::config::constants::{DEFAULT_CLAUDE_MODEL, DEFAULT_MAX_TOKENS};
+
 /// Content block - supports text, image, tool_use, and tool_result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -226,8 +228,8 @@ pub struct MessageRequest {
 impl MessageRequest {
     pub fn new(user_query: &str) -> Self {
         Self {
-            model: "claude-sonnet-4-6".to_string(),
-            max_tokens: 4096,
+            model: DEFAULT_CLAUDE_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
             messages: vec![Message::user(user_query)],
             system: None,
             tools: None,
@@ -237,8 +239,8 @@ impl MessageRequest {
     /// Create request with full conversation context
     pub fn with_context(messages: Vec<Message>) -> Self {
         Self {
-            model: "claude-sonnet-4-6".to_string(),
-            max_tokens: 4096,
+            model: DEFAULT_CLAUDE_MODEL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
             messages,
             system: None,
             tools: None,

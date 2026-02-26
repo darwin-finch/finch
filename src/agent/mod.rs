@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::claude::types::{ContentBlock, Message, MessageRequest};
 use crate::claude::ClaudeClient;
+use crate::config::constants::DEFAULT_CLAUDE_MODEL;
 use crate::config::{persona::Persona, Config};
 use crate::generators::claude::CODING_SYSTEM_PROMPT;
 use crate::tools::implementations::{
@@ -112,7 +113,7 @@ impl AgentLoop {
             .config
             .active_teacher()
             .and_then(|t| t.model.clone())
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+            .unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string());
         let reflector = ReflectionEngine::new(create_client(&self.config)?, model.clone());
 
         let mut completed_count: usize = 0;

@@ -27,3 +27,6 @@ pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8000";
 
 /// Default bind address for the network worker (all interfaces).
 pub const DEFAULT_WORKER_ADDR: &str = "0.0.0.0:8000";
+
+/// Default Claude model used when no model is specified in config.
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";

@@ -13,10 +13,11 @@ use super::LlmProvider;
 use crate::claude::retry::with_retry;
 use crate::claude::streaming::StreamEvent;
 use crate::claude::types::{ContentBlock, MessageRequest};
+use crate::config::constants::DEFAULT_CLAUDE_MODEL;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const REQUEST_TIMEOUT_SECS: u64 = 60;
+const REQUEST_TIMEOUT_SECS: u64 = 120;
 
 /// Parse an Anthropic API error body and return a human-friendly message with hints.
 fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
@@ -74,7 +75,7 @@ impl ClaudeProvider {
         Ok(Self {
             client,
             api_key,
-            default_model: "claude-sonnet-4-6".to_string(),
+            default_model: DEFAULT_CLAUDE_MODEL.to_string(),
         })
     }
 
