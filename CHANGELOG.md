@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.16] - 2026-02-26
+
+### Fixed
+- **Memory schema migration**: production DBs created before v0.7.15 had the
+  wrong `tree_nodes` primary key (`id AUTOINCREMENT` instead of `node_id`).
+  `CREATE TABLE IF NOT EXISTS` silently skipped the broken table, causing every
+  MemTree insert to fail — 154 SQL conversations recorded, 0 nodes ever indexed.
+  `MemorySystem::new()` now detects the old schema via `pragma_table_info`,
+  drops the always-empty stale table, and lets schema.sql recreate it correctly.
+  Includes regression test.
+
 ## [0.7.15] - 2026-02-26
 
 ### Added
