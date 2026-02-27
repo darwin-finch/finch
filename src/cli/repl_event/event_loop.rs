@@ -3387,8 +3387,12 @@ pub(crate) fn find_last_exchange(messages: &[crate::claude::Message]) -> (String
 /// verbatim. If `max` is 0 or the list is shorter than `max`, returns all messages.
 ///
 /// After slicing, advances past any leading assistant messages so the window
-/// always starts with a user turn (required by all provider APIs). A floor of
-/// 2 messages is kept to avoid sending an empty window in degenerate cases.
+/// always starts with a user turn (required by all provider APIs). Also strips
+/// any leading user messages that contain only `tool_result` blocks — these are
+/// orphaned when the sliding window cuts the preceding assistant `tool_use`
+/// message, and all providers reject `tool_result` without a matching `tool_use`.
+/// A floor of 2 messages is kept to avoid sending an empty window in degenerate
+/// cases.
 pub(crate) fn apply_sliding_window(
     msgs: Vec<crate::claude::Message>,
     max: usize,
@@ -3400,6 +3404,30 @@ pub(crate) fn apply_sliding_window(
     // Ensure the window starts with a user message (API requirement).
     while window.len() > 2 && window.first().map(|m| m.role.as_str()) == Some("assistant") {
         window.remove(0);
+    }
+    // Strip orphaned tool_result-only user messages at the window boundary.
+    // This happens when the cut falls inside a tool-call round-trip: the
+    // assistant tool_use was dropped but the user tool_result survived.
+    // Every provider rejects tool_result blocks without a matching tool_use.
+    loop {
+        if window.len() <= 2 {
+            break;
+        }
+        let first_is_orphaned = window.first().map(|m| {
+            m.role == "user"
+                && !m.content.is_empty()
+                && m.content
+                    .iter()
+                    .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        });
+        if first_is_orphaned != Some(true) {
+            break;
+        }
+        window.remove(0); // drop orphaned tool_result user turn
+        // Also drop the assistant reply that followed it (starts the next pair).
+        if window.first().map(|m| m.role.as_str()) == Some("assistant") {
+            window.remove(0);
+        }
     }
     window
 }
@@ -4411,6 +4439,87 @@ mod tests {
             result.len() >= 2,
             "floor of 2 must be maintained; got {}",
             result.len()
+        );
+    }
+
+    /// Regression: orphaned tool_result at window boundary must be stripped.
+    ///
+    /// Scenario: conversation has two full tool-call round-trips followed by a
+    /// user text turn.  With a small window, the first round-trip's tool_use is
+    /// cut but its tool_result survives as the first message in the window.
+    /// All providers reject `tool_result` blocks without a matching `tool_use`.
+    #[test]
+    fn test_sliding_window_strips_orphaned_tool_result_at_boundary() {
+        use crate::claude::Message;
+
+        // Build:
+        //   [0] user "question"          ← will be dropped by window
+        //   [1] assistant with ToolUse   ← will be dropped by window (cut here)
+        //   [2] user with ToolResult     ← ORPHANED — tool_use was dropped
+        //   [3] assistant "answer 1"
+        //   [4] user "next question"
+        //   [5] assistant "answer 2"
+        let tool_use_id = "call_orphan_test".to_string();
+
+        let msgs: Vec<Message> = vec![
+            // [0] old user turn (outside window)
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "question".to_string(),
+                }],
+            },
+            // [1] assistant with ToolUse (will be cut by window)
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: tool_use_id.clone(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({"command": "ls"}),
+                }],
+            },
+            // [2] user with ToolResult — orphaned when [1] is cut
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: "file1.rs\nfile2.rs".to_string(),
+                    is_error: None,
+                }],
+            },
+            // [3] assistant reply
+            assistant_msg("answer 1"),
+            // [4] next user turn
+            user_msg("next question"),
+            // [5] assistant reply
+            assistant_msg("answer 2"),
+        ];
+
+        // window=4 keeps msgs[2..] = [orphaned ToolResult user, assistant, user, assistant]
+        let result = apply_sliding_window(msgs, 4);
+
+        // The orphaned tool_result user turn ([2]) and its assistant response ([3])
+        // must have been stripped, leaving [user "next question", assistant "answer 2"].
+        assert!(
+            result.len() >= 2,
+            "must have at least 2 messages; got {}",
+            result.len()
+        );
+        assert_eq!(
+            result.first().unwrap().role,
+            "user",
+            "window must start with a user message"
+        );
+        // Crucially: the first user message must NOT be a tool_result-only message.
+        let first_has_only_tool_results = result.first().map(|m| {
+            m.content
+                .iter()
+                .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        });
+        assert_ne!(
+            first_has_only_tool_results,
+            Some(true),
+            "orphaned tool_result user message must have been stripped"
         );
     }
 

@@ -213,6 +213,43 @@ impl ProviderRequest {
 
         let dropped = keep_from;
         self.messages = self.messages.drain(keep_from..).collect();
+
+        // After dropping from the head, the first message may now be a user
+        // message containing only tool_result blocks whose corresponding
+        // tool_use (in the preceding assistant message) was just dropped.
+        // All providers reject tool_result without a matching tool_use, so
+        // strip any such orphaned pairs from the front of the window.
+        use crate::claude::types::ContentBlock;
+        loop {
+            if self.messages.len() <= 1 {
+                break;
+            }
+            let first_is_orphaned = self
+                .messages
+                .first()
+                .map(|m| {
+                    m.role == "user"
+                        && !m.content.is_empty()
+                        && m.content
+                            .iter()
+                            .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                })
+                .unwrap_or(false);
+            if !first_is_orphaned {
+                break;
+            }
+            self.messages.remove(0); // drop orphaned tool_result user turn
+            // Drop the assistant reply that answered it (if still present).
+            if self
+                .messages
+                .first()
+                .map(|m| m.role.as_str())
+                == Some("assistant")
+            {
+                self.messages.remove(0);
+            }
+        }
+
         dropped
     }
 }
