@@ -84,11 +84,40 @@ impl MemorySystem {
         // Enable WAL mode for concurrency
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
+        // Migration A: detect old tree_nodes schema (primary key was 'id AUTOINCREMENT',
+        // not 'node_id').  The old table always had 0 rows because inserts failed with
+        // FK violations, so dropping it is safe.  We detect by checking whether the
+        // 'node_id' column is absent from an existing table.
+        {
+            let table_exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tree_nodes'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if table_exists > 0 {
+                let has_node_id: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pragma_table_info('tree_nodes') WHERE name='node_id'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if has_node_id == 0 {
+                    tracing::info!(
+                        "Dropping stale tree_nodes table (old schema used 'id', not 'node_id')"
+                    );
+                    conn.execute_batch("DROP TABLE IF EXISTS tree_nodes;")?;
+                }
+            }
+        }
+
         // Load schema (CREATE TABLE IF NOT EXISTS — safe to re-run)
         let schema = include_str!("schema.sql");
         conn.execute_batch(schema)?;
 
-        // Migration: add importance column if the DB predates v0.7.15.
+        // Migration B: add importance column if the DB predates v0.7.15.
         // Silently ignored if the column already exists.
         let _ = conn.execute(
             "ALTER TABLE tree_nodes ADD COLUMN importance INTEGER NOT NULL DEFAULT 1",
@@ -739,6 +768,55 @@ mod tests {
         assert_eq!(recent.len(), 3);
         // Should be in reverse chronological order
         assert!(recent[0].1.contains("Message 5"));
+
+        Ok(())
+    }
+
+    /// Regression: old production DBs had `id AUTOINCREMENT` as the tree_nodes PK
+    /// instead of `node_id INTEGER PRIMARY KEY`.  MemorySystem::new() must detect
+    /// this and drop/recreate the table so inserts don't fail with
+    /// "no such column: node_id".
+    #[tokio::test]
+    async fn test_old_schema_migration_drops_and_recreates_tree_nodes() -> Result<()> {
+        use rusqlite::Connection;
+
+        let temp = NamedTempFile::new()?;
+
+        // Set up a DB with the OLD tree_nodes schema (id AUTOINCREMENT)
+        {
+            let conn = Connection::open(temp.path())?;
+            conn.execute_batch(
+                "CREATE TABLE tree_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_id INTEGER,
+                    text TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    level INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );",
+            )?;
+        }
+
+        // Open via MemorySystem — migration should run automatically
+        let config = MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let memory = MemorySystem::new(config)?;
+
+        // Verify new schema: inserting a conversation must succeed
+        memory
+            .insert_conversation(
+                "user",
+                "We decided to always use anyhow for error handling.",
+                Some("test"),
+                None,
+            )
+            .await?;
+
+        let stats = memory.stats().await?;
+        assert_eq!(stats.conversation_count, 1);
+        assert_eq!(stats.tree_node_count, 1, "node should be in MemTree after migration");
 
         Ok(())
     }
