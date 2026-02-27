@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.20] - 2026-02-27
+
+### Changed
+- **Zero clippy warnings**: `cargo clippy` now exits clean.
+  - `Sampler` swapped from `ThreadRng` to `SmallRng` (fixes
+    `arc_with_non_send_sync`; `SmallRng` is `Send + Sync`).
+  - `#[allow(clippy::too_many_arguments)]` on 9 private render / constructor
+    functions where param-struct refactors would add noise with no benefit
+    (setup wizard render functions, dialog widget renderers, agent `run_task`,
+    `RequestMetric::new`, `ServerState::new`, `ToolExecutor::execute_tool` /
+    `execute_tool_loop`).
+  - `#[allow(clippy::result_large_err)]` on `convert_response_to_openai`
+    (axum `Response` is inherently large; boxing it adds noise).
+
 ## [0.7.19] - 2026-02-27
 
 ### Added
