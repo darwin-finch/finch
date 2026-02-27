@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 
 -- Tree nodes table (MemTree hierarchical structure)
 -- node_id matches the MemTree's own NodeId (u64) for round-trip fidelity.
+-- importance: 0=Discard, 1=Normal, 2=High, 3=Critical (see memory/quality.rs)
 CREATE TABLE IF NOT EXISTS tree_nodes (
     node_id INTEGER PRIMARY KEY,
     parent_id INTEGER,
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS tree_nodes (
     embedding BLOB NOT NULL,  -- f32 array stored as little-endian bytes
     level INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
+    importance INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY (parent_id) REFERENCES tree_nodes(node_id)
 );
 

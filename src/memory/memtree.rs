@@ -29,6 +29,10 @@ pub struct TreeNode {
     pub embedding: Vec<f32>,
     pub level: usize,
     pub created_at: i64,
+    /// Importance tier (0=Discard, 1=Normal, 2=High, 3=Critical).
+    /// Stored as u8 to keep TreeNode cheap to clone.
+    /// Root node always has importance=0.
+    pub importance: u8,
 }
 
 /// MemTree - Hierarchical semantic memory structure
@@ -61,6 +65,7 @@ impl MemTree {
             embedding: vec![0.0; dim],
             level: 0,
             created_at: chrono::Utc::now().timestamp(),
+            importance: 0, // synthetic — not a real memory
         };
 
         nodes.insert(root_id, root);
@@ -80,7 +85,10 @@ impl MemTree {
     /// 3. If similar enough and has children, descend to most similar child
     /// 4. Otherwise, create new child node
     /// 5. Update parent aggregation
-    pub fn insert(&mut self, text: String, embedding: Vec<f32>) -> Result<NodeId> {
+    ///
+    /// `importance` is the tier assigned by `MemoryClassifier` (0–3).
+    /// It is stored on the node and used to boost retrieval scores.
+    pub fn insert(&mut self, text: String, embedding: Vec<f32>, importance: u8) -> Result<NodeId> {
         let created_at = chrono::Utc::now().timestamp();
 
         // Start traversal at root
@@ -134,6 +142,7 @@ impl MemTree {
                     embedding: embedding.clone(),
                     level: node.level + 1,
                     created_at,
+                    importance,
                 };
 
                 self.nodes.insert(new_id, new_node);
@@ -191,25 +200,36 @@ impl MemTree {
         Ok(())
     }
 
-    /// Retrieve top-k most similar nodes (collapsed tree retrieval)
+    /// Retrieve top-k most relevant nodes (flat retrieval with importance weighting).
     ///
-    /// Treats all nodes as a flat set for simplicity
-    /// More sophisticated: hierarchical retrieval from paper
+    /// Score = cosine_similarity × importance_boost, where:
+    ///   - Critical (3) → ×1.4  (decisions, bugs, explicit rules)
+    ///   - High    (2) → ×1.2  (file refs, code patterns, preferences)
+    ///   - Normal  (1) → ×1.0  (general Q&A)
+    ///   - Discard (0) →  0.0  (never returned)
+    ///
+    /// This means a Critical memory at 0.70 similarity scores 0.98, beating a
+    /// Normal memory at 0.85 — important things surface even when slightly less
+    /// semantically close to the query.
     pub fn retrieve(&self, query_embedding: &[f32], top_k: usize) -> Vec<(NodeId, String, f32)> {
         let mut results: Vec<_> = self
             .nodes
             .values()
-            .filter(|node| node.id != self.root) // Skip root
+            .filter(|node| node.id != self.root && node.importance > 0)
             .map(|node| {
                 let similarity = cosine_similarity(query_embedding, &node.embedding);
-                (node.id, node.text.clone(), similarity)
+                let boost = match node.importance {
+                    3 => 1.4_f32,
+                    2 => 1.2_f32,
+                    _ => 1.0_f32,
+                };
+                (node.id, node.text.clone(), similarity * boost)
             })
             .collect();
 
-        // Sort by similarity descending
+        // Sort by weighted score descending
         results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Return top-k
         results.into_iter().take(top_k).collect()
     }
 
@@ -262,7 +282,7 @@ mod tests {
         let engine = TfIdfEmbedding::new();
 
         let emb = engine.embed("test text").unwrap();
-        let node_id = tree.insert("test text".to_string(), emb).unwrap();
+        let node_id = tree.insert("test text".to_string(), emb, 1).unwrap();
 
         assert_eq!(tree.size(), 1);
         assert!(tree.get_node(node_id).is_some());
@@ -278,7 +298,7 @@ mod tests {
 
         for text in texts {
             let emb = engine.embed(text).unwrap();
-            tree.insert(text.to_string(), emb).unwrap();
+            tree.insert(text.to_string(), emb, 1).unwrap();
         }
 
         assert_eq!(tree.size(), 3);
@@ -291,10 +311,10 @@ mod tests {
 
         // Insert nodes
         let emb1 = engine.embed("rust programming").unwrap();
-        tree.insert("rust programming".to_string(), emb1).unwrap();
+        tree.insert("rust programming".to_string(), emb1, 1).unwrap();
 
         let emb2 = engine.embed("python coding").unwrap();
-        tree.insert("python coding".to_string(), emb2).unwrap();
+        tree.insert("python coding".to_string(), emb2, 1).unwrap();
 
         // Query
         let query_emb = engine.embed("rust").unwrap();
@@ -313,10 +333,10 @@ mod tests {
 
         // Insert similar texts (should create hierarchy)
         let emb1 = engine.embed("rust").unwrap();
-        let id1 = tree.insert("rust".to_string(), emb1).unwrap();
+        let id1 = tree.insert("rust".to_string(), emb1, 1).unwrap();
 
         let emb2 = engine.embed("rust programming").unwrap();
-        let id2 = tree.insert("rust programming".to_string(), emb2).unwrap();
+        let id2 = tree.insert("rust programming".to_string(), emb2, 1).unwrap();
 
         // Check hierarchy
         let node1 = tree.get_node(id1).unwrap();
@@ -359,8 +379,63 @@ mod tests {
         ];
         for text in &texts {
             let emb = engine.embed(text).unwrap();
-            tree.insert(text.to_string(), emb).unwrap();
+            tree.insert(text.to_string(), emb, 1).unwrap();
         }
         assert_eq!(tree.size(), texts.len());
+    }
+
+    // ── Importance ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_insert_stores_importance() {
+        let mut tree = MemTree::new();
+        let engine = TfIdfEmbedding::new();
+        let emb = engine.embed("we decided to use anyhow").unwrap();
+        let id = tree.insert("we decided to use anyhow".to_string(), emb, 3).unwrap();
+        assert_eq!(tree.get_node(id).unwrap().importance, 3);
+    }
+
+    #[test]
+    fn test_critical_node_outranks_normal_node_in_retrieval() {
+        // Insert a Normal node and a Critical node with similar content.
+        // The Critical node should rank first even if slightly less similar.
+        let mut tree = MemTree::new();
+        let engine = TfIdfEmbedding::new();
+
+        let emb_normal = engine.embed("rust programming tips").unwrap();
+        tree.insert("rust programming tips".to_string(), emb_normal, 1 /* Normal */).unwrap();
+
+        let emb_critical = engine.embed("always use anyhow for rust errors").unwrap();
+        tree.insert("always use anyhow for rust errors".to_string(), emb_critical, 3 /* Critical */).unwrap();
+
+        let query = engine.embed("rust").unwrap();
+        let results = tree.retrieve(&query, 2);
+
+        assert_eq!(results.len(), 2);
+        // Critical node must appear at position 0 (highest weighted score)
+        assert!(
+            results[0].1.contains("always"),
+            "Critical node should rank first: {:?}",
+            results.iter().map(|(_, t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_discard_nodes_not_returned_in_retrieve() {
+        let mut tree = MemTree::new();
+        let engine = TfIdfEmbedding::new();
+
+        let emb = engine.embed("ok").unwrap();
+        tree.insert("ok".to_string(), emb, 0 /* Discard */).unwrap();
+
+        let query = engine.embed("ok").unwrap();
+        let results = tree.retrieve(&query, 5);
+
+        // Discard-importance nodes must never be returned
+        assert!(
+            results.is_empty(),
+            "Discard nodes must not appear in retrieval: {:?}",
+            results
+        );
     }
 }

@@ -9,10 +9,12 @@
 mod embeddings;
 mod memtree;
 pub mod neural_embedding;
+pub mod quality;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
 pub use memtree::{MemTree, NodeId, TreeNode};
 pub use neural_embedding::NeuralEmbeddingEngine;
+pub use quality::{MemoryClassifier, MemoryImportance};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -82,9 +84,16 @@ impl MemorySystem {
         // Enable WAL mode for concurrency
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
-        // Load schema
+        // Load schema (CREATE TABLE IF NOT EXISTS — safe to re-run)
         let schema = include_str!("schema.sql");
         conn.execute_batch(schema)?;
+
+        // Migration: add importance column if the DB predates v0.7.15.
+        // Silently ignored if the column already exists.
+        let _ = conn.execute(
+            "ALTER TABLE tree_nodes ADD COLUMN importance INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
 
         tracing::info!("Memory system initialized: {}", config.db_path.display());
 
@@ -185,16 +194,20 @@ impl MemorySystem {
             )?;
         }
 
-        // Insert into MemTree
-        let embedding = self.embedding_engine.embed(content)?;
-        let node_id = {
-            let mut tree = self.tree.lock().await;
-            tree.insert(content.to_string(), embedding)?
-        };
-
-        // Persist all nodes (root + ancestors + new leaf) so the DB stays
-        // consistent across process restarts and FK constraints are satisfied.
-        self.save_all_nodes_to_db().await?;
+        // Quality filter: classify and extract key content before indexing.
+        // Low-signal content (acks, greetings) is skipped in MemTree but still
+        // written to the conversations table above for raw history.
+        let classifier = MemoryClassifier::new();
+        if let Some((key_content, importance)) = classifier.process(role, content) {
+            let embedding = self.embedding_engine.embed(&key_content)?;
+            {
+                let mut tree = self.tree.lock().await;
+                tree.insert(key_content, embedding, importance.as_u8())?;
+            }
+            // Persist all nodes (root + ancestors + new leaf) so the DB stays
+            // consistent across process restarts and FK constraints are satisfied.
+            self.save_all_nodes_to_db().await?;
+        }
 
         tracing::debug!("Inserted conversation into memory: {} chars", content.len());
 
@@ -284,8 +297,8 @@ impl MemorySystem {
                 .collect();
             tx.execute(
                 "INSERT OR REPLACE INTO tree_nodes
-                 (node_id, parent_id, text, embedding, level, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (node_id, parent_id, text, embedding, level, created_at, importance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     node.id as i64,
                     node.parent.map(|p| p as i64),
@@ -293,6 +306,7 @@ impl MemorySystem {
                     &embedding_bytes,
                     node.level as i64,
                     node.created_at,
+                    node.importance as i64,
                 ],
             )?;
         }
@@ -309,10 +323,11 @@ impl MemorySystem {
             embedding: Vec<f32>,
             level: usize,
             created_at: i64,
+            importance: u8,
         }
 
         let mut stmt = conn.prepare(
-            "SELECT node_id, parent_id, text, embedding, level, created_at
+            "SELECT node_id, parent_id, text, embedding, level, created_at, importance
              FROM tree_nodes ORDER BY node_id ASC",
         )?;
 
@@ -324,11 +339,12 @@ impl MemorySystem {
                 let embedding_bytes: Vec<u8> = row.get(3)?;
                 let level: i64 = row.get(4)?;
                 let created_at: i64 = row.get(5)?;
-                Ok((node_id, parent_id, text, embedding_bytes, level, created_at))
+                let importance: i64 = row.get(6).unwrap_or(1);
+                Ok((node_id, parent_id, text, embedding_bytes, level, created_at, importance))
             })?
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|(node_id, parent_id, text, embedding_bytes, level, created_at)| Row {
+            .map(|(node_id, parent_id, text, embedding_bytes, level, created_at, importance)| Row {
                 node_id: node_id as u64,
                 parent_id: parent_id.map(|p| p as u64),
                 text,
@@ -338,6 +354,7 @@ impl MemorySystem {
                     .collect(),
                 level: level as usize,
                 created_at,
+                importance: importance.clamp(0, 3) as u8,
             })
             .collect();
 
@@ -361,6 +378,7 @@ impl MemorySystem {
                     embedding: row.embedding.clone(),
                     level: row.level,
                     created_at: row.created_at,
+                    importance: row.importance,
                 },
             );
         }

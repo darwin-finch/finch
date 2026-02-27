@@ -86,16 +86,25 @@ async fn test_memory_stats() -> Result<()> {
 
     let memory = MemorySystem::new(config)?;
 
-    // Insert multiple conversations
+    // Insert substantive messages (> 20 chars) so they pass the quality filter
+    // and land in both the SQL history table and the MemTree semantic index.
     for i in 1..=10 {
         memory
-            .insert_conversation("user", &format!("Question {}", i), Some("local"), None)
+            .insert_conversation(
+                "user",
+                &format!("How do I implement feature number {} correctly in Rust?", i),
+                Some("local"),
+                None,
+            )
             .await?;
     }
 
     let stats = memory.stats().await?;
+    // conversation_count is the raw SQL history — always incremented regardless of quality.
     assert_eq!(stats.conversation_count, 10);
-    assert_eq!(stats.tree_node_count, 10); // One node per conversation
+    // tree_node_count is the semantic index — incremented only for non-noise content.
+    // All 10 messages pass the quality filter, so they should all be indexed.
+    assert_eq!(stats.tree_node_count, 10);
 
     Ok(())
 }
@@ -162,7 +171,7 @@ async fn test_memtree_insertion() -> Result<()> {
 
     for text in texts {
         let emb = engine.embed(text)?;
-        tree.insert(text.to_string(), emb)?;
+        tree.insert(text.to_string(), emb, 1)?;
     }
 
     assert_eq!(tree.size(), 4);
@@ -192,7 +201,12 @@ async fn test_memory_persistence() -> Result<()> {
 
         let memory = MemorySystem::new(config)?;
         memory
-            .insert_conversation("user", "Test persistence", Some("local"), None)
+            .insert_conversation(
+                "user",
+                "We decided to always use anyhow for error handling in this project.",
+                Some("local"),
+                None,
+            )
             .await?;
     }
 
