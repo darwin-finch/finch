@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.15] - 2026-02-26
+
+### Added
+- **WorkUnit** (`src/cli/messages/work_unit.rs`): unified message type covering
+  the full lifecycle of one AI generation turn — streaming throb animation,
+  tool-call sub-rows with live output, and a collapsed completion view.
+  Replaces the StreamingResponseMessage + OperationMessage combination.
+  45 unit tests covering construction, status transitions, token accumulation,
+  row lifecycle, format output, timing, ANSI rendering, thread safety, and
+  concurrent updates.
+- **Memory quality layer** (`src/memory/quality.rs`): three-tier improvement to
+  what gets indexed and how it surfaces:
+  - *Filter* — short acks ("ok", "got it"), greetings, and messages under 20
+    chars are discarded from the MemTree semantic index (still written to SQL
+    history). Noise-free index means retrieval is always signal.
+  - *Classify + boost* — memories tagged Critical (decisions, bug insights,
+    explicit rules — ×1.4 retrieval boost), High (file paths, code patterns,
+    preferences — ×1.2), or Normal (×1.0). `create_memory` tool content is
+    always Critical. Score = cosine_similarity × importance_boost.
+  - *Extract* — long assistant responses have code fences stripped; prose core
+    capped at 300 chars at a sentence boundary.
+  - Schema: `importance INTEGER NOT NULL DEFAULT 1` added to `tree_nodes`;
+    auto-migration on open for existing databases.
+  - 19 new tests covering noise filtering, importance classification, extraction,
+    retrieval boost ordering, and Discard-tier exclusion.
+
+### Fixed
+- **SQLite FK violations in memory tests** (`src/memory/mod.rs`): `libsqlite3-sys`
+  bundles SQLite compiled with `SQLITE_DEFAULT_FOREIGN_KEYS=1`, so FK enforcement
+  is ON by default. The root node (id=0) was never persisted, causing every leaf
+  insert with `parent_id=0` to fail. Fixed by replacing `save_node_to_db(leaf_id)`
+  with `save_all_nodes_to_db()` — writes all nodes sorted by node_id (root first)
+  in a single transaction.
+- **Stale parent embeddings across restarts**: the old code only persisted the
+  newly inserted leaf. `update_parent_aggregation()` modifies all ancestors on
+  every insert, but those changes were never written to DB. `save_all_nodes_to_db()`
+  persists all of them.
+- **WorkUnit body lines not rendered in Complete state**: `format_row_collapsed`
+  was intentionally stripping body lines (diffs, bash output, etc.) even after
+  completion. Body lines are permanent content, not ephemeral streaming noise —
+  they now render correctly in both InProgress and Complete states.
+
 ## [0.7.14] - 2026-02-26
 
 ### Fixed
