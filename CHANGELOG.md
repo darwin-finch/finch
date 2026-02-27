@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.19] - 2026-02-27
+
+### Added
+- **Brain can propose actions with user approval**: the background brain now has
+  a `run_command` tool. When it discovers something actionable while you're
+  typing (failing test, missing dependency, stale lockfile), it pops a
+  `"Brain wants to run: \`{command}\` / Reason: {reason}"` Yes/No dialog.
+  Approved commands run via `sh -c` (30 s timeout); output is folded into the
+  brain's context summary. Max brain turns bumped 6 → 8 to accommodate
+  action round-trips.
+
+### Fixed
+- **Orphaned `tool_result` blocks after context truncation**: when the sliding
+  window or token-budget truncation dropped messages from the head of the
+  conversation, it could leave a user message containing only `tool_result`
+  blocks whose corresponding `tool_use` had been cut. All providers reject this
+  with `"unexpected tool_use_id found in tool_result blocks"`, causing every
+  subsequent query to fail. Both `apply_sliding_window()` and
+  `ProviderRequest::truncate_to_context_limit()` now strip orphaned
+  tool-result-only turns (and the assistant reply that follows) from the window
+  head after truncation. Regression test added.
+
+### Changed
+- **Dead code removed**: deleted Phase 4 Candle-based stubs (`RouterModel`,
+  `ValidatorModel`, `ModelEnsemble`) from `src/models/mod.rs` and purged the
+  orphaned files (`ensemble.rs`, `router.rs`, `validator.rs`,
+  `hybrid_router.rs`, `model_router.rs`) that were unreachable in the module
+  tree. Cleaned up downstream references in `batch_trainer.rs` and
+  `checkpoint.rs`.
+- **Clippy warnings reduced 22 → 12**: added `Default` impls for
+  `CandleLoader`, `ThresholdRouter`, `ThresholdValidator`, and `McpClient`;
+  replaced `QueryPattern::from_str` inherent method with a proper
+  `std::str::FromStr` impl; renamed `from_gemini_response` /
+  `from_openai_response` → `parse_response` (wrong self-convention); renamed
+  `TextTokenizer::default` → `stub`; added `TokenCallback` / `ForwardOutput`
+  type aliases in `onnx.rs`.
+
 ## [0.7.17] - 2026-02-26
 
 ### Changed
