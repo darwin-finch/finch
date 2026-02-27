@@ -395,10 +395,16 @@ impl TuiRenderer {
         let mut rows: usize = 0;
 
         // ── 1. Active WorkUnit ────────────────────────────────────────────────
+        // Cap to the last third of the terminal height so streaming responses
+        // don't grow the live area upward and shoot content off-screen.
+        let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
+        let max_live_lines = (term_h / 3).max(5);
         let live_msg = self.find_live_message();
         if let Some(msg) = &live_msg {
             let formatted = msg.format(&self.colors);
-            for line in formatted.split('\n') {
+            let all_lines: Vec<&str> = formatted.split('\n').collect();
+            let start = all_lines.len().saturating_sub(max_live_lines);
+            for line in &all_lines[start..] {
                 let line = line.trim_end_matches('\r');
                 execute!(stdout, Print(line), Print("\r\n"))?;
                 rows += 1;
