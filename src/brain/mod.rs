@@ -8,7 +8,9 @@
 // Tool set: read, glob, grep, ask_user_question (no bash, no web_fetch).
 // Max turns: 6 (3-4 tool calls + summary reply).
 
+mod action;
 mod ask_user;
+pub use action::{execute_brain_command, BrainActionTool};
 pub use ask_user::AskUserBrainTool;
 
 use crate::claude::types::{ContentBlock, Message};
@@ -28,8 +30,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-/// Maximum turns the brain may run.  6 allows 3-4 tool calls + final summary.
-const BRAIN_MAX_TURNS: usize = 6;
+/// Maximum turns the brain may run.  8 allows 4-5 tool calls (inc. action round-trips) + summary.
+const BRAIN_MAX_TURNS: usize = 8;
 
 /// A running background brain session.
 ///
@@ -135,8 +137,12 @@ fn brain_system_prompt(cwd: &str) -> String {
          Your job: speculatively read and search the codebase to pre-gather relevant \
          context so the main AI has a head start.\n\
          You may ask the user short clarifying questions using the ask_user_question tool.\n\
-         Available tools: read, glob, grep, ask_user_question.\n\
-         Stop after 3-5 tool calls. Summarise your findings concisely (200-400 words).\n\
+         If you discover something that needs attention (failing tests, missing deps, \
+         broken builds), you may propose a command via the run_command tool — the user \
+         will be asked to approve before it runs.\n\
+         Available tools: read, glob, grep, ask_user_question, run_command.\n\
+         Stop after 3-6 tool calls. Summarise your findings concisely (200-400 words), \
+         including any command output if a command was approved and run.\n\
          Working directory: {cwd}",
         cwd = cwd
     )
@@ -151,12 +157,13 @@ async fn run_brain_loop(
 ) -> Result<String> {
     let system = brain_system_prompt(cwd);
 
-    // Build brain tools (read-only + ask_user_question)
+    // Build brain tools (read-only + ask_user_question + run_command with approval)
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ReadTool),
         Box::new(GlobTool),
         Box::new(GrepTool),
-        Box::new(AskUserBrainTool::new(event_tx)),
+        Box::new(AskUserBrainTool::new(event_tx.clone())),
+        Box::new(BrainActionTool::new(event_tx)),
     ];
     let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
 

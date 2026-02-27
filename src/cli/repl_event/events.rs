@@ -77,6 +77,16 @@ pub enum ReplEvent {
         options: Vec<String>,
         response_tx: tokio::sync::oneshot::Sender<String>,
     },
+
+    /// Brain wants to run a shell command and is asking for approval.
+    ///
+    /// The event loop shows a Yes/No dialog.  If approved, the command is
+    /// executed and `Some(output)` is sent; if denied, `None` is sent.
+    BrainProposedAction {
+        command: String,
+        reason: String,
+        response_tx: tokio::sync::oneshot::Sender<Option<String>>,
+    },
 }
 
 #[cfg(test)]

@@ -87,6 +87,7 @@ impl EventHandler {
             ReplEvent::CancelQuery => {}
             ReplEvent::Shutdown => {}
             ReplEvent::BrainQuestion { .. } => {}
+            ReplEvent::BrainProposedAction { .. } => {}
         }
 
         Ok(())

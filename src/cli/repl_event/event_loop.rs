@@ -260,6 +260,13 @@ pub struct EventLoop {
 
     /// Options for the current brain question dialog (to map index → text).
     pending_brain_question_options: Vec<String>,
+
+    /// Pending oneshot sender for a BrainProposedAction approval dialog.
+    /// Resolved with Some(output) when approved and executed, None when denied.
+    pending_brain_action_tx: Option<tokio::sync::oneshot::Sender<Option<String>>>,
+
+    /// The command string for the pending brain action (shown in the dialog).
+    pending_brain_action_command: Option<String>,
 }
 
 /// View mode for the REPL
@@ -383,6 +390,8 @@ impl EventLoop {
             active_brain: Arc::new(RwLock::new(None)),
             pending_brain_question_tx: None,
             pending_brain_question_options: Vec::new(),
+            pending_brain_action_tx: None,
+            pending_brain_action_command: None,
         }
     }
 
@@ -551,6 +560,7 @@ impl EventLoop {
                         ReplEvent::CancelQuery => "CancelQuery",
                         ReplEvent::Shutdown => "Shutdown",
                         ReplEvent::BrainQuestion { .. } => "BrainQuestion",
+                        ReplEvent::BrainProposedAction { .. } => "BrainProposedAction",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -595,6 +605,20 @@ impl EventLoop {
                                 };
                                 let _ = brain_tx.send(answer);
                                 tracing::debug!("[EVENT_LOOP] Brain question answered");
+                            } else if let Some(action_tx) = self.pending_brain_action_tx.take() {
+                                // Brain proposed action — "Yes" = index 0, anything else = deny.
+                                let command = self.pending_brain_action_command.take().unwrap_or_default();
+                                let approved = matches!(&dialog_result, crate::cli::tui::DialogResult::Selected(0));
+                                if approved {
+                                    tracing::debug!("[EVENT_LOOP] Brain action approved: {}", command);
+                                    tokio::spawn(async move {
+                                        let output = crate::brain::execute_brain_command(&command).await;
+                                        let _ = action_tx.send(Some(output));
+                                    });
+                                } else {
+                                    tracing::debug!("[EVENT_LOOP] Brain action denied");
+                                    let _ = action_tx.send(None);
+                                }
                             } else {
                                 // Find which query this dialog was for (tool approval)
                                 let mut approvals = self.pending_approvals.write().await;
@@ -2167,6 +2191,15 @@ impl EventLoop {
                 self.handle_brain_question(question, options, response_tx)
                     .await?;
             }
+
+            ReplEvent::BrainProposedAction {
+                command,
+                reason,
+                response_tx,
+            } => {
+                self.handle_brain_proposed_action(command, reason, response_tx)
+                    .await?;
+            }
         }
 
         Ok(())
@@ -2480,6 +2513,53 @@ impl EventLoop {
         // Store the response channel and options; the render tick will send the answer.
         self.pending_brain_question_tx = Some(response_tx);
         self.pending_brain_question_options = options;
+        Ok(())
+    }
+
+    /// Handle a `BrainProposedAction` event: show a Yes/No approval dialog.
+    ///
+    /// The response channel is stored and resolved by the render tick after the
+    /// user makes a selection.  A previously pending action is denied automatically
+    /// (replaced by the new one).
+    async fn handle_brain_proposed_action(
+        &mut self,
+        command: String,
+        reason: String,
+        response_tx: tokio::sync::oneshot::Sender<Option<String>>,
+    ) -> Result<()> {
+        use crate::cli::tui::{Dialog, DialogOption};
+
+        tracing::debug!("[EVENT_LOOP] Brain proposed action: {}", command);
+
+        // Deny any previously pending action (replaced by this one).
+        if let Some(old_tx) = self.pending_brain_action_tx.take() {
+            let _ = old_tx.send(None);
+        }
+        self.pending_brain_action_command = None;
+
+        let prompt = if reason.is_empty() {
+            format!("Brain wants to run:\n  `{}`", command)
+        } else {
+            format!("Brain wants to run:\n  `{}`\n\nReason: {}", command, reason)
+        };
+
+        let dialog = Dialog::select(
+            prompt,
+            vec![
+                DialogOption::new("Yes, run it"),
+                DialogOption::new("No, skip"),
+            ],
+        );
+
+        let mut tui = self.tui_renderer.lock().await;
+        tui.active_dialog = Some(dialog);
+        if let Err(e) = tui.render() {
+            tracing::error!("[EVENT_LOOP] Failed to render brain action dialog: {}", e);
+        }
+        drop(tui);
+
+        self.pending_brain_action_tx = Some(response_tx);
+        self.pending_brain_action_command = Some(command);
         Ok(())
     }
 
