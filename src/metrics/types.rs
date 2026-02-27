@@ -36,6 +36,7 @@ pub struct RequestMetric {
 }
 
 impl RequestMetric {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         query_hash: String,
         routing_decision: String,

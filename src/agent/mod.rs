@@ -223,6 +223,7 @@ impl AgentLoop {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_task(
         &self,
         task: &AgentTask,

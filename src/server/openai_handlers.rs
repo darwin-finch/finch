@@ -765,6 +765,7 @@ fn convert_tools_to_internal(tools: &[Tool]) -> Vec<InternalToolDefinition> {
 }
 
 /// Convert internal GeneratorResponse to OpenAI format
+#[allow(clippy::result_large_err)]
 fn convert_response_to_openai(
     content_blocks: Vec<ContentBlock>,
     model: &str,

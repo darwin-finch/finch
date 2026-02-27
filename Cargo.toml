@@ -99,7 +99,7 @@ sysinfo = "0.32"  # System RAM detection for model selection
 tokenizers = "0.21"  # Tokenization (used by both ONNX and Candle)
 hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }  # HuggingFace Hub integration
 indicatif = "0.17"  # Progress bars for download tracking
-rand = "0.8"  # Random number generation for sampling
+rand = { version = "0.8", features = ["small_rng"] }  # Random number generation for sampling
 safetensors = "0.4"  # Model weight loading (used by Candle)
 
 # For web tools (Phase 3)

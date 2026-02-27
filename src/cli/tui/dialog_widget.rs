@@ -26,6 +26,7 @@ impl<'a> DialogWidget<'a> {
     }
 
     /// Render a single-select dialog
+    #[allow(clippy::too_many_arguments)]
     fn render_select(
         &self,
         options: &[DialogOption],
@@ -147,6 +148,7 @@ impl<'a> DialogWidget<'a> {
     }
 
     /// Render a multi-select dialog
+    #[allow(clippy::too_many_arguments)]
     fn render_multiselect(
         &self,
         options: &[DialogOption],

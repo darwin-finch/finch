@@ -92,6 +92,7 @@ impl AgentServer {
     ///
     /// `providers` is the ordered list of cloud providers from `[[providers]]` config.
     /// If empty, the server falls back to `claude_client` for all cloud forwarding.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         _config: Config,
         server_config: ServerConfig,

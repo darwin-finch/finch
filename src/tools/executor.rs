@@ -315,6 +315,7 @@ impl ToolExecutor {
     }
 
     /// Execute a single tool use
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, tool_use, conversation, save_models_fn, batch_trainer, local_generator, tokenizer, repl_mode, plan_content, live_output), fields(tool = %tool_use.name, id = %tool_use.id))]
     pub async fn execute_tool<F>(
         &self,
@@ -455,6 +456,7 @@ impl ToolExecutor {
     }
 
     /// Execute multiple tool uses in sequence
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(
         self,
         tool_uses,

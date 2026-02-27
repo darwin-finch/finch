@@ -2195,6 +2195,7 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
 }
 
 /// Render Models section (unified Backend + Teachers)
+#[allow(clippy::too_many_arguments)]
 fn render_models_section(
     f: &mut Frame,
     area: Rect,
@@ -2825,6 +2826,7 @@ fn render_configure_local_overlay(
 }
 
 /// Render Personas section
+#[allow(clippy::too_many_arguments)]
 fn render_personas_section(
     f: &mut Frame,
     area: Rect,
@@ -2940,6 +2942,7 @@ fn render_personas_section(
 }
 
 /// Render Features section (all settings visible)
+#[allow(clippy::too_many_arguments)]
 fn render_features_section(
     f: &mut Frame,
     area: Rect,

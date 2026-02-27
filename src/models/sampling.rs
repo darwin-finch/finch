@@ -134,15 +134,16 @@ pub struct SamplingDecision {
 /// Sampler that decides when to send queries to Claude
 pub struct Sampler {
     config: SamplingConfig,
-    rng: rand::rngs::ThreadRng,
+    rng: rand::rngs::SmallRng,
 }
 
 impl Sampler {
     /// Create new sampler
     pub fn new(config: SamplingConfig) -> Self {
+        use rand::SeedableRng;
         Self {
             config,
-            rng: rand::thread_rng(),
+            rng: rand::rngs::SmallRng::from_entropy(),
         }
     }
 
