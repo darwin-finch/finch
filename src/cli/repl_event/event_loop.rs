@@ -964,7 +964,10 @@ impl EventLoop {
             let mut ctx = self.brain_context.write().await;
             match ctx.take() {
                 Some(brain_ctx) if !brain_ctx.trim().is_empty() => {
-                    tracing::debug!("[EVENT_LOOP] Injecting brain context ({} chars)", brain_ctx.len());
+                    tracing::debug!(
+                        "[EVENT_LOOP] Injecting brain context ({} chars)",
+                        brain_ctx.len()
+                    );
                     format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, brain_ctx)
                 }
                 _ => input.clone(),
@@ -2369,10 +2372,7 @@ impl EventLoop {
             DialogOption::new("3. No"),
         ];
 
-        let dialog = Dialog::select(
-            format!("{}\n{}", tool_name, summary),
-            options,
-        );
+        let dialog = Dialog::select(format!("{}\n{}", tool_name, summary), options);
 
         // Set dialog in TUI (non-blocking - will be handled by async_input task)
         let mut tui = self.tui_renderer.lock().await;
@@ -3178,7 +3178,7 @@ fn strip_ansi(s: &str) -> String {
             match chars.peek() {
                 Some(&'[') => {
                     chars.next(); // consume '['
-                    // CSI sequence: consume until ASCII letter
+                                  // CSI sequence: consume until ASCII letter
                     for nc in chars.by_ref() {
                         if nc.is_ascii_alphabetic() {
                             break;
@@ -3187,7 +3187,7 @@ fn strip_ansi(s: &str) -> String {
                 }
                 Some(&']') => {
                     chars.next(); // consume ']'
-                    // OSC sequence: consume until BEL (0x07) or ESC
+                                  // OSC sequence: consume until BEL (0x07) or ESC
                     for nc in chars.by_ref() {
                         if nc == '\x07' || nc == '\x1b' {
                             break;
@@ -3237,9 +3237,7 @@ fn bash_smart_summary(content: &str) -> String {
     // 3. could not compile
     for line in lines.iter().rev() {
         let clean = strip_ansi(line.trim());
-        if clean.starts_with("error: could not compile")
-            || clean.starts_with("error: aborting")
-        {
+        if clean.starts_with("error: could not compile") || clean.starts_with("error: aborting") {
             return truncate_summary(clean);
         }
     }
@@ -3702,10 +3700,15 @@ mod tests {
         let content = format!("{}\n{}", summary_line, diff_lines.join("\n"));
         let (summary, body) = tool_result_to_display("edit", &content);
         assert_eq!(summary, summary_line);
-        assert_eq!(body.len(), MAX_TOOL_BODY_LINES + 1, "should have lines + overflow hint");
+        assert_eq!(
+            body.len(),
+            MAX_TOOL_BODY_LINES + 1,
+            "should have lines + overflow hint"
+        );
         assert!(
             body.last().unwrap().contains("ctrl+o to expand"),
-            "overflow hint missing: {:?}", body.last()
+            "overflow hint missing: {:?}",
+            body.last()
         );
     }
 
@@ -3720,7 +3723,10 @@ mod tests {
 
     #[test]
     fn test_tool_result_read_returns_line_count_no_body() {
-        let content = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (summary, body) = tool_result_to_display("read", &content);
         assert_eq!(summary, "50 lines");
         assert!(body.is_empty(), "Read must not show file content inline");
@@ -3735,7 +3741,10 @@ mod tests {
 
     #[test]
     fn test_tool_result_read_large_file_still_no_body() {
-        let content = (0..1000).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let content = (0..1000)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (summary, body) = tool_result_to_display("read", &content);
         assert_eq!(summary, "1000 lines");
         assert!(body.is_empty(), "Large file must not bloat body");
@@ -3836,12 +3845,16 @@ mod tests {
         let content = "running 5 tests\ntest foo ... ok\ntest bar ... FAILED\n\
                        test result: FAILED. 1 passed; 1 failed; 0 ignored";
         let (summary, _) = tool_result_to_display("bash", content);
-        assert_eq!(summary, "test result: FAILED. 1 passed; 1 failed; 0 ignored");
+        assert_eq!(
+            summary,
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored"
+        );
     }
 
     #[test]
     fn test_tool_result_bash_cargo_build_success() {
-        let content = "   Compiling foo v1.0\n    Finished `dev` profile [unoptimized] target(s) in 3s";
+        let content =
+            "   Compiling foo v1.0\n    Finished `dev` profile [unoptimized] target(s) in 3s";
         let (summary, _) = tool_result_to_display("bash", content);
         assert!(summary.contains("Finished"), "got: {}", summary);
     }
@@ -3852,7 +3865,8 @@ mod tests {
         let (summary, _) = tool_result_to_display("bash", content);
         assert!(
             summary.contains("could not compile") || summary.contains("error[E"),
-            "got: {}", summary
+            "got: {}",
+            summary
         );
     }
 
@@ -3861,7 +3875,11 @@ mod tests {
         let content = "STDERR:\nls: cannot access '/nope': No such file or directory\nExit code: 2";
         let (summary, _) = tool_result_to_display("bash", content);
         // "Exit code:" takes priority when no cargo patterns match
-        assert!(summary.contains("Exit code:") || !summary.is_empty(), "got: {}", summary);
+        assert!(
+            summary.contains("Exit code:") || !summary.is_empty(),
+            "got: {}",
+            summary
+        );
     }
 
     #[test]
@@ -3887,7 +3905,8 @@ mod tests {
         let (summary, _) = tool_result_to_display("bash", content);
         assert!(
             summary.contains("test result:"),
-            "ANSI stripping failed, got: {:?}", summary
+            "ANSI stripping failed, got: {:?}",
+            summary
         );
     }
 
@@ -3904,7 +3923,10 @@ mod tests {
         let lines: Vec<String> = (0..30).map(|i| format!("output line {}", i)).collect();
         let content = lines.join("\n");
         let (_, body) = tool_result_to_display("bash", &content);
-        assert!(body.len() <= MAX_TOOL_BODY_LINES + 1, "body should be capped");
+        assert!(
+            body.len() <= MAX_TOOL_BODY_LINES + 1,
+            "body should be capped"
+        );
         if body.len() == MAX_TOOL_BODY_LINES + 1 {
             assert!(body.last().unwrap().contains("ctrl+o to expand"));
         }
@@ -3916,8 +3938,16 @@ mod tests {
     fn test_tool_result_empty_returns_empty() {
         for tool in &["bash", "read", "edit", "write", "glob", "grep"] {
             let (summary, body) = tool_result_to_display(tool, "");
-            assert!(summary.is_empty(), "tool={} summary should be empty for empty content", tool);
-            assert!(body.is_empty(), "tool={} body should be empty for empty content", tool);
+            assert!(
+                summary.is_empty(),
+                "tool={} summary should be empty for empty content",
+                tool
+            );
+            assert!(
+                body.is_empty(),
+                "tool={} body should be empty for empty content",
+                tool
+            );
         }
     }
 
@@ -3980,13 +4010,19 @@ mod tests {
     #[test]
     fn test_bash_smart_summary_cargo_test_ok() {
         let out = "running 5 tests\ntest a ... ok\ntest result: ok. 5 passed; 0 failed";
-        assert_eq!(bash_smart_summary(out), "test result: ok. 5 passed; 0 failed");
+        assert_eq!(
+            bash_smart_summary(out),
+            "test result: ok. 5 passed; 0 failed"
+        );
     }
 
     #[test]
     fn test_bash_smart_summary_cargo_test_failed() {
         let out = "running 3 tests\ntest b ... FAILED\ntest result: FAILED. 2 passed; 1 failed";
-        assert_eq!(bash_smart_summary(out), "test result: FAILED. 2 passed; 1 failed");
+        assert_eq!(
+            bash_smart_summary(out),
+            "test result: FAILED. 2 passed; 1 failed"
+        );
     }
 
     #[test]
@@ -4001,7 +4037,8 @@ mod tests {
         let s = bash_smart_summary(out);
         assert!(
             s.contains("could not compile") || s.contains("error["),
-            "got: {}", s
+            "got: {}",
+            s
         );
     }
 
@@ -4014,8 +4051,11 @@ mod tests {
     #[test]
     fn test_bash_smart_summary_strips_ansi_codes() {
         let out = "\x1b[32mtest result: ok. 1 passed; 0 failed\x1b[0m";
-        assert!(bash_smart_summary(out).contains("test result:"),
-            "ANSI codes should be stripped from summary: {:?}", bash_smart_summary(out));
+        assert!(
+            bash_smart_summary(out).contains("test result:"),
+            "ANSI codes should be stripped from summary: {:?}",
+            bash_smart_summary(out)
+        );
     }
 
     #[test]
@@ -4028,8 +4068,11 @@ mod tests {
     fn test_bash_smart_summary_test_result_beats_finished() {
         // When both "Finished" and "test result:" appear, test result wins
         let out = "    Finished test profile in 2s\nrunning 3 tests\ntest result: ok. 3 passed";
-        assert!(bash_smart_summary(out).starts_with("test result:"),
-            "test result should beat Finished: {}", bash_smart_summary(out));
+        assert!(
+            bash_smart_summary(out).starts_with("test result:"),
+            "test result should beat Finished: {}",
+            bash_smart_summary(out)
+        );
     }
 
     // ── PresentPlan display ───────────────────────────────────────────────────
@@ -4041,10 +4084,16 @@ mod tests {
             "PresentPlan",
             &serde_json::json!({"plan": "# Refactor Auth System\n\nDetails here..."}),
         );
-        assert!(label.contains("Refactor Auth System"),
-            "label should show plan title: {:?}", label);
-        assert!(label.contains("PresentPlan"),
-            "label should show tool name: {:?}", label);
+        assert!(
+            label.contains("Refactor Auth System"),
+            "label should show plan title: {:?}",
+            label
+        );
+        assert!(
+            label.contains("PresentPlan"),
+            "label should show tool name: {:?}",
+            label
+        );
     }
 
     #[test]
@@ -4054,8 +4103,11 @@ mod tests {
             "PresentPlan",
             &serde_json::json!({"plan": "Just some prose with no heading."}),
         );
-        assert!(label.contains("proposing plan"),
-            "should fall back to 'proposing plan': {:?}", label);
+        assert!(
+            label.contains("proposing plan"),
+            "should fall back to 'proposing plan': {:?}",
+            label
+        );
     }
 
     #[test]
@@ -4065,10 +4117,16 @@ mod tests {
             "presentplan",
             &serde_json::json!({"plan": "# First Title\n## Second Title\n\nContent"}),
         );
-        assert!(label.contains("First Title"),
-            "should use first heading: {:?}", label);
-        assert!(!label.contains("Second Title"),
-            "should not show second heading: {:?}", label);
+        assert!(
+            label.contains("First Title"),
+            "should use first heading: {:?}",
+            label
+        );
+        assert!(
+            !label.contains("Second Title"),
+            "should not show second heading: {:?}",
+            label
+        );
     }
 
     // --- find_last_exchange ---
@@ -4454,7 +4512,10 @@ mod tests {
                 }
             })
             .collect();
-        assert!(!result_ids.is_empty(), "last message must contain ToolResult blocks");
+        assert!(
+            !result_ids.is_empty(),
+            "last message must contain ToolResult blocks"
+        );
 
         // The second-to-last message must be assistant and contain matching ToolUse ids.
         let preceding = &msgs[msgs.len() - 2];
@@ -4534,8 +4595,14 @@ mod tests {
 
     #[test]
     fn test_tool_approval_summary_bash_with_command() {
-        let tool = make_tool_use("bash", serde_json::json!({"command": "git push origin main"}));
-        assert_eq!(tool_approval_summary(&tool), "Command: git push origin main");
+        let tool = make_tool_use(
+            "bash",
+            serde_json::json!({"command": "git push origin main"}),
+        );
+        assert_eq!(
+            tool_approval_summary(&tool),
+            "Command: git push origin main"
+        );
     }
 
     #[test]
@@ -4600,7 +4667,11 @@ mod tests {
         let tool = make_tool_use("grep", serde_json::json!({"pattern": long}));
         let result = tool_approval_summary(&tool);
         assert!(result.starts_with("Pattern: "), "got: {}", result);
-        assert!(result.contains("..."), "long pattern should truncate: {}", result);
+        assert!(
+            result.contains("..."),
+            "long pattern should truncate: {}",
+            result
+        );
     }
 
     #[test]
@@ -4639,7 +4710,11 @@ mod tests {
         let tool = make_tool_use("EnterPlanMode", serde_json::json!({"reason": long_reason}));
         let result = tool_approval_summary(&tool);
         assert!(result.starts_with("Reason: "), "got: {}", result);
-        assert!(result.contains("..."), "long reason should truncate: {}", result);
+        assert!(
+            result.contains("..."),
+            "long reason should truncate: {}",
+            result
+        );
     }
 
     #[test]
@@ -4660,12 +4735,13 @@ mod tests {
     fn test_dialog_result_selected_0_approve_once() {
         // Option "1. Yes" → ApproveOnce
         let tool = make_tool_use("bash", serde_json::json!({"command": "ls"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(0),
-            &tool,
-        );
+        let result =
+            dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(0), &tool);
         assert!(
-            matches!(result, crate::cli::repl_event::events::ConfirmationResult::ApproveOnce),
+            matches!(
+                result,
+                crate::cli::repl_event::events::ConfirmationResult::ApproveOnce
+            ),
             "index 0 (Yes) should be ApproveOnce, got {:?}",
             result
         );
@@ -4675,15 +4751,17 @@ mod tests {
     fn test_dialog_result_selected_1_approve_pattern_session() {
         // Option "2. Yes, and don't ask again for: bash:*" → ApprovePatternSession
         let tool = make_tool_use("bash", serde_json::json!({"command": "git status"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(1),
-            &tool,
-        );
+        let result =
+            dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(1), &tool);
         match result {
             crate::cli::repl_event::events::ConfirmationResult::ApprovePatternSession(p) => {
                 assert_eq!(p.tool_name, "bash");
                 assert_eq!(p.pattern, "*");
-                assert!(p.description.contains("session"), "description: {}", p.description);
+                assert!(
+                    p.description.contains("session"),
+                    "description: {}",
+                    p.description
+                );
             }
             other => panic!("expected ApprovePatternSession, got {:?}", other),
         }
@@ -4693,12 +4771,13 @@ mod tests {
     fn test_dialog_result_selected_2_deny() {
         // Option "3. No" → Deny
         let tool = make_tool_use("bash", serde_json::json!({"command": "rm -rf /"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(2),
-            &tool,
-        );
+        let result =
+            dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(2), &tool);
         assert!(
-            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            matches!(
+                result,
+                crate::cli::repl_event::events::ConfirmationResult::Deny
+            ),
             "index 2 (No) should be Deny, got {:?}",
             result
         );
@@ -4707,12 +4786,13 @@ mod tests {
     #[test]
     fn test_dialog_result_selected_high_index_deny() {
         let tool = make_tool_use("bash", serde_json::json!({"command": "echo hi"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(99),
-            &tool,
-        );
+        let result =
+            dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(99), &tool);
         assert!(
-            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            matches!(
+                result,
+                crate::cli::repl_event::events::ConfirmationResult::Deny
+            ),
             "out-of-range index should be Deny, got {:?}",
             result
         );
@@ -4721,12 +4801,12 @@ mod tests {
     #[test]
     fn test_dialog_result_cancelled_deny() {
         let tool = make_tool_use("bash", serde_json::json!({"command": "echo hi"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Cancelled,
-            &tool,
-        );
+        let result = dialog_result_to_confirmation(crate::cli::tui::DialogResult::Cancelled, &tool);
         assert!(
-            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            matches!(
+                result,
+                crate::cli::repl_event::events::ConfirmationResult::Deny
+            ),
             "Cancelled should be Deny, got {:?}",
             result
         );
@@ -4740,7 +4820,10 @@ mod tests {
             &tool,
         );
         assert!(
-            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            matches!(
+                result,
+                crate::cli::repl_event::events::ConfirmationResult::Deny
+            ),
             "CustomText should be Deny (safety), got {:?}",
             result
         );
@@ -4750,13 +4833,15 @@ mod tests {
     fn test_dialog_result_pattern_session_uses_tool_name() {
         // Verify the "don't ask again" pattern uses the actual tool name
         let tool = make_tool_use("grep", serde_json::json!({"pattern": "TODO"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(1),
-            &tool,
-        );
+        let result =
+            dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(1), &tool);
         match result {
             crate::cli::repl_event::events::ConfirmationResult::ApprovePatternSession(p) => {
-                assert_eq!(p.tool_name, "grep", "pattern tool_name should match tool: {}", p.tool_name);
+                assert_eq!(
+                    p.tool_name, "grep",
+                    "pattern tool_name should match tool: {}",
+                    p.tool_name
+                );
             }
             other => panic!("expected ApprovePatternSession, got {:?}", other),
         }
@@ -4768,10 +4853,8 @@ mod tests {
         // otherwise the cache won't recognise future calls to the same tool.
         // Index 1 = "2. Yes, and don't ask again for: Bash:*"
         let tool = make_tool_use("Bash", serde_json::json!({"command": "cargo fmt"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(1),
-            &tool,
-        );
+        let result =
+            dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(1), &tool);
         match result {
             crate::cli::repl_event::events::ConfirmationResult::ApprovePatternSession(p) => {
                 assert_eq!(
@@ -4788,12 +4871,13 @@ mod tests {
         // Persistent approval is no longer in the 3-option dialog.
         // Index 2 → Deny; index 99 → Deny. Just verify nothing panics.
         let tool = make_tool_use("read", serde_json::json!({"file_path": "src/lib.rs"}));
-        let result = dialog_result_to_confirmation(
-            crate::cli::tui::DialogResult::Selected(2),
-            &tool,
-        );
+        let result =
+            dialog_result_to_confirmation(crate::cli::tui::DialogResult::Selected(2), &tool);
         assert!(
-            matches!(result, crate::cli::repl_event::events::ConfirmationResult::Deny),
+            matches!(
+                result,
+                crate::cli::repl_event::events::ConfirmationResult::Deny
+            ),
             "index 2 is No/Deny in 3-option dialog, got {:?}",
             result
         );
@@ -4825,7 +4909,10 @@ mod tests {
             }
             _ => input.clone(),
         };
-        assert_eq!(enriched, input, "query should be unchanged when brain has no context");
+        assert_eq!(
+            enriched, input,
+            "query should be unchanged when brain has no context"
+        );
     }
 
     #[test]
@@ -4861,9 +4948,18 @@ mod tests {
         let was_pending = pending.take().is_some();
         options.clear();
 
-        assert!(was_pending, "pending_brain_question_tx should have been Some");
-        assert!(pending.is_none(), "pending_brain_question_tx should be None after take");
-        assert!(options.is_empty(), "pending_brain_question_options should be cleared");
+        assert!(
+            was_pending,
+            "pending_brain_question_tx should have been Some"
+        );
+        assert!(
+            pending.is_none(),
+            "pending_brain_question_tx should be None after take"
+        );
+        assert!(
+            options.is_empty(),
+            "pending_brain_question_options should be cleared"
+        );
     }
 
     #[test]

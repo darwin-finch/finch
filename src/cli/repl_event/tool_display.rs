@@ -81,14 +81,12 @@ fn extract_key_param(tool_name: &str, input: &Value) -> String {
                 .map(|l| l.trim_start_matches('#').trim().to_string())
                 .unwrap_or_else(|| "proposing plan".to_string())
         }
-        "askuserquestion" | "ask_user_question" => {
-            input["questions"]
-                .as_array()
-                .and_then(|q| q.first())
-                .and_then(|q| q["question"].as_str())
-                .unwrap_or("user prompt")
-                .to_string()
-        }
+        "askuserquestion" | "ask_user_question" => input["questions"]
+            .as_array()
+            .and_then(|q| q.first())
+            .and_then(|q| q["question"].as_str())
+            .unwrap_or("user prompt")
+            .to_string(),
         _ => {
             // For unknown tools, show first string param value
             if let Some(obj) = input.as_object() {
@@ -162,8 +160,7 @@ mod tests {
 
     #[test]
     fn test_format_tool_label_bash() {
-        let label =
-            format_tool_label("Bash", &serde_json::json!({"command": "git status"}));
+        let label = format_tool_label("Bash", &serde_json::json!({"command": "git status"}));
         assert!(label.contains("Bash"), "got: {:?}", label);
         assert!(label.contains("git status"), "got: {:?}", label);
     }
@@ -173,14 +170,21 @@ mod tests {
         let long_cmd = "a".repeat(100);
         let label = format_tool_label("Bash", &serde_json::json!({"command": long_cmd}));
         // Should be truncated — visible portion <= MAX_PARAM_LEN + ellipsis
-        assert!(label.contains("…"), "long command should be truncated: {:?}", label);
+        assert!(
+            label.contains("…"),
+            "long command should be truncated: {:?}",
+            label
+        );
     }
 
     // ── extract_key_param ────────────────────────────────────────────────────
 
     #[test]
     fn test_extract_key_param_bash() {
-        let p = extract_key_param("bash", &serde_json::json!({"command": "git push origin main"}));
+        let p = extract_key_param(
+            "bash",
+            &serde_json::json!({"command": "git push origin main"}),
+        );
         assert_eq!(p, "git push origin main");
     }
 
@@ -193,10 +197,7 @@ mod tests {
     #[test]
     fn test_extract_key_param_read() {
         // Path longer than 3 components → last 3 shown (cwd-relative if under cwd)
-        let p = extract_key_param(
-            "read",
-            &serde_json::json!({"file_path": "/a/b/c/d/e.rs"}),
-        );
+        let p = extract_key_param("read", &serde_json::json!({"file_path": "/a/b/c/d/e.rs"}));
         // Either cwd-relative (if somehow under cwd) or last 3 components
         assert!(!p.is_empty());
         assert!(p.ends_with("e.rs"), "should end with filename: {}", p);
@@ -210,7 +211,10 @@ mod tests {
 
     #[test]
     fn test_extract_key_param_write() {
-        let p = extract_key_param("write", &serde_json::json!({"file_path": "/a/b/c/d/foo.rs"}));
+        let p = extract_key_param(
+            "write",
+            &serde_json::json!({"file_path": "/a/b/c/d/foo.rs"}),
+        );
         assert!(p.ends_with("foo.rs"), "should end with filename: {}", p);
     }
 
@@ -250,7 +254,11 @@ mod tests {
     fn test_extract_key_param_grep_long_pattern_truncated() {
         let long = "a".repeat(50);
         let p = extract_key_param("grep", &serde_json::json!({"pattern": long, "path": "."}));
-        assert!(p.contains("…"), "long grep pattern should be truncated: {}", p);
+        assert!(
+            p.contains("…"),
+            "long grep pattern should be truncated: {}",
+            p
+        );
     }
 
     #[test]
@@ -314,7 +322,10 @@ mod tests {
 
     #[test]
     fn test_extract_key_param_task_shows_description() {
-        let p = extract_key_param("task", &serde_json::json!({"description": "explore codebase"}));
+        let p = extract_key_param(
+            "task",
+            &serde_json::json!({"description": "explore codebase"}),
+        );
         assert_eq!(p, "explore codebase");
     }
 
@@ -351,8 +362,11 @@ mod tests {
         // Not under cwd — falls back to last 3 components
         let result = shorten_path("/a/b/c/d/e.rs");
         // Either cwd-relative (unlikely for /a/b/...) or last 3
-        assert!(result.ends_with("c/d/e.rs") || result.contains("e.rs"),
-            "got: {}", result);
+        assert!(
+            result.ends_with("c/d/e.rs") || result.contains("e.rs"),
+            "got: {}",
+            result
+        );
     }
 
     #[test]
@@ -367,15 +381,26 @@ mod tests {
         let absolute = cwd.join("src").join("lib.rs");
         let result = shorten_path(&absolute.to_string_lossy());
         // Should be the relative path, not truncated
-        assert_eq!(result, "src/lib.rs", "expected relative path, got: {}", result);
+        assert_eq!(
+            result, "src/lib.rs",
+            "expected relative path, got: {}",
+            result
+        );
     }
 
     #[test]
     fn test_shorten_path_last_3_with_ellipsis() {
         let result = shorten_path("/one/two/three/four/five/six.rs");
-        assert!(result.starts_with("…/"), "should start with ellipsis: {}", result);
-        assert!(result.ends_with("four/five/six.rs"),
-            "should keep last 3 components: {}", result);
+        assert!(
+            result.starts_with("…/"),
+            "should start with ellipsis: {}",
+            result
+        );
+        assert!(
+            result.ends_with("four/five/six.rs"),
+            "should keep last 3 components: {}",
+            result
+        );
     }
 
     // ── truncate ─────────────────────────────────────────────────────────────

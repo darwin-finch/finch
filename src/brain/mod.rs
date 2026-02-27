@@ -11,8 +11,8 @@
 mod ask_user;
 pub use ask_user::AskUserBrainTool;
 
-use crate::cli::repl_event::events::ReplEvent;
 use crate::claude::types::{ContentBlock, Message};
+use crate::cli::repl_event::events::ReplEvent;
 use crate::memory::MemorySystem;
 use crate::providers::{LlmProvider, ProviderRequest};
 use crate::tools::implementations::glob::GlobTool;
@@ -106,7 +106,11 @@ impl BrainSession {
             }
         });
 
-        Self { id, cancel, cancelled }
+        Self {
+            id,
+            cancel,
+            cancelled,
+        }
     }
 
     /// Cancel the brain session.  Idempotent.
@@ -196,7 +200,11 @@ async fn run_brain_loop(
 
         if !response.has_tool_uses() {
             let text = response.text();
-            info!("Brain finished in {} turns ({} chars)", turn + 1, text.len());
+            info!(
+                "Brain finished in {} turns ({} chars)",
+                turn + 1,
+                text.len()
+            );
             return Ok(text);
         }
 
@@ -232,12 +240,7 @@ async fn execute_brain_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> Resu
     let tool = tools
         .iter()
         .find(|t| t.name() == tool_use.name)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Brain tool '{}' not available",
-                tool_use.name
-            )
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("Brain tool '{}' not available", tool_use.name))?;
 
     let context = ToolContext {
         conversation: None,
@@ -277,7 +280,10 @@ mod tests {
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"ask_user_question"));
         assert!(!names.contains(&"bash"), "brain must not have bash");
-        assert!(!names.contains(&"web_fetch"), "brain must not have web_fetch");
+        assert!(
+            !names.contains(&"web_fetch"),
+            "brain must not have web_fetch"
+        );
     }
 
     #[test]
@@ -302,10 +308,7 @@ mod tests {
         struct NeverProvider;
         #[async_trait]
         impl LlmProvider for NeverProvider {
-            async fn send_message(
-                &self,
-                _req: &ProviderRequest,
-            ) -> Result<ProviderResponse> {
+            async fn send_message(&self, _req: &ProviderRequest) -> Result<ProviderResponse> {
                 anyhow::bail!("NeverProvider should not be called")
             }
             async fn send_message_stream(
@@ -414,7 +417,10 @@ mod tests {
 
         // Query returns that decision for a relevant partial input
         let results = mem.query("error handling", Some(3)).await.unwrap();
-        assert!(!results.is_empty(), "memory should recall the anyhow decision");
+        assert!(
+            !results.is_empty(),
+            "memory should recall the anyhow decision"
+        );
 
         // The memory_prefix formatting logic mirrors what run_brain_loop does:
         let prefix = format!(

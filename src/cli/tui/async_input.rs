@@ -90,7 +90,9 @@ fn should_accept_key_event(key: &KeyEvent) -> bool {
 /// - Handles all other keys via TextArea
 /// - Renders TUI periodically
 /// - Sends `InputEvent::TypingStarted` after 300 ms of typing silence (true debounce)
-pub fn spawn_input_task(tui_renderer: Arc<Mutex<TuiRenderer>>) -> mpsc::UnboundedReceiver<InputEvent> {
+pub fn spawn_input_task(
+    tui_renderer: Arc<Mutex<TuiRenderer>>,
+) -> mpsc::UnboundedReceiver<InputEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {

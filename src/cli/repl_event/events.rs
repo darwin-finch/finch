@@ -224,7 +224,9 @@ mod tests {
             response_tx,
         };
         match event {
-            ReplEvent::BrainQuestion { question, options, .. } => {
+            ReplEvent::BrainQuestion {
+                question, options, ..
+            } => {
                 assert_eq!(question, "Which file should I look at?");
                 assert_eq!(options.len(), 2);
             }

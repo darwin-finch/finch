@@ -5,9 +5,9 @@ use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use std::process::Stdio;
 
 pub struct BashTool;
 
@@ -188,9 +188,21 @@ mod tests {
         assert!(result.contains("line3"));
 
         let lines = received.lock().unwrap();
-        assert!(lines.contains(&"line1".to_string()), "callback must receive line1: {:?}", *lines);
-        assert!(lines.contains(&"line2".to_string()), "callback must receive line2: {:?}", *lines);
-        assert!(lines.contains(&"line3".to_string()), "callback must receive line3: {:?}", *lines);
+        assert!(
+            lines.contains(&"line1".to_string()),
+            "callback must receive line1: {:?}",
+            *lines
+        );
+        assert!(
+            lines.contains(&"line2".to_string()),
+            "callback must receive line2: {:?}",
+            *lines
+        );
+        assert!(
+            lines.contains(&"line3".to_string()),
+            "callback must receive line3: {:?}",
+            *lines
+        );
     }
 
     #[tokio::test]

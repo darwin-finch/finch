@@ -75,7 +75,8 @@ impl Tool for AskUserBrainTool {
 
         // Send the question to the event loop — it will show a dialog.
         // If the channel is closed (event loop stopped), return no-answer.
-        if self.event_tx
+        if self
+            .event_tx
             .send(ReplEvent::BrainQuestion {
                 question,
                 options,

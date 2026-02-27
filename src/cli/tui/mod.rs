@@ -1295,7 +1295,7 @@ impl TuiRenderer {
                 ))
             )?;
         }
-        execute!(stdout, Print(&bot))?;
+        execute!(stdout, Print(format!("{}\r\n", bot)))?;
         rows += 2; // buttons row + bot border
 
         Ok(rows)
@@ -2130,7 +2130,11 @@ mod tests {
         }
         let is_active = false;
         {
-            let _g: Option<PanickingGuard> = if is_active { Some(PanickingGuard) } else { None };
+            let _g: Option<PanickingGuard> = if is_active {
+                Some(PanickingGuard)
+            } else {
+                None
+            };
         }
         // If we reach here, the guard was not dropped — correct.
     }
@@ -2198,6 +2202,9 @@ mod tests {
         let buggy = total_rows.saturating_sub(1); // 0 — stays at row 1, clears nothing
         assert_eq!(correct, 1, "single-row: must move up 1 to reach top");
         assert_eq!(buggy, 0, "single-row: buggy formula is 0 (no-op erase)");
-        assert_ne!(correct, buggy, "correct and buggy must differ for single-row case");
+        assert_ne!(
+            correct, buggy,
+            "correct and buggy must differ for single-row case"
+        );
     }
 }

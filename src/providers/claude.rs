@@ -271,7 +271,8 @@ impl ClaudeProvider {
                                                                 // extended thinking blocks so the
                                                                 // model's chain-of-thought never
                                                                 // leaks into the TUI output.
-                                                                if builder.block_type != "thinking" {
+                                                                if builder.block_type != "thinking"
+                                                                {
                                                                     if tx
                                                                         .send(Ok(
                                                                             StreamChunk::TextDelta(

@@ -155,9 +155,9 @@ impl MemorySystem {
         // Load MemTree from persisted tree_nodes table.
         // Falls back gracefully to empty tree if table is empty or data is missing.
         {
-            let node_count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
-                    .unwrap_or(0);
+            let node_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM tree_nodes", [], |row| row.get(0))
+                .unwrap_or(0);
             if node_count > 0 {
                 if let Err(e) = Self::load_tree_from_db_conn(&conn, &mut tree) {
                     tracing::warn!("Failed to load MemTree from DB (will start fresh): {}", e);
@@ -369,22 +369,32 @@ impl MemorySystem {
                 let level: i64 = row.get(4)?;
                 let created_at: i64 = row.get(5)?;
                 let importance: i64 = row.get(6).unwrap_or(1);
-                Ok((node_id, parent_id, text, embedding_bytes, level, created_at, importance))
+                Ok((
+                    node_id,
+                    parent_id,
+                    text,
+                    embedding_bytes,
+                    level,
+                    created_at,
+                    importance,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|(node_id, parent_id, text, embedding_bytes, level, created_at, importance)| Row {
-                node_id: node_id as u64,
-                parent_id: parent_id.map(|p| p as u64),
-                text,
-                embedding: embedding_bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect(),
-                level: level as usize,
-                created_at,
-                importance: importance.clamp(0, 3) as u8,
-            })
+            .map(
+                |(node_id, parent_id, text, embedding_bytes, level, created_at, importance)| Row {
+                    node_id: node_id as u64,
+                    parent_id: parent_id.map(|p| p as u64),
+                    text,
+                    embedding: embedding_bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect(),
+                    level: level as usize,
+                    created_at,
+                    importance: importance.clamp(0, 3) as u8,
+                },
+            )
             .collect();
 
         if rows.is_empty() {
@@ -816,7 +826,10 @@ mod tests {
 
         let stats = memory.stats().await?;
         assert_eq!(stats.conversation_count, 1);
-        assert_eq!(stats.tree_node_count, 1, "node should be in MemTree after migration");
+        assert_eq!(
+            stats.tree_node_count, 1,
+            "node should be in MemTree after migration"
+        );
 
         Ok(())
     }

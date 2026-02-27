@@ -311,7 +311,8 @@ mod tests {
 
         // Insert nodes
         let emb1 = engine.embed("rust programming").unwrap();
-        tree.insert("rust programming".to_string(), emb1, 1).unwrap();
+        tree.insert("rust programming".to_string(), emb1, 1)
+            .unwrap();
 
         let emb2 = engine.embed("python coding").unwrap();
         tree.insert("python coding".to_string(), emb2, 1).unwrap();
@@ -336,7 +337,9 @@ mod tests {
         let id1 = tree.insert("rust".to_string(), emb1, 1).unwrap();
 
         let emb2 = engine.embed("rust programming").unwrap();
-        let id2 = tree.insert("rust programming".to_string(), emb2, 1).unwrap();
+        let id2 = tree
+            .insert("rust programming".to_string(), emb2, 1)
+            .unwrap();
 
         // Check hierarchy
         let node1 = tree.get_node(id1).unwrap();
@@ -391,7 +394,9 @@ mod tests {
         let mut tree = MemTree::new();
         let engine = TfIdfEmbedding::new();
         let emb = engine.embed("we decided to use anyhow").unwrap();
-        let id = tree.insert("we decided to use anyhow".to_string(), emb, 3).unwrap();
+        let id = tree
+            .insert("we decided to use anyhow".to_string(), emb, 3)
+            .unwrap();
         assert_eq!(tree.get_node(id).unwrap().importance, 3);
     }
 
@@ -403,10 +408,20 @@ mod tests {
         let engine = TfIdfEmbedding::new();
 
         let emb_normal = engine.embed("rust programming tips").unwrap();
-        tree.insert("rust programming tips".to_string(), emb_normal, 1 /* Normal */).unwrap();
+        tree.insert(
+            "rust programming tips".to_string(),
+            emb_normal,
+            1, /* Normal */
+        )
+        .unwrap();
 
         let emb_critical = engine.embed("always use anyhow for rust errors").unwrap();
-        tree.insert("always use anyhow for rust errors".to_string(), emb_critical, 3 /* Critical */).unwrap();
+        tree.insert(
+            "always use anyhow for rust errors".to_string(),
+            emb_critical,
+            3, /* Critical */
+        )
+        .unwrap();
 
         let query = engine.embed("rust").unwrap();
         let results = tree.retrieve(&query, 2);

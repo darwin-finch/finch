@@ -244,11 +244,7 @@ impl MemoryClassifier {
             // Strip code blocks (``` fences and 4-space / tab indented lines)
             let prose: String = content
                 .lines()
-                .filter(|l| {
-                    !l.starts_with("```")
-                        && !l.starts_with("    ")
-                        && !l.starts_with('\t')
-                })
+                .filter(|l| !l.starts_with("```") && !l.starts_with("    ") && !l.starts_with('\t'))
                 .map(|l| l.trim())
                 .filter(|l| !l.is_empty())
                 .collect::<Vec<_>>()
@@ -323,7 +319,9 @@ mod tests {
     #[test]
     fn test_noise_below_20_chars_is_discarded() {
         // 19 chars — just under threshold
-        assert!(classifier().process("user", "short message here!").is_none());
+        assert!(classifier()
+            .process("user", "short message here!")
+            .is_none());
     }
 
     // ── Classification ───────────────────────────────────────────────────────
@@ -371,15 +369,15 @@ mod tests {
 
     #[test]
     fn test_preference_is_high() {
-        let result = classifier().process("user", "I prefer to use structured logging with tracing.");
+        let result =
+            classifier().process("user", "I prefer to use structured logging with tracing.");
         assert!(result.is_some());
         assert_eq!(result.unwrap().1, MemoryImportance::High);
     }
 
     #[test]
     fn test_generic_question_is_normal() {
-        let result =
-            classifier().process("user", "How do Rust lifetimes work in practice?");
+        let result = classifier().process("user", "How do Rust lifetimes work in practice?");
         assert!(result.is_some());
         assert_eq!(result.unwrap().1, MemoryImportance::Normal);
     }
@@ -387,7 +385,10 @@ mod tests {
     #[test]
     fn test_system_role_is_always_critical() {
         // role="system" is from the explicit create_memory tool — always Critical
-        let result = classifier().process("system", "[context] The user is working on a Rust codebase.");
+        let result = classifier().process(
+            "system",
+            "[context] The user is working on a Rust codebase.",
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().1, MemoryImportance::Critical);
     }
@@ -449,8 +450,12 @@ mod tests {
 
     #[test]
     fn test_retrieval_boost_ordering() {
-        assert!(MemoryImportance::Critical.retrieval_boost() > MemoryImportance::High.retrieval_boost());
-        assert!(MemoryImportance::High.retrieval_boost() > MemoryImportance::Normal.retrieval_boost());
+        assert!(
+            MemoryImportance::Critical.retrieval_boost() > MemoryImportance::High.retrieval_boost()
+        );
+        assert!(
+            MemoryImportance::High.retrieval_boost() > MemoryImportance::Normal.retrieval_boost()
+        );
         assert_eq!(MemoryImportance::Discard.retrieval_boost(), 0.0);
     }
 }
