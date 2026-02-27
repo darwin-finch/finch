@@ -17,6 +17,12 @@ pub struct McpClient {
     connections: Arc<RwLock<HashMap<String, Arc<RwLock<McpConnection>>>>>,
 }
 
+impl Default for McpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl McpClient {
     /// Create a new MCP client
     pub fn new() -> Self {

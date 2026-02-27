@@ -1,5 +1,11 @@
 use anyhow::{bail, Context, Result};
 use ndarray;
+
+/// Token streaming callback (receives token id + decoded string).
+type TokenCallback = Box<dyn FnMut(u32, &str) + Send>;
+
+/// Return type for a single forward pass: logits + updated KV cache.
+type ForwardOutput = (Vec<f32>, Vec<(DynValue, DynValue)>);
 use ort::{
     ep,
     memory::MemoryInfo,
@@ -287,7 +293,7 @@ impl LoadedOnnxModel {
         &mut self,
         input_ids: &[u32],
         max_new_tokens: usize,
-        mut token_callback: Option<Box<dyn FnMut(u32, &str) + Send>>,
+        mut token_callback: Option<TokenCallback>,
     ) -> Result<Vec<u32>> {
         info!(
             "ONNX autoregressive generation: {} input tokens, max {} new tokens",
@@ -381,7 +387,7 @@ impl LoadedOnnxModel {
         num_layers: usize,
         num_kv_heads: usize,
         head_dim: usize,
-    ) -> Result<(Vec<f32>, Vec<(DynValue, DynValue)>)> {
+    ) -> Result<ForwardOutput> {
         // Prepare input_ids tensor
         let input_tensor = self.prepare_input(input_tokens)?;
 

@@ -27,6 +27,13 @@ use crate::config::ExecutionTarget;
 pub struct CandleLoader;
 
 #[cfg(feature = "candle")]
+impl Default for CandleLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "candle")]
 impl CandleLoader {
     /// Create new Candle loader
     pub fn new() -> Self {

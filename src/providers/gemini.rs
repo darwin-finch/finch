@@ -153,7 +153,7 @@ impl GeminiProvider {
     }
 
     /// Convert Gemini response to ProviderResponse
-    fn from_gemini_response(
+    fn parse_response(
         &self,
         response: GeminiResponse,
         model: String,
@@ -238,7 +238,7 @@ impl GeminiProvider {
 
         tracing::debug!("Received response: {:?}", gemini_response);
 
-        self.from_gemini_response(gemini_response, model)
+        self.parse_response(gemini_response, model)
     }
 
     /// Send a message with streaming response (no retry)

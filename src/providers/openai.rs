@@ -363,7 +363,7 @@ impl OpenAIProvider {
     }
 
     /// Convert OpenAI response to ProviderResponse
-    fn from_openai_response(&self, response: OpenAIResponse) -> Result<ProviderResponse> {
+    fn parse_response(&self, response: OpenAIResponse) -> Result<ProviderResponse> {
         let choice = response
             .choices
             .into_iter()
@@ -435,7 +435,7 @@ impl OpenAIProvider {
 
         tracing::debug!("Received response: {:?}", openai_response);
 
-        self.from_openai_response(openai_response)
+        self.parse_response(openai_response)
     }
 
     /// Send a message with streaming response (no retry)

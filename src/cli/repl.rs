@@ -442,7 +442,7 @@ impl Repl {
         }
 
         // Initialize tokenizer (still needed for tool execution)
-        let tokenizer = Arc::new(TextTokenizer::default().unwrap_or_else(|e| {
+        let tokenizer = Arc::new(TextTokenizer::stub().unwrap_or_else(|e| {
             output_status!("⚠️  Failed to create tokenizer: {}", e);
             output_status!("   Active learning tools may not work correctly");
             panic!("Cannot create tokenizer")

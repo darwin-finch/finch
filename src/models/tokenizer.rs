@@ -29,7 +29,7 @@ impl TextTokenizer {
         )
     }
 
-    pub fn default() -> Result<Self> {
+    pub fn stub() -> Result<Self> {
         // Phase 4: Return dummy instance for compatibility
         // The tokenizer is only used for training features which are stubbed
         Ok(Self)

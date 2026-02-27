@@ -111,6 +111,12 @@ impl Clone for ThresholdRouter {
     }
 }
 
+impl Default for ThresholdRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ThresholdRouter {
     /// Create new threshold router with balanced defaults
     pub fn new() -> Self {

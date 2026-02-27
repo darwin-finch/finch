@@ -63,6 +63,12 @@ pub struct ThresholdValidator {
     total_validations: usize,
 }
 
+impl Default for ThresholdValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ThresholdValidator {
     /// Create new threshold validator with conservative defaults
     pub fn new() -> Self {

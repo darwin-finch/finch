@@ -52,10 +52,13 @@ impl QueryPattern {
             Self::Other => "other",
         }
     }
+}
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+impl std::str::FromStr for QueryPattern {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "greeting" => Self::Greeting,
             "definition" => Self::Definition,
             "how_to" | "howto" => Self::HowTo,
@@ -66,7 +69,7 @@ impl QueryPattern {
             "opinion" => Self::Opinion,
             "complex" => Self::Complex,
             _ => Self::Other,
-        }
+        })
     }
 }
 
@@ -215,7 +218,7 @@ impl LearningModel for PatternClassifier {
     fn update(&mut self, _input: &str, expected: &ModelExpectation) -> Result<()> {
         // Extract pattern from expectation
         let pattern = match expected {
-            ModelExpectation::PatternLabel { category, .. } => QueryPattern::from_str(category),
+            ModelExpectation::PatternLabel { category, .. } => category.parse().unwrap(),
             _ => QueryPattern::Other,
         };
 
@@ -336,7 +339,7 @@ mod tests {
         ];
         for variant in &variants {
             let s = variant.as_str();
-            let parsed = QueryPattern::from_str(s);
+            let parsed: QueryPattern = s.parse().unwrap();
             assert_eq!(
                 &parsed, variant,
                 "from_str roundtrip failed for {:?}",
@@ -347,16 +350,16 @@ mod tests {
 
     #[test]
     fn test_query_pattern_from_str_case_insensitive() {
-        assert_eq!(QueryPattern::from_str("GREETING"), QueryPattern::Greeting);
-        assert_eq!(QueryPattern::from_str("HowTo"), QueryPattern::HowTo);
-        assert_eq!(QueryPattern::from_str("HOWTO"), QueryPattern::HowTo);
-        assert_eq!(QueryPattern::from_str("CODE"), QueryPattern::Code);
+        assert_eq!("GREETING".parse::<QueryPattern>().unwrap(), QueryPattern::Greeting);
+        assert_eq!("HowTo".parse::<QueryPattern>().unwrap(), QueryPattern::HowTo);
+        assert_eq!("HOWTO".parse::<QueryPattern>().unwrap(), QueryPattern::HowTo);
+        assert_eq!("CODE".parse::<QueryPattern>().unwrap(), QueryPattern::Code);
     }
 
     #[test]
     fn test_query_pattern_from_str_unknown_is_other() {
-        assert_eq!(QueryPattern::from_str("xyz_unknown"), QueryPattern::Other);
-        assert_eq!(QueryPattern::from_str(""), QueryPattern::Other);
+        assert_eq!("xyz_unknown".parse::<QueryPattern>().unwrap(), QueryPattern::Other);
+        assert_eq!("".parse::<QueryPattern>().unwrap(), QueryPattern::Other);
     }
 
     #[test]
