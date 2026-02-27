@@ -68,6 +68,14 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
             Ok(Box::new(provider))
         }
 
+        ProviderEntry::Ollama { base_url, model, .. } => {
+            Ok(Box::new(OpenAIProvider::new_ollama(base_url.clone(), model.clone())?))
+        }
+
+        ProviderEntry::RemoteDaemon { address, .. } => {
+            Ok(Box::new(OpenAIProvider::new_remote_daemon(address.clone())?))
+        }
+
         ProviderEntry::Local { .. } => {
             bail!("Local providers use a local generator — call create_local_generator() instead")
         }

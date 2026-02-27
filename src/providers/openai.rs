@@ -152,6 +152,31 @@ impl OpenAIProvider {
         )
     }
 
+    /// Create an Ollama provider using Ollama's OpenAI-compatible API.
+    ///
+    /// Ollama exposes `/v1/chat/completions` at `base_url` (default: `http://localhost:11434`).
+    /// No API key is required — "ollama" is sent as a placeholder.
+    pub fn new_ollama(base_url: String, model: String) -> Result<Self> {
+        Self::new(
+            "ollama".to_string(), // Ollama ignores the Authorization header
+            base_url,
+            model,
+            "ollama".to_string(),
+        )
+    }
+
+    /// Create a provider that talks to a remote finch daemon's OpenAI-compatible endpoint.
+    ///
+    /// The daemon exposes `/v1/chat/completions` at `address`.
+    pub fn new_remote_daemon(address: String) -> Result<Self> {
+        Self::new(
+            String::new(), // no API key for the local/remote daemon
+            address,
+            "default".to_string(),
+            "remote_daemon".to_string(),
+        )
+    }
+
     /// Set custom model for this provider
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.default_model = model.into();

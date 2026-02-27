@@ -9,6 +9,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_ollama_model() -> String {
+    "qwen2.5:7b".to_string()
+}
+
+fn default_ollama_base_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
 fn default_inference_provider() -> InferenceProvider {
     InferenceProvider::Onnx
 }
@@ -89,6 +97,35 @@ pub enum ProviderEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+    /// Ollama local/remote inference (OpenAI-compatible API).
+    ///
+    /// ```toml
+    /// [[providers]]
+    /// type = "ollama"
+    /// model = "qwen2.5:7b"
+    /// base_url = "http://localhost:11434"   # default
+    /// ```
+    Ollama {
+        #[serde(default = "default_ollama_model")]
+        model: String,
+        #[serde(default = "default_ollama_base_url")]
+        base_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Remote finch daemon as a provider.
+    ///
+    /// ```toml
+    /// [[providers]]
+    /// type = "remote_daemon"
+    /// address = "http://192.168.1.50:11435"
+    /// ```
+    #[serde(rename = "remote_daemon")]
+    RemoteDaemon {
+        address: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     Local {
         #[serde(default = "default_inference_provider")]
         inference_provider: InferenceProvider,
@@ -119,6 +156,8 @@ impl ProviderEntry {
             Self::Gemini { name, .. } => name.as_deref().unwrap_or("Gemini"),
             Self::Mistral { name, .. } => name.as_deref().unwrap_or("Mistral"),
             Self::Groq { name, .. } => name.as_deref().unwrap_or("Groq"),
+            Self::Ollama { name, .. } => name.as_deref().unwrap_or("Ollama"),
+            Self::RemoteDaemon { name, .. } => name.as_deref().unwrap_or("Remote Daemon"),
             Self::Local { name, .. } => name.as_deref().unwrap_or("Local"),
         }
     }
@@ -132,6 +171,8 @@ impl ProviderEntry {
             Self::Gemini { .. } => "gemini",
             Self::Mistral { .. } => "mistral",
             Self::Groq { .. } => "groq",
+            Self::Ollama { .. } => "ollama",
+            Self::RemoteDaemon { .. } => "remote_daemon",
             Self::Local { .. } => "local",
         }
     }
@@ -141,7 +182,7 @@ impl ProviderEntry {
         matches!(self, Self::Local { .. })
     }
 
-    /// API key for cloud variants; `None` for Local.
+    /// API key for cloud variants; `None` for Local, Ollama, and RemoteDaemon.
     pub fn api_key(&self) -> Option<&str> {
         match self {
             Self::Claude { api_key, .. } => Some(api_key.as_str()),
@@ -150,7 +191,7 @@ impl ProviderEntry {
             Self::Gemini { api_key, .. } => Some(api_key.as_str()),
             Self::Mistral { api_key, .. } => Some(api_key.as_str()),
             Self::Groq { api_key, .. } => Some(api_key.as_str()),
-            Self::Local { .. } => None,
+            Self::Ollama { .. } | Self::RemoteDaemon { .. } | Self::Local { .. } => None,
         }
     }
 
@@ -163,7 +204,8 @@ impl ProviderEntry {
             Self::Gemini { model, .. } => model.as_deref(),
             Self::Mistral { model, .. } => model.as_deref(),
             Self::Groq { model, .. } => model.as_deref(),
-            Self::Local { .. } => None,
+            Self::Ollama { model, .. } => Some(model.as_str()),
+            Self::RemoteDaemon { .. } | Self::Local { .. } => None,
         }
     }
 }

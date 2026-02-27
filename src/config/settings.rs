@@ -371,7 +371,7 @@ impl ProviderEntry {
                 base_url: None,
                 name: name.clone(),
             }),
-            Self::Local { .. } => None,
+            Self::Ollama { .. } | Self::RemoteDaemon { .. } | Self::Local { .. } => None,
         }
     }
 
