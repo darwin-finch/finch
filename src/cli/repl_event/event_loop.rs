@@ -2443,6 +2443,7 @@ impl EventLoop {
             self.event_tx.clone(),
             Arc::clone(&self.brain_context),
             self.cwd.clone(),
+            self.memory_system.clone(),
         );
 
         *self.active_brain.write().await = Some(session);

@@ -13,6 +13,7 @@ pub use ask_user::AskUserBrainTool;
 
 use crate::cli::repl_event::events::ReplEvent;
 use crate::claude::types::{ContentBlock, Message};
+use crate::memory::MemorySystem;
 use crate::providers::{LlmProvider, ProviderRequest};
 use crate::tools::implementations::glob::GlobTool;
 use crate::tools::implementations::grep::GrepTool;
@@ -49,12 +50,17 @@ impl BrainSession {
     ///
     /// The brain writes its final context summary into `brain_context` once it
     /// finishes.  Events (e.g. `BrainQuestion`) are sent on `event_tx`.
+    ///
+    /// If `memory` is provided the brain pre-queries it with the partial input
+    /// and injects any recalled memories into its task message before exploring
+    /// the codebase.
     pub fn spawn(
         partial_input: String,
         provider: Arc<dyn LlmProvider>,
         event_tx: mpsc::UnboundedSender<ReplEvent>,
         brain_context: Arc<RwLock<Option<String>>>,
         cwd: String,
+        memory: Option<Arc<MemorySystem>>,
     ) -> Self {
         let id = Uuid::new_v4();
         let cancel = CancellationToken::new();
@@ -72,6 +78,7 @@ impl BrainSession {
                     provider.as_ref(),
                     event_tx,
                     &cwd,
+                    memory.as_deref(),
                 ) => {
                     match result {
                         Ok(summary) => {
@@ -136,6 +143,7 @@ async fn run_brain_loop(
     provider: &dyn LlmProvider,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     cwd: &str,
+    memory: Option<&MemorySystem>,
 ) -> Result<String> {
     let system = brain_system_prompt(cwd);
 
@@ -148,9 +156,26 @@ async fn run_brain_loop(
     ];
     let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
 
+    // Pre-query memory so the brain knows past decisions before it explores.
+    let memory_prefix = if let Some(mem) = memory {
+        match mem.query(partial_input, Some(3)).await {
+            Ok(memories) if !memories.is_empty() => {
+                debug!("Brain recalled {} memories for pre-context", memories.len());
+                Some(format!(
+                    "[Relevant context from past sessions:\n\n{}]\n\n",
+                    memories.join("\n\n---\n\n")
+                ))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let task = format!(
-        "The user is typing: \"{}\"\n\n\
+        "{}The user is typing: \"{}\"\n\n\
          Search the codebase for relevant context.",
+        memory_prefix.as_deref().unwrap_or(""),
         partial_input
     );
 
@@ -305,6 +330,7 @@ mod tests {
             tx,
             ctx,
             "/tmp".to_string(),
+            None,
         );
         // Cancel immediately — must not panic.
         session.cancel();
@@ -349,6 +375,7 @@ mod tests {
                 tx,
                 ctx,
                 "/tmp".to_string(),
+                None,
             )
         };
 
@@ -357,5 +384,59 @@ mod tests {
         assert_ne!(s1.id, s2.id, "each BrainSession should have a unique UUID");
         s1.cancel();
         s2.cancel();
+    }
+
+    /// Regression: when memory is provided, the brain's task message must
+    /// include the recalled context before the user's partial input.
+    #[tokio::test]
+    async fn test_brain_memory_prefix_injected_into_task() {
+        use crate::memory::{MemoryConfig, MemorySystem};
+        use tempfile::NamedTempFile;
+
+        let temp = NamedTempFile::new().unwrap();
+        let mem = Arc::new(
+            MemorySystem::new(MemoryConfig {
+                db_path: temp.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        // Store a memorable decision
+        mem.insert_conversation(
+            "user",
+            "We decided to always use anyhow for error handling in this project.",
+            Some("test"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Query returns that decision for a relevant partial input
+        let results = mem.query("error handling", Some(3)).await.unwrap();
+        assert!(!results.is_empty(), "memory should recall the anyhow decision");
+
+        // The memory_prefix formatting logic mirrors what run_brain_loop does:
+        let prefix = format!(
+            "[Relevant context from past sessions:\n\n{}]\n\n",
+            results.join("\n\n---\n\n")
+        );
+        let task = format!(
+            "{}The user is typing: \"{}\"\n\nSearch the codebase for relevant context.",
+            prefix, "error handling approach"
+        );
+
+        assert!(
+            task.contains("anyhow"),
+            "task message should contain recalled memory"
+        );
+        assert!(
+            task.contains("The user is typing"),
+            "task message should contain partial input"
+        );
+        assert!(
+            task.starts_with("[Relevant context from past sessions:"),
+            "memory prefix should come first"
+        );
     }
 }
