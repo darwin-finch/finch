@@ -7,33 +7,23 @@
 use serde::{Deserialize, Serialize};
 
 /// Priority of a task item
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TodoPriority {
     High,
+    #[default]
     Medium,
     Low,
 }
 
-impl Default for TodoPriority {
-    fn default() -> Self {
-        TodoPriority::Medium
-    }
-}
-
 /// Lifecycle status of a task item
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
+    #[default]
     Pending,
     InProgress,
     Completed,
-}
-
-impl Default for TodoStatus {
-    fn default() -> Self {
-        TodoStatus::Pending
-    }
 }
 
 /// A single task item in the session task list

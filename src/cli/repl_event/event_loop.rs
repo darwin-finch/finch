@@ -98,6 +98,33 @@ async fn refresh_context_strip(
     }
 }
 
+type ToolResultsMap =
+    Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>;
+type PendingApprovalsMap = Arc<
+    RwLock<
+        std::collections::HashMap<
+            Uuid,
+            (
+                crate::tools::types::ToolUse,
+                tokio::sync::oneshot::Sender<super::events::ConfirmationResult>,
+            ),
+        >,
+    >,
+>;
+type ActiveToolUsesMap = Arc<
+    RwLock<
+        std::collections::HashMap<
+            String,
+            (
+                String,
+                serde_json::Value,
+                Arc<crate::cli::messages::WorkUnit>,
+                usize,
+            ),
+        >,
+    >,
+>;
+
 /// Main event loop for concurrent REPL
 #[allow(dead_code)]
 pub struct EventLoop {
@@ -149,23 +176,13 @@ pub struct EventLoop {
     tool_coordinator: ToolExecutionCoordinator,
 
     /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
-    tool_results: Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>,
+    tool_results: ToolResultsMap,
 
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
 
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
-    pending_approvals: Arc<
-        RwLock<
-            std::collections::HashMap<
-                Uuid,
-                (
-                    crate::tools::types::ToolUse,
-                    tokio::sync::oneshot::Sender<super::events::ConfirmationResult>,
-                ),
-            >,
-        >,
-    >,
+    pending_approvals: PendingApprovalsMap,
 
     /// Daemon client (for /local command)
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
@@ -188,19 +205,7 @@ pub struct EventLoop {
     /// Active tool calls: tool_id -> (tool_name, input, work_unit, row_idx)
     /// All tools in one generation turn share the same WorkUnit; each
     /// tool occupies one row identified by its index.
-    active_tool_uses: Arc<
-        RwLock<
-            std::collections::HashMap<
-                String,
-                (
-                    String,
-                    serde_json::Value,
-                    Arc<crate::cli::messages::WorkUnit>,
-                    usize,
-                ),
-            >,
-        >,
-    >,
+    active_tool_uses: ActiveToolUsesMap,
 
     /// Feedback logger — writes rated responses to ~/.finch/feedback.jsonl
     feedback_logger: Option<FeedbackLogger>,
@@ -1337,19 +1342,7 @@ impl EventLoop {
         mode: Arc<RwLock<ReplMode>>,
         output_manager: Arc<OutputManager>,
         status_bar: Arc<crate::cli::StatusBar>,
-        active_tool_uses: Arc<
-            RwLock<
-                std::collections::HashMap<
-                    String,
-                    (
-                        String,
-                        serde_json::Value,
-                        Arc<crate::cli::messages::WorkUnit>,
-                        usize,
-                    ),
-                >,
-            >,
-        >,
+        active_tool_uses: ActiveToolUsesMap,
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
         session_label: String,
         cwd: String,

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::models::{GeneratorModel, RouterModel, Saveable, ValidatorModel};
+use crate::models::{GeneratorModel, Saveable};
 
 /// Checkpoint metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,10 +19,8 @@ pub struct Checkpoint {
     pub total_queries: usize,
     /// Metrics at checkpoint time
     pub metrics: CheckpointMetrics,
-    /// Paths to saved models
-    pub router_path: PathBuf,
+    /// Path to saved generator model
     pub generator_path: PathBuf,
-    pub validator_path: PathBuf,
 }
 
 /// Metrics snapshot at checkpoint time
@@ -68,9 +66,7 @@ impl CheckpointManager {
     /// Create a checkpoint
     pub fn create_checkpoint(
         &self,
-        router: &RouterModel,
         generator: &GeneratorModel,
-        validator: &ValidatorModel,
         total_queries: usize,
         metrics: CheckpointMetrics,
     ) -> Result<Checkpoint> {
@@ -87,20 +83,11 @@ impl CheckpointManager {
             )
         })?;
 
-        // Save models
-        let router_path = checkpoint_subdir.join("router.safetensors");
+        // Save model
         let generator_path = checkpoint_subdir.join("generator.safetensors");
-        let validator_path = checkpoint_subdir.join("validator.safetensors");
-
-        router
-            .save(&router_path)
-            .context("Failed to save router model")?;
         generator
             .save(&generator_path)
             .context("Failed to save generator model")?;
-        validator
-            .save(&validator_path)
-            .context("Failed to save validator model")?;
 
         // Create checkpoint metadata
         let checkpoint = Checkpoint {
@@ -108,9 +95,7 @@ impl CheckpointManager {
             timestamp,
             total_queries,
             metrics: metrics.clone(),
-            router_path: router_path.clone(),
             generator_path: generator_path.clone(),
-            validator_path: validator_path.clone(),
         };
 
         // Save checkpoint metadata
@@ -192,10 +177,7 @@ impl CheckpointManager {
     }
 
     /// Restore from a checkpoint
-    pub fn restore_checkpoint(
-        &self,
-        checkpoint_id: &str,
-    ) -> Result<(RouterModel, GeneratorModel, ValidatorModel)> {
+    pub fn restore_checkpoint(&self, checkpoint_id: &str) -> Result<GeneratorModel> {
         // Find checkpoint
         let checkpoints = self.list_checkpoints()?;
         let checkpoint = checkpoints
@@ -203,13 +185,9 @@ impl CheckpointManager {
             .find(|c| c.id == checkpoint_id)
             .ok_or_else(|| anyhow::anyhow!("Checkpoint not found: {}", checkpoint_id))?;
 
-        // Load models
-        let router = RouterModel::load(&checkpoint.router_path)
-            .context("Failed to load router model from checkpoint")?;
+        // Load model
         let generator = GeneratorModel::load(&checkpoint.generator_path)
             .context("Failed to load generator model from checkpoint")?;
-        let validator = ValidatorModel::load(&checkpoint.validator_path)
-            .context("Failed to load validator model from checkpoint")?;
 
         tracing::info!(
             checkpoint_id = %checkpoint_id,
@@ -217,7 +195,7 @@ impl CheckpointManager {
             "Restored from checkpoint"
         );
 
-        Ok((router, generator, validator))
+        Ok(generator)
     }
 
     /// Delete a checkpoint
@@ -287,9 +265,7 @@ mod tests {
             timestamp: Utc::now(),
             total_queries: 1000,
             metrics,
-            router_path: PathBuf::from("/tmp/router.safetensors"),
             generator_path: PathBuf::from("/tmp/generator.safetensors"),
-            validator_path: PathBuf::from("/tmp/validator.safetensors"),
         };
 
         let json = serde_json::to_string(&checkpoint).unwrap();

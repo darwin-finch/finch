@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::models::{GeneratorModel, ModelConfig, RouterModel, ValidatorModel};
+use crate::models::{GeneratorModel, ModelConfig};
 
 /// Training example (query, response, metadata)
 #[derive(Debug, Clone)]
@@ -76,12 +76,8 @@ pub struct BatchTrainer {
     batch_size: usize,
     /// Learning rate
     learning_rate: f64,
-    /// Router model (shared, write access during training)
-    router: Arc<RwLock<RouterModel>>,
     /// Generator model (shared, write access during training)
     generator: Arc<RwLock<GeneratorModel>>,
-    /// Validator model (shared, write access during training)
-    validator: Arc<RwLock<ValidatorModel>>,
     /// Total examples trained on
     total_trained: Arc<Mutex<usize>>,
     /// Last training timestamp
@@ -91,19 +87,14 @@ pub struct BatchTrainer {
 impl BatchTrainer {
     /// Create new batch trainer
     pub fn new(batch_size: usize, learning_rate: f64, config: &ModelConfig) -> Result<Self> {
-        // Create models
-        let router = RouterModel::new(config)?;
         let generator_config = crate::models::GeneratorConfig::RandomInit(config.clone());
         let generator = GeneratorModel::new(generator_config)?;
-        let validator = ValidatorModel::new(config)?;
 
         Ok(Self {
             training_queue: Arc::new(Mutex::new(VecDeque::new())),
             batch_size,
             learning_rate,
-            router: Arc::new(RwLock::new(router)),
             generator: Arc::new(RwLock::new(generator)),
-            validator: Arc::new(RwLock::new(validator)),
             total_trained: Arc::new(Mutex::new(0)),
             last_training: Arc::new(Mutex::new(None)),
         })
@@ -144,9 +135,7 @@ impl BatchTrainer {
 
         // Clone Arc references for background task
         let training_queue = Arc::clone(&self.training_queue);
-        let router = Arc::clone(&self.router);
         let generator = Arc::clone(&self.generator);
-        let validator = Arc::clone(&self.validator);
         let total_trained = Arc::clone(&self.total_trained);
         let last_training = Arc::clone(&self.last_training);
         let batch_size = self.batch_size;
@@ -156,9 +145,7 @@ impl BatchTrainer {
         tokio::spawn(async move {
             match Self::train_batch_internal(
                 training_queue,
-                router,
                 generator,
-                validator,
                 total_trained,
                 last_training,
                 batch_size,
@@ -187,9 +174,7 @@ impl BatchTrainer {
     pub async fn train_now(&self) -> Result<TrainingResult> {
         Self::train_batch_internal(
             Arc::clone(&self.training_queue),
-            Arc::clone(&self.router),
             Arc::clone(&self.generator),
-            Arc::clone(&self.validator),
             Arc::clone(&self.total_trained),
             Arc::clone(&self.last_training),
             self.batch_size,
@@ -201,9 +186,7 @@ impl BatchTrainer {
     /// Internal training implementation
     async fn train_batch_internal(
         training_queue: Arc<Mutex<VecDeque<TrainingExample>>>,
-        _router: Arc<RwLock<RouterModel>>,
         _generator: Arc<RwLock<GeneratorModel>>,
-        _validator: Arc<RwLock<ValidatorModel>>,
         _total_trained: Arc<Mutex<usize>>,
         _last_training: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
         batch_size: usize,
@@ -252,17 +235,9 @@ impl BatchTrainer {
         }
     }
 
-    /// Get references to models (for saving/loading)
-    pub fn router(&self) -> Arc<RwLock<RouterModel>> {
-        Arc::clone(&self.router)
-    }
-
+    /// Get reference to generator model (for saving/loading)
     pub fn generator(&self) -> Arc<RwLock<GeneratorModel>> {
         Arc::clone(&self.generator)
-    }
-
-    pub fn validator(&self) -> Arc<RwLock<ValidatorModel>> {
-        Arc::clone(&self.validator)
     }
 }
 

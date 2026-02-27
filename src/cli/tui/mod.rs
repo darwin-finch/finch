@@ -518,7 +518,7 @@ impl TuiRenderer {
                     let text_vis = line.chars().count();
                     let total_vis = prefix_vis + text_vis;
                     let phys = if term_width > 0 {
-                        (total_vis.max(1) + term_width - 1) / term_width
+                        total_vis.max(1).div_ceil(term_width)
                     } else {
                         1
                     };

@@ -272,8 +272,7 @@ impl ClaudeProvider {
                                                                 // model's chain-of-thought never
                                                                 // leaks into the TUI output.
                                                                 if builder.block_type != "thinking"
-                                                                {
-                                                                    if tx
+                                                                    && tx
                                                                         .send(Ok(
                                                                             StreamChunk::TextDelta(
                                                                                 text,
@@ -281,11 +280,10 @@ impl ClaudeProvider {
                                                                         ))
                                                                         .await
                                                                         .is_err()
-                                                                    {
-                                                                        // Receiver dropped, stop streaming
-                                                                        done = true;
-                                                                        break;
-                                                                    }
+                                                                {
+                                                                    // Receiver dropped, stop streaming
+                                                                    done = true;
+                                                                    break;
                                                                 }
                                                             }
                                                         }
