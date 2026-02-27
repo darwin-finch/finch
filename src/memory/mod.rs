@@ -192,8 +192,9 @@ impl MemorySystem {
             tree.insert(content.to_string(), embedding)?
         };
 
-        // Persist immediately so it survives process exit
-        self.save_node_to_db(node_id).await?;
+        // Persist all nodes (root + ancestors + new leaf) so the DB stays
+        // consistent across process restarts and FK constraints are satisfied.
+        self.save_all_nodes_to_db().await?;
 
         tracing::debug!("Inserted conversation into memory: {} chars", content.len());
 
@@ -251,36 +252,51 @@ impl MemorySystem {
         })
     }
 
-    /// Persist a single MemTree node to the tree_nodes table.
-    async fn save_node_to_db(&self, node_id: NodeId) -> Result<()> {
-        let node = {
+    /// Persist all MemTree nodes to the tree_nodes table in a single transaction.
+    ///
+    /// Nodes are written sorted by node_id (root first) so that the self-referential
+    /// FK constraint `parent_id → node_id` is satisfied for each INSERT.
+    ///
+    /// This replaces the old `save_node_to_db(leaf_id)` approach which only persisted
+    /// the newly inserted leaf.  That missed two things:
+    ///   1. The root node (id=0) was never written, causing FK violations because
+    ///      libsqlite3-sys bundles SQLite compiled with SQLITE_DEFAULT_FOREIGN_KEYS=1.
+    ///   2. Parent embeddings updated by `update_parent_aggregation` were never
+    ///      persisted, so embeddings went stale across process restarts.
+    async fn save_all_nodes_to_db(&self) -> Result<()> {
+        let mut nodes: Vec<TreeNode> = {
             let tree = self.tree.lock().await;
-            tree.all_nodes().get(&node_id).cloned()
-        };
-        let node = match node {
-            Some(n) => n,
-            None => return Ok(()),
+            tree.all_nodes().values().cloned().collect()
         };
 
-        let embedding_bytes: Vec<u8> = node
-            .embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        // Sort by node_id ascending so root (id=0) is written before its children.
+        // SQLite enforces the self-referential FK immediately (IMMEDIATE mode),
+        // so parent rows must exist before child rows within the transaction.
+        nodes.sort_by_key(|n| n.id);
 
         let conn = self.db.lock().await;
-        conn.execute(
-            "INSERT OR REPLACE INTO tree_nodes (node_id, parent_id, text, embedding, level, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                node.id as i64,
-                node.parent.map(|p| p as i64),
-                &node.text,
-                &embedding_bytes,
-                node.level as i64,
-                node.created_at,
-            ],
-        )?;
+        let tx = conn.unchecked_transaction()?;
+        for node in &nodes {
+            let embedding_bytes: Vec<u8> = node
+                .embedding
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            tx.execute(
+                "INSERT OR REPLACE INTO tree_nodes
+                 (node_id, parent_id, text, embedding, level, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    node.id as i64,
+                    node.parent.map(|p| p as i64),
+                    &node.text,
+                    &embedding_bytes,
+                    node.level as i64,
+                    node.created_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
