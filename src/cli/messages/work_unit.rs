@@ -330,6 +330,12 @@ impl Message for WorkUnit {
                     format!("{}⏺{} {}{}", CYAN, RESET, inner.response_text, timing)
                 };
 
+                // Collapsed sub-rows: show what tools ran (label + summary + body lines)
+                for row in &inner.rows {
+                    out.push('\n');
+                    out.push_str(&format_row_collapsed(row));
+                }
+
                 out
             }
         }
@@ -382,6 +388,48 @@ fn format_row(row: &WorkRow) -> String {
                 )
             };
             // Render body lines (diff, bash output, grep matches, etc.) indented below
+            for line in &row.body_lines {
+                out.push('\n');
+                out.push_str(&format!("    {}", line));
+            }
+            out
+        }
+        WorkRowStatus::Error(err) => {
+            let timing = row
+                .elapsed_at_finish
+                .filter(|d| d.as_secs() >= 1)
+                .map(|d| format!(" {}({}){}", GRAY_DIM, fmt_elapsed(d.as_secs()), RESET))
+                .unwrap_or_default();
+            format!(
+                "  {}⎿{} {} {}❌ {}{}{}",
+                GRAY, RESET, row.label, RED_COLOR, err, RESET, timing
+            )
+        }
+    }
+}
+
+/// Compact one-line row for the collapsed (Complete) state.
+/// Same as `format_row` but skips body lines — keeps scrollback tidy.
+fn format_row_collapsed(row: &WorkRow) -> String {
+    match &row.status {
+        WorkRowStatus::Running => {
+            // Shouldn't happen in Complete state, but render gracefully.
+            format!("  {}⎿{} {}{}…{}", GRAY, RESET, row.label, GRAY_DIM, RESET)
+        }
+        WorkRowStatus::Complete(summary) => {
+            let timing = row
+                .elapsed_at_finish
+                .filter(|d| d.as_secs() >= 1)
+                .map(|d| format!(" {}({}){}", GRAY_DIM, fmt_elapsed(d.as_secs()), RESET))
+                .unwrap_or_default();
+            let mut out = if summary.is_empty() {
+                format!("  {}⎿{} {}{}", GRAY, RESET, row.label, timing)
+            } else {
+                format!(
+                    "  {}⎿{} {} {}{}{}{}",
+                    GRAY, RESET, row.label, GRAY_DIM, summary, RESET, timing
+                )
+            };
             for line in &row.body_lines {
                 out.push('\n');
                 out.push_str(&format!("    {}", line));
