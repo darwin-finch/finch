@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.17] - 2026-02-26
+
+### Changed
+- **Brain now queries memory before exploring the codebase**: when the user
+  starts typing, the brain pre-fetches the top-3 relevant memories and injects
+  them into its task message so it already knows past decisions, conventions,
+  and bug fixes before it reads a single file. Memory disabled → behaviour
+  unchanged (`None` passed; zero overhead).
+
 ## [0.7.16] - 2026-02-26
 
 ### Fixed
