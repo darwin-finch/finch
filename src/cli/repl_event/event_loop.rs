@@ -268,6 +268,21 @@ pub struct EventLoop {
 
     /// The command string for the pending brain action (shown in the dialog).
     pending_brain_action_command: Option<String>,
+
+    /// Known brain states from last poll (Uuid -> BrainState), for transition detection.
+    known_brain_states: std::collections::HashMap<Uuid, crate::server::BrainState>,
+
+    /// Brain UUID that the REPL is currently waiting for a question/plan from.
+    /// Set when a transition to WaitingForInput/PlanReady is detected.
+    pending_daemon_brain_id: Option<Uuid>,
+
+    /// Oneshot sender for daemon brain question dialog response.
+    pending_daemon_brain_question_tx: Option<tokio::sync::oneshot::Sender<String>>,
+    pending_daemon_brain_question_options: Vec<String>,
+
+    /// Whether the REPL is currently showing a plan dialog for a daemon brain.
+    pending_daemon_brain_plan: bool,
+    pending_daemon_brain_plan_id: Option<Uuid>,
 }
 
 /// View mode for the REPL
@@ -393,6 +408,12 @@ impl EventLoop {
             pending_brain_question_options: Vec::new(),
             pending_brain_action_tx: None,
             pending_brain_action_command: None,
+            known_brain_states: std::collections::HashMap::new(),
+            pending_daemon_brain_id: None,
+            pending_daemon_brain_question_tx: None,
+            pending_daemon_brain_question_options: Vec::new(),
+            pending_daemon_brain_plan: false,
+            pending_daemon_brain_plan_id: None,
         }
     }
 
@@ -510,6 +531,9 @@ impl EventLoop {
         // Cleanup interval (30 seconds)
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
 
+        // Brain poll interval (500ms) - polls daemon for active brain state transitions
+        let mut brain_poll_interval = tokio::time::interval(Duration::from_millis(500));
+
         // Flag to control the loop
         let mut should_exit = false;
 
@@ -620,6 +644,48 @@ impl EventLoop {
                                     tracing::debug!("[EVENT_LOOP] Brain action denied");
                                     let _ = action_tx.send(None);
                                 }
+                            } else if self.pending_daemon_brain_plan {
+                                // Daemon brain plan response
+                                self.pending_daemon_brain_plan = false;
+                                if let Some(brain_id) = self.pending_daemon_brain_plan_id.take() {
+                                    if let Some(ref client) = self.daemon_client {
+                                        let (action, feedback) = match &dialog_result {
+                                            crate::cli::tui::DialogResult::Selected(0) => ("approve", None),
+                                            crate::cli::tui::DialogResult::Selected(2) => ("reject", None),
+                                            crate::cli::tui::DialogResult::CustomText(s) => ("changes", Some(s.as_str())),
+                                            crate::cli::tui::DialogResult::TextEntered(s) => ("changes", Some(s.as_str())),
+                                            _ => ("reject", None),
+                                        };
+                                        let fb = feedback.map(str::to_string);
+                                        let client_clone = client.clone();
+                                        tokio::spawn(async move {
+                                            let _ = client_clone.respond_to_brain_plan(
+                                                brain_id,
+                                                action,
+                                                fb.as_deref(),
+                                            ).await;
+                                        });
+                                    }
+                                }
+                            } else if let Some(brain_id) = self.pending_daemon_brain_id.take() {
+                                // Daemon brain question response
+                                let opts = std::mem::take(&mut self.pending_daemon_brain_question_options);
+                                let answer = match &dialog_result {
+                                    crate::cli::tui::DialogResult::TextEntered(s) => s.clone(),
+                                    crate::cli::tui::DialogResult::CustomText(s) => s.clone(),
+                                    crate::cli::tui::DialogResult::Selected(idx) => opts
+                                        .get(*idx)
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("option_{}", idx)),
+                                    _ => "[no answer]".to_string(),
+                                };
+                                if let Some(ref client) = self.daemon_client {
+                                    let client_clone = client.clone();
+                                    tokio::spawn(async move {
+                                        let _ = client_clone.answer_brain_question(brain_id, &answer).await;
+                                    });
+                                }
+                                tracing::debug!("[EVENT_LOOP] Daemon brain question answered");
                             } else {
                                 // Find which query this dialog was for (tool approval)
                                 let mut approvals = self.pending_approvals.write().await;
@@ -673,6 +739,13 @@ impl EventLoop {
                 // Periodic cleanup
                 _ = cleanup_interval.tick() => {
                     self.cleanup_old_queries().await;
+                }
+
+                // Brain poll (500ms) — detect state transitions in daemon brains
+                _ = brain_poll_interval.tick() => {
+                    if let Err(e) = self.poll_daemon_brains().await {
+                        tracing::debug!("Brain poll error (non-fatal): {}", e);
+                    }
                 }
             }
         }
@@ -925,6 +998,15 @@ impl EventLoop {
                             }
                         }
                         self.render_tui().await?;
+                    }
+                    Command::Brain(task) => {
+                        self.handle_brain_spawn(task).await?;
+                    }
+                    Command::Brains => {
+                        self.handle_brains_list().await?;
+                    }
+                    Command::BrainCancel(name_or_id) => {
+                        self.handle_brain_cancel(name_or_id).await?;
                     }
                     _ => {
                         // All other commands output to scrollback via write_info
@@ -2912,6 +2994,301 @@ impl EventLoop {
 
         self.render_tui().await?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Daemon brain command handlers
+    // -------------------------------------------------------------------------
+
+    /// Handle `/brain <task>` — spawn a brain in the daemon.
+    async fn handle_brain_spawn(&mut self, task: String) -> Result<()> {
+        let Some(ref client) = self.daemon_client else {
+            self.output_manager
+                .write_info("⚠️  Daemon not connected — brain sessions require the daemon.");
+            return self.render_tui().await;
+        };
+
+        match client.spawn_brain(&task, None).await {
+            Ok(summary) => {
+                self.output_manager.write_info(format!(
+                    "🧠 Brain '{}' started (id: {})",
+                    summary.name, summary.id
+                ));
+                // Seed known state
+                self.known_brain_states.insert(summary.id, summary.state);
+                // Immediately update status bar
+                self.update_brain_status_bar().await;
+            }
+            Err(e) => {
+                self.output_manager
+                    .write_info(format!("⚠️  Failed to spawn brain: {}", e));
+            }
+        }
+
+        self.render_tui().await
+    }
+
+    /// Handle `/brains` — list active brains.
+    async fn handle_brains_list(&mut self) -> Result<()> {
+        let Some(ref client) = self.daemon_client else {
+            self.output_manager
+                .write_info("⚠️  Daemon not connected.");
+            return self.render_tui().await;
+        };
+
+        match client.list_brains().await {
+            Ok(brains) if brains.is_empty() => {
+                self.output_manager.write_info("No active brain sessions.");
+            }
+            Ok(brains) => {
+                let mut lines = vec!["Active brain sessions:".to_string()];
+                for b in &brains {
+                    let state_str = match b.state {
+                        crate::server::BrainState::Running => "running",
+                        crate::server::BrainState::WaitingForInput => "waiting for input",
+                        crate::server::BrainState::PlanReady => "plan ready",
+                        crate::server::BrainState::Dead => "dead",
+                    };
+                    lines.push(format!(
+                        "  {:30}  {}  {}s",
+                        b.name, state_str, b.age_secs
+                    ));
+                }
+                self.output_manager.write_info(lines.join("\n"));
+            }
+            Err(e) => {
+                self.output_manager
+                    .write_info(format!("⚠️  Failed to list brains: {}", e));
+            }
+        }
+
+        self.render_tui().await
+    }
+
+    /// Handle `/brain cancel <name-or-id>`.
+    async fn handle_brain_cancel(&mut self, name_or_id: String) -> Result<()> {
+        let Some(ref client) = self.daemon_client else {
+            self.output_manager
+                .write_info("⚠️  Daemon not connected.");
+            return self.render_tui().await;
+        };
+
+        // Try to parse as UUID first; fall back to name lookup via list
+        let id = if let Ok(id) = name_or_id.parse::<uuid::Uuid>() {
+            id
+        } else {
+            // Find by name
+            match client.list_brains().await {
+                Ok(brains) => {
+                    match brains.iter().find(|b| b.name == name_or_id) {
+                        Some(b) => b.id,
+                        None => {
+                            self.output_manager.write_info(format!(
+                                "⚠️  No brain named '{}'.",
+                                name_or_id
+                            ));
+                            return self.render_tui().await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.output_manager
+                        .write_info(format!("⚠️  Failed to list brains: {}", e));
+                    return self.render_tui().await;
+                }
+            }
+        };
+
+        match client.cancel_brain(id).await {
+            Ok(()) => {
+                self.known_brain_states.remove(&id);
+                self.output_manager
+                    .write_info(format!("🧠 Brain {} cancelled.", id));
+                self.update_brain_status_bar().await;
+            }
+            Err(e) => {
+                self.output_manager
+                    .write_info(format!("⚠️  Failed to cancel brain: {}", e));
+            }
+        }
+
+        self.render_tui().await
+    }
+
+    // -------------------------------------------------------------------------
+    // Brain polling
+    // -------------------------------------------------------------------------
+
+    /// Poll daemon for active brain state transitions (called every 500ms).
+    async fn poll_daemon_brains(&mut self) -> Result<()> {
+        // Clone the client Arc so we don't hold a borrow on self during async calls.
+        let client = match &self.daemon_client {
+            Some(c) => Arc::clone(c),
+            None => return Ok(()),
+        };
+
+        let brains = match client.list_brains().await {
+            Ok(b) => b,
+            Err(_) => return Ok(()), // daemon not reachable — non-fatal
+        };
+
+        // Update status bar brain count
+        let active_count = brains.len();
+        if active_count > 0 {
+            let plural = if active_count == 1 { "brain" } else { "brains" };
+            self.status_bar.update_line(
+                crate::cli::status_bar::StatusLineType::Custom("brains".to_string()),
+                format!("🧠 {} {}", active_count, plural),
+            );
+        } else {
+            self.status_bar
+                .remove_line(&crate::cli::status_bar::StatusLineType::Custom("brains".to_string()));
+            self.known_brain_states.clear();
+            return Ok(());
+        }
+
+        // Remove state entries for brains that no longer exist
+        let live_ids: std::collections::HashSet<Uuid> = brains.iter().map(|b| b.id).collect();
+        self.known_brain_states.retain(|id, _| live_ids.contains(id));
+
+        // Collect transitions we need to act on (avoids re-borrowing self in loop body)
+        struct Transition {
+            id: Uuid,
+            name: String,
+            state: crate::server::BrainState,
+        }
+        let mut transitions: Vec<Transition> = Vec::new();
+
+        for summary in &brains {
+            let prev = self.known_brain_states.get(&summary.id).cloned();
+            let new_state = summary.state.clone();
+
+            // Update known state
+            self.known_brain_states.insert(summary.id, new_state.clone());
+
+            // Detect transitions to WaitingForInput or PlanReady
+            let transitioned = prev.map(|p| p != new_state).unwrap_or(false);
+            if transitioned {
+                transitions.push(Transition {
+                    id: summary.id,
+                    name: summary.name.clone(),
+                    state: new_state,
+                });
+            }
+        }
+
+        // Handle transitions
+        for t in transitions {
+            match &t.state {
+                crate::server::BrainState::WaitingForInput => {
+                    if let Ok(detail) = client.get_brain(t.id).await {
+                        if let Some(q) = detail.pending_question {
+                            self.show_daemon_brain_question(t.id, &t.name, q).await?;
+                        }
+                    }
+                }
+                crate::server::BrainState::PlanReady => {
+                    if let Ok(detail) = client.get_brain(t.id).await {
+                        if let Some(p) = detail.pending_plan {
+                            self.show_daemon_brain_plan(t.id, &t.name, p).await?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update status bar brain count from cached state.
+    async fn update_brain_status_bar(&self) {
+        let n = self.known_brain_states.len();
+        if n > 0 {
+            let plural = if n == 1 { "brain" } else { "brains" };
+            self.status_bar.update_line(
+                crate::cli::status_bar::StatusLineType::Custom("brains".to_string()),
+                format!("🧠 {} {}", n, plural),
+            );
+        } else {
+            self.status_bar
+                .remove_line(&crate::cli::status_bar::StatusLineType::Custom("brains".to_string()));
+        }
+    }
+
+    /// Show a dialog for a daemon brain question.
+    async fn show_daemon_brain_question(
+        &mut self,
+        brain_id: Uuid,
+        brain_name: &str,
+        q: crate::server::brain_registry::PendingQuestionView,
+    ) -> Result<()> {
+        use crate::cli::tui::{Dialog, DialogOption};
+
+        let title = format!("Brain \"{}\" asks:\n{}", brain_name, q.question);
+
+        let dialog = if q.options.is_empty() {
+            Dialog::text_input(title, None)
+        } else {
+            let opts: Vec<DialogOption> = q.options.iter().map(|o| DialogOption::new(o)).collect();
+            Dialog::select_with_custom(title, opts)
+        };
+
+        // Store context for when dialog result arrives
+        self.pending_daemon_brain_id = Some(brain_id);
+        self.pending_daemon_brain_question_options = q.options;
+
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = Some(dialog);
+            tui.pending_dialog_result = None;
+        }
+
+        // Write question to scrollback
+        self.output_manager.write_info(format!(
+            "🧠 Brain '{}' asks: {}",
+            brain_name, q.question
+        ));
+        self.render_tui().await
+    }
+
+    /// Show a plan approval dialog for a daemon brain.
+    async fn show_daemon_brain_plan(
+        &mut self,
+        brain_id: Uuid,
+        brain_name: &str,
+        p: crate::server::brain_registry::PendingPlanView,
+    ) -> Result<()> {
+        use crate::cli::tui::{Dialog, DialogOption};
+
+        let opts = vec![
+            DialogOption::new("Approve"),
+            DialogOption::new("Request changes"),
+            DialogOption::new("Reject"),
+        ];
+        let mut dialog = Dialog::select(
+            format!("Brain \"{}\" plan:", brain_name),
+            opts,
+        );
+        // Show plan content in the dialog body
+        dialog.body = Some(p.plan.clone());
+
+        self.pending_daemon_brain_id = Some(brain_id);
+        self.pending_daemon_brain_plan = true;
+        self.pending_daemon_brain_plan_id = Some(brain_id);
+
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = Some(dialog);
+            tui.pending_dialog_result = None;
+        }
+
+        // Write plan to scrollback
+        self.output_manager.write_info(format!(
+            "🧠 Brain '{}' plan:\n{}",
+            brain_name, p.plan
+        ));
+        self.render_tui().await
     }
 }
 

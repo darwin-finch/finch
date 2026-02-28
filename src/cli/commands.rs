@@ -54,6 +54,10 @@ pub enum Command {
     LicenseStatus,           // /license or /license status
     LicenseActivate(String), // /license activate <key>
     LicenseRemove,           // /license remove
+    // Daemon brain sessions
+    Brain(String),       // /brain <task>  — spawn background research brain
+    Brains,              // /brains        — list active brain sessions
+    BrainCancel(String), // /brain cancel <name-or-id>
 }
 
 impl Command {
@@ -86,6 +90,8 @@ impl Command {
             // License management
             "/license" | "/license status" => return Some(Command::LicenseStatus),
             "/license remove" => return Some(Command::LicenseRemove),
+            // Brain sessions
+            "/brains" | "/brains list" => return Some(Command::Brains),
             _ => {}
         }
 
@@ -94,6 +100,22 @@ impl Command {
             let key = rest.trim();
             if !key.is_empty() {
                 return Some(Command::LicenseActivate(key.to_string()));
+            }
+        }
+
+        // Handle /brain cancel <name-or-id>
+        if let Some(rest) = trimmed.strip_prefix("/brain cancel ") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Some(Command::BrainCancel(name.to_string()));
+            }
+        }
+
+        // Handle /brain <task>  (must come after /brain cancel)
+        if let Some(rest) = trimmed.strip_prefix("/brain ") {
+            let task = rest.trim();
+            if !task.is_empty() {
+                return Some(Command::Brain(task.to_string()));
             }
         }
 
@@ -323,6 +345,10 @@ pub fn handle_command(
         Command::LicenseStatus | Command::LicenseActivate(_) | Command::LicenseRemove => Ok(
             CommandOutput::Status("License commands should be handled in REPL.".to_string()),
         ),
+        // Brain commands are handled directly in REPL
+        Command::Brain(_) | Command::Brains | Command::BrainCancel(_) => Ok(
+            CommandOutput::Status("Brain commands should be handled in REPL.".to_string()),
+        ),
     }
 }
 
@@ -415,6 +441,14 @@ pub fn format_help() -> String {
          \x1b[32m  • Remember pattern\x1b[0m         Always allow (saves to /patterns)\n\
          \x1b[31m  • Deny\x1b[0m                     Reject the action\n\n\
          Available tools: Read, Glob, Grep, WebFetch, Bash, Restart\n\n\
+         \x1b[1;33m🧠 Daemon Brain Sessions:\x1b[0m\n\
+         \x1b[36m  /brain <task>\x1b[0m      Spawn a background research brain\n\
+         \x1b[90m                     Example: /brain investigate why auth tests are flaky\x1b[0m\n\
+         \x1b[36m  /brains\x1b[0m            List active brain sessions\n\
+         \x1b[36m  /brain cancel <n>\x1b[0m  Cancel a brain by name or id\n\
+         \x1b[0m\n\
+         \x1b[90m  Brains run in the daemon and survive REPL disconnects.\x1b[0m\n\
+         \x1b[90m  When a brain has a question or plan, a dialog appears in the REPL.\x1b[0m\n\n\
          \x1b[1;33m📚 Learn More:\x1b[0m\n\
          \x1b[36m  GitHub:\x1b[0m   https://github.com/schancel/finch\n\
          \x1b[36m  Issues:\x1b[0m   https://github.com/schancel/finch/issues\n\

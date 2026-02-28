@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use super::AgentServer;
 use crate::claude::{ContentBlock, Message};
@@ -39,6 +40,11 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         // Node identity and work stats (distributed worker network)
         .route("/v1/node/info", get(handle_node_info))
         .route("/v1/node/stats", get(handle_node_stats))
+        // Brain sessions
+        .route("/v1/brains", post(spawn_brain).get(list_brains))
+        .route("/v1/brains/:id", get(get_brain).delete(cancel_brain))
+        .route("/v1/brains/:id/answer", post(answer_brain_question))
+        .route("/v1/brains/:id/plan", post(respond_to_brain_plan))
         // Note: node handlers load config independently (no AgentServer state needed)
         // Health and metrics
         .route("/health", get(health_check))
@@ -46,6 +52,145 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .with_state(server)
         // Merge feedback router
         .merge(feedback_router)
+}
+
+// ---------------------------------------------------------------------------
+// Brain route handlers
+// ---------------------------------------------------------------------------
+
+/// POST /v1/brains — spawn a new brain session
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // `name` is reserved for future named-brain support
+struct SpawnBrainRequest {
+    task: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn spawn_brain(
+    State(server): State<Arc<AgentServer>>,
+    Json(req): Json<SpawnBrainRequest>,
+) -> Result<Json<crate::server::brain_registry::BrainSummary>, AppError> {
+    use crate::brain::daemon_brain::run_daemon_brain_loop;
+
+    let id = uuid::Uuid::new_v4();
+    let registry = Arc::clone(server.brain_registry());
+
+    // Choose a provider (first available)
+    let provider = server
+        .provider_for_name(None)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("No provider configured for daemon brains"))?;
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~".to_string());
+
+    let name = registry.insert(id, req.task.clone()).await;
+    let _ = name; // name embedded in registry
+
+    let registry_clone = Arc::clone(&registry);
+    let task_clone = req.task.clone();
+    let cwd_clone = cwd.clone();
+
+    tokio::spawn(async move {
+        run_daemon_brain_loop(id, task_clone, registry_clone, provider, cwd_clone).await;
+    });
+
+    let brains = registry.get_detail(id).await;
+    let summary = brains
+        .map(|d| crate::server::brain_registry::BrainSummary {
+            id: d.id,
+            name: d.name,
+            task: d.task,
+            state: d.state,
+            age_secs: d.age_secs,
+        })
+        .ok_or_else(|| anyhow::anyhow!("Brain not found after spawn"))?;
+
+    Ok(Json(summary))
+}
+
+/// GET /v1/brains — list active brains
+async fn list_brains(
+    State(server): State<Arc<AgentServer>>,
+) -> Result<Json<Vec<crate::server::brain_registry::BrainSummary>>, AppError> {
+    let list = server.brain_registry().list_active().await;
+    Ok(Json(list))
+}
+
+/// GET /v1/brains/:id — full brain detail
+async fn get_brain(
+    State(server): State<Arc<AgentServer>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<crate::server::brain_registry::BrainDetail>, AppError> {
+    let detail = server
+        .brain_registry()
+        .get_detail(id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Brain {} not found", id))?;
+    Ok(Json(detail))
+}
+
+/// DELETE /v1/brains/:id — cancel a brain
+async fn cancel_brain(
+    State(server): State<Arc<AgentServer>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    if server.brain_registry().cancel(id).await {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError(anyhow::anyhow!("Brain {} not found", id)))
+    }
+}
+
+/// POST /v1/brains/:id/answer — answer a pending question
+#[derive(Debug, Deserialize)]
+struct AnswerRequest {
+    answer: String,
+}
+
+async fn answer_brain_question(
+    State(server): State<Arc<AgentServer>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<AnswerRequest>,
+) -> Result<StatusCode, AppError> {
+    server
+        .brain_registry()
+        .answer_question(id, req.answer)
+        .await?;
+    Ok(StatusCode::OK)
+}
+
+/// POST /v1/brains/:id/plan — respond to a pending plan
+#[derive(Debug, Deserialize)]
+struct PlanResponseRequest {
+    action: String,
+    #[serde(default)]
+    feedback: Option<String>,
+}
+
+async fn respond_to_brain_plan(
+    State(server): State<Arc<AgentServer>>,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PlanResponseRequest>,
+) -> Result<StatusCode, AppError> {
+    use crate::server::brain_registry::PlanResponse;
+
+    let response = match req.action.as_str() {
+        "approve" => PlanResponse::Approve,
+        "reject" => PlanResponse::Reject,
+        "changes" | "changes_requested" => PlanResponse::ChangesRequested {
+            feedback: req.feedback.unwrap_or_default(),
+        },
+        other => return Err(AppError(anyhow::anyhow!("Unknown plan action: {}", other))),
+    };
+
+    server
+        .brain_registry()
+        .respond_to_plan(id, response)
+        .await?;
+    Ok(StatusCode::OK)
 }
 
 /// Request body for /v1/messages endpoint (Claude-compatible)

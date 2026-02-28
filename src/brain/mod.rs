@@ -10,6 +10,7 @@
 
 mod action;
 mod ask_user;
+pub mod daemon_brain;
 pub use action::{execute_brain_command, BrainActionTool};
 pub use ask_user::AskUserBrainTool;
 

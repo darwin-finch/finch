@@ -895,6 +895,109 @@ impl DaemonClient {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Brain session methods
+    // -------------------------------------------------------------------------
+
+    /// Spawn a new daemon brain session.
+    pub async fn spawn_brain(
+        &self,
+        task: &str,
+        _name: Option<&str>,
+    ) -> Result<crate::server::brain_registry::BrainSummary> {
+        let url = format!("{}/v1/brains", self.base_url);
+        let body = serde_json::json!({ "task": task });
+        let response: crate::server::brain_registry::BrainSummary = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to spawn brain")?
+            .json()
+            .await
+            .context("Failed to parse spawn brain response")?;
+        Ok(response)
+    }
+
+    /// List active brain sessions.
+    pub async fn list_brains(&self) -> Result<Vec<crate::server::brain_registry::BrainSummary>> {
+        let url = format!("{}/v1/brains", self.base_url);
+        let response: Vec<crate::server::brain_registry::BrainSummary> = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to list brains")?
+            .json()
+            .await
+            .context("Failed to parse brain list")?;
+        Ok(response)
+    }
+
+    /// Get full detail for a brain session.
+    pub async fn get_brain(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<crate::server::brain_registry::BrainDetail> {
+        let url = format!("{}/v1/brains/{}", self.base_url, id);
+        let response: crate::server::brain_registry::BrainDetail = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to get brain")?
+            .json()
+            .await
+            .context("Failed to parse brain detail")?;
+        Ok(response)
+    }
+
+    /// Answer a pending question in a brain session.
+    pub async fn answer_brain_question(&self, id: uuid::Uuid, answer: &str) -> Result<()> {
+        let url = format!("{}/v1/brains/{}/answer", self.base_url, id);
+        let body = serde_json::json!({ "answer": answer });
+        self.client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to answer brain question")?;
+        Ok(())
+    }
+
+    /// Respond to a pending plan in a brain session.
+    pub async fn respond_to_brain_plan(
+        &self,
+        id: uuid::Uuid,
+        action: &str,
+        feedback: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}/v1/brains/{}/plan", self.base_url, id);
+        let mut body = serde_json::json!({ "action": action });
+        if let Some(fb) = feedback {
+            body["feedback"] = serde_json::Value::String(fb.to_string());
+        }
+        self.client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to respond to brain plan")?;
+        Ok(())
+    }
+
+    /// Cancel a brain session.
+    pub async fn cancel_brain(&self, id: uuid::Uuid) -> Result<()> {
+        let url = format!("{}/v1/brains/{}", self.base_url, id);
+        self.client
+            .delete(&url)
+            .send()
+            .await
+            .context("Failed to cancel brain")?;
+        Ok(())
+    }
+
     /// Query local model only with automatic crash recovery
     ///
     /// Same as query_local_only but with automatic daemon restart on connection failure.
