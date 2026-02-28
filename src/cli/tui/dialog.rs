@@ -79,6 +79,9 @@ pub struct Dialog {
     pub title: String,
     pub dialog_type: DialogType,
     pub help_message: Option<String>,
+    /// Optional body text shown inside the box, above the options divider.
+    /// Used to display a plan preview so the user can read it without scrolling.
+    pub body: Option<String>,
     pub custom_input: Option<String>, // Stores custom text if "Other" is being entered
     pub custom_mode_active: bool,     // Whether user is currently typing custom text
     pub custom_cursor_pos: usize,     // Char-index cursor in custom_input
@@ -95,6 +98,7 @@ impl Dialog {
                 allow_custom: false,
             },
             help_message: None,
+            body: None,
             custom_input: None,
             custom_mode_active: false,
             custom_cursor_pos: 0,
@@ -111,6 +115,7 @@ impl Dialog {
                 allow_custom: true,
             },
             help_message: None,
+            body: None,
             custom_input: Some(String::new()),
             custom_mode_active: false,
             custom_cursor_pos: 0,
@@ -128,6 +133,7 @@ impl Dialog {
                 allow_custom: false,
             },
             help_message: None,
+            body: None,
             custom_input: None,
             custom_mode_active: false,
             custom_cursor_pos: 0,
@@ -145,6 +151,7 @@ impl Dialog {
                 allow_custom: true,
             },
             help_message: None,
+            body: None,
             custom_input: Some(String::new()),
             custom_mode_active: false,
             custom_cursor_pos: 0,
@@ -163,6 +170,7 @@ impl Dialog {
                 default,
             },
             help_message: None,
+            body: None,
             custom_input: None,
             custom_mode_active: false,
             custom_cursor_pos: 0,
@@ -180,6 +188,7 @@ impl Dialog {
                 selected: default,
             },
             help_message: None,
+            body: None,
             custom_input: None,
             custom_mode_active: false,
             custom_cursor_pos: 0,
@@ -189,6 +198,13 @@ impl Dialog {
     /// Set the help message for this dialog
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help_message = Some(help.into());
+        self
+    }
+
+    /// Set optional body text shown inside the box above the options.
+    /// Useful for displaying a plan or other content the user needs to read before deciding.
+    pub fn with_body(mut self, body: impl Into<String>) -> Self {
+        self.body = Some(body.into());
         self
     }
 

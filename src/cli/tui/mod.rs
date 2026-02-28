@@ -1042,6 +1042,27 @@ impl TuiRenderer {
             rows += 1;
         }
 
+        // Body text (optional, shown above the options divider)
+        if let Some(ref body) = dialog.body {
+            execute!(stdout, Print(format!("{}\r\n", div)))?;
+            rows += 1;
+            for line in body.lines() {
+                for wrapped in wrap_text(line, inner) {
+                    execute!(
+                        stdout,
+                        Print(format!(
+                            "│  {}{:<w$}{}  │\r\n",
+                            DIM_GRAY,
+                            wrapped,
+                            RESET,
+                            w = inner
+                        ))
+                    )?;
+                    rows += 1;
+                }
+            }
+        }
+
         execute!(stdout, Print(format!("{}\r\n", div)))?;
         rows += 1;
 
