@@ -27,6 +27,7 @@ use crate::tools::types::{ToolDefinition, ToolUse};
 
 use super::events::ReplEvent;
 use super::query_state::{QueryState, QueryStateManager};
+use tokio_util::sync::CancellationToken;
 use super::tool_display::format_tool_label;
 use super::tool_execution::ToolExecutionCoordinator;
 
@@ -1650,6 +1651,11 @@ impl EventLoop {
                                 Arc::clone(&tui_renderer),
                                 Arc::clone(&mode),
                                 Arc::clone(&output_manager),
+                                query_states
+                                    .get_metadata(query_id)
+                                    .await
+                                    .map(|m| m.cancellation_token)
+                                    .unwrap_or_else(CancellationToken::new),
                             )
                             .await
                             {
@@ -1892,6 +1898,11 @@ impl EventLoop {
                             Arc::clone(&tui_renderer),
                             Arc::clone(&mode),
                             Arc::clone(&output_manager),
+                            query_states
+                                .get_metadata(query_id)
+                                .await
+                                .map(|m| m.cancellation_token)
+                                .unwrap_or_else(CancellationToken::new),
                         )
                         .await
                         {
@@ -2143,15 +2154,9 @@ impl EventLoop {
                 };
 
                 if let Some(qid) = query_id {
-                    // Update query state to cancelled
-                    self.query_states
-                        .update_state(
-                            qid,
-                            QueryState::Failed {
-                                error: "Cancelled by user".to_string(),
-                            },
-                        )
-                        .await;
+                    // Fire the per-query cancellation token so handle_present_plan
+                    // (and any other token-aware loops) can detect the cancel immediately.
+                    self.query_states.cancel_query(qid).await;
 
                     // Clear active query
                     *self.active_query_id.write().await = None;
@@ -2918,6 +2923,7 @@ async fn handle_present_plan(
     tui_renderer: Arc<tokio::sync::Mutex<TuiRenderer>>,
     mode: Arc<tokio::sync::RwLock<crate::cli::ReplMode>>,
     output_manager: Arc<crate::cli::OutputManager>,
+    cancel: CancellationToken,
 ) -> Option<Result<String>> {
     use chrono::Utc;
     use crossterm::style::Stylize;
@@ -3033,8 +3039,17 @@ async fn handle_present_plan(
 
     let dialog_result: crate::cli::tui::DialogResult = loop {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Ctrl+C → CancelQuery → cancellation_token.cancel() path.
+        // Check before acquiring the mutex to avoid contention.
+        if cancel.is_cancelled() {
+            let mut tui = tui_renderer.lock().await;
+            tui.active_dialog = None;
+            break crate::cli::tui::DialogResult::Cancelled;
+        }
+
         let mut tui = tui_renderer.lock().await;
-        // Ctrl+C while dialog is open → cancel (set by spawn_input_task)
+        // Legacy path: pending_cancellation set directly (race with render tick).
         if tui.pending_cancellation {
             tui.pending_cancellation = false;
             tui.active_dialog = None;

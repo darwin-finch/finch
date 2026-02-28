@@ -1044,22 +1044,53 @@ impl TuiRenderer {
 
         // Body text (optional, shown above the options divider)
         if let Some(ref body) = dialog.body {
+            let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
+            // Reserve ~12 rows for title, help, both dividers, options, and bottom border.
+            let max_body_rows = term_h.saturating_sub(12).clamp(3, 15);
+
             execute!(stdout, Print(format!("{}\r\n", div)))?;
             rows += 1;
+
+            // Collect all wrapped lines first so we know whether to truncate.
+            let mut all_body_lines: Vec<String> = Vec::new();
             for line in body.lines() {
                 for wrapped in wrap_text(line, inner) {
-                    execute!(
-                        stdout,
-                        Print(format!(
-                            "│  {}{:<w$}{}  │\r\n",
-                            DIM_GRAY,
-                            wrapped,
-                            RESET,
-                            w = inner
-                        ))
-                    )?;
-                    rows += 1;
+                    // Hard-truncate any single word longer than inner (e.g. long URLs).
+                    let truncated: String = wrapped.chars().take(inner).collect();
+                    all_body_lines.push(truncated);
                 }
+            }
+
+            let truncated = all_body_lines.len() > max_body_rows;
+            let show_count = if truncated {
+                max_body_rows.saturating_sub(1)
+            } else {
+                all_body_lines.len()
+            };
+
+            for line in &all_body_lines[..show_count] {
+                let pad = " ".repeat(inner.saturating_sub(line.chars().count()));
+                execute!(
+                    stdout,
+                    Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, line, pad, RESET))
+                )?;
+                rows += 1;
+            }
+
+            if truncated {
+                let remaining = all_body_lines.len() - show_count;
+                let notice =
+                    format!("… ({} more lines — ↑ scroll up for full plan)", remaining);
+                let notice_short: String = notice.chars().take(inner).collect();
+                let pad = " ".repeat(inner.saturating_sub(notice_short.chars().count()));
+                execute!(
+                    stdout,
+                    Print(format!(
+                        "│  {}{}{}{}  │\r\n",
+                        DIM_GRAY, notice_short, pad, RESET
+                    ))
+                )?;
+                rows += 1;
             }
         }
 
