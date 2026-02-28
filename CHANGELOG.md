@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.21] - 2026-02-28
+
+### Fixed
+- **Ctrl+C now exits cleanly after streaming responses**: `active_query_id` was
+  never cleared at the end of the streaming path, so pressing Ctrl+C when idle
+  showed "Query cancelled" instead of quitting. Streaming path now sends
+  `StreamingComplete` before returning; the event loop clears the active query
+  ID as it does for non-streaming responses. A duplicate-message guard was also
+  added to the `StreamingComplete` handler so conversation history stays clean.
+- **Plan dialog shows the plan**: when `PresentPlan` was called the plan content
+  went to scrollback and then the approval dialog appeared — the user had to
+  scroll up to read what they were approving. The dialog now includes the full
+  plan text (up to 30 lines, with a "scroll up for more" note if longer) inside
+  the box, visible alongside the Approve / Request changes / Reject options.
+
 ## [0.7.20] - 2026-02-27
 
 ### Changed
