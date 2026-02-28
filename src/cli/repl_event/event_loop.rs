@@ -1764,6 +1764,12 @@ impl EventLoop {
                         )
                         .await;
 
+                    // Signal the event loop to clear active_query_id (streaming path never sends this otherwise)
+                    let _ = event_tx.send(ReplEvent::StreamingComplete {
+                        query_id,
+                        full_response: text.clone(),
+                    });
+
                     tracing::debug!("[EVENT_LOOP] Query complete, returning");
                     return;
                 }
@@ -2058,19 +2064,24 @@ impl EventLoop {
                 full_response,
             } => {
                 tracing::debug!(
-                    "[EVENT_LOOP] Handling StreamingComplete event (non-streaming path)"
+                    "[EVENT_LOOP] Handling StreamingComplete event"
                 );
 
                 // Check if this query is executing tools
                 // If so, the assistant message was already added with ToolUse blocks
+                let state = self
+                    .query_states
+                    .get_metadata(query_id)
+                    .await
+                    .map(|m| m.state.clone());
                 let is_executing_tools =
-                    if let Some(metadata) = self.query_states.get_metadata(query_id).await {
-                        matches!(metadata.state, QueryState::ExecutingTools { .. })
-                    } else {
-                        false
-                    };
+                    matches!(state, Some(QueryState::ExecutingTools { .. }));
+                // The streaming path adds the assistant message and sets Completed before
+                // sending StreamingComplete. The non-streaming path does not — it relies on
+                // this handler to do both. Detect which case we are in.
+                let already_completed = matches!(state, Some(QueryState::Completed { .. }));
 
-                if !is_executing_tools {
+                if !is_executing_tools && !already_completed {
                     tracing::debug!(
                         "[EVENT_LOOP] No tools, adding assistant message to conversation"
                     );
@@ -2092,7 +2103,7 @@ impl EventLoop {
                         .await;
                     tracing::debug!("[EVENT_LOOP] Updated query state");
                 } else {
-                    tracing::debug!("[EVENT_LOOP] Tools executing, skipping duplicate message");
+                    tracing::debug!("[EVENT_LOOP] Skipping duplicate message (tools={is_executing_tools}, already_completed={already_completed})");
                 }
 
                 // Update context usage indicator now that the message is committed

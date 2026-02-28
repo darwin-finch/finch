@@ -483,9 +483,6 @@ impl Repl {
                 Ok(renderer) => {
                     output_status!("✓ TUI mode enabled (Ratatui)");
 
-                    // Enable buffering for TUI mode (fixes output regression)
-                    output_manager.enable_buffering();
-
                     // Set global TUI renderer for Menu dialogs (Phase 5)
                     use crate::cli::global_output::set_global_tui_renderer;
                     set_global_tui_renderer(renderer);
