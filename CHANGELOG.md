@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.23] - 2026-02-28
+
+### Added
+- **Daemon brain sessions**: `/brain <task>` spawns a named background research
+  agent in the daemon that investigates tasks autonomously using read/glob/grep
+  tools, survives REPL disconnects, and surfaces questions and plans as dialogs.
+  `/brains` lists active sessions; `/brain cancel <name>` cancels one. The
+  status bar shows `🧠 N brains` while sessions are running. Brains are backed
+  by HTTP routes on the daemon (`POST /v1/brains`, `GET /v1/brains`,
+  `GET/DELETE /v1/brains/:id`, `POST /v1/brains/:id/answer`,
+  `POST /v1/brains/:id/plan`) and polled every 500 ms from the REPL.
+
 ## [0.7.22] - 2026-02-28
 
 ### Fixed
