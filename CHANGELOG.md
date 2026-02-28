@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.22] - 2026-02-28
+
+### Fixed
+- **Plan dialog body no longer overflows the terminal**: a plan longer than
+  ~12 lines made the dialog taller than the screen, corrupting the cursor
+  position and permanently locking up the display. The body section is now
+  capped at `min(15, terminal_height − 12)` rows; if the plan is longer a
+  truncation notice (`… (N more lines — ↑ scroll up for full plan)`) is
+  appended. Each line is also hard-truncated at the inner box width so long
+  tokens (URLs, code identifiers) cannot bleed past the border.
+- **Ctrl+C now exits the plan-approval dialog**: pressing Ctrl+C while the
+  `PresentPlan` approval dialog was showing had no effect — the render tick
+  was clearing `pending_cancellation` before the poll loop could see it,
+  leaving the user trapped. `CancelQuery` now fires the per-query
+  `CancellationToken` via `cancel_query()`; `handle_present_plan` receives
+  that token and checks `cancel.is_cancelled()` at the top of each 50 ms
+  poll iteration before acquiring the TUI mutex, so cancellation is detected
+  reliably.
+
 ## [0.7.21] - 2026-02-28
 
 ### Fixed
