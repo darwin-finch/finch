@@ -119,7 +119,7 @@ fn test_tool_display_uses_correct_unicode() {
 /// test confirming the public export is stable.
 #[test]
 fn test_format_token_count_public_api() {
-    use finch::cli::repl_event::event_loop::format_token_count;
+    use finch::cli::repl_event::tool_display::format_token_count;
 
     // Below 1000 → plain decimal
     assert_eq!(format_token_count(0), "0");
@@ -137,7 +137,7 @@ fn test_format_token_count_public_api() {
 /// The status-bar "↑ input" format is correctly assembled from format_token_count.
 #[test]
 fn test_input_token_status_bar_format() {
-    use finch::cli::repl_event::event_loop::format_token_count;
+    use finch::cli::repl_event::tool_display::format_token_count;
 
     let input_tokens: u32 = 1250;
     let output_tokens: usize = 300;
