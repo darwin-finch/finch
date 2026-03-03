@@ -252,4 +252,31 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().contains("No matches"));
     }
+
+    /// Regression: grep with path "." must not return results from ./target/.
+    ///
+    /// The original bug: searching for `#[cfg(test)]` in "." would flood results
+    /// with matches from compiled HTML docs in ./target/doc/, hitting the 100-match
+    /// cap before reaching any source files — causing the model to loop forever.
+    #[tokio::test]
+    async fn test_grep_excludes_target_directory() {
+        // Search for something that definitely exists in target/ (e.g. the word "test"
+        // which appears in every Rust HTML doc) but also in src/.  The result must
+        // NOT contain any path starting with "./target/" or "target/".
+        let result = GrepTool
+            .execute(
+                serde_json::json!({"pattern": "cfg.*test", "path": "."}),
+                &ctx(),
+            )
+            .await;
+        assert!(result.is_ok());
+        let out = result.unwrap();
+        // No line in the output should reference target/
+        for line in out.lines() {
+            assert!(
+                !line.starts_with("./target/") && !line.starts_with("target/"),
+                "grep returned a result from target/: {line}"
+            );
+        }
+    }
 }
