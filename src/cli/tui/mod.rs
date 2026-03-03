@@ -89,6 +89,7 @@ fn tilde_cwd() -> String {
 ///
 /// Each `\n` in the string produces an additional row.  An empty string still
 /// occupies exactly one row (the idle hint is always shown).
+#[allow(dead_code)]
 pub(crate) fn count_status_lines(status: &str) -> usize {
     status.lines().count().max(1)
 }
@@ -562,11 +563,25 @@ impl TuiRenderer {
                 Print(format!("\r\n{}{}{}", DIM_GRAY, status_sep, RESET))
             )?;
 
-            let status_line_count = count_status_lines(&effective_status) + 1; // +1 for separator
+            // Count physical terminal rows consumed by status lines.  Long lines wrap,
+            // so we must use the *visible* length (ANSI codes stripped) divided by the
+            // terminal width — not just the number of '\n'-delimited logical lines.
+            // Using logical line count here was the cause of the "separator spam on open"
+            // bug: wrapped context lines were undercounted, leaving the cursor too low
+            // after MoveUp, which caused erase_live_area() to miss the separator row and
+            // draw a new one on every render tick.
+            let mut status_phys_rows: usize = 1; // 1 for the separator line itself
             for line in effective_status.lines() {
                 execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, line, RESET)))?;
+                let vis = shadow_buffer::visible_length(line);
+                let phys = if term_width > 0 {
+                    vis.max(1).div_ceil(term_width)
+                } else {
+                    1
+                };
+                status_phys_rows += phys;
             }
-            rows += status_line_count;
+            rows += status_phys_rows;
 
             // ── 6. Reposition cursor inside the input area ────────────────────
             //
@@ -598,7 +613,7 @@ impl TuiRenderer {
                 input_phys_rows.iter().skip(cursor_row + 1).sum::<usize>()
                     + rows_in_cursor_line_below;
 
-            let rows_below_cursor = input_below_phys + status_line_count;
+            let rows_below_cursor = input_below_phys + status_phys_rows;
             if rows_below_cursor > 0 {
                 execute!(stdout, cursor::MoveUp(rows_below_cursor as u16))?;
             }

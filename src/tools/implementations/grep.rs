@@ -67,6 +67,20 @@ impl Tool for GrepTool {
         'outer: for entry in WalkDir::new(path)
             .max_depth(10)
             .into_iter()
+            .filter_entry(|e| {
+                // Skip directories that are never useful source-code search targets.
+                // This prevents flooding results with compiled artifacts, VCS objects,
+                // or package manager caches (e.g. ./target/doc/*.html in Rust projects).
+                if e.file_type().is_dir() {
+                    let name = e.file_name().to_string_lossy();
+                    !matches!(
+                        name.as_ref(),
+                        "target" | ".git" | "node_modules" | ".cargo" | ".next" | "dist" | "build" | ".svn" | ".hg"
+                    )
+                } else {
+                    true
+                }
+            })
             .filter_map(|e| e.ok())
         {
             if !entry.file_type().is_file() {

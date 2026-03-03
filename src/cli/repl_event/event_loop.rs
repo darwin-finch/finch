@@ -272,6 +272,10 @@ pub struct EventLoop {
     /// Known brain states from last poll (Uuid -> BrainState), for transition detection.
     known_brain_states: std::collections::HashMap<Uuid, crate::server::BrainState>,
 
+    /// Per-query tool call history: query_id -> set of "tool_name:input_json" strings.
+    /// Used to detect infinite loops (same tool called with same args multiple times).
+    tool_call_history: Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+
     /// Brain UUID that the REPL is currently waiting for a question/plan from.
     /// Set when a transition to WaitingForInput/PlanReady is detected.
     pending_daemon_brain_id: Option<Uuid>,
@@ -409,6 +413,7 @@ impl EventLoop {
             pending_brain_action_tx: None,
             pending_brain_action_command: None,
             known_brain_states: std::collections::HashMap::new(),
+            tool_call_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_daemon_brain_id: None,
             pending_daemon_brain_question_tx: None,
             pending_daemon_brain_question_options: Vec::new(),
@@ -1398,6 +1403,7 @@ impl EventLoop {
         // Keep a reference to the cloud generator for summarisation calls
         // (we always want a capable model for summarisation, regardless of routing).
         let summary_gen = Arc::clone(&claude_gen);
+        let tool_call_history = Arc::clone(&self.tool_call_history);
 
         tokio::spawn(async move {
             Self::process_query_with_tools(
@@ -1426,6 +1432,7 @@ impl EventLoop {
                 enable_summarization,
                 auto_compact_enabled,
                 summary_gen,
+                tool_call_history,
             )
             .await;
         });
@@ -1459,6 +1466,7 @@ impl EventLoop {
         enable_summarization: bool,
         auto_compact_enabled: bool,
         summary_gen: Arc<dyn Generator>,
+        tool_call_history: Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
     ) {
         tracing::debug!(
             "process_query_with_tools starting for query_id: {:?}",
@@ -1682,6 +1690,41 @@ impl EventLoop {
                         // Execute tools (check for AskUserQuestion first, then mode restrictions)
                         let current_mode = mode.read().await;
                         for tool_use in tool_uses {
+                            // Loop detection: track how many times this exact (tool, input) has
+                            // been called for this query.  A second identical call is a strong
+                            // signal the model is stuck; return a terminal error.
+                            let call_key = format!(
+                                "{}:{}",
+                                tool_use.name,
+                                tool_use.input.to_string()
+                            );
+                            let call_count = {
+                                let mut history = tool_call_history.write().await;
+                                let entry = history
+                                    .entry(query_id)
+                                    .or_insert_with(std::collections::HashMap::new);
+                                let count = entry.entry(call_key.clone()).or_insert(0);
+                                *count += 1;
+                                *count
+                            };
+                            if call_count > 1 {
+                                let label = format_tool_label(&tool_use.name, &tool_use.input);
+                                let row_idx = work_unit.add_row(label);
+                                work_unit.fail_row(row_idx, "loop detected");
+                                let error_msg = format!(
+                                    "LOOP DETECTED: You have called {} with the same arguments {} time(s) and received the same result each time.\n\
+                                     Repeating this call will not produce different output.\n\
+                                     You have enough information to proceed. Call PresentPlan now to show your plan.",
+                                    tool_use.name, call_count - 1
+                                );
+                                let _ = event_tx.send(ReplEvent::ToolResult {
+                                    query_id,
+                                    tool_id: tool_use.id.clone(),
+                                    result: Err(anyhow::anyhow!("{}", error_msg)),
+                                });
+                                continue;
+                            }
+
                             // Check if tool is allowed in current mode
                             if !Self::is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
                                 // Tool blocked by plan mode - add error row and send result
@@ -1932,6 +1975,39 @@ impl EventLoop {
                     // Execute tools (check for AskUserQuestion first, then mode restrictions)
                     let current_mode = mode.read().await;
                     for tool_use in tool_uses {
+                        // Loop detection (same as streaming path)
+                        let call_key = format!(
+                            "{}:{}",
+                            tool_use.name,
+                            tool_use.input.to_string()
+                        );
+                        let call_count = {
+                            let mut history = tool_call_history.write().await;
+                            let entry = history
+                                .entry(query_id)
+                                .or_insert_with(std::collections::HashMap::new);
+                            let count = entry.entry(call_key.clone()).or_insert(0);
+                            *count += 1;
+                            *count
+                        };
+                        if call_count > 1 {
+                            let label = format_tool_label(&tool_use.name, &tool_use.input);
+                            let row_idx = work_unit.add_row(label);
+                            work_unit.fail_row(row_idx, "loop detected");
+                            let error_msg = format!(
+                                "LOOP DETECTED: You have called {} with the same arguments {} time(s) and received the same result each time.\n\
+                                 Repeating this call will not produce different output.\n\
+                                 You have enough information to proceed. Call PresentPlan now to show your plan.",
+                                tool_use.name, call_count - 1
+                            );
+                            let _ = event_tx.send(ReplEvent::ToolResult {
+                                query_id,
+                                tool_id: tool_use.id.clone(),
+                                result: Err(anyhow::anyhow!("{}", error_msg)),
+                            });
+                            continue;
+                        }
+
                         // Check if tool is allowed in current mode
                         if !Self::is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
                             let label = format_tool_label(&tool_use.name, &tool_use.input);
@@ -2213,6 +2289,8 @@ impl EventLoop {
                         *active = None;
                     }
                 }
+                // Clear per-query tool-call history so it doesn't grow forever.
+                self.tool_call_history.write().await.remove(&query_id);
             }
 
             ReplEvent::StatsUpdate {
@@ -2242,6 +2320,8 @@ impl EventLoop {
 
                     // Clear active query
                     *self.active_query_id.write().await = None;
+                    // Clear tool-call history for cancelled query
+                    self.tool_call_history.write().await.remove(&qid);
 
                     // If we were in plan/executing mode, cancel that too so the
                     // user doesn't have to press Ctrl+C again to escape.
