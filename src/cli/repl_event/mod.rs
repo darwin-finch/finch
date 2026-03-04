@@ -2,6 +2,7 @@
 
 pub mod event_loop;
 pub mod events;
+pub mod plan_handler;
 pub mod query_state;
 pub mod tool_display;
 pub mod tool_execution;
