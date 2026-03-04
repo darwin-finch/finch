@@ -1,4 +1,12 @@
-// Event types for the concurrent REPL event loop
+//! `ReplEvent` — the message bus between async tasks in the event loop.
+//!
+//! Every cross-task action is encoded as a `ReplEvent` sent over an unbounded
+//! `mpsc` channel to the main loop.  Variants fall into three groups:
+//!
+//! * **Query lifecycle** — `StreamingChunk`, `StreamingComplete`, `ToolResult`,
+//!   `ToolApprovalNeeded`, `CancelQuery`.
+//! * **Brain** — `BrainQuestion`, `BrainProposedAction`.
+//! * **Daemon** — `DaemonBrainQuestion`, `DaemonBrainProposedAction`.
 
 use crate::tools::executor::ToolSignature;
 use crate::tools::patterns::ToolPattern;

@@ -1,4 +1,17 @@
-// Event loop for concurrent REPL - handles user input, queries, and rendering simultaneously
+//! Main `EventLoop` — orchestrates user input, query dispatch, and TUI rendering.
+//!
+//! The event loop runs a `select!` over three streams:
+//!
+//! * **User input** from `spawn_input_task` (keystrokes, submit, Ctrl+C).
+//! * **Query events** from the `ReplEvent` mpsc channel (streaming chunks,
+//!   tool results, approval requests, brain messages).
+//! * **Render tick** (~100ms) — flushes buffered output to the TUI.
+//!
+//! ## Submodules used
+//! * `plan_handler` — intercepts `PresentPlan` / `AskUserQuestion` tool calls.
+//! * `tool_display` — formats tool output for display rows.
+//! * `tool_execution` — concurrent tool dispatch with approval gating.
+//! * `query_state` — per-query state machine (pending → streaming → done).
 
 use anyhow::{Context, Result};
 use chrono::Utc;

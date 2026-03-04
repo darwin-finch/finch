@@ -1,4 +1,8 @@
-// Query state management for concurrent query execution
+//! Per-query state and metadata for concurrent query execution.
+//!
+//! `QueryStateManager` tracks every in-flight query (identified by `Uuid`)
+//! through its lifecycle: pending → streaming → awaiting tool results → done.
+//! Each query has associated `WorkUnit` rows that drive the live TUI display.
 
 use crate::claude::Message;
 use std::collections::HashMap;

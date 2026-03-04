@@ -1,4 +1,13 @@
-// Tool execution coordinator for concurrent tool execution in event loop
+//! Concurrent, approval-gated tool execution.
+//!
+//! `ToolExecutionCoordinator` spawns a Tokio task per tool call so multiple
+//! tools can run in parallel without blocking the event loop.  Each task:
+//!
+//! 1. Checks whether the tool needs user approval (via `ToolExecutor::is_approved`).
+//! 2. If needed, sends a `ReplEvent::ToolApprovalNeeded` and waits on a oneshot
+//!    channel — only *this* task blocks; other tool tasks proceed independently.
+//! 3. Executes the tool (with a 30-second timeout) and sends the result back as
+//!    `ReplEvent::ToolResult`.
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
