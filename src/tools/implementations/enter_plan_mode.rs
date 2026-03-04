@@ -82,14 +82,11 @@ impl Tool for EnterPlanModeTool {
             "✅ Entered planning mode.\n\n\
              📋 Task: {}\n\
              📁 Plan file: {}\n\n\
-             Available tools:\n\
-             • Read - Read file contents\n\
-             • Glob - Find files by pattern\n\
-             • Grep - Search file contents\n\
-             • WebFetch - Fetch documentation\n\n\
-             Explore the codebase and develop your implementation plan.\n\
-             When ready, use PresentPlan to show your plan for approval.\n\n\
-             ⚠️  Tools like Bash, Write, and Edit are blocked in planning mode.",
+             Available tools: Read, Glob, Grep, WebFetch, AskUserQuestion\n\
+             Blocked: Bash, Write, Edit\n\n\
+             ⚡ Be efficient: use the MINIMUM number of tool calls needed.\n\
+             For simple tasks, 1-3 reads is enough. Do not read files speculatively.\n\
+             When you have enough information, call PresentPlan immediately.",
             reason,
             plan_path.display()
         ))

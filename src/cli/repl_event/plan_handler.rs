@@ -16,6 +16,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+use crate::cli::messages::work_unit::WorkUnit;
 use crate::cli::output_manager::OutputManager;
 use crate::cli::repl::ReplMode;
 use crate::cli::tui::TuiRenderer;
@@ -71,6 +72,7 @@ pub(crate) async fn handle_present_plan(
     mode: Arc<tokio::sync::RwLock<crate::cli::ReplMode>>,
     output_manager: Arc<OutputManager>,
     cancel: CancellationToken,
+    work_unit: Arc<WorkUnit>,
 ) -> Option<Result<String>> {
     use chrono::Utc;
     use crossterm::style::Stylize;
@@ -160,6 +162,10 @@ pub(crate) async fn handle_present_plan(
     .with_help(
         "Use ↑↓ or j/k to navigate, Enter to select, 'o' for custom feedback, Esc to cancel",
     );
+
+    // Stop the "Deliberating…" spinner before showing the dialog — the model
+    // is done thinking; the user now needs to review.
+    work_unit.set_complete();
 
     // Flush plan content to scrollback before showing the dialog overlay so it
     // is visible while the user reviews it.

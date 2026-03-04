@@ -1795,6 +1795,7 @@ impl EventLoop {
                                     .await
                                     .map(|m| m.cancellation_token)
                                     .unwrap_or_else(CancellationToken::new),
+                                Arc::clone(&work_unit),
                             )
                             .await
                             {
@@ -2075,6 +2076,7 @@ impl EventLoop {
                                 .await
                                 .map(|m| m.cancellation_token)
                                 .unwrap_or_else(CancellationToken::new),
+                            Arc::clone(&work_unit),
                         )
                         .await
                         {
@@ -2530,6 +2532,47 @@ impl EventLoop {
             .remove(&query_id)
             .unwrap_or_default();
 
+        // Sync the plan mode status bar.  handle_present_plan() updates the mode Arc
+        // but is a free function without &self access, so the indicator update happens here.
+        let current_mode = self.mode.read().await.clone();
+        self.update_plan_mode_indicator(&current_mode);
+
+        // ── Plan-approval fast path ───────────────────────────────────────────
+        // When the user just approved a PresentPlan, the mode is now Executing.
+        // The long planning exploration history confuses the model (it forgets the
+        // task and re-explores instead of implementing).  Reset to a clean context
+        // with just the execution directive, and cancel any active brain session so
+        // its pending AskUserQuestion dialogs don't interfere.
+        if matches!(current_mode, ReplMode::Executing { .. }) {
+            let plan_directive = results.iter().find_map(|(_, r)| {
+                if let Ok(content) = r {
+                    if content.starts_with("Plan approved by user.") {
+                        Some(content.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+
+            if let Some(directive) = plan_directive {
+                // Cancel brain — its stale AskUserQuestion would hijack the next dialog.
+                self.cancel_active_brain(true).await;
+
+                // Reset conversation to a single clear execution prompt.
+                {
+                    let mut conv = self.conversation.write().await;
+                    conv.clear();
+                    conv.add_user_message(directive);
+                }
+
+                self.spawn_query_task(query_id, String::new()).await;
+                return Ok(());
+            }
+        }
+
+        // ── Normal path: build ToolResult message and continue ────────────────
         // Create a user message with proper ToolResult content blocks
         let mut content_blocks = Vec::new();
         for (tool_id, result) in results {
