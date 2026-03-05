@@ -1,0 +1,34 @@
+import * as z from "zod";
+export type AlreadyCanceledSubscriptionData = {
+    error: "AlreadyCanceledSubscription";
+    detail: string;
+};
+export declare class AlreadyCanceledSubscription extends Error {
+    error: "AlreadyCanceledSubscription";
+    detail: string;
+    /** The original data that was passed to this error instance. */
+    data$: AlreadyCanceledSubscriptionData;
+    constructor(err: AlreadyCanceledSubscriptionData);
+}
+/** @internal */
+export declare const AlreadyCanceledSubscription$inboundSchema: z.ZodType<AlreadyCanceledSubscription, z.ZodTypeDef, unknown>;
+/** @internal */
+export type AlreadyCanceledSubscription$Outbound = {
+    error: "AlreadyCanceledSubscription";
+    detail: string;
+};
+/** @internal */
+export declare const AlreadyCanceledSubscription$outboundSchema: z.ZodType<AlreadyCanceledSubscription$Outbound, z.ZodTypeDef, AlreadyCanceledSubscription>;
+/**
+ * @internal
+ * @deprecated This namespace will be removed in future versions. Use schemas and types that are exported directly from this module.
+ */
+export declare namespace AlreadyCanceledSubscription$ {
+    /** @deprecated use `AlreadyCanceledSubscription$inboundSchema` instead. */
+    const inboundSchema: z.ZodType<AlreadyCanceledSubscription, z.ZodTypeDef, unknown>;
+    /** @deprecated use `AlreadyCanceledSubscription$outboundSchema` instead. */
+    const outboundSchema: z.ZodType<AlreadyCanceledSubscription$Outbound, z.ZodTypeDef, AlreadyCanceledSubscription>;
+    /** @deprecated use `AlreadyCanceledSubscription$Outbound` instead. */
+    type Outbound = AlreadyCanceledSubscription$Outbound;
+}
+//# sourceMappingURL=alreadycanceledsubscription.d.ts.map

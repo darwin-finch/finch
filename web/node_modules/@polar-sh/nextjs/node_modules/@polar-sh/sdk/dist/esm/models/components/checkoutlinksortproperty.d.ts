@@ -1,0 +1,46 @@
+import * as z from "zod";
+import { ClosedEnum } from "../../types/enums.js";
+export declare const CheckoutLinkSortProperty: {
+    readonly CreatedAt: "created_at";
+    readonly MinusCreatedAt: "-created_at";
+    readonly Label: "label";
+    readonly MinusLabel: "-label";
+    readonly SuccessUrl: "success_url";
+    readonly MinusSuccessUrl: "-success_url";
+    readonly AllowDiscountCodes: "allow_discount_codes";
+    readonly MinusAllowDiscountCodes: "-allow_discount_codes";
+};
+export type CheckoutLinkSortProperty = ClosedEnum<typeof CheckoutLinkSortProperty>;
+/** @internal */
+export declare const CheckoutLinkSortProperty$inboundSchema: z.ZodNativeEnum<typeof CheckoutLinkSortProperty>;
+/** @internal */
+export declare const CheckoutLinkSortProperty$outboundSchema: z.ZodNativeEnum<typeof CheckoutLinkSortProperty>;
+/**
+ * @internal
+ * @deprecated This namespace will be removed in future versions. Use schemas and types that are exported directly from this module.
+ */
+export declare namespace CheckoutLinkSortProperty$ {
+    /** @deprecated use `CheckoutLinkSortProperty$inboundSchema` instead. */
+    const inboundSchema: z.ZodNativeEnum<{
+        readonly CreatedAt: "created_at";
+        readonly MinusCreatedAt: "-created_at";
+        readonly Label: "label";
+        readonly MinusLabel: "-label";
+        readonly SuccessUrl: "success_url";
+        readonly MinusSuccessUrl: "-success_url";
+        readonly AllowDiscountCodes: "allow_discount_codes";
+        readonly MinusAllowDiscountCodes: "-allow_discount_codes";
+    }>;
+    /** @deprecated use `CheckoutLinkSortProperty$outboundSchema` instead. */
+    const outboundSchema: z.ZodNativeEnum<{
+        readonly CreatedAt: "created_at";
+        readonly MinusCreatedAt: "-created_at";
+        readonly Label: "label";
+        readonly MinusLabel: "-label";
+        readonly SuccessUrl: "success_url";
+        readonly MinusSuccessUrl: "-success_url";
+        readonly AllowDiscountCodes: "allow_discount_codes";
+        readonly MinusAllowDiscountCodes: "-allow_discount_codes";
+    }>;
+}
+//# sourceMappingURL=checkoutlinksortproperty.d.ts.map

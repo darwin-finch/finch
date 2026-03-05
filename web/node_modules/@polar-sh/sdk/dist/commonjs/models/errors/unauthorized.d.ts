@@ -1,0 +1,34 @@
+import * as z from "zod";
+export type UnauthorizedData = {
+    error: "Unauthorized";
+    detail: string;
+};
+export declare class Unauthorized extends Error {
+    error: "Unauthorized";
+    detail: string;
+    /** The original data that was passed to this error instance. */
+    data$: UnauthorizedData;
+    constructor(err: UnauthorizedData);
+}
+/** @internal */
+export declare const Unauthorized$inboundSchema: z.ZodType<Unauthorized, z.ZodTypeDef, unknown>;
+/** @internal */
+export type Unauthorized$Outbound = {
+    error: "Unauthorized";
+    detail: string;
+};
+/** @internal */
+export declare const Unauthorized$outboundSchema: z.ZodType<Unauthorized$Outbound, z.ZodTypeDef, Unauthorized>;
+/**
+ * @internal
+ * @deprecated This namespace will be removed in future versions. Use schemas and types that are exported directly from this module.
+ */
+export declare namespace Unauthorized$ {
+    /** @deprecated use `Unauthorized$inboundSchema` instead. */
+    const inboundSchema: z.ZodType<Unauthorized, z.ZodTypeDef, unknown>;
+    /** @deprecated use `Unauthorized$outboundSchema` instead. */
+    const outboundSchema: z.ZodType<Unauthorized$Outbound, z.ZodTypeDef, Unauthorized>;
+    /** @deprecated use `Unauthorized$Outbound` instead. */
+    type Outbound = Unauthorized$Outbound;
+}
+//# sourceMappingURL=unauthorized.d.ts.map

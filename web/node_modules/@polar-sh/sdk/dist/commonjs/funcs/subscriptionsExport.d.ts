@@ -1,0 +1,19 @@
+import { PolarCore } from "../core.js";
+import { RequestOptions } from "../lib/sdks.js";
+import { ConnectionError, InvalidRequestError, RequestAbortedError, RequestTimeoutError, UnexpectedClientError } from "../models/errors/httpclienterrors.js";
+import { HTTPValidationError } from "../models/errors/httpvalidationerror.js";
+import { SDKError } from "../models/errors/sdkerror.js";
+import { SDKValidationError } from "../models/errors/sdkvalidationerror.js";
+import { SubscriptionsExportRequest } from "../models/operations/subscriptionsexport.js";
+import { APIPromise } from "../types/async.js";
+import { Result } from "../types/fp.js";
+/**
+ * Export Subscriptions
+ *
+ * @remarks
+ * Export subscriptions as a CSV file.
+ *
+ * **Scopes**: `subscriptions:read` `subscriptions:write`
+ */
+export declare function subscriptionsExport(client: PolarCore, request: SubscriptionsExportRequest, options?: RequestOptions): APIPromise<Result<any, HTTPValidationError | SDKError | SDKValidationError | UnexpectedClientError | InvalidRequestError | RequestAbortedError | RequestTimeoutError | ConnectionError>>;
+//# sourceMappingURL=subscriptionsExport.d.ts.map

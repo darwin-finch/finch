@@ -1,0 +1,39 @@
+import * as z from "zod";
+import { Result as SafeParseResult } from "../../types/fp.js";
+import { SDKValidationError } from "../errors/sdkvalidationerror.js";
+import { Pledge, Pledge$Outbound } from "./pledge.js";
+/**
+ * Sent when a new pledge is created. Note that this does mean that the pledge has been paid yet.
+ *
+ * @remarks
+ *
+ * **Discord & Slack support:** Full
+ */
+export type WebhookPledgeCreatedPayload = {
+    type?: "pledge.created" | undefined;
+    data: Pledge;
+};
+/** @internal */
+export declare const WebhookPledgeCreatedPayload$inboundSchema: z.ZodType<WebhookPledgeCreatedPayload, z.ZodTypeDef, unknown>;
+/** @internal */
+export type WebhookPledgeCreatedPayload$Outbound = {
+    type: "pledge.created";
+    data: Pledge$Outbound;
+};
+/** @internal */
+export declare const WebhookPledgeCreatedPayload$outboundSchema: z.ZodType<WebhookPledgeCreatedPayload$Outbound, z.ZodTypeDef, WebhookPledgeCreatedPayload>;
+/**
+ * @internal
+ * @deprecated This namespace will be removed in future versions. Use schemas and types that are exported directly from this module.
+ */
+export declare namespace WebhookPledgeCreatedPayload$ {
+    /** @deprecated use `WebhookPledgeCreatedPayload$inboundSchema` instead. */
+    const inboundSchema: z.ZodType<WebhookPledgeCreatedPayload, z.ZodTypeDef, unknown>;
+    /** @deprecated use `WebhookPledgeCreatedPayload$outboundSchema` instead. */
+    const outboundSchema: z.ZodType<WebhookPledgeCreatedPayload$Outbound, z.ZodTypeDef, WebhookPledgeCreatedPayload>;
+    /** @deprecated use `WebhookPledgeCreatedPayload$Outbound` instead. */
+    type Outbound = WebhookPledgeCreatedPayload$Outbound;
+}
+export declare function webhookPledgeCreatedPayloadToJSON(webhookPledgeCreatedPayload: WebhookPledgeCreatedPayload): string;
+export declare function webhookPledgeCreatedPayloadFromJSON(jsonString: string): SafeParseResult<WebhookPledgeCreatedPayload, SDKValidationError>;
+//# sourceMappingURL=webhookpledgecreatedpayload.d.ts.map

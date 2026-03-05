@@ -1,0 +1,22 @@
+import { PolarCore } from "../core.js";
+import { RequestOptions } from "../lib/sdks.js";
+import { Refund } from "../models/components/refund.js";
+import { RefundCreate } from "../models/components/refundcreate.js";
+import { ConnectionError, InvalidRequestError, RequestAbortedError, RequestTimeoutError, UnexpectedClientError } from "../models/errors/httpclienterrors.js";
+import { HTTPValidationError } from "../models/errors/httpvalidationerror.js";
+import { RefundAmountTooHigh } from "../models/errors/refundamounttoohigh.js";
+import { RefundedAlready } from "../models/errors/refundedalready.js";
+import { SDKError } from "../models/errors/sdkerror.js";
+import { SDKValidationError } from "../models/errors/sdkvalidationerror.js";
+import { APIPromise } from "../types/async.js";
+import { Result } from "../types/fp.js";
+/**
+ * Create Refund
+ *
+ * @remarks
+ * Create a refund.
+ *
+ * **Scopes**: `refunds:write`
+ */
+export declare function refundsCreate(client: PolarCore, request: RefundCreate, options?: RequestOptions): APIPromise<Result<Refund | undefined, RefundAmountTooHigh | RefundedAlready | HTTPValidationError | SDKError | SDKValidationError | UnexpectedClientError | InvalidRequestError | RequestAbortedError | RequestTimeoutError | ConnectionError>>;
+//# sourceMappingURL=refundsCreate.d.ts.map

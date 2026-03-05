@@ -1,0 +1,21 @@
+import { PolarCore } from "../core.js";
+import { RequestOptions } from "../lib/sdks.js";
+import { Meter } from "../models/components/meter.js";
+import { ConnectionError, InvalidRequestError, RequestAbortedError, RequestTimeoutError, UnexpectedClientError } from "../models/errors/httpclienterrors.js";
+import { HTTPValidationError } from "../models/errors/httpvalidationerror.js";
+import { ResourceNotFound } from "../models/errors/resourcenotfound.js";
+import { SDKError } from "../models/errors/sdkerror.js";
+import { SDKValidationError } from "../models/errors/sdkvalidationerror.js";
+import { MetersUpdateRequest } from "../models/operations/metersupdate.js";
+import { APIPromise } from "../types/async.js";
+import { Result } from "../types/fp.js";
+/**
+ * Update Meter
+ *
+ * @remarks
+ * Update a meter.
+ *
+ * **Scopes**: `meters:write`
+ */
+export declare function metersUpdate(client: PolarCore, request: MetersUpdateRequest, options?: RequestOptions): APIPromise<Result<Meter, ResourceNotFound | HTTPValidationError | SDKError | SDKValidationError | UnexpectedClientError | InvalidRequestError | RequestAbortedError | RequestTimeoutError | ConnectionError>>;
+//# sourceMappingURL=metersUpdate.d.ts.map

@@ -40,9 +40,7 @@ use crate::tools::types::{ToolDefinition, ToolUse};
 
 use super::events::ReplEvent;
 use super::query_state::{QueryState, QueryStateManager};
-use tokio_util::sync::CancellationToken;
-use super::plan_handler::{handle_ask_user_question, handle_present_plan, is_tool_allowed_in_mode};
-use super::tool_display::{format_tool_label, tool_result_to_display};
+use super::tool_display::tool_result_to_display;
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// Refresh the ContextLine status-strip entries and the terminal window/tab title.
@@ -113,6 +111,160 @@ async fn refresh_context_strip(
     }
 }
 
+/// Dispatch a batch of tool uses for one query turn.
+///
+/// Called from both the streaming and non-streaming response paths — they used
+/// to each contain an identical 115-line block.  This function is the single
+/// source of truth for:
+///
+/// * Loop detection (same tool+args called twice → terminal error)
+/// * Plan-mode tool gating (blocks Write/Edit/Bash in Planning mode)
+/// * WorkUnit row creation and `active_tool_uses` registration
+/// * Inline dispatch for `AskUserQuestion` and `PresentPlan`
+/// * Fallback to `ToolExecutionCoordinator::spawn_tool_execution`
+/// * Memory status bar refresh after all tools are queued
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_tool_uses(
+    tool_uses: Vec<crate::tools::types::ToolUse>,
+    query_id: Uuid,
+    work_unit: &Arc<crate::cli::messages::WorkUnit>,
+    mode: &Arc<RwLock<ReplMode>>,
+    tool_call_history: &Arc<
+        RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
+    >,
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
+    active_tool_uses: &ActiveToolUsesMap,
+    tui_renderer: &Arc<tokio::sync::Mutex<crate::cli::tui::TuiRenderer>>,
+    output_manager: &Arc<crate::cli::output_manager::OutputManager>,
+    query_states: &Arc<super::query_state::QueryStateManager>,
+    tool_coordinator: &super::tool_execution::ToolExecutionCoordinator,
+    memory_system: &Option<Arc<crate::memory::MemorySystem>>,
+    memory_recall_count: usize,
+    session_label: &str,
+    cwd: &str,
+    status_bar: &Arc<crate::cli::StatusBar>,
+    context_lines: usize,
+) {
+    use super::plan_handler::{handle_ask_user_question, handle_present_plan, is_tool_allowed_in_mode};
+    use super::tool_display::format_tool_label;
+    use tokio_util::sync::CancellationToken;
+
+    let current_mode = mode.read().await;
+    for tool_use in tool_uses {
+        // Loop detection: a second identical (tool, input) call for this query means
+        // the model is stuck; return a terminal error so it breaks out.
+        let call_key = format!("{}:{}", tool_use.name, tool_use.input);
+        let call_count = {
+            let mut history = tool_call_history.write().await;
+            let entry = history
+                .entry(query_id)
+                .or_insert_with(std::collections::HashMap::new);
+            let count = entry.entry(call_key).or_insert(0);
+            *count += 1;
+            *count
+        };
+        if call_count > 1 {
+            let label = format_tool_label(&tool_use.name, &tool_use.input);
+            let row_idx = work_unit.add_row(label);
+            work_unit.fail_row(row_idx, "loop detected");
+            let error_msg = format!(
+                "LOOP DETECTED: You have called {} with the same arguments {} time(s) and received the same result each time.\n\
+                 Repeating this call will not produce different output.\n\
+                 You have enough information to proceed. Call PresentPlan now to show your plan.",
+                tool_use.name,
+                call_count - 1
+            );
+            let _ = event_tx.send(ReplEvent::ToolResult {
+                query_id,
+                tool_id: tool_use.id.clone(),
+                result: Err(anyhow::anyhow!("{}", error_msg)),
+            });
+            continue;
+        }
+
+        // Plan-mode gate: block destructive tools while exploring
+        if !is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
+            let label = format_tool_label(&tool_use.name, &tool_use.input);
+            let row_idx = work_unit.add_row(label);
+            work_unit.fail_row(row_idx, "blocked in plan mode");
+            let error_msg = format!(
+                "Tool '{}' is not allowed in planning mode.\n\
+                 Reason: This tool can modify system state.\n\
+                 Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
+                 Type /approve to execute your plan with all tools enabled.",
+                tool_use.name
+            );
+            let _ = event_tx.send(ReplEvent::ToolResult {
+                query_id,
+                tool_id: tool_use.id.clone(),
+                result: Err(anyhow::anyhow!("{}", error_msg)),
+            });
+            continue;
+        }
+
+        // Add a running row for this tool in the shared WorkUnit
+        let label = format_tool_label(&tool_use.name, &tool_use.input);
+        let row_idx = work_unit.add_row(&label);
+        active_tool_uses.write().await.insert(
+            tool_use.id.clone(),
+            (tool_use.name.clone(), Arc::clone(work_unit), row_idx),
+        );
+
+        // Inline handlers for interactive tools (block until dialog resolved)
+        if let Some(result) =
+            handle_ask_user_question(&tool_use, Arc::clone(tui_renderer)).await
+        {
+            let _ = event_tx.send(ReplEvent::ToolResult {
+                query_id,
+                tool_id: tool_use.id.clone(),
+                result,
+            });
+        } else if let Some(result) = handle_present_plan(
+            &tool_use,
+            Arc::clone(tui_renderer),
+            Arc::clone(mode),
+            Arc::clone(output_manager),
+            query_states
+                .get_metadata(query_id)
+                .await
+                .map(|m| m.cancellation_token)
+                .unwrap_or_else(CancellationToken::new),
+            Arc::clone(work_unit),
+        )
+        .await
+        {
+            let _ = event_tx.send(ReplEvent::ToolResult {
+                query_id,
+                tool_id: tool_use.id.clone(),
+                result,
+            });
+        } else {
+            // Regular tool: run concurrently in a background task
+            tool_coordinator.spawn_tool_execution(
+                query_id,
+                tool_use,
+                Arc::clone(work_unit),
+                row_idx,
+            );
+        }
+    }
+    drop(current_mode);
+
+    // Update memory status bar now that tools are queued
+    if let Some(ref mem) = memory_system {
+        if let Ok(stats) = mem.stats().await {
+            status_bar.update_line(
+                crate::cli::status_bar::StatusLineType::MemoryContext,
+                format!(
+                    "🧠 recalled {}  ·  {} memories",
+                    memory_recall_count, stats.conversation_count
+                ),
+            );
+        }
+        refresh_context_strip(mem, session_label, cwd, status_bar, context_lines).await;
+    }
+}
+
 type ToolResultsMap =
     Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>;
 type PendingApprovalsMap = Arc<
@@ -132,7 +284,6 @@ type ActiveToolUsesMap = Arc<
             String,
             (
                 String,
-                serde_json::Value,
                 Arc<crate::cli::messages::WorkUnit>,
                 usize,
             ),
@@ -1698,144 +1849,27 @@ impl EventLoop {
                             "[EVENT_LOOP] Assistant message added, spawning tool executions"
                         );
 
-                        // Tool calls share the WorkUnit that was created before streaming.
-                        // Each tool gets its own sub-row within the same WorkUnit.
-
-                        // Execute tools (check for AskUserQuestion first, then mode restrictions)
-                        let current_mode = mode.read().await;
-                        for tool_use in tool_uses {
-                            // Loop detection: track how many times this exact (tool, input) has
-                            // been called for this query.  A second identical call is a strong
-                            // signal the model is stuck; return a terminal error.
-                            let call_key = format!(
-                                "{}:{}",
-                                tool_use.name,
-                                tool_use.input.to_string()
-                            );
-                            let call_count = {
-                                let mut history = tool_call_history.write().await;
-                                let entry = history
-                                    .entry(query_id)
-                                    .or_insert_with(std::collections::HashMap::new);
-                                let count = entry.entry(call_key.clone()).or_insert(0);
-                                *count += 1;
-                                *count
-                            };
-                            if call_count > 1 {
-                                let label = format_tool_label(&tool_use.name, &tool_use.input);
-                                let row_idx = work_unit.add_row(label);
-                                work_unit.fail_row(row_idx, "loop detected");
-                                let error_msg = format!(
-                                    "LOOP DETECTED: You have called {} with the same arguments {} time(s) and received the same result each time.\n\
-                                     Repeating this call will not produce different output.\n\
-                                     You have enough information to proceed. Call PresentPlan now to show your plan.",
-                                    tool_use.name, call_count - 1
-                                );
-                                let _ = event_tx.send(ReplEvent::ToolResult {
-                                    query_id,
-                                    tool_id: tool_use.id.clone(),
-                                    result: Err(anyhow::anyhow!("{}", error_msg)),
-                                });
-                                continue;
-                            }
-
-                            // Check if tool is allowed in current mode
-                            if !is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
-                                // Tool blocked by plan mode - add error row and send result
-                                let label = format_tool_label(&tool_use.name, &tool_use.input);
-                                let row_idx = work_unit.add_row(label);
-                                let error_msg = format!(
-                                        "Tool '{}' is not allowed in planning mode.\n\
-                                         Reason: This tool can modify system state.\n\
-                                         Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
-                                         Type /approve to execute your plan with all tools enabled.",
-                                        tool_use.name
-                                    );
-                                work_unit.fail_row(row_idx, "blocked in plan mode");
-                                let _ = event_tx.send(ReplEvent::ToolResult {
-                                    query_id,
-                                    tool_id: tool_use.id.clone(),
-                                    result: Err(anyhow::anyhow!("{}", error_msg)),
-                                });
-                                continue;
-                            }
-
-                            // Add a running row for this tool to the shared WorkUnit
-                            let label = format_tool_label(&tool_use.name, &tool_use.input);
-                            let row_idx = work_unit.add_row(&label);
-
-                            // Store (name, input, work_unit, row_idx) for result lookup
-                            active_tool_uses.write().await.insert(
-                                tool_use.id.clone(),
-                                (
-                                    tool_use.name.clone(),
-                                    tool_use.input.clone(),
-                                    Arc::clone(&work_unit),
-                                    row_idx,
-                                ),
-                            );
-
-                            // Check if this is AskUserQuestion (handle specially)
-                            if let Some(result) =
-                                handle_ask_user_question(&tool_use, Arc::clone(&tui_renderer)).await
-                            {
-                                // Send result immediately
-                                let _ = event_tx.send(ReplEvent::ToolResult {
-                                    query_id,
-                                    tool_id: tool_use.id.clone(),
-                                    result,
-                                });
-                            } else if let Some(result) = handle_present_plan(
-                                &tool_use,
-                                Arc::clone(&tui_renderer),
-                                Arc::clone(&mode),
-                                Arc::clone(&output_manager),
-                                query_states
-                                    .get_metadata(query_id)
-                                    .await
-                                    .map(|m| m.cancellation_token)
-                                    .unwrap_or_else(CancellationToken::new),
-                                Arc::clone(&work_unit),
-                            )
-                            .await
-                            {
-                                // Send result immediately
-                                let _ = event_tx.send(ReplEvent::ToolResult {
-                                    query_id,
-                                    tool_id: tool_use.id.clone(),
-                                    result,
-                                });
-                            } else {
-                                // Regular tool execution (with live-output streaming)
-                                tool_coordinator.spawn_tool_execution(
-                                    query_id,
-                                    tool_use,
-                                    Arc::clone(&work_unit),
-                                    row_idx,
-                                );
-                            }
-                        }
-                        drop(current_mode);
-                        // Resolve "querying…" and refresh context even on tool-calling turns.
-                        if let Some(ref mem) = memory_system {
-                            if let Ok(stats) = mem.stats().await {
-                                status_bar.update_line(
-                                    crate::cli::status_bar::StatusLineType::MemoryContext,
-                                    format!(
-                                        "🧠 recalled {}  ·  {} memories",
-                                        memory_recall_count, stats.conversation_count
-                                    ),
-                                );
-                            }
-                            refresh_context_strip(
-                                mem,
-                                &session_label,
-                                &cwd,
-                                &status_bar,
-                                context_lines,
-                            )
-                            .await;
-                        }
+                        // Dispatch tools (loop detection, mode gating, inline handlers, spawn)
+                        dispatch_tool_uses(
+                            tool_uses,
+                            query_id,
+                            &work_unit,
+                            &mode,
+                            &tool_call_history,
+                            &event_tx,
+                            &active_tool_uses,
+                            &tui_renderer,
+                            &output_manager,
+                            &query_states,
+                            &tool_coordinator,
+                            &memory_system,
+                            memory_recall_count,
+                            &session_label,
+                            &cwd,
+                            &status_bar,
+                            context_lines,
+                        )
+                        .await;
                         tracing::debug!("[EVENT_LOOP] Tool executions spawned, returning");
                         return;
                     }
@@ -1985,138 +2019,27 @@ impl EventLoop {
                     };
                     conversation.write().await.add_message(assistant_message);
 
-                    // Tool calls share the WorkUnit created before generate().
-
-                    // Execute tools (check for AskUserQuestion first, then mode restrictions)
-                    let current_mode = mode.read().await;
-                    for tool_use in tool_uses {
-                        // Loop detection (same as streaming path)
-                        let call_key = format!(
-                            "{}:{}",
-                            tool_use.name,
-                            tool_use.input.to_string()
-                        );
-                        let call_count = {
-                            let mut history = tool_call_history.write().await;
-                            let entry = history
-                                .entry(query_id)
-                                .or_insert_with(std::collections::HashMap::new);
-                            let count = entry.entry(call_key.clone()).or_insert(0);
-                            *count += 1;
-                            *count
-                        };
-                        if call_count > 1 {
-                            let label = format_tool_label(&tool_use.name, &tool_use.input);
-                            let row_idx = work_unit.add_row(label);
-                            work_unit.fail_row(row_idx, "loop detected");
-                            let error_msg = format!(
-                                "LOOP DETECTED: You have called {} with the same arguments {} time(s) and received the same result each time.\n\
-                                 Repeating this call will not produce different output.\n\
-                                 You have enough information to proceed. Call PresentPlan now to show your plan.",
-                                tool_use.name, call_count - 1
-                            );
-                            let _ = event_tx.send(ReplEvent::ToolResult {
-                                query_id,
-                                tool_id: tool_use.id.clone(),
-                                result: Err(anyhow::anyhow!("{}", error_msg)),
-                            });
-                            continue;
-                        }
-
-                        // Check if tool is allowed in current mode
-                        if !is_tool_allowed_in_mode(&tool_use.name, &current_mode) {
-                            let label = format_tool_label(&tool_use.name, &tool_use.input);
-                            let row_idx = work_unit.add_row(label);
-                            work_unit.fail_row(row_idx, "blocked in plan mode");
-                            let error_msg = format!(
-                                "Tool '{}' is not allowed in planning mode.\n\
-                                     Reason: This tool can modify system state.\n\
-                                     Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
-                                     Type /approve to execute your plan with all tools enabled.",
-                                tool_use.name
-                            );
-                            let _ = event_tx.send(ReplEvent::ToolResult {
-                                query_id,
-                                tool_id: tool_use.id.clone(),
-                                result: Err(anyhow::anyhow!("{}", error_msg)),
-                            });
-                            continue;
-                        }
-
-                        // Add a running row for this tool
-                        let label = format_tool_label(&tool_use.name, &tool_use.input);
-                        let row_idx = work_unit.add_row(&label);
-                        active_tool_uses.write().await.insert(
-                            tool_use.id.clone(),
-                            (
-                                tool_use.name.clone(),
-                                tool_use.input.clone(),
-                                Arc::clone(&work_unit),
-                                row_idx,
-                            ),
-                        );
-
-                        // Check if this is AskUserQuestion (handle specially)
-                        if let Some(result) =
-                            handle_ask_user_question(&tool_use, Arc::clone(&tui_renderer)).await
-                        {
-                            // Send result immediately
-                            let _ = event_tx.send(ReplEvent::ToolResult {
-                                query_id,
-                                tool_id: tool_use.id.clone(),
-                                result,
-                            });
-                        } else if let Some(result) = handle_present_plan(
-                            &tool_use,
-                            Arc::clone(&tui_renderer),
-                            Arc::clone(&mode),
-                            Arc::clone(&output_manager),
-                            query_states
-                                .get_metadata(query_id)
-                                .await
-                                .map(|m| m.cancellation_token)
-                                .unwrap_or_else(CancellationToken::new),
-                            Arc::clone(&work_unit),
-                        )
-                        .await
-                        {
-                            // Send result immediately
-                            let _ = event_tx.send(ReplEvent::ToolResult {
-                                query_id,
-                                tool_id: tool_use.id.clone(),
-                                result,
-                            });
-                        } else {
-                            // Regular tool execution (with live-output streaming)
-                            tool_coordinator.spawn_tool_execution(
-                                query_id,
-                                tool_use,
-                                Arc::clone(&work_unit),
-                                row_idx,
-                            );
-                        }
-                    }
-                    drop(current_mode);
-                    // Resolve "querying…" and refresh context even on tool-calling turns.
-                    if let Some(ref mem) = memory_system {
-                        if let Ok(stats) = mem.stats().await {
-                            status_bar.update_line(
-                                crate::cli::status_bar::StatusLineType::MemoryContext,
-                                format!(
-                                    "🧠 recalled {}  ·  {} memories",
-                                    memory_recall_count, stats.conversation_count
-                                ),
-                            );
-                        }
-                        refresh_context_strip(
-                            mem,
-                            &session_label,
-                            &cwd,
-                            &status_bar,
-                            context_lines,
-                        )
-                        .await;
-                    }
+                    // Dispatch tools (loop detection, mode gating, inline handlers, spawn)
+                    dispatch_tool_uses(
+                        tool_uses,
+                        query_id,
+                        &work_unit,
+                        &mode,
+                        &tool_call_history,
+                        &event_tx,
+                        &active_tool_uses,
+                        &tui_renderer,
+                        &output_manager,
+                        &query_states,
+                        &tool_coordinator,
+                        &memory_system,
+                        memory_recall_count,
+                        &session_label,
+                        &cwd,
+                        &status_bar,
+                        context_lines,
+                    )
+                    .await;
                     return;
                 }
 
@@ -2456,13 +2379,13 @@ impl EventLoop {
         result: Result<String>,
     ) -> Result<()> {
         // Look up the tool's WorkUnit and row index
-        let (tool_name, _tool_input, work_unit, row_idx) = {
+        let (tool_name, work_unit, row_idx) = {
             let mut map = self.active_tool_uses.write().await;
             map.remove(&tool_id).unwrap_or_else(|| {
                 // Fallback: create a standalone WorkUnit for untracked tools
                 let fallback = self.output_manager.start_work_unit("Tool");
                 let row_idx = fallback.add_row(&tool_id);
-                (tool_id.clone(), serde_json::Value::Null, fallback, row_idx)
+                (tool_id.clone(), fallback, row_idx)
             })
         };
 

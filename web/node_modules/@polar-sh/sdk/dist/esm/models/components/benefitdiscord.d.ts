@@ -1,0 +1,77 @@
+import * as z from "zod";
+import { Result as SafeParseResult } from "../../types/fp.js";
+import { SDKValidationError } from "../errors/sdkvalidationerror.js";
+import { BenefitDiscordProperties, BenefitDiscordProperties$Outbound } from "./benefitdiscordproperties.js";
+/**
+ * A benefit of type `discord`.
+ *
+ * @remarks
+ *
+ * Use it to automatically invite your backers to a Discord server.
+ */
+export type BenefitDiscord = {
+    /**
+     * Creation timestamp of the object.
+     */
+    createdAt: Date;
+    /**
+     * Last modification timestamp of the object.
+     */
+    modifiedAt: Date | null;
+    /**
+     * The ID of the benefit.
+     */
+    id: string;
+    type?: "discord" | undefined;
+    /**
+     * The description of the benefit.
+     */
+    description: string;
+    /**
+     * Whether the benefit is selectable when creating a product.
+     */
+    selectable: boolean;
+    /**
+     * Whether the benefit is deletable.
+     */
+    deletable: boolean;
+    /**
+     * The ID of the organization owning the benefit.
+     */
+    organizationId: string;
+    /**
+     * Properties for a benefit of type `discord`.
+     */
+    properties: BenefitDiscordProperties;
+};
+/** @internal */
+export declare const BenefitDiscord$inboundSchema: z.ZodType<BenefitDiscord, z.ZodTypeDef, unknown>;
+/** @internal */
+export type BenefitDiscord$Outbound = {
+    created_at: string;
+    modified_at: string | null;
+    id: string;
+    type: "discord";
+    description: string;
+    selectable: boolean;
+    deletable: boolean;
+    organization_id: string;
+    properties: BenefitDiscordProperties$Outbound;
+};
+/** @internal */
+export declare const BenefitDiscord$outboundSchema: z.ZodType<BenefitDiscord$Outbound, z.ZodTypeDef, BenefitDiscord>;
+/**
+ * @internal
+ * @deprecated This namespace will be removed in future versions. Use schemas and types that are exported directly from this module.
+ */
+export declare namespace BenefitDiscord$ {
+    /** @deprecated use `BenefitDiscord$inboundSchema` instead. */
+    const inboundSchema: z.ZodType<BenefitDiscord, z.ZodTypeDef, unknown>;
+    /** @deprecated use `BenefitDiscord$outboundSchema` instead. */
+    const outboundSchema: z.ZodType<BenefitDiscord$Outbound, z.ZodTypeDef, BenefitDiscord>;
+    /** @deprecated use `BenefitDiscord$Outbound` instead. */
+    type Outbound = BenefitDiscord$Outbound;
+}
+export declare function benefitDiscordToJSON(benefitDiscord: BenefitDiscord): string;
+export declare function benefitDiscordFromJSON(jsonString: string): SafeParseResult<BenefitDiscord, SDKValidationError>;
+//# sourceMappingURL=benefitdiscord.d.ts.map

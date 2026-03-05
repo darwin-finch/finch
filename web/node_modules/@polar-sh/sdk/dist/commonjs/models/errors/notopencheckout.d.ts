@@ -1,0 +1,34 @@
+import * as z from "zod";
+export type NotOpenCheckoutData = {
+    error: "NotOpenCheckout";
+    detail: string;
+};
+export declare class NotOpenCheckout extends Error {
+    error: "NotOpenCheckout";
+    detail: string;
+    /** The original data that was passed to this error instance. */
+    data$: NotOpenCheckoutData;
+    constructor(err: NotOpenCheckoutData);
+}
+/** @internal */
+export declare const NotOpenCheckout$inboundSchema: z.ZodType<NotOpenCheckout, z.ZodTypeDef, unknown>;
+/** @internal */
+export type NotOpenCheckout$Outbound = {
+    error: "NotOpenCheckout";
+    detail: string;
+};
+/** @internal */
+export declare const NotOpenCheckout$outboundSchema: z.ZodType<NotOpenCheckout$Outbound, z.ZodTypeDef, NotOpenCheckout>;
+/**
+ * @internal
+ * @deprecated This namespace will be removed in future versions. Use schemas and types that are exported directly from this module.
+ */
+export declare namespace NotOpenCheckout$ {
+    /** @deprecated use `NotOpenCheckout$inboundSchema` instead. */
+    const inboundSchema: z.ZodType<NotOpenCheckout, z.ZodTypeDef, unknown>;
+    /** @deprecated use `NotOpenCheckout$outboundSchema` instead. */
+    const outboundSchema: z.ZodType<NotOpenCheckout$Outbound, z.ZodTypeDef, NotOpenCheckout>;
+    /** @deprecated use `NotOpenCheckout$Outbound` instead. */
+    type Outbound = NotOpenCheckout$Outbound;
+}
+//# sourceMappingURL=notopencheckout.d.ts.map

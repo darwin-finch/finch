@@ -394,7 +394,7 @@ impl EventLoop {
         let dialog = if q.options.is_empty() {
             Dialog::text_input(title, None)
         } else {
-            let opts: Vec<DialogOption> = q.options.iter().map(|o| DialogOption::new(o)).collect();
+            let opts: Vec<DialogOption> = q.options.iter().map(DialogOption::new).collect();
             Dialog::select_with_custom(title, opts)
         };
 
