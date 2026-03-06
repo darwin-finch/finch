@@ -9,7 +9,7 @@ type ForwardOutput = (Vec<f32>, Vec<(DynValue, DynValue)>);
 use ort::{
     ep,
     memory::MemoryInfo,
-    session::{builder::GraphOptimizationLevel, output::SessionOutputs, Session},
+    session::{builder::GraphOptimizationLevel, Session, SessionOutputs},
     value::{DynValue, Value},
 };
 use std::path::{Path, PathBuf};
