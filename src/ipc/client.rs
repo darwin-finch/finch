@@ -410,6 +410,36 @@ fn read_query_response(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Connect to the live daemon socket and verify ping round-trip.
+    ///
+    /// Requires a running daemon with the IPC socket at `~/.finch/daemon.sock`.
+    /// Run with:
+    ///   cargo test --lib ipc::client::tests::test_ipc_ping -- --ignored --nocapture
+    /// capnp-rpc uses spawn_local internally so we need a LocalSet.
+    #[test]
+    #[ignore]
+    fn test_ipc_ping() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            let client = IpcClient::connect()
+                .await
+                .expect("IPC connect — is `finch daemon` running?");
+
+            let version = client.ping().await.expect("ping failed");
+            assert!(!version.is_empty(), "version string should be non-empty");
+            println!("IPC ping OK — daemon version: {}", version);
+        }));
+    }
+}
+
 fn brain_state_to_server(s: Result<CapnpBrainState, capnp::NotInSchema>) -> BrainState {
     match s.unwrap_or(CapnpBrainState::Cancelled) {
         CapnpBrainState::Running => BrainState::Running,
