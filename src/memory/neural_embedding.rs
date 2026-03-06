@@ -81,19 +81,19 @@ impl NeuralEmbeddingEngine {
         // Create ONNX Runtime session (CPU only for embeddings — fast enough)
         std::env::set_var("ORT_LOGGING_LEVEL", "3"); // Fatal only
         let session = Session::builder()
-            .context("Failed to create ONNX session builder")?
+            .map_err(|e| anyhow!("Failed to create ONNX session builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .context("Failed to set optimization level")?
+            .map_err(|e| anyhow!("Failed to set optimization level: {e}"))?
             .with_intra_threads(2)
-            .context("Failed to set thread count")?
+            .map_err(|e| anyhow!("Failed to set thread count: {e}"))?
             .commit_from_file(&model_path)
-            .with_context(|| format!("Failed to load ONNX model from {:?}", model_path))?;
+            .map_err(|e| anyhow!("Failed to load ONNX model from {:?}: {e}", model_path))?;
 
         // Check which inputs the model expects
         let has_token_type_ids = session
             .inputs()
             .iter()
-            .any(|i| i.name() == "token_type_ids");
+            .any(|i: &ort::value::Outlet| i.name() == "token_type_ids");
 
         info!(
             "Neural embedding model loaded: dim={}, token_type_ids={}",

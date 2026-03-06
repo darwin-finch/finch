@@ -42,14 +42,19 @@ impl OnnxLoader {
         std::env::set_var("ORT_LOGGING_LEVEL", "2"); // Warning and above only
 
         // Build execution provider list
-        let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?; // Parallel ops within layer
+        let mut builder = Session::builder()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_intra_threads(4)
+            .map_err(|e| anyhow::anyhow!("{e}"))?; // Parallel ops within layer
 
         // Add execution providers based on config
         let providers = self.get_execution_providers(config);
         if !providers.is_empty() {
-            builder = builder.with_execution_providers(providers)?;
+            builder = builder
+                .with_execution_providers(providers)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
         // Create session
@@ -558,7 +563,7 @@ impl LoadedOnnxModel {
         // try_extract_tensor returns Result<(shape, data_slice)>
         let (shape, data) = output_tensor
             .try_extract_tensor::<f32>()
-            .context("Failed to extract f32 tensor from output")?;
+            .map_err(|e| anyhow::anyhow!("Failed to extract f32 tensor: {e}"))?;
 
         debug!("Output tensor shape: {:?}", shape);
 
