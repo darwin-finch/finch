@@ -91,8 +91,10 @@ pub enum ReplMode {
 pub struct Repl {
     _config: Config,
     claude_client: ClaudeClient,
-    // Daemon client (optional - for daemon-only mode)
+    // Daemon client (optional - for daemon-only mode, HTTP)
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
+    // IPC client — Cap'n Proto channel to the daemon (preferred over daemon_client)
+    ipc_client: Option<crate::ipc::IpcClient>,
     // Teacher session with context optimization
     teacher_session: Arc<RwLock<TeacherSession>>,
     // Provider management (for runtime switching)
@@ -569,6 +571,7 @@ impl Repl {
             _config: config,
             claude_client,
             daemon_client,
+            ipc_client: None, // Set after construction via set_ipc_client()
             teacher_session,
             available_providers,
             available_teachers,
@@ -621,6 +624,11 @@ impl Repl {
             auto_compact_enabled,
             brain_enabled,
         }
+    }
+
+    /// Set the IPC client for daemon communication (must be called inside a LocalSet).
+    pub fn set_ipc_client(&mut self, client: crate::ipc::IpcClient) {
+        self.ipc_client = Some(client);
     }
 
     /// Try to connect to daemon (non-blocking, returns None if not available)
@@ -1532,6 +1540,7 @@ impl Repl {
             Arc::clone(&self.local_generator),
             Arc::clone(&self.tokenizer),
             self.daemon_client.clone(),
+            self.ipc_client.take(),
             mode,
             self.memory_system.clone(),
             self.session_label.clone(),

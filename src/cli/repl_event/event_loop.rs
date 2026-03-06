@@ -122,8 +122,12 @@ pub struct EventLoop {
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
 
-    /// Daemon client (for /local command)
+    /// Daemon client (for /local command, HTTP-based)
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
+
+    /// IPC client — Cap'n Proto channel to the daemon. Preferred over daemon_client
+    /// for brain management. Must live inside a tokio LocalSet (capnp-rpc !Send).
+    ipc_client: Option<crate::ipc::IpcClient>,
 
     /// REPL mode (Normal, Planning, Executing)
     mode: Arc<RwLock<ReplMode>>,
@@ -253,6 +257,7 @@ impl EventLoop {
         local_generator: Arc<RwLock<LocalGenerator>>,
         tokenizer: Arc<TextTokenizer>,
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
+        ipc_client: Option<crate::ipc::IpcClient>,
         mode: Arc<RwLock<ReplMode>>,
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
         session_label: String,
@@ -323,6 +328,7 @@ impl EventLoop {
             active_query_id: Arc::new(RwLock::new(None)),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             daemon_client,
+            ipc_client,
             mode,
             plan_content,
             memtree_console,
@@ -590,15 +596,21 @@ impl EventLoop {
                                 // Daemon brain plan response
                                 self.pending_daemon_brain_plan = false;
                                 if let Some(brain_id) = self.pending_daemon_brain_plan_id.take() {
-                                    if let Some(ref client) = self.daemon_client {
-                                        let (action, feedback) = match &dialog_result {
-                                            crate::cli::tui::DialogResult::Selected(0) => ("approve", None),
-                                            crate::cli::tui::DialogResult::Selected(2) => ("reject", None),
-                                            crate::cli::tui::DialogResult::CustomText(s) => ("changes", Some(s.as_str())),
-                                            crate::cli::tui::DialogResult::TextEntered(s) => ("changes", Some(s.as_str())),
-                                            _ => ("reject", None),
-                                        };
-                                        let fb = feedback.map(str::to_string);
+                                    let (approved, instruction) = match &dialog_result {
+                                        crate::cli::tui::DialogResult::Selected(0) => (true, None),
+                                        crate::cli::tui::DialogResult::CustomText(s) => (false, Some(s.clone())),
+                                        crate::cli::tui::DialogResult::TextEntered(s) => (false, Some(s.clone())),
+                                        _ => (false, None),
+                                    };
+                                    if let Some(ref ipc) = self.ipc_client {
+                                        let _ = ipc.respond_to_brain_plan(
+                                            brain_id,
+                                            approved,
+                                            instruction.as_deref(),
+                                        ).await;
+                                    } else if let Some(ref client) = self.daemon_client {
+                                        let action = if approved { "approve" } else if instruction.is_some() { "changes" } else { "reject" };
+                                        let fb = instruction.clone();
                                         let client_clone = client.clone();
                                         tokio::spawn(async move {
                                             let _ = client_clone.respond_to_brain_plan(
@@ -621,7 +633,9 @@ impl EventLoop {
                                         .unwrap_or_else(|| format!("option_{}", idx)),
                                     _ => "[no answer]".to_string(),
                                 };
-                                if let Some(ref client) = self.daemon_client {
+                                if let Some(ref ipc) = self.ipc_client {
+                                    let _ = ipc.answer_brain_question(brain_id, &answer).await;
+                                } else if let Some(ref client) = self.daemon_client {
                                     let client_clone = client.clone();
                                     tokio::spawn(async move {
                                         let _ = client_clone.answer_brain_question(brain_id, &answer).await;

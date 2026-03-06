@@ -574,8 +574,17 @@ async fn main() -> Result<()> {
         eprintln!("[DEBUG] Starting REPL with full TUI...");
     }
 
-    // Use event loop mode (has all TUI features)
-    repl.run_event_loop(args.initial_prompt).await?;
+    // Run inside a LocalSet so IpcClient (capnp-rpc, !Send) can use spawn_local.
+    // Normal tokio::spawn calls inside the event loop still go to the thread pool.
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        // Try IPC connection to the daemon socket (non-blocking).
+        // If it fails (daemon not running), we just skip it.
+        if let Ok(ipc) = finch::ipc::IpcClient::connect().await {
+            repl.set_ipc_client(ipc);
+        }
+        repl.run_event_loop(args.initial_prompt).await
+    }).await?;
 
     if std::env::var("SHAMMAH_DEBUG").is_ok() {
         eprintln!("[DEBUG] REPL exited, returning from main");
