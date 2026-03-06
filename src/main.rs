@@ -1140,7 +1140,26 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     };
 
     // Set up graceful shutdown handling
-    let server_handle = tokio::spawn(async move { server.serve().await });
+    let server = Arc::new(server);
+    let server_handle = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move { server.serve().await }
+    });
+
+    // Start Cap'n Proto IPC server on Unix socket (internal CLI ↔ daemon channel).
+    // capnp-rpc uses !Send futures, so we run it on a dedicated single-threaded runtime
+    // inside a spawn_blocking thread rather than tokio::spawn (which requires Send).
+    let ipc_handle = tokio::task::spawn_blocking({
+        let server = Arc::clone(&server);
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("IPC tokio runtime");
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(finch::ipc::start_ipc_server(server)))
+        }
+    });
 
     // Wait for shutdown signal (Ctrl+C or SIGTERM)
     tokio::select! {
@@ -1158,6 +1177,13 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 Err(e) => {
                     tracing::error!(error = %e, "Server task panicked");
                 }
+            }
+        }
+        result = ipc_handle => {
+            match result {
+                Ok(Ok(())) => tracing::info!("IPC server exited normally"),
+                Ok(Err(e)) => tracing::error!(error = %e, "IPC server error"),
+                Err(e) => tracing::error!(error = %e, "IPC server task panicked"),
             }
         }
     }

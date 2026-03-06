@@ -21,7 +21,7 @@ tui-textarea = "0.6"  # Text area widget for ratatui (TUI mode)
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["compat"] }  # compat needed for capnp-rpc TokioAsync{Read,Write}CompatExt
 futures = "0.3"
 
 # Global state for TUI output system (Phase 3.5)
@@ -127,6 +127,13 @@ core-foundation = "0.10"  # Foundation types (required by core-graphics)
 # Unix signal handling (for daemon process checks)
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }
+
+# Cap'n Proto IPC (CLI ↔ daemon over Unix socket)
+capnp = "0.20"
+capnp-rpc = "0.20"
+
+[build-dependencies]
+capnpc = "0.20"
 
 [dev-dependencies]
 mockito = "1.2"

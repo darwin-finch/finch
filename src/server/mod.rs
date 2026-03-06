@@ -10,7 +10,7 @@ pub mod openai_types; // Public for client access
 mod session;
 mod training_worker;
 
-pub use brain_registry::{BrainDetail, BrainRegistry, BrainState, BrainSummary, PlanResponse};
+pub use brain_registry::{BrainDetail, BrainRegistry, BrainState, BrainSummary, PendingPlanView, PendingQuestionView, PlanResponse};
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
@@ -87,6 +87,8 @@ pub struct AgentServer {
     training_coordinator: Arc<TrainingCoordinator>,
     /// Training examples sender (for feedback endpoint)
     training_tx: Arc<tokio::sync::mpsc::UnboundedSender<crate::models::WeightedExample>>,
+    /// Training examples receiver — taken once by `serve()` to hand to the worker.
+    training_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::models::WeightedExample>>>,
     /// Brain registry — tracks all daemon brain sessions
     brain_registry: Arc<BrainRegistry>,
 }
@@ -114,8 +116,8 @@ impl AgentServer {
             server_config.session_timeout_minutes,
         );
 
-        // Create training channel (will be connected to worker in serve())
-        let (training_tx, _training_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create training channel; receiver is taken by serve() to hand to the worker.
+        let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
         let providers: Vec<Arc<dyn LlmProvider>> = providers.into_iter().map(Arc::from).collect();
 
         Ok(Self {
@@ -130,17 +132,26 @@ impl AgentServer {
             generator_state,
             training_coordinator,
             training_tx: Arc::new(training_tx),
+            training_rx: std::sync::Mutex::new(Some(training_rx)),
             brain_registry: Arc::new(BrainRegistry::new()),
         })
     }
 
-    /// Start the HTTP server
-    pub async fn serve(mut self) -> Result<()> {
+    /// Start the HTTP server.
+    ///
+    /// Takes `Arc<Self>` so the same server instance can be shared with the
+    /// Cap'n Proto IPC server that runs concurrently.
+    pub async fn serve(self: Arc<Self>) -> Result<()> {
         let addr: SocketAddr = self.config.bind_address.parse()?;
 
-        // Create training worker channel
-        let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
-        self.training_tx = Arc::new(training_tx);
+        // Take the training receiver that was created in new().  Panics if
+        // serve() is called more than once on the same instance (shouldn't happen).
+        let training_rx = self
+            .training_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("AgentServer::serve() called twice");
 
         // Spawn training worker in background
         let worker = TrainingWorker::new(
@@ -208,8 +219,8 @@ impl AgentServer {
             tracing::info!("Model monitor task exiting");
         });
 
-        // Create application state
-        let app_state = Arc::new(self);
+        // Use the existing Arc as application state.
+        let app_state = self;
 
         // Build router with a body size limit to guard against oversized foreign payloads.
         // 4MB is generous for natural-language queries while blocking obvious DoS attempts.
@@ -303,6 +314,14 @@ impl AgentServer {
     /// Get reference to brain registry
     pub fn brain_registry(&self) -> &Arc<BrainRegistry> {
         &self.brain_registry
+    }
+
+    /// Return the primary cloud provider (first in the configured list, if any).
+    ///
+    /// Used by the IPC server to service CLI queries without going through the
+    /// full HTTP handler stack.
+    pub fn primary_provider(&self) -> Option<Arc<dyn crate::providers::LlmProvider>> {
+        self.providers.first().cloned()
     }
 }
 

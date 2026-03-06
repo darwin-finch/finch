@@ -1,6 +1,19 @@
 // Shammah - Local-first Constitutional AI Proxy
 // Library exports
 
+// Cap'n Proto generated code must live at the crate root so that the
+// self-references emitted by capnpc (`crate::finch_ipc_capnp::…`) resolve.
+#[allow(
+    clippy::all,
+    dead_code,
+    unused_imports,
+    non_camel_case_types,
+    non_snake_case
+)]
+pub mod finch_ipc_capnp {
+    include!(concat!(env!("OUT_DIR"), "/finch_ipc_capnp.rs"));
+}
+
 // Core modules
 pub mod agent; // Autonomous agent loop (task backlog, reflection, activity log)
 pub mod brain; // Background context-gathering agent (spawned when user starts typing)
@@ -13,6 +26,7 @@ pub mod daemon; // Daemon lifecycle and auto-spawn (Phase 8)
 pub mod errors; // User-friendly error messages
 pub mod feedback; // Response feedback system for LoRA training
 pub mod generators; // Unified generator interface
+pub mod ipc;        // Cap'n Proto IPC layer (CLI ↔ daemon over Unix socket)
 pub mod license;
 pub mod llms; // Generic LLM abstraction (Phase 1)
 pub mod local; // Local generation system

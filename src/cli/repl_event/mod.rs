@@ -30,11 +30,13 @@
 pub mod event_loop;
 pub mod events;
 pub mod plan_handler;
+pub mod query_processor;
 pub mod query_state;
 pub mod tool_display;
 pub mod tool_execution;
 
 pub use event_loop::EventLoop;
 pub use events::{ConfirmationResult, ReplEvent};
+pub(crate) use query_processor::apply_sliding_window;
 pub use query_state::{QueryMetadata, QueryState, QueryStateManager};
 pub use tool_execution::ToolExecutionCoordinator;
