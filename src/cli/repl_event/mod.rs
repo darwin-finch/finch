@@ -37,6 +37,5 @@ pub mod tool_execution;
 
 pub use event_loop::EventLoop;
 pub use events::{ConfirmationResult, ReplEvent};
-pub(crate) use query_processor::apply_sliding_window;
 pub use query_state::{QueryMetadata, QueryState, QueryStateManager};
 pub use tool_execution::ToolExecutionCoordinator;

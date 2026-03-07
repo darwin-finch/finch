@@ -15,7 +15,6 @@ use uuid::Uuid;
 use crate::ipc::schema::finch_ipc_capnp::{
     self, BrainState as CapnpBrainState, finch_daemon,
 };
-use crate::ipc::transport::sock_path;
 use crate::server::{AgentServer, PlanResponse};
 
 // ---------------------------------------------------------------------------
@@ -274,15 +273,14 @@ impl finch_daemon::Server for FinchDaemonImpl {
     fn spawn_brain(
         &mut self,
         params: finch_daemon::SpawnBrainParams,
-        mut results: finch_daemon::SpawnBrainResults,
+        _results: finch_daemon::SpawnBrainResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
         let task = pry!(p.get_task_description()).to_str().unwrap_or("").to_string();
         let provider = pry!(p.get_provider()).to_str().unwrap_or("").to_string();
         let server = Arc::clone(&self.server);
 
-        // spawn_brain over IPC is not yet implemented — requires daemon-side
-        // BrainSession infrastructure.  Return an error until wired up.
+        // TODO(#wiring): implement spawn_brain over IPC
         let _ = (task, provider, server);
         Promise::err(capnp::Error::failed(
             "spawn_brain over IPC not yet implemented".to_string(),

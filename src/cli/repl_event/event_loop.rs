@@ -122,11 +122,8 @@ pub struct EventLoop {
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
 
-    /// Daemon client (for /local command, HTTP-based)
-    daemon_client: Option<Arc<crate::client::DaemonClient>>,
-
-    /// IPC client — Cap'n Proto channel to the daemon. Preferred over daemon_client
-    /// for brain management. Must live inside a tokio LocalSet (capnp-rpc !Send).
+    /// IPC client — Cap'n Proto channel to the daemon.
+    /// Must live inside a tokio LocalSet (capnp-rpc !Send).
     ipc_client: Option<crate::ipc::IpcClient>,
 
     /// REPL mode (Normal, Planning, Executing)
@@ -256,7 +253,6 @@ impl EventLoop {
         streaming_enabled: bool,
         local_generator: Arc<RwLock<LocalGenerator>>,
         tokenizer: Arc<TextTokenizer>,
-        daemon_client: Option<Arc<crate::client::DaemonClient>>,
         ipc_client: Option<crate::ipc::IpcClient>,
         mode: Arc<RwLock<ReplMode>>,
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
@@ -327,7 +323,6 @@ impl EventLoop {
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            daemon_client,
             ipc_client,
             mode,
             plan_content,
@@ -608,17 +603,6 @@ impl EventLoop {
                                             approved,
                                             instruction.as_deref(),
                                         ).await;
-                                    } else if let Some(ref client) = self.daemon_client {
-                                        let action = if approved { "approve" } else if instruction.is_some() { "changes" } else { "reject" };
-                                        let fb = instruction.clone();
-                                        let client_clone = client.clone();
-                                        tokio::spawn(async move {
-                                            let _ = client_clone.respond_to_brain_plan(
-                                                brain_id,
-                                                action,
-                                                fb.as_deref(),
-                                            ).await;
-                                        });
                                     }
                                 }
                             } else if let Some(brain_id) = self.pending_daemon_brain_id.take() {
@@ -635,11 +619,6 @@ impl EventLoop {
                                 };
                                 if let Some(ref ipc) = self.ipc_client {
                                     let _ = ipc.answer_brain_question(brain_id, &answer).await;
-                                } else if let Some(ref client) = self.daemon_client {
-                                    let client_clone = client.clone();
-                                    tokio::spawn(async move {
-                                        let _ = client_clone.answer_brain_question(brain_id, &answer).await;
-                                    });
                                 }
                                 tracing::debug!("[EVENT_LOOP] Daemon brain question answered");
                             } else {
@@ -1109,52 +1088,55 @@ impl EventLoop {
     /// Handle /local command - query local model directly (bypass routing)
     async fn handle_local_query(&mut self, query: String) -> Result<()> {
         use crate::cli::messages::StreamingResponseMessage;
-        use std::sync::Arc;
 
-        // Check if daemon client exists
-        if let Some(daemon_client) = &self.daemon_client {
-            // Create streaming response message with info header prepended
-            let msg = Arc::new(StreamingResponseMessage::new());
-            msg.append_chunk("🔧 Local Model Query (bypassing routing)\n\n");
+        let Some(ref ipc) = self.ipc_client else {
             self.output_manager
-                .add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
-            self.render_tui().await?;
-
-            // Spawn streaming query in background so event loop continues running
-            // This allows TUI to keep rendering while tokens stream in
-            let daemon_client = daemon_client.clone();
-            let msg_clone = msg.clone();
-            let output_mgr = self.output_manager.clone();
-
-            tokio::spawn(async move {
-                match daemon_client
-                    .query_local_only_streaming_with_callback(&query, move |token_text| {
-                        tracing::debug!("[/local] Received chunk: {:?}", token_text);
-                        msg_clone.append_chunk(token_text);
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        // Append status indicator to the response message itself
-                        msg.append_chunk("\n✓ Local model (bypassed routing)");
-                        msg.set_complete();
-                    }
-                    Err(e) => {
-                        msg.set_failed();
-                        output_mgr.write_error(format!("Local query failed: {}", e));
-                    }
-                }
-            });
-
-            // Return immediately - event loop continues, TUI keeps rendering
-        } else {
-            // No daemon mode - show error
-            self.output_manager
-                .write_error("Error: /local requires daemon mode.");
+                .write_error("Error: /local requires the daemon.");
             self.output_manager
                 .write_info("    Start the daemon: finch daemon --bind 127.0.0.1:11435");
-            self.render_tui().await?;
-        }
+            return self.render_tui().await;
+        };
+
+        let msg = Arc::new(StreamingResponseMessage::new());
+        msg.append_chunk("🔧 Local Model Query (bypassing routing)\n\n");
+        self.output_manager
+            .add_trait_message(msg.clone() as Arc<dyn crate::cli::messages::Message>);
+        self.render_tui().await?;
+
+        let messages = vec![crate::claude::Message {
+            role: "user".to_string(),
+            content: vec![crate::claude::ContentBlock::Text { text: query }],
+        }];
+
+        let mut rx = match ipc.query_stream(messages, vec![]).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                msg.set_failed();
+                self.output_manager.write_error(format!("Local query failed: {}", e));
+                return self.render_tui().await;
+            }
+        };
+
+        // Drive the stream in a local task so the event loop keeps rendering
+        let msg_clone = msg.clone();
+        let output_mgr = self.output_manager.clone();
+        tokio::task::spawn_local(async move {
+            use crate::generators::StreamChunk;
+            while let Some(result) = rx.recv().await {
+                match result {
+                    Ok(StreamChunk::TextDelta(t)) => msg_clone.append_chunk(&t),
+                    Ok(_) => {} // Usage, ContentBlockComplete — ignored
+                    Err(e) => {
+                        msg_clone.set_failed();
+                        output_mgr.write_error(format!("Local query error: {}", e));
+                        return;
+                    }
+                }
+            }
+            // Channel closed = stream complete
+            msg_clone.append_chunk("\n✓ Local model (bypassed routing)");
+            msg_clone.set_complete();
+        });
 
         Ok(())
     }
@@ -2240,9 +2222,6 @@ pub(crate) fn find_last_exchange(messages: &[crate::claude::Message]) -> (String
     (last_query, last_response)
 }
 
-// apply_sliding_window moved to query_processor.rs; re-exported for tests.
-pub(crate) use super::query_processor::apply_sliding_window;
-
 
 /// Build a concise human-readable summary of a tool call for the approval dialog.
 ///
@@ -2347,6 +2326,7 @@ pub(crate) fn dialog_result_to_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::repl_event::query_processor::apply_sliding_window;
     // format_elapsed and format_token_count moved to tool_display; import for status-bar tests.
     use crate::cli::repl_event::tool_display::{format_elapsed, format_token_count};
 

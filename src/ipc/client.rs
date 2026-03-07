@@ -4,8 +4,6 @@
 //! logical operations as the old HTTP `DaemonClient`, but over the fast
 //! binary Cap'n Proto channel.
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use capnp::capability::Promise;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
