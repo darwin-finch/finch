@@ -591,7 +591,7 @@ pub async fn handle_chat_completions(
     }
 
     // Convert internal response to OpenAI format (handles tool_calls)
-    let openai_response = match convert_response_to_openai(content_blocks, &request.model) {
+    let openai_response = match convert_response_to_openai(content_blocks, &request.model, &request.messages) {
         Ok(resp) => resp,
         Err(error_resp) => return error_resp,
     };
@@ -698,7 +698,7 @@ async fn handle_local_only_query(
 
     // Convert response to OpenAI format
     info!("Converting response to OpenAI format...");
-    let openai_response = convert_response_to_openai(content_blocks, &request.model)?;
+    let openai_response = convert_response_to_openai(content_blocks, &request.model, &request.messages)?;
     info!("Response converted, sending back to client");
 
     Ok(Json(openai_response))
@@ -764,11 +764,17 @@ fn convert_tools_to_internal(tools: &[Tool]) -> Vec<InternalToolDefinition> {
         .collect()
 }
 
+/// Estimate token count from text using the ~4 chars/token heuristic.
+fn estimate_tokens(text: &str) -> u32 {
+    ((text.len() + 3) / 4) as u32
+}
+
 /// Convert internal GeneratorResponse to OpenAI format
 #[allow(clippy::result_large_err)]
 fn convert_response_to_openai(
     content_blocks: Vec<ContentBlock>,
     model: &str,
+    input_messages: &[crate::server::openai_types::ChatMessage],
 ) -> Result<ChatCompletionResponse, Response> {
     let mut message_content: Option<String> = None;
     let mut tool_calls: Option<Vec<ToolCall>> = None;
@@ -806,6 +812,22 @@ fn convert_response_to_openai(
         }
     }
 
+    let prompt_tokens: u32 = input_messages
+        .iter()
+        .map(|m| {
+            let content_tokens = m.content.as_deref().map(estimate_tokens).unwrap_or(0);
+            let tool_tokens = m
+                .tool_calls
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|tc| estimate_tokens(&tc.function.arguments))
+                .sum::<u32>();
+            content_tokens + tool_tokens
+        })
+        .sum();
+    let completion_tokens = message_content.as_deref().map(estimate_tokens).unwrap_or(0);
+
     let response = ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -823,9 +845,9 @@ fn convert_response_to_openai(
             finish_reason: finish_reason.to_string(),
         }],
         usage: Usage {
-            prompt_tokens: 0, // TODO: Calculate actual counts
-            completion_tokens: 0,
-            total_tokens: 0,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
         },
     };
 

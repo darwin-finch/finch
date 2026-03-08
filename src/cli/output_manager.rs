@@ -252,23 +252,86 @@ impl Clone for OutputManager {
 }
 
 #[cfg(test)]
-// FIXME: Tests disabled - need to update for new message architecture
-// (OutputMessage was replaced with concrete message types)
-#[cfg(test)]
 mod tests {
-    // use super::*;
+    use super::*;
 
-    // #[test]
-    // fn test_basic_operations() {
-    //     let manager = OutputManager::new(crate::config::ColorScheme::default());
-    //
-    //     manager.write_user("Hello");
-    //     manager.write_response("Hi there!");
-    //     manager.write_tool("read", "File contents...");
-    //
-    //     assert_eq!(manager.len(), 3);
-    //
-    //     let messages = manager.get_messages();
-    //     assert_eq!(messages.len(), 3);
-    // }
+    fn silent_manager() -> OutputManager {
+        let m = OutputManager::new(crate::config::ColorScheme::default());
+        m.disable_stdout();
+        m
+    }
+
+    #[test]
+    fn test_basic_message_count() {
+        let manager = silent_manager();
+
+        manager.write_user("Hello");
+        manager.write_response("Hi there!");
+        manager.write_tool("read", "File contents...");
+
+        assert_eq!(manager.len(), 3);
+        assert_eq!(manager.get_messages().len(), 3);
+    }
+
+    #[test]
+    fn test_is_empty_and_clear() {
+        let manager = silent_manager();
+        assert!(manager.is_empty());
+
+        manager.write_user("a");
+        assert!(!manager.is_empty());
+
+        manager.clear();
+        assert!(manager.is_empty());
+        assert_eq!(manager.len(), 0);
+    }
+
+    #[test]
+    fn test_get_last_messages() {
+        let manager = silent_manager();
+
+        for i in 0..5 {
+            manager.write_info(format!("msg {i}"));
+        }
+
+        let last = manager.get_last_messages(3);
+        assert_eq!(last.len(), 3);
+    }
+
+    #[test]
+    fn test_buffering_mode() {
+        let manager = silent_manager();
+        manager.enable_buffering();
+
+        manager.write_user("buffered");
+        assert!(manager.has_pending());
+
+        let drained = manager.drain_pending();
+        assert_eq!(drained.len(), 1);
+        assert!(!manager.has_pending());
+    }
+
+    #[test]
+    fn test_clone_shares_state() {
+        let manager = silent_manager();
+        let clone = manager.clone();
+
+        manager.write_user("shared");
+        // Clone sees the same underlying Arc data
+        assert_eq!(clone.len(), 1);
+    }
+
+    #[test]
+    fn test_start_live_tool_registered() {
+        let manager = silent_manager();
+        let _live = manager.start_live_tool("tool header");
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_start_work_unit_registered() {
+        let manager = silent_manager();
+        let _wu = manager.start_work_unit("thinking");
+        assert_eq!(manager.len(), 1);
+    }
 }
