@@ -7,6 +7,7 @@
     clippy::all,
     dead_code,
     unused_imports,
+    unused_parens,
     non_camel_case_types,
     non_snake_case
 )]

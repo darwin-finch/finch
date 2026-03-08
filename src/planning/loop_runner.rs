@@ -56,7 +56,6 @@ impl PlanLoop {
 
     async fn run_inner(&self, task: &str, tui: &Arc<Mutex<TuiRenderer>>) -> Result<PlanResult> {
         let mut history: Vec<PlanIteration> = Vec::new();
-        let mut steering_feedback: Option<String> = None;
 
         // ── Clarification gate (iteration 0) ────────────────────────────────
         // On the very first call, ask the model if the task is clear. If it
@@ -119,7 +118,6 @@ impl PlanLoop {
                 }
                 UserFeedback::Cancel => return Ok(PlanResult::Cancelled),
                 UserFeedback::Continue(text) => {
-                    steering_feedback = text.clone();
                     history.push(PlanIteration {
                         iteration: 1,
                         plan_text: probe,
@@ -131,6 +129,7 @@ impl PlanLoop {
         }
 
         for iteration in 2..=self.config.max_iterations {
+            let steering_feedback = history.last().and_then(|i| i.user_feedback.clone());
             // ── 1. Generate plan ────────────────────────────────────────────
             self.show_iteration_header(iteration);
             tui.lock().await.set_operation_status(format!(
@@ -223,7 +222,6 @@ impl PlanLoop {
                     return Ok(PlanResult::Cancelled);
                 }
                 UserFeedback::Continue(text) => {
-                    steering_feedback = text.clone();
                     history.push(PlanIteration {
                         iteration,
                         plan_text: plan,
