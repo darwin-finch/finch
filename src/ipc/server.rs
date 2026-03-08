@@ -273,18 +273,40 @@ impl finch_daemon::Server for FinchDaemonImpl {
     fn spawn_brain(
         &mut self,
         params: finch_daemon::SpawnBrainParams,
-        _results: finch_daemon::SpawnBrainResults,
+        mut results: finch_daemon::SpawnBrainResults,
     ) -> Promise<(), capnp::Error> {
+        use crate::brain::daemon_brain::run_daemon_brain_loop;
+
         let p = pry!(params.get());
         let task = pry!(p.get_task_description()).to_str().unwrap_or("").to_string();
-        let provider = pry!(p.get_provider()).to_str().unwrap_or("").to_string();
+        let provider_name = pry!(p.get_provider()).to_str().unwrap_or("").to_string();
         let server = Arc::clone(&self.server);
 
-        // TODO(#wiring): implement spawn_brain over IPC
-        let _ = (task, provider, server);
-        Promise::err(capnp::Error::failed(
-            "spawn_brain over IPC not yet implemented".to_string(),
-        ))
+        Promise::from_future(async move {
+            let id = Uuid::new_v4();
+            let registry = Arc::clone(server.brain_registry());
+
+            let provider = server
+                .provider_for_name(if provider_name.is_empty() { None } else { Some(&provider_name) })
+                .cloned()
+                .ok_or_else(|| capnp::Error::failed("No provider configured for daemon brains".into()))?;
+
+            let cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~".to_string());
+
+            registry.insert(id, task.clone()).await;
+
+            let registry_clone = Arc::clone(&registry);
+            let task_clone = task.clone();
+            let cwd_clone = cwd.clone();
+            tokio::spawn(async move {
+                run_daemon_brain_loop(id, task_clone, registry_clone, provider, cwd_clone).await;
+            });
+
+            results.get().set_id(id.to_string().as_str());
+            Ok(())
+        })
     }
 
     fn list_brains(
@@ -338,6 +360,9 @@ impl finch_daemon::Server for FinchDaemonImpl {
             }
             if let Some(pp) = &detail.pending_plan {
                 d.set_plan(pp.plan.as_str());
+            }
+            if let Some(summary) = &detail.final_summary {
+                d.set_result(summary.as_str());
             }
             let logs = &detail.event_log;
             let mut el = d.init_event_log(logs.len() as u32);

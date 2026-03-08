@@ -57,17 +57,22 @@ pub async fn run_daemon_brain_loop(
 ) {
     info!("Daemon brain {} starting: {}", id, task);
     match run_loop(id, &task, Arc::clone(&registry), provider.as_ref(), &cwd).await {
-        Ok(()) => {
-            info!("Daemon brain {} finished", id);
+        Ok(Some(summary)) => {
+            info!("Daemon brain {} finished with summary ({} chars)", id, summary.len());
+            registry.set_completed_with_summary(id, summary).await;
+        }
+        Ok(None) => {
+            info!("Daemon brain {} finished (plan path)", id);
+            registry.set_dead(id).await;
         }
         Err(e) => {
             warn!("Daemon brain {} error: {}", id, e);
             registry
                 .append_log(id, format!("[Error] {}", e))
                 .await;
+            registry.set_dead(id).await;
         }
     }
-    registry.set_dead(id).await;
 }
 
 async fn run_loop(
@@ -76,7 +81,7 @@ async fn run_loop(
     registry: Arc<BrainRegistry>,
     provider: &dyn LlmProvider,
     cwd: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let system = daemon_brain_system_prompt(task, cwd);
 
     // Build tool set: read/glob/grep + ask_user_question + present_plan
@@ -105,7 +110,7 @@ async fn run_loop(
             if let Some(detail) = registry.get_detail(id).await {
                 if detail.state == BrainState::Dead {
                     debug!("Daemon brain {} cancelled externally", id);
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
@@ -122,13 +127,14 @@ async fn run_loop(
             .await;
 
         if !response.has_tool_uses() {
-            // No more tool calls — brain finished without presenting a plan.
+            // No more tool calls — brain finished; its final text is the summary.
+            let summary = response.text();
             info!(
-                "Daemon brain {} finished without presenting a plan after {} turns",
+                "Daemon brain {} finished with summary after {} turns",
                 id,
                 turn + 1
             );
-            return Ok(());
+            return Ok(Some(summary));
         }
 
         messages.push(response.to_message());
@@ -160,12 +166,12 @@ async fn run_loop(
 
             if plan_approved {
                 messages.push(Message::with_content("user", result_blocks));
-                return Ok(());
+                return Ok(None);
             }
             if plan_rejected {
                 registry.append_log(id, "[Plan rejected by user]".to_string()).await;
                 messages.push(Message::with_content("user", result_blocks));
-                return Ok(());
+                return Ok(None);
             }
         }
 

@@ -77,6 +77,8 @@ pub struct BrainEntry {
     pub pending_question: Option<PendingQuestion>,
     pub pending_plan: Option<PendingPlan>,
     pub created_at: Instant,
+    /// Final summary text produced by the brain (set when it finishes naturally).
+    pub final_summary: Option<String>,
 }
 
 /// Serializable summary of a brain (for GET /v1/brains list).
@@ -100,6 +102,7 @@ pub struct BrainDetail {
     pub pending_question: Option<PendingQuestionView>,
     pub pending_plan: Option<PendingPlanView>,
     pub age_secs: u64,
+    pub final_summary: Option<String>,
 }
 
 /// Serializable view of a pending question.
@@ -141,6 +144,7 @@ impl BrainEntry {
                 plan: p.plan.clone(),
             }),
             age_secs: self.created_at.elapsed().as_secs(),
+            final_summary: self.final_summary.clone(),
         }
     }
 }
@@ -193,6 +197,7 @@ impl BrainRegistry {
                 pending_question: None,
                 pending_plan: None,
                 created_at: Instant::now(),
+                final_summary: None,
             },
         );
 
@@ -247,6 +252,17 @@ impl BrainRegistry {
             entry.state = BrainState::Dead;
             entry.pending_question = None;
             entry.pending_plan = None;
+        }
+    }
+
+    /// Mark a brain as dead and store its final summary text for injection into the REPL.
+    pub async fn set_completed_with_summary(&self, id: Uuid, summary: String) {
+        let mut brains = self.brains.write().await;
+        if let Some(entry) = brains.get_mut(&id) {
+            entry.state = BrainState::Dead;
+            entry.pending_question = None;
+            entry.pending_plan = None;
+            entry.final_summary = Some(summary);
         }
     }
 
@@ -504,5 +520,48 @@ mod tests {
         let active = registry.list_active().await;
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, id1);
+    }
+
+    #[tokio::test]
+    async fn test_set_completed_with_summary_stores_text() {
+        let registry = BrainRegistry::new();
+        let id = Uuid::new_v4();
+        registry.insert(id, "summarise codebase".to_string()).await;
+
+        registry
+            .set_completed_with_summary(id, "The project uses ONNX for inference.".to_string())
+            .await;
+
+        let detail = registry.get_detail(id).await.unwrap();
+        assert_eq!(detail.state, BrainState::Dead);
+        assert_eq!(
+            detail.final_summary.as_deref(),
+            Some("The project uses ONNX for inference.")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_dead_leaves_summary_none() {
+        let registry = BrainRegistry::new();
+        let id = Uuid::new_v4();
+        registry.insert(id, "a task".to_string()).await;
+        registry.set_dead(id).await;
+
+        let detail = registry.get_detail(id).await.unwrap();
+        assert_eq!(detail.state, BrainState::Dead);
+        assert!(detail.final_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_to_detail_propagates_final_summary() {
+        let registry = BrainRegistry::new();
+        let id = Uuid::new_v4();
+        registry.insert(id, "analyse perf".to_string()).await;
+        registry
+            .set_completed_with_summary(id, "CPU bottleneck in tokenizer".to_string())
+            .await;
+
+        let detail = registry.get_detail(id).await.unwrap();
+        assert_eq!(detail.final_summary.as_deref(), Some("CPU bottleneck in tokenizer"));
     }
 }

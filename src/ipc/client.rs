@@ -188,6 +188,9 @@ impl IpcClient {
                      .unwrap_or_default())
             .collect();
 
+        let result_str = d.get_result()?.to_str()?.to_string();
+        let final_summary = if result_str.is_empty() { None } else { Some(result_str) };
+
         Ok(BrainDetail {
             id: Uuid::parse_str(d.get_id()?.to_str()?)?,
             name: d.get_name()?.to_str()?.to_string(),
@@ -197,6 +200,7 @@ impl IpcClient {
             event_log,
             pending_question,
             pending_plan,
+            final_summary,
         })
     }
 

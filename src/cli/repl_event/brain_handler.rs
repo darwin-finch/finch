@@ -331,6 +331,7 @@ impl EventLoop {
             name: String,
             question: Option<crate::server::brain_registry::PendingQuestionView>,
             plan: Option<crate::server::brain_registry::PendingPlanView>,
+            final_summary: Option<String>,
         }
         let mut details: Vec<Detail> = Vec::new();
         for t in &transitions {
@@ -343,6 +344,18 @@ impl EventLoop {
                             name: t.name.clone(),
                             question: d.pending_question,
                             plan: d.pending_plan,
+                            final_summary: None,
+                        });
+                    }
+                }
+                crate::server::BrainState::Dead => {
+                    if let Ok(d) = self.ipc_client.as_ref().unwrap().get_brain(t.id).await {
+                        details.push(Detail {
+                            id: t.id,
+                            name: t.name.clone(),
+                            question: None,
+                            plan: None,
+                            final_summary: d.final_summary,
                         });
                     }
                 }
@@ -350,12 +363,19 @@ impl EventLoop {
             }
         }
 
-        // Phase 3: show dialogs (needs &mut self, no ipc_client borrow held)
+        // Phase 3: show dialogs / inject summaries (needs &mut self, no ipc_client borrow held)
         for d in details {
             if let Some(q) = d.question {
                 self.show_daemon_brain_question(d.id, &d.name, q).await?;
             } else if let Some(p) = d.plan {
                 self.show_daemon_brain_plan(d.id, &d.name, p).await?;
+            } else if let Some(summary) = d.final_summary {
+                // Brain finished — inject its summary so the next query benefits from it.
+                *self.brain_context.write().await = Some(summary.clone());
+                self.output_manager.write_info(format!(
+                    "🧠 Brain '{}' finished — context ready.",
+                    d.name
+                ));
             }
         }
 
