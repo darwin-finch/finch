@@ -469,9 +469,6 @@ impl PlanLoop {
         tui: &Arc<Mutex<TuiRenderer>>,
         question: &str,
     ) -> Result<Option<String>> {
-        self.output_manager
-            .write_info(format!("\n❓ {question}"));
-
         let dialog = Dialog::text_input(question.to_string(), None);
         let result = {
             let mut tui_guard = tui.lock().await;

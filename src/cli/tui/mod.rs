@@ -374,8 +374,8 @@ impl TuiRenderer {
     /// (not necessarily at the bottom row), so we must use that field — not
     /// `active_rows - 1` — to reach the top correctly.
     pub fn erase_live_area(&mut self) -> Result<()> {
-        if self.active_rows == 0 {
-            return Ok(());
+        if self.active_rows == 0 && self.cursor_row_from_top == 0 {
+            return Ok(()); // Nothing to erase
         }
         let mut stdout = io::stdout();
         execute!(stdout, cursor::MoveToColumn(0))?;
@@ -892,8 +892,10 @@ impl TuiRenderer {
                             self.update_ghost_text();
                         }
                     },
-                    Event::Resize(_, _) => {
-                        self.active_rows = 0;
+                    Event::Resize(w, h) => {
+                        // Clear the entire screen on resize; cursor goes to (0,0)
+                        // so the next draw_live_area() starts from the correct position.
+                        let _ = self.handle_resize(w, h);
                     }
                     _ => {}
                 }
@@ -1191,10 +1193,13 @@ impl TuiRenderer {
                 rows += 1;
             }
             DialogType::TextInput { prompt, input, .. } => {
-                execute!(
-                    stdout,
-                    Print(format!("│  {:<w$}  │\r\n", prompt, w = inner))
-                )?;
+                if !prompt.is_empty() {
+                    execute!(
+                        stdout,
+                        Print(format!("│  {:<w$}  │\r\n", prompt, w = inner))
+                    )?;
+                    rows += 1;
+                }
                 execute!(
                     stdout,
                     Print(format!(
@@ -1203,7 +1208,7 @@ impl TuiRenderer {
                         w = inner.saturating_sub(2)
                     ))
                 )?;
-                rows += 2;
+                rows += 1;
             }
         }
 
@@ -1372,6 +1377,12 @@ impl TuiRenderer {
     /// Returns `DialogResult::Cancelled` if Esc is pressed.
     pub fn show_dialog(&mut self, dialog: Dialog) -> Result<DialogResult> {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        // Commit any pending Complete messages to scrollback before drawing the dialog.
+        // This ensures messages written before show_dialog() appear above the dialog,
+        // not below it (or deferred until after the dialog closes).
+        let om = Arc::clone(&self.output_manager);
+        self.flush_output_safe(&om)?;
 
         self.active_dialog = Some(dialog);
         self.erase_live_area()?;

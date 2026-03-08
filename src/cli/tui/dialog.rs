@@ -162,9 +162,9 @@ impl Dialog {
     pub fn text_input(title: impl Into<String>, default: Option<String>) -> Self {
         let title_str = title.into();
         Self {
-            title: title_str.clone(),
+            title: title_str,
             dialog_type: DialogType::TextInput {
-                prompt: title_str,
+                prompt: String::new(), // title already shown above divider; no need to repeat
                 input: default.clone().unwrap_or_default(),
                 cursor_pos: default.as_ref().map(|s| s.len()).unwrap_or(0),
                 default,
