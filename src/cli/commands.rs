@@ -176,13 +176,18 @@ impl Command {
             }
         }
         if let Some(rest) = trimmed.strip_prefix("/define ") {
-            // /define <word> <definition…>
+            // /define <word> <definition…>   — definition may be empty (AI auto-define)
             let rest = rest.trim();
-            if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
-                let word = rest[..space].trim().to_string();
-                let definition = rest[space..].trim().to_string();
-                if !word.is_empty() && !definition.is_empty() {
-                    return Some(Command::StackDefine(word, definition));
+            if !rest.is_empty() {
+                if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
+                    let word = rest[..space].trim().to_string();
+                    let definition = rest[space..].trim().to_string();
+                    if !word.is_empty() {
+                        return Some(Command::StackDefine(word, definition));
+                    }
+                } else {
+                    // word only — trigger AI auto-define
+                    return Some(Command::StackDefine(rest.to_string(), String::new()));
                 }
             }
         }

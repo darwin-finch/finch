@@ -1074,8 +1074,8 @@ impl EventLoop {
                 return Ok(());
             } else {
                 // Give usage hints for known commands with missing arguments
-                let msg = if input.trim() == "/define" || input.trim().starts_with("/define ") && !input.trim()[8..].contains(' ') {
-                    "Usage: /define <word>[:<sense>] <definition>  (e.g. /define bank:river the edge of a stream)".to_string()
+                let msg = if input.trim() == "/define" {
+                    "Usage: /define <word>[:<sense>] [definition]  (e.g. /define love   or   /define bank:river the edge of a stream)".to_string()
                 } else if input.trim() == "/describe" {
                     "Usage: /describe <word>  (e.g. /describe love)".to_string()
                 } else {
@@ -2484,6 +2484,12 @@ impl EventLoop {
         } else {
             (word.trim().to_lowercase(), None)
         };
+
+        // AI auto-define when no definition supplied
+        if definition.trim().is_empty() {
+            return self.handle_stack_define_auto(key, sense).await;
+        }
+
         let def = definition.trim();
 
         // Escape for TOML
@@ -2540,6 +2546,113 @@ impl EventLoop {
                 "{label} added to ~/.finch/library.toml"
             ));
         }
+        self.render_tui().await
+    }
+
+    /// AI auto-define: ask the brain provider for a definition when the user types `/define word`.
+    async fn handle_stack_define_auto(&mut self, key: String, sense: Option<String>) -> Result<()> {
+        let Some(provider) = self.brain_provider.clone() else {
+            self.output_manager.write_info(
+                "No AI provider configured — use: /define <word> <definition>".to_string(),
+            );
+            return self.render_tui().await;
+        };
+
+        let label = sense.as_deref()
+            .map(|s| format!("\x1b[1;36m{key}\x1b[0m:\x1b[33m{s}\x1b[0m"))
+            .unwrap_or_else(|| format!("\x1b[1;36m{key}\x1b[0m"));
+        self.output_manager.write_info(format!("defining {label}…"));
+        self.render_tui().await?;
+
+        let word_arg = if let Some(ref s) = sense {
+            format!("[\"{key}:{s}\"]")
+        } else {
+            format!("[\"{key}\"]")
+        };
+
+        let request = crate::providers::ProviderRequest::new(vec![
+            crate::claude::types::Message::user(&word_arg),
+        ])
+        .with_system(crate::coforth::generator::GENERATION_SYSTEM_PROMPT.to_string())
+        .with_max_tokens(500);
+
+        let response = match provider.send_message(&request).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.output_manager.write_info(format!("auto-define failed: {e}"));
+                return self.render_tui().await;
+            }
+        };
+
+        // Extract text from response content blocks
+        let text: String = response.content.iter().filter_map(|block| {
+            if let crate::claude::ContentBlock::Text { text } = block { Some(text.as_str()) } else { None }
+        }).collect::<Vec<_>>().join("");
+        let json_text = text
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+
+        let entries: Vec<serde_json::Value> = match serde_json::from_str(json_text) {
+            Ok(v) => v,
+            Err(e) => {
+                self.output_manager.write_info(format!(
+                    "auto-define: couldn't parse AI response: {e}\n\x1b[90m{text}\x1b[0m"
+                ));
+                return self.render_tui().await;
+            }
+        };
+
+        let Some(entry) = entries.into_iter().next() else {
+            self.output_manager.write_info("auto-define: AI returned empty list".to_string());
+            return self.render_tui().await;
+        };
+
+        let definition = entry["definition"]
+            .as_str()
+            .unwrap_or("(no definition)")
+            .to_string();
+        let forth = entry["forth"].as_str().map(|s| s.to_string());
+
+        // Save to ~/.finch/library.toml
+        let path = dirs::home_dir()
+            .map(|h| h.join(".finch").join("library.toml"))
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+
+        let safe_def = definition.replace('\\', "\\\\").replace('"', "\\\"");
+        let sense_line = sense.as_deref()
+            .map(|s| format!("sense = \"{s}\"\n"))
+            .unwrap_or_default();
+        let forth_line = forth.as_deref()
+            .map(|f| {
+                let safe_f = f.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("forth = \"{safe_f}\"\n")
+            })
+            .unwrap_or_default();
+        let entry_toml = format!(
+            "\n[[word]]\nword = \"{key}\"\ndefinition = \"{safe_def}\"\n{sense_line}{forth_line}"
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        use std::io::Write;
+        file.write_all(entry_toml.as_bytes())
+            .context("failed to write library entry")?;
+
+        // Inject into live poset
+        {
+            let lib = crate::coforth::Library::load();
+            let mut p = self.poset.lock().await;
+            lib.inject_into_poset(&key, 1, &mut p);
+        }
+
+        self.output_manager.write_info(format!(
+            "{label}: {definition}\x1b[90m  (saved to ~/.finch/library.toml)\x1b[0m"
+        ));
         self.render_tui().await
     }
 
