@@ -1163,6 +1163,9 @@ pub struct BuildOptions {
     pub batch_size: usize,
     pub validate: bool,
     pub output: PathBuf,
+    /// When true, regenerate words even if they already exist in the output file.
+    /// Used by `heal` which re-generates words that lack valid Forth snippets.
+    pub force: bool,
 }
 
 /// Generate Forth for a flat list of words, streaming results to `output`.
@@ -1187,8 +1190,8 @@ pub async fn build_library(
         _ => anyhow::bail!("specify --all, --category, or --words"),
     };
 
-    // Deduplicate and skip already-generated words
-    let existing = existing_words(&opts.output);
+    // Deduplicate and (unless force) skip already-generated words
+    let existing = if opts.force { HashSet::new() } else { existing_words(&opts.output) };
     let mut seen = HashSet::new();
     seen.extend(existing);
 

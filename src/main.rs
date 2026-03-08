@@ -1718,6 +1718,7 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
                 words: Some(words_to_heal),
                 batch_size,
                 validate: true,
+                force: true,   // re-generate even if word exists without Forth
                 output: output_path,
             };
             generator::build_library(opts, gen).await?;
@@ -1769,6 +1770,7 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
                 words: words_vec,
                 batch_size,
                 validate,
+                force: false,
                 output: output_path,
             };
 
