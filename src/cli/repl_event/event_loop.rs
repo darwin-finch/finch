@@ -2452,20 +2452,25 @@ impl EventLoop {
     }
 
     /// `/describe <word>` — look up a word in the English library and display all its senses.
+    /// If the word is not in the library, auto-define it (AI or manual dialog) then show it.
     async fn handle_stack_describe(&mut self, word: String) -> Result<()> {
-        let lib = crate::coforth::Library::load();
         let key = word.trim().to_lowercase();
+        let senses_empty = {
+            let lib = crate::coforth::Library::load();
+            lib.lookup_all(&key).is_empty()
+        };
+
+        if senses_empty {
+            // Unknown word — define it first, then fall through to show
+            self.handle_stack_define_auto(key.clone(), None).await?;
+        }
+
+        // Re-load after possible auto-define
+        let lib = crate::coforth::Library::load();
         let senses = lib.lookup_all(&key);
         if senses.is_empty() {
-            let nearby = lib.related(&key, 1);
-            if nearby.is_empty() {
-                self.output_manager.write_info(format!("\"{}\" not in library", key));
-            } else {
-                let names: Vec<&str> = nearby.iter().map(|e| e.word.as_str()).collect();
-                self.output_manager.write_info(format!(
-                    "\"{}\" not found — nearby: {}", key, names.join(", ")
-                ));
-            }
+            // Auto-define was cancelled or failed — nothing to show
+            return Ok(());
         } else {
             let mut out = format!("\x1b[1;36m{key}\x1b[0m");
             for (i, entry) in senses.iter().enumerate() {
