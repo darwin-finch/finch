@@ -60,6 +60,22 @@ pub enum Command {
     BrainCancel(String), // /brain cancel <name-or-id>
     // Execution graph
     Graph, // /graph — show causal trace of last query
+    // Co-Forth VM stack ops
+    StackPush(String),            // /push <text>      — push text onto the stack
+    StackShow,                    // /stack            — show current stack contents
+    StackPop,                     // /pop              — remove top item (undo last push)
+    StackRun,                     // /run              — execute full stack as one query
+    StackClear,                   // /stack clear      — drop all stack items
+    StackProgram,                 // /program          — switch panel to Forth source view
+    StackView,                    // /view             — switch panel to graph view (toggle)
+    StackDemo,                    // /demo             — seed an example language to play with
+    // Special Forth vocabulary ops
+    StackChain(usize, usize),     // /chain W1 W2      — add edge W1 → W2
+    StackForget(usize),           // /forget W1        — remove word and AI descendants
+    StackDup(usize),              // /dup W1           — clone word as new entry
+    StackSwap(usize, usize),      // /swap W1 W2       — swap labels of two words
+    StackDescribe(String),        // /describe <word>  — show library entry for a word
+    StackDefine(String, String),  // /define <word> <def> — add word to user library
 }
 
 impl Command {
@@ -95,6 +111,14 @@ impl Command {
             // Brain sessions
             "/brains" | "/brains list" => return Some(Command::Brains),
             "/graph" => return Some(Command::Graph),
+            // Co-Forth VM
+            "/stack" | "/stack list" | "/stack show" => return Some(Command::StackShow),
+            "/stack clear" | "/stack reset" => return Some(Command::StackClear),
+            "/pop" => return Some(Command::StackPop),
+            "/run" | "/execute" | "/exec" => return Some(Command::StackRun),
+            "/program" | "/words" | "/forth" => return Some(Command::StackProgram),
+            "/view" | "/graph view" | "/poset" => return Some(Command::StackView),
+            "/demo" | "/demo lang" => return Some(Command::StackDemo),
             _ => {}
         }
 
@@ -103,6 +127,63 @@ impl Command {
             let key = rest.trim();
             if !key.is_empty() {
                 return Some(Command::LicenseActivate(key.to_string()));
+            }
+        }
+
+        // Handle /push <text> — push onto stack
+        if let Some(rest) = trimmed.strip_prefix("/push ") {
+            let text = rest.trim();
+            if !text.is_empty() {
+                return Some(Command::StackPush(text.to_string()));
+            }
+        }
+
+        // Co-Forth special ops: /chain W1 W2, /forget W1, /dup W1, /swap W1 W2
+        if let Some(rest) = trimmed.strip_prefix("/chain ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() == 2 {
+                let a = parse_word_id(parts[0]);
+                let b = parse_word_id(parts[1]);
+                if let (Some(a), Some(b)) = (a, b) {
+                    return Some(Command::StackChain(a, b));
+                }
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/forget ") {
+            if let Some(id) = parse_word_id(rest.trim()) {
+                return Some(Command::StackForget(id));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/dup ") {
+            if let Some(id) = parse_word_id(rest.trim()) {
+                return Some(Command::StackDup(id));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/swap ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() == 2 {
+                let a = parse_word_id(parts[0]);
+                let b = parse_word_id(parts[1]);
+                if let (Some(a), Some(b)) = (a, b) {
+                    return Some(Command::StackSwap(a, b));
+                }
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/describe ") {
+            let word = rest.trim();
+            if !word.is_empty() {
+                return Some(Command::StackDescribe(word.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/define ") {
+            // /define <word> <definition…>
+            let rest = rest.trim();
+            if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
+                let word = rest[..space].trim().to_string();
+                let definition = rest[space..].trim().to_string();
+                if !word.is_empty() && !definition.is_empty() {
+                    return Some(Command::StackDefine(word, definition));
+                }
             }
         }
 
@@ -356,7 +437,31 @@ pub fn handle_command(
         Command::Graph => Ok(CommandOutput::Status(
             "Graph command should be handled in REPL.".to_string(),
         )),
+        // Stack commands are handled directly in REPL
+        Command::StackPush(_)
+        | Command::StackShow
+        | Command::StackPop
+        | Command::StackRun
+        | Command::StackClear
+        | Command::StackProgram
+        | Command::StackView
+        | Command::StackDemo
+        | Command::StackChain(_, _)
+        | Command::StackForget(_)
+        | Command::StackDup(_)
+        | Command::StackSwap(_, _)
+        | Command::StackDescribe(_)
+        | Command::StackDefine(_, _) => Ok(CommandOutput::Status(
+            "Stack commands should be handled in REPL.".to_string(),
+        )),
     }
+}
+
+/// Parse "W3" or "3" into a node id (usize).
+fn parse_word_id(s: &str) -> Option<usize> {
+    let s = s.trim();
+    let digits = s.strip_prefix('W').or_else(|| s.strip_prefix('w')).unwrap_or(s);
+    digits.parse::<usize>().ok()
 }
 
 pub fn format_help() -> String {
@@ -448,6 +553,21 @@ pub fn format_help() -> String {
          \x1b[32m  • Remember pattern\x1b[0m         Always allow (saves to /patterns)\n\
          \x1b[31m  • Deny\x1b[0m                     Reject the action\n\n\
          Available tools: Read, Glob, Grep, WebFetch, Bash, Restart\n\n\
+         \x1b[1;33m📚 Co-Forth VM:\x1b[0m\n\
+         \x1b[36m  /push <text>\x1b[0m       Push a word onto the stack (silent)\n\
+         \x1b[36m  /pop\x1b[0m               Remove top item (undo last push)\n\
+         \x1b[36m  /run\x1b[0m               Execute the program (shows approval dialog)\n\
+         \x1b[36m  /program\x1b[0m           Show current program as Forth source\n\
+         \x1b[36m  /stack\x1b[0m             Show stack contents\n\
+         \x1b[36m  /stack clear\x1b[0m       Drop all stack items\n\
+         \x1b[36m  /describe <word>\x1b[0m   Show library definition + related words\n\
+         \x1b[36m  /define <w> <def>\x1b[0m  Add/override a word in your personal library\n\
+         \x1b[36m  /define <w>:<sense>\x1b[0m Add a specific sense (e.g. /define bank:river the sloping land)\n\
+         \x1b[90m                     (1030 English words preloaded — override at your peril)\x1b[0m\n\
+         \x1b[0m\n\
+         \x1b[90m  Type text to push words. The AI pushes back via Push tool.\n\
+         The stack builds a Forth dialect. /run executes it.\x1b[0m\n\
+         \x1b[90m  /run collapses the stack and executes it.\x1b[0m\n\n\
          \x1b[1;33m🧠 Daemon Brain Sessions:\x1b[0m\n\
          \x1b[36m  /brain <task>\x1b[0m      Spawn a background research brain\n\
          \x1b[90m                     Example: /brain investigate why auth tests are flaky\x1b[0m\n\

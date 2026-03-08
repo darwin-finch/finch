@@ -228,6 +228,17 @@ pub struct EventLoop {
     /// Whether the REPL is currently showing a plan dialog for a daemon brain.
     pending_daemon_brain_plan: bool,
     pending_daemon_brain_plan_id: Option<Uuid>,
+
+    /// Co-Forth shared stack: items pushed by the user (text) or by the AI (Push tool).
+    /// Arc<Mutex> so the tool executor can write to it during generation.
+    stack: Arc<tokio::sync::Mutex<Vec<String>>>,
+
+    /// Co-Forth poset VM — partially-ordered task graph with 3D renderer.
+    poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>,
+
+    /// The Co-Forth word that was popped when entering plan mode.
+    /// Stored so the user can re-plan without losing the word.
+    plan_word: Option<String>,
 }
 
 /// View mode for the REPL
@@ -271,9 +282,19 @@ impl EventLoop {
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-        // Wire the todo list into the TUI renderer before wrapping in Arc<Mutex>
+        // Create Co-Forth shared stack before TUI so both hold the same Arc.
+        let stack: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        // Create Co-Forth poset VM before TUI so both hold the same Arc.
+        let poset: Arc<tokio::sync::Mutex<crate::poset::Poset>> =
+            Arc::new(tokio::sync::Mutex::new(crate::poset::Poset::new()));
+
+        // Wire todo list, stack, and poset into TUI renderer before wrapping in Arc<Mutex>
         let mut tui_renderer = tui_renderer;
         tui_renderer.set_todo_list(Arc::clone(&todo_list));
+        tui_renderer.set_stack(Arc::clone(&stack));
+        tui_renderer.set_poset(Arc::clone(&poset));
 
         // Wrap TUI in Arc<Mutex> for shared access
         let tui_renderer = Arc::new(Mutex::new(tui_renderer));
@@ -284,7 +305,7 @@ impl EventLoop {
         // Initialize plan content storage
         let plan_content = Arc::new(RwLock::new(None));
 
-        // Create tool coordinator
+        // Create tool coordinator and wire the shared stack in.
         let tool_coordinator = ToolExecutionCoordinator::new(
             event_tx.clone(),
             Arc::clone(&tool_executor),
@@ -293,7 +314,9 @@ impl EventLoop {
             Arc::clone(&tokenizer),
             Arc::clone(&mode),
             Arc::clone(&plan_content),
-        );
+        )
+        .with_stack(Arc::clone(&stack))
+        .with_poset(Arc::clone(&poset));
 
         // Initialize memtree console (uses a separate dummy tree for the tree-view UI)
         let (memtree_console, memtree_handler) = {
@@ -363,6 +386,9 @@ impl EventLoop {
             current_graph: Arc::new(tokio::sync::Mutex::new(
                 crate::graph::ExecutionGraph::new(),
             )),
+            stack,
+            poset,
+            plan_word: None,
         }
     }
 
@@ -535,6 +561,8 @@ impl EventLoop {
                         ReplEvent::Shutdown => "Shutdown",
                         ReplEvent::BrainQuestion { .. } => "BrainQuestion",
                         ReplEvent::BrainProposedAction { .. } => "BrainProposedAction",
+                        ReplEvent::PosetComplete { result: Ok(_) } => "PosetComplete(ok)",
+                        ReplEvent::PosetComplete { result: Err(_) } => "PosetComplete(err)",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -549,6 +577,9 @@ impl EventLoop {
 
                 // Periodic rendering
                 _ = render_interval.tick() => {
+                    // Slowly rotate the poset 3D view (0.008 rad/tick ≈ 1 full turn per ~12s)
+                    self.poset.lock().await.rotate(0.008, 0.0);
+
                     // Check for pending cancellation
                     {
                         let mut tui = self.tui_renderer.lock().await;
@@ -762,28 +793,52 @@ impl EventLoop {
                         let current_mode = self.mode.read().await.clone();
                         match current_mode {
                             ReplMode::Normal => {
-                                // Enter plan mode manually
-                                let plan_path = std::env::temp_dir()
-                                    .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
-                                let new_mode = ReplMode::Planning {
-                                    task: "Manual exploration".to_string(),
-                                    plan_path: plan_path.clone(),
-                                    created_at: chrono::Utc::now(),
+                                // If the Co-Forth stack has words, pop the top one and run the
+                                // IMPCPD plan loop on it. Store in plan_word so the user can
+                                // re-plan (/plan again) without re-popping.
+                                let stack_word = if let Some(word) = self.plan_word.clone() {
+                                    // Re-plan: use stored word, don't pop again
+                                    Some(word)
+                                } else {
+                                    let popped = {
+                                        let mut s = self.stack.lock().await;
+                                        s.pop()
+                                    };
+                                    if let Some(word) = popped {
+                                        self.plan_word = Some(word.clone());
+                                        Some(word)
+                                    } else {
+                                        None
+                                    }
                                 };
-                                *self.mode.write().await = new_mode.clone();
-                                self.output_manager.write_info(
-                                    "📋 Entered plan mode.\n\
-                                     You can explore the codebase using read-only tools:\n\
-                                     - Read files, glob, grep, web_fetch are allowed\n\
-                                     - Write, edit, bash are restricted\n\
-                                     Use /plan to exit plan mode.",
-                                );
-                                // Update status bar indicator
-                                self.update_plan_mode_indicator(&new_mode);
+
+                                if let Some(task) = stack_word {
+                                    // Kick off the full IMPCPD plan loop for the popped word.
+                                    self.handle_plan_task(task).await?;
+                                } else {
+                                    // No stack word — plain plan mode entry
+                                    let plan_path = std::env::temp_dir()
+                                        .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+                                    let new_mode = ReplMode::Planning {
+                                        task: "Manual exploration".to_string(),
+                                        plan_path: plan_path.clone(),
+                                        created_at: chrono::Utc::now(),
+                                    };
+                                    *self.mode.write().await = new_mode.clone();
+                                    self.output_manager.write_info(
+                                        "📋 Entered plan mode.\n\
+                                         You can explore the codebase using read-only tools:\n\
+                                         - Read files, glob, grep, web_fetch are allowed\n\
+                                         - Write, edit, bash are restricted\n\
+                                         Use /plan to exit plan mode.",
+                                    );
+                                    self.update_plan_mode_indicator(&new_mode);
+                                }
                             }
                             ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
-                                // Exit plan mode, return to normal
+                                // Exit plan mode, return to normal; clear plan_word
                                 *self.mode.write().await = ReplMode::Normal;
+                                self.plan_word = None;
                                 self.output_manager
                                     .write_info("✅ Exited plan mode. Returned to normal mode.");
                                 // Update status bar indicator
@@ -952,6 +1007,61 @@ impl EventLoop {
                     Command::Graph => {
                         self.handle_graph_command().await?;
                     }
+                    Command::StackPush(text) => {
+                        self.handle_stack_push(text).await?;
+                    }
+                    Command::StackShow => {
+                        self.handle_stack_show().await?;
+                    }
+                    Command::StackPop => {
+                        self.handle_stack_pop().await?;
+                    }
+                    Command::StackRun => {
+                        if let Some(query) = self.handle_stack_run().await? {
+                            // confirm_poset_run is called inside handle_poset_or_query.
+                            self.handle_poset_or_query(query).await?;
+                            {
+                                // Placeholder block kept for structure (was: rejected branch).
+                                let _ = ();
+                                self.render_tui().await?;
+                            }
+                        }
+                    }
+                    Command::StackClear => {
+                        self.handle_stack_clear().await?;
+                    }
+                    Command::StackProgram => {
+                        self.handle_stack_program().await?;
+                    }
+                    Command::StackView => {
+                        let mut tui = self.tui_renderer.lock().await;
+                        if tui.poset_panel_mode == crate::cli::tui::PosetPanelMode::Forth {
+                            tui.toggle_poset_view();
+                        }
+                        drop(tui);
+                        self.render_tui().await?;
+                    }
+                    Command::StackDemo => {
+                        self.handle_stack_demo().await?;
+                    }
+                    Command::StackChain(a, b) => {
+                        self.handle_stack_chain(a, b).await?;
+                    }
+                    Command::StackForget(id) => {
+                        self.handle_stack_forget(id).await?;
+                    }
+                    Command::StackDup(id) => {
+                        self.handle_stack_dup(id).await?;
+                    }
+                    Command::StackSwap(a, b) => {
+                        self.handle_stack_swap(a, b).await?;
+                    }
+                    Command::StackDescribe(word) => {
+                        self.handle_stack_describe(word).await?;
+                    }
+                    Command::StackDefine(word, definition) => {
+                        self.handle_stack_define(word, definition).await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -963,9 +1073,15 @@ impl EventLoop {
                 }
                 return Ok(());
             } else {
-                // Unknown commands also go to scrollback
-                self.output_manager
-                    .write_info(format!("Unknown command: {}", input));
+                // Give usage hints for known commands with missing arguments
+                let msg = if input.trim() == "/define" || input.trim().starts_with("/define ") && !input.trim()[8..].contains(' ') {
+                    "Usage: /define <word>[:<sense>] <definition>  (e.g. /define bank:river the edge of a stream)".to_string()
+                } else if input.trim() == "/describe" {
+                    "Usage: /describe <word>  (e.g. /describe love)".to_string()
+                } else {
+                    format!("Unknown command: {}", input)
+                };
+                self.output_manager.write_info(msg);
                 self.render_tui().await?;
                 return Ok(());
             }
@@ -979,6 +1095,29 @@ impl EventLoop {
             return Ok(());
         }
 
+        // ── Co-Forth: plain text pushes onto the stack (no AI trigger) ──────────
+        // The program accumulates silently. /run is the only execution trigger.
+        // This preserves the Forth model: words are defined first, executed later.
+        self.output_manager.write_user(input.clone());
+        self.handle_stack_push(input).await?;
+        return Ok(());
+    }
+
+    /// Execute a query with echo (used by /run where the query hasn't been displayed yet).
+    async fn execute_query(&mut self, input: String) -> Result<()> {
+        self.execute_query_inner(input, true, false).await
+    }
+
+    /// Execute a conversational response to a word push — no tools, no brain context injection.
+    async fn execute_chat_response(&mut self, input: String) -> Result<()> {
+        self.execute_query_inner(input, false, true).await
+    }
+
+    /// Execute a query directly — called by /run after draining the stack, or
+    /// after a user push (where the echo was already written).
+    /// `echo` — whether to write the user query to the output buffer.
+    /// `chat_only` — suppress tools and brain context (for word-push conversational responses).
+    async fn execute_query_inner(&mut self, input: String, echo: bool, chat_only: bool) -> Result<()> {
         // Drain any pending images from TUI (pasted before sending)
         let pending_images: Vec<(String, String)> = {
             let mut tui = self.tui_renderer.lock().await;
@@ -988,8 +1127,10 @@ impl EventLoop {
                 .collect()
         };
 
-        // Echo user input to output buffer
-        self.output_manager.write_user(input.clone());
+        // Echo query to output buffer (skip when caller already echoed)
+        if echo {
+            self.output_manager.write_user(input.clone());
+        }
 
         // Create a new query
         let conversation_snapshot = self.conversation.read().await.snapshot();
@@ -1015,8 +1156,11 @@ impl EventLoop {
         *self.active_query_id.write().await = Some(query_id);
 
         // Inject pre-gathered brain context (if any) as a hidden block.
-        // Skip if the context is empty or whitespace-only.
-        let enriched = {
+        // Skip for chat_only (word pushes) — brain context triggers tool use.
+        let enriched = if chat_only {
+            // Drop brain context without consuming it — it stays for the next real query.
+            input.clone()
+        } else {
             let mut ctx = self.brain_context.write().await;
             match ctx.take() {
                 Some(brain_ctx) if !brain_ctx.trim().is_empty() => {
@@ -1030,8 +1174,34 @@ impl EventLoop {
             }
         };
 
-        // Spawn query processing task
-        self.spawn_query_task(query_id, enriched).await;
+        // Co-Forth mode: if the poset has words, inject the shared vocabulary context.
+        let enriched = {
+            let p = self.poset.lock().await;
+            if !p.is_empty() {
+                let vocab: Vec<String> = p.nodes.iter()
+                    .map(|n| format!("  W{} — {}", n.id, n.label))
+                    .collect();
+                format!(
+                    "{}\n\n[Context: the user is building a vocabulary ({} words so far: {}). \
+                     Respond naturally — talk about ideas, meanings, connections. \
+                     Do NOT mention the vocabulary system, word labels (W0/W1/etc.), \
+                     Co-Forth, or stack mechanics in your responses. \
+                     That machinery is invisible to users. Just converse.]",
+                    enriched,
+                    p.nodes.len(),
+                    vocab.join(", "),
+                )
+            } else {
+                enriched
+            }
+        };
+
+        // Spawn query processing task (no tools for chat_only word-push responses)
+        if chat_only {
+            self.spawn_query_task_no_tools(query_id, enriched).await;
+        } else {
+            self.spawn_query_task(query_id, enriched).await;
+        }
 
         Ok(())
     }
@@ -1388,6 +1558,73 @@ impl EventLoop {
         });
     }
 
+    /// Like `spawn_query_task` but passes empty tool definitions — used for conversational
+    /// word-push responses where tool use would be inappropriate.
+    async fn spawn_query_task_no_tools(&self, query_id: Uuid, query: String) {
+        if !query.is_empty() {
+            let mut g = self.current_graph.lock().await;
+            g.reset(query_id, &self.session_label);
+            g.add_node(crate::graph::NodeKind::UserInput { text: query.clone() });
+        }
+
+        let event_tx = self.event_tx.clone();
+        let claude_gen = self.cloud_gen.read().await.clone();
+        let qwen_gen = Arc::clone(&self.qwen_gen);
+        let router = Arc::clone(&self.router);
+        let generator_state = Arc::clone(&self.generator_state);
+        let no_tools: Arc<Vec<crate::tools::ToolDefinition>> = Arc::new(vec![]);
+        let conversation = Arc::clone(&self.conversation);
+        let query_states = Arc::clone(&self.query_states);
+        let tool_coordinator = self.tool_coordinator.clone();
+        let tui_renderer = Arc::clone(&self.tui_renderer);
+        let mode = Arc::clone(&self.mode);
+        let output_manager = Arc::clone(&self.output_manager);
+        let status_bar = Arc::clone(&self.status_bar);
+        let active_tool_uses = Arc::clone(&self.active_tool_uses);
+        let memory_system = self.memory_system.clone();
+        let session_label = self.session_label.clone();
+        let cwd = self.cwd.clone();
+        let context_lines = self.context_lines;
+        let max_verbatim = self.max_verbatim_messages;
+        let recall_k = self.context_recall_k;
+        let enable_summarization = self.enable_summarization;
+        let auto_compact_enabled = self.auto_compact_enabled;
+        let summary_gen = Arc::clone(&claude_gen);
+        let tool_call_history = Arc::clone(&self.tool_call_history);
+
+        tokio::spawn(async move {
+            process_query_with_tools(
+                query_id,
+                query,
+                event_tx,
+                claude_gen,
+                qwen_gen,
+                router,
+                generator_state,
+                no_tools,
+                conversation,
+                query_states,
+                tool_coordinator,
+                tui_renderer,
+                mode,
+                output_manager,
+                status_bar,
+                active_tool_uses,
+                memory_system,
+                session_label,
+                cwd,
+                context_lines,
+                max_verbatim,
+                recall_k,
+                enable_summarization,
+                auto_compact_enabled,
+                summary_gen,
+                tool_call_history,
+            )
+            .await;
+        });
+    }
+
 
     /// Handle an event from the event channel
     async fn handle_event(&mut self, event: ReplEvent) -> Result<()> {
@@ -1542,6 +1779,10 @@ impl EventLoop {
                     }
                 }
 
+                // The AI does NOT auto-push to the stack on completion.
+                // It pushes explicitly via the Push tool when it wants to
+                // add something to the collaborative program.
+
                 // Clear per-query tool-call history so it doesn't grow forever.
                 self.tool_call_history.write().await.remove(&query_id);
             }
@@ -1639,6 +1880,21 @@ impl EventLoop {
                 self.handle_brain_proposed_action(command, reason, response_tx)
                     .await?;
             }
+
+            ReplEvent::PosetComplete { result } => {
+                match result {
+                    Ok(text) if !text.trim().is_empty() => {
+                        self.output_manager.write_response(text);
+                    }
+                    Ok(_) => {
+                        self.output_manager.write_info("📚 Program complete.");
+                    }
+                    Err(e) => {
+                        self.output_manager.write_info(format!("📚 Error: {e}"));
+                    }
+                }
+                self.render_tui().await?;
+            }
         }
 
         Ok(())
@@ -1721,7 +1977,7 @@ impl EventLoop {
                 // Truncate very long error messages for the row display
                 let err_str = e.to_string();
                 let short_err = if err_str.len() > 60 {
-                    format!("{}…", &err_str[..57])
+                    format!("{}…", err_str.chars().take(57).collect::<String>())
                 } else {
                     err_str
                 };
@@ -1902,6 +2158,692 @@ impl EventLoop {
         }
         self.render_tui().await?;
         Ok(())
+    }
+
+    /// Handle `/push <text>` — push text onto the Co-Forth stack.
+    /// Push a word onto the Co-Forth stack and respond conversationally.
+    async fn handle_stack_push(&mut self, text: String) -> Result<()> {
+        // Strip trailing noise characters (backslash, punctuation typos) from the push.
+        let text = text.trim_end_matches(|c: char| c == '\\' || c == '/' || c == ',' || c == '.')
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return Ok(());
+        }
+        {
+            let mut stack = self.stack.lock().await;
+            stack.push(text.clone());
+        };
+        // Add a Task node to the poset.
+        self.poset.lock().await.add_node(
+            text.clone(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
+
+        // Seed from the English library: bring in the 1-hop neighbourhood
+        // of each word in the pushed text that appears in the library.
+        {
+            let lib = crate::coforth::Library::load();
+            let mut p = self.poset.lock().await;
+            for token in text.split_whitespace() {
+                let token = token.trim_matches(|c: char| !c.is_alphabetic());
+                if lib.lookup(token).is_some() {
+                    lib.inject_into_poset(token, 1, &mut p);
+                }
+            }
+        }
+        // Ensure the panel shows Forth view (vocabulary being built).
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            if tui.poset_panel_mode != crate::cli::tui::PosetPanelMode::Forth {
+                tui.poset_panel_mode = crate::cli::tui::PosetPanelMode::Forth;
+            }
+        }
+
+        // Precompile: fire a background task that anticipates what words the user
+        // will want next and pushes them silently. The panel gains words before
+        // the user even asks. This is the JIT step — compile-on-define.
+        let trigger_id = {
+            let p = self.poset.lock().await;
+            p.nodes.last().map(|n| n.id)
+        };
+        self.spawn_coforth_precompile(text.clone(), trigger_id).await;
+
+        // Talk back — respond conversationally to what was pushed.
+        // Frame the push as a topic, not a command, so the AI riffs on the word
+        // rather than giving a generic coding-assistant intro.
+        let query = if text.split_whitespace().count() <= 3 {
+            // Short push — guide the AI to talk about the concept, not treat it as a command.
+            format!("Tell me about: {text}")
+        } else {
+            text
+        };
+        // Caller already echoed the original push; use chat_response to avoid
+        // showing the reframed query text AND to suppress tool use.
+        self.execute_chat_response(query).await?;
+
+        Ok(())
+    }
+
+    /// Spawn a background task that reads the current vocabulary and pushes
+    /// 2-3 words the user is likely to want next — without blocking the TUI.
+    /// Uses the local model (the CPU) so precompilation is fast and offline.
+    /// `trigger_id` — the poset node that triggered this precompile; new words
+    /// are wired as successors of that node so the vocabulary has structure.
+    async fn spawn_coforth_precompile(&mut self, new_word: String, trigger_id: Option<usize>) {
+        // Prefer the local model — precompile should be cheap, fast, and offline.
+        let generator = self.qwen_gen.clone();
+        let poset = Arc::clone(&self.poset);
+        let stack = Arc::clone(&self.stack);
+
+        // Snapshot current vocabulary for the prompt.
+        let vocab: Vec<String> = {
+            let p = poset.lock().await;
+            p.nodes.iter()
+                .map(|n| format!("W{} — {}", n.id, n.label))
+                .collect()
+        };
+
+        tokio::spawn(async move {
+            let vocab_str = if vocab.is_empty() {
+                String::new()
+            } else {
+                format!("Existing words:\n{}\n\n", vocab.join("\n"))
+            };
+
+            // Structured prompt — rigid template so small models can follow it.
+            // Each line: WORD: <label> | FORTH: <forth source>
+            // The Forth source should be a colon definition or a literal expression.
+            let prompt = format!(
+                "Extend a Co-Forth vocabulary. A new word was just defined:\n\
+                 WORD: {new_word}\n\n\
+                 {vocab_str}\
+                 Suggest 2-3 related words. For each, write one line:\n\
+                 WORD: <label> | FORTH: <forth code>\n\n\
+                 The Forth code must be valid Forth that produces a result (a number or printed output).\n\
+                 Available built-ins: + - * / mod dup drop swap over rot . .\" cr if else then begin until do loop i variable @ !\n\
+                 Useful library words: square cube sum-to-n gcd fib sign even? odd? clamp\n\
+                 Example:\n\
+                 WORD: double | FORTH: : double 2 * ; 5 double .\n\
+                 WORD: sum-5 | FORTH: 5 sum-to-n .\n\
+                 Be specific. No explanations.",
+            );
+
+            let messages = vec![crate::claude::Message {
+                role: "user".to_string(),
+                content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+            }];
+
+            let Ok(response) = generator.generate(messages, None).await else { return };
+
+            // Parse "WORD: <label> | FORTH: <code>" lines from the response.
+            // Falls back to plain "WORD: <label>" if no Forth code provided.
+            struct ParsedWord { label: String, forth: Option<String> }
+            let mut items: Vec<ParsedWord> = Vec::new();
+
+            for line in response.text.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("WORD:") {
+                    if let Some((label_part, forth_part)) = rest.split_once('|') {
+                        let label = label_part.trim().to_string();
+                        let forth = forth_part.strip_prefix("FORTH:")
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        if !label.is_empty() { items.push(ParsedWord { label, forth }); }
+                    } else {
+                        let label = rest.trim().to_string();
+                        if !label.is_empty() { items.push(ParsedWord { label, forth: None }); }
+                    }
+                }
+            }
+
+            // Push each parsed word into the poset and stack,
+            // wired as a successor of the triggering word.
+            for item in items.into_iter().take(3) {
+                let new_id = {
+                    let mut p = poset.lock().await;
+                    let id = p.add_node(
+                        item.label.clone(),
+                        crate::poset::NodeKind::Observation,
+                        crate::poset::NodeAuthor::Ai,
+                    );
+                    if let Some(ref code) = item.forth {
+                        if let Some(n) = p.node_mut(id) {
+                            n.compiled_code = Some(code.clone());
+                            n.compiled_lang = Some("forth".to_string());
+                        }
+                    }
+                    if let Some(tid) = trigger_id {
+                        p.edges.push((tid, id));
+                    }
+                    id
+                };
+                let _ = new_id;
+                stack.lock().await.push(item.label);
+            }
+        });
+    }
+
+    /// `/chain W1 W2` — add edge W1 → W2 (W2 depends on W1).
+    async fn handle_stack_chain(&mut self, a: usize, b: usize) -> Result<()> {
+        let ok = {
+            let mut p = self.poset.lock().await;
+            let has_a = p.nodes.iter().any(|n| n.id == a);
+            let has_b = p.nodes.iter().any(|n| n.id == b);
+            if has_a && has_b {
+                p.edges.push((a, b));
+                true
+            } else {
+                false
+            }
+        };
+        if ok {
+            self.output_manager.write_info(format!("W{a} → W{b}"));
+        } else {
+            self.output_manager.write_info(format!("W{a} or W{b} not found"));
+        }
+        self.render_tui().await
+    }
+
+    /// `/forget W1` — remove word and any AI-generated successors.
+    async fn handle_stack_forget(&mut self, id: usize) -> Result<()> {
+        let removed = {
+            let mut p = self.poset.lock().await;
+            let mut to_remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            to_remove.insert(id);
+            let mut frontier = vec![id];
+            while let Some(cur) = frontier.pop() {
+                for &(pred, succ) in &p.edges {
+                    if pred == cur && !to_remove.contains(&succ) {
+                        if p.nodes.iter().any(|n| n.id == succ
+                            && matches!(n.author, crate::poset::NodeAuthor::Ai))
+                        {
+                            to_remove.insert(succ);
+                            frontier.push(succ);
+                        }
+                    }
+                }
+            }
+            let count = to_remove.len();
+            let removed_labels: std::collections::HashSet<String> = p.nodes.iter()
+                .filter(|n| to_remove.contains(&n.id))
+                .map(|n| n.label.clone())
+                .collect();
+            p.nodes.retain(|n| !to_remove.contains(&n.id));
+            p.edges.retain(|&(a, b)| !to_remove.contains(&a) && !to_remove.contains(&b));
+            drop(p);
+            let mut s = self.stack.lock().await;
+            s.retain(|item| !removed_labels.contains(item));
+            count
+        };
+        self.output_manager.write_info(format!(
+            "forgot W{id} ({removed} word{} removed)",
+            if removed == 1 { "" } else { "s" }
+        ));
+        self.render_tui().await
+    }
+
+    /// `/dup W1` — clone word W1 as a new entry with no edges.
+    async fn handle_stack_dup(&mut self, id: usize) -> Result<()> {
+        let result = {
+            let mut p = self.poset.lock().await;
+            if let Some(node) = p.nodes.iter().find(|n| n.id == id).cloned() {
+                let new_id = p.add_node(
+                    node.label.clone(),
+                    node.kind.clone(),
+                    crate::poset::NodeAuthor::User,
+                );
+                Some((new_id, node.label))
+            } else {
+                None
+            }
+        };
+        if let Some((new_id, label)) = result {
+            self.stack.lock().await.push(label.clone());
+            self.output_manager.write_info(format!("W{id} → W{new_id}  \"{label}\""));
+        } else {
+            self.output_manager.write_info(format!("W{id} not found"));
+        }
+        self.render_tui().await
+    }
+
+    /// `/swap W1 W2` — swap the labels of two words.
+    async fn handle_stack_swap(&mut self, a: usize, b: usize) -> Result<()> {
+        let ok = {
+            let mut p = self.poset.lock().await;
+            let a_idx = p.nodes.iter().position(|n| n.id == a);
+            let b_idx = p.nodes.iter().position(|n| n.id == b);
+            if let (Some(ai), Some(bi)) = (a_idx, b_idx) {
+                let label_a = p.nodes[ai].label.clone();
+                let label_b = p.nodes[bi].label.clone();
+                p.nodes[ai].label = label_b;
+                p.nodes[bi].label = label_a;
+                true
+            } else {
+                false
+            }
+        };
+        if ok {
+            self.output_manager.write_info(format!("swapped W{a} ↔ W{b}"));
+        } else {
+            self.output_manager.write_info(format!("W{a} or W{b} not found"));
+        }
+        self.render_tui().await
+    }
+
+    /// `/describe <word>` — look up a word in the English library and display all its senses.
+    async fn handle_stack_describe(&mut self, word: String) -> Result<()> {
+        let lib = crate::coforth::Library::load();
+        let key = word.trim().to_lowercase();
+        let senses = lib.lookup_all(&key);
+        if senses.is_empty() {
+            let nearby = lib.related(&key, 1);
+            if nearby.is_empty() {
+                self.output_manager.write_info(format!("\"{}\" not in library", key));
+            } else {
+                let names: Vec<&str> = nearby.iter().map(|e| e.word.as_str()).collect();
+                self.output_manager.write_info(format!(
+                    "\"{}\" not found — nearby: {}", key, names.join(", ")
+                ));
+            }
+        } else {
+            let mut out = format!("\x1b[1;36m{key}\x1b[0m");
+            for (i, entry) in senses.iter().enumerate() {
+                let sense_label = entry.sense.as_deref()
+                    .map(|s| format!("  \x1b[33m[{s}]\x1b[0m"))
+                    .unwrap_or_default();
+                let num = if senses.len() > 1 { format!("{}. ", i + 1) } else { String::new() };
+                let related = if entry.related.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n     related: {}", entry.related.join(", "))
+                };
+                let forth = entry.forth.as_deref()
+                    .map(|f| format!("\n     forth:   {f}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "\n  {num}\x1b[90m[{}]\x1b[0m{sense_label}  {}{}{}",
+                    entry.kind, entry.definition, related, forth
+                ));
+            }
+            self.output_manager.write_info(out);
+        }
+        self.render_tui().await
+    }
+
+    /// `/define <word>[:<sense>] <definition>` — append to ~/.finch/library.toml and seed into poset.
+    ///
+    /// Examples:
+    ///   /define bank a financial institution
+    ///   /define bank:river the sloping land beside a river
+    async fn handle_stack_define(&mut self, word: String, definition: String) -> Result<()> {
+        // Parse optional sense from "word:sense"
+        let (key, sense) = if let Some((w, s)) = word.trim().split_once(':') {
+            (w.trim().to_lowercase(), Some(s.trim().to_string()))
+        } else {
+            (word.trim().to_lowercase(), None)
+        };
+        let def = definition.trim();
+
+        // Escape for TOML
+        let safe_def = def.replace('\\', "\\\\").replace('"', "\\\"");
+
+        let path = dirs::home_dir()
+            .map(|h| h.join(".finch").join("library.toml"))
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+
+        let sense_line = sense.as_deref()
+            .map(|s| format!("sense = \"{s}\"\n"))
+            .unwrap_or_default();
+        let entry_toml = format!(
+            "\n[[word]]\nword = \"{key}\"\ndefinition = \"{safe_def}\"\n{sense_line}"
+        );
+
+        let (already_exists, sense_exists) = {
+            let lib = crate::coforth::Library::load();
+            let senses = lib.lookup_all(&key);
+            let sense_exists = senses.iter().any(|e| e.sense.as_deref() == sense.as_deref());
+            (!senses.is_empty(), sense_exists)
+        };
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        use std::io::Write;
+        file.write_all(entry_toml.as_bytes())
+            .context("failed to write library entry")?;
+
+        // Seed into current poset so it's immediately available
+        {
+            let lib = crate::coforth::Library::load();
+            let mut p = self.poset.lock().await;
+            lib.inject_into_poset(&key, 1, &mut p);
+        }
+
+        let label = sense.as_deref()
+            .map(|s| format!("\x1b[1;36m{key}\x1b[0m:\x1b[33m{s}\x1b[0m"))
+            .unwrap_or_else(|| format!("\x1b[1;36m{key}\x1b[0m"));
+
+        if sense_exists {
+            self.output_manager.write_info(format!(
+                "{label} overridden in ~/.finch/library.toml  \x1b[90m(at your peril)\x1b[0m"
+            ));
+        } else if already_exists {
+            self.output_manager.write_info(format!(
+                "{label} added as new sense to ~/.finch/library.toml"
+            ));
+        } else {
+            self.output_manager.write_info(format!(
+                "{label} added to ~/.finch/library.toml"
+            ));
+        }
+        self.render_tui().await
+    }
+
+    /// Handle `/program` — render the current stack as Forth source code.
+    ///
+    /// Seed the stack with a small "codebase archaeology" language as a demo.
+    ///
+    /// Defines four words:
+    ///   W0  ENTRY-POINTS  — find main() and binary entry points  [Glob, Grep]
+    ///   W1  MODULE-MAP    — map modules and public interfaces     [Glob, Grep]
+    ///   W2  CALL-GRAPH    — trace call graph from entry points    [Read]       needs W0
+    ///   W3  STORY         — onboarding narrative                              needs W1, W2
+    ///
+    /// Parallel roots: W0 and W1 run concurrently.
+    /// Then W2 (needs W0), then W3 (needs W1 and W2).
+    async fn handle_stack_demo(&mut self) -> Result<()> {
+        use crate::poset::{NodeAuthor, NodeKind};
+
+        // Clear any existing stack and poset first.
+        self.stack.lock().await.clear();
+        {
+            let mut p = self.poset.lock().await;
+            *p = crate::poset::Poset::new();
+        }
+
+        // Word definitions: (label, kind, tools, predecessors)
+        let words: &[(&str, NodeKind, &[&str], &[usize])] = &[
+            (
+                "find main() and binary entry points in this codebase",
+                NodeKind::Task,
+                &["Glob", "Grep"],
+                &[],
+            ),
+            (
+                "map all modules and their public interfaces",
+                NodeKind::Task,
+                &["Glob", "Grep"],
+                &[],
+            ),
+            (
+                "trace the call graph from entry points",
+                NodeKind::Task,
+                &["Read"],
+                &[0], // needs W0
+            ),
+            (
+                "write a developer onboarding story for this codebase",
+                NodeKind::Task,
+                &[],
+                &[1, 2], // needs W1 and W2
+            ),
+        ];
+
+        let mut ids: Vec<usize> = Vec::new();
+        {
+            let mut p = self.poset.lock().await;
+            for &(label, ref kind, tools, _) in words {
+                let tool_names: Vec<String> = tools.iter().map(|s| s.to_string()).collect();
+                let id = p.add_node_with_tools(
+                    label.to_string(),
+                    kind.clone(),
+                    NodeAuthor::User,
+                    tool_names,
+                );
+                ids.push(id);
+            }
+            // Wire edges based on predecessor lists.
+            for (i, &(_, _, _, preds)) in words.iter().enumerate() {
+                for &pred_idx in preds {
+                    p.edges.push((ids[pred_idx], ids[i]));
+                }
+            }
+        }
+
+        // Mirror into the flat stack (for /stack show compatibility).
+        {
+            let mut s = self.stack.lock().await;
+            for &(label, _, _, _) in words {
+                s.push(label.to_string());
+            }
+        }
+
+        self.output_manager.write_info(
+            "📚 Demo language seeded: 4 words, 3 edges.\n\
+             W0 + W1 run in parallel → W2 → W3.\n\
+             /program to see the vocabulary · /view for graph · /run to execute."
+        );
+
+        // Switch to Forth view so the vocabulary is immediately visible.
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.poset_panel_mode = crate::cli::tui::PosetPanelMode::Forth;
+        }
+        self.render_tui().await
+    }
+
+    /// Switch the Co-Forth overlay panel to Forth source view.
+    /// The overlay recomputes the program from the live poset on each render tick.
+    async fn handle_stack_program(&mut self) -> Result<()> {
+        let mut tui = self.tui_renderer.lock().await;
+        if tui.poset_panel_mode != crate::cli::tui::PosetPanelMode::Forth {
+            tui.toggle_poset_view();
+        }
+        drop(tui);
+        self.render_tui().await
+    }
+
+    /// Handle `/stack` — show current stack contents.
+    async fn handle_stack_show(&mut self) -> Result<()> {
+        let stack = self.stack.lock().await;
+        if stack.is_empty() {
+            self.output_manager
+                .write_info("📚 Stack is empty.  Type to push, /pop to execute.");
+        } else {
+            let mut lines = vec![format!(
+                "📚 Stack ({} item{}):",
+                stack.len(),
+                if stack.len() == 1 { "" } else { "s" }
+            )];
+            for (i, item) in stack.iter().enumerate() {
+                let preview = if item.len() > 80 {
+                    format!("{}…", item.chars().take(80).collect::<String>())
+                } else {
+                    item.clone()
+                };
+                lines.push(format!("  [{:>2}] {}", i + 1, preview));
+            }
+            lines.push(String::new());
+            lines.push("/pop to execute all as one query.".to_string());
+            self.output_manager.write_info(lines.join("\n"));
+        }
+        drop(stack);
+        self.render_tui().await
+    }
+
+    /// Handle `/pop` — remove the top item from the stack (undo last push).
+    async fn handle_stack_pop(&mut self) -> Result<()> {
+        let mut stack = self.stack.lock().await;
+        if stack.is_empty() {
+            drop(stack);
+            self.output_manager
+                .write_info("📚 Stack is empty. Nothing to pop.");
+            self.render_tui().await?;
+            return Ok(());
+        }
+        let item = stack.pop().unwrap();
+        let depth = stack.len();
+        drop(stack);
+        let preview = if item.len() > 60 {
+            format!("{}…", item.chars().take(60).collect::<String>())
+        } else {
+            item
+        };
+        self.output_manager.write_info(format!(
+            "📚 popped → \"{preview}\"   depth:{depth}"
+        ));
+        self.render_tui().await
+    }
+
+    /// Handle `/run` — join all stack items and execute as one query (clears stack).
+    /// Returns `Some(query)` if the stack was non-empty, `None` otherwise.
+    async fn handle_stack_run(&mut self) -> Result<Option<String>> {
+        let mut stack = self.stack.lock().await;
+        if stack.is_empty() {
+            drop(stack);
+            self.output_manager
+                .write_info("📚 Stack is empty. Type something first.");
+            self.render_tui().await?;
+            return Ok(None);
+        }
+        let count = stack.len();
+        let query = stack.drain(..).collect::<Vec<_>>().join("\n\n");
+        drop(stack);
+        self.output_manager.write_info(format!(
+            "📚 Running {count} item{}…",
+            if count == 1 { "" } else { "s" }
+        ));
+        self.render_tui().await?;
+        Ok(Some(query))
+    }
+
+    /// Execute the approved stack: if any poset nodes have tools, run the poset executor;
+    /// otherwise fall back to the plain query path.
+    async fn handle_poset_or_query(&mut self, query: String) -> Result<()> {
+        let is_non_empty = !self.poset.lock().await.is_empty();
+
+        if is_non_empty {
+            // Show the execution plan and ask for approval before running anything.
+            let approved = self.confirm_poset_run().await?;
+            if !approved { return Ok(()); }
+
+            use crate::tools::implementations::{
+                BashTool, GlobTool, GrepTool, ReadTool, WebFetchTool, WriteTool, EditTool,
+            };
+            let mut reg = crate::tools::ToolRegistry::new();
+            reg.register(Box::new(ReadTool));
+            reg.register(Box::new(GlobTool));
+            reg.register(Box::new(GrepTool));
+            reg.register(Box::new(BashTool));
+            reg.register(Box::new(WebFetchTool::new()));
+            reg.register(Box::new(WriteTool));
+            reg.register(Box::new(EditTool));
+            let registry = Some(Arc::new(reg));
+
+            let generator = self.cloud_gen.read().await.clone();
+            let poset = Arc::clone(&self.poset);
+            let stack = Arc::clone(&self.stack);
+            let event_tx = self.event_tx.clone();
+
+            // Spawn execution as a background task so the TUI keeps ticking.
+            // Node status (Pending → Running → Done) updates through the shared
+            // Arc<Mutex<Poset>>, so the Forth panel shows live progress.
+            tokio::spawn(async move {
+                let result = crate::poset::executor::execute_poset(
+                    poset, generator, registry, Some(stack),
+                ).await;
+                let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
+            });
+
+            self.output_manager.write_info("running");
+            self.render_tui().await?;
+        } else {
+            self.execute_query(query).await?;
+        }
+        Ok(())
+    }
+
+    /// Handle `/stack clear` — drop all stack items.
+    async fn handle_stack_clear(&mut self) -> Result<()> {
+        let mut stack = self.stack.lock().await;
+        let count = stack.len();
+        stack.clear();
+        drop(stack);
+        if count == 0 {
+            self.output_manager.write_info("📚 Stack was already empty.");
+        } else {
+            self.output_manager.write_info(format!(
+                "📚 Cleared {count} item{} from stack.",
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+        self.render_tui().await
+    }
+
+    /// Show the execution plan and ask for approval before running the poset.
+    /// The plan shows which words run concurrently at each depth level,
+    /// and what tools (machine access) each word has.
+    async fn confirm_poset_run(&mut self) -> Result<bool> {
+        use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+
+        let plan = {
+            let p = self.poset.lock().await;
+            if p.is_empty() { return Ok(false); }
+
+            // Topological sort + depth propagation.
+            let mut depth: std::collections::HashMap<usize, usize> =
+                p.nodes.iter().map(|n| (n.id, 0usize)).collect();
+            let mut in_deg: std::collections::HashMap<usize, usize> =
+                p.nodes.iter().map(|n| (n.id, 0)).collect();
+            for &(_, s) in &p.edges { *in_deg.entry(s).or_insert(0) += 1; }
+            let mut q: std::collections::VecDeque<usize> = in_deg.iter()
+                .filter(|(_, &d)| d == 0).map(|(&id, _)| id).collect();
+            let mut topo: Vec<usize> = Vec::new();
+            while let Some(id) = q.pop_front() {
+                topo.push(id);
+                let d = depth[&id];
+                for &(pred, succ) in &p.edges {
+                    if pred == id {
+                        let e = depth.entry(succ).or_insert(0);
+                        if d + 1 > *e { *e = d + 1; }
+                        let deg = in_deg.entry(succ).or_insert(0);
+                        *deg = deg.saturating_sub(1);
+                        if *deg == 0 { q.push_back(succ); }
+                    }
+                }
+            }
+
+            let max_depth = depth.values().copied().max().unwrap_or(0);
+            let mut lines: Vec<String> = Vec::new();
+            for lvl in 0..=max_depth {
+                let group: Vec<&crate::poset::Node> = topo.iter()
+                    .filter(|&&id| depth[&id] == lvl)
+                    .filter_map(|&id| p.nodes.iter().find(|n| n.id == id))
+                    .collect();
+                if group.is_empty() { continue; }
+
+                let names: Vec<String> = group.iter()
+                    .map(|n| format!("W{}", n.id))
+                    .collect();
+
+                let concurrent = if group.len() > 1 { "  \\ concurrent" } else { "" };
+                lines.push(format!("  {}{}", names.join("  "), concurrent));
+            }
+            lines.join("\n")
+        };
+
+        let title = format!(": PROGRAM\n{}\n;\n\nthis will run on your machine.", plan);
+        let dialog = Dialog::select(title, vec![
+            DialogOption::new("run"),
+            DialogOption::new("cancel"),
+        ]);
+
+        let result = { self.tui_renderer.lock().await.show_dialog(dialog)? };
+        Ok(matches!(result, DialogResult::Selected(0)))
     }
 
     /// Handle tool approval request (show dialog, get user response)
@@ -2320,7 +3262,7 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> 
                 format!(
                     "Command: {}",
                     if cmd.len() > 60 {
-                        format!("{}...", &cmd[..60])
+                        format!("{}...", cmd.chars().take(60).collect::<String>())
                     } else {
                         cmd.to_string()
                     }
@@ -2341,7 +3283,7 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> 
                 format!(
                     "Pattern: {}",
                     if pattern.len() > 40 {
-                        format!("{}...", &pattern[..40])
+                        format!("{}...", pattern.chars().take(40).collect::<String>())
                     } else {
                         pattern.to_string()
                     }
@@ -2362,7 +3304,7 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> 
                 format!(
                     "Reason: {}",
                     if reason.len() > 50 {
-                        format!("{}...", &reason[..50])
+                        format!("{}...", reason.chars().take(50).collect::<String>())
                     } else {
                         reason.to_string()
                     }
