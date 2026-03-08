@@ -108,6 +108,16 @@ enum Command {
         #[command(subcommand)]
         license_command: Option<LicenseCommand>,
     },
+    /// Co-Forth: run or validate Forth code
+    Coforth {
+        #[command(subcommand)]
+        coforth_command: CoforthCommand,
+    },
+    /// English word library: build, list, and inspect
+    Library {
+        #[command(subcommand)]
+        library_command: LibraryCommand,
+    },
     /// Run as an autonomous agent, working through a task backlog
     Agent {
         /// Persona name (builtin or ~/.finch/personas/<name>.toml) or path to .toml
@@ -145,6 +155,72 @@ enum NetworkCommand {
 enum TrainCommand {
     /// Install Python dependencies for LoRA training
     Setup,
+}
+
+#[derive(Parser, Debug)]
+enum CoforthCommand {
+    /// Run Forth code and print output
+    Run {
+        /// Forth source code to execute
+        #[arg(long)]
+        code: String,
+    },
+    /// Validate Forth code (run and report success/failure)
+    Validate {
+        /// Forth source code to validate
+        #[arg(long)]
+        code: String,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum LibraryCommand {
+    /// List all words in the library
+    List,
+    /// Show a word's definition and Forth code
+    Show {
+        /// Word to look up
+        word: String,
+    },
+    /// Generate Forth for English words using AI, saving to ~/.finch/library.toml
+    Build {
+        /// Generate all built-in word categories
+        #[arg(long)]
+        all: bool,
+        /// Generate a specific category (run `finch library build --list-categories` to see them)
+        #[arg(long)]
+        category: Option<String>,
+        /// Comma-separated list of specific words
+        #[arg(long)]
+        words: Option<String>,
+        /// List available categories and exit
+        #[arg(long)]
+        list_categories: bool,
+        /// Validate each snippet before saving (requires binary to be built)
+        #[arg(long, default_value = "true")]
+        validate: bool,
+        /// Words per API batch
+        #[arg(long, default_value = "15")]
+        batch_size: usize,
+        /// Write output to a file instead of ~/.finch/library.toml
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Run every Forth snippet in the library and report failures
+    Verify {
+        /// Show passing words too (default: failures and missing only)
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Generate Forth for words that are missing snippets or have broken ones
+    Heal {
+        /// Words per API batch
+        #[arg(long, default_value = "15")]
+        batch_size: usize,
+        /// Write output to a file instead of ~/.finch/library.toml
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -273,6 +349,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::License { license_command }) => {
             return run_license_command(license_command).await;
+        }
+        Some(Command::Coforth { coforth_command }) => {
+            return run_coforth_command(coforth_command);
+        }
+        Some(Command::Library { library_command }) => {
+            return run_library_command(library_command).await;
         }
         Some(Command::Agent {
             persona,
@@ -1338,6 +1420,7 @@ async fn run_query_teacher_only(
                         None, // repl_mode
                         None, // plan_content
                         None, // live_output
+                        None, // stack
                     )
                     .await
             };
@@ -1435,6 +1518,263 @@ async fn run_node_info() -> Result<()> {
     println!("    finch worker");
     println!("  To accept queries from other machines:");
     println!("    finch worker --bind 0.0.0.0:8000");
+
+    Ok(())
+}
+
+// ── finch coforth ─────────────────────────────────────────────────────────────
+
+fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
+    match cmd {
+        CoforthCommand::Run { code } => {
+            match finch::coforth::Forth::run(&code) {
+                Ok(out) => print!("{out}"),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        CoforthCommand::Validate { code } => {
+            match finch::coforth::Forth::run(&code) {
+                Ok(out) if !out.is_empty() => {
+                    println!("ok  →  {:?}", out.trim());
+                }
+                Ok(_) => {
+                    eprintln!("fail: compiled and ran but produced no output");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("fail: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── finch library ─────────────────────────────────────────────────────────────
+
+async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
+    use finch::coforth::generator::{self, BuildOptions, CATEGORIES};
+    use finch::coforth::Library;
+
+    match cmd {
+        LibraryCommand::List => {
+            let lib = Library::load();
+            let words = lib.all_words();
+            println!("{} words in library:", words.len());
+            for w in &words {
+                print!("{w}  ");
+            }
+            println!();
+        }
+
+        LibraryCommand::Show { word } => {
+            let lib = Library::load();
+            match lib.lookup(&word) {
+                Some(e) => {
+                    println!("word:       {}", e.word);
+                    println!("definition: {}", e.definition);
+                    println!("kind:       {}", e.kind);
+                    println!("related:    {}", e.related.join(", "));
+                    if let Some(ref forth) = e.forth {
+                        println!("forth:      {forth}");
+                        // Run it to show output
+                        if let Ok(out) = finch::coforth::Forth::run(forth) {
+                            if !out.is_empty() {
+                                println!("output:     {}", out.trim());
+                            }
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("'{}' not found in library", word);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        LibraryCommand::Verify { verbose } => {
+            let lib = Library::load();
+            let mut ok = 0usize;
+            let mut missing = 0usize;
+            let mut broken: Vec<(String, String)> = Vec::new();
+
+            let mut words: Vec<&str> = lib.word_list();
+            words.sort_unstable();
+
+            for word in &words {
+                let senses = lib.lookup_all(word);
+                for entry in senses {
+                    match &entry.forth {
+                        None => {
+                            missing += 1;
+                            if verbose {
+                                println!("  ? {word}  (no Forth)");
+                            }
+                        }
+                        Some(code) => {
+                            match finch::coforth::Forth::run(code) {
+                                Ok(out) if !out.is_empty() => {
+                                    ok += 1;
+                                    if verbose {
+                                        println!("  ✓ {word}");
+                                    }
+                                }
+                                Ok(_) => {
+                                    broken.push((word.to_string(), "no output".to_string()));
+                                }
+                                Err(e) => {
+                                    broken.push((word.to_string(), e.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            println!();
+            println!("Library: {} words", lib.word_count());
+            println!("  ✓ verified:  {ok}");
+            println!("  ? no Forth:  {missing}");
+            println!("  ✗ broken:    {}", broken.len());
+
+            if !broken.is_empty() {
+                println!();
+                println!("Broken snippets:");
+                for (w, e) in &broken {
+                    println!("  ✗ {w}: {e}");
+                }
+            }
+
+            if missing > 0 && !verbose {
+                println!();
+                println!("Run `finch library heal` to generate Forth for the {missing} missing words.");
+            }
+
+            if !broken.is_empty() || missing > 0 {
+                std::process::exit(1);
+            }
+        }
+
+        LibraryCommand::Heal { batch_size, output } => {
+            // Collect words that are missing Forth or have broken snippets
+            let lib = Library::load();
+            let mut words_to_heal: Vec<String> = Vec::new();
+
+            for word in lib.word_list() {
+                let senses = lib.lookup_all(word);
+                for entry in senses {
+                    let needs_healing = match &entry.forth {
+                        None => true,
+                        Some(code) => {
+                            match finch::coforth::Forth::run(code) {
+                                Ok(out) if out.is_empty() => true,
+                                Err(_) => true,
+                                _ => false,
+                            }
+                        }
+                    };
+                    if needs_healing {
+                        let key = if let Some(ref s) = entry.sense {
+                            format!("{}:{}", word, s)
+                        } else {
+                            word.to_string()
+                        };
+                        words_to_heal.push(key);
+                    }
+                }
+            }
+
+            if words_to_heal.is_empty() {
+                println!("All {} words already have verified Forth snippets.", lib.word_count());
+                return Ok(());
+            }
+
+            println!("{} words need Forth snippets.", words_to_heal.len());
+
+            let config = load_config().unwrap_or_else(|_| finch::config::Config::new(vec![]));
+            let gen: std::sync::Arc<dyn finch::generators::Generator> =
+                match finch::providers::create_provider(&config.teachers) {
+                    Ok(provider) => {
+                        let client = std::sync::Arc::new(
+                            finch::claude::ClaudeClient::with_provider(provider)
+                        );
+                        std::sync::Arc::new(finch::generators::claude::ClaudeGenerator::new(client))
+                    }
+                    Err(e) => {
+                        eprintln!("No provider configured: {e}");
+                        eprintln!("Run `finch setup` to configure an API key.");
+                        std::process::exit(1);
+                    }
+                };
+
+            let output_path = output.unwrap_or_else(generator::user_library_path);
+            let opts = generator::BuildOptions {
+                all: false,
+                category: None,
+                words: Some(words_to_heal),
+                batch_size,
+                validate: true,
+                output: output_path,
+            };
+            generator::build_library(opts, gen).await?;
+        }
+
+        LibraryCommand::Build {
+            all,
+            category,
+            words,
+            list_categories,
+            validate,
+            batch_size,
+            output,
+        } => {
+            if list_categories {
+                println!("Available categories ({}):", CATEGORIES.len());
+                for (name, words) in CATEGORIES {
+                    println!("  {:30} ({} words)", name, words.len());
+                }
+                return Ok(());
+            }
+
+            let words_vec: Option<Vec<String>> = words.map(|w| {
+                w.split(',').map(|s| s.trim().to_lowercase()).collect()
+            });
+
+            let output_path = output.unwrap_or_else(generator::user_library_path);
+
+            // Build a generator from config
+            let config = load_config().unwrap_or_else(|_| finch::config::Config::new(vec![]));
+            let gen: std::sync::Arc<dyn finch::generators::Generator> =
+                match finch::providers::create_provider(&config.teachers) {
+                    Ok(provider) => {
+                        let client = std::sync::Arc::new(
+                            finch::claude::ClaudeClient::with_provider(provider)
+                        );
+                        std::sync::Arc::new(finch::generators::claude::ClaudeGenerator::new(client))
+                    }
+                    Err(e) => {
+                        eprintln!("No provider configured: {e}");
+                        eprintln!("Run `finch setup` to configure an API key.");
+                        std::process::exit(1);
+                    }
+                };
+
+            let opts = BuildOptions {
+                all,
+                category,
+                words: words_vec,
+                batch_size,
+                validate,
+                output: output_path,
+            };
+
+            generator::build_library(opts, gen).await?;
+        }
+    }
 
     Ok(())
 }
