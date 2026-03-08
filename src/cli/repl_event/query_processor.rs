@@ -24,13 +24,14 @@ use super::query_state::{QueryState, QueryStateManager};
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// Shared map of active tool calls keyed by tool_id.
-/// Maps `tool_id → (tool_name, work_unit, row_idx)`.
+/// Maps `tool_id → (tool_name, tool_input, work_unit, row_idx)`.
 pub(crate) type ActiveToolUsesMap = Arc<
     RwLock<
         std::collections::HashMap<
             String,
             (
                 String,
+                serde_json::Value,
                 Arc<crate::cli::messages::WorkUnit>,
                 usize,
             ),
@@ -202,7 +203,7 @@ pub(super) async fn dispatch_tool_uses(
         let row_idx = work_unit.add_row(&label);
         active_tool_uses.write().await.insert(
             tool_use.id.clone(),
-            (tool_use.name.clone(), Arc::clone(work_unit), row_idx),
+            (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(work_unit), row_idx),
         );
 
         // Inline handlers for interactive tools (block until dialog resolved)

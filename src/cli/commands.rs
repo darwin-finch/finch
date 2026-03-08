@@ -58,6 +58,8 @@ pub enum Command {
     Brain(String),       // /brain <task>  — spawn background research brain
     Brains,              // /brains        — list active brain sessions
     BrainCancel(String), // /brain cancel <name-or-id>
+    // Execution graph
+    Graph, // /graph — show causal trace of last query
 }
 
 impl Command {
@@ -92,6 +94,7 @@ impl Command {
             "/license remove" => return Some(Command::LicenseRemove),
             // Brain sessions
             "/brains" | "/brains list" => return Some(Command::Brains),
+            "/graph" => return Some(Command::Graph),
             _ => {}
         }
 
@@ -349,6 +352,10 @@ pub fn handle_command(
         Command::Brain(_) | Command::Brains | Command::BrainCancel(_) => Ok(
             CommandOutput::Status("Brain commands should be handled in REPL.".to_string()),
         ),
+        // Graph command is handled directly in REPL
+        Command::Graph => Ok(CommandOutput::Status(
+            "Graph command should be handled in REPL.".to_string(),
+        )),
     }
 }
 

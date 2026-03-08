@@ -214,6 +214,9 @@ pub struct EventLoop {
     /// Used to detect infinite loops (same tool called with same args multiple times).
     tool_call_history: Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
 
+    /// Execution graph for the current (or most recent) query.
+    current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
+
     /// Brain UUID that the REPL is currently waiting for a question/plan from.
     /// Set when a transition to WaitingForInput/PlanReady is detected.
     pending_daemon_brain_id: Option<Uuid>,
@@ -357,6 +360,9 @@ impl EventLoop {
             pending_daemon_brain_question_options: Vec::new(),
             pending_daemon_brain_plan: false,
             pending_daemon_brain_plan_id: None,
+            current_graph: Arc::new(tokio::sync::Mutex::new(
+                crate::graph::ExecutionGraph::new(),
+            )),
         }
     }
 
@@ -943,6 +949,9 @@ impl EventLoop {
                     Command::BrainCancel(name_or_id) => {
                         self.handle_brain_cancel(name_or_id).await?;
                     }
+                    Command::Graph => {
+                        self.handle_graph_command().await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -1311,6 +1320,14 @@ impl EventLoop {
 
     /// Spawn a background task to process a query
     async fn spawn_query_task(&self, query_id: Uuid, query: String) {
+        // ── Reset execution graph for a real new query (not a tool continuation) ──
+        // Tool-continuation calls pass empty `query`; those extend the same graph.
+        if !query.is_empty() {
+            let mut g = self.current_graph.lock().await;
+            g.reset(query_id, &self.session_label);
+            g.add_node(crate::graph::NodeKind::UserInput { text: query.clone() });
+        }
+
         let event_tx = self.event_tx.clone();
         let claude_gen = self.cloud_gen.read().await.clone();
         let qwen_gen = Arc::clone(&self.qwen_gen);
@@ -1512,6 +1529,19 @@ impl EventLoop {
                         *active = None;
                     }
                 }
+                // Record final response + save execution graph
+                if !is_executing_tools {
+                    let preview = full_response
+                        .chars()
+                        .take(300)
+                        .collect::<String>();
+                    let mut g = self.current_graph.lock().await;
+                    g.add_node(crate::graph::NodeKind::FinalResponse { preview });
+                    if let Err(e) = g.save() {
+                        tracing::warn!("Failed to save execution graph: {}", e);
+                    }
+                }
+
                 // Clear per-query tool-call history so it doesn't grow forever.
                 self.tool_call_history.write().await.remove(&query_id);
             }
@@ -1522,6 +1552,14 @@ impl EventLoop {
                 output_tokens,
                 latency_ms,
             } => {
+                // Record LLM invocation in execution graph
+                self.current_graph.lock().await.add_node(
+                    crate::graph::NodeKind::LlmCall {
+                        model: model.clone(),
+                        input_tokens,
+                        output_tokens,
+                    },
+                );
                 // Update status bar with live stats
                 self.status_bar
                     .update_live_stats(model, input_tokens, output_tokens, latency_ms);
@@ -1663,13 +1701,13 @@ impl EventLoop {
         result: Result<String>,
     ) -> Result<()> {
         // Look up the tool's WorkUnit and row index
-        let (tool_name, work_unit, row_idx) = {
+        let (tool_name, tool_input, work_unit, row_idx) = {
             let mut map = self.active_tool_uses.write().await;
             map.remove(&tool_id).unwrap_or_else(|| {
                 // Fallback: create a standalone WorkUnit for untracked tools
                 let fallback = self.output_manager.start_work_unit("Tool");
                 let row_idx = fallback.add_row(&tool_id);
-                (tool_id.clone(), fallback, row_idx)
+                (tool_id.clone(), serde_json::Value::Null, fallback, row_idx)
             })
         };
 
@@ -1689,6 +1727,29 @@ impl EventLoop {
                 };
                 work_unit.fail_row(row_idx, short_err);
             }
+        }
+
+        // Record tool execution in the graph
+        {
+            let input_preview = {
+                let s = tool_input.to_string();
+                if s.len() > 120 { s[..120].to_string() } else { s }
+            };
+            let (output_preview, is_error) = match &result {
+                Ok(c) => {
+                    let preview = c.chars().take(200).collect::<String>();
+                    (preview, false)
+                }
+                Err(e) => (e.to_string().chars().take(200).collect(), true),
+            };
+            self.current_graph.lock().await.add_node(
+                crate::graph::NodeKind::ToolExecution {
+                    name: tool_name.clone(),
+                    input_preview,
+                    output_preview,
+                    is_error,
+                },
+            );
         }
 
         // Check if tool execution changed the mode (e.g., EnterPlanMode, PresentPlan)
@@ -1816,6 +1877,30 @@ impl EventLoop {
         // This will send another request to Claude with the tool results
         self.spawn_query_task(query_id, String::new()).await;
 
+        Ok(())
+    }
+
+    /// Handle `/graph` — display the execution graph for the most recent query.
+    async fn handle_graph_command(&mut self) -> Result<()> {
+        let g = self.current_graph.lock().await;
+        if g.is_empty() {
+            self.output_manager
+                .write_info("No execution graph recorded yet. Run a query first.");
+        } else {
+            let text = g.format_display();
+            // Append save path hint
+            let hint = if let Some(qid) = g.query_id {
+                let short = &qid.to_string()[..8];
+                format!(
+                    "\nSaved to ~/.finch/graphs/{}-{}.json",
+                    g.session_label, short
+                )
+            } else {
+                String::new()
+            };
+            self.output_manager.write_info(format!("{}{}", text, hint));
+        }
+        self.render_tui().await?;
         Ok(())
     }
 

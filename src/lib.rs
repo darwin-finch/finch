@@ -27,6 +27,7 @@ pub mod daemon; // Daemon lifecycle and auto-spawn (Phase 8)
 pub mod errors; // User-friendly error messages
 pub mod feedback; // Response feedback system for LoRA training
 pub mod generators; // Unified generator interface
+pub mod graph; // Execution graph — causal trace of query turns
 pub mod ipc;        // Cap'n Proto IPC layer (CLI ↔ daemon over Unix socket)
 pub mod license;
 pub mod llms; // Generic LLM abstraction (Phase 1)
