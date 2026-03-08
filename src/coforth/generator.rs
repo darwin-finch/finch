@@ -1272,9 +1272,43 @@ pub async fn build_library(
 
                 let entries: Vec<serde_json::Value> = match serde_json::from_str(&text) {
                     Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[batch {batch_idx}] JSON error: {e}");
-                        return (0, words.len());
+                    Err(_first_err) => {
+                        // Try to salvage individual objects from a broken JSON array.
+                        // The model sometimes emits unescaped quotes inside Forth strings.
+                        // Strategy: parse object-by-object, skipping malformed entries.
+                        let mut salvaged: Vec<serde_json::Value> = Vec::new();
+                        let mut depth = 0i32;
+                        let mut obj_start: Option<usize> = None;
+                        let chars: Vec<char> = text.chars().collect();
+                        let mut i = 0;
+                        while i < chars.len() {
+                            match chars[i] {
+                                '{' => {
+                                    if depth == 0 { obj_start = Some(i); }
+                                    depth += 1;
+                                }
+                                '}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        if let Some(start) = obj_start {
+                                            let slice: String = chars[start..=i].iter().collect();
+                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&slice) {
+                                                salvaged.push(v);
+                                            }
+                                            // skip malformed objects silently
+                                        }
+                                        obj_start = None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            i += 1;
+                        }
+                        if salvaged.is_empty() {
+                            eprintln!("[batch {batch_idx}] JSON error: could not salvage any objects");
+                            return (0, words.len());
+                        }
+                        salvaged
                     }
                 };
 
