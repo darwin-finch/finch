@@ -91,6 +91,18 @@ impl Library {
         }
     }
 
+    /// Total number of distinct words (keys) in the library.
+    pub fn word_count(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Sorted list of all word keys (lowercase, alphabetical).
+    pub fn word_list(&self) -> Vec<&str> {
+        let mut keys: Vec<&str> = self.words.keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        keys
+    }
+
     /// Look up the primary (first) sense of a word.
     pub fn lookup(&self, word: &str) -> Option<&WordEntry> {
         self.words.get(&word.to_lowercase()).and_then(|v| v.first())

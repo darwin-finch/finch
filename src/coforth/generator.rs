@@ -680,13 +680,16 @@ AVAILABLE WORDS (use ONLY these):\n\
     bit set-bit clr-bit tst-bit  nl .cr spaces tab banner .bool\n\
 \n\
 SAFETY RULES (ALL mandatory):\n\
-  1. Every loop MUST terminate: do/loop with literal integer bounds,\n\
+  1. Stack starts EMPTY. NEVER pop or consume values. Only push literals.\n\
+     Bad: n . cr   Bad: + . cr   Bad: a b *   Good: 42 . cr   Good: 1 2 + . cr\n\
+  2. Every loop MUST terminate: do/loop with literal integer bounds,\n\
      begin/until where the exit condition is guaranteed.\n\
-  2. Stack depth NEVER exceeds 8 items.\n\
-  3. Stack is clean at end (depth 0).\n\
-  4. MUST produce at least one output character.\n\
-  5. Snippet is 1-4 tokens — concise and illustrative.\n\
-  6. No variable declarations (only top-level Forth can declare variables).\n\
+  3. Stack depth NEVER exceeds 8 items.\n\
+  4. Stack is clean at end (depth 0).\n\
+  5. MUST produce at least one output character.\n\
+  6. Snippet is 1-6 tokens — concise and illustrative.\n\
+  7. No variable declarations (only top-level Forth can declare variables).\n\
+  8. Do NOT use the word itself as a Forth word inside its own snippet.\n\
 \n\
 The Forth should DEMONSTRATE the word's meaning computationally.\n\
 \n\
@@ -711,21 +714,26 @@ pub fn entry_to_toml(word: &str, definition: &str, related: &[String], kind: &st
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Use TOML literal string (single quotes) when possible — no escaping needed
-    let forth_toml = if !forth.contains('\'') {
-        format!("'{forth}'")
+    let forth_line = if forth.is_empty() {
+        String::new()
     } else {
-        let escaped = forth.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{escaped}\"")
+        // Use TOML literal string (single quotes) when possible — no escaping needed
+        let forth_toml = if !forth.contains('\'') {
+            format!("'{forth}'")
+        } else {
+            let escaped = forth.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        };
+        format!("forth = {forth_toml}\n")
     };
 
     format!(
-        "[[word]]\nword = \"{word}\"\ndefinition = \"{def}\"\nrelated = [{related_str}]\nkind = \"{kind}\"\nforth = {forth_toml}\n\n",
+        "[[word]]\nword = \"{word}\"\ndefinition = \"{def}\"\nrelated = [{related_str}]\nkind = \"{kind}\"\n{forth_line}\n",
         word = word,
         def = definition.replace('"', "\\\""),
         related_str = related_str,
         kind = kind,
-        forth_toml = forth_toml,
+        forth_line = forth_line,
     )
 }
 
@@ -900,21 +908,32 @@ pub async fn build_library(
                         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                         .unwrap_or_default();
 
-                    if word.is_empty() || forth.is_empty() { fail += 1; continue; }
+                    if word.is_empty() || definition.is_empty() { fail += 1; continue; }
 
-                    if validate {
+                    // Validate Forth snippet if present; fall back to definition-only on failure
+                    let validated_forth = if forth.is_empty() {
+                        String::new()
+                    } else if validate {
                         match crate::coforth::Forth::run(forth) {
                             Ok(out) if !out.is_empty() => {
                                 println!("  ✓ {word}");
+                                forth.to_string()
                             }
-                            Ok(_) => { eprintln!("  ✗ {word}: no output"); fail += 1; continue; }
-                            Err(e) => { eprintln!("  ✗ {word}: {e}"); fail += 1; continue; }
+                            Ok(_) => {
+                                eprintln!("  ✗ {word}: no output — saving definition only");
+                                String::new()
+                            }
+                            Err(e) => {
+                                eprintln!("  ✗ {word}: {e} — saving definition only");
+                                String::new()
+                            }
                         }
                     } else {
                         println!("  + {word}");
-                    }
+                        forth.to_string()
+                    };
 
-                    toml_buf.push_str(&entry_to_toml(&word, definition, &related, kind, forth));
+                    toml_buf.push_str(&entry_to_toml(&word, definition, &related, kind, &validated_forth));
                     ok += 1;
                 }
 

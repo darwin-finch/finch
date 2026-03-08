@@ -1174,22 +1174,41 @@ impl EventLoop {
             }
         };
 
-        // Co-Forth mode: if the poset has words, inject the shared vocabulary context.
+        // Co-Forth mode: inject vocabulary context (library size + current stack).
         let enriched = {
+            let lib = crate::coforth::Library::load();
+            let lib_count = lib.word_count();
             let p = self.poset.lock().await;
-            if !p.is_empty() {
-                let vocab: Vec<String> = p.nodes.iter()
-                    .map(|n| format!("  W{} — {}", n.id, n.label))
+            let stack_count = p.nodes.len();
+
+            if lib_count > 0 || stack_count > 0 {
+                // Sample up to 12 library words alphabetically for flavour
+                let sample: Vec<String> = lib.word_list()
+                    .into_iter()
+                    .take(12)
+                    .map(|w| w.to_string())
                     .collect();
+                let sample_str = if sample.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (e.g. {}…)", sample.join(", "))
+                };
+
+                let stack_note = if stack_count > 0 {
+                    format!(" The active program has {} items on the stack.", stack_count)
+                } else {
+                    String::new()
+                };
+
                 format!(
-                    "{}\n\n[Context: the user is building a vocabulary ({} words so far: {}). \
-                     Respond naturally — talk about ideas, meanings, connections. \
-                     Do NOT mention the vocabulary system, word labels (W0/W1/etc.), \
-                     Co-Forth, or stack mechanics in your responses. \
-                     That machinery is invisible to users. Just converse.]",
+                    "{}\n\n[Context: the user has a coforth vocabulary of {} defined words{}.{} \
+                     They can define, redefine, and compose these words. \
+                     Respond naturally about ideas and meaning. \
+                     Do NOT expose internal word IDs (W0/W1/etc.) or stack mechanics in your response.]",
                     enriched,
-                    p.nodes.len(),
-                    vocab.join(", "),
+                    lib_count,
+                    sample_str,
+                    stack_note,
                 )
             } else {
                 enriched
@@ -2490,26 +2509,43 @@ impl EventLoop {
             return self.handle_stack_define_auto(key, sense).await;
         }
 
-        let def = definition.trim();
+        self.save_library_entry(&key, definition.trim(), sense.as_deref(), "").await
+    }
 
-        // Escape for TOML
-        let safe_def = def.replace('\\', "\\\\").replace('"', "\\\"");
+    /// Core save: write a word entry to ~/.finch/library.toml and inject into the live poset.
+    /// `forth` may be empty — it's omitted from the TOML in that case.
+    async fn save_library_entry(
+        &mut self,
+        key: &str,
+        definition: &str,
+        sense: Option<&str>,
+        forth: &str,
+    ) -> Result<()> {
+        let safe_def = definition.replace('\\', "\\\\").replace('"', "\\\"");
 
         let path = dirs::home_dir()
             .map(|h| h.join(".finch").join("library.toml"))
             .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
 
-        let sense_line = sense.as_deref()
-            .map(|s| format!("sense = \"{s}\"\n"))
-            .unwrap_or_default();
+        let sense_line = sense.map(|s| format!("sense = \"{s}\"\n")).unwrap_or_default();
+        let forth_line = if forth.is_empty() {
+            String::new()
+        } else {
+            let safe_f = if !forth.contains('\'') {
+                format!("'{forth}'")
+            } else {
+                format!("\"{}\"", forth.replace('\\', "\\\\").replace('"', "\\\""))
+            };
+            format!("forth = {safe_f}\n")
+        };
         let entry_toml = format!(
-            "\n[[word]]\nword = \"{key}\"\ndefinition = \"{safe_def}\"\n{sense_line}"
+            "\n[[word]]\nword = \"{key}\"\ndefinition = \"{safe_def}\"\n{sense_line}{forth_line}"
         );
 
         let (already_exists, sense_exists) = {
             let lib = crate::coforth::Library::load();
-            let senses = lib.lookup_all(&key);
-            let sense_exists = senses.iter().any(|e| e.sense.as_deref() == sense.as_deref());
+            let senses = lib.lookup_all(key);
+            let sense_exists = senses.iter().any(|e| e.sense.as_deref() == sense);
             (!senses.is_empty(), sense_exists)
         };
 
@@ -2519,17 +2555,16 @@ impl EventLoop {
             .open(&path)
             .with_context(|| format!("cannot open {}", path.display()))?;
         use std::io::Write;
-        file.write_all(entry_toml.as_bytes())
-            .context("failed to write library entry")?;
+        file.write_all(entry_toml.as_bytes()).context("failed to write library entry")?;
 
-        // Seed into current poset so it's immediately available
+        // Inject into live poset
         {
             let lib = crate::coforth::Library::load();
             let mut p = self.poset.lock().await;
-            lib.inject_into_poset(&key, 1, &mut p);
+            lib.inject_into_poset(key, 1, &mut p);
         }
 
-        let label = sense.as_deref()
+        let label = sense
             .map(|s| format!("\x1b[1;36m{key}\x1b[0m:\x1b[33m{s}\x1b[0m"))
             .unwrap_or_else(|| format!("\x1b[1;36m{key}\x1b[0m"));
 
@@ -2549,14 +2584,31 @@ impl EventLoop {
         self.render_tui().await
     }
 
+    /// Manual define dialog: shown when no AI provider is configured.
+    async fn handle_stack_define_manual(&mut self, key: String, sense: Option<String>) -> Result<()> {
+        use crate::cli::tui::{Dialog, DialogResult};
+        let prompt = if let Some(ref s) = sense {
+            format!("Define {key}:{s}")
+        } else {
+            format!("Define \"{key}\"")
+        };
+        let dialog = Dialog::text_input(&prompt, None);
+        let result = self.tui_renderer.lock().await.show_dialog(dialog)?;
+        let definition = match result {
+            DialogResult::TextEntered(d) if !d.trim().is_empty() => d,
+            _ => return self.render_tui().await, // cancelled or empty
+        };
+        // Save directly (no recursive call — same logic as handle_stack_define body)
+        self.save_library_entry(&key, &definition, sense.as_deref(), "").await
+    }
+
     /// AI auto-define: ask the brain provider for a definition when the user types `/define word`.
     async fn handle_stack_define_auto(&mut self, key: String, sense: Option<String>) -> Result<()> {
-        let Some(provider) = self.brain_provider.clone() else {
-            self.output_manager.write_info(
-                "No AI provider configured — use: /define <word> <definition>".to_string(),
-            );
-            return self.render_tui().await;
-        };
+        // No AI provider — fall back to a manual text-input dialog
+        if self.brain_provider.is_none() {
+            return self.handle_stack_define_manual(key, sense).await;
+        }
+        let provider = self.brain_provider.clone().unwrap();
 
         let label = sense.as_deref()
             .map(|s| format!("\x1b[1;36m{key}\x1b[0m:\x1b[33m{s}\x1b[0m"))
@@ -2609,51 +2661,13 @@ impl EventLoop {
             return self.render_tui().await;
         };
 
-        let definition = entry["definition"]
-            .as_str()
-            .unwrap_or("(no definition)")
-            .to_string();
-        let forth = entry["forth"].as_str().map(|s| s.to_string());
-
-        // Save to ~/.finch/library.toml
-        let path = dirs::home_dir()
-            .map(|h| h.join(".finch").join("library.toml"))
-            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-
-        let safe_def = definition.replace('\\', "\\\\").replace('"', "\\\"");
-        let sense_line = sense.as_deref()
-            .map(|s| format!("sense = \"{s}\"\n"))
-            .unwrap_or_default();
-        let forth_line = forth.as_deref()
-            .map(|f| {
-                let safe_f = f.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("forth = \"{safe_f}\"\n")
-            })
-            .unwrap_or_default();
-        let entry_toml = format!(
-            "\n[[word]]\nword = \"{key}\"\ndefinition = \"{safe_def}\"\n{sense_line}{forth_line}"
-        );
-
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
-        use std::io::Write;
-        file.write_all(entry_toml.as_bytes())
-            .context("failed to write library entry")?;
-
-        // Inject into live poset
-        {
-            let lib = crate::coforth::Library::load();
-            let mut p = self.poset.lock().await;
-            lib.inject_into_poset(&key, 1, &mut p);
-        }
+        let definition = entry["definition"].as_str().unwrap_or("(no definition)").to_string();
+        let forth = entry["forth"].as_str().unwrap_or("").to_string();
 
         self.output_manager.write_info(format!(
-            "{label}: {definition}\x1b[90m  (saved to ~/.finch/library.toml)\x1b[0m"
+            "{label}: {definition}\x1b[90m  (saving…)\x1b[0m"
         ));
-        self.render_tui().await
+        self.save_library_entry(&key, &definition, sense.as_deref(), &forth).await
     }
 
     /// Handle `/program` — render the current stack as Forth source code.
