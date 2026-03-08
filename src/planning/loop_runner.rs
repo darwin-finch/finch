@@ -58,7 +58,79 @@ impl PlanLoop {
         let mut history: Vec<PlanIteration> = Vec::new();
         let mut steering_feedback: Option<String> = None;
 
-        for iteration in 1..=self.config.max_iterations {
+        // ── Clarification gate (iteration 0) ────────────────────────────────
+        // On the very first call, ask the model if the task is clear. If it
+        // responds with "CLARIFY: <question>", surface that to the user before
+        // running any critique passes.
+        {
+            tui.lock().await.set_operation_status("Checking task clarity…".to_string());
+            let probe = self
+                .generate_plan(task, &[], None)
+                .await
+                .context("Failed to generate plan")?;
+
+            if let Some(question) = extract_clarification(&probe) {
+                tui.lock().await.clear_operation_status();
+                match self.prompt_clarification(tui, &question).await? {
+                    None => return Ok(PlanResult::Cancelled),
+                    Some(clarified) => {
+                        // Restart with the full clarified task
+                        let new_task = format!("{task}\n\nClarification: {clarified}");
+                        // Tail-recurse via a fresh run_inner (depth stays 1)
+                        return Box::pin(self.run_inner(&new_task, tui)).await;
+                    }
+                }
+            }
+            // Task is clear — use this first plan as iteration 1
+            tui.lock().await.clear_operation_status();
+            self.show_iteration_header(1);
+            self.show_plan(&probe, 1);
+
+            let personas = select_active_personas(&probe);
+            self.show_critique_header(1, &personas);
+            tui.lock().await.set_operation_status("IMPCPD 1: critiquing…".to_string());
+            let critiques = self
+                .critique_plan(&probe, &personas)
+                .await
+                .context("Failed to critique plan")?;
+            tui.lock().await.clear_operation_status();
+            self.show_critiques(&critiques);
+
+            let minority: Vec<&CritiqueItem> =
+                critiques.iter().filter(|c| c.is_minority_risk).collect();
+            if !minority.is_empty() {
+                self.show_minority_risks(&minority);
+            }
+
+            let feedback = self
+                .prompt_user_feedback(tui, 1)
+                .await
+                .context("Failed to get user feedback")?;
+
+            match feedback {
+                UserFeedback::Approve => {
+                    history.push(PlanIteration {
+                        iteration: 1,
+                        plan_text: probe,
+                        critiques,
+                        user_feedback: None,
+                    });
+                    return Ok(PlanResult::UserApproved { iterations: history });
+                }
+                UserFeedback::Cancel => return Ok(PlanResult::Cancelled),
+                UserFeedback::Continue(text) => {
+                    steering_feedback = text.clone();
+                    history.push(PlanIteration {
+                        iteration: 1,
+                        plan_text: probe,
+                        critiques,
+                        user_feedback: text,
+                    });
+                }
+            }
+        }
+
+        for iteration in 2..=self.config.max_iterations {
             // ── 1. Generate plan ────────────────────────────────────────────
             self.show_iteration_header(iteration);
             tui.lock().await.set_operation_status(format!(
@@ -184,12 +256,15 @@ impl PlanLoop {
             "{alignment}\n\n\
              You are an expert software engineer creating an implementation plan.\n\
              Task: {task}\n\n\
-             Generate a clear, numbered implementation plan. Requirements:\n\
+             If the task is clear and actionable, generate a numbered implementation plan:\n\
              - Each step must be specific and actionable\n\
              - Name the exact files to modify or create\n\
              - Keep the scope tight — only what is necessary for this task\n\
              - Steps should leave the codebase in a compilable state when followed in order\n\n\
-             Return ONLY the numbered plan. No preamble. No post-amble.",
+             If the task is ambiguous, too vague, or not a software engineering task, \
+             respond with exactly one line in this format:\n\
+             CLARIFY: <your question to the user>\n\n\
+             Return ONLY the numbered plan OR the CLARIFY line. No preamble. No post-amble.",
             alignment = crate::providers::UNIVERSAL_ALIGNMENT_PROMPT.trim(),
         );
 
@@ -388,6 +463,34 @@ impl PlanLoop {
         }
     }
 
+    /// Show a clarification question from the model and collect the user's answer.
+    ///
+    /// Returns `None` if the user cancels.
+    async fn prompt_clarification(
+        &self,
+        tui: &Arc<Mutex<TuiRenderer>>,
+        question: &str,
+    ) -> Result<Option<String>> {
+        self.output_manager
+            .write_info(format!("\n❓ {question}"));
+
+        let dialog = Dialog::text_input(question.to_string(), None);
+        let result = {
+            let mut tui_guard = tui.lock().await;
+            tui_guard
+                .show_dialog(dialog)
+                .context("Failed to show clarification dialog")?
+        };
+
+        Ok(match result {
+            DialogResult::CustomText(text) if !text.trim().is_empty() => {
+                Some(text.trim().to_string())
+            }
+            DialogResult::Cancelled => None,
+            _ => None,
+        })
+    }
+
     /// Show a blocking dialog and collect user steering feedback.
     async fn prompt_user_feedback(
         &self,
@@ -430,6 +533,21 @@ impl PlanLoop {
 
         Ok(feedback)
     }
+}
+
+// ── Clarification detection ───────────────────────────────────────────────────
+
+/// If the model responded with "CLARIFY: <question>", extract the question.
+/// Returns `None` if the response is a normal plan.
+fn extract_clarification(response: &str) -> Option<String> {
+    let trimmed = response.trim();
+    // Accept "CLARIFY:" at the start of the whole response (possibly multi-line,
+    // but we only care about the first line being the signal).
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    first_line
+        .strip_prefix("CLARIFY:")
+        .map(|q| q.trim().to_string())
+        .filter(|q| !q.is_empty())
 }
 
 // ── Convergence check ──────────────────────────────────────────────────────────
@@ -641,6 +759,35 @@ mod tests {
     fn test_parse_critique_response_invalid_json_soft_degrades() {
         let items = parse_critique_response("not json at all").unwrap();
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_extract_clarification_detects_clarify_prefix() {
+        assert_eq!(
+            extract_clarification("CLARIFY: What do you mean by hello?"),
+            Some("What do you mean by hello?".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_clarification_ignores_normal_plan() {
+        assert_eq!(
+            extract_clarification("1. Read the file\n2. Modify the handler"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_clarification_ignores_empty_clarify() {
+        assert_eq!(extract_clarification("CLARIFY:"), None);
+        assert_eq!(extract_clarification("CLARIFY:   "), None);
+    }
+
+    #[test]
+    fn test_extract_clarification_only_checks_first_line() {
+        // CLARIFY on a later line should not trigger (it's part of plan text)
+        let plan = "1. Do the thing\nCLARIFY: irrelevant";
+        assert_eq!(extract_clarification(plan), None);
     }
 
     #[test]
