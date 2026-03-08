@@ -78,6 +78,7 @@ pub enum Command {
     StackDefine(String, String),  // /define <word> <def> — add word to user library
     ForthEval(String),            // : word ... ; or /forth <expr> — eval in Forth interpreter
     ForthUndo,                    // /undefine — undo last Forth definition
+    LibraryUndefine(String),      // /undefine <word> — remove last user library entry for word
 }
 
 impl Command {
@@ -181,9 +182,15 @@ impl Command {
         if trimmed.starts_with(": ") {
             return Some(Command::ForthEval(trimmed.to_string()));
         }
-        // Forth undo
+        // Forth / library undo
         if trimmed == "/undefine" {
             return Some(Command::ForthUndo);
+        }
+        if let Some(rest) = trimmed.strip_prefix("/undefine ") {
+            let word = rest.trim().to_string();
+            if !word.is_empty() {
+                return Some(Command::LibraryUndefine(word));
+            }
         }
         // Forth eval via /forth
         if let Some(rest) = trimmed.strip_prefix("/forth ") {
@@ -476,7 +483,8 @@ pub fn handle_command(
         | Command::StackDescribe(_)
         | Command::StackDefine(_, _)
         | Command::ForthEval(_)
-        | Command::ForthUndo => Ok(CommandOutput::Status(
+        | Command::ForthUndo
+        | Command::LibraryUndefine(_) => Ok(CommandOutput::Status(
             "Stack commands should be handled in REPL.".to_string(),
         )),
     }

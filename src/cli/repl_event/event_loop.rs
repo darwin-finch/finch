@@ -1085,6 +1085,9 @@ impl EventLoop {
                     Command::ForthUndo => {
                         self.handle_forth_undo().await?;
                     }
+                    Command::LibraryUndefine(word) => {
+                        self.handle_library_undefine(word).await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -2530,6 +2533,64 @@ impl EventLoop {
                 self.output_manager.write_info("nothing to undo".to_string());
             }
         }
+        self.render_tui().await
+    }
+
+    /// `/undefine <word>` — remove the last user-library entry for `word`.
+    ///
+    /// The embedded library is never modified; only `~/.finch/library.toml` entries
+    /// are removed.  If there are multiple user entries for the word, only the last
+    /// one is removed (stack semantics — the one below it becomes active again).
+    async fn handle_library_undefine(&mut self, word: String) -> Result<()> {
+        let key = word.trim().to_lowercase();
+        let user_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".finch")
+            .join("library.toml");
+
+        let msg = if user_path.exists() {
+            match std::fs::read_to_string(&user_path) {
+                Ok(content) => {
+                    // Split into [[word]] blocks and remove the LAST block matching `key`
+                    let blocks: Vec<&str> = content.split("\n[[word]]").collect();
+                    let target = format!("\nword = \"{}\"", key);
+                    let target2 = format!("word = \"{}\"", key); // first block (no leading \n)
+
+                    // Find the last block that matches
+                    let last_match = blocks.iter().rposition(|b| {
+                        let trimmed = b.trim_start_matches('\n');
+                        trimmed.starts_with(&target2) ||
+                        trimmed.lines().next().map(|l| l == &target2[..]).unwrap_or(false) ||
+                        b.contains(&target)
+                    });
+
+                    match last_match {
+                        Some(idx) => {
+                            let mut new_blocks: Vec<&str> = blocks.clone();
+                            new_blocks.remove(idx);
+                            let new_content = if new_blocks.is_empty() {
+                                String::new()
+                            } else {
+                                let first = new_blocks[0].to_string();
+                                let rest = new_blocks[1..].iter()
+                                    .map(|b| format!("\n[[word]]{b}"))
+                                    .collect::<String>();
+                                format!("{first}{rest}")
+                            };
+                            std::fs::write(&user_path, new_content)
+                                .context("Failed to write library.toml")?;
+                            format!("removed: {key}  (previous definition now active)")
+                        }
+                        None => format!("no user definition found for: {key}"),
+                    }
+                }
+                Err(e) => format!("error reading library: {e}"),
+            }
+        } else {
+            format!("no user library at {}", user_path.display())
+        };
+
+        self.output_manager.write_info(msg);
         self.render_tui().await
     }
 
