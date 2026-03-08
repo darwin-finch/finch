@@ -46,6 +46,19 @@ impl EventLoop {
 
     /// Handle a `TypingStarted` event: (re-)spawn the brain with the new partial input.
     async fn handle_typing_started(&self, partial: String) {
+        // Extract words from the partial input and show arrows in the panel.
+        {
+            let mut seen = std::collections::HashSet::new();
+            let words: Vec<String> = partial
+                .split(|c: char| !c.is_alphabetic() && c != '-' && c != '\'')
+                .filter(|w| w.len() >= 3)
+                .map(|w| w.to_lowercase())
+                .filter(|w| seen.insert(w.clone()))
+                .collect();
+            let mut tui = self.tui_renderer.lock().await;
+            tui.set_typing_words(words);
+        }
+
         // No-op if brain is disabled or no cloud provider is available.
         let provider = match &self.brain_provider {
             Some(p) => Arc::clone(p),

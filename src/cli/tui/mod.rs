@@ -85,6 +85,55 @@ fn tilde_cwd() -> String {
 
 // ─── Co-Forth Forth source renderer ───────────────────────────────────────────
 
+/// Render the live typing words as arrow-connected vocabulary lines.
+///
+/// For each word found in the library, shows its definition snippet.
+/// Between consecutive recognised words, draws `word1 → word2`.
+/// Unknown words are shown in dim.
+fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> Vec<String> {
+    const CYAN:  &str = "\x1b[36m";
+    const DIM:   &str = "\x1b[2m";
+    const BOLD:  &str = "\x1b[1m";
+    const RESET: &str = "\x1b[0m";
+    const ARROW: &str = " → ";
+
+    let lib = crate::coforth::Library::load();
+    let mut lines: Vec<String> = Vec::new();
+
+    // Build arrow chain line: word1 → word2 → word3
+    let mut chain = String::new();
+    for (i, word) in words.iter().enumerate() {
+        let key = word.to_lowercase();
+        let found = lib.lookup(&key).is_some();
+        if i > 0 { chain.push_str(ARROW); }
+        if found {
+            chain.push_str(&format!("{BOLD}{CYAN}{word}{RESET}"));
+        } else {
+            chain.push_str(&format!("{DIM}{word}{RESET}"));
+        }
+    }
+    if !chain.is_empty() {
+        lines.push(chain);
+    }
+
+    // Per-word: definition snippet (first 40 chars)
+    for word in words {
+        if lines.len() >= max_lines { break; }
+        let key = word.to_lowercase();
+        if let Some(entry) = lib.lookup(&key) {
+            let def = entry.definition.chars().take(panel_w.saturating_sub(4)).collect::<String>();
+            lines.push(format!("{DIM}{word}{RESET}  {def}"));
+            // Show related words on next line if space
+            if lines.len() < max_lines && !entry.related.is_empty() {
+                let rel = entry.related.iter().take(3).map(|r| r.as_str()).collect::<Vec<_>>().join(", ");
+                lines.push(format!("  {DIM}↳ {rel}{RESET}"));
+            }
+        }
+    }
+
+    lines
+}
+
 /// Render a `Poset` as compact Forth source lines for the panel overlay.
 ///
 /// Each node becomes one word definition; predecessors are called first.
@@ -336,6 +385,9 @@ pub enum PosetPanelMode {
     #[default]
     Graph,
     Forth,
+    /// Live typing view — shows arrows between words as the user types.
+    /// Returns to the previous mode when input is cleared/submitted.
+    Typing,
 }
 
 // ─── TuiRenderer ──────────────────────────────────────────────────────────────
@@ -410,6 +462,12 @@ pub struct TuiRenderer {
 
     // Session identity — set by print_startup_header(); shown in separator line.
     session_label: String,
+
+    /// Words currently being typed (updated on each keystroke via set_typing_words).
+    /// When non-empty, the panel switches to Typing mode to show live arrows.
+    pub typing_words: Vec<String>,
+    /// Panel mode to restore after typing is done (before Typing mode was set).
+    pre_typing_mode: PosetPanelMode,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -488,6 +546,8 @@ impl TuiRenderer {
             panel_hint_shown: false,
 
             session_label: String::new(),
+            typing_words: Vec::new(),
+            pre_typing_mode: PosetPanelMode::Forth,
         })
     }
 
@@ -513,8 +573,28 @@ impl TuiRenderer {
     pub fn toggle_poset_view(&mut self) {
         self.poset_panel_mode = match self.poset_panel_mode {
             PosetPanelMode::Graph => PosetPanelMode::Forth,
-            PosetPanelMode::Forth => PosetPanelMode::Graph,
+            PosetPanelMode::Forth | PosetPanelMode::Typing => PosetPanelMode::Graph,
         };
+    }
+
+    /// Update the live typing words and switch the panel to Typing mode.
+    /// Pass an empty slice to clear (restores the previous mode).
+    pub fn set_typing_words(&mut self, words: Vec<String>) {
+        if words.is_empty() {
+            // Restore previous mode when input is cleared
+            if matches!(self.poset_panel_mode, PosetPanelMode::Typing) {
+                self.poset_panel_mode = self.pre_typing_mode;
+                self.pre_typing_mode = PosetPanelMode::Forth;
+            }
+            self.typing_words.clear();
+        } else {
+            // Switch to Typing mode (save current mode first)
+            if !matches!(self.poset_panel_mode, PosetPanelMode::Typing) {
+                self.pre_typing_mode = self.poset_panel_mode.clone();
+                self.poset_panel_mode = PosetPanelMode::Typing;
+            }
+            self.typing_words = words;
+        }
     }
 
 
@@ -934,6 +1014,9 @@ impl TuiRenderer {
         let content: Vec<String> = match self.poset_panel_mode {
             PosetPanelMode::Graph => crate::poset::renderer::render(&poset, PANEL_W, PANEL_H - 1),
             PosetPanelMode::Forth => poset_to_forth_lines(&poset, PANEL_W, PANEL_H - 1),
+            PosetPanelMode::Typing => {
+                typing_words_to_lines(&self.typing_words, PANEL_W, PANEL_H - 1)
+            }
         };
 
         let node_count = poset.nodes.len();
@@ -952,6 +1035,7 @@ impl TuiRenderer {
         let view_toggle = match self.poset_panel_mode {
             PosetPanelMode::Graph => "/program",
             PosetPanelMode::Forth => "/view",
+            PosetPanelMode::Typing => "typing",
         };
         let header = format!(
             "{dim}{n} words  ·  {toggle}{reset}",

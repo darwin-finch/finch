@@ -210,7 +210,7 @@ impl DaemonClient {
             }],
         }];
 
-        const MAX_TURNS: usize = 10;
+        const MAX_TURNS: usize = 30;
         let mut turn = 0;
 
         loop {

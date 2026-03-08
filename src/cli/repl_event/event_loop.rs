@@ -540,6 +540,11 @@ impl EventLoop {
                                 let _ = tui.pending_dialog_result.take();
                             }
                             self.pending_brain_question_options.clear();
+                            // Clear typing words — restore panel to previous mode.
+                            {
+                                let mut tui = self.tui_renderer.lock().await;
+                                tui.set_typing_words(vec![]);
+                            }
                             // Cancel the brain session but preserve its context for injection.
                             self.cancel_active_brain(false).await;
                             self.handle_user_input(input).await?;
