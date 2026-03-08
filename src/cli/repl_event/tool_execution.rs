@@ -47,6 +47,12 @@ pub struct ToolExecutionCoordinator {
 
     /// Plan content storage
     plan_content: Arc<RwLock<Option<String>>>,
+
+    /// Co-Forth shared stack (AI can push items here via the Push tool)
+    stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+
+    /// Co-Forth poset — each tool call auto-pushes a trace node here.
+    poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 }
 
 impl ToolExecutionCoordinator {
@@ -68,7 +74,21 @@ impl ToolExecutionCoordinator {
             tokenizer,
             repl_mode,
             plan_content,
+            stack: None,
+            poset: None,
         }
+    }
+
+    /// Wire the Co-Forth shared stack so the Push tool can write to it.
+    pub fn with_stack(mut self, stack: Arc<tokio::sync::Mutex<Vec<String>>>) -> Self {
+        self.stack = Some(stack);
+        self
+    }
+
+    /// Wire the Co-Forth poset so every tool call auto-records a trace node.
+    pub fn with_poset(mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>) -> Self {
+        self.poset = Some(poset);
+        self
     }
 
     /// Get access to the tool executor (for MCP commands and other management)
@@ -101,6 +121,8 @@ impl ToolExecutionCoordinator {
         let tokenizer = Arc::clone(&self.tokenizer);
         let repl_mode = Arc::clone(&self.repl_mode);
         let plan_content = Arc::clone(&self.plan_content);
+        let stack = self.stack.clone();
+        let poset = self.poset.clone();
 
         // Build a live-output callback that streams stdout lines into the WorkUnit row.
         // The format() method shows the last 3 body_lines for Running rows, so each
@@ -241,6 +263,9 @@ impl ToolExecutionCoordinator {
             // Tool approved (or doesn't need approval), execute it
             let conversation_snapshot = conversation.read().await.clone();
 
+            // Wire the poset into the executor so tool calls auto-record trace nodes.
+            tool_executor.lock().await.poset = poset.clone();
+
             // Execute with timeout to prevent system freezing (especially for CPU-heavy operations)
             let timeout_duration = std::time::Duration::from_secs(30);
             let result = tokio::time::timeout(
@@ -258,6 +283,7 @@ impl ToolExecutionCoordinator {
                         Some(Arc::clone(&repl_mode)),
                         Some(Arc::clone(&plan_content)),
                         Some(Arc::clone(&live_output)),
+                        stack.clone(), // Co-Forth shared stack
                     ),
             )
             .await;
@@ -271,6 +297,26 @@ impl ToolExecutionCoordinator {
                         tool_use.name,
                         tool_result.content.len()
                     );
+
+                    // Push tool result onto the Co-Forth stack so the user can
+                    // see what the AI observed before deciding to /run.
+                    // Skip internal tools (Push, TodoWrite, etc.) — those manage
+                    // their own stack interaction.
+                    let skip_stack = matches!(
+                        tool_use.name.as_str(),
+                        "Push" | "TodoWrite" | "TodoRead" | "EnterPlanMode" | "enter_plan_mode"
+                    );
+                    if !skip_stack {
+                        if let Some(ref s) = stack {
+                            let frame = format!(
+                                "[{}]\n{}",
+                                tool_use.name,
+                                tool_result.content.trim()
+                            );
+                            s.lock().await.push(frame);
+                        }
+                    }
+
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
                         tool_id: tool_use.id.clone(),

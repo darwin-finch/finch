@@ -88,6 +88,7 @@ impl EventHandler {
             ReplEvent::Shutdown => {}
             ReplEvent::BrainQuestion { .. } => {}
             ReplEvent::BrainProposedAction { .. } => {}
+            ReplEvent::PosetComplete { .. } => {}
         }
 
         Ok(())
@@ -236,7 +237,7 @@ fn format_tool_description(tool_use: &crate::tools::types::ToolUse) -> String {
                 let command_str = command.as_str().unwrap_or("command");
                 // Truncate long commands
                 if command_str.len() > 60 {
-                    format!("{}...", &command_str[..60])
+                    format!("{}...", command_str.chars().take(60).collect::<String>())
                 } else {
                     command_str.to_string()
                 }

@@ -76,6 +76,8 @@ pub enum Command {
     StackSwap(usize, usize),      // /swap W1 W2       — swap labels of two words
     StackDescribe(String),        // /describe <word>  — show library entry for a word
     StackDefine(String, String),  // /define <word> <def> — add word to user library
+    ForthEval(String),            // : word ... ; or /forth <expr> — eval in Forth interpreter
+    ForthUndo,                    // /undefine — undo last Forth definition
 }
 
 impl Command {
@@ -175,6 +177,22 @@ impl Command {
                 return Some(Command::StackDescribe(word.to_string()));
             }
         }
+        // Forth definition typed directly: `: word ... ;`
+        if trimmed.starts_with(": ") {
+            return Some(Command::ForthEval(trimmed.to_string()));
+        }
+        // Forth undo
+        if trimmed == "/undefine" {
+            return Some(Command::ForthUndo);
+        }
+        // Forth eval via /forth
+        if let Some(rest) = trimmed.strip_prefix("/forth ") {
+            let expr = rest.trim();
+            if !expr.is_empty() {
+                return Some(Command::ForthEval(expr.to_string()));
+            }
+        }
+
         if let Some(rest) = trimmed.strip_prefix("/define ") {
             // /define <word> <definition…>   — definition may be empty (AI auto-define)
             let rest = rest.trim();
@@ -456,7 +474,9 @@ pub fn handle_command(
         | Command::StackDup(_)
         | Command::StackSwap(_, _)
         | Command::StackDescribe(_)
-        | Command::StackDefine(_, _) => Ok(CommandOutput::Status(
+        | Command::StackDefine(_, _)
+        | Command::ForthEval(_)
+        | Command::ForthUndo => Ok(CommandOutput::Status(
             "Stack commands should be handled in REPL.".to_string(),
         )),
     }

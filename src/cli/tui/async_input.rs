@@ -177,8 +177,25 @@ pub fn spawn_input_task(
                                     (KeyCode::Char('c'), m)
                                         if m.contains(KeyModifiers::CONTROL) =>
                                     {
-                                        // Ctrl+C: Cancel query
-                                        tui.pending_cancellation = true;
+                                        // Ctrl+C: Clear input if non-empty, otherwise cancel query
+                                        let content = tui.input_textarea.lines().join("");
+                                        if content.trim().is_empty() {
+                                            tui.pending_cancellation = true;
+                                        } else {
+                                            tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                            first_event_modified_input = true;
+                                        }
+                                        Ok(None)
+                                    }
+                                    (KeyCode::Esc, _) => {
+                                        // Escape: Clear input if non-empty, otherwise cancel query
+                                        let content = tui.input_textarea.lines().join("");
+                                        if content.trim().is_empty() {
+                                            tui.pending_cancellation = true;
+                                        } else {
+                                            tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                            first_event_modified_input = true;
+                                        }
                                         Ok(None)
                                     }
                                     // Cmd+V on macOS / Ctrl+V: check clipboard for images
@@ -342,22 +359,21 @@ pub fn spawn_input_task(
                     };
 
                     // Fast path: Check if more events are immediately available (for paste operations)
-                    // Process all available events without delay to make pasting instant
+                    // Process all available events without delay to make pasting instant.
+                    // All Enter keys in this batch are treated as newlines — the user can
+                    // submit deliberately on the *next* keypress after the paste settles.
                     let mut had_input = first_event_modified_input;
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
                             Ok(Event::Key(key)) if key.code == KeyCode::Enter => {
-                                if key
-                                    .modifiers
-                                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                                {
-                                    // Shift+Enter / Alt(Option)+Enter: Insert newline
-                                    tui.input_textarea.input(Event::Key(key));
-                                    had_input = true;
-                                } else {
-                                    // Enter without Shift: Stop batch, will be processed next iteration
-                                    break;
-                                }
+                                // In paste batch: always insert newline, never submit.
+                                // Re-map to Shift+Enter so tui-textarea treats it as newline.
+                                let newline_key = crossterm::event::KeyEvent::new(
+                                    KeyCode::Enter,
+                                    KeyModifiers::SHIFT,
+                                );
+                                tui.input_textarea.input(Event::Key(newline_key));
+                                had_input = true;
                             }
                             Ok(Event::Key(key)) => {
                                 // Sanitize pasted content (filter images/control chars)

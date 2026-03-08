@@ -42,6 +42,9 @@ pub mod memory_tools;
 // Session task list tools
 pub mod todo_tools;
 
+// Co-Forth VM stack tools
+pub mod stack_tools;
+
 // Re-exports for convenience
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
@@ -65,3 +68,5 @@ pub use llm_tools::LLMDelegationTool;
 pub use memory_tools::{CreateMemoryTool, ListRecentTool, SearchMemoryTool};
 
 pub use todo_tools::{TodoReadTool, TodoWriteTool};
+
+pub use stack_tools::{StackClearTool, StackPopTool, StackPushTool, StackRunTool};

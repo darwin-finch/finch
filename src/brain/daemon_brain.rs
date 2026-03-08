@@ -199,6 +199,8 @@ async fn execute_daemon_brain_tool(
         repl_mode: None,
         plan_content: None,
         live_output: None,
+        stack: None,
+        poset: None,
     };
 
     match tool.execute(tool_use.input.clone(), &context).await {
@@ -392,6 +394,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            stack: None,
+            poset: None,
         };
         let registry_clone = Arc::clone(&registry);
         let exec_handle = tokio::spawn(async move {
@@ -432,6 +436,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            stack: None,
+            poset: None,
         };
         let registry_clone = Arc::clone(&registry);
         let exec_handle = tokio::spawn(async move {

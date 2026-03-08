@@ -259,6 +259,8 @@ async fn execute_brain_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> Resu
         repl_mode: None,
         plan_content: None,
         live_output: None,
+        stack: None,
+        poset: None,
     };
 
     tool.execute(tool_use.input.clone(), &context).await

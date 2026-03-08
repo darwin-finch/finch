@@ -95,6 +95,11 @@ pub enum ReplEvent {
         reason: String,
         response_tx: tokio::sync::oneshot::Sender<Option<String>>,
     },
+
+    /// Co-Forth poset execution finished.
+    PosetComplete {
+        result: Result<String>,
+    },
 }
 
 #[cfg(test)]

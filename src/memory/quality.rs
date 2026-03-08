@@ -271,7 +271,13 @@ fn truncate_at_sentence(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
 
-    let slice = &s[..max_chars];
+    // Find a safe char boundary at or before max_chars
+    let safe = s.char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max_chars)
+        .last()
+        .unwrap_or(0);
+    let slice = &s[..safe];
 
     // Prefer ending at a sentence boundary
     if let Some(pos) = slice.rfind(['.', '!', '\n']) {

@@ -83,6 +83,160 @@ fn tilde_cwd() -> String {
     }
 }
 
+// ─── Co-Forth Forth source renderer ───────────────────────────────────────────
+
+/// Render a `Poset` as compact Forth source lines for the panel overlay.
+///
+/// Each node becomes one word definition; predecessors are called first.
+/// `PROGRAM` calls all leaf nodes (nodes with no outgoing edges).
+/// Output is capped at `max_lines` lines.
+fn poset_to_forth_lines(
+    poset: &crate::poset::Poset,
+    _panel_w: usize,
+    max_lines: usize,
+) -> Vec<String> {
+    use crate::poset::NodeStatus;
+    const C: &str = "\x1b[36m"; // cyan
+    const Y: &str = "\x1b[33m"; // yellow
+    const G: &str = "\x1b[32m"; // green
+    const R: &str = "\x1b[31m"; // red
+    const D: &str = "\x1b[90m"; // dim
+    const RST: &str = "\x1b[0m";
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // Build predecessor map: node_id → [pred_id, ...]
+    let mut preds: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    let mut has_successor: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for &(pred, succ) in &poset.edges {
+        preds.entry(succ).or_default().push(pred);
+        has_successor.insert(pred);
+    }
+
+    // Topological sort (Kahn's algorithm)
+    let mut in_degree: std::collections::HashMap<usize, usize> = poset.nodes.iter()
+        .map(|n| (n.id, 0))
+        .collect();
+    for &(_, succ) in &poset.edges {
+        *in_degree.entry(succ).or_insert(0) += 1;
+    }
+    let mut queue: std::collections::VecDeque<usize> = in_degree.iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&id, _)| id)
+        .collect();
+    let mut topo: Vec<usize> = Vec::new();
+    while let Some(id) = queue.pop_front() {
+        topo.push(id);
+        for &(pred, succ) in &poset.edges {
+            if pred == id {
+                let d = in_degree.entry(succ).or_insert(0);
+                *d = d.saturating_sub(1);
+                if *d == 0 { queue.push_back(succ); }
+            }
+        }
+    }
+    // Any remaining (cycles) append in id order.
+    for n in &poset.nodes {
+        if !topo.contains(&n.id) { topo.push(n.id); }
+    }
+
+    // Word name helper
+    let word_name = |id: usize| -> String { format!("W{id}") };
+
+    // Render each word in topo order
+    for &id in &topo {
+        let Some(node) = poset.nodes.iter().find(|n| n.id == id) else { continue };
+
+        let status_glyph = match node.status {
+            NodeStatus::Done    => format!("{G}✓{RST}"),
+            NodeStatus::Failed  => format!("{R}✗{RST}"),
+            NodeStatus::Running => format!("{Y}▶{RST}"),
+            NodeStatus::Pending => format!("{D}·{RST}"),
+        };
+
+        let stack_effect = format!("{D}( -- result ){RST}");
+
+        // Predecessor calls (for words that have dependencies)
+        let pred_call = preds.get(&id)
+            .filter(|ps| !ps.is_empty())
+            .map(|ps| {
+                let names: Vec<String> = ps.iter().map(|&pid| word_name(pid)).collect();
+                format!("  {D}{}{RST}", names.join(" "))
+            })
+            .unwrap_or_default();
+
+        // Label: truncate to ~30 chars
+        let label: String = node.label.chars().take(30).collect();
+        let ellipsis = if node.label.len() > 30 { "…" } else { "" };
+
+        // Word header: `: W0  ( bash write read -- )  ✓`
+        lines.push(format!(
+            "{C}: {name}{RST}  {se}  {status}",
+            name   = word_name(id),
+            se     = stack_effect,
+            status = status_glyph,
+        ));
+        // Body: optional pred calls + label
+        if !pred_call.is_empty() {
+            lines.push(pred_call);
+        }
+        lines.push(format!("  {D}.\" {label}{ellipsis}\"{RST}"));
+        lines.push(format!("{C};{RST}"));
+
+        if lines.len() >= max_lines.saturating_sub(2) {
+            let remaining = topo.len().saturating_sub(topo.iter().position(|&x| x == id).unwrap_or(0) + 1);
+            if remaining > 0 {
+                lines.push(format!("{D}\\ … {remaining} more word{} …{RST}", if remaining == 1 { "" } else { "s" }));
+            }
+            break;
+        }
+    }
+
+    // PROGRAM word — reflects the partial order.
+    // Nodes at the same DAG depth with no edges between them run concurrently;
+    // we group them on the same line with a `\ concurrent` annotation.
+    if lines.len() < max_lines {
+        // Compute depth of each node (longest path from a root).
+        let mut depth: std::collections::HashMap<usize, usize> = poset.nodes.iter()
+            .map(|n| (n.id, 0))
+            .collect();
+        for &id in &topo {
+            let d = depth.get(&id).copied().unwrap_or(0);
+            for &(pred, succ) in &poset.edges {
+                if pred == id {
+                    let entry = depth.entry(succ).or_insert(0);
+                    if d + 1 > *entry { *entry = d + 1; }
+                }
+            }
+        }
+        // Group node ids by depth level, in topo order within each group.
+        let max_depth = depth.values().copied().max().unwrap_or(0);
+        let mut program_lines: Vec<String> = vec![format!("{Y}: PROGRAM{RST}")];
+        for lvl in 0..=max_depth {
+            let group: Vec<String> = topo.iter()
+                .filter(|&&id| depth.get(&id).copied().unwrap_or(0) == lvl)
+                .map(|&id| word_name(id))
+                .collect();
+            if group.is_empty() { continue; }
+            let parallel_note = if group.len() > 1 {
+                format!("  {D}\\ concurrent{RST}")
+            } else {
+                String::new()
+            };
+            program_lines.push(format!("  {}{}", group.join("  "), parallel_note));
+        }
+        // Close with semicolon on the last line.
+        if let Some(last) = program_lines.last_mut() {
+            last.push_str(&format!("  {Y};{RST}"));
+        }
+        for l in program_lines {
+            if lines.len() < max_lines { lines.push(l); }
+        }
+    }
+
+    lines
+}
+
 // ─── Pure logic helpers (testable without a terminal) ─────────────────────────
 
 /// Count the number of terminal rows an `effective_status` string will occupy.
@@ -175,6 +329,15 @@ pub(crate) fn compute_effective_status(
     "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel".to_string()
 }
 
+// ─── Poset panel view mode ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PosetPanelMode {
+    #[default]
+    Graph,
+    Forth,
+}
+
 // ─── TuiRenderer ──────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -231,6 +394,19 @@ pub struct TuiRenderer {
 
     // Session task list (set after construction via set_todo_list)
     todo_list: Option<Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>>,
+
+    // Co-Forth shared stack (set after construction via set_stack)
+    stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+
+    // Co-Forth poset VM — 3D rotating graph (set after construction via set_poset)
+    poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
+    // True when the poset panel was rendered (non-empty) on the last tick.
+    // Used to keep cursor_row_from_top stable when try_lock() fails.
+    poset_was_visible: bool,
+    // Which view is shown in the poset panel: graph or forth source.
+    pub poset_panel_mode: PosetPanelMode,
+    // True once we've shown the first-panel hint line — shown once, then silent.
+    panel_hint_shown: bool,
 
     // Session identity — set by print_startup_header(); shown in separator line.
     session_label: String,
@@ -305,6 +481,11 @@ impl TuiRenderer {
             render_interval: Duration::from_millis(100),
 
             todo_list: None,
+            stack: None,
+            poset: None,
+            poset_was_visible: false,
+            poset_panel_mode: PosetPanelMode::Forth,
+            panel_hint_shown: false,
 
             session_label: String::new(),
         })
@@ -317,6 +498,25 @@ impl TuiRenderer {
     ) {
         self.todo_list = Some(todo_list);
     }
+
+    /// Attach the Co-Forth shared stack so the live area can display it.
+    pub fn set_stack(&mut self, stack: Arc<tokio::sync::Mutex<Vec<String>>>) {
+        self.stack = Some(stack);
+    }
+
+    /// Attach the Co-Forth poset VM so the live area can render its 3D graph.
+    pub fn set_poset(&mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>) {
+        self.poset = Some(poset);
+    }
+
+    /// Toggle the poset panel between graph view and Forth source view.
+    pub fn toggle_poset_view(&mut self) {
+        self.poset_panel_mode = match self.poset_panel_mode {
+            PosetPanelMode::Graph => PosetPanelMode::Forth,
+            PosetPanelMode::Forth => PosetPanelMode::Graph,
+        };
+    }
+
 
     // ── TextArea factories (also called from async_input) ─────────────────────
 
@@ -443,6 +643,12 @@ impl TuiRenderer {
                 }
             }
         }
+
+        // ── 1c. Co-Forth panel ────────────────────────────────────────────────
+        // The panel is rendered as a floating overlay in draw_poset_overlay()
+        // (top-right corner of the viewport) — not inline here.  This avoids
+        // all cursor-row-counting issues; the overlay uses SavePosition /
+        // RestorePosition and has no effect on `rows` or erase_live_area().
 
         // ── 2. Separator: "──  ~/repos/finch ──────── jade-river ──" ──────────
         // CWD is left-anchored; session name is right-anchored.
@@ -696,7 +902,113 @@ impl TuiRenderer {
     /// Redraw the live area.  Called by the event loop and by async_input.
     pub fn render(&mut self) -> Result<()> {
         self.erase_live_area()?;
-        self.draw_live_area()
+        self.draw_live_area()?;
+        self.draw_poset_overlay()
+    }
+
+    // ── Co-Forth panel overlay ─────────────────────────────────────────────────
+
+    /// Render the Co-Forth panel (graph or Forth source) as a floating overlay
+    /// in the top-right corner of the current terminal viewport.
+    ///
+    /// Uses cursor::SavePosition / RestorePosition so the overlay has **zero
+    /// effect** on the live area's cursor tracking.  No rows are added to
+    /// `active_rows`; the panel never triggers the "Reflecting…" scrollback spam.
+    pub fn draw_poset_overlay(&mut self) -> Result<()> {
+        let Some(ref poset_arc) = self.poset else {
+            return Ok(());
+        };
+        let Ok(poset) = poset_arc.try_lock() else {
+            return Ok(());
+        };
+        if poset.is_empty() {
+            return Ok(());
+        }
+
+        const PANEL_H: usize = 9; // rows (includes mode-hint header)
+        const PANEL_W: usize = 44; // visible columns
+        let (term_cols, _term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let start_col = (term_cols as usize).saturating_sub(PANEL_W) as u16;
+
+        // Build lines for the chosen view.
+        let content: Vec<String> = match self.poset_panel_mode {
+            PosetPanelMode::Graph => crate::poset::renderer::render(&poset, PANEL_W, PANEL_H - 1),
+            PosetPanelMode::Forth => poset_to_forth_lines(&poset, PANEL_W, PANEL_H - 1),
+        };
+
+        let node_count = poset.nodes.len();
+
+        // One-time hint: the first time the panel appears, write a single line
+        // to scrollback so the user knows what they're looking at. After that,
+        // the panel speaks for itself.
+        if !self.panel_hint_shown {
+            self.panel_hint_shown = true;
+            self.output_manager.write_info(
+                "a vocabulary is forming in the corner"
+            );
+        }
+
+        // Header: just the word count and view toggle. No execution pressure.
+        let view_toggle = match self.poset_panel_mode {
+            PosetPanelMode::Graph => "/program",
+            PosetPanelMode::Forth => "/view",
+        };
+        let header = format!(
+            "{dim}{n} words  ·  {toggle}{reset}",
+            dim    = DIM_GRAY,
+            n      = node_count,
+            toggle = view_toggle,
+            reset  = RESET,
+        );
+
+        let mut stdout = io::stdout();
+        execute!(stdout, cursor::SavePosition)?;
+
+        // Header row
+        execute!(stdout, cursor::MoveTo(start_col, 0))?;
+        let hdr_vis: String = header.chars().take(PANEL_W).collect();
+        execute!(stdout, Print(&hdr_vis))?;
+
+        // Content rows
+        for (i, line) in content.iter().take(PANEL_H - 1).enumerate() {
+            execute!(stdout, cursor::MoveTo(start_col, (i + 1) as u16))?;
+            // Truncate to panel width and pad with spaces to clear stale chars.
+            let vis_len = crate::cli::tui::visible_length(line);
+            let truncated: String = if vis_len > PANEL_W {
+                // Clip at PANEL_W visible chars (skip ANSI codes)
+                let mut out = String::new();
+                let mut visible = 0usize;
+                let mut chars = line.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\x1b' {
+                        out.push(c);
+                        for cc in chars.by_ref() {
+                            out.push(cc);
+                            if cc.is_ascii_alphabetic() { break; }
+                        }
+                    } else {
+                        if visible >= PANEL_W { break; }
+                        out.push(c);
+                        visible += 1;
+                    }
+                }
+                out
+            } else {
+                line.clone()
+            };
+            let pad = " ".repeat(PANEL_W.saturating_sub(vis_len.min(PANEL_W)));
+            execute!(stdout, Print(&truncated), Print(&pad))?;
+        }
+        // Blank-fill any unused rows (e.g. small posets).
+        let blank = " ".repeat(PANEL_W);
+        for i in content.len()..(PANEL_H - 1) {
+            execute!(stdout, cursor::MoveTo(start_col, (i + 1) as u16))?;
+            execute!(stdout, Print(&blank))?;
+        }
+
+        execute!(stdout, cursor::RestorePosition)?;
+        stdout.flush()?;
+        Ok(())
     }
 
     /// Kept for API compatibility.  Forces a redraw if flagged.

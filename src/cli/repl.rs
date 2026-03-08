@@ -354,9 +354,16 @@ impl Repl {
             crate::tools::todo::TodoList::default(),
         ));
         {
-            use crate::tools::implementations::{TodoReadTool, TodoWriteTool};
+            use crate::tools::implementations::{
+                StackClearTool, StackPushTool, StackRunTool, TodoReadTool, TodoWriteTool,
+            };
             tool_registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
             tool_registry.register(Box::new(TodoReadTool::new(Arc::clone(&todo_list))));
+            // Co-Forth VM — stack Arc is wired in later via with_stack()
+            // NOTE: StackPopTool intentionally omitted — only the user can pop (undo).
+            tool_registry.register(Box::new(StackPushTool));
+            tool_registry.register(Box::new(StackRunTool));
+            tool_registry.register(Box::new(StackClearTool));
         }
 
         // Create permission manager
@@ -1248,6 +1255,7 @@ impl Repl {
                         None, // repl_mode (not available in raw mode)
                         None, // plan_content
                         None, // live_output
+                        None, // stack
                     )
                     .await?;
 

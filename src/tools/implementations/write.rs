@@ -125,6 +125,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+        stack: None,
+        poset: None,
         };
         let result = tool.execute(input, &context).await.unwrap();
         assert!(result.contains("Created"), "got: {}", result);

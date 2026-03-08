@@ -352,7 +352,7 @@ fn truncate_summary(s: String) -> String {
     if s.len() <= 70 {
         s
     } else {
-        format!("{}…", &s[..69])
+        format!("{}…", s.chars().take(69).collect::<String>())
     }
 }
 
@@ -370,7 +370,7 @@ pub(crate) fn compact_tool_summary(content: &str) -> String {
     if lines.len() == 1 {
         let line = lines[0].trim();
         if line.len() > 60 {
-            format!("{}…", &line[..57])
+            format!("{}…", line.chars().take(57).collect::<String>())
         } else {
             line.to_string()
         }

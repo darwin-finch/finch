@@ -150,6 +150,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+        stack: None,
+        poset: None,
         };
         let input = serde_json::json!({
             "binary_path": "./target/release/finch"
@@ -172,6 +174,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+        stack: None,
+        poset: None,
         };
         let input = serde_json::json!({
             "reason": "test",

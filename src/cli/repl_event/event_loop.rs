@@ -239,6 +239,16 @@ pub struct EventLoop {
     /// The Co-Forth word that was popped when entering plan mode.
     /// Stored so the user can re-plan without losing the word.
     plan_word: Option<String>,
+
+    /// Persistent Forth interpreter for the session.
+    /// Word definitions typed via `: word ... ;` or `/forth` accumulate here.
+    /// Stack state is cleared between evals; only the dictionary persists.
+    forth_vm: crate::coforth::Forth,
+
+    /// Undo history for Forth definitions.
+    /// Each entry is a snapshot taken just before an eval (or /define).
+    /// `/undefine` (or Ctrl+Z in Forth context) pops and restores.
+    forth_undo: Vec<crate::coforth::DictionarySnapshot>,
 }
 
 /// View mode for the REPL
@@ -389,6 +399,8 @@ impl EventLoop {
             stack,
             poset,
             plan_word: None,
+            forth_vm: crate::coforth::Forth::new(),
+            forth_undo: Vec::new(),
         }
     }
 
@@ -1062,6 +1074,12 @@ impl EventLoop {
                     Command::StackDefine(word, definition) => {
                         self.handle_stack_define(word, definition).await?;
                     }
+                    Command::ForthEval(code) => {
+                        self.handle_forth_eval(code).await?;
+                    }
+                    Command::ForthUndo => {
+                        self.handle_forth_undo().await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -1078,6 +1096,15 @@ impl EventLoop {
                     "Usage: /define <word>[:<sense>] [definition]  (e.g. /define love   or   /define bank:river the edge of a stream)".to_string()
                 } else if input.trim() == "/describe" {
                     "Usage: /describe <word>  (e.g. /describe love)".to_string()
+                } else if let Some(word) = input.trim().strip_prefix('/') {
+                    // /word  → treat as /describe word (look it up in the library)
+                    let word = word.trim().to_string();
+                    if !word.is_empty() && word.split_whitespace().count() == 1 {
+                        self.handle_stack_describe(word).await?;
+                        return Ok(());
+                    } else {
+                        format!("Unknown command: {}", input)
+                    }
                 } else {
                     format!("Unknown command: {}", input)
                 };
@@ -2447,6 +2474,56 @@ impl EventLoop {
             self.output_manager.write_info(format!("swapped W{a} ↔ W{b}"));
         } else {
             self.output_manager.write_info(format!("W{a} or W{b} not found"));
+        }
+        self.render_tui().await
+    }
+
+    /// Evaluate a Forth expression or definition in the session-persistent VM.
+    ///
+    /// Triggered by:
+    ///  - `: word ... ;`  (typed directly — Forth word definition)
+    ///  - `/forth <expr>` (explicit eval command)
+    ///
+    /// The VM persists across calls so words defined in one input are available
+    /// in subsequent inputs.
+    async fn handle_forth_eval(&mut self, code: String) -> Result<()> {
+        // Snapshot before eval so the user can undo it
+        let snap = self.forth_vm.snapshot();
+        self.forth_undo.push(snap);
+
+        match self.forth_vm.exec(&code) {
+            Ok(out) if !out.is_empty() => {
+                self.output_manager.write_info(out);
+            }
+            Ok(_) => {
+                // Definition compiled silently — confirm it to the user
+                if code.trim_start().starts_with(':') {
+                    let name = code.trim_start_matches(':').trim()
+                        .split_whitespace().next().unwrap_or("word");
+                    self.output_manager.write_info(format!("defined: {name}"));
+                }
+            }
+            Err(e) => {
+                // Restore on error so a bad definition doesn't corrupt the VM
+                if let Some(snap) = self.forth_undo.pop() {
+                    self.forth_vm.restore(&snap);
+                }
+                self.output_manager.write_info(format!("forth error: {e}"));
+            }
+        }
+        self.render_tui().await
+    }
+
+    /// `/undefine` — undo the last Forth definition.
+    async fn handle_forth_undo(&mut self) -> Result<()> {
+        match self.forth_undo.pop() {
+            Some(snap) => {
+                self.forth_vm.restore(&snap);
+                self.output_manager.write_info("undone".to_string());
+            }
+            None => {
+                self.output_manager.write_info("nothing to undo".to_string());
+            }
         }
         self.render_tui().await
     }

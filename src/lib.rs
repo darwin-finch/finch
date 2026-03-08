@@ -40,6 +40,8 @@ pub mod monitoring; // System monitoring (memory, CPU)
 pub mod network; // Lotus Network device registration and membership
 pub mod node; // Node identity and work statistics (distributed worker)
 pub mod planning; // IMPCPD iterative plan refinement loop
+pub mod coforth;  // Co-Forth English library — every word as a Forth word
+pub mod poset;    // Co-Forth poset VM — partially-ordered task graph with 3D renderer
 pub mod providers; // Multi-provider LLM support
 pub mod router;
 pub mod scheduling; // Autonomous task scheduling (Phase 5)

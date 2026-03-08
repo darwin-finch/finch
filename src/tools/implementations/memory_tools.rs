@@ -80,7 +80,7 @@ impl Tool for SearchMemoryTool {
                 .map(|(i, text)| {
                     // Truncate very long memories
                     let preview = if text.len() > 500 {
-                        format!("{}...", &text[..500])
+                        format!("{}...", text.chars().take(500).collect::<String>())
                     } else {
                         text.clone()
                     };
@@ -159,7 +159,7 @@ impl Tool for CreateMemoryTool {
         Ok(format!(
             "Memory created: {}",
             if full_content.len() > 100 {
-                format!("{}...", &full_content[..100])
+                format!("{}...", full_content.chars().take(100).collect::<String>())
             } else {
                 full_content
             }
@@ -225,7 +225,7 @@ impl Tool for ListRecentTool {
                 .map(|(i, (role, content))| {
                     // Truncate very long messages
                     let preview = if content.len() > 200 {
-                        format!("{}...", &content[..200])
+                        format!("{}...", content.chars().take(200).collect::<String>())
                     } else {
                         content.clone()
                     };
@@ -279,6 +279,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+        stack: None,
+        poset: None,
         };
         let result = tool
             .execute(
@@ -316,6 +318,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+        stack: None,
+        poset: None,
         };
 
         let result = tool
@@ -364,6 +368,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+        stack: None,
+        poset: None,
         };
         let result = tool
             .execute(serde_json::json!({"limit": 3}), &context)

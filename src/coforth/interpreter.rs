@@ -42,6 +42,9 @@ enum Cell {
     Lit(i64),           // push literal onto data stack
     Str(usize),         // print strings[idx]  (string-literal pool)
     Confirm(usize),     // ask user strings[idx]; push -1 (yes) or 0 (no)
+    ReadFile(usize),    // read file at strings[idx]; emit contents to out
+    ExecCmd(usize),     // run shell command strings[idx]; emit stdout to out
+    GlobFiles(usize),   // list files matching glob strings[idx]; emit to out
     Builtin(Builtin),   // execute a primitive operation
     Addr(usize),        // call word at memory[addr]: push ip+1, ip = addr
     JmpZ(usize),        // if pop() == 0: ip = addr  (if/while/of)
@@ -110,6 +113,17 @@ pub struct Forth {
 
 const MAX_CALL_DEPTH: usize = 256;
 const MAX_STEPS: usize = 2_000_000;
+
+/// Snapshot of the Forth dictionary state (not the data stack).
+/// Used to implement undo: restore the dictionary to a previous point.
+#[derive(Clone)]
+pub struct DictionarySnapshot {
+    memory_len:  usize,
+    strings_len: usize,
+    heap_len:    usize,
+    name_index:  HashMap<String, usize>,
+    var_index:   HashMap<String, usize>,
+}
 
 // ── Standard library (pre-loaded Forth definitions) ──────────────────────────
 
@@ -263,6 +277,27 @@ impl Forth {
         self.out.clear();
         self.eval(source)?;
         Ok(self.out.clone())
+    }
+
+    /// Snapshot the current dictionary state (word definitions only, not the data stack).
+    pub fn snapshot(&self) -> DictionarySnapshot {
+        DictionarySnapshot {
+            memory_len:  self.memory.len(),
+            strings_len: self.strings.len(),
+            heap_len:    self.heap.len(),
+            name_index:  self.name_index.clone(),
+            var_index:   self.var_index.clone(),
+        }
+    }
+
+    /// Restore the dictionary to a previous snapshot.
+    /// The data stack is left as-is.
+    pub fn restore(&mut self, snap: &DictionarySnapshot) {
+        self.memory.truncate(snap.memory_len);
+        self.strings.truncate(snap.strings_len);
+        self.heap.truncate(snap.heap_len);
+        self.name_index = snap.name_index.clone();
+        self.var_index  = snap.var_index.clone();
     }
 }
 
@@ -451,6 +486,24 @@ impl Forth {
             self.memory.push(Cell::Confirm(idx));
             return Ok(());
         }
+        if let Some(s) = tok.strip_prefix("\x00read:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ReadFile(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00exec:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ExecCmd(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00glob:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::GlobFiles(idx));
+            return Ok(());
+        }
         if let Ok(n) = tok.parse::<i64>() {
             self.memory.push(Cell::Lit(n));
             return Ok(());
@@ -513,6 +566,35 @@ impl Forth {
                         true // auto-approve when no TUI callback (tests, pipe mode)
                     };
                     self.data.push(if approved { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::ReadFile(idx) => {
+                    let path = self.strings[idx].clone();
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => self.out.push_str(&content),
+                        Err(e) => self.out.push_str(&format!("error reading {path}: {e}\n")),
+                    }
+                    ip += 1;
+                }
+                Cell::ExecCmd(idx) => {
+                    let cmd = self.strings[idx].clone();
+                    match std::process::Command::new("sh").arg("-c").arg(&cmd).output() {
+                        Ok(o) => self.out.push_str(&String::from_utf8_lossy(&o.stdout)),
+                        Err(e) => self.out.push_str(&format!("exec error: {e}\n")),
+                    }
+                    ip += 1;
+                }
+                Cell::GlobFiles(idx) => {
+                    let pattern = self.strings[idx].clone();
+                    // Simple glob: expand via shell to avoid adding a dep
+                    let result = std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("ls -1 {pattern} 2>/dev/null"))
+                        .output();
+                    match result {
+                        Ok(o) => self.out.push_str(&String::from_utf8_lossy(&o.stdout)),
+                        Err(e) => self.out.push_str(&format!("glob error: {e}\n")),
+                    }
                     ip += 1;
                 }
                 Cell::Builtin(b) => { self.exec_builtin(b)?; ip += 1; }
@@ -837,6 +919,27 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00confirm:{s}"));
+        } else if c == '"' && tok == "read" {
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00read:{s}"));
+        } else if c == '"' && tok == "exec" {
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00exec:{s}"));
+        } else if c == '"' && tok == "glob" {
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00glob:{s}"));
         } else if c.is_whitespace() {
             flush!();
             chars.next();
