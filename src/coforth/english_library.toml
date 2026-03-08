@@ -7110,3 +7110,172 @@ related = ["just", "equal", "balance", "right"]
 kind = "character"
 forth = '5 2 / . ." fair" cr'
 
+
+[[word]]
+word = "adverb"
+definition = "a word that modifies a verb, adjective, or other adverb"
+related = ["quickly", "very", "modifier", "grammar"]
+kind = "concept"
+forth = '." quickly" cr'
+
+[[word]]
+word = "belonging"
+sense = "feeling"
+definition = "the feeling of being at home in a place or group"
+related = ["home", "community", "identity", "connection"]
+kind = "feeling"
+forth = '." home" cr'
+
+[[word]]
+word = "border"
+sense = "boundary"
+definition = "a boundary separating two regions"
+related = ["boundary", "edge", "limit", "divide"]
+kind = "concept"
+forth = '." |" cr'
+
+[[word]]
+word = "both"
+sense = "two"
+definition = "the two; used to refer to two people or things together"
+related = ["two", "pair", "and", "together"]
+kind = "concept"
+forth = '1 . 2 . cr'
+
+[[word]]
+word = "cardinality"
+sense = "set-size"
+definition = "the number of elements in a set"
+related = ["size", "count", "set", "number"]
+kind = "mathematics"
+forth = '3 . cr'
+
+[[word]]
+word = "class"
+definition = "a category of things sharing common attributes"
+related = ["category", "type", "group", "kind"]
+kind = "concept"
+forth = '." { }" cr'
+
+[[word]]
+word = "countable"
+sense = "enumerable"
+definition = "able to be counted; having a finite or enumerable number of elements"
+related = ["finite", "number", "set", "enumerate"]
+kind = "mathematics"
+forth = '1 2 3 . . . cr'
+
+[[word]]
+word = "depend"
+sense = "rely"
+definition = "to rely on something; to be contingent on a condition"
+related = ["rely", "conditional", "require", "need"]
+kind = "relation"
+forth = '1 0= . cr'
+
+[[word]]
+word = "find"
+sense = "locate"
+definition = "to locate or obtain after searching"
+related = ["search", "locate", "discover", "seek"]
+kind = "action"
+forth = '1 . cr'
+
+[[word]]
+word = "fitness"
+sense = "capacity"
+definition = "the quality of being suitable or capable; physical condition"
+related = ["health", "strength", "capacity", "adapt"]
+kind = "quality"
+forth = '3 square . cr'
+
+[[word]]
+word = "gravity"
+sense = "physics"
+definition = "the force that attracts bodies toward the Earth's centre"
+related = ["force", "weight", "attraction", "mass"]
+kind = "physics"
+forth = '981 . cr'
+
+[[word]]
+word = "guardian"
+sense = "protector"
+definition = "a person who protects or watches over another"
+related = ["protect", "watch", "keeper", "defend"]
+kind = "role"
+forth = '." guard" cr'
+
+[[word]]
+word = "hard"
+sense = "difficult"
+definition = "requiring great effort; not soft; difficult to do"
+related = ["difficult", "solid", "firm", "challenge"]
+kind = "quality"
+forth = '9 . cr'
+
+[[word]]
+word = "homotopy"
+sense = "topology"
+definition = "a continuous deformation of one function or shape into another"
+related = ["topology", "continuous", "path", "deform"]
+kind = "mathematics"
+forth = '1 . cr'
+
+[[word]]
+word = "lazy"
+sense = "deferred"
+definition = "unwilling to work or expend energy; evaluated only when needed"
+related = ["deferred", "idle", "slow", "rest"]
+kind = "quality"
+forth = '0 . cr'
+
+[[word]]
+word = "metabolism"
+sense = "biology"
+definition = "the chemical processes in a living organism to maintain life"
+related = ["energy", "cells", "chemical", "body"]
+kind = "biology"
+forth = '3 square . cr'
+
+[[word]]
+word = "preposition"
+definition = "a word expressing the relation between a noun and other sentence elements"
+related = ["in", "on", "at", "grammar"]
+kind = "concept"
+forth = '." in" cr'
+
+[[word]]
+word = "refugee"
+definition = "a person forced to leave their country to escape war or persecution"
+related = ["exile", "displaced", "asylum", "flee"]
+kind = "person"
+forth = '1 . cr'
+
+[[word]]
+word = "safe"
+definition = "protected from danger, harm, or risk"
+related = ["secure", "protected", "shelter", "guard"]
+kind = "quality"
+forth = '1 . cr'
+
+[[word]]
+word = "tally"
+sense = "count"
+definition = "a running count kept by making marks; to add up"
+related = ["count", "score", "mark", "total"]
+kind = "action"
+forth = '5 0 do ." |" loop cr'
+
+[[word]]
+word = "tax"
+definition = "a compulsory payment levied by government on income or goods"
+related = ["levy", "revenue", "duty", "payment"]
+kind = "concept"
+forth = '100 10 / . cr'
+
+[[word]]
+word = "tolerance"
+definition = "the ability to accept things one dislikes; an allowable margin of deviation"
+related = ["accept", "patience", "margin", "permit"]
+kind = "quality"
+forth = '1 . cr'
