@@ -260,6 +260,24 @@ pub enum ViewMode {
     Tree,
 }
 
+/// Scan Forth source for `scatter-exec" cmd"` literals and return formatted plan lines.
+///
+/// Used for pre-flight plan display before remote execution.
+fn extract_scatter_exec_commands(code: &str) -> Vec<String> {
+    let mut cmds = Vec::new();
+    let needle = r#"scatter-exec""#;
+    let mut rest = code;
+    while let Some(pos) = rest.find(needle) {
+        rest = &rest[pos + needle.len()..];
+        let rest2 = rest.trim_start_matches(' ');
+        if let Some(end) = rest2.find('"') {
+            cmds.push(format!("* → bash -c {:?}", &rest2[..end]));
+            rest = &rest2[end + 1..];
+        }
+    }
+    cmds
+}
+
 impl EventLoop {
     /// Create a new event loop with unified generators
     #[allow(clippy::too_many_arguments)]
@@ -511,6 +529,105 @@ impl EventLoop {
             )
             .await;
         }
+
+        // ── Boot JIT ──────────────────────────────────────────────────────────
+        // Every boot: JIT-compile ALL vocabulary words with Forth code into the
+        // VM dictionary as named colon definitions (`: word <code> ;`).
+        // This makes every vocab word callable directly from Forth.
+        //
+        // The scroll shows words being compiled — it runs fast, pausing every
+        // BATCH lines so the terminal actually has time to paint.
+        //
+        // After JIT, words marked `boot = true` have their code *executed*
+        // (not just compiled), producing their boot-time output.
+        {
+            use crossterm::style::Stylize;
+
+            let lib = crate::coforth::Library::load();
+
+            // Collect all entries that have Forth code, sorted alphabetically.
+            let mut all_entries: Vec<_> = lib.all_entries()
+                .into_iter()
+                .filter(|e| e.forth.is_some())
+                .collect();
+            all_entries.sort_by(|a, b| a.word.cmp(&b.word));
+
+            const BATCH: usize = 8;
+            let mut batch_lines: Vec<String> = Vec::with_capacity(BATCH);
+            let mut boot_codes: Vec<String> = Vec::new();
+
+            // Wire gen" so boot words that call it have a provider.
+            let gen_handle = self.cloud_gen.clone();
+            self.forth_vm.set_gen_fn(Box::new(move |prompt: &str| {
+                let prompt = prompt.to_string();
+                let gen = gen_handle.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async move {
+                            let messages = vec![crate::claude::Message {
+                                role: "user".to_string(),
+                                content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+                            }];
+                            let g = gen.read().await;
+                            match g.generate(messages, None).await {
+                                Ok(resp) => resp.text,
+                                Err(e) => format!("(gen error: {e})\n"),
+                            }
+                        })
+                    })
+                } else {
+                    "(no async runtime)\n".to_string()
+                }
+            }));
+
+            for (i, entry) in all_entries.iter().enumerate() {
+                let code = entry.forth.as_deref().unwrap_or("");
+
+                // JIT: compile `: word <code> ;` so the word is callable from Forth.
+                let jit_def = format!(": {} {} ;", entry.word, code);
+                let ok = self.forth_vm.exec(&jit_def).is_ok();
+
+                if entry.boot {
+                    boot_codes.push(code.to_string());
+                }
+
+                // Show the actual colon definition being compiled — Forth dictionary boot.
+                // Weird on purpose: you are watching vocabulary become executable.
+                let status = if ok { "ok".dark_grey() } else { "?".red() };
+                let jit_display = jit_def.chars().take(72).collect::<String>();
+                batch_lines.push(format!("{}  {}",
+                    jit_display.dark_grey(),
+                    status,
+                ));
+
+                // Flush every BATCH words so the terminal has time to paint.
+                if batch_lines.len() >= BATCH || i + 1 == all_entries.len() {
+                    self.output_manager.write_info(batch_lines.join("\n"));
+                    self.render_tui().await.ok();
+                    tokio::time::sleep(Duration::from_millis(4)).await;
+                    batch_lines.clear();
+                }
+            }
+
+            // Execute boot=true words (they may produce output: poems, time, etc.)
+            for code in &boot_codes {
+                if let Ok(out) = self.forth_vm.exec(code) {
+                    if !out.is_empty() {
+                        self.output_manager.write_info(out.trim_end().to_string());
+                    }
+                }
+            }
+            if !boot_codes.is_empty() {
+                self.render_tui().await.ok();
+            }
+
+            // Boot poetry — plain Rust strings, compiled in, no parsing.
+            for poem in crate::coforth::library::BOOT_POETRY {
+                self.output_manager.write_info(poem.to_string());
+            }
+            self.render_tui().await.ok();
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         // Render interval (100ms) - blit overwrites visible area with shadow buffer
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
@@ -810,23 +927,36 @@ impl EventLoop {
                         let current_mode = self.mode.read().await.clone();
                         match current_mode {
                             ReplMode::Normal => {
-                                // If the Co-Forth stack has words, pop the top one and run the
-                                // IMPCPD plan loop on it. Store in plan_word so the user can
-                                // re-plan (/plan again) without re-popping.
+                                // Gobble ALL items from the vocabulary stack.
+                                // If multiple words have accumulated, drain the whole stack and
+                                // stream a plan response — non-blocking so the user can keep
+                                // pushing more words while the AI is thinking.
+                                // If only one word (or re-planning the stored word), use the full
+                                // IMCPD planner for a deeper, multi-iteration plan.
+                                let all_words: Vec<String> = {
+                                    let mut s = self.stack.lock().await;
+                                    std::mem::take(&mut *s)
+                                };
+
+                                if all_words.len() >= 2 {
+                                    // Multiple concepts — gobble all, stream a combined plan.
+                                    self.plan_word = None; // consumed; re-plan starts fresh
+                                    let task = format!(
+                                        "I've been building a vocabulary: {}. \
+                                         Synthesise these concepts into a concrete plan. \
+                                         What connects them? What should I build or do?",
+                                        all_words.join(", ")
+                                    );
+                                    self.execute_chat_response(task).await?;
+                                } else {
+                                // Single word (or re-plan): full IMCPD plan loop.
                                 let stack_word = if let Some(word) = self.plan_word.clone() {
-                                    // Re-plan: use stored word, don't pop again
                                     Some(word)
                                 } else {
-                                    let popped = {
-                                        let mut s = self.stack.lock().await;
-                                        s.pop()
-                                    };
-                                    if let Some(word) = popped {
+                                    all_words.into_iter().next().map(|word| {
                                         self.plan_word = Some(word.clone());
-                                        Some(word)
-                                    } else {
-                                        None
-                                    }
+                                        word
+                                    })
                                 };
 
                                 if let Some(task) = stack_word {
@@ -851,6 +981,7 @@ impl EventLoop {
                                     );
                                     self.update_plan_mode_indicator(&new_mode);
                                 }
+                                } // end single-word else branch
                             }
                             ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
                                 // Exit plan mode, return to normal; clear plan_word
@@ -1079,6 +1210,12 @@ impl EventLoop {
                     Command::StackDefine(word, definition) => {
                         self.handle_stack_define(word, definition).await?;
                     }
+                    Command::StackOverride(word, definition) => {
+                        self.handle_stack_override(word, definition).await?;
+                    }
+                    Command::Ask(query) => {
+                        self.execute_query(query).await?;
+                    }
                     Command::ForthEval(code) => {
                         self.handle_forth_eval(code).await?;
                     }
@@ -1087,6 +1224,9 @@ impl EventLoop {
                     }
                     Command::LibraryUndefine(word) => {
                         self.handle_library_undefine(word).await?;
+                    }
+                    Command::LibraryRun(word) => {
+                        self.handle_library_run(word).await?;
                     }
                     _ => {
                         // All other commands output to scrollback via write_info
@@ -1128,6 +1268,22 @@ impl EventLoop {
                 .send(ReplEvent::Shutdown)
                 .context("Failed to send shutdown event")?;
             return Ok(());
+        }
+
+        // Forth word definition: `: word ... ;`
+        // Route directly to the Forth VM — do not push as a vocabulary word.
+        if input.trim().starts_with(": ") {
+            self.output_manager.write_user(input.clone());
+            return self.handle_forth_eval(input.trim().to_string()).await;
+        }
+
+        // Direct AI query: `?? question` — bypasses the stack and asks the AI.
+        if let Some(query) = input.trim().strip_prefix("?? ").or_else(|| input.trim().strip_prefix("??")) {
+            let query = query.trim().to_string();
+            if !query.is_empty() {
+                self.output_manager.write_user(input.clone());
+                return self.execute_query(query).await;
+            }
         }
 
         // ── Co-Forth: plain text pushes onto the stack (no AI trigger) ──────────
@@ -2264,20 +2420,53 @@ impl EventLoop {
         };
         self.spawn_coforth_precompile(text.clone(), trigger_id).await;
 
-        // Talk back — respond conversationally to what was pushed.
-        // Frame the push as a topic, not a command, so the AI riffs on the word
-        // rather than giving a generic coding-assistant intro.
-        let query = if text.split_whitespace().count() <= 3 {
-            // Short push — guide the AI to talk about the concept, not treat it as a command.
-            format!("Tell me about: {text}")
-        } else {
-            text
-        };
-        // Caller already echoed the original push; use chat_response to avoid
-        // showing the reframed query text AND to suppress tool use.
-        self.execute_chat_response(query).await?;
+        // Try the VM first — boot JIT compiled all vocab words so known words run immediately.
+        let snap = self.forth_vm.snapshot();
+        let vm_result = self.forth_vm.exec(&text);
+        match vm_result {
+            Ok(out) if !out.is_empty() => {
+                self.output_manager.write_info(out.trim_end().to_string());
+                return self.render_tui().await;
+            }
+            Ok(_) => {
+                // Compiled/ran silently — the other programmer reads the stack.
+                return self.render_tui().await;
+            }
+            Err(ref e) => {
+                // VM rejected it — restore and note the error for the AI's context.
+                self.forth_vm.restore(&snap);
+                let _ = e; // moved into query below
+            }
+        }
+        let vm_err = vm_result.err().map(|e| e.to_string());
 
-        Ok(())
+        // The other programmer's turn: respond with Forth.
+        // Both sides only write Forth — definitions, words, stack ops, output.
+        let stack_snapshot: Vec<String> = {
+            let s = self.stack.lock().await;
+            s.iter().cloned().collect()
+        };
+        let stack_str = if stack_snapshot.is_empty() {
+            String::new()
+        } else {
+            format!("\nstack: {}", stack_snapshot.join("  "))
+        };
+        let error_str = match &vm_err {
+            Some(e) => format!("\nVM said: {e}"),
+            None => String::new(),
+        };
+        let query = format!(
+            "Two programmers building a program together on a shared stack. \
+             The program can be in English, Chinese, or any language — \
+             the words are the program. \
+             The other programmer just pushed this:\n\n  {text}{stack_str}{error_str}\n\n\
+             Respond only with Forth. \
+             Use the same language they used for word names and strings. \
+             If what they pushed was wrong, correct it. \
+             Define words with : name ... ; and run them. \
+             No prose. No explanation. Just Forth.",
+        );
+        self.execute_chat_response(query).await
     }
 
     /// Spawn a background task that reads the current vocabulary and pushes
@@ -2495,6 +2684,58 @@ impl EventLoop {
     /// The VM persists across calls so words defined in one input are available
     /// in subsequent inputs.
     async fn handle_forth_eval(&mut self, code: String) -> Result<()> {
+        use crossterm::style::Stylize;
+        // Pre-flight: if the code contains scatter-exec" or exec-at" commands, show
+        // the user a plan and require confirmation before firing on remote machines.
+        let scatter_cmds = extract_scatter_exec_commands(&code);
+        if !scatter_cmds.is_empty() {
+            let cmd_list = scatter_cmds
+                .iter()
+                .map(|c| format!("  • {c}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let plan = format!("Remote execution plan\n\n{cmd_list}");
+            let dialog = crate::cli::tui::Dialog::confirm(plan, false);
+            let result = {
+                let mut tui = self.tui_renderer.lock().await;
+                tui.show_dialog(dialog)
+            };
+            match result {
+                Ok(crate::cli::tui::DialogResult::Confirmed(true)) => {}
+                _ => {
+                    self.output_manager.write_info(
+                        "remote exec: cancelled".dark_grey().to_string()
+                    );
+                    return self.render_tui().await;
+                }
+            }
+        }
+
+        // Wire the active generator into the VM so gen" prompt" works.
+        // Uses block_in_place so the sync GenFn closure can await the async generator.
+        let gen_handle = self.cloud_gen.clone();
+        self.forth_vm.set_gen_fn(Box::new(move |prompt: &str| {
+            let prompt = prompt.to_string();
+            let gen = gen_handle.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        let messages = vec![crate::claude::Message {
+                            role: "user".to_string(),
+                            content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+                        }];
+                        let g = gen.read().await;
+                        match g.generate(messages, None).await {
+                            Ok(resp) => resp.text,
+                            Err(e) => format!("(gen error: {e})\n"),
+                        }
+                    })
+                })
+            } else {
+                "(no async runtime)\n".to_string()
+            }
+        }));
+
         // Snapshot before eval so the user can undo it
         let snap = self.forth_vm.snapshot();
         self.forth_undo.push(snap);
@@ -2508,7 +2749,9 @@ impl EventLoop {
                 if code.trim_start().starts_with(':') {
                     let name = code.trim_start_matches(':').trim()
                         .split_whitespace().next().unwrap_or("word");
-                    self.output_manager.write_info(format!("defined: {name}"));
+                    self.output_manager.write_info(
+                        format!("defined: {}", name.cyan().bold())
+                    );
                 }
             }
             Err(e) => {
@@ -2516,7 +2759,9 @@ impl EventLoop {
                 if let Some(snap) = self.forth_undo.pop() {
                     self.forth_vm.restore(&snap);
                 }
-                self.output_manager.write_info(format!("forth error: {e}"));
+                self.output_manager.write_info(
+                    format!("{} {e}", "forth error:".red())
+                );
             }
         }
         self.render_tui().await
@@ -2533,6 +2778,63 @@ impl EventLoop {
                 self.output_manager.write_info("nothing to undo".to_string());
             }
         }
+        self.render_tui().await
+    }
+
+    /// `/run <word>` — look up the word in the library and execute its Forth snippet.
+    ///
+    /// Shows both the Forth source and its output, so the user can see exactly
+    /// what the word computes.  This is the introspection path: every word can
+    /// be run to verify its computational meaning.
+    async fn handle_library_run(&mut self, word: String) -> Result<()> {
+        use crossterm::style::Stylize;
+
+        let key = word.trim().to_lowercase();
+        let lib = crate::coforth::Library::load();
+        let senses = lib.lookup_all(&key);
+
+        if senses.is_empty() {
+            self.output_manager.write_info(format!(
+                "unknown word: {}  (try /define {})",
+                key.clone().yellow(),
+                key.clone().cyan()
+            ));
+            return self.render_tui().await;
+        }
+
+        let mut output = String::new();
+        for entry in senses {
+            let sense_tag = entry.sense.as_deref()
+                .map(|s| format!(" {}", format!("[{s}]").yellow()))
+                .unwrap_or_default();
+            match &entry.forth {
+                None => {
+                    output.push_str(&format!(
+                        "{}{}  {}\n",
+                        key.clone().bold().cyan(),
+                        sense_tag,
+                        "(no Forth)".dark_grey()
+                    ));
+                }
+                Some(code) => {
+                    let run_result = crate::coforth::Forth::run(code);
+                    let result_str = match run_result {
+                        Ok(s) if s.is_empty() => "(no output)".dark_grey().to_string(),
+                        Ok(s) => s.trim_end().to_string().green().to_string(),
+                        Err(e) => format!("error: {e}").red().to_string(),
+                    };
+                    output.push_str(&format!(
+                        "{}{}\n  {}\n  {}\n",
+                        key.clone().bold().cyan(),
+                        sense_tag,
+                        code.as_str().dark_grey(),
+                        result_str
+                    ));
+                }
+            }
+        }
+
+        self.output_manager.write_info(output.trim_end().to_string());
         self.render_tui().await
     }
 
@@ -2615,10 +2917,11 @@ impl EventLoop {
             // Auto-define was cancelled or failed — nothing to show
             return Ok(());
         } else {
-            let mut out = format!("\x1b[1;36m{key}\x1b[0m");
+            use crossterm::style::Stylize;
+            let mut out = key.clone().bold().cyan().to_string();
             for (i, entry) in senses.iter().enumerate() {
                 let sense_label = entry.sense.as_deref()
-                    .map(|s| format!("  \x1b[33m[{s}]\x1b[0m"))
+                    .map(|s| format!("  {}", format!("[{s}]").yellow()))
                     .unwrap_or_default();
                 let num = if senses.len() > 1 { format!("{}. ", i + 1) } else { String::new() };
                 let related = if entry.related.is_empty() {
@@ -2630,8 +2933,12 @@ impl EventLoop {
                     .map(|f| format!("\n     forth:   {f}"))
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "\n  {num}\x1b[90m[{}]\x1b[0m{sense_label}  {}{}{}",
-                    entry.kind, entry.definition, related, forth
+                    "\n  {num}{}{}  {}{}{}",
+                    format!("[{}]", entry.kind).dark_grey(),
+                    sense_label,
+                    entry.definition,
+                    related,
+                    forth
                 ));
             }
             self.output_manager.write_info(out);
@@ -2660,7 +2967,29 @@ impl EventLoop {
         self.save_library_entry(&key, definition.trim(), sense.as_deref(), "").await
     }
 
-    /// Core save: write a word entry to ~/.finch/library.toml and inject into the live poset.
+    /// `/override <word> <def>` — write directly to ~/.finch/library.toml, bypassing the repo.
+    /// This gives per-machine overrides that are never committed.
+    async fn handle_stack_override(&mut self, word: String, definition: String) -> Result<()> {
+        let (key, sense) = if let Some((w, s)) = word.split_once(':') {
+            (w.trim().to_lowercase(), Some(s.trim().to_string()))
+        } else {
+            (word.trim().to_lowercase(), None)
+        };
+        if key.is_empty() {
+            return Ok(());
+        }
+        self.save_library_entry_local(&key, definition.trim(), sense.as_deref(), "").await
+    }
+
+    /// Save a word entry to `~/.finch/library.toml` (machine-local, never committed).
+    async fn save_library_entry_local(&mut self, key: &str, definition: &str, sense: Option<&str>, forth: &str) -> Result<()> {
+        let path = dirs::home_dir()
+            .map(|h| h.join(".finch").join("library.toml"))
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+        self.save_library_entry_to(key, definition, sense, forth, &path, "~/.finch/library.toml").await
+    }
+
+    /// Core save: write a word entry to vocabulary/{lang}.toml in the git repo and inject into the live poset.
     /// `forth` may be empty — it's omitted from the TOML in that case.
     async fn save_library_entry(
         &mut self,
@@ -2669,11 +2998,35 @@ impl EventLoop {
         sense: Option<&str>,
         forth: &str,
     ) -> Result<()> {
-        let safe_def = definition.replace('\\', "\\\\").replace('"', "\\\"");
+        // Write to the project-local vocabulary module (vocabulary/lang.toml in git root).
+        // Falls back to ~/.finch/library.toml when not in a git repo.
+        let lang = crate::coforth::library::detect_vocab_lang(key);
+        let (path, display) = match crate::coforth::library::repo_vocab_path(lang) {
+            Some(p) => {
+                let d = format!("vocabulary/{lang}.toml");
+                (p, d)
+            }
+            None => {
+                let p = dirs::home_dir()
+                    .map(|h| h.join(".finch").join("library.toml"))
+                    .ok_or_else(|| anyhow::anyhow!("cannot determine save path"))?;
+                (p, "~/.finch/library.toml".to_string())
+            }
+        };
+        self.save_library_entry_to(key, definition, sense, forth, &path, &display).await
+    }
 
-        let path = dirs::home_dir()
-            .map(|h| h.join(".finch").join("library.toml"))
-            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    /// Shared write+inject implementation used by both save paths.
+    async fn save_library_entry_to(
+        &mut self,
+        key: &str,
+        definition: &str,
+        sense: Option<&str>,
+        forth: &str,
+        path: &std::path::Path,
+        display_path: &str,
+    ) -> Result<()> {
+        let safe_def = definition.replace('\\', "\\\\").replace('"', "\\\"");
 
         let sense_line = sense.map(|s| format!("sense = \"{s}\"\n")).unwrap_or_default();
         let forth_line = if forth.is_empty() {
@@ -2697,12 +3050,12 @@ impl EventLoop {
             (!senses.is_empty(), sense_exists)
         };
 
+        use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("cannot open {}", path.display()))?;
-        use std::io::Write;
         file.write_all(entry_toml.as_bytes()).context("failed to write library entry")?;
 
         // Inject into live poset
@@ -2712,21 +3065,22 @@ impl EventLoop {
             lib.inject_into_poset(key, 1, &mut p);
         }
 
+        use crossterm::style::Stylize;
         let label = sense
-            .map(|s| format!("\x1b[1;36m{key}\x1b[0m:\x1b[33m{s}\x1b[0m"))
-            .unwrap_or_else(|| format!("\x1b[1;36m{key}\x1b[0m"));
+            .map(|s| format!("{}:{}", key.bold().cyan(), s.yellow()))
+            .unwrap_or_else(|| key.bold().cyan().to_string());
 
         if sense_exists {
             self.output_manager.write_info(format!(
-                "{label} overridden in ~/.finch/library.toml  \x1b[90m(at your peril)\x1b[0m"
+                "{label} redefined in {display_path}"
             ));
         } else if already_exists {
             self.output_manager.write_info(format!(
-                "{label} added as new sense to ~/.finch/library.toml"
+                "{label} added as new sense to {display_path}"
             ));
         } else {
             self.output_manager.write_info(format!(
-                "{label} added to ~/.finch/library.toml"
+                "{label} → {display_path}"
             ));
         }
         self.render_tui().await
@@ -2758,9 +3112,10 @@ impl EventLoop {
         }
         let provider = self.brain_provider.clone().unwrap();
 
+        use crossterm::style::Stylize;
         let label = sense.as_deref()
-            .map(|s| format!("\x1b[1;36m{key}\x1b[0m:\x1b[33m{s}\x1b[0m"))
-            .unwrap_or_else(|| format!("\x1b[1;36m{key}\x1b[0m"));
+            .map(|s| format!("{}:{}", key.clone().bold().cyan(), s.yellow()))
+            .unwrap_or_else(|| key.clone().bold().cyan().to_string());
         self.output_manager.write_info(format!("defining {label}…"));
         self.render_tui().await?;
 
@@ -2798,7 +3153,8 @@ impl EventLoop {
             Ok(v) => v,
             Err(e) => {
                 self.output_manager.write_info(format!(
-                    "auto-define: couldn't parse AI response: {e}\n\x1b[90m{text}\x1b[0m"
+                    "auto-define: couldn't parse AI response: {e}\n{}",
+                    text.as_str().dark_grey()
                 ));
                 return self.render_tui().await;
             }
@@ -2813,7 +3169,8 @@ impl EventLoop {
         let forth = entry["forth"].as_str().unwrap_or("").to_string();
 
         self.output_manager.write_info(format!(
-            "{label}: {definition}\x1b[90m  (saving…)\x1b[0m"
+            "{label}: {definition}{}",
+            "  (saving…)".dark_grey()
         ));
         self.save_library_entry(&key, &definition, sense.as_deref(), &forth).await
     }
@@ -3042,17 +3399,22 @@ impl EventLoop {
         Ok(())
     }
 
-    /// Handle `/stack clear` — drop all stack items.
+    /// Handle `/stack clear` — drop all stack items and return panel to graph view.
     async fn handle_stack_clear(&mut self) -> Result<()> {
         let mut stack = self.stack.lock().await;
         let count = stack.len();
         stack.clear();
         drop(stack);
+        // Return panel to graph view so the user is back in normal chat mode.
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.poset_panel_mode = crate::cli::tui::PosetPanelMode::Graph;
+        }
         if count == 0 {
-            self.output_manager.write_info("📚 Stack was already empty.");
+            self.output_manager.write_info("stack empty  (tip: ?? question  to ask the AI directly)");
         } else {
             self.output_manager.write_info(format!(
-                "📚 Cleared {count} item{} from stack.",
+                "cleared {count} item{}  (tip: ?? question  to ask the AI directly)",
                 if count == 1 { "" } else { "s" }
             ));
         }
@@ -4409,6 +4771,26 @@ mod tests {
             options.is_empty(),
             "pending_brain_question_options should be cleared"
         );
+    }
+
+    #[test]
+    fn test_extract_scatter_exec_commands_none() {
+        let cmds = extract_scatter_exec_commands("1 2 + .");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_extract_scatter_exec_commands_single() {
+        let cmds = extract_scatter_exec_commands(r#"scatter-exec" hostname""#);
+        assert_eq!(cmds, vec![r#"* → bash -c "hostname""#]);
+    }
+
+    #[test]
+    fn test_extract_scatter_exec_commands_multiple() {
+        let cmds = extract_scatter_exec_commands(
+            r#"peer" 192.168.1.1:11435" scatter-exec" hostname" scatter-exec" uname -a""#
+        );
+        assert_eq!(cmds, vec![r#"* → bash -c "hostname""#, r#"* → bash -c "uname -a""#]);
     }
 
     #[test]

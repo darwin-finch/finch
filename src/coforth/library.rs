@@ -30,6 +30,8 @@ pub struct WordEntry {
     pub forth: Option<String>, // Forth code that embodies this word; runs at CPU speed
     #[serde(default)]
     pub sense: Option<String>, // disambiguating label e.g. "game", "romantic", "physics"
+    #[serde(default)]
+    pub boot: bool, // if true, Forth code runs at startup (used for boot poetry etc.)
 }
 
 fn default_kind() -> String {
@@ -59,13 +61,33 @@ impl Library {
     /// Load seed vocabulary + generated English library + user extensions.
     ///
     /// Load order (later entries override earlier ones for the same word):
-    ///   1. SEED_LIBRARY   — philosophical/abstract primitives (~80 words, hand-crafted)
-    ///   2. ENGLISH_LIBRARY — generated comprehensive lexicon (baked in at compile time)
-    ///   3. ~/.finch/library.toml — user additions and overrides
+    ///   1. SEED_LIBRARY        — philosophical/abstract primitives (~80 words)
+    ///   2. ENGLISH_LIBRARY     — generated comprehensive lexicon (baked in at compile time)
+    ///   3. {git_root}/vocabulary/*.toml — project-local per-language modules (versioned in repo)
+    ///   4. ~/.finch/library.toml — user-global additions and overrides
     pub fn load() -> Self {
         let mut lib = Self::default();
         lib.load_toml(SEED_LIBRARY);
         lib.load_toml(ENGLISH_LIBRARY);
+
+        // Load project-local vocabulary modules (vocabulary/en.toml, vocabulary/zh.toml, …)
+        if let Some(root) = git_repo_root() {
+            let vocab_dir = root.join("vocabulary");
+            if let Ok(entries) = std::fs::read_dir(&vocab_dir) {
+                let mut paths: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("toml"))
+                    .collect();
+                paths.sort(); // deterministic load order
+                for path in paths {
+                    if let Ok(contents) = std::fs::read_to_string(&path) {
+                        lib.load_toml(&contents);
+                    }
+                }
+            }
+        }
+
         if let Some(user_path) = user_library_path() {
             if let Ok(contents) = std::fs::read_to_string(&user_path) {
                 lib.load_toml(&contents);
@@ -114,6 +136,27 @@ impl Library {
             .get(&word.to_lowercase())
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Return all entries marked `boot = true` (across all words/senses), in
+    /// alphabetical order by word name.  Used to run boot-time poetry at startup.
+    pub fn boot_entries(&self) -> Vec<&WordEntry> {
+        let mut entries: Vec<&WordEntry> = self.words.values()
+            .flat_map(|senses| senses.iter())
+            .filter(|e| e.boot && e.forth.is_some())
+            .collect();
+        entries.sort_by(|a, b| a.word.cmp(&b.word));
+        entries
+    }
+
+    /// Return every entry across all words and senses, in alphabetical order.
+    /// Used on first boot to run the whole vocabulary.
+    pub fn all_entries(&self) -> Vec<&WordEntry> {
+        let mut entries: Vec<&WordEntry> = self.words.values()
+            .flat_map(|senses| senses.iter())
+            .collect();
+        entries.sort_by(|a, b| a.word.cmp(&b.word));
+        entries
     }
 
     /// BFS from `seed`, returning all entries (all senses) within `hops` steps.
@@ -207,6 +250,55 @@ impl Library {
 fn user_library_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".finch").join("library.toml"))
 }
+
+/// Walk up from the current directory looking for a `.git` directory.
+/// Returns the directory that contains `.git`, i.e. the repo root.
+pub fn git_repo_root() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Determine which vocabulary language module a word belongs to.
+///
+/// Returns a module name (file stem under `vocabulary/`):
+///   - `"zh"` for Chinese / CJK characters
+///   - `"en"` for everything else (default)
+pub fn detect_vocab_lang(word: &str) -> &'static str {
+    let has_cjk = word.chars().any(|c| {
+        matches!(c as u32,
+            0x2E80..=0x9FFF |  // CJK Radicals → CJK Unified Ideographs (includes Ext A 3400-4DBF)
+            0xF900..=0xFAFF |  // Compatibility Ideographs
+            0x20000..=0x2A6DF  // Extension B
+        )
+    });
+    if has_cjk { "zh" } else { "en" }
+}
+
+/// Return the path to the project-local vocabulary file for `lang` (e.g. `"zh"`, `"en"`).
+/// Creates the `vocabulary/` directory if needed.  Returns `None` if not in a git repo.
+pub fn repo_vocab_path(lang: &str) -> Option<std::path::PathBuf> {
+    let root = git_repo_root()?;
+    let dir = root.join("vocabulary");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{lang}.toml")))
+}
+
+// ── Boot poetry ────────────────────────────────────────────────────────────────
+// Printed every startup, before the REPL is ready.
+// Written directly in Rust — no parsing, no Forth, no gen".
+// These are for alignment: orient both the human and the system at the start.
+
+pub const BOOT_POETRY: &[&str] = &[
+    "the machine is warm.\nthe task is yours.\nthe silence between us is not empty.",
+    "you do not start from nothing.\neverything you wrote before is still here.",
+];
 
 // ── Vocabulary sources ─────────────────────────────────────────────────────────
 
@@ -2434,6 +2526,107 @@ word = "time"
 definition = "the progression of events from past through present to future"
 related = ["now", "past", "future", "change"]
 kind = "observation"
+
+# ── 中文 / Chinese ─────────────────────────────────────────────────────────────
+
+[[word]]
+word = "你好"
+definition = "a greeting — 'you good', offered at the opening of contact"
+related = ["hello", "greet", "begin"]
+kind = "observation"
+forth = '." 你好。" cr'
+
+[[word]]
+word = "再见"
+definition = "farewell — 'again see', a promise folded into goodbye"
+related = ["goodbye", "leave", "return"]
+kind = "observation"
+forth = '." 再见。" cr'
+
+[[word]]
+word = "谢谢"
+definition = "thanks — gratitude made small enough to say twice"
+related = ["thanks", "receive", "give"]
+kind = "observation"
+forth = '." 谢谢。" cr'
+
+[[word]]
+word = "道"
+definition = "the way things move when nothing forces them"
+related = ["nature", "flow", "pattern", "way"]
+kind = "observation"
+forth = '." 道可道，非常道。" cr'
+
+[[word]]
+word = "空"
+definition = "emptiness that holds all possibility"
+related = ["void", "nothing", "begin", "silence"]
+kind = "observation"
+forth = 'depth 0= if ." 空。" else ." 非空：" depth . then cr'
+
+[[word]]
+word = "心"
+definition = "heart-mind — the place where feeling and knowing are the same"
+related = ["heart", "mind", "feel", "know"]
+kind = "observation"
+forth = '." 心。" cr'
+
+[[word]]
+word = "水"
+definition = "water — soft enough to yield, strong enough to wear stone"
+related = ["water", "flow", "river", "soft"]
+kind = "observation"
+forth = '." 水善利萬物而不爭。" cr'
+
+[[word]]
+word = "人"
+definition = "person — the character shows two lines holding each other up"
+related = ["person", "human", "together", "other"]
+kind = "observation"
+forth = '." 人。" cr'
+
+[[word]]
+word = "天"
+definition = "sky or heaven — what is above all things"
+related = ["sky", "above", "sun", "beyond"]
+kind = "observation"
+forth = '." 天。" cr'
+
+[[word]]
+word = "地"
+definition = "earth or ground — what supports all things from below"
+related = ["earth", "ground", "below", "root"]
+kind = "observation"
+forth = '." 地。" cr'
+
+[[word]]
+word = "月"
+definition = "moon — marks months, lights the dark, changes faithfully"
+related = ["moon", "night", "time", "change"]
+kind = "observation"
+forth = '." 月。" cr'
+
+[[word]]
+word = "山"
+definition = "mountain — stillness made tall"
+related = ["mountain", "still", "high", "stone"]
+kind = "observation"
+forth = '." 山。" cr'
+
+[[word]]
+word = "一"
+definition = "one — the stroke from which all numbers come"
+related = ["begin", "first", "source", "whole"]
+kind = "observation"
+forth = '1 . cr'
+
+[[word]]
+word = "无"
+definition = "nothing, non-being — the source from which being arises"
+related = ["void", "nothing", "begin", "空"]
+kind = "observation"
+forth = '0 . cr'
+
 "#;
 
 #[cfg(test)]

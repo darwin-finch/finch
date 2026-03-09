@@ -44,46 +44,19 @@ impl EventLoop {
         }
     }
 
-    /// Handle a `TypingStarted` event: (re-)spawn the brain with the new partial input.
+    /// Handle a `TypingStarted` event: update the word panel.
+    /// No AI calls are made while typing — functions only fire on submit.
     async fn handle_typing_started(&self, partial: String) {
         // Extract words from the partial input and show arrows in the panel.
-        {
-            let mut seen = std::collections::HashSet::new();
-            let words: Vec<String> = partial
-                .split(|c: char| !c.is_alphabetic() && c != '-' && c != '\'')
-                .filter(|w| w.len() >= 3)
-                .map(|w| w.to_lowercase())
-                .filter(|w| seen.insert(w.clone()))
-                .collect();
-            let mut tui = self.tui_renderer.lock().await;
-            tui.set_typing_words(words);
-        }
-
-        // No-op if brain is disabled or no cloud provider is available.
-        let provider = match &self.brain_provider {
-            Some(p) => Arc::clone(p),
-            None => return,
-        };
-
-        // Skip commands and very short input (not worth speculating on).
-        if partial.trim().starts_with('/') || partial.trim().len() < 10 {
-            return;
-        }
-
-        // Cancel stale brain AND clear its context (it was for a different partial input).
-        self.cancel_active_brain(true).await;
-
-        let session = crate::brain::BrainSession::spawn(
-            partial,
-            provider,
-            self.event_tx.clone(),
-            Arc::clone(&self.brain_context),
-            self.cwd.clone(),
-            self.memory_system.clone(),
-        );
-
-        *self.active_brain.write().await = Some(session);
-        tracing::debug!("[EVENT_LOOP] Brain spawned for typing-started event");
+        let mut seen = std::collections::HashSet::new();
+        let words: Vec<String> = partial
+            .split(|c: char| !c.is_alphabetic() && c != '-' && c != '\'')
+            .filter(|w| w.len() >= 3)
+            .map(|w| w.to_lowercase())
+            .filter(|w| seen.insert(w.clone()))
+            .collect();
+        let mut tui = self.tui_renderer.lock().await;
+        tui.set_typing_words(words);
     }
 
     /// Handle a `BrainQuestion` event: show a dialog and store the response channel.
