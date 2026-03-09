@@ -45,6 +45,10 @@ enum Cell {
     ReadFile(usize),    // read file at strings[idx]; emit contents to out
     ExecCmd(usize),     // run shell command strings[idx]; emit stdout to out
     GlobFiles(usize),   // list files matching glob strings[idx]; emit to out
+    AddPeer(usize),     // register peer address strings[idx] for scatter
+    ScatterExec(usize),     // run strings[idx] Forth code on all peers in parallel
+    ScatterBashExec(usize), // run strings[idx] as bash -c on all peers via /v1/exec
+    GenAI(usize),           // call AI generator with strings[idx] as prompt; emit response
     Builtin(Builtin),   // execute a primitive operation
     Addr(usize),        // call word at memory[addr]: push ip+1, ip = addr
     JmpZ(usize),        // if pop() == 0: ip = addr  (if/while/of)
@@ -86,15 +90,34 @@ enum Builtin {
     Cos,                      // ( deg*1000 -- cos*1000 )
     // Fixed-point helpers
     FPMul,                    // ( a b scale -- a*b/scale )  fixed-point multiply
+    // Distributed
+    Peers,                    // ( -- )  list registered peers
+    PeersClear,               // ( -- )  remove all registered peers
+    // Terminal control (crossterm-backed)
+    AtXy,                     // ( col row -- )  move cursor to col, row
+    TermSize,                 // ( -- cols rows )  push terminal dimensions
+    SaveCursor,               // ( -- )  save cursor position
+    RestoreCursor,            // ( -- )  restore cursor position
+    ClearEol,                 // ( -- )  clear from cursor to end of line
+    ClearLine,                // ( -- )  clear entire current line
+    ColorFg,                  // ( n -- )  set foreground ANSI color 0-255
+    ResetStyle,               // ( -- )  reset all text attributes
+    SyncBegin,                // ( -- )  begin synchronized update
+    SyncEnd,                  // ( -- )  end synchronized update
+    HideCursor,               // ( -- )  hide terminal cursor
+    ShowCursor,               // ( -- )  show terminal cursor
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
 
 /// Signature for the optional confirm callback.
-///
-/// Called when the `confirm` word executes.  Returns `true` (continue) or
-/// `false` (deny).  The string argument is a label/message from the program.
 pub type ConfirmFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Signature for the optional AI generation callback.
+///
+/// Called when `gen" prompt"` executes.  Receives the prompt string and returns
+/// the model's response as a String.  If unset, `gen"` emits a placeholder.
+pub type GenFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 
 pub struct Forth {
     data:       Vec<i64>,
@@ -106,9 +129,15 @@ pub struct Forth {
     heap:       Vec<i64>,                // variable storage
     var_index:  HashMap<String, usize>,  // variable name → heap address
     pub out:    String,
-    /// Optional confirm callback.  `confirm" msg"` calls this and pushes -1 or 0.
-    /// If unset, defaults to `true` (auto-approve — useful in tests / CLI).
+    /// Peer addresses for `scatter"`.  Each entry is a host:port or URL.
+    pub peers:  Vec<String>,
+    /// Source log — every `: name body ;` compiled into this VM, in order.
+    /// Lets the VM be serialised to Forth source and pasted into another session.
+    pub source_log: Vec<String>,
+    /// Optional confirm callback.
     confirm_fn: Option<ConfirmFn>,
+    /// Optional AI generation callback.  Wired to the active generator in the REPL.
+    gen_fn: Option<GenFn>,
 }
 
 const MAX_CALL_DEPTH: usize = 256;
@@ -118,11 +147,12 @@ const MAX_STEPS: usize = 2_000_000;
 /// Used to implement undo: restore the dictionary to a previous point.
 #[derive(Clone)]
 pub struct DictionarySnapshot {
-    memory_len:  usize,
-    strings_len: usize,
-    heap_len:    usize,
-    name_index:  HashMap<String, usize>,
-    var_index:   HashMap<String, usize>,
+    memory_len:      usize,
+    strings_len:     usize,
+    heap_len:        usize,
+    name_index:      HashMap<String, usize>,
+    var_index:       HashMap<String, usize>,
+    source_log_len:  usize,
 }
 
 // ── Standard library (pre-loaded Forth definitions) ──────────────────────────
@@ -188,6 +218,24 @@ const STDLIB: &str = r#"
 : banner    ( -- )     ." ────────────────────────" cr ;
 : .bool     ( flag -- )  if ." true" else ." false" then ;
 
+\ ── Boot ceremony ─────────────────────────────────────────────────────────────
+: boot-wake ( -- )  ." ── the language wakes ──" cr ;
+: boot-rest ( -- )  banner ;
+
+\ ── Terminal UI helpers (crossterm-backed) ────────────────────────────────────
+\ Primitives: at-xy  term-size  save-cursor  restore-cursor
+\             clear-eol  clear-line  color!  reset-style
+\             sync-begin  sync-end  hide-cursor  show-cursor
+\
+\ Draw n copies of char starting at (col row):
+: h-line  ( col row n char -- )
+    >r >r       \ rstack: char n  ;  stack: col row
+    at-xy       \ position cursor
+    r> r>       \ stack: n char
+    swap        \ stack: char n
+    0 do        dup emit
+    loop drop ;
+
 \ ── Numeric output ───────────────────────────────────────────────────────────
 \ Print n in binary (8 bits)
 : .bin8  ( n -- )
@@ -246,7 +294,10 @@ impl Forth {
             heap:       Vec::new(),
             var_index:  HashMap::new(),
             out:        String::new(),
+            peers:      Vec::new(),
+            source_log: Vec::new(),
             confirm_fn: None,
+            gen_fn:     None,
         };
         // Load standard library silently (errors ignored — all words should be valid)
         let _ = f.eval(STDLIB);
@@ -272,6 +323,20 @@ impl Forth {
         self
     }
 
+    /// Attach an AI generation callback (builder pattern).
+    ///
+    /// `gen" prompt"` will call this function and emit the returned string.
+    /// Without a callback, `gen"` emits `(no generator)`.
+    pub fn with_gen(mut self, f: GenFn) -> Self {
+        self.gen_fn = Some(f);
+        self
+    }
+
+    /// Set the AI generation callback on an existing instance.
+    pub fn set_gen_fn(&mut self, f: GenFn) {
+        self.gen_fn = Some(f);
+    }
+
     /// Execute Forth source on this instance and return collected output.
     pub fn exec(&mut self, source: &str) -> Result<String> {
         self.out.clear();
@@ -279,14 +344,25 @@ impl Forth {
         Ok(self.out.clone())
     }
 
+    /// Return a snapshot of the current data stack (top = last element).
+    pub fn data_stack(&self) -> &[i64] {
+        &self.data
+    }
+
+    /// Push values onto the data stack (used to inject remote results locally).
+    pub fn push_stack(&mut self, values: &[i64]) {
+        self.data.extend_from_slice(values);
+    }
+
     /// Snapshot the current dictionary state (word definitions only, not the data stack).
     pub fn snapshot(&self) -> DictionarySnapshot {
         DictionarySnapshot {
-            memory_len:  self.memory.len(),
-            strings_len: self.strings.len(),
-            heap_len:    self.heap.len(),
-            name_index:  self.name_index.clone(),
-            var_index:   self.var_index.clone(),
+            memory_len:     self.memory.len(),
+            strings_len:    self.strings.len(),
+            heap_len:       self.heap.len(),
+            name_index:     self.name_index.clone(),
+            var_index:      self.var_index.clone(),
+            source_log_len: self.source_log.len(),
         }
     }
 
@@ -298,6 +374,13 @@ impl Forth {
         self.heap.truncate(snap.heap_len);
         self.name_index = snap.name_index.clone();
         self.var_index  = snap.var_index.clone();
+        self.source_log.truncate(snap.source_log_len);
+    }
+
+    /// Serialise the VM's user-defined words as Forth source.
+    /// Paste this into any session to recreate the same dictionary.
+    pub fn dump_source(&self) -> String {
+        self.source_log.join("\n")
     }
 }
 
@@ -350,6 +433,8 @@ impl Forth {
                         pos += 1;
                     }
                     if depth != 0 { bail!("missing ; for :{name}"); }
+                    // Log source before compiling so the VM is serialisable.
+                    self.source_log.push(format!(": {} {} ;", name, body.join(" ")));
                     // Register entry address BEFORE compiling body so `recurse` resolves.
                     let word_addr = self.memory.len();
                     self.name_index.insert(name.clone(), word_addr);
@@ -504,6 +589,30 @@ impl Forth {
             self.memory.push(Cell::GlobFiles(idx));
             return Ok(());
         }
+        if let Some(s) = tok.strip_prefix("\x00peer:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::AddPeer(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00scatter:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ScatterExec(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00scatter-exec:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ScatterBashExec(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00gen:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::GenAI(idx));
+            return Ok(());
+        }
         if let Ok(n) = tok.parse::<i64>() {
             self.memory.push(Cell::Lit(n));
             return Ok(());
@@ -586,14 +695,106 @@ impl Forth {
                 }
                 Cell::GlobFiles(idx) => {
                     let pattern = self.strings[idx].clone();
-                    // Simple glob: expand via shell to avoid adding a dep
-                    let result = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(format!("ls -1 {pattern} 2>/dev/null"))
-                        .output();
-                    match result {
-                        Ok(o) => self.out.push_str(&String::from_utf8_lossy(&o.stdout)),
+                    match glob::glob(&pattern) {
+                        Ok(paths) => {
+                            let mut any = false;
+                            for path in paths.flatten() {
+                                self.out.push_str(&path.display().to_string());
+                                self.out.push('\n');
+                                any = true;
+                            }
+                            if !any {
+                                // no matches — silent, like ls 2>/dev/null
+                            }
+                        }
                         Err(e) => self.out.push_str(&format!("glob error: {e}\n")),
+                    }
+                    ip += 1;
+                }
+                Cell::AddPeer(idx) => {
+                    let addr = self.strings[idx].clone();
+                    if !self.peers.contains(&addr) {
+                        self.peers.push(addr);
+                    }
+                    ip += 1;
+                }
+                Cell::ScatterExec(idx) => {
+                    let snippet = self.strings[idx].clone();
+                    if self.peers.is_empty() {
+                        self.out.push_str(
+                            "scatter: no peers  (use peer\" host:port\" to register one)\n"
+                        );
+                    } else {
+                        let peers = self.peers.clone();
+                        let results = run_scatter(&peers, &snippet);
+                        for r in results {
+                            if let Some(err) = r.error {
+                                self.out.push_str(&format!("[{}] error: {}\n", r.peer, err));
+                            } else {
+                                // Print any output lines
+                                for line in r.output.lines() {
+                                    self.out.push_str(&format!("[{}] {}\n", r.peer, line));
+                                }
+                                // Push the peer's stack values onto the local stack.
+                                // This is the "forth back" — remote results become local values.
+                                for v in &r.stack {
+                                    self.data.push(*v);
+                                }
+                            }
+                        }
+                    }
+                    ip += 1;
+                }
+                Cell::ScatterBashExec(idx) => {
+                    let cmd = self.strings[idx].clone();
+                    if self.peers.is_empty() {
+                        self.out.push_str(
+                            "scatter-exec: no peers  (use peer\" host:port\" to register one)\n"
+                        );
+                    } else {
+                        let peers = self.peers.clone();
+                        // Show plan and require confirmation before executing on remote machines.
+                        let plan = format!(
+                            "Run on {} peer(s): bash -c {:?}\n  targets: {}",
+                            peers.len(),
+                            cmd,
+                            peers.join(", ")
+                        );
+                        let approved = if let Some(ref f) = self.confirm_fn {
+                            f(&plan)
+                        } else {
+                            true // auto-approve in tests / pipe mode
+                        };
+                        if !approved {
+                            self.out.push_str("scatter-exec: cancelled\n");
+                        } else {
+                            let results = run_exec_scatter(&peers, &cmd);
+                            for r in results {
+                                if let Some(err) = r.error {
+                                    self.out.push_str(&format!("[{}] error: {}\n", r.peer, err));
+                                } else {
+                                    for line in r.output.lines() {
+                                        self.out.push_str(&format!("[{}] {}\n", r.peer, line));
+                                    }
+                                    if r.output.is_empty() {
+                                        self.out.push_str(&format!("[{}] (no output)\n", r.peer));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ip += 1;
+                }
+                Cell::GenAI(idx) => {
+                    let prompt = self.strings[idx].clone();
+                    let response = if let Some(ref f) = self.gen_fn {
+                        f(&prompt)
+                    } else {
+                        "(no generator connected)\n".to_string()
+                    };
+                    self.out.push_str(&response);
+                    if !response.ends_with('\n') {
+                        self.out.push('\n');
                     }
                     ip += 1;
                 }
@@ -828,12 +1029,107 @@ impl Forth {
                 if scale == 0 { bail!("fpmul: scale is zero"); }
                 self.data.push((a as i128 * b as i128 / scale as i128) as i64);
             }
+            Builtin::Peers => {
+                if self.peers.is_empty() {
+                    self.out.push_str("(no peers registered)\n");
+                } else {
+                    for (i, p) in self.peers.iter().enumerate() {
+                        self.out.push_str(&format!("{}: {}\n", i, p));
+                    }
+                }
+            }
+            Builtin::PeersClear => {
+                self.peers.clear();
+            }
+            // ── Terminal control (crossterm) ─────────────────────────────────
+            Builtin::AtXy => {
+                use crossterm::{cursor, execute};
+                let row = self.pop()? as u16;
+                let col = self.pop()? as u16;
+                execute!(std::io::stdout(), cursor::MoveTo(col, row)).ok();
+            }
+            Builtin::TermSize => {
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                self.data.push(cols as i64);
+                self.data.push(rows as i64);
+            }
+            Builtin::SaveCursor => {
+                use crossterm::{cursor, execute};
+                execute!(std::io::stdout(), cursor::SavePosition).ok();
+            }
+            Builtin::RestoreCursor => {
+                use crossterm::{cursor, execute};
+                execute!(std::io::stdout(), cursor::RestorePosition).ok();
+            }
+            Builtin::ClearEol => {
+                use crossterm::{terminal::{Clear, ClearType}, execute};
+                execute!(std::io::stdout(), Clear(ClearType::UntilNewLine)).ok();
+            }
+            Builtin::ClearLine => {
+                use crossterm::{terminal::{Clear, ClearType}, execute};
+                execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).ok();
+            }
+            Builtin::ColorFg => {
+                use crossterm::{style::{SetForegroundColor, Color}, execute};
+                let n = self.pop()? as u8;
+                execute!(std::io::stdout(), SetForegroundColor(Color::AnsiValue(n))).ok();
+            }
+            Builtin::ResetStyle => {
+                use crossterm::{style::ResetColor, execute};
+                execute!(std::io::stdout(), ResetColor).ok();
+            }
+            Builtin::SyncBegin => {
+                use crossterm::{queue, terminal::BeginSynchronizedUpdate};
+                use std::io::Write;
+                queue!(std::io::stdout(), BeginSynchronizedUpdate).ok();
+                std::io::stdout().flush().ok();
+            }
+            Builtin::SyncEnd => {
+                use crossterm::{queue, terminal::EndSynchronizedUpdate};
+                use std::io::Write;
+                queue!(std::io::stdout(), EndSynchronizedUpdate).ok();
+                std::io::stdout().flush().ok();
+            }
+            Builtin::HideCursor => {
+                use crossterm::{cursor, execute};
+                execute!(std::io::stdout(), cursor::Hide).ok();
+            }
+            Builtin::ShowCursor => {
+                use crossterm::{cursor, execute};
+                execute!(std::io::stdout(), cursor::Show).ok();
+            }
         }
         Ok(())
     }
 
     fn pop(&mut self) -> Result<i64> {
         self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow"))
+    }
+}
+
+// ── Scatter helpers — bridge sync Forth VM to async scatter functions ──────────
+
+fn run_scatter(peers: &[String], code: &str) -> Vec<crate::coforth::scatter::PeerResult> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(crate::coforth::scatter::scatter_exec(peers, code))
+        })
+    } else {
+        tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(crate::coforth::scatter::scatter_exec(peers, code))
+    }
+}
+
+fn run_exec_scatter(peers: &[String], cmd: &str) -> Vec<crate::coforth::scatter::PeerResult> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd))
+        })
+    } else {
+        tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd))
     }
 }
 
@@ -872,6 +1168,21 @@ fn name_to_builtin(name: &str) -> Option<Builtin> {
         "sin" => Builtin::Sin,
         "cos" => Builtin::Cos,
         "fpmul" => Builtin::FPMul,
+        "peers" => Builtin::Peers,
+        "peers-clear" => Builtin::PeersClear,
+        // Terminal control
+        "at-xy"          => Builtin::AtXy,
+        "term-size"      => Builtin::TermSize,
+        "save-cursor"    => Builtin::SaveCursor,
+        "restore-cursor" => Builtin::RestoreCursor,
+        "clear-eol"      => Builtin::ClearEol,
+        "clear-line"     => Builtin::ClearLine,
+        "color!"         => Builtin::ColorFg,
+        "reset-style"    => Builtin::ResetStyle,
+        "sync-begin"     => Builtin::SyncBegin,
+        "sync-end"       => Builtin::SyncEnd,
+        "hide-cursor"    => Builtin::HideCursor,
+        "show-cursor"    => Builtin::ShowCursor,
         _ => return None,
     })
 }
@@ -940,6 +1251,38 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00glob:{s}"));
+        } else if c == '"' && tok == "peer" {
+            // peer" addr"  — register a remote finch daemon as a scatter target
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00peer:{s}"));
+        } else if c == '"' && tok == "scatter" {
+            // scatter" code"  — run code on all registered peers in parallel
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00scatter:{s}"));
+        } else if c == '"' && tok == "gen" {
+            // gen" prompt"  — call AI generator, emit response
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00gen:{s}"));
+        } else if c == '"' && tok == "scatter-exec" {
+            // scatter-exec" cmd"  — run bash -c cmd on all peers via /v1/exec
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00scatter-exec:{s}"));
         } else if c.is_whitespace() {
             flush!();
             chars.next();
@@ -984,6 +1327,11 @@ fn push_branch(t: &mut Vec<String>, f: &mut Vec<String>, in_false: bool, tok: &s
 
 /// Collect tokens for `begin/until|again|while`.
 /// Returns (body, end_kind, after_body [for while..repeat], tokens_consumed).
+///
+/// Depth rules: only `begin` increments depth; only `until`, `again`, `repeat`
+/// decrement it.  `while` never changes depth — it is not a balancer for `begin`,
+/// only `repeat` is.  This allows nested `begin..while..repeat` loops to be
+/// collected correctly.
 fn collect_begin(tokens: &[String], start: usize) -> Result<(Vec<String>, String, Vec<String>, usize)> {
     let mut body = Vec::new();
     let mut after = Vec::new();
@@ -993,12 +1341,20 @@ fn collect_begin(tokens: &[String], start: usize) -> Result<(Vec<String>, String
     let mut i = start;
     while i < tokens.len() {
         match tokens[i].as_str() {
-            "begin" => { depth += 1; (if in_after { &mut after } else { &mut body }).push(tokens[i].clone()); }
+            "begin" => {
+                depth += 1;
+                (if in_after { &mut after } else { &mut body }).push(tokens[i].clone());
+            }
             "until" | "again" if depth == 1 => { end_kind = tokens[i].clone(); break; }
             "while" if depth == 1 => { end_kind = "while".to_string(); in_after = true; }
             "repeat" if depth == 1 && in_after => { break; }
-            "until" | "again" | "while" | "repeat" => {
+            // Inner loop terminators: only until/again/repeat balance begin.
+            "until" | "again" | "repeat" => {
                 depth -= 1;
+                (if in_after { &mut after } else { &mut body }).push(tokens[i].clone());
+            }
+            // Inner while — push but do NOT change depth (while is not a begin-balancer).
+            "while" => {
                 (if in_after { &mut after } else { &mut body }).push(tokens[i].clone());
             }
             _ => { (if in_after { &mut after } else { &mut body }).push(tokens[i].clone()); }

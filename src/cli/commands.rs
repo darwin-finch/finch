@@ -61,6 +61,7 @@ pub enum Command {
     // Execution graph
     Graph, // /graph — show causal trace of last query
     // Co-Forth VM stack ops
+    Ask(String),                  // /ask <query>      — send directly to AI (bypass stack)
     StackPush(String),            // /push <text>      — push text onto the stack
     StackShow,                    // /stack            — show current stack contents
     StackPop,                     // /pop              — remove top item (undo last push)
@@ -75,10 +76,13 @@ pub enum Command {
     StackDup(usize),              // /dup W1           — clone word as new entry
     StackSwap(usize, usize),      // /swap W1 W2       — swap labels of two words
     StackDescribe(String),        // /describe <word>  — show library entry for a word
-    StackDefine(String, String),  // /define <word> <def> — add word to user library
+    StackDefine(String, String),  // /define <word> <def> — add word to repo vocabulary
+    StackOverride(String, String), // /override <word> <def> — machine-local override (~/.finch/library.toml)
     ForthEval(String),            // : word ... ; or /forth <expr> — eval in Forth interpreter
     ForthUndo,                    // /undefine — undo last Forth definition
+    VmDump,                       // /vm — dump VM source to scrollback + clipboard
     LibraryUndefine(String),      // /undefine <word> — remove last user library entry for word
+    LibraryRun(String),           // /run <word> — execute the Forth snippet for a library word
 }
 
 impl Command {
@@ -115,6 +119,7 @@ impl Command {
             "/brains" | "/brains list" => return Some(Command::Brains),
             "/graph" => return Some(Command::Graph),
             // Co-Forth VM
+            "/vm" | "/vm dump" | "/vm copy" => return Some(Command::VmDump),
             "/stack" | "/stack list" | "/stack show" => return Some(Command::StackShow),
             "/stack clear" | "/stack reset" => return Some(Command::StackClear),
             "/pop" => return Some(Command::StackPop),
@@ -130,6 +135,14 @@ impl Command {
             let key = rest.trim();
             if !key.is_empty() {
                 return Some(Command::LicenseActivate(key.to_string()));
+            }
+        }
+
+        // Handle /ask <query> — bypass stack, send directly to AI
+        if let Some(rest) = trimmed.strip_prefix("/ask ") {
+            let query = rest.trim();
+            if !query.is_empty() {
+                return Some(Command::Ask(query.to_string()));
             }
         }
 
@@ -192,6 +205,12 @@ impl Command {
                 return Some(Command::LibraryUndefine(word));
             }
         }
+        if let Some(rest) = trimmed.strip_prefix("/run ") {
+            let word = rest.trim().to_string();
+            if !word.is_empty() && !word.contains(' ') {
+                return Some(Command::LibraryRun(word));
+            }
+        }
         // Forth eval via /forth
         if let Some(rest) = trimmed.strip_prefix("/forth ") {
             let expr = rest.trim();
@@ -202,17 +221,50 @@ impl Command {
 
         if let Some(rest) = trimmed.strip_prefix("/define ") {
             // /define <word> <definition…>   — definition may be empty (AI auto-define)
+            // Word may be:
+            //   • a single token (no spaces)  →  /define hello   A greeting
+            //   • a quoted phrase              →  /define "machine learning"   AI technique
+            //   • a Chinese word/phrase        →  /define 你好   A Chinese greeting
             let rest = rest.trim();
             if !rest.is_empty() {
-                if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
-                    let word = rest[..space].trim().to_string();
-                    let definition = rest[space..].trim().to_string();
-                    if !word.is_empty() {
-                        return Some(Command::StackDefine(word, definition));
+                let (word, definition) = if rest.starts_with('"') {
+                    // Quoted phrase: find closing '"'
+                    if let Some(close) = rest[1..].find('"') {
+                        let phrase = rest[1..=close].to_string();
+                        let def = rest[close + 2..].trim().to_string();
+                        (phrase, def)
+                    } else {
+                        // Unclosed quote — treat whole thing as the word
+                        (rest.trim_matches('"').to_string(), String::new())
                     }
+                } else if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
+                    (rest[..space].trim().to_string(), rest[space..].trim().to_string())
                 } else {
-                    // word only — trigger AI auto-define
-                    return Some(Command::StackDefine(rest.to_string(), String::new()));
+                    (rest.to_string(), String::new())
+                };
+                if !word.is_empty() {
+                    return Some(Command::StackDefine(word, definition));
+                }
+            }
+        }
+
+        // Handle /override — machine-local word override (writes to ~/.finch/library.toml)
+        if let Some(rest) = trimmed.strip_prefix("/override ") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                let (word, definition) = if rest.starts_with('"') {
+                    if let Some(close) = rest[1..].find('"') {
+                        (rest[1..=close].to_string(), rest[close + 2..].trim().to_string())
+                    } else {
+                        (rest.trim_matches('"').to_string(), String::new())
+                    }
+                } else if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
+                    (rest[..space].trim().to_string(), rest[space..].trim().to_string())
+                } else {
+                    (rest.to_string(), String::new())
+                };
+                if !word.is_empty() {
+                    return Some(Command::StackOverride(word, definition));
                 }
             }
         }
@@ -467,8 +519,9 @@ pub fn handle_command(
         Command::Graph => Ok(CommandOutput::Status(
             "Graph command should be handled in REPL.".to_string(),
         )),
-        // Stack commands are handled directly in REPL
-        Command::StackPush(_)
+        // Ask / stack commands are handled directly in REPL
+        Command::Ask(_)
+        | Command::StackPush(_)
         | Command::StackShow
         | Command::StackPop
         | Command::StackRun
@@ -482,9 +535,12 @@ pub fn handle_command(
         | Command::StackSwap(_, _)
         | Command::StackDescribe(_)
         | Command::StackDefine(_, _)
+        | Command::StackOverride(_, _)
         | Command::ForthEval(_)
         | Command::ForthUndo
-        | Command::LibraryUndefine(_) => Ok(CommandOutput::Status(
+        | Command::VmDump
+        | Command::LibraryUndefine(_)
+        | Command::LibraryRun(_) => Ok(CommandOutput::Status(
             "Stack commands should be handled in REPL.".to_string(),
         )),
     }
@@ -572,6 +628,8 @@ pub fn format_help() -> String {
          \x1b[36m  Ctrl+D\x1b[0m             Exit REPL (same as /quit)\n\
          \x1b[36m  Ctrl+G\x1b[0m             Mark last response as \x1b[32mgood\x1b[0m (1x training weight)\n\
          \x1b[36m  Ctrl+B\x1b[0m             Mark last response as \x1b[31mbad\x1b[0m (10x training weight)\n\
+         \x1b[36m  Ctrl+Z\x1b[0m             Undo last Forth definition (/undefine)\n\
+         \x1b[36m  Ctrl+P\x1b[0m             Pop top word off vocabulary stack (/pop)\n\
          \x1b[36m  Tab\x1b[0m                Complete /command (accepts ghost text)\n\
          \x1b[36m  Shift+Tab\x1b[0m          Toggle plan mode on/off\n\
          \x1b[36m  Shift+Enter\x1b[0m        Multi-line input (insert newline)\n\
@@ -595,6 +653,7 @@ pub fn format_help() -> String {
          \x1b[36m  /stack clear\x1b[0m       Drop all stack items\n\
          \x1b[36m  /describe <word>\x1b[0m   Show library definition + related words\n\
          \x1b[36m  /define <w> <def>\x1b[0m  Add/override a word in your personal library\n\
+         \x1b[36m  /define \"phrase\" <def>\x1b[0m Override a multi-word phrase or Chinese term\n\
          \x1b[36m  /define <w>:<sense>\x1b[0m Add a specific sense (e.g. /define bank:river the sloping land)\n\
          \x1b[90m                     (1030 English words preloaded — override at your peril)\x1b[0m\n\
          \x1b[0m\n\

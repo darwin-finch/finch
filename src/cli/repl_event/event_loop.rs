@@ -1222,6 +1222,9 @@ impl EventLoop {
                     Command::ForthUndo => {
                         self.handle_forth_undo().await?;
                     }
+                    Command::VmDump => {
+                        self.handle_vm_dump().await?;
+                    }
                     Command::LibraryUndefine(word) => {
                         self.handle_library_undefine(word).await?;
                     }
@@ -2458,15 +2461,10 @@ impl EventLoop {
         // Ask the AI programmer for Forth — then execute it.
         // Forth can do everything we need: define, run, correct, compose.
         let prompt = format!(
-            "Two programmers building a program together on a shared stack. \
-             The program can be in English, Chinese, or any language — \
-             the words are the program. \
-             The other programmer just pushed this:\n\n  {text}{stack_str}{error_str}\n\n\
-             Respond only with Forth. \
-             Use the same language they used for word names and strings. \
-             If what they pushed was wrong, correct it. \
-             Define words with : name ... ; and run them. \
-             No prose. No explanation. Just Forth.",
+            "Forth session. Two programmers, shared stack. \
+             Pushed:{stack_str}\n  > {text}{error_str}\n\
+             Reply: Forth only. Same language as input. \
+             Fix errors. Define and run words. No prose.",
         );
         let messages = vec![crate::claude::Message {
             role: "user".to_string(),
@@ -2785,6 +2783,25 @@ impl EventLoop {
                 );
             }
         }
+        self.render_tui().await
+    }
+
+    /// `/vm` — dump the VM's user-defined words as Forth source.
+    /// Shows in scrollback and copies to clipboard so it can be pasted
+    /// into another session to recreate the same dictionary.
+    async fn handle_vm_dump(&mut self) -> Result<()> {
+        use crossterm::style::Stylize;
+        let source = self.forth_vm.dump_source();
+        if source.is_empty() {
+            self.output_manager.write_info("vm: no user-defined words yet".dark_grey().to_string());
+            return self.render_tui().await;
+        }
+        // Copy to clipboard (best-effort).
+        let copied = arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(source.clone()))
+            .is_ok();
+        let note = if copied { "  (copied to clipboard)".dark_grey().to_string() } else { String::new() };
+        self.output_manager.write_info(format!("{}{note}", source));
         self.render_tui().await
     }
 
