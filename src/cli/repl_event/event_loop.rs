@@ -626,6 +626,22 @@ impl EventLoop {
                 self.output_manager.write_info(poem.to_string());
             }
             self.render_tui().await.ok();
+
+            // Auto-discover peers on LAN in background — REPL stays responsive.
+            // When found, PeersDiscovered event arrives and we add them to the VM.
+            {
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let peers = tokio::task::spawn_blocking(|| {
+                        crate::coforth::interpreter::run_peers_discover_pub(2000)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    if !peers.is_empty() {
+                        let _ = event_tx.send(ReplEvent::PeersDiscovered(peers));
+                    }
+                });
+            }
         }
         // ─────────────────────────────────────────────────────────────────────
 
@@ -697,6 +713,7 @@ impl EventLoop {
                         ReplEvent::BrainProposedAction { .. } => "BrainProposedAction",
                         ReplEvent::PosetComplete { result: Ok(_) } => "PosetComplete(ok)",
                         ReplEvent::PosetComplete { result: Err(_) } => "PosetComplete(err)",
+                        ReplEvent::PeersDiscovered(_) => "PeersDiscovered",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -2107,6 +2124,30 @@ impl EventLoop {
                     }
                 }
                 self.render_tui().await?;
+            }
+
+            ReplEvent::PeersDiscovered(peers) => {
+                // Background boot scan found finch instances on the LAN.
+                // Add each to the Forth VM's peer list and show a one-line notice.
+                let mut added = Vec::new();
+                for (host, port) in peers {
+                    let addr = format!("{host}:{port}");
+                    if !self.forth_vm.peers.contains(&addr) {
+                        self.forth_vm.peers.push(addr.clone());
+                        added.push(addr);
+                    }
+                }
+                if !added.is_empty() {
+                    use crossterm::style::Stylize;
+                    let names = added.iter()
+                        .map(|a| a.as_str().cyan().to_string())
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    self.output_manager.write_info(
+                        format!("peers: {}", names)
+                    );
+                    self.render_tui().await?;
+                }
             }
         }
 

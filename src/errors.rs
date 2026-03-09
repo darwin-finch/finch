@@ -2,81 +2,35 @@
 //
 // Provides helpers to convert technical errors into actionable messages
 // that guide users toward solutions.
-//
-// Localization Support:
-// The error messages support localization via the LANG environment variable.
-// Currently supported: English (en_US), with framework for future languages.
 
 use anyhow::{Context, Result};
+use crossterm::style::Stylize;
 use std::fmt;
 
-/// Get the current locale from environment
-fn get_locale() -> &'static str {
-    // Check LANG environment variable
-    if let Ok(lang) = std::env::var("LANG") {
-        if lang.starts_with("es") {
-            return "es";
-        } else if lang.starts_with("fr") {
-            return "fr";
-        } else if lang.starts_with("de") {
-            return "de";
-        } else if lang.starts_with("zh") {
-            return "zh";
-        } else if lang.starts_with("ja") {
-            return "ja";
-        }
-    }
-    "en" // Default to English
-}
-
 /// Localized text helper
-fn t(key: &str) -> String {
-    let locale = get_locale();
-
-    let text = match (locale, key) {
-        // English (default)
-        ("en", "try") => "Try:",
-        ("en", "suggestion") => "Suggestion:",
-        ("en", "possible_causes") => "Possible causes:",
-        ("en", "error") => "Error:",
-
-        // Spanish
-        ("es", "try") => "Intenta:",
-        ("es", "suggestion") => "Sugerencia:",
-        ("es", "possible_causes") => "Posibles causas:",
-        ("es", "error") => "Error:",
-
-        // French
-        ("fr", "try") => "Essayez:",
-        ("fr", "suggestion") => "Suggestion:",
-        ("fr", "possible_causes") => "Causes possibles:",
-        ("fr", "error") => "Erreur:",
-
-        // German
-        ("de", "try") => "Versuchen Sie:",
-        ("de", "suggestion") => "Vorschlag:",
-        ("de", "possible_causes") => "Mögliche Ursachen:",
-        ("de", "error") => "Fehler:",
-
-        // Default fallback
-        _ => match key {
-            "try" => "Try:",
-            "suggestion" => "Suggestion:",
-            "possible_causes" => "Possible causes:",
-            "error" => "Error:",
-            _ => key,
-        },
-    };
-
-    text.to_string()
+fn t(key: &str) -> &'static str {
+    let lang = std::env::var("LANG").unwrap_or_default();
+    let locale = &lang[..lang.len().min(2)];
+    match (locale, key) {
+        ("es", "try")            => "Intenta:",
+        ("es", "suggestion")     => "Sugerencia:",
+        ("es", "possible_causes")=> "Posibles causas:",
+        ("fr", "try")            => "Essayez:",
+        ("fr", "suggestion")     => "Suggestion:",
+        ("fr", "possible_causes")=> "Causes possibles:",
+        ("de", "try")            => "Versuchen Sie:",
+        ("de", "suggestion")     => "Vorschlag:",
+        ("de", "possible_causes")=> "Mögliche Ursachen:",
+        (_,    "try")            => "Try:",
+        (_,    "suggestion")     => "Suggestion:",
+        (_,    "possible_causes")=> "Possible causes:",
+        _                        => ":",
+    }
 }
 
 /// Wrap an error with user-friendly context
 pub trait UserFriendlyError {
-    /// Add user-friendly context to this error
     fn user_context(self, message: &str) -> Self;
-
-    /// Add user-friendly context with a suggestion
     fn user_context_with_suggestion(self, problem: &str, suggestion: &str) -> Self;
 }
 
@@ -88,10 +42,10 @@ impl<T> UserFriendlyError for Result<T> {
     fn user_context_with_suggestion(self, problem: &str, suggestion: &str) -> Self {
         self.with_context(|| {
             format!(
-                "{}\n\n\x1b[1;33m{}:\x1b[0m {}",
+                "{}\n\n{}  {}",
                 problem,
-                t("suggestion"),
-                suggestion
+                t("suggestion").yellow().bold(),
+                suggestion,
             )
         })
     }
@@ -101,20 +55,23 @@ impl<T> UserFriendlyError for Result<T> {
 pub fn connection_refused_error(address: &str) -> String {
     format!(
         "Could not connect to daemon at {}\n\n\
-        \x1b[1;33m{}:\x1b[0m\n\
+        {}\n\
         • Daemon is not running\n\
         • Daemon crashed or failed to start\n\
         • Wrong bind address\n\n\
-        \x1b[1;32m{}:\x1b[0m\n\
+        {}\n\
         1. Start the daemon:\n\
-           \x1b[36mfinch daemon-start\x1b[0m\n\n\
+           {}\n\n\
         2. Check daemon logs:\n\
-           \x1b[36mtail -f ~/.finch/daemon.log\x1b[0m\n\n\
+           {}\n\n\
         3. Check if daemon is running:\n\
-           \x1b[36mps aux | grep \"finch daemon\"\x1b[0m",
+           {}",
         address,
-        t("possible_causes"),
-        t("try")
+        t("possible_causes").yellow().bold(),
+        t("try").green().bold(),
+        "finch daemon-start".cyan(),
+        "tail -f ~/.finch/daemon.log".cyan(),
+        "ps aux | grep \"finch daemon\"".cyan(),
     )
 }
 
@@ -122,18 +79,23 @@ pub fn connection_refused_error(address: &str) -> String {
 pub fn model_not_found_error(model_name: &str) -> String {
     format!(
         "Model '{}' not found\n\n\
-        \x1b[1;33mPossible causes:\x1b[0m\n\
+        {}\n\
         • Model not downloaded yet\n\
         • Model download failed\n\
         • Wrong model name\n\n\
-        \x1b[1;32mTry:\x1b[0m\n\
+        {}\n\
         1. Run setup wizard to download models:\n\
-           \x1b[36mfinch setup\x1b[0m\n\n\
+           {}\n\n\
         2. Check model cache:\n\
-           \x1b[36mls ~/.cache/huggingface/hub/\x1b[0m\n\n\
+           {}\n\n\
         3. Verify model name in config:\n\
-           \x1b[36mcat ~/.finch/config.toml\x1b[0m",
-        model_name
+           {}",
+        model_name,
+        "Possible causes:".yellow().bold(),
+        "Try:".green().bold(),
+        "finch setup".cyan(),
+        "ls ~/.cache/huggingface/hub/".cyan(),
+        "cat ~/.finch/config.toml".cyan(),
     )
 }
 
@@ -141,15 +103,15 @@ pub fn model_not_found_error(model_name: &str) -> String {
 pub fn api_key_invalid_error(provider: &str) -> String {
     format!(
         "{} API key is invalid or missing\n\n\
-        \x1b[1;33mPossible causes:\x1b[0m\n\
+        {}\n\
         • API key not set in config\n\
         • API key format is incorrect\n\
         • API key has been revoked\n\n\
-        \x1b[1;32mTry:\x1b[0m\n\
+        {}\n\
         1. Run setup wizard:\n\
-           \x1b[36mfinch setup\x1b[0m\n\n\
+           {}\n\n\
         2. Check your config file:\n\
-           \x1b[36mcat ~/.finch/config.toml\x1b[0m\n\n\
+           {}\n\n\
         3. Verify API key format:\n\
            • Claude: sk-ant-...\n\
            • OpenAI: sk-...\n\
@@ -158,7 +120,11 @@ pub fn api_key_invalid_error(provider: &str) -> String {
            • Claude: https://console.anthropic.com/\n\
            • OpenAI: https://platform.openai.com/api-keys\n\
            • Google: https://makersuite.google.com/app/apikey",
-        provider
+        provider,
+        "Possible causes:".yellow().bold(),
+        "Try:".green().bold(),
+        "finch setup".cyan(),
+        "cat ~/.finch/config.toml".cyan(),
     )
 }
 
@@ -166,20 +132,25 @@ pub fn api_key_invalid_error(provider: &str) -> String {
 pub fn config_parse_error(error: &str) -> String {
     format!(
         "Failed to parse config file\n\n\
-        \x1b[1;33mError:\x1b[0m {}\n\n\
-        \x1b[1;32mTry:\x1b[0m\n\
+        {}  {}\n\n\
+        {}\n\
         1. Check config file syntax:\n\
-           \x1b[36mcat ~/.finch/config.toml\x1b[0m\n\n\
+           {}\n\n\
         2. Validate TOML format online:\n\
            https://www.toml-lint.com/\n\n\
         3. Backup and regenerate config:\n\
-           \x1b[36mmv ~/.finch/config.toml ~/.finch/config.toml.backup\x1b[0m\n\
-           \x1b[36mfinch setup\x1b[0m\n\n\
+           {}\n\
+           {}\n\n\
         4. Common mistakes:\n\
            • Missing quotes around strings\n\
            • Unclosed brackets []\n\
            • Invalid TOML syntax",
-        error
+        "Error:".yellow().bold(),
+        error,
+        "Try:".green().bold(),
+        "cat ~/.finch/config.toml".cyan(),
+        "mv ~/.finch/config.toml ~/.finch/config.toml.backup".cyan(),
+        "finch setup".cyan(),
     )
 }
 
@@ -187,18 +158,24 @@ pub fn config_parse_error(error: &str) -> String {
 pub fn file_not_found_error(path: &str, description: &str) -> String {
     format!(
         "{} not found: {}\n\n\
-        \x1b[1;33mPossible causes:\x1b[0m\n\
+        {}\n\
         • File has been deleted\n\
         • Wrong path specified\n\
         • Permissions issue\n\n\
-        \x1b[1;32mTry:\x1b[0m\n\
+        {}\n\
         1. Check if file exists:\n\
-           \x1b[36mls -la {}\x1b[0m\n\n\
+           {}\n\n\
         2. Check parent directory:\n\
-           \x1b[36mls -la $(dirname \"{}\")\x1b[0m\n\n\
+           {}\n\n\
         3. Verify file permissions:\n\
-           \x1b[36mls -l {}\x1b[0m",
-        description, path, path, path, path
+           {}",
+        description,
+        path,
+        "Possible causes:".yellow().bold(),
+        "Try:".green().bold(),
+        format!("ls -la {path}").cyan(),
+        format!("ls -la $(dirname \"{path}\")").cyan(),
+        format!("ls -l {path}").cyan(),
     )
 }
 
@@ -206,18 +183,24 @@ pub fn file_not_found_error(path: &str, description: &str) -> String {
 pub fn permission_denied_error(path: &str, operation: &str) -> String {
     format!(
         "Permission denied: cannot {} {}\n\n\
-        \x1b[1;33mPossible causes:\x1b[0m\n\
+        {}\n\
         • Insufficient file permissions\n\
         • File owned by another user\n\
         • Parent directory not writable\n\n\
-        \x1b[1;32mTry:\x1b[0m\n\
+        {}\n\
         1. Check file permissions:\n\
-           \x1b[36mls -la {}\x1b[0m\n\n\
+           {}\n\n\
         2. Fix permissions if you own the file:\n\
-           \x1b[36mchmod u+rw {}\x1b[0m\n\n\
+           {}\n\n\
         3. Check parent directory permissions:\n\
-           \x1b[36mls -la $(dirname \"{}\")\x1b[0m",
-        operation, path, path, path, path
+           {}",
+        operation,
+        path,
+        "Possible causes:".yellow().bold(),
+        "Try:".green().bold(),
+        format!("ls -la {path}").cyan(),
+        format!("chmod u+rw {path}").cyan(),
+        format!("ls -la $(dirname \"{path}\")").cyan(),
     )
 }
 
@@ -225,12 +208,15 @@ pub fn permission_denied_error(path: &str, operation: &str) -> String {
 pub fn daemon_already_running_error(pid: u32) -> String {
     format!(
         "Daemon is already running (PID: {})\n\n\
-        \x1b[1;32mTo restart the daemon:\x1b[0m\n\
+        {}\n\
         1. Stop the existing daemon:\n\
-           \x1b[36mfinch daemon-stop\x1b[0m\n\n\
+           {}\n\n\
         2. Start a new daemon:\n\
-           \x1b[36mfinch daemon-start\x1b[0m",
-        pid
+           {}",
+        pid,
+        "To restart the daemon:".green().bold(),
+        "finch daemon-stop".cyan(),
+        "finch daemon-start".cyan(),
     )
 }
 
@@ -238,34 +224,41 @@ pub fn daemon_already_running_error(pid: u32) -> String {
 pub fn model_loading_error(model_name: &str, error: &str) -> String {
     format!(
         "Failed to load model '{}'\n\n\
-        \x1b[1;33mError:\x1b[0m {}\n\n\
-        \x1b[1;33mPossible causes:\x1b[0m\n\
+        {}  {}\n\n\
+        {}\n\
         • Corrupted model files\n\
         • Insufficient RAM\n\
         • Incompatible model format\n\n\
-        \x1b[1;32mTry:\x1b[0m\n\
+        {}\n\
         1. Clear model cache and redownload:\n\
-           \x1b[36mrm -rf ~/.cache/huggingface/hub/models--*{}\x1b[0m\n\
-           \x1b[36mfinch setup\x1b[0m\n\n\
+           {}\n\
+           {}\n\n\
         2. Check available RAM:\n\
-           \x1b[36mfree -h\x1b[0m  (Linux)\n\
-           \x1b[36mvm_stat\x1b[0m   (macOS)\n\n\
+           {}  (Linux)\n\
+           {}  (macOS)\n\n\
         3. Try a smaller model:\n\
            • 1.5B models: ~2GB RAM\n\
            • 3B models: ~4GB RAM\n\
            • 7B models: ~8GB RAM",
-        model_name, error, model_name
+        model_name,
+        "Error:".yellow().bold(),
+        error,
+        "Possible causes:".yellow().bold(),
+        "Try:".green().bold(),
+        format!("rm -rf ~/.cache/huggingface/hub/models--*{model_name}").cyan(),
+        "finch setup".cyan(),
+        "free -h".cyan(),
+        "vm_stat".cyan(),
     )
 }
 
 /// Wrap a generic error with suggestions
 pub fn wrap_error_with_suggestion(error: impl fmt::Display, suggestion: &str) -> String {
     format!(
-        "{}\n\n\
-        \x1b[1;33m{}:\x1b[0m {}",
+        "{}\n\n{}  {}",
         error,
-        t("suggestion"),
-        suggestion
+        t("suggestion").yellow().bold(),
+        suggestion,
     )
 }
 

@@ -125,6 +125,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
 
     #[cfg(target_family = "unix")]
     {
+        use std::os::unix::process::CommandExt;
         Command::new(&exe_path)
             .arg("daemon")
             .arg("--bind")
@@ -136,6 +137,10 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
                     .context("Failed to clone log file handle")?,
             ))
             .stderr(Stdio::from(log_file))
+            // New process group so the daemon is independent of the shell's
+            // job control — prevents zsh from reporting it as "[1] terminated"
+            // when the REPL exits.
+            .process_group(0)
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
     }

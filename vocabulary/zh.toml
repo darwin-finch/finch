@@ -1,0 +1,103 @@
+# 中文词汇 — 项目本地中文定义。
+#
+# 格式与英文相同。中文词语直接用 UTF-8 编写。
+#
+#   [[word]]
+#   word       = "词语"
+#   definition = "一句话释义"
+#   related    = ["词1", "词2"]
+#   kind       = "task | question | observation | constraint"
+#   forth      = "Forth 代码"
+#   boot       = true
+
+# ── 问候 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "你好"
+definition = "见面时表达善意的问候语"
+related = ["问候", "相遇", "开始"]
+kind = "observation"
+forth = '." 你好。" cr'
+
+[[word]]
+word = "再见"
+definition = "离别时说的话，一个字包含了一次祝愿"
+related = ["离开", "结束", "分别"]
+kind = "observation"
+forth = '." 再见。" cr'
+
+[[word]]
+word = "谢谢"
+definition = "承认收到了他人给予的东西"
+related = ["感谢", "接受", "给予"]
+kind = "observation"
+forth = '." 谢谢。" cr'
+
+# ── 时间 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "现在"
+definition = "唯一能够行动的时刻"
+related = ["时间", "当下", "此刻"]
+kind = "observation"
+forth = 'time . ." 秒，自纪元起。" cr'
+
+[[word]]
+word = "等待"
+definition = "为即将到来的事物留出空间的静止"
+related = ["暂停", "休息", "保持"]
+kind = "observation"
+forth = '." 等待中。" cr'
+
+# ── 方向 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "上"
+definition = "向更高处的方向"
+related = ["高", "升", "天"]
+kind = "observation"
+forth = '." 上。" cr'
+
+[[word]]
+word = "下"
+definition = "向更低处的方向"
+related = ["低", "降", "地"]
+kind = "observation"
+forth = '." 下。" cr'
+
+[[word]]
+word = "前"
+definition = "面向的方向，时间或空间上的前方"
+related = ["进", "未来", "始"]
+kind = "observation"
+forth = '." 前。" cr'
+
+# ── 存在 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "道"
+definition = "万物运行的方式，不可名而常自然"
+related = ["自然", "无为", "规律"]
+kind = "observation"
+forth = '." 道可道，非常道。" cr'
+
+[[word]]
+word = "空"
+definition = "容纳一切可能性的虚空"
+related = ["无", "虚", "始"]
+kind = "observation"
+forth = 'depth 0= if ." 空。" else ." 非空：" depth . then cr'
+
+[[word]]
+word = "一"
+definition = "所有数的起点，万物之始"
+related = ["始", "源", "单"]
+kind = "observation"
+forth = '1 . cr'
+
+[[word]]
+word = "心"
+definition = "感知与思考的居所"
+related = ["思", "感", "意"]
+kind = "observation"
+forth = '." 心。" cr gen" write two lines about the heart as a place of knowing. chinese or english, your choice."'

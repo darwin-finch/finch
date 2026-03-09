@@ -98,10 +98,11 @@ impl CandleLoader {
             serde_json::from_str(&config_str).context("Failed to parse config.json")?;
 
         let weights_path = model_path.join("model.safetensors");
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], candle_core::DType::F32, &device)
-                .context("Failed to load model weights")?
-        };
+        // Load weights without mmap so no unsafe block is needed.
+        // Uses slightly more RAM than mmap but is fully safe Rust.
+        let tensors = candle_core::safetensors::load(&weights_path, &device)
+            .context("Failed to load model weights")?;
+        let vb = VarBuilder::from_tensors(tensors, candle_core::DType::F32, &device);
 
         let model = models::qwen2::Model::new(&config, vb).context("Failed to build Qwen model")?;
 

@@ -46,6 +46,9 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/brains/:id/answer", post(answer_brain_question))
         .route("/v1/brains/:id/plan", post(respond_to_brain_plan))
         // Note: node handlers load config independently (no AgentServer state needed)
+        // Co-Forth remote eval and direct exec
+        .route("/v1/forth/eval", post(handle_forth_eval))
+        .route("/v1/exec", post(handle_exec))
         // Health and metrics
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
@@ -621,4 +624,99 @@ pub async fn handle_node_stats() -> Result<Json<serde_json::Value>, AppError> {
 
     let stats = WorkTracker::load_persisted()?;
     Ok(Json(serde_json::to_value(&stats)?))
+}
+
+// ---------------------------------------------------------------------------
+// Co-Forth remote eval endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ForthEvalRequest {
+    code: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ForthEvalResponse {
+    output: String,
+    /// Data stack after execution (top of stack = last element).
+    /// Allows the caller to push these values onto their own local stack.
+    stack: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// POST /v1/forth/eval — execute a Forth snippet and return output + stack
+async fn handle_forth_eval(
+    Json(req): Json<ForthEvalRequest>,
+) -> Result<Json<ForthEvalResponse>, AppError> {
+    use crate::coforth::Forth;
+
+    let mut vm = Forth::new();
+    match vm.exec(&req.code) {
+        Ok(output) => Ok(Json(ForthEvalResponse {
+            output,
+            stack: vm.data_stack().to_vec(),
+            error: None,
+        })),
+        Err(e) => Ok(Json(ForthEvalResponse {
+            output: vm.out.clone(),
+            stack: vm.data_stack().to_vec(),
+            error: Some(e.to_string()),
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct exec endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ExecRequest {
+    cmd: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    stdin: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecResponse {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// POST /v1/exec — run a command on this machine and return its output.
+///
+/// Body: { "cmd": "hostname" }
+///   or: { "cmd": "grep", "args": ["-r", "TODO", "."] }
+///   or: { "cmd": "bash", "args": ["-c", "echo hello && ls"] }
+async fn handle_exec(
+    Json(req): Json<ExecRequest>,
+) -> Result<Json<ExecResponse>, AppError> {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new(&req.cmd)
+        .args(&req.args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn '{}': {}", req.cmd, e))?;
+
+    if let (Some(mut stdin), Some(input)) = (child.stdin.take(), &req.stdin) {
+        let _ = stdin.write_all(input.as_bytes());
+    }
+
+    let output = child.wait_with_output()
+        .map_err(|e| anyhow::anyhow!("failed to wait for '{}': {}", req.cmd, e))?;
+
+    Ok(Json(ExecResponse {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code().unwrap_or(-1),
+        error: None,
+    }))
 }

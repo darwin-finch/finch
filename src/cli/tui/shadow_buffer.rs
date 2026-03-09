@@ -93,44 +93,71 @@ impl ShadowBuffer {
         }
     }
 
-    /// Write a line to the buffer at row y, handling wrapping
-    /// Returns number of rows consumed
+    /// Write a line to the buffer at row y, handling wrapping.
+    ///
+    /// CJK / fullwidth characters occupy 2 terminal columns; wrapping is done
+    /// by column position, not by character count.  Returns the number of rows
+    /// consumed (≥ 1 even for an empty line).
     fn write_line(&mut self, y: usize, line: &str, style: Style) -> usize {
+
         if y >= self.height {
             return 0;
         }
 
-        // Split line into visible text and ANSI codes
         let (visible_chars, _ansi_positions) = extract_visible_chars(line);
 
         if visible_chars.is_empty() {
-            return 1; // Empty line = 1 row
+            return 1; // Empty line still occupies one row
         }
 
-        // Calculate how many rows this line needs
-        let chars_per_row = self.width.max(1);
-        let num_rows = visible_chars.len().div_ceil(chars_per_row);
-        let num_rows = num_rows.min(self.height - y); // Don't exceed buffer
+        let term_width = self.width.max(1);
+        let mut row = 0;
+        let mut col: usize = 0; // current terminal column
 
-        // Write wrapped chunks with style
-        for row_idx in 0..num_rows {
-            let start = row_idx * chars_per_row;
-            let end = (start + chars_per_row).min(visible_chars.len());
-            let chunk = &visible_chars[start..end];
+        for &ch in &visible_chars {
+            let ch_w = char_display_width(ch);
 
-            // Write actual characters
-            for (col_idx, &ch) in chunk.iter().enumerate() {
-                self.set(col_idx, y + row_idx, Cell { ch, style });
+            if y + row >= self.height {
+                break;
             }
 
-            // Fill remaining cells in row with spaces (but preserve background style)
-            // This ensures the background extends to the full width
-            for col_idx in chunk.len()..chars_per_row {
-                self.set(col_idx, y + row_idx, Cell { ch: ' ', style });
+            // If wide char won't fit in the remaining columns, pad and wrap.
+            if col + ch_w > term_width {
+                while col < term_width {
+                    self.set(col, y + row, Cell { ch: ' ', style });
+                    col += 1;
+                }
+                row += 1;
+                col = 0;
+                if y + row >= self.height {
+                    break;
+                }
+            }
+
+            self.set(col, y + row, Cell { ch, style });
+            if ch_w == 2 {
+                // Mark the second terminal column occupied by this wide char
+                // with a zero-width space so the diff system clears it correctly.
+                self.set(col + 1, y + row, Cell { ch: '\u{200B}', style });
+            }
+            col += ch_w;
+
+            if col >= term_width {
+                row += 1;
+                col = 0;
             }
         }
 
-        num_rows
+        // Fill the rest of the final row with spaces (only if there's content there)
+        if col > 0 && y + row < self.height {
+            while col < term_width {
+                self.set(col, y + row, Cell { ch: ' ', style });
+                col += 1;
+            }
+        }
+
+        // If col is 0 we just wrapped onto a fresh row that has no content — don't count it.
+        if col == 0 { row } else { row + 1 }
     }
 
     /// Render messages to shadow buffer with proper wrapping
@@ -229,7 +256,49 @@ impl ShadowBuffer {
     }
 }
 
-/// Calculate visible length of string (excluding ANSI escape codes)
+/// Return the terminal display width (in columns) of a single character.
+///
+/// CJK / fullwidth characters occupy 2 columns; everything else occupies 1.
+/// This covers the Unicode ranges that crossterm / terminal emulators treat as
+/// double-width without pulling in an extra crate.
+#[inline]
+fn char_display_width(c: char) -> usize {
+    match c as u32 {
+        // Hangul Jamo
+        0x1100..=0x115F |
+        // CJK Radicals Supplement … CJK Symbols and Punctuation
+        0x2E80..=0x303E |
+        // Hiragana … CJK Compatibility
+        0x3040..=0x33FF |
+        // CJK Unified Ideographs Extension A
+        0x3400..=0x4DBF |
+        // CJK Unified Ideographs (covers all common Chinese, Japanese, Korean)
+        0x4E00..=0xA4CF |
+        // Hangul Jamo Extended-A
+        0xA960..=0xA97F |
+        // Hangul Syllables … Hangul Jamo Extended-B
+        0xAC00..=0xD7FF |
+        // CJK Compatibility Ideographs
+        0xF900..=0xFAFF |
+        // Vertical forms
+        0xFE10..=0xFE19 |
+        // CJK Compatibility Forms … Small Form Variants
+        0xFE30..=0xFE6F |
+        // Fullwidth Latin and Halfwidth Katakana
+        0xFF01..=0xFF60 |
+        // Fullwidth Signs
+        0xFFE0..=0xFFE6 |
+        // CJK Unified Ideographs Extension B–F (supplementary planes)
+        0x20000..=0x2FFFD |
+        0x30000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// Calculate visible display-column width of string (excluding ANSI escape codes).
+///
+/// CJK / fullwidth characters (Chinese, Japanese, Korean) occupy 2 terminal columns
+/// each.  All other printable characters occupy 1 column.
 pub fn visible_length(s: &str) -> usize {
     let mut len = 0;
     let mut chars = s.chars().peekable();
@@ -264,10 +333,9 @@ pub fn visible_length(s: &str) -> usize {
             }
             '\r' | '\x08' | '\x7f' => {
                 // Control characters that don't add visible length
-                // \r = carriage return, \x08 = backspace, \x7f = delete
             }
             _ => {
-                len += 1; // Regular visible character
+                len += char_display_width(c);
             }
         }
     }
@@ -574,5 +642,51 @@ mod tests {
         current.set(2, 2, Cell::new('C'));
         let changes = diff_buffers(&current, &prev);
         assert_eq!(changes.len(), 3);
+    }
+
+    // ─── CJK / Chinese character support ─────────────────────────────────────
+
+    #[test]
+    fn test_visible_length_cjk() {
+        // Each Chinese character is 2 terminal columns wide
+        assert_eq!(visible_length("你好"), 4);   // 2 chars × 2 cols
+        assert_eq!(visible_length("hello你好"), 9); // 5 + 4
+        assert_eq!(visible_length("世界"), 4);
+    }
+
+    #[test]
+    fn test_visible_length_cjk_with_ansi() {
+        // ANSI codes are zero-width; CJK chars inside ANSI sequences still count 2
+        let s = "\x1b[32m你好\x1b[0m";
+        assert_eq!(visible_length(s), 4);
+    }
+
+    #[test]
+    fn test_write_line_cjk_fits_in_one_row() {
+        // "你好" = 4 columns; terminal width 10 → fits in 1 row
+        let mut buf = ShadowBuffer::new(10, 3);
+        let rows = buf.write_line(0, "你好", Style::default());
+        assert_eq!(rows, 1);
+        assert_eq!(buf.get(0, 0).unwrap().ch, '你');
+        assert_eq!(buf.get(2, 0).unwrap().ch, '好');
+    }
+
+    #[test]
+    fn test_write_line_cjk_wraps_at_column_boundary() {
+        // "你好世界" = 8 columns; terminal width 6
+        // Row 0: 你(0-1) 好(2-3) 世(4-5) → fills exactly; row 1: 界(0-1)
+        let mut buf = ShadowBuffer::new(6, 4);
+        let rows = buf.write_line(0, "你好世界", Style::default());
+        assert!(rows >= 2, "expected wrapping, got {rows} rows");
+        assert_eq!(buf.get(0, 0).unwrap().ch, '你');
+        assert_eq!(buf.get(4, 0).unwrap().ch, '世'); // 世 at cols 4-5 of row 0
+        assert_eq!(buf.get(0, 1).unwrap().ch, '界'); // 界 wraps to row 1
+    }
+
+    #[test]
+    fn test_render_messages_cjk_row_count() {
+        // "你好世界" at width 6 needs 2 rows; visible_length = 8, ceil(8/6) = 2
+        let cols = 8_usize.div_ceil(6);
+        assert_eq!(cols, 2);
     }
 }

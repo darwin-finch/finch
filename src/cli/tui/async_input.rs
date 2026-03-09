@@ -246,6 +246,24 @@ pub fn spawn_input_task(
                                             Some(crate::feedback::FeedbackRating::Bad);
                                         Ok(None)
                                     }
+                                    (KeyCode::Char('z'), m)
+                                        if m.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // Ctrl+Z: Undo last Forth definition
+                                        Ok(Some("/undefine".to_string()))
+                                    }
+                                    (KeyCode::Char('p'), m)
+                                        if m.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // Ctrl+P: Pop top word off vocabulary stack
+                                        Ok(Some("/pop".to_string()))
+                                    }
+                                    (KeyCode::Char('d'), m)
+                                        if m.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // Ctrl+D: Exit (like /quit)
+                                        Ok(Some("/quit".to_string()))
+                                    }
                                     (KeyCode::Char('/'), m)
                                         if m.contains(KeyModifiers::CONTROL) =>
                                     {
@@ -267,6 +285,7 @@ pub fn spawn_input_task(
                                                     tui.history_index = Some(idx - 1);
                                                     let cmd = &tui.command_history[idx - 1];
                                                     tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(cmd);
+                                                    first_event_modified_input = true;
                                                 }
                                             } else if !tui.command_history.is_empty() {
                                                 // Save current input as draft before entering history
@@ -284,6 +303,7 @@ pub fn spawn_input_task(
                                                     TuiRenderer::create_clean_textarea_with_text(
                                                         cmd,
                                                     );
+                                                first_event_modified_input = true;
                                             }
                                         } else {
                                             // Not at top - move cursor up within textarea
@@ -309,14 +329,13 @@ pub fn spawn_input_task(
                                                     // At newest entry - restore draft or clear
                                                     tui.history_index = None;
                                                     if let Some(draft) = tui.history_draft.take() {
-                                                        // Restore the saved draft
                                                         tui.input_textarea = TuiRenderer::create_clean_textarea_with_text(&draft);
                                                     } else {
-                                                        // No draft - clear input
                                                         tui.input_textarea =
                                                             TuiRenderer::create_clean_textarea();
                                                     }
                                                 }
+                                                first_event_modified_input = true;
                                             }
                                         } else {
                                             // Not at bottom - move cursor down within textarea

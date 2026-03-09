@@ -2627,6 +2627,70 @@ related = ["void", "nothing", "begin", "空"]
 kind = "observation"
 forth = '0 . cr'
 
+# ── Crypto and string primitives ─────────────────────────────────────────────
+# These are safe Rust builtins — the AI can compose them but cannot replace them.
+# Stack notation: idx is an integer index into the string pool (from s" literal").
+
+[[word]]
+word = "sha256"
+definition = "hash a string to its SHA-256 hex digest; vocabulary is the boundary"
+related = ["sign", "verify", "nonce", "file-sha256", "trust"]
+kind = "task"
+
+[[word]]
+word = "file-sha256"
+definition = "read a file from disk and push its SHA-256 hex digest"
+related = ["sha256", "verify", "check", "agree"]
+kind = "task"
+
+[[word]]
+word = "nonce"
+definition = "push a cryptographically random 64-bit integer; each call is unique"
+related = ["random", "sign", "keygen", "trust"]
+kind = "task"
+
+[[word]]
+word = "keygen"
+definition = "generate an Ed25519 keypair; push pub-idx then priv-idx onto the stack"
+related = ["sign", "verify", "nonce", "trust", "identity"]
+kind = "task"
+
+[[word]]
+word = "sign"
+definition = "sign a string with an Ed25519 private key; push the hex signature"
+related = ["verify", "keygen", "trust", "agree", "sha256"]
+kind = "task"
+
+[[word]]
+word = "verify"
+definition = "verify an Ed25519 signature against a public key and data; push true or false"
+related = ["sign", "keygen", "trust", "agree", "check"]
+kind = "task"
+
+[[word]]
+word = "type"
+definition = "print the string at the given pool index; the inverse of s\""
+related = ["sha256", "str=", "str-len", "str-cat"]
+kind = "task"
+
+[[word]]
+word = "str="
+definition = "compare two strings by index; push true if they are equal"
+related = ["type", "sha256", "verify", "agree"]
+kind = "task"
+
+[[word]]
+word = "str-len"
+definition = "push the byte length of a string at the given pool index"
+related = ["type", "str=", "str-cat"]
+kind = "task"
+
+[[word]]
+word = "str-cat"
+definition = "concatenate two strings by index; push the new index"
+related = ["type", "str=", "str-len"]
+kind = "task"
+
 "#;
 
 #[cfg(test)]

@@ -91,10 +91,7 @@ fn tilde_cwd() -> String {
 /// Between consecutive recognised words, draws `word1 → word2`.
 /// Unknown words are shown in dim.
 fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> Vec<String> {
-    const CYAN:  &str = "\x1b[36m";
-    const DIM:   &str = "\x1b[2m";
-    const BOLD:  &str = "\x1b[1m";
-    const RESET: &str = "\x1b[0m";
+    use crossterm::style::Stylize;
     const ARROW: &str = " → ";
 
     let lib = crate::coforth::Library::load();
@@ -107,9 +104,9 @@ fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> 
         let found = lib.lookup(&key).is_some();
         if i > 0 { chain.push_str(ARROW); }
         if found {
-            chain.push_str(&format!("{BOLD}{CYAN}{word}{RESET}"));
+            chain.push_str(&word.clone().bold().cyan().to_string());
         } else {
-            chain.push_str(&format!("{DIM}{word}{RESET}"));
+            chain.push_str(&word.clone().dim().to_string());
         }
     }
     if !chain.is_empty() {
@@ -122,11 +119,11 @@ fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> 
         let key = word.to_lowercase();
         if let Some(entry) = lib.lookup(&key) {
             let def = entry.definition.chars().take(panel_w.saturating_sub(4)).collect::<String>();
-            lines.push(format!("{DIM}{word}{RESET}  {def}"));
+            lines.push(format!("{}  {def}", word.clone().dim()));
             // Show related words on next line if space
             if lines.len() < max_lines && !entry.related.is_empty() {
                 let rel = entry.related.iter().take(3).map(|r| r.as_str()).collect::<Vec<_>>().join(", ");
-                lines.push(format!("  {DIM}↳ {rel}{RESET}"));
+                lines.push(format!("  {}", format!("↳ {rel}").dim()));
             }
         }
     }

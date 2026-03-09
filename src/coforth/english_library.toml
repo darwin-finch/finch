@@ -7279,3 +7279,73 @@ definition = "the ability to accept things one dislikes; an allowable margin of 
 related = ["accept", "patience", "margin", "permit"]
 kind = "quality"
 forth = '1 . cr'
+
+[[word]]
+word = "interval"
+definition = "a gap or pause between events or parts"
+related = ["gap", "pause", "space", "break"]
+kind = "temporal"
+forth = '5 0 do i . 100 0 do loop loop cr'
+
+[[word]]
+word = "tempo"
+definition = "the speed at which something happens"
+related = ["pace", "rhythm", "speed", "rate"]
+kind = "temporal"
+forth = '4 0 do ." beat " 50 0 do loop loop cr'
+
+[[word]]
+word = "chronology"
+definition = "the order of events in time"
+related = ["sequence", "order", "timeline", "history"]
+kind = "temporal"
+forth = '5 1 do i . ." -> " loop ." end" cr'
+
+[[word]]
+word = "milestone"
+definition = "an important point or event in progress"
+related = ["marker", "achievement", "stage", "point"]
+kind = "temporal"
+forth = '10 5 / . ." milestone reached" cr'
+
+[[word]]
+word = "pending"
+definition = "waiting to be completed or decided"
+related = ["waiting", "future", "undecided", "coming"]
+kind = "temporal"
+forth = '." waiting..." 3 0 do ." ." loop cr'
+
+[[word]]
+word = "synchronize"
+definition = "to cause things to happen at the same time"
+related = ["align", "coordinate", "match", "time"]
+kind = "temporal"
+forth = 'time dup . ." sync " . cr'
+
+[[word]]
+word = "timestamp"
+definition = "a record of when something occurred"
+related = ["mark", "record", "time", "log"]
+kind = "temporal"
+forth = 'time . ." recorded" cr'
+
+[[word]]
+word = "countdown"
+definition = "counting backwards to zero or an event"
+related = ["count", "backwards", "timer", "approach"]
+kind = "temporal"
+forth = '5 1 do 6 i - . loop ." go!" cr'
+
+[[word]]
+word = "stopwatch"
+definition = "a device for measuring elapsed time"
+related = ["timer", "measure", "elapsed", "precise"]
+kind = "temporal"
+forth = 'time dup . 1000 + swap - . ." elapsed" cr'
+
+[[word]]
+word = "hourglass"
+definition = "a device measuring time by sand flowing between chambers"
+related = ["sand", "flow", "measure", "timer"]
+kind = "temporal"
+forth = '60 0 do ." sand " loop ." flows" cr'

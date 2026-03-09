@@ -100,6 +100,10 @@ pub enum ReplEvent {
     PosetComplete {
         result: Result<String>,
     },
+
+    /// mDNS background boot scan found finch instances on the LAN.
+    /// The event loop adds them to the Forth VM's peer list and shows a notice.
+    PeersDiscovered(Vec<(String, u16)>),
 }
 
 #[cfg(test)]

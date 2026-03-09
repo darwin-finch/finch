@@ -1,0 +1,120 @@
+# English vocabulary — project-local definitions.
+#
+# Format:
+#   [[word]]
+#   word       = "name"
+#   definition = "one sentence"
+#   related    = ["word1", "word2"]   # optional
+#   kind       = "task | question | observation | constraint"
+#   sense      = "label"              # optional disambiguator
+#   forth      = "code"              # optional Forth code
+#   boot       = true                # run Forth code at every startup
+
+# ── Greetings ──────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "hello"
+definition = "a greeting offered at the start of contact"
+related = ["greet", "meet", "begin"]
+kind = "observation"
+forth = '." hello." cr'
+
+[[word]]
+word = "goodbye"
+definition = "a parting word — a blessing compressed into one breath"
+related = ["leave", "end", "part"]
+kind = "observation"
+forth = '." goodbye." cr'
+
+[[word]]
+word = "thanks"
+definition = "acknowledgment that something given was received"
+related = ["gratitude", "receive", "give"]
+kind = "observation"
+forth = '." thank you." cr'
+
+# ── Self ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "finch"
+definition = "a small bird that navigates by its own compass"
+related = ["bird", "local", "navigate"]
+kind = "observation"
+forth = '." finch — local-first AI, watching from nearby." cr'
+
+[[word]]
+word = "forth"
+definition = "a language that runs what it means"
+related = ["stack", "word", "execute"]
+kind = "observation"
+forth = '." forth: words all the way down." cr'
+
+[[word]]
+word = "stack"
+definition = "what you have before you decide what to do with it"
+related = ["push", "pop", "depth"]
+kind = "observation"
+forth = 'depth . ." items on the stack." cr'
+
+# ── Time ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "now"
+definition = "the only moment that can act"
+related = ["time", "present", "moment"]
+kind = "observation"
+forth = 'time . ." seconds since epoch." cr'
+
+[[word]]
+word = "wait"
+definition = "stillness that holds space for what comes next"
+related = ["pause", "rest", "hold"]
+kind = "observation"
+forth = '." waiting." cr'
+
+# ── Geometry ───────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "circle"
+definition = "a perfect form — every point equidistant from a center it never reaches"
+related = ["infinity", "return", "wholeness"]
+kind = "observation"
+forth = '." circle" cr gen" write a single short poem (3-5 lines) about a perfect circle. no title, no explanation. just the poem."'
+boot = true
+
+[[word]]
+word = "line"
+definition = "the shortest agreement between two points"
+related = ["direction", "path", "straight"]
+kind = "observation"
+forth = '0 0 40 45 h-line cr'
+
+# ── Thinking ───────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "why"
+definition = "the question that pulls everything else forward"
+related = ["cause", "reason", "purpose"]
+kind = "question"
+forth = '." why: the question that won''t stay answered." cr'
+
+[[word]]
+word = "yes"
+definition = "commitment made in one syllable"
+related = ["agree", "affirm", "consent"]
+kind = "observation"
+forth = '." yes." cr'
+
+[[word]]
+word = "no"
+definition = "a boundary stated without apology"
+related = ["refuse", "deny", "limit"]
+kind = "observation"
+forth = '." no." cr'
+
+[[word]]
+word = "maybe"
+definition = "a doorway held open"
+related = ["uncertain", "possible", "consider"]
+kind = "observation"
+forth = '." maybe." cr'

@@ -89,6 +89,7 @@ impl EventHandler {
             ReplEvent::BrainQuestion { .. } => {}
             ReplEvent::BrainProposedAction { .. } => {}
             ReplEvent::PosetComplete { .. } => {}
+            ReplEvent::PeersDiscovered(_) => {}
         }
 
         Ok(())

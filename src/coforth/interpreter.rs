@@ -41,6 +41,7 @@ use anyhow::{bail, Result};
 enum Cell {
     Lit(i64),           // push literal onto data stack
     Str(usize),         // print strings[idx]  (string-literal pool)
+    PushStr(usize),     // push strings[idx] index as i64 onto data stack (s" literal")
     Confirm(usize),     // ask user strings[idx]; push -1 (yes) or 0 (no)
     ReadFile(usize),    // read file at strings[idx]; emit contents to out
     ExecCmd(usize),     // run shell command strings[idx]; emit stdout to out
@@ -48,6 +49,7 @@ enum Cell {
     AddPeer(usize),     // register peer address strings[idx] for scatter
     ScatterExec(usize),     // run strings[idx] Forth code on all peers in parallel
     ScatterBashExec(usize), // run strings[idx] as bash -c on all peers via /v1/exec
+    ScatterStack,           // ( code-idx -- ) scatter strings[pop()] to all peers (dynamic code)
     GenAI(usize),           // call AI generator with strings[idx] as prompt; emit response
     Builtin(Builtin),   // execute a primitive operation
     Addr(usize),        // call word at memory[addr]: push ip+1, ip = addr
@@ -93,6 +95,27 @@ enum Builtin {
     // Distributed
     Peers,                    // ( -- )  list registered peers
     PeersClear,               // ( -- )  remove all registered peers
+    PeersDiscover,            // ( -- )  mDNS scan; auto-add found finch daemons
+    // String pool operations (stack: idx is i64 index into self.strings)
+    Type,                     // ( idx -- )  print strings[idx]
+    StrEq,                    // ( idx-a idx-b -- bool )  string equality
+    StrLen,                   // ( idx -- n )  byte length of strings[idx]
+    StrCat,                   // ( idx-a idx-b -- idx-c )  concatenate
+    // Crypto primitives (safe Rust — sha2, ed25519-dalek, rand)
+    Sha256,                   // ( idx -- idx' )  SHA-256 hex of strings[idx]
+    FileSha256,               // ( path-idx -- hex-idx )         SHA-256 of whole file (stack)
+    FileSha256Range,          // ( path-idx offset length -- hex-idx )  SHA-256 of byte range
+    FileHash,                 // ( path-idx -- )                 SHA-256 of whole file → out
+    FileHashRange,            // ( path-idx offset length -- )   SHA-256 of byte range → out
+    FileFetch,                // ( path-idx -- content-idx )     read whole file into pool
+    FileSlice,                // ( path-idx offset length -- content-idx )  byte range → pool (utf-8 lossy)
+    FileSize,                 // ( path-idx -- n )               file size in bytes
+    FileWrite,                // ( content-idx path-idx -- )     overwrite file
+    FileAppend,               // ( content-idx path-idx -- )     append to file
+    Nonce,                    // ( -- n )  cryptographically random i64
+    Keygen,                   // ( -- pub-idx priv-idx )  generate Ed25519 keypair (hex)
+    Sign,                     // ( priv-idx data-idx -- sig-idx )  Ed25519 sign
+    Verify,                   // ( pub-idx sig-idx data-idx -- bool )  Ed25519 verify
     // Terminal control (crossterm-backed)
     AtXy,                     // ( col row -- )  move cursor to col, row
     TermSize,                 // ( -- cols rows )  push terminal dimensions
@@ -579,6 +602,12 @@ impl Forth {
             self.memory.push(Cell::Str(idx));
             return Ok(());
         }
+        if let Some(s) = tok.strip_prefix("\x00push-str:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::PushStr(idx));
+            return Ok(());
+        }
         if let Some(s) = tok.strip_prefix("\x00confirm:") {
             let idx = self.strings.len();
             self.strings.push(s.to_string());
@@ -615,6 +644,10 @@ impl Forth {
             self.memory.push(Cell::ScatterExec(idx));
             return Ok(());
         }
+        if tok == "\x00scatter-stack" {
+            self.memory.push(Cell::ScatterStack);
+            return Ok(());
+        }
         if let Some(s) = tok.strip_prefix("\x00scatter-exec:") {
             let idx = self.strings.len();
             self.strings.push(s.to_string());
@@ -638,6 +671,11 @@ impl Forth {
             }
         }
         let lo = tok.to_lowercase();
+        if lo == "scatter-code" {
+            // ( code-idx -- )  scatter strings[code-idx] on all peers (dynamic, stack-based)
+            self.memory.push(Cell::ScatterStack);
+            return Ok(());
+        }
         if lo == "exit" {
             self.memory.push(Cell::Ret);
             return Ok(());
@@ -679,6 +717,11 @@ impl Forth {
                 Cell::Str(idx) => {
                     let s = self.strings[idx].clone();
                     self.out.push_str(&s);
+                    ip += 1;
+                }
+                Cell::PushStr(idx) => {
+                    // s" literal" — push string pool index as an integer operand
+                    self.data.push(idx as i64);
                     ip += 1;
                 }
                 Cell::Confirm(idx) => {
@@ -793,6 +836,34 @@ impl Forth {
                                     if r.output.is_empty() {
                                         self.out.push_str(&format!("[{}] (no output)\n", r.peer));
                                     }
+                                }
+                            }
+                        }
+                    }
+                    ip += 1;
+                }
+                Cell::ScatterStack => {
+                    // ( code-idx -- )  scatter strings[code-idx] to all registered peers
+                    let code_idx = self.pop()? as usize;
+                    let snippet = self.strings.get(code_idx)
+                        .ok_or_else(|| anyhow::anyhow!("scatter-code: index {} out of bounds", code_idx))?
+                        .clone();
+                    if self.peers.is_empty() {
+                        self.out.push_str(
+                            "scatter-code: no peers  (use peer\" host:port\" to register one)\n"
+                        );
+                    } else {
+                        let peers = self.peers.clone();
+                        let results = run_scatter(&peers, &snippet);
+                        for r in results {
+                            if let Some(err) = r.error {
+                                self.out.push_str(&format!("[{}] error: {}\n", r.peer, err));
+                            } else {
+                                for line in r.output.lines() {
+                                    self.out.push_str(&format!("[{}] {}\n", r.peer, line));
+                                }
+                                for v in &r.stack {
+                                    self.data.push(*v);
                                 }
                             }
                         }
@@ -1055,6 +1126,284 @@ impl Forth {
             Builtin::PeersClear => {
                 self.peers.clear();
             }
+            Builtin::PeersDiscover => {
+                // mDNS scan — finds _finch._tcp.local. services, adds host:port to self.peers
+                let found = run_peers_discover(2000);
+                if found.is_empty() {
+                    self.out.push_str("peers-discover: no finch instances found on LAN\n");
+                } else {
+                    for (host, port) in &found {
+                        let addr = format!("{host}:{port}");
+                        if !self.peers.contains(&addr) {
+                            self.peers.push(addr.clone());
+                            self.out.push_str(&format!("  + {addr}\n"));
+                        }
+                    }
+                }
+            }
+            // ── String pool operations ────────────────────────────────────────
+            Builtin::Type => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("type: string index {} out of bounds", idx))?
+                    .clone();
+                self.out.push_str(&s);
+            }
+            Builtin::StrEq => {
+                let b = self.pop()? as usize;
+                let a = self.pop()? as usize;
+                let sa = self.strings.get(a)
+                    .ok_or_else(|| anyhow::anyhow!("str=: index {} out of bounds", a))?;
+                let sb = self.strings.get(b)
+                    .ok_or_else(|| anyhow::anyhow!("str=: index {} out of bounds", b))?;
+                self.data.push(if sa == sb { -1 } else { 0 });
+            }
+            Builtin::StrLen => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-len: index {} out of bounds", idx))?;
+                self.data.push(s.len() as i64);
+            }
+            Builtin::StrCat => {
+                let b = self.pop()? as usize;
+                let a = self.pop()? as usize;
+                let sb = self.strings.get(b)
+                    .ok_or_else(|| anyhow::anyhow!("str-cat: index {} out of bounds", b))?
+                    .clone();
+                let sa = self.strings.get(a)
+                    .ok_or_else(|| anyhow::anyhow!("str-cat: index {} out of bounds", a))?
+                    .clone();
+                let cat = sa + &sb;
+                let idx = self.strings.len();
+                self.strings.push(cat);
+                self.data.push(idx as i64);
+            }
+            // ── Crypto primitives ─────────────────────────────────────────────
+            Builtin::Sha256 => {
+                use sha2::{Sha256, Digest};
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("sha256: index {} out of bounds", idx))?
+                    .as_bytes().to_vec();
+                let hash = Sha256::digest(&s);
+                let hex = crypto_hex_encode(&hash);
+                let new_idx = self.strings.len();
+                self.strings.push(hex);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::FileSha256 => {
+                use sha2::{Sha256, Digest};
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-sha256: index {} out of bounds", path_idx))?
+                    .clone();
+                let content = std::fs::read(&path)
+                    .map_err(|e| anyhow::anyhow!("file-sha256: cannot read {}: {}", path, e))?;
+                let hash = Sha256::digest(&content);
+                let hex = crypto_hex_encode(&hash);
+                let new_idx = self.strings.len();
+                self.strings.push(hex);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::FileHash => {
+                // ( path-idx -- )  hash file, print hex to out — scatter-friendly (no pool idx noise)
+                use sha2::{Sha256, Digest};
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-hash: index {} out of bounds", path_idx))?
+                    .clone();
+                match std::fs::read(&path) {
+                    Ok(content) => {
+                        let hash = Sha256::digest(&content);
+                        let hex = crypto_hex_encode(&hash);
+                        self.out.push_str(&hex);
+                        self.out.push('\n');
+                    }
+                    Err(e) => self.out.push_str(&format!("file-hash: cannot read {}: {}\n", path, e)),
+                }
+            }
+            Builtin::FileFetch => {
+                // ( path-idx -- content-idx )  read whole file into string pool
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-fetch: index {} out of bounds", path_idx))?
+                    .clone();
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow::anyhow!("file-fetch: cannot read {}: {}", path, e))?;
+                let new_idx = self.strings.len();
+                self.strings.push(content);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::FileSlice => {
+                // ( path-idx offset length -- content-idx )  read byte range into pool (utf-8 lossy)
+                let length  = self.pop()? as usize;
+                let offset  = self.pop()? as usize;
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-slice: index {} out of bounds", path_idx))?
+                    .clone();
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| anyhow::anyhow!("file-slice: cannot read {}: {}", path, e))?;
+                let start = offset.min(bytes.len());
+                let end   = (offset + length).min(bytes.len());
+                let slice = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+                let new_idx = self.strings.len();
+                self.strings.push(slice);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::FileSha256Range => {
+                // ( path-idx offset length -- hex-idx )  SHA-256 of exact byte range
+                use sha2::{Sha256, Digest};
+                let length   = self.pop()? as usize;
+                let offset   = self.pop()? as usize;
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-sha256-range: index {} out of bounds", path_idx))?
+                    .clone();
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| anyhow::anyhow!("file-sha256-range: cannot read {}: {}", path, e))?;
+                let start = offset.min(bytes.len());
+                let end   = (offset + length).min(bytes.len());
+                let hex = crypto_hex_encode(&Sha256::digest(&bytes[start..end]));
+                let new_idx = self.strings.len();
+                self.strings.push(hex);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::FileHashRange => {
+                // ( path-idx offset length -- )  SHA-256 of byte range → out
+                use sha2::{Sha256, Digest};
+                let length   = self.pop()? as usize;
+                let offset   = self.pop()? as usize;
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-hash-range: index {} out of bounds", path_idx))?
+                    .clone();
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let start = offset.min(bytes.len());
+                        let end   = (offset + length).min(bytes.len());
+                        let hex = crypto_hex_encode(&Sha256::digest(&bytes[start..end]));
+                        self.out.push_str(&hex);
+                        self.out.push('\n');
+                    }
+                    Err(e) => self.out.push_str(&format!("file-hash-range: cannot read {}: {}\n", path, e)),
+                }
+            }
+            Builtin::FileSize => {
+                // ( path-idx -- n )  file size in bytes; -1 if not found
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-size: index {} out of bounds", path_idx))?
+                    .clone();
+                let n = std::fs::metadata(&path)
+                    .map(|m| m.len() as i64)
+                    .unwrap_or(-1);
+                self.data.push(n);
+            }
+            Builtin::FileWrite => {
+                // ( content-idx path-idx -- )  overwrite file with string content
+                let path_idx    = self.pop()? as usize;
+                let content_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-write: path index {} out of bounds", path_idx))?
+                    .clone();
+                let content = self.strings.get(content_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-write: content index {} out of bounds", content_idx))?
+                    .clone();
+                std::fs::write(&path, content.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("file-write: cannot write {}: {}", path, e))?;
+            }
+            Builtin::FileAppend => {
+                // ( content-idx path-idx -- )  append string content to file
+                use std::io::Write as IoWrite;
+                let path_idx    = self.pop()? as usize;
+                let content_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-append: path index {} out of bounds", path_idx))?
+                    .clone();
+                let content = self.strings.get(content_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-append: content index {} out of bounds", content_idx))?
+                    .clone();
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true).create(true).open(&path)
+                    .map_err(|e| anyhow::anyhow!("file-append: cannot open {}: {}", path, e))?;
+                f.write_all(content.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("file-append: cannot write {}: {}", path, e))?;
+            }
+            Builtin::Nonce => {
+                use rand::RngCore;
+                let n = rand::thread_rng().next_u64() as i64;
+                self.data.push(n);
+            }
+            Builtin::Keygen => {
+                use ed25519_dalek::SigningKey;
+                use rand::rngs::OsRng;
+                let signing_key = SigningKey::generate(&mut OsRng);
+                let priv_hex = crypto_hex_encode(&signing_key.to_bytes());
+                let pub_hex  = crypto_hex_encode(signing_key.verifying_key().as_bytes());
+                // ( -- pub-idx priv-idx )  TOS = priv (ready to sign next)
+                let pub_idx = self.strings.len();
+                self.strings.push(pub_hex);
+                let priv_idx = self.strings.len();
+                self.strings.push(priv_hex);
+                self.data.push(pub_idx as i64);
+                self.data.push(priv_idx as i64);
+            }
+            Builtin::Sign => {
+                use ed25519_dalek::{SigningKey, Signer};
+                let data_idx    = self.pop()? as usize;
+                let privkey_idx = self.pop()? as usize;
+                let privkey_hex = self.strings.get(privkey_idx)
+                    .ok_or_else(|| anyhow::anyhow!("sign: privkey index out of bounds"))?
+                    .clone();
+                let data_str = self.strings.get(data_idx)
+                    .ok_or_else(|| anyhow::anyhow!("sign: data index out of bounds"))?
+                    .clone();
+                let privkey_bytes = crypto_hex_decode(&privkey_hex)
+                    .map_err(|e| anyhow::anyhow!("sign: bad privkey hex: {}", e))?;
+                if privkey_bytes.len() != 32 {
+                    bail!("sign: privkey must be 32 bytes (64 hex chars), got {}", privkey_bytes.len());
+                }
+                let arr: [u8; 32] = privkey_bytes.try_into().unwrap();
+                let signing_key = SigningKey::from_bytes(&arr);
+                let sig = signing_key.sign(data_str.as_bytes());
+                let sig_hex = crypto_hex_encode(&sig.to_bytes());
+                let sig_idx = self.strings.len();
+                self.strings.push(sig_hex);
+                self.data.push(sig_idx as i64);
+            }
+            Builtin::Verify => {
+                use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+                let data_idx   = self.pop()? as usize;
+                let sig_idx    = self.pop()? as usize;
+                let pubkey_idx = self.pop()? as usize;
+                let pubkey_hex = self.strings.get(pubkey_idx)
+                    .ok_or_else(|| anyhow::anyhow!("verify: pubkey index out of bounds"))?
+                    .clone();
+                let sig_hex = self.strings.get(sig_idx)
+                    .ok_or_else(|| anyhow::anyhow!("verify: sig index out of bounds"))?
+                    .clone();
+                let data_str = self.strings.get(data_idx)
+                    .ok_or_else(|| anyhow::anyhow!("verify: data index out of bounds"))?
+                    .clone();
+                let pubkey_bytes = crypto_hex_decode(&pubkey_hex)
+                    .map_err(|e| anyhow::anyhow!("verify: bad pubkey hex: {}", e))?;
+                let sig_bytes = crypto_hex_decode(&sig_hex)
+                    .map_err(|e| anyhow::anyhow!("verify: bad sig hex: {}", e))?;
+                if pubkey_bytes.len() != 32 {
+                    bail!("verify: pubkey must be 32 bytes, got {}", pubkey_bytes.len());
+                }
+                if sig_bytes.len() != 64 {
+                    bail!("verify: signature must be 64 bytes, got {}", sig_bytes.len());
+                }
+                let pub_arr: [u8; 32] = pubkey_bytes.try_into().unwrap();
+                let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap();
+                let vk  = VerifyingKey::from_bytes(&pub_arr)
+                    .map_err(|e| anyhow::anyhow!("verify: invalid pubkey: {}", e))?;
+                let sig = Signature::from_bytes(&sig_arr);
+                let ok  = vk.verify(data_str.as_bytes(), &sig).is_ok();
+                self.data.push(if ok { -1 } else { 0 });
+            }
             // ── Terminal control (crossterm) ─────────────────────────────────
             Builtin::AtXy => {
                 use crossterm::{cursor, execute};
@@ -1121,6 +1470,20 @@ impl Forth {
     }
 }
 
+// ── Crypto helpers ────────────────────────────────────────────────────────────
+
+fn crypto_hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn crypto_hex_decode(s: &str) -> Result<Vec<u8>> {
+    if s.len() % 2 != 0 { bail!("hex: odd-length string"); }
+    (0..s.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i+2], 16)
+            .map_err(|e| anyhow::anyhow!("hex decode at byte {}: {}", i/2, e)))
+        .collect()
+}
+
 // ── Scatter helpers — bridge sync Forth VM to async scatter functions ──────────
 
 fn run_scatter(peers: &[String], code: &str) -> Vec<crate::coforth::scatter::PeerResult> {
@@ -1133,6 +1496,33 @@ fn run_scatter(peers: &[String], code: &str) -> Vec<crate::coforth::scatter::Pee
             .expect("tokio runtime")
             .block_on(crate::coforth::scatter::scatter_exec(peers, code))
     }
+}
+
+/// Public entry point for background boot discovery (called from event_loop).
+pub fn run_peers_discover_pub(timeout_ms: u64) -> Vec<(String, u16)> {
+    run_peers_discover(timeout_ms)
+}
+
+/// Synchronous mDNS discovery — returns (host, port) pairs for all found finch instances.
+/// Blocks for at most `timeout_ms` milliseconds.
+fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16)> {
+    use std::time::Duration;
+    let timeout = Duration::from_millis(timeout_ms);
+
+    let inner = || -> anyhow::Result<Vec<(String, u16)>> {
+        let client = crate::service::discovery_client::ServiceDiscoveryClient::new()?;
+        let services = client.discover(timeout)?;
+        Ok(services.into_iter().map(|s| (s.host, s.port)).collect())
+    };
+
+    // discover() uses recv_timeout internally — it's a blocking call.
+    // Must use block_in_place when inside a tokio worker thread.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(inner)
+    } else {
+        inner()
+    }
+    .unwrap_or_default()
 }
 
 fn run_exec_scatter(peers: &[String], cmd: &str) -> Vec<crate::coforth::scatter::PeerResult> {
@@ -1184,6 +1574,27 @@ fn name_to_builtin(name: &str) -> Option<Builtin> {
         "fpmul" => Builtin::FPMul,
         "peers" => Builtin::Peers,
         "peers-clear" => Builtin::PeersClear,
+        "peers-discover" | "discover" => Builtin::PeersDiscover,
+        // String pool
+        "type"    => Builtin::Type,
+        "str="    => Builtin::StrEq,
+        "str-len" => Builtin::StrLen,
+        "str-cat" => Builtin::StrCat,
+        // Crypto
+        "sha256"      => Builtin::Sha256,
+        "file-sha256" => Builtin::FileSha256,
+        "file-hash"         => Builtin::FileHash,
+        "file-hash-range"   => Builtin::FileHashRange,
+        "file-fetch"        => Builtin::FileFetch,
+        "file-slice"        => Builtin::FileSlice,
+        "file-sha256-range" => Builtin::FileSha256Range,
+        "file-size"         => Builtin::FileSize,
+        "file-write"        => Builtin::FileWrite,
+        "file-append"       => Builtin::FileAppend,
+        "nonce"       => Builtin::Nonce,
+        "keygen"      => Builtin::Keygen,
+        "sign"        => Builtin::Sign,
+        "verify"      => Builtin::Verify,
         // Terminal control
         "at-xy"          => Builtin::AtXy,
         "term-size"      => Builtin::TermSize,
@@ -1233,6 +1644,14 @@ fn tokenize(src: &str) -> Vec<String> {
                 let mut s = String::new();
                 for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
                 tokens.push(format!("\x00str:{s}"));
+            } else if chars.peek() == Some(&'|') {
+                // .| text with "quotes" |  — print alternate delimiter
+                flush!();
+                chars.next(); // consume |
+                if chars.peek() == Some(&' ') { chars.next(); }
+                let mut s = String::new();
+                for c2 in chars.by_ref() { if c2 == '|' { break; } s.push(c2); }
+                tokens.push(format!("\x00str:{s}"));
             } else {
                 tok.push('.');
             }
@@ -1281,6 +1700,22 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00scatter:{s}"));
+        } else if c == '"' && tok == "s" {
+            // s" text"  — push string pool index as integer operand (no printing)
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00push-str:{s}"));
+        } else if c == '|' && tok == "s" {
+            // s| text with "quotes" |  — alternate string delimiter; avoids escaping hell
+            tok.clear();
+            chars.next(); // consume |
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '|' { break; } s.push(c2); }
+            tokens.push(format!("\x00push-str:{s}"));
         } else if c == '"' && tok == "gen" {
             // gen" prompt"  — call AI generator, emit response
             tok.clear();
@@ -1677,5 +2112,200 @@ mod tests {
         assert!(vm.dump_source().contains(": b"));
         vm.restore(&snap);
         assert!(!vm.dump_source().contains(": b"), "b should be gone after restore");
+    }
+
+    #[test]
+    fn test_alternate_string_delimiter() {
+        // s| ... | allows embedded " without escaping
+        let out = Forth::run(r#"s| say "hello" | type"#).unwrap();
+        assert_eq!(out, r#"say "hello" "#);
+    }
+
+    #[test]
+    fn test_alternate_print_delimiter() {
+        // .| ... | prints without needing to escape "
+        let out = Forth::run(r#".| say "hello" |"#).unwrap();
+        assert_eq!(out, r#"say "hello" "#);
+    }
+
+    #[test]
+    fn test_file_fetch_and_hash() {
+        // Write a temp file, fetch it, hash it
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello forth").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+
+        let mut vm = Forth::new();
+        let code = format!(r#"s" {path}" file-fetch sha256 type"#);
+        let out = vm.exec(&code).unwrap();
+        // SHA-256 of "hello forth"
+        use sha2::{Sha256, Digest};
+        let expected = format!("{:x}", Sha256::digest(b"hello forth"));
+        assert_eq!(out.trim(), expected);
+    }
+
+    #[test]
+    fn test_file_hash_prints() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello forth").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+
+        let code = format!(r#"s" {path}" file-hash"#);
+        let out = Forth::run(&code).unwrap();
+        use sha2::{Sha256, Digest};
+        let expected = format!("{:x}", Sha256::digest(b"hello forth"));
+        assert_eq!(out.trim(), expected);
+    }
+
+    #[test]
+    fn test_file_size() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello forth").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        let code = format!(r#"s" {path}" file-size . cr"#);
+        let out = Forth::run(&code).unwrap();
+        assert_eq!(out.trim(), "11");
+    }
+
+    #[test]
+    fn test_file_sha256_range_first_bytes() {
+        use std::io::Write;
+        use sha2::{Sha256, Digest};
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello forth world").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        // hash first 5 bytes = "hello"
+        let code = format!(r#"s" {path}" 0 5 file-sha256-range type"#);
+        let out = Forth::run(&code).unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"hello"));
+        assert_eq!(out.trim(), expected);
+    }
+
+    #[test]
+    fn test_file_sha256_range_mid_bytes() {
+        use std::io::Write;
+        use sha2::{Sha256, Digest};
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello forth world").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        // hash bytes 6..11 = "forth"
+        let code = format!(r#"s" {path}" 6 5 file-sha256-range type"#);
+        let out = Forth::run(&code).unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"forth"));
+        assert_eq!(out.trim(), expected);
+    }
+
+    #[test]
+    fn test_file_slice_reads_range() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello forth world").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        let code = format!(r#"s" {path}" 6 5 file-slice type"#);
+        let out = Forth::run(&code).unwrap();
+        assert_eq!(out, "forth");
+    }
+
+    #[test]
+    fn test_file_hash_range_prints() {
+        use std::io::Write;
+        use sha2::{Sha256, Digest};
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello forth world").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        let code = format!(r#"s" {path}" 0 5 file-hash-range"#);
+        let out = Forth::run(&code).unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"hello"));
+        assert_eq!(out.trim(), expected);
+    }
+
+    #[test]
+    fn test_file_sha256_range_clamps_to_eof() {
+        use std::io::Write;
+        use sha2::{Sha256, Digest};
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hi").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        // ask for 100 bytes from offset 0 — should clamp to actual 2 bytes
+        let code = format!(r#"s" {path}" 0 100 file-sha256-range type"#);
+        let out = Forth::run(&code).unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"hi"));
+        assert_eq!(out.trim(), expected);
+    }
+
+    #[test]
+    fn test_push_str_and_type() {
+        // s" text" pushes a string pool index; type prints it
+        let out = Forth::run(r#"s" hello world" type"#).unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn test_str_eq() {
+        let out = Forth::run(r#"s" abc" s" abc" str= . cr"#).unwrap();
+        assert!(out.contains("-1"), "equal strings should push -1");
+        let out2 = Forth::run(r#"s" abc" s" xyz" str= . cr"#).unwrap();
+        assert!(out2.contains("0"), "different strings should push 0");
+    }
+
+    #[test]
+    fn test_str_len() {
+        let out = Forth::run(r#"s" hello" str-len . cr"#).unwrap();
+        assert!(out.trim() == "5", "str-len of 'hello' should be 5, got {out:?}");
+    }
+
+    #[test]
+    fn test_str_cat() {
+        let out = Forth::run(r#"s" foo" s" bar" str-cat type"#).unwrap();
+        assert_eq!(out, "foobar");
+    }
+
+    #[test]
+    fn test_sha256_known_value() {
+        // SHA-256 of empty string is well-known
+        let out = Forth::run(r#"s" " sha256 type"#).unwrap();
+        assert_eq!(out, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[test]
+    fn test_nonce_is_integer() {
+        // nonce pushes an integer; running it twice should produce different values (with overwhelming probability)
+        let mut vm = Forth::new();
+        vm.exec("nonce nonce").unwrap();
+        let stack = vm.data_stack().to_vec();
+        assert_eq!(stack.len(), 2, "nonce should push one value each call");
+        // With overwhelming probability two random 64-bit values differ
+        // (chance of collision: 2^-63 ≈ 0)
+    }
+
+    #[test]
+    fn test_keygen_sign_verify() {
+        // Full round-trip: generate keypair, sign data, verify signature
+        let out = Forth::run(
+            r#"keygen  ( -- pub-idx priv-idx )
+               s" the shared stack is real"  ( -- pub priv data )
+               sign   ( -- pub sig )
+               swap   ( -- sig pub )
+               swap   ( -- pub sig )
+               s" the shared stack is real"  ( -- pub sig data )
+               verify . cr"#
+        ).unwrap();
+        assert!(out.trim() == "-1", "valid signature should verify as true (-1), got {out:?}");
+    }
+
+    #[test]
+    fn test_verify_rejects_tampered_data() {
+        let out = Forth::run(
+            r#"keygen
+               s" original message" sign
+               swap
+               swap
+               s" tampered message"
+               verify . cr"#
+        ).unwrap();
+        assert!(out.trim() == "0", "tampered data should fail verification, got {out:?}");
     }
 }

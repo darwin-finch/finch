@@ -15,6 +15,7 @@
 pub mod generator;
 pub mod interpreter;
 pub mod library;
+pub mod scatter;
 
 pub use interpreter::{Forth, DictionarySnapshot};
 pub use library::{Library, WordEntry};
