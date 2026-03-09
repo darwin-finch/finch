@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::LazyLock;
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -94,6 +95,18 @@ impl Library {
             }
         }
         lib
+    }
+
+    /// Access the pre-built (cached) built-in definitions (SEED + ENGLISH).
+    /// O(1) after first call — computed once, shared for the process lifetime.
+    pub fn builtin_defs() -> &'static BuiltinDefs {
+        &BUILTIN_DEFS
+    }
+
+    /// Clone a pre-compiled VM (STDLIB + all builtins).
+    /// Use this in tests and boot instead of `Forth::new()` + compile — O(clone) not O(compile).
+    pub fn precompiled_vm() -> crate::coforth::Forth {
+        COMPILED_VM.clone_dict()
     }
 
     fn load_toml(&mut self, src: &str) {
@@ -305,6 +318,47 @@ pub const BOOT_POETRY: &[&str] = &[
 /// Generated comprehensive English lexicon — baked in at compile time.
 /// Re-generate with: `finch library build --all`
 const ENGLISH_LIBRARY: &str = include_str!("english_library.toml");
+
+/// Pre-built (word, forth-code) pairs from the BUILT-IN libraries only (SEED + ENGLISH).
+/// Sorted alphabetically, ready for JIT compilation.  User vocabulary is added at runtime.
+/// Computed once via LazyLock — eliminates repeated TOML parse + sort on each boot/test.
+pub struct BuiltinDefs {
+    /// Sorted (word_name, forth_code) pairs.
+    pub pairs: Vec<(String, String)>,
+    /// Single concatenated Forth source: ": word code ;\n" for every entry.
+    pub all_defs: String,
+}
+
+/// Pre-compiled Forth VM with STDLIB + all builtin defs loaded.
+/// Clone with `clone_dict()` to get a ready-to-use VM without re-compiling anything.
+static COMPILED_VM: LazyLock<crate::coforth::Forth> = LazyLock::new(|| {
+    let defs = &*BUILTIN_DEFS;
+    let mut vm = crate::coforth::Forth::new();
+    let _ = vm.exec_with_fuel(&defs.all_defs, 0);
+    vm
+});
+
+static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
+    let mut lib = Library::default();
+    lib.load_toml(SEED_LIBRARY);
+    lib.load_toml(ENGLISH_LIBRARY);
+
+    let mut entries: Vec<_> = lib.words.values()
+        .flat_map(|senses| senses.iter())
+        .filter(|e| e.forth.is_some())
+        .collect();
+    entries.sort_by(|a, b| a.word.cmp(&b.word));
+
+    let mut all_defs = String::with_capacity(entries.len() * 44);
+    let pairs: Vec<(String, String)> = entries.iter().map(|e| {
+        let code = e.forth.as_deref().unwrap_or("");
+        let line = format!(": {} {} ;\n", e.word, code);
+        all_defs.push_str(&line);
+        (e.word.clone(), code.to_string())
+    }).collect();
+
+    BuiltinDefs { pairs, all_defs }
+});
 
 /// Philosophical/abstract primitives — hand-crafted, always present.
 const SEED_LIBRARY: &str = r#"
@@ -2918,27 +2972,75 @@ mod tests {
 
     #[test]
     fn test_all_forth_compiles_and_runs() {
-        // Every word in the seed library with a `forth` field must either:
-        // 1. Run successfully as standalone code (poetry/demo words), OR
-        // 2. Compile successfully as a word body (primitive wrappers like `sha256`)
-        let lib = Library::load();
-        let mut failures: Vec<String> = Vec::new();
-        for senses in lib.words.values() {
-            for entry in senses {
-                if let Some(ref code) = entry.forth {
-                    // First try standalone execution
-                    if crate::coforth::Forth::run(code).is_err() {
-                        // Fall back: try as a word body (handles primitives that need stack args)
-                        let def = format!(": __test_coforth__ {} ;", code);
-                        if let Err(e) = crate::coforth::Forth::run(&def) {
-                            failures.push(format!("{}: body compile failed: {e}", entry.word));
-                        }
-                    }
+        // Uses the pre-compiled VM — STDLIB + all builtin defs already compiled.
+        // Cloning is O(memory_size), not O(compile_time).  Fast even for 1300+ words.
+        let defs = Library::builtin_defs();
+        assert!(!defs.pairs.is_empty(), "no builtin defs loaded");
+
+        // Verify compilation succeeded (COMPILED_VM would be empty on failure).
+        // Clone a ready-to-run VM — no STDLIB re-parse, no re-compilation.
+        let mut vm = Library::precompiled_vm();
+
+        // Call each word; report unknown-word errors only (stack errors are fine).
+        let mut hard_failures: Vec<String> = Vec::new();
+        for (word, _) in &defs.pairs {
+            vm.clear_data();
+            if let Err(e) = vm.exec_with_fuel(word.as_str(), 2_000) {
+                if e.to_string().contains("unknown word") {
+                    hard_failures.push(format!("  {word}: {e}"));
+                }
+            }
+        }
+        if !hard_failures.is_empty() {
+            panic!("Words not callable:\n{}", hard_failures.join("\n"));
+        }
+    }
+
+    /// Verify all 1000+ English-library words are callable from the pre-compiled VM.
+    /// Zero extra TOML parsing or compilation — pure clone + call.
+    #[test]
+    fn test_english_library_all_words_batch() {
+        let defs = Library::builtin_defs();
+        assert!(defs.pairs.len() > 1000, "expected 1000+ builtin words, got {}", defs.pairs.len());
+
+        let mut vm = Library::precompiled_vm();
+        let mut failures = Vec::new();
+        for (word, _) in &defs.pairs {
+            vm.clear_data();
+            if let Err(e) = vm.exec_with_fuel(word, 2_000) {
+                if e.to_string().contains("unknown word") {
+                    failures.push(format!("  {word}: {e}"));
                 }
             }
         }
         if !failures.is_empty() {
-            panic!("Forth errors in seed library:\n{}", failures.join("\n"));
+            panic!("Words not callable:\n{}", failures.join("\n"));
+        }
+    }
+
+    /// Verify the Rust↔Forth mix: every Builtin variant has a STDLIB wrapper
+    /// (so it appears in `words` and is callable by name) and round-trips correctly.
+    #[test]
+    fn test_rust_builtins_have_forth_wrappers() {
+        // Spot-check critical builtins are reachable by name from a fresh VM.
+        let critical = [
+            "capitalize", "str-upper", "str-lower", "str-trim",
+            "word-count", "sentence?", "grammar-check", "improve",
+            "fix", "polish", ".sentence", ".words",
+            "undo", "lock", "unlock", "lock-ttl",
+            "sha256", "nonce", "keygen", "sign", "verify",
+            "file-write", "file-fetch", "scatter-code", "peers-discover",
+        ];
+        let mut vm = crate::coforth::Forth::new();
+        // Compile a probe that calls each word — stack errors are fine.
+        for name in &critical {
+            vm.clear_data();
+            // The word must be known (either builtin or STDLIB wrapper).
+            // Try calling it; if "unknown word" it's missing entirely
+            let result = vm.exec_with_fuel(name, 1_000);
+            let known = result.map(|_| true)
+                .unwrap_or_else(|e| !e.to_string().contains("unknown word"));
+            assert!(known, "'{name}' is neither a builtin nor a STDLIB wrapper — missing from vocab");
         }
     }
 

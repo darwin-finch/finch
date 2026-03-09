@@ -417,7 +417,7 @@ impl EventLoop {
             stack,
             poset,
             plan_word: None,
-            forth_vm: crate::coforth::Forth::new(),
+            forth_vm: crate::coforth::Library::precompiled_vm(),
             forth_undo: Vec::new(),
         }
     }
@@ -543,39 +543,51 @@ impl EventLoop {
         {
             use crossterm::style::Stylize;
 
-            let lib = crate::coforth::Library::load();
+            // Use the pre-built (cached) builtin defs — no TOML re-parse, no re-sort.
+            // User vocabulary/*.toml files are merged on top at runtime.
+            let builtin = crate::coforth::Library::builtin_defs();
 
-            // Collect all entries that have Forth code, sorted alphabetically.
-            let mut all_entries: Vec<_> = lib.all_entries()
+            // Load user vocabulary extensions on top of the builtins.
+            let lib = crate::coforth::Library::load();
+            let mut user_entries: Vec<_> = lib.all_entries()
                 .into_iter()
                 .filter(|e| e.forth.is_some())
+                .filter(|e| !builtin.pairs.iter().any(|(w, _)| w == &e.word))
                 .collect();
-            all_entries.sort_by(|a, b| a.word.cmp(&b.word));
+            user_entries.sort_by(|a, b| a.word.cmp(&b.word));
 
+            // Build display lines from builtins + user extensions.
+            let mut display_lines: Vec<String> = Vec::with_capacity(
+                builtin.pairs.len() + user_entries.len()
+            );
             let mut boot_codes: Vec<String> = Vec::new();
 
-            // Collect boot codes and build display lines (no compile per-word yet).
-            let mut display_lines: Vec<String> = Vec::with_capacity(all_entries.len());
-            let mut all_defs = String::with_capacity(all_entries.len() * 40);
+            // Builtin display lines (pre-sorted, cached).
+            for (word, code) in &builtin.pairs {
+                let jit_def = format!(": {} {} ;", word, code);
+                let jit_display = jit_def.chars().take(72).collect::<String>();
+                display_lines.push(format!("{}  {}", jit_display.dark_grey(), "ok".dark_grey()));
+            }
 
-            for entry in &all_entries {
+            // User extension display lines + boot codes.
+            let mut user_defs = String::new();
+            for entry in &user_entries {
                 let code = entry.forth.as_deref().unwrap_or("");
                 let jit_def = format!(": {} {} ;", entry.word, code);
-                all_defs.push_str(&jit_def);
-                all_defs.push('\n');
+                user_defs.push_str(&jit_def);
+                user_defs.push('\n');
                 if entry.boot {
                     boot_codes.push(code.to_string());
                 }
                 let jit_display = jit_def.chars().take(72).collect::<String>();
-                display_lines.push(format!("{}  {}",
-                    jit_display.dark_grey(),
-                    "ok".dark_grey(),
-                ));
+                display_lines.push(format!("{}  {}", jit_display.dark_grey(), "ok".dark_grey()));
             }
 
-            // Compile the entire vocabulary in one eval pass — no per-word overhead.
-            // Unlimited fuel (0) so large stdlib doesn't hit the budget.
-            let _ = self.forth_vm.exec_with_fuel(&all_defs, 0);
+            // Builtins are already compiled (VM started from precompiled_vm()).
+            // Only compile user vocabulary extensions.
+            if !user_defs.is_empty() {
+                let _ = self.forth_vm.exec_with_fuel(&user_defs, 0);
+            }
 
             // Show the full dictionary flash in one write — instant, no sleep.
             self.output_manager.write_info(display_lines.join("\n"));

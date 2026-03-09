@@ -484,6 +484,36 @@ impl Forth {
         self.data.extend_from_slice(values);
     }
 
+    /// Clear the data stack (used between word calls in tests).
+    pub fn clear_data(&mut self) {
+        self.data.clear();
+    }
+
+    /// Clone the compiled dictionary state into a fresh VM (no stack, no callbacks).
+    /// Used to share a pre-compiled VM baseline across tests without re-compiling STDLIB
+    /// or vocabulary on every clone.  Callbacks (confirm_fn, gen_fn) are not copied.
+    pub fn clone_dict(&self) -> Self {
+        Forth {
+            data:       Vec::new(),
+            loop_stack: Vec::new(),
+            rstack:     Vec::new(),
+            memory:     self.memory.clone(),
+            strings:    self.strings.clone(),
+            name_index: self.name_index.clone(),
+            heap:       self.heap.clone(),
+            var_index:  self.var_index.clone(),
+            out:        String::new(),
+            peers:      self.peers.clone(),
+            source_log: Vec::new(),    // fresh log — don't inherit parent's history
+            log_definitions: true,
+            fuel:       DEFAULT_FUEL,
+            undo_stack: Vec::new(),
+            locks:      HashMap::new(),
+            confirm_fn: None,
+            gen_fn:     None,
+        }
+    }
+
     /// Snapshot the current dictionary state (word definitions only, not the data stack).
     pub fn snapshot(&self) -> DictionarySnapshot {
         DictionarySnapshot {
@@ -1819,7 +1849,7 @@ fn run_exec_scatter(peers: &[String], cmd: &str) -> Vec<crate::coforth::scatter:
 
 // ── Name table ────────────────────────────────────────────────────────────────
 
-fn name_to_builtin(name: &str) -> Option<Builtin> {
+pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
     Some(match name {
         "+" => Builtin::Plus, "-" => Builtin::Minus, "*" => Builtin::Star,
         "/" => Builtin::Slash, "mod" => Builtin::Mod,
