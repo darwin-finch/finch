@@ -1121,9 +1121,6 @@ impl TuiRenderer {
         // Store session label so blit_visible_area() can embed it in the separator.
         self.session_label = session_label.to_string();
 
-        // Clear the visible terminal so we start from a clean slate.
-        execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-
         // Darwin finch ASCII bird — 6 lines.
         // Columns 0-14: bird art.  Column 15+: info text.
         //

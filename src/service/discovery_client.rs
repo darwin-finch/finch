@@ -34,7 +34,7 @@ impl ServiceDiscoveryClient {
 
     /// Discover services on local network (blocks for timeout duration)
     pub fn discover(&self, timeout: Duration) -> Result<Vec<DiscoveredService>> {
-        tracing::info!("Discovering Finch instances on local network...");
+        tracing::debug!("Discovering Finch instances on local network...");
 
         // Start browsing for services
         let receiver = self
@@ -110,7 +110,7 @@ impl ServiceDiscoveryClient {
             }
         }
 
-        tracing::info!("Discovered {} Finch instance(s)", services.len());
+        tracing::debug!("Discovered {} Finch instance(s)", services.len());
 
         // Shut down first, then drain remaining queued events before dropping the
         // receiver.  Without the drain, the mdns-sd background thread logs

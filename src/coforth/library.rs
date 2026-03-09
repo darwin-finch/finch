@@ -572,7 +572,7 @@ word = "function"
 definition = "a relation that assigns each input exactly one output"
 related = ["map", "input", "output", "compute"]
 kind = "observation"
-forth = ': f ( n -- 2n+1 ) 2* 1 + ; 5 f . cr'
+forth = '5 2* 1 + . cr'
 
 [[word]]
 word = "compute"
