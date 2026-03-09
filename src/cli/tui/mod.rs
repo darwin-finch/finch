@@ -1564,11 +1564,14 @@ impl TuiRenderer {
             DialogType::Confirm {
                 prompt, selected, ..
             } => {
-                execute!(
-                    stdout,
-                    Print(format!("│  {:<w$}  │\r\n", prompt, w = inner))
-                )?;
-                rows += 1;
+                // Prompt may be multi-line — wrap each line inside the box borders.
+                for line in wrap_text(prompt, inner) {
+                    execute!(
+                        stdout,
+                        Print(format!("│  {:<w$}  │\r\n", line, w = inner))
+                    )?;
+                    rows += 1;
+                }
                 let yes_style = if *selected { "\x1b[1;36m" } else { DIM_GRAY };
                 let no_style = if !selected { "\x1b[1;36m" } else { DIM_GRAY };
                 execute!(

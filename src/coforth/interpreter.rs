@@ -29,6 +29,7 @@
 /// Comments: ( ... )   \ line comment
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 
 // ── Flat memory cell ─────────────────────────────────────────────────────────
@@ -83,6 +84,22 @@ enum Builtin {
     Random,                   // ( -- n )
     Time,                     // ( -- epoch_secs )
     Depth, Nop,
+    Fuel,                     // ( -- n )  push remaining step budget
+    WithFuel,                 // ( n addr -- )  call word at addr with n-step budget
+    Undo,                     // ( -- )  restore dictionary to state before last definition
+    // Distributed locking — advisory; auto-expire; only meaningful across peers
+    Lock,                     // ( name-idx ttl-ms -- flag )  acquire if free/expired (-1) or fail (0)
+    Unlock,                   // ( name-idx -- )              release early
+    LockTtl,                  // ( name-idx -- ms )           remaining TTL (0 if free or expired)
+    // Writing assistance — string manipulation + AI correction
+    Capitalize,               // ( str-idx -- str-idx )  uppercase first character
+    StrUpper,                 // ( str-idx -- str-idx )  all uppercase
+    StrLower,                 // ( str-idx -- str-idx )  all lowercase
+    StrTrim,                  // ( str-idx -- str-idx )  strip leading/trailing whitespace
+    WordCount,                // ( str-idx -- n )        number of whitespace-delimited words
+    SentenceCheck,            // ( str-idx -- flag )     -1 if starts uppercase + ends . ! ?
+    GrammarCheck,             // ( str-idx -- str-idx )  AI: return grammar-corrected sentence
+    ImproveStr,               // ( str-idx -- str-idx )  AI: return clearer/more fluent sentence
     // Integer math extras
     Sqrt,                     // ( n -- isqrt(n) )  integer square root
     Floor,                    // ( n d -- n/d*d )   floor division result
@@ -159,6 +176,15 @@ pub struct Forth {
     /// Only active after stdlib init; stdlib words are intentionally excluded.
     pub source_log: Vec<String>,
     log_definitions: bool,
+    /// Remaining step budget for the current exec call.
+    /// Decremented by the inner interpreter; exec_with_fuel resets it.
+    fuel: usize,
+    /// Internal undo history: auto-pushed before each new `: name` definition.
+    /// Capped at 20 entries (oldest dropped).  `undo` pops and restores.
+    undo_stack: Vec<DictionarySnapshot>,
+    /// Distributed advisory lock table: name → expiry instant.
+    /// Auto-expires on each `lock` call.  Max TTL = 30 s (nobody holds for long).
+    locks: HashMap<String, Instant>,
     /// Optional confirm callback.
     confirm_fn: Option<ConfirmFn>,
     /// Optional AI generation callback.  Wired to the active generator in the REPL.
@@ -166,7 +192,11 @@ pub struct Forth {
 }
 
 const MAX_CALL_DEPTH: usize = 256;
-const MAX_STEPS: usize = 2_000_000;
+/// Default step budget for interactive vocabulary words.
+/// 1M steps: enough for fib(20) (~300k steps), gcd, most recursive definitions.
+/// Catches infinite loops in ~1ms rather than seconds.
+/// Use `exec_with_fuel` or the `with-fuel` word for intentional heavy work.
+const DEFAULT_FUEL: usize = 1_000_000;
 
 /// Snapshot of the Forth dictionary state (not the data stack).
 /// Used to implement undo: restore the dictionary to a previous point.
@@ -303,6 +333,67 @@ const STDLIB: &str = r#"
 : noop  ( -- )  ;
 : ?dup  ( n -- n n | 0 )  dup if dup then ;
 : tally ( n -- )  0 do ." |" loop cr ;
+
+\ ── Co-Forth vocabulary ───────────────────────────────────────────────────────
+\ Thin wrappers so builtins appear in `words` and can be overridden by users.
+: type              ( idx -- )               type ;
+: str=              ( a b -- flag )          str= ;
+: str-len           ( idx -- n )             str-len ;
+: str-cat           ( a b -- idx )           str-cat ;
+: sha256            ( idx -- idx )           sha256 ;
+: nonce             ( -- n )                 nonce ;
+: keygen            ( -- pub sec )           keygen ;
+: sign              ( msg sec -- sig )       sign ;
+: verify            ( msg sig pub -- flag )  verify ;
+: file-write        ( data path -- )         file-write ;
+: file-append       ( data path -- )         file-append ;
+: file-size         ( path -- n )            file-size ;
+: file-fetch        ( path -- data )         file-fetch ;
+: file-slice        ( path off n -- data )   file-slice ;
+: file-sha256       ( path -- hash )         file-sha256 ;
+: file-sha256-range ( path off n -- hash )   file-sha256-range ;
+: file-hash         ( path -- )              file-hash ;
+: file-hash-range   ( path off n -- )        file-hash-range ;
+: scatter-code      ( code -- )              scatter-code ;
+: peers-discover    ( ms -- )                peers-discover ;
+: fuel              ( -- n )                 fuel ;
+: with-fuel         ( n -- )                 with-fuel ;
+: undo              ( -- )                   undo ;
+: lock              ( name-idx ttl-ms -- flag )   lock ;
+: unlock            ( name-idx -- )               unlock ;
+: lock-ttl          ( name-idx -- ms )            lock-ttl ;
+\ lock-or-fail: acquire or emit error and drop  ( name-idx ttl-ms -- )
+: lock-or-fail      ( name-idx ttl-ms -- )
+    2dup lock 0= if
+        drop type ."  lock denied" cr
+    else
+        2drop
+    then ;
+
+\ ── Writing assistance ────────────────────────────────────────────────────────
+: capitalize    ( str-idx -- str-idx )   capitalize ;
+: str-upper     ( str-idx -- str-idx )   str-upper ;
+: str-lower     ( str-idx -- str-idx )   str-lower ;
+: str-trim      ( str-idx -- str-idx )   str-trim ;
+: word-count    ( str-idx -- n )         word-count ;
+: sentence?     ( str-idx -- flag )      sentence? ;
+: grammar-check ( str-idx -- str-idx )   grammar-check ;
+: improve       ( str-idx -- str-idx )   improve ;
+
+\ .sentence  ( str-idx -- )  grammar-check, capitalize, print with newline
+: .sentence     ( str-idx -- )   grammar-check capitalize type cr ;
+
+\ correct?  ( str-idx -- flag )  alias for sentence?
+: correct?      ( str-idx -- flag )  sentence? ;
+
+\ fix  ( str-idx -- str-idx )  alias for grammar-check
+: fix           ( str-idx -- str-idx )  grammar-check ;
+
+\ polish  ( str-idx -- str-idx )  grammar-check then improve
+: polish        ( str-idx -- str-idx )  grammar-check improve ;
+
+\ .words  ( str-idx -- )  print word count
+: .words        ( str-idx -- )   word-count . ." words" cr ;
 "#;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -322,11 +413,15 @@ impl Forth {
             peers:           Vec::new(),
             source_log:      Vec::new(),
             log_definitions: false, // off during stdlib load
+            fuel:            usize::MAX, // unlimited while loading stdlib
+            undo_stack:      Vec::new(),
+            locks:           HashMap::new(),
             confirm_fn:      None,
             gen_fn:          None,
         };
         // Load standard library silently — not logged (every session has stdlib)
         let _ = f.eval(STDLIB);
+        f.fuel = DEFAULT_FUEL; // restore budget for user code
         f.log_definitions = true; // user words from here on are logged
         f
     }
@@ -365,8 +460,16 @@ impl Forth {
     }
 
     /// Execute Forth source on this instance and return collected output.
+    /// Uses the default fuel budget (100k steps). For heavy computation use `exec_with_fuel`.
     pub fn exec(&mut self, source: &str) -> Result<String> {
+        self.exec_with_fuel(source, DEFAULT_FUEL)
+    }
+
+    /// Execute with an explicit step budget.
+    /// `fuel = 0` means unlimited (use with care — infinite loops will hang).
+    pub fn exec_with_fuel(&mut self, source: &str, fuel: usize) -> Result<String> {
         self.out.clear();
+        self.fuel = if fuel == 0 { usize::MAX } else { fuel };
         self.eval(source)?;
         Ok(self.out.clone())
     }
@@ -460,6 +563,11 @@ impl Forth {
                         pos += 1;
                     }
                     if depth != 0 { bail!("missing ; for :{name}"); }
+                    // Auto-push undo snapshot before each user definition (capped at 20).
+                    if self.log_definitions {
+                        if self.undo_stack.len() >= 20 { self.undo_stack.remove(0); }
+                        self.undo_stack.push(self.snapshot());
+                    }
                     // Log user-defined words so the VM is serialisable.
                     // On redefinition, replace the previous entry so the dump
                     // stays clean — pasting it never defines a word twice.
@@ -490,6 +598,18 @@ impl Forth {
                     let addr = self.heap.len();
                     self.heap.push(0);
                     self.var_index.insert(name, addr);
+                }
+                "forget" => {
+                    flush_pending!();
+                    pos += 1;
+                    if pos >= tokens.len() { bail!("expected name after forget"); }
+                    let name = tokens[pos].to_lowercase();
+                    // Remove from word and variable indices so the name is unreachable.
+                    self.name_index.remove(&name);
+                    self.var_index.remove(&name);
+                    // Remove from source log so dump/undo are clean.
+                    let word_prefix = format!(": {} ", name);
+                    self.source_log.retain(|e| !e.starts_with(&word_prefix));
                 }
                 _ => {
                     pending.push(tokens[pos].clone());
@@ -707,10 +827,12 @@ impl Forth {
     fn execute(&mut self, start: usize) -> Result<()> {
         let mut ip = start;
         let mut call_stack: Vec<usize> = Vec::new();
-        let mut steps = 0usize;
         loop {
-            steps += 1;
-            if steps > MAX_STEPS { bail!("step limit exceeded — possible infinite loop"); }
+            if self.fuel == 0 {
+                bail!("fuel exhausted — word is too expensive for vocabulary use.\n\
+                       hint: use  N with-fuel  for intentional heavy computation.");
+            }
+            self.fuel -= 1;
             if ip >= self.memory.len() { break; }
             match self.memory[ip].clone() {
                 Cell::Lit(n) => { self.data.push(n); ip += 1; }
@@ -1081,6 +1203,164 @@ impl Forth {
             }
             Builtin::Depth => { self.data.push(self.data.len() as i64); }
             Builtin::Nop   => {}
+            Builtin::Fuel  => { self.data.push(self.fuel as i64); }
+            Builtin::WithFuel => {
+                // ( n -- )  set fuel budget for the next word call
+                // Used as: 1000000 with-fuel  before a heavy word
+                let n = self.pop()?;
+                self.fuel = if n <= 0 { usize::MAX } else { n as usize };
+            }
+            Builtin::Undo => {
+                if let Some(snap) = self.undo_stack.pop() {
+                    self.restore(&snap);
+                    self.out.push_str("ok\n");
+                } else {
+                    self.out.push_str("nothing to undo\n");
+                }
+            }
+            Builtin::Lock => {
+                // ( name-idx ttl-ms -- flag )
+                // Acquire advisory lock.  Max TTL = 30 000 ms.  Returns -1 on success, 0 if held.
+                const MAX_TTL_MS: u64 = 30_000;
+                let ttl_ms = self.pop()? as u64;
+                let name_idx = self.pop()? as usize;
+                let name = self.strings.get(name_idx)
+                    .ok_or_else(|| anyhow::anyhow!("lock: string index {} out of bounds", name_idx))?
+                    .clone();
+                let ttl = Duration::from_millis(ttl_ms.min(MAX_TTL_MS));
+                let now = Instant::now();
+                // Purge expired entry first
+                if let Some(&exp) = self.locks.get(&name) {
+                    if now >= exp { self.locks.remove(&name); }
+                }
+                if self.locks.contains_key(&name) {
+                    self.data.push(0); // lock is held
+                } else {
+                    self.locks.insert(name, now + ttl);
+                    self.data.push(-1); // acquired
+                }
+            }
+            Builtin::Unlock => {
+                // ( name-idx -- )  release the named lock immediately
+                let name_idx = self.pop()? as usize;
+                let name = self.strings.get(name_idx)
+                    .ok_or_else(|| anyhow::anyhow!("unlock: string index {} out of bounds", name_idx))?
+                    .clone();
+                self.locks.remove(&name);
+            }
+            Builtin::LockTtl => {
+                // ( name-idx -- ms )  remaining TTL; 0 if free or expired
+                let name_idx = self.pop()? as usize;
+                let name = self.strings.get(name_idx)
+                    .ok_or_else(|| anyhow::anyhow!("lock-ttl: string index {} out of bounds", name_idx))?;
+                let now = Instant::now();
+                let ms = self.locks.get(name)
+                    .and_then(|&exp| exp.checked_duration_since(now))
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                self.data.push(ms);
+            }
+            // ── Writing assistance ────────────────────────────────────────────
+            Builtin::Capitalize => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("capitalize: index {} out of bounds", idx))?
+                    .clone();
+                let result = {
+                    let mut c = s.chars();
+                    match c.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                    }
+                };
+                let new_idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::StrUpper => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-upper: index {} out of bounds", idx))?
+                    .to_uppercase();
+                let new_idx = self.strings.len();
+                self.strings.push(s);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::StrLower => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-lower: index {} out of bounds", idx))?
+                    .to_lowercase();
+                let new_idx = self.strings.len();
+                self.strings.push(s);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::StrTrim => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-trim: index {} out of bounds", idx))?
+                    .trim()
+                    .to_string();
+                let new_idx = self.strings.len();
+                self.strings.push(s);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::WordCount => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("word-count: index {} out of bounds", idx))?;
+                let n = s.split_whitespace().count();
+                self.data.push(n as i64);
+            }
+            Builtin::SentenceCheck => {
+                // A well-formed sentence: non-empty, first char uppercase, last char is . ! ?
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("sentence?: index {} out of bounds", idx))?;
+                let trimmed = s.trim();
+                let valid = !trimmed.is_empty()
+                    && trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                    && trimmed.chars().last().map(|c| matches!(c, '.' | '!' | '?')).unwrap_or(false);
+                self.data.push(if valid { -1 } else { 0 });
+            }
+            Builtin::GrammarCheck => {
+                let idx = self.pop()? as usize;
+                let text = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("grammar-check: index {} out of bounds", idx))?
+                    .clone();
+                let result = if let Some(ref f) = self.gen_fn {
+                    let prompt = format!(
+                        "Fix any grammar mistakes in this sentence. \
+                         Return only the corrected sentence, no explanation: {}",
+                        text
+                    );
+                    f(&prompt).trim().to_string()
+                } else {
+                    text // no AI available: return unchanged
+                };
+                let new_idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(new_idx as i64);
+            }
+            Builtin::ImproveStr => {
+                let idx = self.pop()? as usize;
+                let text = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("improve: index {} out of bounds", idx))?
+                    .clone();
+                let result = if let Some(ref f) = self.gen_fn {
+                    let prompt = format!(
+                        "Improve this sentence to be clearer and more fluent. \
+                         Return only the improved sentence, no explanation: {}",
+                        text
+                    );
+                    f(&prompt).trim().to_string()
+                } else {
+                    text
+                };
+                let new_idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(new_idx as i64);
+            }
             Builtin::Sqrt  => {
                 let n = self.pop()?;
                 if n < 0 { bail!("sqrt of negative"); }
@@ -1566,6 +1846,21 @@ fn name_to_builtin(name: &str) -> Option<Builtin> {
         "allot" => Builtin::Allot, "cells" => Builtin::Cells,
         "words" => Builtin::Words, "random" => Builtin::Random, "time" => Builtin::Time,
         "depth" => Builtin::Depth, "nop" => Builtin::Nop,
+        "fuel"      => Builtin::Fuel,
+        "with-fuel" => Builtin::WithFuel,
+        "undo"      => Builtin::Undo,
+        "lock"      => Builtin::Lock,
+        "unlock"    => Builtin::Unlock,
+        "lock-ttl"  => Builtin::LockTtl,
+        // Writing assistance
+        "capitalize"    => Builtin::Capitalize,
+        "str-upper"     => Builtin::StrUpper,
+        "str-lower"     => Builtin::StrLower,
+        "str-trim"      => Builtin::StrTrim,
+        "word-count"    => Builtin::WordCount,
+        "sentence?"     => Builtin::SentenceCheck,
+        "grammar-check" => Builtin::GrammarCheck,
+        "improve"       => Builtin::ImproveStr,
         "sqrt" | "isqrt" => Builtin::Sqrt,
         "floor" => Builtin::Floor,
         "ceil" | "ceiling" => Builtin::Ceil,
@@ -2115,6 +2410,37 @@ mod tests {
     }
 
     #[test]
+    fn test_fuel_catches_infinite_loop_fast() {
+        let mut vm = Forth::new();
+        let err = vm.exec(": forever  begin again ; forever").unwrap_err();
+        assert!(err.to_string().contains("fuel exhausted"), "expected fuel error, got: {err}");
+    }
+
+    #[test]
+    fn test_fuel_word_pushes_remaining() {
+        let mut vm = Forth::new();
+        // fuel should be close to DEFAULT_FUEL at start of exec; just check it's a large positive
+        let out = vm.exec("fuel . cr").unwrap();
+        let n: i64 = out.trim().parse().unwrap();
+        assert!(n > 0 && n <= 1_000_000, "fuel should be positive and ≤ default, got {n}");
+    }
+
+    #[test]
+    fn test_with_fuel_allows_more_steps() {
+        let mut vm = Forth::new();
+        // fib 25 needs ~3M steps (recursive) — over default, explicit fuel required
+        let out = vm.exec_with_fuel("25 fib . cr", 0).unwrap(); // 0 = unlimited
+        assert_eq!(out.trim(), "121393"); // fib(25) with base case n<2→1
+    }
+
+    #[test]
+    fn test_default_fuel_allows_fib20() {
+        // fib 20 should fit comfortably in 100k steps
+        let out = Forth::run("20 fib . cr").unwrap();
+        assert_eq!(out.trim(), "10946");
+    }
+
+    #[test]
     fn test_alternate_string_delimiter() {
         // s| ... | allows embedded " without escaping
         let out = Forth::run(r#"s| say "hello" | type"#).unwrap();
@@ -2307,5 +2633,249 @@ mod tests {
                verify . cr"#
         ).unwrap();
         assert!(out.trim() == "0", "tampered data should fail verification, got {out:?}");
+    }
+
+    // ── forget / undo tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_forget_removes_word() {
+        let mut vm = Forth::new();
+        vm.exec(": hello  42 . ;").unwrap();
+        vm.exec("forget hello").unwrap();
+        // Word should no longer be callable
+        assert!(vm.exec("hello").is_err(), "hello should be undefined after forget");
+    }
+
+    #[test]
+    fn test_forget_removes_from_source_log() {
+        let mut vm = Forth::new();
+        vm.exec(": greet  cr ;").unwrap();
+        assert!(vm.dump_source().contains(": greet"), "should be in log before forget");
+        vm.exec("forget greet").unwrap();
+        assert!(!vm.dump_source().contains(": greet"), "should be gone from log after forget");
+    }
+
+    #[test]
+    fn test_forget_unknown_word_is_graceful() {
+        let mut vm = Forth::new();
+        // Forgetting a non-existent word should not error
+        vm.exec("forget nonexistent-xyz").unwrap();
+    }
+
+    #[test]
+    fn test_forget_does_not_affect_other_words() {
+        let mut vm = Forth::new();
+        vm.exec(": a  1 . ;").unwrap();
+        vm.exec(": b  2 . ;").unwrap();
+        vm.exec("forget a").unwrap();
+        // b still callable
+        let out = vm.exec("b").unwrap();
+        assert_eq!(out.trim(), "2");
+    }
+
+    #[test]
+    fn test_undo_removes_last_definition() {
+        let mut vm = Forth::new();
+        vm.exec(": hello  42 . ;").unwrap();
+        vm.exec("undo").unwrap();
+        assert!(vm.exec("hello").is_err(), "hello should be gone after undo");
+    }
+
+    #[test]
+    fn test_undo_restores_previous_definition() {
+        let mut vm = Forth::new();
+        vm.exec(": foo  1 . ;").unwrap();
+        vm.exec(": foo  2 . ;").unwrap(); // redefine
+        vm.exec("undo").unwrap();
+        let out = vm.exec("foo").unwrap();
+        assert_eq!(out.trim(), "1", "undo should restore previous definition of foo");
+    }
+
+    #[test]
+    fn test_undo_multiple_levels() {
+        let mut vm = Forth::new();
+        vm.exec(": a  10 . ;").unwrap();
+        vm.exec(": b  20 . ;").unwrap();
+        vm.exec(": c  30 . ;").unwrap();
+        vm.exec("undo").unwrap(); // removes c
+        vm.exec("undo").unwrap(); // removes b
+        assert!(vm.exec("c").is_err(), "c should be gone");
+        assert!(vm.exec("b").is_err(), "b should be gone");
+        let out = vm.exec("a").unwrap();
+        assert_eq!(out.trim(), "10", "a should still work");
+    }
+
+    #[test]
+    fn test_undo_nothing_is_graceful() {
+        let mut vm = Forth::new();
+        let out = vm.exec("undo").unwrap();
+        assert!(out.contains("nothing to undo"), "should say nothing to undo, got: {out:?}");
+    }
+
+    #[test]
+    fn test_undo_removes_from_source_log() {
+        let mut vm = Forth::new();
+        vm.exec(": visible  99 . ;").unwrap();
+        assert!(vm.dump_source().contains(": visible"), "should be in log");
+        vm.exec("undo").unwrap();
+        assert!(!vm.dump_source().contains(": visible"), "should be gone after undo");
+    }
+
+    // ── lock / unlock tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_lock_acquire_succeeds_when_free() {
+        let mut vm = Forth::new();
+        let out = vm.exec(r#"s" res" 5000 lock . cr"#).unwrap();
+        assert_eq!(out.trim(), "-1", "first lock should succeed");
+    }
+
+    #[test]
+    fn test_lock_fails_when_already_held() {
+        let mut vm = Forth::new();
+        vm.exec(r#"s" res" 5000 lock drop"#).unwrap();
+        let out = vm.exec(r#"s" res" 5000 lock . cr"#).unwrap();
+        assert_eq!(out.trim(), "0", "second lock on same resource should fail");
+    }
+
+    #[test]
+    fn test_unlock_releases_lock() {
+        let mut vm = Forth::new();
+        vm.exec(r#"s" res" 5000 lock drop"#).unwrap();
+        vm.exec(r#"s" res" unlock"#).unwrap();
+        let out = vm.exec(r#"s" res" 5000 lock . cr"#).unwrap();
+        assert_eq!(out.trim(), "-1", "lock should succeed after unlock");
+    }
+
+    #[test]
+    fn test_lock_ttl_positive_when_held() {
+        let mut vm = Forth::new();
+        vm.exec(r#"s" res" 5000 lock drop"#).unwrap();
+        let out = vm.exec(r#"s" res" lock-ttl . cr"#).unwrap();
+        let ms: i64 = out.trim().parse().unwrap();
+        assert!(ms > 0 && ms <= 5000, "TTL should be positive and ≤ 5000, got {ms}");
+    }
+
+    #[test]
+    fn test_lock_ttl_zero_when_free() {
+        let mut vm = Forth::new();
+        let out = vm.exec(r#"s" res" lock-ttl . cr"#).unwrap();
+        assert_eq!(out.trim(), "0", "TTL should be 0 when lock is free");
+    }
+
+    #[test]
+    fn test_lock_max_ttl_capped_at_30s() {
+        let mut vm = Forth::new();
+        // Request 60 000 ms — should be capped to 30 000
+        vm.exec(r#"s" res" 60000 lock drop"#).unwrap();
+        let out = vm.exec(r#"s" res" lock-ttl . cr"#).unwrap();
+        let ms: i64 = out.trim().parse().unwrap();
+        assert!(ms <= 30_000, "TTL should be capped at 30 000 ms, got {ms}");
+        assert!(ms > 0, "TTL should still be positive");
+    }
+
+    // ── Writing assistance tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_capitalize_first_letter() {
+        let out = Forth::run(r#"s" hello world" capitalize type"#).unwrap();
+        assert_eq!(out, "Hello world");
+    }
+
+    #[test]
+    fn test_capitalize_already_capitalized() {
+        let out = Forth::run(r#"s" Hello" capitalize type"#).unwrap();
+        assert_eq!(out, "Hello");
+    }
+
+    #[test]
+    fn test_str_upper() {
+        let out = Forth::run(r#"s" hello" str-upper type"#).unwrap();
+        assert_eq!(out, "HELLO");
+    }
+
+    #[test]
+    fn test_str_lower() {
+        let out = Forth::run(r#"s" HELLO" str-lower type"#).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn test_str_trim() {
+        let out = Forth::run(r#"s"   hello   " str-trim type"#).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn test_word_count() {
+        let out = Forth::run(r#"s" the quick brown fox" word-count . cr"#).unwrap();
+        assert_eq!(out.trim(), "4");
+    }
+
+    #[test]
+    fn test_sentence_check_valid() {
+        let out = Forth::run(r#"s" Hello world." sentence? . cr"#).unwrap();
+        assert_eq!(out.trim(), "-1");
+    }
+
+    #[test]
+    fn test_sentence_check_no_capital() {
+        let out = Forth::run(r#"s" hello world." sentence? . cr"#).unwrap();
+        assert_eq!(out.trim(), "0");
+    }
+
+    #[test]
+    fn test_sentence_check_no_terminal_punct() {
+        let out = Forth::run(r#"s" Hello world" sentence? . cr"#).unwrap();
+        assert_eq!(out.trim(), "0");
+    }
+
+    #[test]
+    fn test_sentence_check_question_mark() {
+        let out = Forth::run(r#"s" Is this correct?" sentence? . cr"#).unwrap();
+        assert_eq!(out.trim(), "-1");
+    }
+
+    #[test]
+    fn test_grammar_check_no_ai_returns_original() {
+        // Without a gen_fn, grammar-check returns the string unchanged
+        let out = Forth::run(r#"s" i goes to store" grammar-check type"#).unwrap();
+        assert_eq!(out, "i goes to store");
+    }
+
+    #[test]
+    fn test_grammar_check_with_ai() {
+        let mut vm = Forth::new();
+        vm.set_gen_fn(Box::new(|_prompt| "I go to the store.".to_string()));
+        let out = vm.exec(r#"s" i goes to store" grammar-check type"#).unwrap();
+        assert_eq!(out, "I go to the store.");
+    }
+
+    #[test]
+    fn test_improve_no_ai_returns_original() {
+        let out = Forth::run(r#"s" It is good." improve type"#).unwrap();
+        assert_eq!(out, "It is good.");
+    }
+
+    #[test]
+    fn test_polish_chains_grammar_then_improve() {
+        let mut vm = Forth::new();
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = call_count.clone();
+        vm.set_gen_fn(Box::new(move |_| {
+            cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "Polished sentence.".to_string()
+        }));
+        let out = vm.exec(r#"s" rough sentence" polish type"#).unwrap();
+        assert_eq!(out, "Polished sentence.");
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2); // grammar + improve
+    }
+
+    #[test]
+    fn test_different_lock_names_are_independent() {
+        let mut vm = Forth::new();
+        vm.exec(r#"s" a" 5000 lock drop"#).unwrap();
+        let out = vm.exec(r#"s" b" 5000 lock . cr"#).unwrap();
+        assert_eq!(out.trim(), "-1", "lock 'b' should succeed when only 'a' is held");
     }
 }

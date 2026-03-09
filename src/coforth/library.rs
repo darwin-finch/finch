@@ -2627,69 +2627,255 @@ related = ["void", "nothing", "begin", "空"]
 kind = "observation"
 forth = '0 . cr'
 
-# ── Crypto and string primitives ─────────────────────────────────────────────
-# These are safe Rust builtins — the AI can compose them but cannot replace them.
-# Stack notation: idx is an integer index into the string pool (from s" literal").
-
-[[word]]
-word = "sha256"
-definition = "hash a string to its SHA-256 hex digest; vocabulary is the boundary"
-related = ["sign", "verify", "nonce", "file-sha256", "trust"]
-kind = "task"
-
-[[word]]
-word = "file-sha256"
-definition = "read a file from disk and push its SHA-256 hex digest"
-related = ["sha256", "verify", "check", "agree"]
-kind = "task"
-
-[[word]]
-word = "nonce"
-definition = "push a cryptographically random 64-bit integer; each call is unique"
-related = ["random", "sign", "keygen", "trust"]
-kind = "task"
-
-[[word]]
-word = "keygen"
-definition = "generate an Ed25519 keypair; push pub-idx then priv-idx onto the stack"
-related = ["sign", "verify", "nonce", "trust", "identity"]
-kind = "task"
-
-[[word]]
-word = "sign"
-definition = "sign a string with an Ed25519 private key; push the hex signature"
-related = ["verify", "keygen", "trust", "agree", "sha256"]
-kind = "task"
-
-[[word]]
-word = "verify"
-definition = "verify an Ed25519 signature against a public key and data; push true or false"
-related = ["sign", "keygen", "trust", "agree", "check"]
-kind = "task"
+# ── Co-Forth primitives ───────────────────────────────────────────────────────
+# Safe Rust builtins — the AI composes these; it cannot replace them.
+# `forth` field = the word body used by the JIT to compile a thin wrapper.
+# Stack notation: idx = integer index into the string pool (s" pushes an idx).
 
 [[word]]
 word = "type"
-definition = "print the string at the given pool index; the inverse of s\""
-related = ["sha256", "str=", "str-len", "str-cat"]
+definition = "print the string at pool index idx  ( idx -- )"
+related = ["str=", "str-len", "str-cat", "sha256"]
 kind = "task"
+forth = "type"
 
 [[word]]
 word = "str="
-definition = "compare two strings by index; push true if they are equal"
-related = ["type", "sha256", "verify", "agree"]
+definition = "compare two strings; push -1 if equal, 0 if not  ( a b -- flag )"
+related = ["type", "str-len", "str-cat", "sha256"]
 kind = "task"
+forth = "str="
 
 [[word]]
 word = "str-len"
-definition = "push the byte length of a string at the given pool index"
+definition = "push the byte length of the string at pool index  ( idx -- n )"
 related = ["type", "str=", "str-cat"]
 kind = "task"
+forth = "str-len"
 
 [[word]]
 word = "str-cat"
-definition = "concatenate two strings by index; push the new index"
+definition = "concatenate two strings and push the new pool index  ( a b -- idx )"
 related = ["type", "str=", "str-len"]
 kind = "task"
+forth = "str-cat"
+
+[[word]]
+word = "sha256"
+definition = "hash a string to its SHA-256 hex digest  ( idx -- idx )"
+related = ["sign", "verify", "nonce", "file-sha256", "trust"]
+kind = "task"
+forth = "sha256"
+
+[[word]]
+word = "nonce"
+definition = "push a cryptographically random 64-bit integer  ( -- n )"
+related = ["random", "sign", "keygen", "trust"]
+kind = "task"
+forth = "nonce"
+
+[[word]]
+word = "keygen"
+definition = "generate an Ed25519 keypair; push pub-idx then priv-idx  ( -- pub priv )"
+related = ["sign", "verify", "nonce", "trust", "identity"]
+kind = "task"
+forth = "keygen"
+
+[[word]]
+word = "sign"
+definition = "sign message with Ed25519 private key; push hex signature  ( msg priv -- sig )"
+related = ["verify", "keygen", "trust", "agree", "sha256"]
+kind = "task"
+forth = "sign"
+
+[[word]]
+word = "verify"
+definition = "verify Ed25519 signature; push -1 true or 0 false  ( msg sig pub -- flag )"
+related = ["sign", "keygen", "trust", "agree", "check"]
+kind = "task"
+forth = "verify"
+
+[[word]]
+word = "file-write"
+definition = "write string to file, creating or truncating  ( data path -- )"
+related = ["file-append", "file-fetch", "file-size"]
+kind = "task"
+forth = "file-write"
+
+[[word]]
+word = "file-append"
+definition = "append string to file, creating if needed  ( data path -- )"
+related = ["file-write", "file-fetch"]
+kind = "task"
+forth = "file-append"
+
+[[word]]
+word = "file-size"
+definition = "push the byte size of a file  ( path -- n )"
+related = ["file-fetch", "file-sha256", "file-slice"]
+kind = "task"
+forth = "file-size"
+
+[[word]]
+word = "file-fetch"
+definition = "read a file and push its content as a string pool index  ( path -- data )"
+related = ["file-size", "file-sha256", "file-slice", "sha256"]
+kind = "task"
+forth = "file-fetch"
+
+[[word]]
+word = "file-slice"
+definition = "read n bytes from file at offset; push as string index  ( path off n -- data )"
+related = ["file-fetch", "file-size", "file-sha256-range"]
+kind = "task"
+forth = "file-slice"
+
+[[word]]
+word = "file-sha256"
+definition = "read a file and push its SHA-256 hex digest  ( path -- hash )"
+related = ["sha256", "file-sha256-range", "verify", "check"]
+kind = "task"
+forth = "file-sha256"
+
+[[word]]
+word = "file-sha256-range"
+definition = "hash n bytes of a file starting at offset  ( path off n -- hash )"
+related = ["file-sha256", "file-slice", "sha256"]
+kind = "task"
+forth = "file-sha256-range"
+
+[[word]]
+word = "file-hash"
+definition = "print the SHA-256 of a file to output  ( path -- )"
+related = ["file-sha256", "file-hash-range", "sha256"]
+kind = "task"
+forth = "file-hash"
+
+[[word]]
+word = "file-hash-range"
+definition = "print SHA-256 of n bytes of a file at offset  ( path off n -- )"
+related = ["file-hash", "file-sha256-range"]
+kind = "task"
+forth = "file-hash-range"
+
+[[word]]
+word = "scatter-code"
+definition = "run the string at stack index on all known peers  ( code -- )"
+related = ["peers-discover", "file-sha256", "sign", "verify"]
+kind = "task"
+forth = "scatter-code"
+
+[[word]]
+word = "peers-discover"
+definition = "scan the LAN for Finch peers for ms milliseconds  ( ms -- )"
+related = ["scatter-code", "sign", "verify"]
+kind = "task"
+forth = "peers-discover"
+
+[[word]]
+word = "fuel"
+definition = "push the remaining step budget for this eval  ( -- n )"
+related = ["with-fuel"]
+kind = "observation"
+forth = "fuel"
+
+[[word]]
+word = "with-fuel"
+definition = "set the step budget; 0 = unlimited  ( n -- )"
+related = ["fuel"]
+kind = "task"
+forth = "with-fuel"
+
+[[word]]
+word = "capitalize"
+definition = "uppercase the first character of a string  ( str-idx -- str-idx )"
+related = ["str-upper", "str-lower", "sentence?"]
+kind = "task"
+forth = "capitalize"
+
+[[word]]
+word = "str-upper"
+definition = "convert string to all uppercase  ( str-idx -- str-idx )"
+related = ["str-lower", "capitalize"]
+kind = "task"
+forth = "str-upper"
+
+[[word]]
+word = "str-lower"
+definition = "convert string to all lowercase  ( str-idx -- str-idx )"
+related = ["str-upper", "capitalize"]
+kind = "task"
+forth = "str-lower"
+
+[[word]]
+word = "str-trim"
+definition = "strip leading and trailing whitespace  ( str-idx -- str-idx )"
+related = ["str-len", "str-cat"]
+kind = "task"
+forth = "str-trim"
+
+[[word]]
+word = "word-count"
+definition = "count whitespace-delimited words in a string  ( str-idx -- n )"
+related = ["str-len", "sentence?"]
+kind = "observation"
+forth = "word-count"
+
+[[word]]
+word = "sentence?"
+definition = "true if string starts uppercase and ends with . ! or ?  ( str-idx -- flag )"
+related = ["grammar-check", "capitalize", "correct?"]
+kind = "observation"
+forth = "sentence?"
+
+[[word]]
+word = "correct?"
+definition = "alias for sentence? — is this a well-formed sentence?  ( str-idx -- flag )"
+related = ["sentence?", "grammar-check"]
+kind = "observation"
+forth = "correct?"
+
+[[word]]
+word = "grammar-check"
+definition = "AI: return grammar-corrected version of the sentence  ( str-idx -- str-idx )"
+related = ["improve", "polish", "sentence?", "fix"]
+kind = "task"
+forth = "grammar-check"
+
+[[word]]
+word = "fix"
+definition = "alias for grammar-check  ( str-idx -- str-idx )"
+related = ["grammar-check", "polish"]
+kind = "task"
+forth = "fix"
+
+[[word]]
+word = "improve"
+definition = "AI: return a clearer, more fluent version of the sentence  ( str-idx -- str-idx )"
+related = ["grammar-check", "polish", "fix"]
+kind = "task"
+forth = "improve"
+
+[[word]]
+word = "polish"
+definition = "grammar-check then improve — full AI writing pass  ( str-idx -- str-idx )"
+related = ["grammar-check", "improve", "fix"]
+kind = "task"
+forth = "polish"
+
+[[word]]
+word = ".sentence"
+definition = "grammar-check, capitalize, print with newline  ( str-idx -- )"
+related = ["grammar-check", "capitalize", "improve"]
+kind = "task"
+forth = ".sentence"
+
+[[word]]
+word = ".words"
+definition = "print the word count of a string  ( str-idx -- )"
+related = ["word-count", "str-len"]
+kind = "observation"
+forth = ".words"
 
 "#;
 
@@ -2732,14 +2918,21 @@ mod tests {
 
     #[test]
     fn test_all_forth_compiles_and_runs() {
-        // Every word in the seed library with a `forth` field must run without error.
+        // Every word in the seed library with a `forth` field must either:
+        // 1. Run successfully as standalone code (poetry/demo words), OR
+        // 2. Compile successfully as a word body (primitive wrappers like `sha256`)
         let lib = Library::load();
         let mut failures: Vec<String> = Vec::new();
         for senses in lib.words.values() {
             for entry in senses {
                 if let Some(ref code) = entry.forth {
-                    if let Err(e) = crate::coforth::Forth::run(code) {
-                        failures.push(format!("{}: {e}", entry.word));
+                    // First try standalone execution
+                    if crate::coforth::Forth::run(code).is_err() {
+                        // Fall back: try as a word body (handles primitives that need stack args)
+                        let def = format!(": __test_coforth__ {} ;", code);
+                        if let Err(e) = crate::coforth::Forth::run(&def) {
+                            failures.push(format!("{}: body compile failed: {e}", entry.word));
+                        }
                     }
                 }
             }

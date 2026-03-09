@@ -552,62 +552,33 @@ impl EventLoop {
                 .collect();
             all_entries.sort_by(|a, b| a.word.cmp(&b.word));
 
-            const BATCH: usize = 8;
-            let mut batch_lines: Vec<String> = Vec::with_capacity(BATCH);
             let mut boot_codes: Vec<String> = Vec::new();
 
-            // Wire gen" so boot words that call it have a provider.
-            let gen_handle = self.cloud_gen.clone();
-            self.forth_vm.set_gen_fn(Box::new(move |prompt: &str| {
-                let prompt = prompt.to_string();
-                let gen = gen_handle.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async move {
-                            let messages = vec![crate::claude::Message {
-                                role: "user".to_string(),
-                                content: vec![crate::claude::ContentBlock::Text { text: prompt }],
-                            }];
-                            let g = gen.read().await;
-                            match g.generate(messages, None).await {
-                                Ok(resp) => resp.text,
-                                Err(e) => format!("(gen error: {e})\n"),
-                            }
-                        })
-                    })
-                } else {
-                    "(no async runtime)\n".to_string()
-                }
-            }));
+            // Collect boot codes and build display lines (no compile per-word yet).
+            let mut display_lines: Vec<String> = Vec::with_capacity(all_entries.len());
+            let mut all_defs = String::with_capacity(all_entries.len() * 40);
 
-            for (i, entry) in all_entries.iter().enumerate() {
+            for entry in &all_entries {
                 let code = entry.forth.as_deref().unwrap_or("");
-
-                // JIT: compile `: word <code> ;` so the word is callable from Forth.
                 let jit_def = format!(": {} {} ;", entry.word, code);
-                let ok = self.forth_vm.exec(&jit_def).is_ok();
-
+                all_defs.push_str(&jit_def);
+                all_defs.push('\n');
                 if entry.boot {
                     boot_codes.push(code.to_string());
                 }
-
-                // Show the actual colon definition being compiled — Forth dictionary boot.
-                // Weird on purpose: you are watching vocabulary become executable.
-                let status = if ok { "ok".dark_grey() } else { "?".red() };
                 let jit_display = jit_def.chars().take(72).collect::<String>();
-                batch_lines.push(format!("{}  {}",
+                display_lines.push(format!("{}  {}",
                     jit_display.dark_grey(),
-                    status,
+                    "ok".dark_grey(),
                 ));
-
-                // Flush every BATCH words so the terminal has time to paint.
-                if batch_lines.len() >= BATCH || i + 1 == all_entries.len() {
-                    self.output_manager.write_info(batch_lines.join("\n"));
-                    self.render_tui().await.ok();
-                    tokio::time::sleep(Duration::from_millis(4)).await;
-                    batch_lines.clear();
-                }
             }
+
+            // Compile the entire vocabulary in one eval pass — no per-word overhead.
+            // Unlimited fuel (0) so large stdlib doesn't hit the budget.
+            let _ = self.forth_vm.exec_with_fuel(&all_defs, 0);
+
+            // Show the full dictionary flash in one write — instant, no sleep.
+            self.output_manager.write_info(display_lines.join("\n"));
 
             // Execute boot=true words (they may produce output: poems, time, etc.)
             for code in &boot_codes {
@@ -2526,7 +2497,31 @@ impl EventLoop {
             .trim_end_matches("```")
             .trim()
             .to_string();
-        self.handle_forth_eval_inner(forth_code, false).await
+
+        // Show what the AI wants to run and require agreement before executing.
+        // Two programmers agree on a program — neither runs unilaterally.
+        use crossterm::style::Stylize;
+        self.output_manager.write_info(
+            format!("{}  {}", "proposed:".dark_grey(), forth_code.as_str().cyan())
+        );
+        self.render_tui().await.ok();
+
+        let dialog = crate::cli::tui::Dialog::confirm("run this?", false)
+            .with_body(forth_code.clone());
+        let confirmed = {
+            let mut tui = self.tui_renderer.lock().await;
+            matches!(
+                tui.show_dialog(dialog),
+                Ok(crate::cli::tui::DialogResult::Confirmed(true))
+            )
+        };
+
+        if confirmed {
+            self.handle_forth_eval_inner(forth_code, false).await
+        } else {
+            self.output_manager.write_info("declined".dark_grey().to_string());
+            self.render_tui().await
+        }
     }
 
     /// Spawn a background task that reads the current vocabulary and pushes

@@ -111,6 +111,22 @@ impl ServiceDiscoveryClient {
         }
 
         tracing::info!("Discovered {} Finch instance(s)", services.len());
+
+        // Shut down first, then drain remaining queued events before dropping the
+        // receiver.  Without the drain, the mdns-sd background thread logs
+        // "sending on a closed channel" for every event still in-flight at shutdown.
+        // Receive the shutdown-complete response so the daemon thread can finish cleanly.
+        if let Ok(shutdown_rx) = self.daemon.shutdown() {
+            let _ = shutdown_rx.recv_timeout(Duration::from_millis(200));
+        }
+        let drain_deadline = Instant::now() + Duration::from_millis(80);
+        while Instant::now() < drain_deadline {
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
         Ok(services)
     }
 }

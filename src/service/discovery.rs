@@ -101,10 +101,13 @@ impl ServiceDiscovery {
 
     /// Stop advertising
     pub fn stop(&self) -> Result<()> {
-        // Shutdown unregisters all services
-        self.daemon
+        // Shutdown unregisters all services.
+        // Receive the shutdown-complete response so the daemon thread can finish
+        // cleanly — without this recv the thread logs "sending on a closed channel".
+        let shutdown_rx = self.daemon
             .shutdown()
             .context("Failed to stop mDNS service")?;
+        let _ = shutdown_rx.recv_timeout(std::time::Duration::from_millis(200));
 
         tracing::info!("Stopped advertising service: {}", self.instance_name);
         Ok(())

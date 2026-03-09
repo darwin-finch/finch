@@ -1056,6 +1056,22 @@ mod tests {
         assert_eq!(result, Some(DialogResult::Confirmed(false)));
     }
 
+    #[test]
+    fn test_confirm_multiline_prompt_stored_correctly() {
+        // Regression: confirm("run this?\n\ncode") used to break box rendering
+        // because the raw \n was passed to a single-line format string.
+        // Now multi-line content goes in .with_body() and the prompt stays single-line.
+        let dialog = Dialog::confirm("run this?", false).with_body(": foo 1 . ;");
+        match &dialog.dialog_type {
+            DialogType::Confirm { prompt, .. } => {
+                assert!(!prompt.contains('\n'), "prompt must not contain newlines");
+                assert_eq!(prompt, "run this?");
+            }
+            _ => panic!("expected Confirm dialog"),
+        }
+        assert_eq!(dialog.body.as_deref(), Some(": foo 1 . ;"));
+    }
+
     // ─── DialogResult helpers ─────────────────────────────────────────────────
 
     #[test]
