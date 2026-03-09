@@ -149,12 +149,12 @@ const MAX_STEPS: usize = 2_000_000;
 /// Used to implement undo: restore the dictionary to a previous point.
 #[derive(Clone)]
 pub struct DictionarySnapshot {
-    memory_len:      usize,
-    strings_len:     usize,
-    heap_len:        usize,
-    name_index:      HashMap<String, usize>,
-    var_index:       HashMap<String, usize>,
-    source_log_len:  usize,
+    memory_len:   usize,
+    strings_len:  usize,
+    heap_len:     usize,
+    name_index:   HashMap<String, usize>,
+    var_index:    HashMap<String, usize>,
+    source_log:   Vec<String>, // full snapshot — handles in-place redefinition correctly
 }
 
 // ── Standard library (pre-loaded Forth definitions) ──────────────────────────
@@ -361,12 +361,12 @@ impl Forth {
     /// Snapshot the current dictionary state (word definitions only, not the data stack).
     pub fn snapshot(&self) -> DictionarySnapshot {
         DictionarySnapshot {
-            memory_len:     self.memory.len(),
-            strings_len:    self.strings.len(),
-            heap_len:       self.heap.len(),
-            name_index:     self.name_index.clone(),
-            var_index:      self.var_index.clone(),
-            source_log_len: self.source_log.len(),
+            memory_len:  self.memory.len(),
+            strings_len: self.strings.len(),
+            heap_len:    self.heap.len(),
+            name_index:  self.name_index.clone(),
+            var_index:   self.var_index.clone(),
+            source_log:  self.source_log.clone(),
         }
     }
 
@@ -378,7 +378,7 @@ impl Forth {
         self.heap.truncate(snap.heap_len);
         self.name_index = snap.name_index.clone();
         self.var_index  = snap.var_index.clone();
-        self.source_log.truncate(snap.source_log_len);
+        self.source_log = snap.source_log.clone();
     }
 
     /// Serialise the VM's user-defined words as Forth source.
@@ -437,9 +437,17 @@ impl Forth {
                         pos += 1;
                     }
                     if depth != 0 { bail!("missing ; for :{name}"); }
-                    // Log user-defined words (not stdlib) so the VM is serialisable.
+                    // Log user-defined words so the VM is serialisable.
+                    // On redefinition, replace the previous entry so the dump
+                    // stays clean — pasting it never defines a word twice.
                     if self.log_definitions {
-                        self.source_log.push(format!(": {} {} ;", name, body.join(" ")));
+                        let entry = format!(": {} {} ;", name, body.join(" "));
+                        let prefix = format!(": {} ", name);
+                        if let Some(pos) = self.source_log.iter().position(|e| e.starts_with(&prefix)) {
+                            self.source_log[pos] = entry;
+                        } else {
+                            self.source_log.push(entry);
+                        }
                     }
                     // Register entry address BEFORE compiling body so `recurse` resolves.
                     let word_addr = self.memory.len();
@@ -1645,6 +1653,19 @@ mod tests {
         vm2.exec(&dump).unwrap();
         let out = vm2.exec("greet").unwrap();
         assert_eq!(out.trim(), "hello");
+    }
+
+    #[test]
+    fn test_vm_dump_redefinition_replaces_not_appends() {
+        let mut vm = Forth::new();
+        vm.exec(": foo  1 . ;").unwrap();
+        vm.exec(": foo  2 . ;").unwrap(); // redefine
+        let dump = vm.dump_source();
+        // Only one entry for foo — no duplicates
+        assert_eq!(dump.lines().filter(|l| l.contains(": foo")).count(), 1);
+        // The dump contains the new definition
+        let out = vm.exec("foo").unwrap();
+        assert_eq!(out.trim(), "2");
     }
 
     #[test]

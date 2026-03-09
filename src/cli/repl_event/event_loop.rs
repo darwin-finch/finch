@@ -2787,8 +2787,8 @@ impl EventLoop {
     }
 
     /// `/vm` — dump the VM's user-defined words as Forth source.
-    /// Shows in scrollback and copies to clipboard so it can be pasted
-    /// into another session to recreate the same dictionary.
+    /// Pure safe Rust: writes to scrollback with crossterm styling.
+    /// Select and copy from the terminal to transfer to another session.
     async fn handle_vm_dump(&mut self) -> Result<()> {
         use crossterm::style::Stylize;
         let source = self.forth_vm.dump_source();
@@ -2796,12 +2796,19 @@ impl EventLoop {
             self.output_manager.write_info("vm: no user-defined words yet".dark_grey().to_string());
             return self.render_tui().await;
         }
-        // Copy to clipboard (best-effort).
-        let copied = arboard::Clipboard::new()
-            .and_then(|mut cb| cb.set_text(source.clone()))
-            .is_ok();
-        let note = if copied { "  (copied to clipboard)".dark_grey().to_string() } else { String::new() };
-        self.output_manager.write_info(format!("{}{note}", source));
+        // Style each definition: colon word cyan, body dark grey.
+        let styled: Vec<String> = source.lines().map(|line| {
+            // ": name body ;" — colour the name, leave body dark grey
+            if let Some(rest) = line.strip_prefix(": ") {
+                let mut parts = rest.splitn(2, ' ');
+                let name = parts.next().unwrap_or("");
+                let body = parts.next().unwrap_or("");
+                format!(": {}  {} ;", name.cyan().bold(), body.trim_end_matches(';').trim().dark_grey())
+            } else {
+                line.dark_grey().to_string()
+            }
+        }).collect();
+        self.output_manager.write_info(styled.join("\n"));
         self.render_tui().await
     }
 
