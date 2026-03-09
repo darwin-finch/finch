@@ -2485,7 +2485,7 @@ impl EventLoop {
             .trim_end_matches("```")
             .trim()
             .to_string();
-        self.handle_forth_eval(forth_code).await
+        self.handle_forth_eval_inner(forth_code, false).await
     }
 
     /// Spawn a background task that reads the current vocabulary and pushes
@@ -2701,8 +2701,13 @@ impl EventLoop {
     ///  - `/forth <expr>` (explicit eval command)
     ///
     /// The VM persists across calls so words defined in one input are available
-    /// in subsequent inputs.
+    /// in subsequent inputs.  `show_define` controls whether silent definitions
+    /// echo "defined: name" — false for AI-generated Forth (output only, no noise).
     async fn handle_forth_eval(&mut self, code: String) -> Result<()> {
+        self.handle_forth_eval_inner(code, true).await
+    }
+
+    async fn handle_forth_eval_inner(&mut self, code: String, show_define: bool) -> Result<()> {
         use crossterm::style::Stylize;
         // Pre-flight: if the code contains scatter-exec" or exec-at" commands, show
         // the user a plan and require confirmation before firing on remote machines.
@@ -2764,8 +2769,8 @@ impl EventLoop {
                 self.output_manager.write_info(out);
             }
             Ok(_) => {
-                // Definition compiled silently — confirm it to the user
-                if code.trim_start().starts_with(':') {
+                // Definition compiled silently — confirm it to the user (not for AI output)
+                if show_define && code.trim_start().starts_with(':') {
                     let name = code.trim_start_matches(':').trim()
                         .split_whitespace().next().unwrap_or("word");
                     self.output_manager.write_info(
