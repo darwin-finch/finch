@@ -2455,7 +2455,9 @@ impl EventLoop {
             Some(e) => format!("\nVM said: {e}"),
             None => String::new(),
         };
-        let query = format!(
+        // Ask the AI programmer for Forth — then execute it.
+        // Forth can do everything we need: define, run, correct, compose.
+        let prompt = format!(
             "Two programmers building a program together on a shared stack. \
              The program can be in English, Chinese, or any language — \
              the words are the program. \
@@ -2466,7 +2468,26 @@ impl EventLoop {
              Define words with : name ... ; and run them. \
              No prose. No explanation. Just Forth.",
         );
-        self.execute_chat_response(query).await
+        let messages = vec![crate::claude::Message {
+            role: "user".to_string(),
+            content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+        }];
+        let forth_code = {
+            let gen = self.cloud_gen.read().await;
+            match gen.generate(messages, None).await {
+                Ok(resp) => resp.text,
+                Err(e) => return Err(e),
+            }
+        };
+        // Strip markdown fences if the AI wrapped its Forth in ```
+        let forth_code = forth_code
+            .trim()
+            .trim_start_matches("```forth")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string();
+        self.handle_forth_eval(forth_code).await
     }
 
     /// Spawn a background task that reads the current vocabulary and pushes
