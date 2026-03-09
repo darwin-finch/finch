@@ -131,9 +131,11 @@ pub struct Forth {
     pub out:    String,
     /// Peer addresses for `scatter"`.  Each entry is a host:port or URL.
     pub peers:  Vec<String>,
-    /// Source log — every `: name body ;` compiled into this VM, in order.
+    /// Source log — every user-defined `: name body ;` compiled into this VM, in order.
     /// Lets the VM be serialised to Forth source and pasted into another session.
+    /// Only active after stdlib init; stdlib words are intentionally excluded.
     pub source_log: Vec<String>,
+    log_definitions: bool,
     /// Optional confirm callback.
     confirm_fn: Option<ConfirmFn>,
     /// Optional AI generation callback.  Wired to the active generator in the REPL.
@@ -293,14 +295,16 @@ impl Forth {
             name_index: HashMap::new(),
             heap:       Vec::new(),
             var_index:  HashMap::new(),
-            out:        String::new(),
-            peers:      Vec::new(),
-            source_log: Vec::new(),
-            confirm_fn: None,
-            gen_fn:     None,
+            out:             String::new(),
+            peers:           Vec::new(),
+            source_log:      Vec::new(),
+            log_definitions: false, // off during stdlib load
+            confirm_fn:      None,
+            gen_fn:          None,
         };
-        // Load standard library silently (errors ignored — all words should be valid)
+        // Load standard library silently — not logged (every session has stdlib)
         let _ = f.eval(STDLIB);
+        f.log_definitions = true; // user words from here on are logged
         f
     }
 
@@ -433,8 +437,10 @@ impl Forth {
                         pos += 1;
                     }
                     if depth != 0 { bail!("missing ; for :{name}"); }
-                    // Log source before compiling so the VM is serialisable.
-                    self.source_log.push(format!(": {} {} ;", name, body.join(" ")));
+                    // Log user-defined words (not stdlib) so the VM is serialisable.
+                    if self.log_definitions {
+                        self.source_log.push(format!(": {} {} ;", name, body.join(" ")));
+                    }
                     // Register entry address BEFORE compiling body so `recurse` resolves.
                     let word_addr = self.memory.len();
                     self.name_index.insert(name.clone(), word_addr);
@@ -1624,5 +1630,31 @@ mod tests {
             .exec(r#"confirm" write file?" if ." approved" else ." denied" then"#)
             .unwrap();
         assert_eq!(out, "approved");
+    }
+
+    #[test]
+    fn test_vm_dump_source_log() {
+        let mut vm = Forth::new();
+        vm.exec(": greet  .\" hello\" cr ;").unwrap();
+        vm.exec(": farewell  .\" bye\" cr ;").unwrap();
+        let dump = vm.dump_source();
+        assert!(dump.contains(": greet"), "greet should be in dump");
+        assert!(dump.contains(": farewell"), "farewell should be in dump");
+        // Pasting the dump into a fresh VM recreates the words.
+        let mut vm2 = Forth::new();
+        vm2.exec(&dump).unwrap();
+        let out = vm2.exec("greet").unwrap();
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[test]
+    fn test_vm_dump_respects_undo() {
+        let mut vm = Forth::new();
+        vm.exec(": a  1 . ;").unwrap();
+        let snap = vm.snapshot();
+        vm.exec(": b  2 . ;").unwrap();
+        assert!(vm.dump_source().contains(": b"));
+        vm.restore(&snap);
+        assert!(!vm.dump_source().contains(": b"), "b should be gone after restore");
     }
 }
