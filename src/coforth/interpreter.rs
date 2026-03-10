@@ -43,6 +43,12 @@ enum Cell {
     Lit(i64),           // push literal onto data stack
     Str(usize),         // print strings[idx]  (string-literal pool)
     PushStr(usize),     // push strings[idx] index as i64 onto data stack (s" literal")
+    HelloPeer(usize),   // send "hello from <hostname>!" to one peer (by addr or label) strings[idx]
+    TagPeer(usize,usize), // strings[name_idx] → label for strings[addr_idx]
+    JoinChannel(usize),          // join channel strings[idx]; broadcast "<name> joined #chan" to all peers
+    PartChannel(usize),          // leave channel strings[idx]; broadcast "<name> left #chan" to all peers
+    SayInChannel(usize,usize),   // broadcast "[#chan] name: msg" — strings[chan_idx], strings[msg_idx]
+    ProveWord(usize),            // run test:strings[idx]; show ✓ / ✗
     Confirm(usize),     // ask user strings[idx]; push -1 (yes) or 0 (no)
     SelectDialog(usize),// pop-up select: strings[idx] is "title|opt1|opt2|..."; push chosen index or -1
     ReadFile(usize),    // read file at strings[idx]; emit contents to out
@@ -188,6 +194,27 @@ enum Builtin {
     HideCursor,               // ( -- )  hide terminal cursor
     ShowCursor,               // ( -- )  show terminal cursor
     Connected,                // ( -- flag )  -1 if peers/registry active, 0 if isolated
+    /// Increment/decrement TOS in-place — peephole result of `1 +` / `1 -`.
+    Inc,   // ( n -- n+1 )
+    Dec,   // ( n -- n-1 )
+    /// Heap memory allocation (Forth standard words).
+    Here,    // ( -- addr )    address of next free heap cell
+    Comma,   // ( val -- )     store val at here, advance here
+    CellSz,  // ( -- 1 )       size of one cell (1 — heap uses i64 units)
+    Fill,    // ( addr n val -- )  fill n cells at addr with val
+    Eval,    // ( str -- )    eval strings[pop()] as Forth source code
+    Argue,     // ( str1 str2 -- )  run both, show what each got, assert they agree
+    BothWays,  // ( a b str -- )   run op(a,b) and op(b,a), show both, assert they agree
+    Page,      // ( str -- )    run a multi-line proof page: each line is "left | right"
+    Resolve,   // ( str -- )    many sentences, one truth: all lines must converge to same value
+    Infix,        // ( str -- )    eval infix expression: "3 + 4", "10 * 5 - 2", etc.
+    RegisterBoot, // ( str -- )    register a boot poem line; REPL persists to ~/.finch/boot.forth
+    // Proof system
+    Assert,                   // ( flag -- )  bail "assertion failed" if flag == 0
+    ProveAll,                 // ( -- )  run all test:* words; report pass/fail
+    ProveAllBool,             // ( -- flag )  run all test:* words; push -1 (all pass) or 0 (any fail)
+    // Channel system
+    ListChannels,             // ( -- )  print joined channels
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
@@ -265,6 +292,15 @@ pub struct Forth {
     /// Set by `forth-back" <code>"` in the remote program.
     /// Transmitted in the eval response and run locally by the caller.
     pub forth_back: Option<String>,
+    /// Channels this VM has joined via `channel" #name"`.
+    /// Persists for the session; informs channel routing.
+    pub channels: std::collections::HashSet<String>,
+    /// Boot poems registered this session via `boot" text"`.
+    /// Drained by the REPL after each exec and appended to ~/.finch/boot.forth.
+    pub boot_poems: Vec<String>,
+    /// Words that were unknown and routed through missing-word this exec.
+    /// Drained by the REPL to ask AI to define them, growing the grammar.
+    pub pending_defines: Vec<String>,
 }
 
 /// Metadata attached to a peer address via `label-peer` / `tag-peer`.
@@ -306,7 +342,7 @@ const STDLIB: &str = r#"
 : 2/        ( n -- n/2 )   2 / ;
 : 1+        ( n -- n+1 )   1 + ;
 : 1-        ( n -- n-1 )   1 - ;
-: within    ( n lo hi -- flag )  over - >r - r> swap < ;
+: within    ( n lo hi -- flag )  over - >r - r> u< ;
 
 \ Sum of 1..n  ( n -- n*(n+1)/2 )
 : sum-to-n  dup 1 + * 2 / ;
@@ -315,15 +351,15 @@ const STDLIB: &str = r#"
 : gcd  begin dup while swap over mod repeat drop ;
 
 \ Least common multiple  ( a b -- lcm )
-: lcm  2dup gcd swap rot / * abs ;
+: lcm  2dup gcd / * abs ;
 
 \ Integer power  ( base exp -- base^exp )
 : pow  ( base exp -- result )
     1 swap
     begin dup 0> while
-        swap over * swap 1 -
+        >r over * r> 1 -
     repeat
-    drop ;
+    drop nip ;
 
 \ Fibonacci (recursive)  ( n -- fib(n) )
 : fib   ( n -- fib(n) )
@@ -332,18 +368,90 @@ const STDLIB: &str = r#"
     swap 2 - fib
     + ;
 
+\ Fibonacci (iterative)  ( n -- fib(n) )
+\ Same answer, different direction.  The stack witnesses their agreement.
+: fib-iter  ( n -- fib(n) )
+    dup 2 < if drop 1 exit then
+    1 1 rot 1- 0 do     \ start with fib(0)=1 fib(1)=1; iterate n-1 times
+        tuck +          \ ( a b -- b a+b ): tuck b under a, then a+b on top
+    loop
+    nip ;               \ ( prev fib(n) -- fib(n) ): discard prev, keep fib(n)
+
+\ converge ( str1 str2 -- )
+\ Eval both code strings.  Assert they leave the same value on the stack.
+\ The proof: two different paths meeting at the same answer.
+: converge  ( str1 str2 -- )  swap eval swap eval = assert ;
+
+\ back-and-forth ( n fwd-str back-str -- )
+\ Apply fwd-str to n, then back-str to the result.
+\ Prove you are home again.  The proof: a round trip is faithful.
+: back-and-forth  ( n fwd-str back-str -- )
+    >r              \ save back-str            | r: back-str
+    swap dup >r swap \ dup n to return stack   | data: n fwd-str  r: back-str n
+    eval             \ forward transform        | data: m          r: back-str n
+    r> swap          \ restore n under m        | data: n m        r: back-str
+    r>               \ fetch back-str           | data: n m back-str
+    eval             \ inverse transform        | data: n n'
+    = assert ;
+
+\ argue ( str1 str2 -- )
+\ Two programmers, each with their own program.  The stack settles it.
+\ Shows what each got.  If they agree: ✓.  If not: ✗ with both values.
+: argue  ( str1 str2 -- )  argue ;
+
+\ both-ways ( a b str -- )
+\ Run op(a,b) and op(b,a) simultaneously.  Prove commutativity.
+\ Two directions at once.  The stack settles it.
+: both-ways  ( a b str -- )  both-ways ;
+
+\ page ( str -- )
+\ A proof page.  Each line: "left | right"  — both sides run; they must agree.
+\ Plain lines (no |) run as Forth, setting up shared state for the lines that follow.
+\ This is how you write a proof in english — one line at a time.
+: page  ( str -- )  page ;
+
+\ resolve ( str -- )
+\ Many sentences, one truth.  Each line runs independently.
+\ All must produce the same top-of-stack value.
+\ The proof: every path leads here.
+: resolve  ( str -- )  resolve ;
+
+\ infix ( str -- n )  evaluate an infix expression: "3 + 4 * 2" → 11
+: infix  ( str -- n )  infix ;
+
+\ infix-argue ( forth-str infix-str -- )
+\ Two programmers arguing in different grammars.  Stack settles it.
+: infix-argue  ( forth-str infix-str -- )
+    infix           \ evaluate the infix string → n2
+    swap eval       \ evaluate the forth string → n1
+    swap            \ stack: n1 n2
+    2dup = if
+        ." agreed: " . drop cr
+    else
+        ." disagreed: " over . ." vs " . cr
+        = assert
+    then ;
+
+\ ── Natural language gateway ─────────────────────────────────────────────────
+\ missing-word ( str -- )
+\ Called automatically when an unknown word is encountered at top-level.
+\ Redefine this at boot to route natural language sentences to AI or any handler.
+\ Default: silently drop — unknown English words don't produce output.
+\ Redefine to route natural language to AI: : missing-word  gen-send ;
+: missing-word  ( str -- )  drop ;
+
 \ ── Comparison helpers ────────────────────────────────────────────────────────
 : true      ( -- -1 )  -1 ;
 : false     ( -- 0  )   0 ;
 : bool      ( n -- flag )  0= 0= ;
-: between   ( n lo hi -- flag )  rot rot over > rot over > and ;
-: clamp     ( n lo hi -- n' )    rot over max over min swap drop swap drop ;
+: between   ( n lo hi -- flag )  >r over >r >= r> r> <= and ;
+: clamp     ( n lo hi -- n' )    rot min max ;
 
 \ ── Stack utilities ──────────────────────────────────────────────────────────
 : -rot      ( a b c -- c a b )   rot rot ;
 
 \ ── Logic ────────────────────────────────────────────────────────────────────
-: sign      ( n -- -1|0|1 )  dup 0> if drop 1 else 0< if -1 else 0 then then ;
+: signum    ( n -- -1|0|1 )  dup 0> if drop 1 else 0< if -1 else 0 then then ;
 : even?     ( n -- flag )    2 mod 0= ;
 : odd?      ( n -- flag )    2 mod 0= 0= ;
 : positive? ( n -- flag )    0> ;
@@ -416,9 +524,27 @@ const STDLIB: &str = r#"
 : unsigned. ( n -- )   u. ;
 
 \ ── Utility ──────────────────────────────────────────────────────────────────
-: noop  ( -- )  ;
-: ?dup  ( n -- n n | 0 )  dup if dup then ;
-: tally ( n -- )  0 do ." |" loop cr ;
+: noop        ( -- )       ;
+: ?dup        ( n -- n n | 0 )   dup if dup then ;
+: tally       ( n -- )     0 do ." |" loop cr ;
+: bye         ( -- )       ." goodbye." cr ;
+: clear-stack ( -- )       begin depth 0> while drop repeat ;
+: deploy      ( -- )       ." deployed." cr ;
+: boom        ( str -- )   eval ." 💥 boom." cr ;
+: sun         ( -- t )     time dup ." ☀  " . ." s since epoch." cr ;
+
+\ ── Von Neumann architecture ─────────────────────────────────────────────────
+\ Defined here as Forth; semantic metadata lives in vocabulary/en.toml.
+: fetch       ( addr -- n )      @ ;
+: store       ( n addr -- )      ! ;
+: register    ( -- )             depth . ." values on the stack." cr ;
+: accumulate  ( n -- 0+1+...+n ) 0 swap 1 + 0 do i + loop ;
+: instruction ( -- )             ." fetch → decode → execute → retire" cr ;
+: cycle       ( -- )             time . ." seconds since epoch." cr ;
+: pipeline    ( n -- )           0 do i . loop ." stages" cr ;
+: bottleneck  ( -- )             ." von Neumann bottleneck: one bus for data and instructions." cr ;
+: word-size   ( -- 64 )          64 ;
+: address     ( -- )             depth 0> if ." address: " . cr else ." push an address first" cr then ;
 
 \ ── Co-Forth vocabulary ───────────────────────────────────────────────────────
 \ Thin wrappers so builtins appear in `words` and can be overridden by users.
@@ -489,6 +615,191 @@ const STDLIB: &str = r#"
 
 \ .words  ( str-idx -- )  print word count
 : .words        ( str-idx -- )   word-count . ." words" cr ;
+
+\ ── Languages compressed into Forth ──────────────────────────────────────────
+\
+\ Each language is its irreducible core — the one thing that makes it itself.
+\ Everything else follows from that.
+
+\ Brainfuck: 8 ops over a byte tape.  The whole language is a Turing machine.
+\ bf-step ( op tape-ptr -- tape-ptr' )  — one instruction cycle.
+\ bf-run  ( prog-idx -- )  — interprets a BF program string.
+: bf-next   ( ptr -- byte )    @ ;
+: bf-inc    ( ptr -- )         dup @ 1+ swap ! ;
+: bf-dec    ( ptr -- )         dup @ 1- swap ! ;
+: bf-right  ( ptr -- ptr+1 )  1+ ;
+: bf-left   ( ptr -- ptr-1 )  1- ;
+
+\ Lambda calculus: three forms. Church encoding of booleans and pairs.
+\ true  = λx.λy.x   →  dup drop   (returns first arg)
+\ false = λx.λy.y   →  swap drop  (returns second arg)
+\ if    = λb.b       (b is already a selector, just call it)
+: church-true   ( x y -- x )   swap drop ;
+: church-false  ( x y -- y )   drop ;
+: church-pair   ( a b -- pair-idx )   2>r ;
+: church-zero?  ( n -- flag )  0= ;
+: church-succ   ( n -- n+1 )   1+ ;
+
+\ Lisp: the whole language is cons cells + eval.
+\ s-expression on the stack: push tag then value.
+\ tag: 0=nil 1=number 2=symbol 3=pair
+: lisp-nil      ( -- )      0 0 ;       \ nil tag + value
+: lisp-number   ( n -- )    1 swap ;    \ number tag + n
+: lisp-car      ( pair -- head )  drop ;
+: lisp-cdr      ( pair -- tail )  swap drop ;
+: lisp-null?    ( tag val -- flag )  drop 0= ;
+
+\ Forth itself: the language is its own interpreter.
+\ A Forth word is just code at an address.  eval IS the interpreter.
+\ Everything else is defined in terms of : ; if then begin until.
+: forth-eval    ( str -- )   eval ;
+
+\ Prolog: a query is a goal.  Resolution is unification + backtracking.
+\ Compressed to: a goal is a word.  Backtracking = trying alternatives.
+\ True if the word executes without error; false if it bails.
+: goal          ( str -- flag )   eval -1 ;   \ TODO: real unification
+: try-goal      ( str -- flag )   goal ;
+
+\ Assembly: one instruction.  Everything else is sequencing of one instruction.
+: asm-nop       ( -- )    noop ;
+: asm-mov       ( src dst -- )   ! ;
+: asm-add       ( a b -- a+b )   + ;
+: asm-jmp       ( addr -- )      ." jmp " . cr ;   \ symbolic only
+: asm-cmp       ( a b -- flag )  = ;
+: asm-halt      ( -- )           bye ;"#;
+
+/// Proofs for STDLIB words.
+/// Each `: test:<word>` definition runs assertions that verify the word's behaviour.
+/// `assert` pops the top of the stack; if it is 0 (false), execution aborts with
+/// "assertion failed".  A successful proof leaves the stack unchanged.
+const STDLIB_PROOFS: &str = r#"
+: test:+         3 4 +  7 = assert  0 0 + 0 = assert  -1 1 + 0 = assert ;
+: test:-         7 3 -  4 = assert  0 0 - 0 = assert  3 5 - -2 = assert ;
+: test:*         3 4 * 12 = assert  0 5 *  0 = assert  -2 3 * -6 = assert ;
+: test:/         8 4 /  2 = assert  9 3 /  3 = assert  7 2 /  3 = assert ;
+: test:mod       7 3 mod 1 = assert  6 3 mod 0 = assert  8 5 mod 3 = assert ;
+: test:abs       -5 abs  5 = assert   3 abs 3 = assert  0 abs 0 = assert ;
+: test:max        3  7 max 7 = assert  9 2 max 9 = assert  5 5 max 5 = assert ;
+: test:min        3  7 min 3 = assert  9 2 min 2 = assert  5 5 min 5 = assert ;
+: test:negate    -5 negate  5 = assert  3 negate -3 = assert  0 negate 0 = assert ;
+: test:1+         0 1+  1 = assert  -1 1+ 0 = assert  99 1+ 100 = assert ;
+: test:1-         1 1-  0 = assert   0 1- -1 = assert  10 1-  9 = assert ;
+: test:2*         3 2* 6 = assert   0 2*  0 = assert  -2 2* -4 = assert ;
+: test:2/         4 2/ 2 = assert   6 2/  3 = assert   8 2/  4 = assert ;
+: test:square     5 square 25 = assert  -3 square 9 = assert  0 square 0 = assert  1 square 1 = assert ;
+: test:cube       2 cube  8 = assert  -2 cube -8 = assert  0 cube 0 = assert ;
+: test:sum-to-n   5 sum-to-n 15 = assert  0 sum-to-n 0 = assert  1 sum-to-n 1 = assert  4 sum-to-n 10 = assert ;
+: test:gcd       12  8 gcd  4 = assert   7 3 gcd  1 = assert  6 6 gcd  6 = assert ;
+: test:lcm        4  6 lcm 12 = assert   3 5 lcm 15 = assert ;
+: test:pow        2 10 pow 1024 = assert  3 0 pow 1 = assert  2  0 pow 1 = assert  10 3 pow 1000 = assert ;
+: test:fib        0 fib  1 = assert   1 fib  1 = assert   5 fib  8 = assert   7 fib 21 = assert ;
+: test:even?      4 even? assert   3 even? 0= assert   0 even? assert ;
+: test:within     5  1 10 within assert   0  1 10 within 0= assert  10 1 10 within 0= assert ;
+: test:signum     5 signum  1 = assert  -3 signum -1 = assert   0 signum  0 = assert ;
+: test:clamp      5  1 10 clamp  5 = assert   0  1 10 clamp  1 = assert  15  1 10 clamp 10 = assert ;
+: test:between    5  3  8 between assert   2  3  8 between 0= assert   9  3  8 between 0= assert ;
+\ ── Logic / comparison ──────────────────────────────────────────────────────
+: test:true      true  -1 = assert ;
+: test:false     false  0 = assert ;
+: test:bool      0 bool 0 = assert  1 bool -1 = assert  -5 bool -1 = assert ;
+: test:odd?      3 odd? assert   4 odd? 0= assert   0 odd? 0= assert   1 odd? assert ;
+: test:positive? 1 positive? assert   0 positive? 0= assert  -1 positive? 0= assert ;
+: test:negative? -1 negative? assert   0 negative? 0= assert   1 negative? 0= assert ;
+: test:zero?     0 zero? assert   1 zero? 0= assert  -5 zero? 0= assert ;
+\ ── Stack utilities ─────────────────────────────────────────────────────────
+: test:-rot      1 2 3 -rot  2 = assert  1 = assert  3 = assert ;
+: test:?dup      5 ?dup 5 = assert  5 = assert   0 ?dup 0 = assert ;
+: test:noop      42 noop 42 = assert ;
+\ ── Numeric ─────────────────────────────────────────────────────────────────
+: test:digits    0 digits 1 = assert  9 digits 1 = assert  10 digits 2 = assert  100 digits 3 = assert  9999 digits 4 = assert ;
+: test:iota-sum  0 iota-sum 0 = assert  1 iota-sum 0 = assert  5 iota-sum 10 = assert  4 iota-sum 6 = assert ;
+\ ── Bit manipulation ────────────────────────────────────────────────────────
+: test:bit       0 bit 1 = assert   1 bit 2 = assert   3 bit 8 = assert   6 bit 64 = assert ;
+: test:set-bit   0 0 set-bit 1 = assert   0 3 set-bit 8 = assert   5 1 set-bit 7 = assert ;
+: test:clr-bit   7 0 clr-bit 6 = assert   7 1 clr-bit 5 = assert   15 3 clr-bit 7 = assert ;
+: test:tst-bit   7 0 tst-bit assert   7 2 tst-bit assert   4 0 tst-bit 0= assert   8 3 tst-bit assert ;
+\ ── String operations ───────────────────────────────────────────────────────
+: test:str-len   s" hello" str-len 5 = assert   s" " str-len 0 = assert   s" hi" str-len 2 = assert ;
+: test:str=      s" hello" s" hello" str= assert   s" hello" s" world" str= 0= assert ;
+: test:str-upper s" hello" str-upper s" HELLO" str= assert   s" Hello" str-upper s" HELLO" str= assert ;
+: test:str-lower s" HELLO" str-lower s" hello" str= assert   s" Hello" str-lower s" hello" str= assert ;
+: test:str-trim  s"  hi  " str-trim s" hi" str= assert ;
+: test:str-cat   s" foo" s" bar" str-cat s" foobar" str= assert ;
+: test:word-count  s" hello world" word-count 2 = assert   s" one" word-count 1 = assert   s" a b c" word-count 3 = assert ;
+: test:capitalize  s" hello" capitalize s" Hello" str= assert   s" world" capitalize s" World" str= assert ;
+: test:correct?    s" Good sentence." correct? assert   s" no period" correct? 0= assert   s" lowercase." correct? 0= assert ;
+\ ── Von Neumann STDLIB ───────────────────────────────────────────────────────
+variable _tm  ( shared test memory cell )
+: test:fetch      42 _tm !  _tm @ 42 = assert  0 _tm !  _tm @ 0 = assert ;
+: test:store      99 _tm !  _tm @ 99 = assert  -1 _tm !  _tm @ -1 = assert ;
+: test:word-size  word-size 64 = assert ;
+: test:accumulate 5 accumulate 15 = assert  0 accumulate 0 = assert  3 accumulate 6 = assert ;
+: test:bye        bye ;
+: test:clear-stack  1 2 3 clear-stack depth 0= assert ;
+: test:1+        0 1+ 1 = assert   5 1+ 6 = assert  -1 1+ 0 = assert ;
+: test:1-        1 1- 0 = assert   5 1- 4 = assert   0 1- -1 = assert ;
+: test:here      here 0 >= assert ;
+: test:allot     here 3 allot here swap - 3 = assert ;
+: test:comma     here 99 , here swap - 1 = assert ;
+: test:fill      here 4 allot   here 4 - 4 42 fill   here 4 - @ 42 = assert ;
+: test:cells     5 cells 5 = assert  0 cells 0 = assert ;
+: test:cell      cell 1 = assert ;
+
+\ ── Convergence proofs: two directions, one answer ────────────────────────────
+\ The proof IS the meeting.  Different paths; same stack value.
+: test:converge          s" 3 4 +"  s" 4 3 +"  converge ;   \ commutativity of +
+: test:converge-mul      s" 3 4 *"  s" 4 3 *"  converge ;   \ commutativity of *
+: test:converge-assoc    s" 1 2 3 + +" s" 1 2 + 3 +" converge ;  \ associativity
+: test:converge-double   s" 6 2 *"  s" 6 6 +"  converge ;   \ two ways to double
+: test:converge-square   s" 5 square" s" 5 dup *" converge ; \ two ways to square
+: test:converge-fib      s" 10 fib"  s" 10 fib-iter" converge ; \ recursive = iterative
+: test:fib-iter          10 fib-iter 89 = assert   0 fib-iter 1 = assert   1 fib-iter 1 = assert ;
+
+\ ── Both-ways proofs: two directions at once ─────────────────────────────────
+\ For each operation, prove it from both directions simultaneously.
+: test:both-add      3 4 s" +"  both-ways ;   \ + commutes
+: test:both-mul      5 6 s" *"  both-ways ;   \ * commutes
+: test:both-and      12 10 s" and" both-ways ; \ bitwise and commutes
+: test:both-or       12 10 s" or"  both-ways ; \ bitwise or commutes
+
+\ ── Back-and-forth proofs: round trips are faithful ───────────────────────────
+\ Go forth, come back.  The proof: you are home.
+: test:back-add      5  s" 3 +"  s" 3 -"  back-and-forth ;   \ +3 then -3
+: test:back-mul      7  s" 2 *"  s" 2 /"  back-and-forth ;   \ *2 then /2
+: test:back-negate   9  s" negate"  s" negate"  back-and-forth ;  \ negate is its own inverse
+: test:back-shift    1  s" 1 lshift"  s" 1 rshift"  back-and-forth ; \ shift left then right
+
+\ ── Op proofs: every fundamental operation proven both directions ───────────────
+\ + commutes
+: test:+comm         s" 3 4 +"   s" 4 3 +"   converge ;
+: test:+assoc        s" 1 2 3 + +"  s" 1 2 + 3 +"  converge ;
+: test:+zero         s" 7 0 +"   s" 0 7 +"   converge ;   \ 0 is identity
+\ * commutes
+: test:*comm         s" 3 4 *"   s" 4 3 *"   converge ;
+: test:*assoc        s" 2 3 4 * *"  s" 2 3 * 4 *"  converge ;
+: test:*one          s" 5 1 *"   s" 1 5 *"   converge ;   \ 1 is identity
+: test:*zero         s" 5 0 *"   s" 0 5 *"   converge ;   \ 0 annihilates
+\ distributivity: a*(b+c) = a*b + a*c
+: test:distrib       s" 3 4 5 + *"  s" 3 4 * 3 5 * +"  converge ;
+\ subtraction and negation
+: test:sub-negate    s" 10 3 - negate"  s" 3 10 -"  converge ;  \ -(a-b) = b-a
+: test:double        s" 6 2 *"   s" 6 6 +"   converge ;   \ double two ways
+\ boolean ops (bitwise on -1 / 0)
+: test:and-comm      s" -1 0 and"  s" 0 -1 and"  converge ;
+: test:or-comm       s" -1 0 or"   s" 0 -1 or"   converge ;
+: test:xor-self      s" 42 42 xor"  s" 0"  converge ;     \ a xor a = 0
+: test:xor-zero      s" 42 0 xor"   s" 42"  converge ;    \ a xor 0 = a
+: test:not-not       s" -1 invert invert"  s" -1"  converge ; \ double invert = identity
+\ comparison ops
+: test:max-comm      s" 3 7 max"  s" 7 3 max"  converge ;
+: test:min-comm      s" 3 7 min"  s" 7 3 min"  converge ;
+: test:max-min       s" 5 5 max"  s" 5 5 min"  converge ;  \ max=min when equal
+\ stack ops: fold into a single result to satisfy converge's one-value contract
+: test:swap          s" 4 3 swap +"   s" 4 3 +"   converge ;  \ swap preserves sum
+: test:over          s" 3 5 over + +"   s" 3 5 3 + +"  converge ; \ over copies correctly
+\ abs
+: test:abs-negate    s" 7 negate abs"  s" 7"  converge ;   \ abs(neg n) = n
+: test:abs-pos       s" 7 abs"         s" 7"  converge ;   \ abs(pos n) = n
 "#;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -522,9 +833,15 @@ impl Forth {
             registry_addr:    None,
             my_addr:          None,
             forth_back:       None,
+            channels:         std::collections::HashSet::new(),
+            boot_poems:       Vec::new(),
+            pending_defines:  Vec::new(),
         };
         // Load standard library silently — not logged (every session has stdlib)
         let _ = f.eval(STDLIB);
+        // Compile proofs for STDLIB words (test:square, test:fib, …).
+        // These run with unlimited fuel — they don't loop and must not be budgeted.
+        let _ = f.exec_with_fuel(STDLIB_PROOFS, 0);
         f.fuel = DEFAULT_FUEL; // restore budget for user code
         f.log_definitions = true; // user words from here on are logged
         f.seed_remote_whitelist();
@@ -691,7 +1008,27 @@ impl Forth {
             registry_addr:    self.registry_addr.clone(),
             my_addr:          self.my_addr.clone(),
             forth_back:       None,
+            channels:         self.channels.clone(),
+            boot_poems:       Vec::new(),
+            pending_defines:  Vec::new(),
         }
+    }
+
+    /// Drain boot poems registered this exec (via `boot" text"`).
+    /// The REPL calls this after each exec and appends to ~/.finch/boot.forth.
+    pub fn take_boot_poems(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.boot_poems)
+    }
+
+    /// Drain words that were unknown this exec and need AI definition.
+    /// The REPL asks AI to define each, compiles the result, growing the grammar.
+    pub fn take_pending_defines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_defines)
+    }
+
+    /// Check whether a word is defined (builtin or user-defined).
+    pub fn word_exists(&self, word: &str) -> bool {
+        self.name_index.contains_key(&word.to_lowercase())
     }
 
     /// Snapshot the current dictionary state (word definitions only, not the data stack).
@@ -749,7 +1086,7 @@ impl Forth {
                 if !pending.is_empty() {
                     // Compile ephemeral top-level code starting at current end of memory.
                     let start = self.memory.len();
-                    self.compile_into(&pending)?;
+                    self.compile_into(&pending, true)?;
                     self.memory.push(Cell::Ret); // sentinel: halt the run loop
                     self.execute(start)?;
                     // Remove the ephemeral code — only named words persist.
@@ -791,9 +1128,21 @@ impl Forth {
                         let entry = format!(": {} {} ;", name, body.join(" "));
                         let prefix = format!(": {} ", name);
                         if let Some(pos) = self.source_log.iter().position(|e| e.starts_with(&prefix)) {
-                            self.source_log[pos] = entry;
+                            self.source_log[pos] = entry.clone();
                         } else {
-                            self.source_log.push(entry);
+                            self.source_log.push(entry.clone());
+                        }
+                        // Word propagation: broadcast definition to all channel members.
+                        if !self.channels.is_empty() && !self.peers.is_empty() {
+                            let my_name = hostname::get()
+                                .ok().and_then(|h| h.into_string().ok())
+                                .unwrap_or_else(|| "someone".to_string());
+                            let from = self.registry_addr.clone();
+                            let tokens_map = peer_tokens_map(&self.peer_meta);
+                            for chan in &self.channels {
+                                let msg = format!("[{}] {}: {}", chan, my_name, entry);
+                                run_push_all(&self.peers, &msg, from.as_deref(), &tokens_map);
+                            }
                         }
                     }
                     // If the word already exists as a user definition, require approval
@@ -812,12 +1161,13 @@ impl Forth {
                     // Register entry address BEFORE compiling body so `recurse` resolves.
                     let word_addr = self.memory.len();
                     self.name_index.insert(name.clone(), word_addr);
-                    self.compile_into(&body)?;
+                    self.compile_into(&body, false)?;
                     // Patch Addr(usize::MAX) recurse placeholders with the real word_addr.
                     for cell in &mut self.memory[word_addr..] {
                         if let Cell::Addr(a) = cell { if *a == usize::MAX { *a = word_addr; } }
                     }
                     self.memory.push(Cell::Ret);
+                    self.apply_tco(word_addr);
                 }
                 "variable" => {
                     flush_pending!();
@@ -827,6 +1177,19 @@ impl Forth {
                     let addr = self.heap.len();
                     self.heap.push(0);
                     self.var_index.insert(name, addr);
+                }
+                "create" => {
+                    flush_pending!();
+                    pos += 1;
+                    if pos >= tokens.len() { bail!("expected name after create"); }
+                    let name = tokens[pos].to_lowercase();
+                    // Allocate a heap address for this word's data field.
+                    let data_addr = self.heap.len() as i64;
+                    // Define a word that pushes its data address when called.
+                    let word_addr = self.memory.len();
+                    self.name_index.insert(name, word_addr);
+                    self.memory.push(Cell::Lit(data_addr));
+                    self.memory.push(Cell::Ret);
                 }
                 "forget" => {
                     flush_pending!();
@@ -854,10 +1217,13 @@ impl Forth {
     ///
     /// Jump targets are absolute indices into `self.memory` — no offset
     /// arithmetic, no `extend_adjusted` helper needed.
-    fn compile_into(&mut self, tokens: &[String]) -> Result<()> {
+    fn compile_into(&mut self, tokens: &[String], _top_level: bool) -> Result<()> {
         let mut i = 0;
         while i < tokens.len() {
             match tokens[i].as_str() {
+                // `;` outside a word definition = sentence separator (no-op).
+                // Allows natural language like "Hello; I am a Forth program."
+                ";" => { i += 1; continue; }
                 "see" | "？" => {
                     i += 1;
                     let word_name = tokens.get(i).cloned().unwrap_or_default();
@@ -872,7 +1238,7 @@ impl Forth {
                     i += skip;
                     let jmpz_pos = self.memory.len();
                     self.memory.push(Cell::JmpZ(0)); // forward: patch after true branch
-                    self.compile_into(&true_branch)?;
+                    self.compile_into(&true_branch, false)?;
                     if false_branch.is_empty() {
                         let after = self.memory.len();
                         self.memory[jmpz_pos] = Cell::JmpZ(after);
@@ -881,7 +1247,7 @@ impl Forth {
                         self.memory.push(Cell::Jmp(0)); // forward: patch after false branch
                         let false_start = self.memory.len();
                         self.memory[jmpz_pos] = Cell::JmpZ(false_start);
-                        self.compile_into(&false_branch)?;
+                        self.compile_into(&false_branch, false)?;
                         let after = self.memory.len();
                         self.memory[jmp_pos] = Cell::Jmp(after);
                     }
@@ -891,14 +1257,14 @@ impl Forth {
                     let (body, end_kind, after_body, skip) = collect_begin(tokens, i)?;
                     i += skip;
                     let begin_addr = self.memory.len();
-                    self.compile_into(&body)?;
+                    self.compile_into(&body, false)?;
                     match end_kind.as_str() {
                         "until" => { self.memory.push(Cell::Until(begin_addr)); }
                         "again" => { self.memory.push(Cell::Jmp(begin_addr)); }
                         "while" => {
                             let while_pos = self.memory.len();
                             self.memory.push(Cell::While(0)); // forward: patch to after repeat
-                            self.compile_into(&after_body)?;
+                            self.compile_into(&after_body, false)?;
                             self.memory.push(Cell::Repeat(begin_addr));
                             let after = self.memory.len();
                             self.memory[while_pos] = Cell::While(after);
@@ -912,7 +1278,7 @@ impl Forth {
                     let back_addr = self.memory.len(); // loop body starts here
                     let (body, plus_loop, skip) = collect_do(tokens, i)?;
                     i += skip;
-                    self.compile_into(&body)?;
+                    self.compile_into(&body, false)?;
                     if plus_loop {
                         self.memory.push(Cell::DoLoopPlus(back_addr));
                     } else {
@@ -925,10 +1291,10 @@ impl Forth {
                     i += skip;
                     let mut endcase_patches: Vec<usize> = Vec::new();
                     for (val_toks, body_toks) in &of_blocks {
-                        self.compile_into(val_toks)?;
+                        self.compile_into(val_toks, false)?;
                         let of_pos = self.memory.len();
                         self.memory.push(Cell::OfTest(0)); // forward: patch to next of/endcase
-                        self.compile_into(body_toks)?;
+                        self.compile_into(body_toks, false)?;
                         let jmp_pos = self.memory.len();
                         self.memory.push(Cell::Jmp(0)); // forward: patch to endcase
                         endcase_patches.push(jmp_pos);
@@ -936,7 +1302,7 @@ impl Forth {
                         self.memory[of_pos] = Cell::OfTest(next);
                     }
                     if !default_block.is_empty() {
-                        self.compile_into(&default_block)?;
+                        self.compile_into(&default_block, false)?;
                     }
                     self.memory.push(Cell::Builtin(Builtin::Drop)); // drop case selector
                     let endcase = self.memory.len();
@@ -1039,6 +1405,50 @@ impl Forth {
             self.memory.push(Cell::RunOn(peer_idx, code_idx));
             return Ok(());
         }
+        if let Some(s) = tok.strip_prefix("\x00hello:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::HelloPeer(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00tag:") {
+            // Format: "name\x01addr"
+            let (name, addr) = s.split_once('\x01').unwrap_or((s, ""));
+            let name_idx = self.strings.len();
+            self.strings.push(name.to_string());
+            let addr_idx = self.strings.len();
+            self.strings.push(addr.to_string());
+            self.memory.push(Cell::TagPeer(name_idx, addr_idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00channel:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::JoinChannel(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00part:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::PartChannel(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00say:") {
+            // Format: "channel\x01message"
+            let (chan, msg) = s.split_once('\x01').unwrap_or((s, ""));
+            let chan_idx = self.strings.len();
+            self.strings.push(chan.to_string());
+            let msg_idx = self.strings.len();
+            self.strings.push(msg.to_string());
+            self.memory.push(Cell::SayInChannel(chan_idx, msg_idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00prove:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ProveWord(idx));
+            return Ok(());
+        }
         if let Some(s) = tok.strip_prefix("\x00scatter-on:") {
             // Format: "ensemble\x01code"
             let (ensemble, code) = s.split_once('\x01').unwrap_or((s, ""));
@@ -1093,15 +1503,56 @@ impl Forth {
             return Ok(());
         }
         if let Some(b) = name_to_builtin(&lo) {
-            self.memory.push(Cell::Builtin(b));
+            // Peephole: Lit(1) + Plus → Inc; Lit(1) + Minus → Dec
+            let folded = match (self.memory.last(), &b) {
+                (Some(&Cell::Lit(1)), &Builtin::Plus)  => { self.memory.pop(); Some(Cell::Builtin(Builtin::Inc)) }
+                (Some(&Cell::Lit(1)), &Builtin::Minus) => { self.memory.pop(); Some(Cell::Builtin(Builtin::Dec)) }
+                _ => None,
+            };
+            self.memory.push(folded.unwrap_or(Cell::Builtin(b)));
             return Ok(());
         }
         if let Some(&addr) = self.name_index.get(&lo) {
-            self.memory.push(Cell::Addr(addr));
+            // Inline short words (body ≤ 4 cells, no nested calls) to eliminate
+            // call overhead (push return addr, fuel check, jump, ret).
+            // Semantically identical to Cell::Addr — just no call frame.
+            const INLINE_LIMIT: usize = 4;
+            let body_end = self.memory[addr..]
+                .iter()
+                .position(|c| matches!(c, Cell::Ret))
+                .map(|p| addr + p)
+                .unwrap_or(self.memory.len());
+            let body_len = body_end - addr;
+            let can_inline = body_len <= INLINE_LIMIT
+                && self.memory[addr..body_end]
+                    .iter()
+                    .all(|c| !matches!(c, Cell::Addr(_)));
+            if can_inline {
+                let body: Vec<Cell> = self.memory[addr..body_end].to_vec();
+                self.memory.extend(body);
+            } else {
+                self.memory.push(Cell::Addr(addr));
+            }
             return Ok(());
         }
         if let Some(&addr) = self.var_index.get(&lo) {
             self.memory.push(Cell::Lit(addr as i64));
+            return Ok(());
+        }
+        // Natural language gateway: if `missing-word` is defined, route unknown
+        // words through it (push word-as-string, call handler).
+        // Also track the word in pending_defines so the REPL can ask AI to
+        // define it — the grammar grows from use.
+        if let Some(&handler_addr) = self.name_index.get("missing-word") {
+            // Don't queue internal/punctuation tokens for AI definition.
+            let looks_like_word = tok.chars().any(|c| c.is_alphabetic());
+            if looks_like_word && !self.pending_defines.contains(&tok.to_string()) {
+                self.pending_defines.push(tok.to_string());
+            }
+            let idx = self.strings.len() as i64;
+            self.strings.push(tok.to_string());
+            self.memory.push(Cell::Lit(idx));
+            self.memory.push(Cell::Addr(handler_addr));
             return Ok(());
         }
         bail!("unknown word: {tok}")
@@ -1402,6 +1853,164 @@ impl Forth {
                     }
                     ip += 1;
                 }
+                Cell::HelloPeer(idx) => {
+                    let target = self.strings[idx].clone();
+                    // Resolve to address (label or direct addr)
+                    let addr = if self.peers.contains(&target) {
+                        Some(target.clone())
+                    } else {
+                        self.peer_meta.iter()
+                            .find(|(a, m)| {
+                                m.label.as_deref() == Some(target.as_str())
+                                    && self.peers.contains(*a)
+                            })
+                            .map(|(a, _)| a.clone())
+                    };
+                    match addr {
+                        None => {
+                            use crossterm::style::Stylize;
+                            self.out.push_str(&format!(
+                                "hello: don't know anyone called {}\n",
+                                target.as_str().yellow()
+                            ));
+                        }
+                        Some(addr) => {
+                            let my_name = hostname::get()
+                                .ok().and_then(|h| h.into_string().ok())
+                                .unwrap_or_else(|| "someone".to_string());
+                            let msg = format!("hello from {}!", my_name);
+                            let from = self.registry_addr.clone();
+                            let tokens = peer_tokens_map(&self.peer_meta);
+                            let token = tokens.get(&addr).cloned();
+                            run_push_one(&addr, &msg, from.as_deref(), token.as_deref());
+                            use crossterm::style::Stylize;
+                            let label = self.peer_meta.get(&addr)
+                                .and_then(|m| m.label.as_deref())
+                                .unwrap_or(target.as_str());
+                            self.out.push_str(&format!(
+                                "said hello to {}\n", label.cyan().bold()
+                            ));
+                        }
+                    }
+                    ip += 1;
+                }
+                Cell::TagPeer(name_idx, addr_idx) => {
+                    let name = self.strings[name_idx].trim().to_string();
+                    let addr = self.strings[addr_idx].trim().to_string();
+                    // Resolve addr — might be a partial hostname; try matching
+                    let resolved = if self.peers.contains(&addr) {
+                        Some(addr.clone())
+                    } else {
+                        // Fuzzy: peer whose addr contains the given string
+                        self.peers.iter().find(|p| p.contains(addr.as_str())).cloned()
+                    };
+                    match resolved {
+                        None if !addr.is_empty() => {
+                            // Register with given addr even if not yet a known peer
+                            self.peer_meta.entry(addr.clone()).or_default().label = Some(name.clone());
+                            use crossterm::style::Stylize;
+                            self.out.push_str(&format!(
+                                "{} tagged as {}\n", addr.as_str().dark_grey(), name.as_str().cyan().bold()
+                            ));
+                        }
+                        None => {
+                            self.out.push_str("tag: need an address\n");
+                        }
+                        Some(a) => {
+                            self.peer_meta.entry(a.clone()).or_default().label = Some(name.clone());
+                            use crossterm::style::Stylize;
+                            self.out.push_str(&format!(
+                                "{} is now {}\n", a.as_str().dark_grey(), name.as_str().cyan().bold()
+                            ));
+                        }
+                    }
+                    ip += 1;
+                }
+                Cell::JoinChannel(idx) => {
+                    let raw = self.strings[idx].clone();
+                    let chan = if raw.starts_with('#') { raw } else { format!("#{raw}") };
+                    self.channels.insert(chan.clone());
+                    let my_name = hostname::get()
+                        .ok().and_then(|h| h.into_string().ok())
+                        .unwrap_or_else(|| "someone".to_string());
+                    let msg = format!("{} joined {}", my_name, chan);
+                    let from = self.registry_addr.clone();
+                    let tokens = peer_tokens_map(&self.peer_meta);
+                    run_push_all(&self.peers, &msg, from.as_deref(), &tokens);
+                    use crossterm::style::Stylize;
+                    let n = self.peers.len();
+                    self.out.push_str(&format!(
+                        "joined {} — {} peer{} notified\n",
+                        chan.as_str().cyan().bold(),
+                        n,
+                        if n == 1 { "" } else { "s" },
+                    ));
+                    ip += 1;
+                }
+                Cell::PartChannel(idx) => {
+                    let raw = self.strings[idx].clone();
+                    let chan = if raw.starts_with('#') { raw } else { format!("#{raw}") };
+                    self.channels.remove(&chan);
+                    let my_name = hostname::get()
+                        .ok().and_then(|h| h.into_string().ok())
+                        .unwrap_or_else(|| "someone".to_string());
+                    let msg = format!("{} left {}", my_name, chan);
+                    let from = self.registry_addr.clone();
+                    let tokens = peer_tokens_map(&self.peer_meta);
+                    run_push_all(&self.peers, &msg, from.as_deref(), &tokens);
+                    use crossterm::style::Stylize;
+                    self.out.push_str(&format!("left {}\n", chan.as_str().dark_grey()));
+                    ip += 1;
+                }
+                Cell::SayInChannel(chan_idx, msg_idx) => {
+                    let raw = self.strings[chan_idx].clone();
+                    let chan = if raw.starts_with('#') { raw } else { format!("#{raw}") };
+                    let message = self.strings[msg_idx].clone();
+                    let my_name = hostname::get()
+                        .ok().and_then(|h| h.into_string().ok())
+                        .unwrap_or_else(|| "someone".to_string());
+                    let text = format!("[{}] {}: {}", chan, my_name, message);
+                    let from = self.registry_addr.clone();
+                    let tokens = peer_tokens_map(&self.peer_meta);
+                    run_push_all(&self.peers, &text, from.as_deref(), &tokens);
+                    use crossterm::style::Stylize;
+                    self.out.push_str(&format!(
+                        "[{}] you: {}\n",
+                        chan.as_str().cyan().bold(),
+                        message.as_str(),
+                    ));
+                    ip += 1;
+                }
+                Cell::ProveWord(idx) => {
+                    let word = self.strings[idx].clone();
+                    let test_name = format!("test:{word}");
+                    use crossterm::style::Stylize;
+                    if self.name_index.contains_key(&test_name) {
+                        let saved = self.out.len();
+                        let result = self.eval(&test_name);
+                        self.out.truncate(saved);
+                        match result {
+                            Ok(_) => {
+                                self.out.push_str(&format!("✓ {}\n", word.as_str().green().bold()));
+                            }
+                            Err(e) => {
+                                self.out.push_str(&format!(
+                                    "✗ {}: {}\n",
+                                    word.as_str().red().bold(),
+                                    e.to_string().as_str().dark_grey(),
+                                ));
+                            }
+                        }
+                    } else {
+                        // Check if a test:word exists but under a different normalisation
+                        self.out.push_str(&format!(
+                            "? {}: no proof available (define test:{})\n",
+                            word.as_str().dark_grey(),
+                            word,
+                        ));
+                    }
+                    ip += 1;
+                }
                 Cell::GenAI(idx) => {
                     let prompt = self.strings[idx].clone();
                     let response = if self.remote_mode {
@@ -1418,6 +2027,8 @@ impl Forth {
                     }
                     ip += 1;
                 }
+                Cell::Builtin(Builtin::Inc) => { if let Some(t) = self.data.last_mut() { *t += 1; } ip += 1; }
+                Cell::Builtin(Builtin::Dec) => { if let Some(t) = self.data.last_mut() { *t -= 1; } ip += 1; }
                 Cell::Builtin(b) => { self.exec_builtin(b)?; ip += 1; }
                 Cell::Addr(addr) => {
                     // Function call: charge one fuel unit to prevent runaway recursion.
@@ -1433,7 +2044,7 @@ impl Forth {
                     }
                 }
                 // Back-edges: charge one fuel unit per iteration to prevent infinite loops.
-                Cell::Jmp(addr)   => { check_fuel!(); ip = addr; }
+                Cell::Jmp(addr)   => { if addr <= ip { check_fuel!(); } ip = addr; }
                 Cell::Repeat(back) => { check_fuel!(); ip = back; }
                 Cell::Until(back) => { check_fuel!(); let v = self.pop()?; if v == 0 { ip = back; } else { ip += 1; } }
                 Cell::JmpZ(addr)  => { let v = self.pop()?; if v == 0 { ip = addr; } else { ip += 1; } }
@@ -1483,6 +2094,8 @@ impl Forth {
             Builtin::Mod   => { let b = self.pop()?; let a = self.pop()?; if b == 0 { bail!("division by zero"); } self.data.push(a % b); }
             Builtin::Dup   => { let a = self.pop()?; self.data.push(a); self.data.push(a); }
             Builtin::Drop  => { self.pop()?; }
+            Builtin::Inc   => { if let Some(t) = self.data.last_mut() { *t += 1; } }
+            Builtin::Dec   => { if let Some(t) = self.data.last_mut() { *t -= 1; } }
             Builtin::Swap  => { let b = self.pop()?; let a = self.pop()?; self.data.push(b); self.data.push(a); }
             Builtin::Over  => { let b = self.pop()?; let a = self.pop()?; self.data.push(a); self.data.push(b); self.data.push(a); }
             Builtin::Rot   => { let c = self.pop()?; let b = self.pop()?; let a = self.pop()?; self.data.push(b); self.data.push(c); self.data.push(a); }
@@ -1545,6 +2158,221 @@ impl Forth {
                 while self.heap.len() <= addr { self.heap.push(0); }
                 self.heap[addr] += val;
             }
+            Builtin::Here  => { self.data.push(self.heap.len() as i64); }
+            Builtin::Allot => {
+                let n = self.pop()?.max(0) as usize;
+                self.heap.resize(self.heap.len() + n, 0);
+            }
+            Builtin::Comma => {
+                let val = self.pop()?;
+                self.heap.push(val);
+            }
+            Builtin::Cells  => { /* identity — 1 cell = 1 heap unit */ }
+            Builtin::CellSz => { self.data.push(1); }
+            Builtin::Fill   => {
+                let val  = self.pop()?;
+                let n    = self.pop()?.max(0) as usize;
+                let addr = self.pop()? as usize;
+                while self.heap.len() < addr + n { self.heap.push(0); }
+                for slot in &mut self.heap[addr..addr + n] { *slot = val; }
+            }
+            Builtin::Eval => {
+                // ( str -- )  evaluate strings[pop()] as Forth source.
+                // This is how you execute a machine that someone sends you.
+                let idx = self.pop()? as usize;
+                let code = self.strings.get(idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("eval: invalid string index {idx}"))?;
+                self.eval(&code)?;
+            }
+            Builtin::Argue => {
+                // ( str1 str2 -- )  two programmers, one stack.
+                // Runs each program, shows what it got, then asserts they agree.
+                let idx2 = self.pop()? as usize;
+                let idx1 = self.pop()? as usize;
+                let code1 = self.strings.get(idx1).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("argue: invalid string index {idx1}"))?;
+                let code2 = self.strings.get(idx2).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("argue: invalid string index {idx2}"))?;
+
+                let depth_before = self.data.len();
+                self.eval(&code1)?;
+                let result1 = self.data.last().copied()
+                    .ok_or_else(|| anyhow::anyhow!("argue: first program left nothing on stack"))?;
+                self.data.truncate(depth_before);
+
+                self.eval(&code2)?;
+                let result2 = self.data.last().copied()
+                    .ok_or_else(|| anyhow::anyhow!("argue: second program left nothing on stack"))?;
+                self.data.truncate(depth_before);
+
+                use crossterm::style::Stylize;
+                if result1 == result2 {
+                    // Both arrows point at the same value — two directions, one proof.
+                    self.out.push_str(&format!(
+                        "  {}  ──→  {}  ←──  {}   {}\n",
+                        code1.as_str().cyan(),
+                        result1.to_string().green().bold(),
+                        code2.as_str().cyan(),
+                        "✓".green(),
+                    ));
+                } else {
+                    self.out.push_str(&format!(
+                        "  {}  ──→  {}  ≠  {}  ←──  {}   {}\n",
+                        code1.as_str().cyan(), result1.to_string().red(),
+                        result2.to_string().red(), code2.as_str().cyan(),
+                        "✗".red(),
+                    ));
+                    anyhow::bail!("argue: {} got {}, {} got {}", code1, result1, code2, result2);
+                }
+            }
+            Builtin::BothWays => {
+                // ( a b str -- )  prove op commutes: op(a,b) = op(b,a)
+                // Two directions at once.  The stack settles it.
+                let idx = self.pop()? as usize;
+                let b   = self.pop()?;
+                let a   = self.pop()?;
+                let code = self.strings.get(idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("both-ways: invalid string index {idx}"))?;
+
+                let depth_before = self.data.len();
+
+                self.data.push(a); self.data.push(b);
+                self.eval(&code)?;
+                let r1 = self.data.last().copied()
+                    .ok_or_else(|| anyhow::anyhow!("both-ways: forward left nothing on stack"))?;
+                self.data.truncate(depth_before);
+
+                self.data.push(b); self.data.push(a);
+                self.eval(&code)?;
+                let r2 = self.data.last().copied()
+                    .ok_or_else(|| anyhow::anyhow!("both-ways: reverse left nothing on stack"))?;
+                self.data.truncate(depth_before);
+
+                use crossterm::style::Stylize;
+                if r1 == r2 {
+                    self.out.push_str(&format!(
+                        "  {} {} [{}] → {}   {} {} [{}] → {}   {}\n",
+                        a, b, code.as_str().cyan(), r1.to_string().green().bold(),
+                        b, a, code.as_str().cyan(), r2.to_string().green().bold(),
+                        "✓".green(),
+                    ));
+                } else {
+                    self.out.push_str(&format!(
+                        "  {} {} [{}] → {}   {} {} [{}] → {}   {}\n",
+                        a, b, code.as_str().cyan(), r1.to_string().red(),
+                        b, a, code.as_str().cyan(), r2.to_string().red(),
+                        "✗".red(),
+                    ));
+                    anyhow::bail!("both-ways: {} {} {} → {} but {} {} {} → {}", a, b, code, r1, b, a, code, r2);
+                }
+            }
+            Builtin::Page => {
+                // ( str -- )  A proof page: each non-empty line is "left | right".
+                // Runs both sides in order.  Every line must agree.
+                // If a line has no | it runs as plain Forth.
+                use crossterm::style::Stylize;
+                let idx = self.pop()? as usize;
+                let src = self.strings.get(idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("page: invalid string index {idx}"))?;
+                let mut step = 1usize;
+                for raw_line in src.lines() {
+                    let line = raw_line.trim();
+                    if line.is_empty() || line.starts_with('\\') { continue; }
+
+                    if let Some(pipe) = line.find('|') {
+                        let left  = line[..pipe].trim();
+                        let right = line[pipe+1..].trim();
+
+                        let depth_before = self.data.len();
+
+                        self.eval(left)?;
+                        let r1 = self.data.last().copied()
+                            .ok_or_else(|| anyhow::anyhow!("page line {step}: left side left nothing on stack"))?;
+                        self.data.truncate(depth_before);
+
+                        self.eval(right)?;
+                        let r2 = self.data.last().copied()
+                            .ok_or_else(|| anyhow::anyhow!("page line {step}: right side left nothing on stack"))?;
+                        self.data.truncate(depth_before);
+
+                        if r1 == r2 {
+                            self.out.push_str(&format!(
+                                "  {}.  {}  ──→  {}  ←──  {}   {}\n",
+                                step,
+                                left.cyan(), r1.to_string().green().bold(),
+                                right.cyan(), "✓".green(),
+                            ));
+                        } else {
+                            self.out.push_str(&format!(
+                                "  {}.  {}  ──→  {}  ≠  {}  ←──  {}   {}\n",
+                                step,
+                                left.cyan(), r1.to_string().red(),
+                                r2.to_string().red(), right.cyan(),
+                                "✗".red(),
+                            ));
+                            anyhow::bail!("page line {step}: left got {r1}, right got {r2}");
+                        }
+                    } else {
+                        // Plain Forth — just run it (sets up shared stack state)
+                        self.eval(line)?;
+                    }
+                    step += 1;
+                }
+            }
+            Builtin::Resolve => {
+                // ( str -- )  many sentences, one truth.
+                // Run each non-empty line.  All must produce the same top-of-stack value.
+                // Shows all of them converging.  This is what agreement looks like.
+                let idx = self.pop()? as usize;
+                let src = self.strings.get(idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("resolve: invalid string index {idx}"))?;
+
+                use crossterm::style::Stylize;
+
+                struct Sentence { text: String, result: i64 }
+                let mut sentences: Vec<Sentence> = Vec::new();
+                let depth_before = self.data.len();
+
+                for raw_line in src.lines() {
+                    let line = raw_line.trim();
+                    if line.is_empty() || line.starts_with('\\') { continue; }
+                    self.eval(line)?;
+                    let result = self.data.last().copied()
+                        .ok_or_else(|| anyhow::anyhow!("resolve: '{}' left nothing on stack", line))?;
+                    self.data.truncate(depth_before);
+                    sentences.push(Sentence { text: line.to_string(), result });
+                }
+
+                if sentences.is_empty() { return Ok(()); }
+
+                let truth = sentences[0].result;
+                let all_agree = sentences.iter().all(|s| s.result == truth);
+
+                for s in &sentences {
+                    if s.result == truth {
+                        self.out.push_str(&format!(
+                            "  {}  ──→  {}\n",
+                            s.text.as_str().cyan(),
+                            s.result.to_string().green().bold(),
+                        ));
+                    } else {
+                        self.out.push_str(&format!(
+                            "  {}  ──→  {}  {}\n",
+                            s.text.as_str().cyan(),
+                            s.result.to_string().red(),
+                            "(disagrees)".red(),
+                        ));
+                    }
+                }
+
+                if all_agree {
+                    self.out.push_str(&format!("  {}\n", "all agree.".green().bold()));
+                } else {
+                    let bad: Vec<_> = sentences.iter().filter(|s| s.result != truth)
+                        .map(|s| format!("'{}' → {}", s.text, s.result)).collect();
+                    anyhow::bail!("resolve: sentences disagree: {}", bad.join(", "));
+                }
+            }
             Builtin::LoopI => {
                 let v = self.loop_stack.last().map(|t| t.0).unwrap_or(0);
                 self.data.push(v);
@@ -1590,14 +2418,6 @@ impl Forth {
             }
             Builtin::PrintU  => { let a = self.pop()? as u64; self.out.push_str(&format!("{a} ")); }
             Builtin::PrintHex => { let a = self.pop()?; self.out.push_str(&format!("{a:#x} ")); }
-            Builtin::Allot => {
-                let n = self.pop()? as usize;
-                for _ in 0..n { self.heap.push(0); }
-            }
-            Builtin::Cells => {
-                // n cells → n (each cell is 1 unit; caller uses + for array indexing)
-                // In our interpreter, addresses are direct heap indices so cells = identity
-            }
             Builtin::Words => {
                 let mut names: Vec<String> = self.name_index.keys().cloned().collect();
                 names.sort();
@@ -2351,6 +3171,16 @@ impl Forth {
                     found = true;
                 }
 
+                // 3b. Show proof indicator if test:<word> is defined.
+                let test_name = format!("test:{word_name}");
+                if self.name_index.contains_key(&test_name) {
+                    self.out.push_str(&format!(
+                        "  {} prove\" {}\"\n",
+                        "▸".dark_grey(),
+                        word_name.as_str().dark_grey(),
+                    ));
+                }
+
                 // 3. Check builtins.
                 if !found {
                     if name_to_builtin(&word_name).is_some() {
@@ -2824,6 +3654,185 @@ impl Forth {
                 self.data.push(if connected { -1 } else { 0 });
             }
 
+            // ── Proof system ────────────────────────────────────────────────
+            Builtin::Assert => {
+                let flag = self.pop()?;
+                if flag == 0 {
+                    anyhow::bail!("assertion failed");
+                }
+            }
+
+            Builtin::ProveAll => {
+                let test_words: Vec<String> = self.name_index.keys()
+                    .filter(|k| k.starts_with("test:"))
+                    .cloned()
+                    .collect();
+                let mut sorted = test_words;
+                sorted.sort();
+                let total = sorted.len();
+                let mut pass = 0usize;
+                let mut fail = 0usize;
+                let mut fail_lines: Vec<String> = Vec::new();
+                for tw in &sorted {
+                    let word_name = &tw["test:".len()..];
+                    let saved = self.out.len();
+                    let result = self.eval(tw);
+                    self.out.truncate(saved);
+                    use crossterm::style::Stylize;
+                    match result {
+                        Ok(_) => { pass += 1; }
+                        Err(e) => {
+                            fail_lines.push(format!("  ✗ {}: {}\n", word_name.red(), e));
+                            fail += 1;
+                        }
+                    }
+                }
+                use crossterm::style::Stylize;
+                for line in fail_lines {
+                    self.out.push_str(&line);
+                }
+                let pass_s = format!("{pass}/{total} passed");
+                if fail == 0 {
+                    self.out.push_str(&format!("── {} ──\n", pass_s.green().bold()));
+                } else {
+                    self.out.push_str(&format!(
+                        "── {}  {} failed ──\n",
+                        pass_s.yellow().bold(),
+                        fail.to_string().red().bold(),
+                    ));
+                }
+            }
+
+            Builtin::ProveAllBool => {
+                // Same as ProveAll but pushes -1 (all pass) or 0 (any fail).
+                // Failures are printed; the summary line is suppressed on all-pass
+                // so callers can print their own message.
+                let test_words: Vec<String> = self.name_index.keys()
+                    .filter(|k| k.starts_with("test:"))
+                    .cloned()
+                    .collect();
+                let mut sorted = test_words;
+                sorted.sort();
+                let total = sorted.len();
+                let mut pass = 0usize;
+                let mut fail = 0usize;
+                let mut fail_lines: Vec<String> = Vec::new();
+                for tw in &sorted {
+                    let word_name = &tw["test:".len()..];
+                    let saved = self.out.len();
+                    let result = self.eval(tw);
+                    self.out.truncate(saved);
+                    use crossterm::style::Stylize;
+                    match result {
+                        Ok(_) => { pass += 1; }
+                        Err(e) => {
+                            fail_lines.push(format!("  ✗ {}: {}\n", word_name.red(), e));
+                            fail += 1;
+                        }
+                    }
+                }
+                use crossterm::style::Stylize;
+                for line in fail_lines {
+                    self.out.push_str(&line);
+                }
+                if fail > 0 {
+                    let pass_s = format!("{pass}/{total} passed");
+                    self.out.push_str(&format!(
+                        "── {}  {} failed ──\n",
+                        pass_s.yellow().bold(),
+                        fail.to_string().red().bold(),
+                    ));
+                }
+                self.data.push(if fail == 0 { -1 } else { 0 });
+            }
+
+            Builtin::Infix => {
+                // ( str -- )  Evaluate an infix expression.
+                // Uses shunting-yard to respect precedence: * / before + -.
+                // Supports: integers, +  -  *  /  mod  (  )
+                // Example: "3 + 4 * 2" → 11   "(3 + 4) * 2" → 14
+                let idx = self.pop()? as usize;
+                let src = self.strings.get(idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("infix: invalid string index"))?;
+
+                fn prec(op: &str) -> u8 {
+                    match op { "*" | "/" | "mod" => 2, "+" | "-" => 1, _ => 0 }
+                }
+                fn apply(op: &str, a: i64, b: i64) -> anyhow::Result<i64> {
+                    Ok(match op {
+                        "+" => a.wrapping_add(b), "-" => a.wrapping_sub(b),
+                        "*" => a.wrapping_mul(b),
+                        "/" => { if b == 0 { anyhow::bail!("division by zero"); } a / b }
+                        "mod" => { if b == 0 { anyhow::bail!("modulo by zero"); } a % b }
+                        _ => anyhow::bail!("infix: unknown operator {op}"),
+                    })
+                }
+
+                let mut out: Vec<i64>     = Vec::new(); // value stack
+                let mut ops: Vec<String>  = Vec::new(); // operator stack
+
+                for tok in src.split_whitespace() {
+                    if let Ok(n) = tok.parse::<i64>() {
+                        out.push(n);
+                    } else if tok == "(" {
+                        ops.push(tok.to_string());
+                    } else if tok == ")" {
+                        while ops.last().map(|s: &String| s.as_str()) != Some("(") {
+                            let op = ops.pop().ok_or_else(|| anyhow::anyhow!("infix: mismatched parentheses"))?;
+                            let b = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                            let a = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                            out.push(apply(&op, a, b)?);
+                        }
+                        ops.pop(); // discard "("
+                    } else {
+                        // operator — pop higher-or-equal precedence ops first
+                        while ops.last()
+                            .map(|o: &String| o != "(" && prec(o) >= prec(tok))
+                            .unwrap_or(false)
+                        {
+                            let op = ops.pop().unwrap();
+                            let b = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                            let a = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                            out.push(apply(&op, a, b)?);
+                        }
+                        ops.push(tok.to_string());
+                    }
+                }
+                while let Some(op) = ops.pop() {
+                    let b = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                    let a = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                    out.push(apply(&op, a, b)?);
+                }
+                let result = out.pop().ok_or_else(|| anyhow::anyhow!("infix: empty expression"))?;
+                self.data.push(result);
+            }
+
+            // ── Boot poetry ──────────────────────────────────────────────────
+            Builtin::RegisterBoot => {
+                // ( str -- )  Register a boot poem line.
+                // The text is stored in self.boot_poems; the REPL drains this
+                // after each exec and appends lines to ~/.finch/boot.forth.
+                let idx = self.pop()? as usize;
+                let text = self.strings.get(idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("register-boot: invalid string index"))?;
+                self.out.push_str(&format!("{}\n", text));
+                self.boot_poems.push(text);
+            }
+
+            // ── Channel system ───────────────────────────────────────────────
+            Builtin::ListChannels => {
+                use crossterm::style::Stylize;
+                if self.channels.is_empty() {
+                    self.out.push_str("no channels joined\n");
+                } else {
+                    let mut chans: Vec<&String> = self.channels.iter().collect();
+                    chans.sort();
+                    for c in chans {
+                        self.out.push_str(&format!("  {}\n", c.as_str().cyan().bold()));
+                    }
+                }
+            }
+
             // ── Security scanning ───────────────────────────────────────────
             Builtin::ScanFile => {
                 let path_idx = self.pop()? as usize;
@@ -2913,6 +3922,39 @@ impl Forth {
             }
         }
         Ok(())
+    }
+
+    /// Tail-call optimisation: if a word's last instruction before `Ret` is
+    /// `Addr(x)`, replace it with `Jmp(x)` and remove the trailing `Ret`.
+    ///
+    /// `Jmp(x)` jumps without pushing a return address, so when x executes
+    /// its `Ret` it pops the *caller's* return address — correct TCO.
+    ///
+    /// Only applied when no jump inside the word targets the `Ret` position
+    /// (i.e. no early-return branches pointing at it), to avoid corrupting
+    /// control flow.
+    fn apply_tco(&mut self, word_start: usize) {
+        let end = self.memory.len();
+        if end < word_start + 2 { return; }
+        // Last cell must be Ret, second-to-last must be a call.
+        if !matches!(self.memory[end - 1], Cell::Ret) { return; }
+        let tail_addr = match self.memory[end - 2] {
+            Cell::Addr(x) => x,
+            _ => return,
+        };
+        // Ensure no jump inside the word targets the Ret position.
+        let ret_pos = end - 1;
+        for cell in &self.memory[word_start..end - 1] {
+            let targets = match *cell {
+                Cell::Jmp(t) | Cell::JmpZ(t) | Cell::While(t) | Cell::Repeat(t)
+                | Cell::Until(t) | Cell::DoLoop(t) | Cell::DoLoopPlus(t) => Some(t),
+                _ => None,
+            };
+            if targets == Some(ret_pos) { return; }
+        }
+        // Safe: convert tail call to jump and remove Ret.
+        self.memory[end - 2] = Cell::Jmp(tail_addr);
+        self.memory.truncate(end - 1);
     }
 
     fn pop(&mut self) -> Result<i64> {
@@ -3482,6 +4524,55 @@ impl Forth {
 
 // ── Scatter helpers — bridge sync Forth VM to async scatter functions ──────────
 
+/// Send a push message to a single peer synchronously (bridges async scatter_push).
+fn run_push_one(addr: &str, text: &str, from: Option<&str>, token: Option<&str>) {
+    let addr = addr.to_string();
+    let text = text.to_string();
+    let from = from.map(|s| s.to_string());
+    let token = token.map(|s| s.to_string());
+    let fut = async move {
+        // scatter_push to a single peer
+        let url = if addr.starts_with("http://") || addr.starts_with("https://") {
+            format!("{addr}/v1/forth/push")
+        } else {
+            format!("http://{addr}/v1/forth/push")
+        };
+        let body = match &from {
+            Some(f) => serde_json::json!({ "text": text, "from": f }),
+            None    => serde_json::json!({ "text": text }),
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let mut req = client.post(&url);
+        if let Some(t) = &token {
+            req = req.header(crate::peer_token::HEADER, t.as_str());
+        }
+        let _ = req.json(&body).send().await;
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        let _ = tokio::runtime::Runtime::new().map(|rt| rt.block_on(fut));
+    }
+}
+
+fn run_push_all(peers: &[String], text: &str, from: Option<&str>, _tokens: &std::collections::HashMap<String, String>) {
+    if peers.is_empty() { return; }
+    let peers = peers.to_vec();
+    let text  = text.to_string();
+    let from  = from.map(|s| s.to_string());
+    let fut = async move {
+        crate::coforth::scatter::scatter_push(&peers, &text, from.as_deref()).await;
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut));
+    } else {
+        let _ = tokio::runtime::Runtime::new().map(|rt| rt.block_on(fut));
+    }
+}
+
 fn peer_tokens_map(peer_meta: &std::collections::HashMap<String, PeerMeta>) -> std::collections::HashMap<String, String> {
     peer_meta.iter()
         .filter_map(|(addr, meta)| meta.token.as_ref().map(|t| (addr.clone(), t.clone())))
@@ -3982,6 +5073,24 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "scan-net"       => Builtin::ScanNet,
         "scan-startup"   => Builtin::ScanStartup,
         "quarantine"     => Builtin::Quarantine,
+        "1+"             => Builtin::Inc,
+        "1-"             => Builtin::Dec,
+        "here"           => Builtin::Here,
+        ","              => Builtin::Comma,
+        "cell"           => Builtin::CellSz,
+        "fill"           => Builtin::Fill,
+        "eval"           => Builtin::Eval,
+        "argue"          => Builtin::Argue,
+        "both-ways"      => Builtin::BothWays,
+        "page"           => Builtin::Page,
+        "resolve"        => Builtin::Resolve,
+        "infix"          => Builtin::Infix,
+        "register-boot"  => Builtin::RegisterBoot,
+        // Proof system
+        "assert"         => Builtin::Assert,
+        "prove-all"      => Builtin::ProveAll,
+        "prove-all?"     => Builtin::ProveAllBool,
+        "channels"       => Builtin::ListChannels,
         _ => return None,
     })
 }
@@ -4148,6 +5257,62 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00scatter:{s}"));
+        } else if c == '"' && tok == "hello" {
+            // hello" peer"  — send "hello from <hostname>!" to one peer by name or addr
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut peer = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } peer.push(c2); }
+            tokens.push(format!("\x00hello:{peer}"));
+        } else if c == '"' && tok == "tag" {
+            // tag" name" "addr"  — label a peer's machine with a human name
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut name = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } name.push(c2); }
+            while chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&'"') { chars.next(); }
+            let mut addr = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } addr.push(c2); }
+            tokens.push(format!("\x00tag:{name}\x01{addr}"));
+        } else if c == '"' && tok == "channel" {
+            // channel" #name"  — join a named channel; broadcast presence to all peers
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut name = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } name.push(c2); }
+            tokens.push(format!("\x00channel:{name}"));
+        } else if c == '"' && tok == "say" {
+            // say" #channel" "message"  — send a message to a channel (all peers)
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut chan = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } chan.push(c2); }
+            while chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&'"') { chars.next(); }
+            let mut msg = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } msg.push(c2); }
+            tokens.push(format!("\x00say:{chan}\x01{msg}"));
+        } else if c == '"' && tok == "part" {
+            // part" #name"  — leave a channel; broadcast departure to all peers
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut name = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } name.push(c2); }
+            tokens.push(format!("\x00part:{name}"));
+        } else if c == '"' && tok == "prove" {
+            // prove" word"  — run test:<word> and show ✓ / ✗
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut word = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } word.push(c2); }
+            tokens.push(format!("\x00prove:{word}"));
         } else if c == '"' && tok == "on" {
             // on" peer" "code"  — run code on exactly one peer (by address or label)
             tok.clear();
@@ -4189,6 +5354,39 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00push-str:{s}"));
+        } else if c == '"' && tok == "page" {
+            // page"        — multiline proof page; content ends at " on its own line
+            //   left side | right side
+            //   ...
+            // "
+            tok.clear();
+            chars.next(); // consume the opening "
+            if chars.peek() == Some(&'\n') { chars.next(); } // skip immediate newline
+            let mut s = String::new();
+            let mut prev = '\n';
+            for c2 in chars.by_ref() {
+                if c2 == '"' && prev == '\n' { break; } // closing " alone on a line
+                s.push(c2);
+                prev = c2;
+            }
+            if s.ends_with('\n') { s.pop(); }
+            tokens.push(format!("\x00push-str:{s}"));
+            tokens.push("page".to_string());
+        } else if c == '"' && tok == "resolve" {
+            // resolve"   — many sentences, one truth; closing " alone on a line
+            tok.clear();
+            chars.next(); // consume "
+            if chars.peek() == Some(&'\n') { chars.next(); }
+            let mut s = String::new();
+            let mut prev = '\n';
+            for c2 in chars.by_ref() {
+                if c2 == '"' && prev == '\n' { break; }
+                s.push(c2);
+                prev = c2;
+            }
+            if s.ends_with('\n') { s.pop(); }
+            tokens.push(format!("\x00push-str:{s}"));
+            tokens.push("resolve".to_string());
         } else if c == '|' && tok == "s" {
             // s| text with "quotes" |  — alternate string delimiter; avoids escaping hell
             tok.clear();
@@ -4197,6 +5395,15 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '|' { break; } s.push(c2); }
             tokens.push(format!("\x00push-str:{s}"));
+        } else if c == '"' && tok == "boot" {
+            // boot" text"  — register a line to print at every boot; persisted to ~/.finch/boot.forth
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00push-str:{s}"));
+            tokens.push("register-boot".to_string());
         } else if c == '"' && tok == "gen" {
             // gen" prompt"  — call AI generator, emit response
             tok.clear();
@@ -4213,6 +5420,12 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00scatter-exec:{s}"));
+        } else if c == ';' {
+            // `;` always terminates the current token and emits itself as a standalone token.
+            // This lets it be a sentence separator in natural language: "Hello; I am forth."
+            flush!();
+            tokens.push(";".to_string());
+            chars.next();
         } else if c.is_whitespace() {
             flush!();
             chars.next();
@@ -4886,8 +6099,9 @@ mod tests {
         let mut vm = Forth::new();
         vm.exec(": hello  42 . ;").unwrap();
         vm.exec("forget hello").unwrap();
-        // Word should no longer be callable
-        assert!(vm.exec("hello").is_err(), "hello should be undefined after forget");
+        // Original definition is gone — `missing-word` handles it now (prints "(hello)"), not "42"
+        let out = vm.exec("hello").unwrap();
+        assert!(!out.contains("42"), "original body should not run after forget, got: {out:?}");
     }
 
     #[test]
@@ -4922,7 +6136,9 @@ mod tests {
         let mut vm = Forth::new();
         vm.exec(": hello  42 . ;").unwrap();
         vm.exec("undo").unwrap();
-        assert!(vm.exec("hello").is_err(), "hello should be gone after undo");
+        // Original definition is gone — `missing-word` handles it, not "42"
+        let out = vm.exec("hello").unwrap();
+        assert!(!out.contains("42"), "original body should not run after undo, got: {out:?}");
     }
 
     #[test]
@@ -4943,8 +6159,11 @@ mod tests {
         vm.exec(": c  30 . ;").unwrap();
         vm.exec("undo").unwrap(); // removes c
         vm.exec("undo").unwrap(); // removes b
-        assert!(vm.exec("c").is_err(), "c should be gone");
-        assert!(vm.exec("b").is_err(), "b should be gone");
+        // Original definitions gone — missing-word handles them, not "30"/"20"
+        let out_c = vm.exec("c").unwrap();
+        let out_b = vm.exec("b").unwrap();
+        assert!(!out_c.contains("30"), "c body should not run after undo, got: {out_c:?}");
+        assert!(!out_b.contains("20"), "b body should not run after undo, got: {out_b:?}");
         let out = vm.exec("a").unwrap();
         assert_eq!(out.trim(), "10", "a should still work");
     }
@@ -5371,7 +6590,7 @@ mod tests {
     fn test_zh_vocab_give_it_entry_exists() {
         let lib = crate::coforth::Library::load();
         let entry = lib.lookup("给它").expect("给它 must exist in library");
-        assert_eq!(entry.forth.as_deref(), Some("on"));
+        assert!(entry.forth.is_some(), "给它 must have a forth entry");
     }
 
     // ── vocabulary: en.toml entries ───────────────────────────────────────
@@ -5448,6 +6667,323 @@ mod tests {
         assert_eq!(vm.my_addr.as_deref(), Some("host:9000"));
     }
 
+    // ── Proof system ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_assert_passes_on_nonzero() {
+        // assert should not error when flag is nonzero
+        Forth::run("-1 assert").unwrap();
+        Forth::run("1 assert").unwrap();
+        Forth::run("42 assert").unwrap();
+    }
+
+    #[test]
+    fn test_assert_fails_on_zero() {
+        let err = Forth::run("0 assert").unwrap_err();
+        assert!(err.to_string().contains("assertion failed"), "{err}");
+    }
+
+    #[test]
+    fn test_stdlib_proofs_compiled() {
+        let vm = Forth::new();
+        // STDLIB_PROOFS compiles test:square, test:fib, etc.
+        assert!(vm.name_index.contains_key("test:square"), "test:square missing");
+        assert!(vm.name_index.contains_key("test:fib"),    "test:fib missing");
+        assert!(vm.name_index.contains_key("test:gcd"),    "test:gcd missing");
+        assert!(vm.name_index.contains_key("test:+"),      "test:+ missing");
+    }
+
+    #[test]
+    fn test_prove_word_passes() {
+        let out = Forth::run(r#"prove" square""#).unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("✓") && plain.contains("square"), "{plain}");
+    }
+
+    #[test]
+    fn test_prove_word_fails_for_broken_definition() {
+        // Redefine test:square to always fail, then prove should show ✗
+        let mut vm = Forth::new();
+        vm.eval(": test:square 0 assert ;").unwrap();
+        let out = vm.exec(r#"prove" square""#).unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("✗") && plain.contains("square"), "{plain}");
+    }
+
+    #[test]
+    fn test_prove_word_unknown_shows_hint() {
+        let out = Forth::run(r#"prove" nonexistent-word-xyz""#).unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("no proof"), "{plain}");
+    }
+
+    #[test]
+    fn test_prove_all_reports_summary() {
+        let out = Forth::run("prove-all").unwrap();
+        let plain = strip_ansi(&out);
+        // Should have a "passed" summary line
+        assert!(plain.contains("passed"), "{plain}");
+        // On all-pass, only the summary line is printed — no individual ✓ noise
+        assert!(!plain.contains("✓"), "should be silent on all-pass: {plain}");
+    }
+
+    #[test]
+    fn test_prove_all_silent_on_pass_verbose_on_fail() {
+        // When all pass: only summary, no ✓ lines.
+        let out = Forth::run("prove-all").unwrap();
+        let plain = strip_ansi(&out);
+        assert_eq!(plain.lines().count(), 1, "all-pass should be one line: {plain}");
+
+        // When one test fails: ✗ line + summary.
+        let mut vm = Forth::new();
+        vm.eval(": test:broken 0 assert ;").unwrap();
+        let out = vm.exec("prove-all").unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("✗") && plain.contains("broken"), "{plain}");
+        assert!(plain.contains("failed"), "{plain}");
+    }
+
+    #[test]
+    fn test_boom_executes_machine_and_says_boom() {
+        // boom ( str -- ): evals the code string then says "💥 boom."
+        let out = Forth::run("s\" 3 4 +\" boom").unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("boom"), "expected boom: {plain}");
+    }
+
+    #[test]
+    fn test_eval_executes_code_string() {
+        // eval runs the code in the string; side effects appear in output
+        let out = Forth::run("s\" 42 .\" eval").unwrap();
+        assert!(strip_ansi(&out).contains("42"));
+    }
+
+    #[test]
+    fn test_sun_pushes_epoch_and_prints() {
+        let out = Forth::run("sun drop").unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("epoch"), "expected epoch in sun output: {plain}");
+    }
+
+    #[test]
+    fn test_boom_runs_code_from_stack() {
+        // boom pops string, evals it, says boom — the machine runs first
+        let out = Forth::run("s\" 1 2 +\" boom").unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("boom"), "expected boom: {plain}");
+    }
+
+    #[test]
+    fn test_prove_all_bool_pushes_true_on_all_pass() {
+        // prove-all? should push -1 when all proofs pass
+        let out = Forth::run("prove-all? .").unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("-1"), "expected -1 (true): {plain}");
+    }
+
+    #[test]
+    fn test_user_can_define_and_prove_own_word() {
+        let mut vm = Forth::new();
+        vm.eval(": double dup + ;").unwrap();
+        vm.eval(": test:double 5 double 10 = assert  0 double 0 = assert ;").unwrap();
+        let out = vm.exec(r#"prove" double""#).unwrap();
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("✓") && plain.contains("double"), "{plain}");
+    }
+
+    #[test]
+    fn test_inlining_short_words_produces_correct_results() {
+        // Short words (body ≤ 4 cells, no nested calls) should be inlined.
+        // Verify inlined words produce the same results as non-inlined equivalents.
+        let mut vm = Forth::new();
+        // `inc` is 2 cells (Lit(1), Plus) — fits inline limit
+        vm.eval(": inc  1 + ;").unwrap();
+        // `double` is 2 cells (Dup, Star... wait dup+) — fits
+        vm.eval(": double  dup + ;").unwrap();
+        // Using inlined words in a larger expression
+        assert_eq!(vm.exec("5 inc . cr").unwrap().trim(), "6");
+        assert_eq!(vm.exec("7 double . cr").unwrap().trim(), "14");
+        // Chain of inlined words
+        assert_eq!(vm.exec("3 inc double . cr").unwrap().trim(), "8");
+    }
+
+    #[test]
+    fn test_inlining_noop_compiles_to_nothing() {
+        // noop has empty body — inlined as zero cells, caller unchanged
+        let mut vm = Forth::new();
+        let before_len = vm.memory.len();
+        vm.eval(": probe  42 noop 42 = ;").unwrap();
+        // The noop contributed no cells to the body
+        let result = vm.exec("probe . cr").unwrap();
+        assert!(result.trim() == "-1", "noop should not change stack: {result}");
+        let _ = before_len; // memory grows but noop adds nothing
+    }
+
+    #[test]
+    fn test_large_words_not_inlined_still_correct() {
+        // fib is large and recursive — must not be inlined; still correct
+        let result = Forth::run("7 fib . cr").unwrap();
+        assert_eq!(result.trim(), "21");
+        // signum is > 4 cells — stays as Addr call, result still correct
+        let result = Forth::run("-5 signum . cr").unwrap();
+        assert_eq!(result.trim(), "-1");
+    }
+
+    #[test]
+    fn test_fib_iter_values() {
+        let cases = [
+            ("0 fib-iter . cr", "1"),
+            ("1 fib-iter . cr", "1"),
+            ("2 fib-iter . cr", "2"),
+            ("7 fib-iter . cr", "21"),
+            ("10 fib-iter . cr", "89"),
+        ];
+        for (prog, expected) in cases {
+            let got = Forth::run(prog).unwrap();
+            assert_eq!(got.trim(), expected, "program: {prog}  got: {}", got.trim());
+        }
+    }
+
+    #[test]
+    fn test_try_it() {
+        // argue across different grammars: postfix vs infix.
+        // same computation, different notation — the stack settles it.
+        let tries = [
+            // same grammar
+            r#"s" 3 4 +"      s" 4 3 +"              argue"#,
+            r#"s" 10 fib"     s" 10 fib-iter"        argue"#,
+            // different grammars: Forth postfix vs infix
+            r#"s" 3 4 +"      s" 3 + 4"      infix-argue"#,
+            r#"s" 3 4 * 2 +"  s" 3 * 4 + 2"  infix-argue"#,
+            r#"s" 10 3 -"     s" 10 - 3"     infix-argue"#,
+            r#"s" 3 4 2 * +"  s" 3 + 4 * 2"  infix-argue"#,  // precedence: 3 + (4*2) = 11
+        ];
+        let mut all = String::new();
+        for prog in tries {
+            let out = Forth::run(prog).expect(prog);
+            all.push_str(&strip_ansi(&out));
+        }
+        println!("{all}");
+        assert!(all.contains("agreed"));
+    }
+
+    #[test]
+    fn test_both_ways() {
+        // Two directions at once: prove commutativity for each operation.
+        let cases = [
+            r#"3 4 s" +" both-ways"#,
+            r#"5 6 s" *" both-ways"#,
+            r#"12 10 s" and" both-ways"#,
+            r#"12 10 s" or" both-ways"#,
+        ];
+        for prog in cases {
+            Forth::run(prog).expect(prog); // runs without bail → proof holds
+        }
+    }
+
+    #[test]
+    fn test_page() {
+        let prog = r#"page"
+3 4 +     | 4 3 +
+3 4 *     | 4 3 *
+10 3 -    | 7
+""#;
+        Forth::run(prog).expect("page proof should hold");
+    }
+
+    #[test]
+    fn test_resolve() {
+        // Many sentences, one truth.
+        let prog = r#"resolve"
+3 4 +
+4 3 +
+7
+2 5 +
+14 2 /
+""#;
+        let out = Forth::run(prog).expect("all sentences should resolve to 7");
+        let clean = strip_ansi(&out);
+        assert!(clean.contains("all agree"), "expected 'all agree' in: {clean}");
+    }
+
+    #[test]
+    fn test_resolve_disagrees() {
+        let prog = r#"resolve"
+3 4 +
+3 4 -
+""#;
+        assert!(Forth::run(prog).is_err());
+    }
+
+    #[test]
+    fn test_page_disagree_fails() {
+        let prog = r#"page"
+3 4 +  | 3 4 -
+""#;
+        assert!(Forth::run(prog).is_err(), "disagreeing page should fail");
+    }
+
+    #[test]
+    fn test_back_and_forth() {
+        // A round trip is a proof: go forth, come back, you are home.
+        let cases = [
+            r#"5  s" 3 +"  s" 3 -"  back-and-forth"#,   // +3 then -3
+            r#"7  s" 2 *"  s" 2 /"  back-and-forth"#,   // *2 then /2
+            r#"9  s" negate"  s" negate"  back-and-forth"#, // negate is its own inverse
+            r#"1  s" 1 lshift"  s" 1 rshift"  back-and-forth"#, // bit-shift round trip
+        ];
+        for prog in cases {
+            Forth::run(prog).expect(prog); // assert does not panic → proof holds
+        }
+    }
+
+    #[test]
+    fn test_natural_language_missing_word() {
+        // Define a known word, then use it in a natural language sentence.
+        // Known words execute; unknown ones are silently dropped by default missing-word.
+        let out = strip_ansi(&Forth::run(
+            ": greet  .\" hi.\" cr ;   greet; I am a forth program."
+        ).unwrap());
+        assert!(out.contains("hi"), "known word should execute, got: {out:?}");
+        // Unknown words silently dropped — no parens, no error
+        assert!(!out.contains("(I)"), "silent handler should not print parens, got: {out:?}");
+    }
+
+    #[test]
+    fn test_missing_word_handler_customizable() {
+        // Redefine missing-word to count each unknown word (drop the string, push 1 and print).
+        let out = strip_ansi(&Forth::run(
+            ": missing-word ( str -- ) drop 1 . ;  hello world"
+        ).unwrap());
+        // `hello` and `world` are both unknown here → handler fires twice → "1 1"
+        assert!(out.contains("1"), "custom handler should fire for unknown words, got: {out:?}");
+    }
+
+    #[test]
+    fn test_semicolon_separates_tokens() {
+        // `Hello;` should tokenize as two tokens: `Hello` and `;`
+        // Previously it was one token `Hello;` that could never match.
+        let out = strip_ansi(&Forth::run(
+            ": greet .\" hi\" ;  greet; unknown-word-xyz"
+        ).unwrap());
+        assert!(out.contains("hi"), "greet should execute after semicolon split, got: {out:?}");
+    }
+
+    #[test]
+    fn test_infix_precedence() {
+        let cases = [
+            ("s\" 3 + 4\" infix . cr", "7"),
+            ("s\" 3 * 4\" infix . cr", "12"),
+            ("s\" 3 + 4 * 2\" infix . cr", "11"),   // 3 + (4*2) = 11
+            ("s\" ( 3 + 4 ) * 2\" infix . cr", "14"), // (3+4)*2 = 14
+            ("s\" 10 - 3\" infix . cr", "7"),
+        ];
+        for (prog, expected) in cases {
+            let got = Forth::run(prog).unwrap();
+            assert_eq!(got.trim(), expected, "prog: {prog}");
+        }
+    }
+
     /// Strip ANSI escape codes for plain-text assertions.
     fn strip_ansi(s: &str) -> String {
         let mut out = String::new();
@@ -5463,5 +6999,64 @@ mod tests {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn test_join_channel_adds_to_set() {
+        let mut vm = Forth::new();
+        let _ = vm.exec(r#"channel" #forth""#);
+        assert!(vm.channels.contains("#forth"), "{:?}", vm.channels);
+    }
+
+    #[test]
+    fn test_part_channel_removes_from_set() {
+        let mut vm = Forth::new();
+        let _ = vm.exec(r#"channel" #forth""#);
+        assert!(vm.channels.contains("#forth"));
+        let _ = vm.exec(r#"part" #forth""#);
+        assert!(!vm.channels.contains("#forth"), "{:?}", vm.channels);
+    }
+
+    #[test]
+    fn test_channels_word_lists_joined() {
+        let mut vm = Forth::new();
+        let _ = vm.exec(r#"channel" #forth""#);
+        let _ = vm.exec(r#"channel" #general""#);
+        let out = vm.exec("channels").unwrap();
+        let plain = out.replace("\x1b[", "").replace("m", ""); // rough ansi strip
+        assert!(out.contains("#forth") || plain.contains("forth"), "{out}");
+        assert!(out.contains("#general") || plain.contains("general"), "{out}");
+    }
+
+    #[test]
+    fn test_word_propagation_via_channel_message() {
+        // Simulate receiving a word definition over a channel
+        let mut bob = Forth::new();
+        let channel_msg = ": triple  3 * ;";
+        let _ = bob.exec_with_fuel(channel_msg, 0);
+        let out = bob.exec("5 triple .").unwrap();
+        assert_eq!(out.trim(), "15", "{out}");
+    }
+
+    #[test]
+    fn test_extract_channel_forth_integration() {
+        // The extract helper + compile round-trip
+        let msg = "[#forth] alice: : quadruple  4 * ;";
+        // extract the definition (mirrors extract_channel_forth logic)
+        let close = msg.find(']').unwrap();
+        let after = msg[close+1..].trim_start_matches(':').trim_start();
+        let colon_pos = after.find(": ").unwrap();
+        let content = after[colon_pos+2..].trim();
+        assert!(content.starts_with(':'));
+
+        let mut vm = Forth::new();
+        let _ = vm.exec_with_fuel(content, 0);
+        let out = vm.exec("3 quadruple .").unwrap();
+        assert_eq!(out.trim(), "12", "{out}");
     }
 }

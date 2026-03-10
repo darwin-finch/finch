@@ -337,6 +337,8 @@ static COMPILED_VM: LazyLock<crate::coforth::Forth> = LazyLock::new(|| {
     let defs = &*BUILTIN_DEFS;
     let mut vm = crate::coforth::Forth::new();
     let _ = vm.exec_with_fuel(&defs.all_defs, 0);
+    // Major words: pure Forth, no TOML. Compiled last so they win over generated versions.
+    let _ = vm.exec_with_fuel(MAJOR_WORDS_FORTH, 0);
     vm
 });
 
@@ -361,6 +363,43 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
 
     BuiltinDefs { pairs, all_defs }
 });
+
+/// Major words — pure Forth, no TOML, no markup.
+/// Just stack ops and sentences. Compiled into COMPILED_VM after BUILTIN_DEFS.
+/// The proof of a word is running it from different sentences and getting the same answer.
+const MAJOR_WORDS_FORTH: &str = "
+: sequence  .\" one thing after another.\" cr  5 0 do i . loop cr ;
+: series    .\" each step doubles.\" cr  1 2 4 8 16 . . . . . cr ;
+: list      .\" here is what you have.\" cr  .s ;
+: array     .\" positions 0 through 2.\" cr  3 0 do i . loop cr ;
+: path      .\" start. step. step. arrive.\" cr ;
+: function  .\" give it five, it returns twenty-five.\" cr  5 dup * . cr ;
+: change    .\" before and after.\" cr  5 dup . .\"  ->\" 1+ . cr ;
+: set       .\" each one distinct.\" cr  1 2 3 .s ;
+: limit     .\" ten wants to be five, so it becomes five.\" cr  10 0 5 clamp . cr ;
+: boundary  .\" two is inside zero to four.\" cr  2 0 4 within .bool cr ;
+: edge      .\" from here to there.\" cr  0 . .\"  ..\" 10 . cr ;
+: group     .\" three and four make seven and stay in the group.\" cr  3 4 + . cr ;
+: number    .\" forty-two.\" cr  42 . cr ;
+: element   depth 0> if .\" this one: \" . cr else .\" nothing on the stack.\" cr then ;
+: divide    .\" ten divided by three: three remainder one.\" cr  10 3 /mod . .\"  r\" . cr ;
+: fraction  .\" one of three equal parts.\" cr ;
+: part      .\" something taken from something larger.\" cr ;
+: sum       .\" one plus two plus three is six.\" cr  1 2 3 + + . cr ;
+: area      .\" four wide, five tall, twenty inside.\" cr  4 5 * . cr ;
+: combine   .\" three and four become seven.\" cr  3 4 + . cr ;
+: rate      .\" how fast things happen.\" cr ;
+: cycle     .\" around and back.\" cr  5 0 do i . loop cr ;
+: along     .\" step by step by step.\" cr ;
+: abstract  .\" the map is not the territory.\" cr ;
+: discrete  .\" each one separate.\" cr  0 1 2 3 4 . . . . . cr ;
+: ascending .\" each one larger than the last.\" cr  1 2 4 8 16 . . . . . cr ;
+: buffer    .\" holding things until they are needed.\" cr  depth . .\"  waiting\" cr ;
+: data      .\" what you have before you decide what it means.\" cr  .s ;
+: order     .\" everything in its place.\" cr  1 2 3 4 5 . . . . . cr ;
+: logic     .\" if true and false, then false.\" cr  true false and .bool cr ;
+: space     .\" room for everything that could happen.\" cr ;
+";
 
 /// Philosophical/abstract primitives — hand-crafted, always present.
 const SEED_LIBRARY: &str = r#"

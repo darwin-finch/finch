@@ -274,6 +274,39 @@ pub enum ViewMode {
 /// Scan Forth source for `scatter-exec" cmd"` literals and return formatted plan lines.
 ///
 /// Used for pre-flight plan display before remote execution.
+/// Extract a Forth definition from a channel message, if present.
+/// Channel messages have the format `[#channel] sender: <content>`.
+/// If `<content>` starts with `:` (a colon definition), return it.
+/// Heuristic: does this input look like natural language rather than Forth code?
+/// Used to decide whether to fall through to AI even when the VM ran silently.
+///
+/// Triggers on:
+/// - Questions (ASCII `?` or fullwidth `？`)
+/// - Non-Latin scripts (Chinese, Arabic, Japanese, Korean, etc.) that aren't
+///   Forth definitions — these never need uppercase to signal "sentence"
+/// - Latin sentences starting with an uppercase letter
+fn looks_like_natural_language(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.contains('?') || trimmed.contains('？') { return true; }
+    // Non-ASCII content that isn't a Forth definition is natural language.
+    // Forth definitions always start with `:`.
+    if !trimmed.starts_with(':') && trimmed.chars().any(|c| !c.is_ascii()) {
+        return true;
+    }
+    // Latin sentence: starts with uppercase letter (not a number or operator).
+    trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+}
+
+fn extract_channel_forth(msg: &str) -> Option<String> {
+    if !msg.starts_with('[') { return None; }
+    let close = msg.find(']')?;
+    let after_bracket = msg[close + 1..].trim_start_matches(':').trim_start();
+    // after_bracket is now "sender: content" — find the ": content" part
+    let colon_pos = after_bracket.find(": ")?;
+    let content = after_bracket[colon_pos + 2..].trim();
+    if content.starts_with(':') { Some(content.to_string()) } else { None }
+}
+
 fn extract_scatter_exec_commands(code: &str) -> Vec<String> {
     let mut cmds = Vec::new();
     let needle = r#"scatter-exec""#;
@@ -571,41 +604,26 @@ impl EventLoop {
                 .collect();
             user_entries.sort_by(|a, b| a.word.cmp(&b.word));
 
-            // Build display lines from builtins + user extensions.
-            let mut display_lines: Vec<String> = Vec::with_capacity(
-                builtin.pairs.len() + user_entries.len()
-            );
             let mut boot_codes: Vec<String> = Vec::new();
 
-            // Builtin display lines (pre-sorted, cached).
-            for (word, code) in &builtin.pairs {
-                let jit_def = format!(": {} {} ;", word, code);
-                let jit_display = jit_def.chars().take(72).collect::<String>();
-                display_lines.push(format!("{}  {}", jit_display.dark_grey(), "ok".dark_grey()));
-            }
-
-            // User extension display lines + boot codes.
+            // Compile user vocabulary extensions (builtins are already in the precompiled VM).
             let mut user_defs = String::new();
             for entry in &user_entries {
                 let code = entry.forth.as_deref().unwrap_or("");
-                let jit_def = format!(": {} {} ;", entry.word, code);
+                let jit_def = if code.trim_start().starts_with(':') {
+                    code.trim().to_string()
+                } else {
+                    format!(": {} {} ;", entry.word, code)
+                };
                 user_defs.push_str(&jit_def);
                 user_defs.push('\n');
                 if entry.boot {
                     boot_codes.push(code.to_string());
                 }
-                let jit_display = jit_def.chars().take(72).collect::<String>();
-                display_lines.push(format!("{}  {}", jit_display.dark_grey(), "ok".dark_grey()));
             }
-
-            // Builtins are already compiled (VM started from precompiled_vm()).
-            // Only compile user vocabulary extensions.
             if !user_defs.is_empty() {
                 let _ = self.forth_vm.exec_with_fuel(&user_defs, 0);
             }
-
-            // Show the full dictionary flash in one write — instant, no sleep.
-            self.output_manager.write_info(display_lines.join("\n"));
 
             // Execute boot=true words (they may produce output: poems, time, etc.)
             for code in &boot_codes {
@@ -621,6 +639,9 @@ impl EventLoop {
 
             // Restore words learned in previous sessions.
             self.load_user_words();
+
+            // Run user-authored boot poetry from ~/.finch/boot.forth.
+            self.run_boot_poems();
 
             // Boot poetry — plain Rust strings, compiled in, no parsing.
             for poem in crate::coforth::library::BOOT_POETRY {
@@ -912,10 +933,20 @@ impl EventLoop {
                     }
                     for msg in incoming {
                         use crossterm::style::Stylize;
-                        self.output_manager.write_info(
+                        // Channel messages ([#name] sender: text) get distinct colour
+                        let display = if msg.starts_with('[') && msg.contains(']') {
+                            format!("{}", msg.as_str().cyan())
+                        } else {
                             format!("{}  {}", "←".dark_grey(), msg.as_str().white())
-                        );
-                        if let Err(e) = self.handle_stack_push(msg).await {
+                        };
+                        self.output_manager.write_info(display);
+
+                        // Word propagation: if the message is a channel Forth definition,
+                        // compile it silently into the local VM so the shared vocabulary grows.
+                        // Format: "[#channel] sender: : word body ;"
+                        if let Some(forth_def) = extract_channel_forth(&msg) {
+                            let _ = self.forth_vm.exec_with_fuel(&forth_def, 0);
+                        } else if let Err(e) = self.handle_stack_push(msg).await {
                             tracing::warn!("Failed to handle incoming push: {e}");
                         }
                     }
@@ -2659,25 +2690,49 @@ impl EventLoop {
 
         // Try the VM first — boot JIT compiled all vocab words so known words run immediately.
         let snap = self.forth_vm.snapshot();
+        let is_nl = looks_like_natural_language(&text);
         let vm_result = self.forth_vm.exec(&text);
+        let vm_err: Option<String>;
         match vm_result {
-            Ok(out) if !out.is_empty() => {
+            Ok(ref out) if !out.is_empty() => {
                 self.save_user_words();
                 self.output_manager.write_info(out.trim_end().to_string());
-                return self.render_tui().await;
+                // Vocab word ran (e.g. `hello`). If this also looks like a sentence
+                // or question, fall through and let the AI respond too.
+                if !is_nl {
+                    return self.render_tui().await;
+                }
+                self.render_tui().await?;
+                vm_err = None;
+                // continue to AI below
             }
             Ok(_) => {
-                // Compiled/ran silently — the other programmer reads the stack.
-                self.save_user_words();
-                return self.render_tui().await;
+                // Drain unknown words that need AI definition.
+                let unknowns = self.forth_vm.take_pending_defines();
+                if !unknowns.is_empty() {
+                    // Grammar grows from use: unknown words get defined, not dropped.
+                    self.forth_vm.restore(&snap);
+                    return self.handle_define_unknown_words(unknowns, text).await;
+                }
+                if is_nl {
+                    // VM ran silently but input looks like natural language.
+                    // Restore snapshot (avoid leaving stale values on the stack)
+                    // and let the AI respond as the "other programmer".
+                    self.forth_vm.restore(&snap);
+                    vm_err = None;
+                    // continue to AI below
+                } else {
+                    // Pure Forth execution — the other programmer reads the stack.
+                    self.save_user_words();
+                    return self.render_tui().await;
+                }
             }
             Err(ref e) => {
                 // VM rejected it — restore and note the error for the AI's context.
+                vm_err = Some(e.to_string());
                 self.forth_vm.restore(&snap);
-                let _ = e; // moved into query below
             }
         }
-        let vm_err = vm_result.err().map(|e| e.to_string());
 
         // The other programmer's turn: respond with Forth.
         // Both sides only write Forth — definitions, words, stack ops, output.
@@ -2707,14 +2762,22 @@ impl EventLoop {
         let system_note = "Two Forth programmers are sharing a terminal, building things together.\
              If the first programmer gave an instruction or described something to build, \
              reply with Forth code only. \
-             After each word definition or expression, add a \\ comment (on the same line, before the semicolon or at end) \
-             that says in plain English what it does — one short phrase, no jargon. \
+             After each word definition, add a \\ comment (same line) that says in plain English what it does — one short phrase, no jargon. \
              Example:  : greet  .\" hello\" cr ;  \\ prints hello \
-             After defining words, call them so the user sees what happens. \
+             After each word definition, write a test:word proof that asserts its behaviour. \
+             Use assert ( flag -- ) which aborts if 0. Keep proofs minimal — one or two checks. \
+             Example after  : double  dup + ;  write  : test:double  4 double 8 = assert ; \
+             For words with side-effects (output only, no stack result), assert the stack depth is unchanged: \
+             Example after  : greet  .\" hi\" cr ;  write  : test:greet  depth >r greet depth r> = assert ; \
+             After all definitions and proofs, write  prove-all  to verify everything before running. \
+             Then call the defined words so the user sees what happens. \
+             If prove-all finds a failure, stop — do not call the main words. \
              When a program needs the user to choose between options, use \
              select\" title|option1|option2\" which pops up a dialog and leaves the chosen index (0-based) on the stack. \
              Example: select\" What color?|Red|Green|Blue\" \
              Forth word names can be in any language — if the input is Chinese, define words with Chinese names. \
+             If the user said something in a language that has no matching word in the vocabulary yet, \
+             define it as a Forth word so it runs instantly next time. \
              If they asked a question or made a comment, \
              reply in the same language they used — clear, direct, two sentences max. \
              Never explain Forth syntax unprompted.";
@@ -2839,7 +2902,7 @@ impl EventLoop {
                  WORD: <label> | FORTH: <forth code>\n\n\
                  The Forth code must be valid Forth that produces a result (a number or printed output).\n\
                  Available built-ins: + - * / mod dup drop swap over rot . .\" cr if else then begin until do loop i variable @ !\n\
-                 Useful library words: square cube sum-to-n gcd fib sign even? odd? clamp\n\
+                 Useful library words: square cube sum-to-n gcd fib signum even? odd? clamp\n\
                  Example:\n\
                  WORD: double | FORTH: : double 2 * ; 5 double .\n\
                  WORD: sum-5 | FORTH: 5 sum-to-n .\n\
@@ -3155,6 +3218,9 @@ impl EventLoop {
                 );
             }
         }
+        // Drain any boot poems registered this exec.
+        let poems = self.forth_vm.take_boot_poems();
+        if !poems.is_empty() { self.save_boot_poems(&poems); }
         self.render_tui().await
     }
 
@@ -3179,6 +3245,115 @@ impl EventLoop {
         let _ = self.forth_vm.exec_with_fuel(&source, 0);
         let count = self.forth_vm.dump_source().lines().count();
         tracing::debug!("Loaded {} user word(s) from {:?}", count, path);
+    }
+
+    /// Append boot poem lines to ~/.finch/boot.forth (one `.\" text\" cr` per line).
+    /// Called after any exec that may have produced boot poems via `boot" text"`.
+    fn save_boot_poems(&self, poems: &[String]) {
+        let Some(mut path) = dirs::home_dir() else { return };
+        path.push(".finch");
+        let _ = std::fs::create_dir_all(&path);
+        path.push("boot.forth");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            for poem in poems {
+                let escaped = poem.replace('"', "\\\"");
+                let _ = writeln!(f, ".\" {}\" cr", escaped);
+            }
+        }
+    }
+
+    /// Run ~/.finch/boot.forth at startup — the user's boot poetry.
+    fn run_boot_poems(&mut self) {
+        let Some(mut path) = dirs::home_dir() else { return };
+        path.push(".finch");
+        path.push("boot.forth");
+        let Ok(source) = std::fs::read_to_string(&path) else { return };
+        if source.is_empty() { return; }
+        if let Ok(out) = self.forth_vm.exec_with_fuel(&source, 0) {
+            if !out.is_empty() {
+                self.output_manager.write_info(out.trim_end().to_string());
+            }
+        }
+    }
+
+    /// Grammar grows from use — unknown words trigger AI definition,
+    /// get compiled into the VM, and re-run instantly from that point on.
+    ///
+    /// Called when the VM encounters unknown words (tracked in `pending_defines`).
+    /// Asks the AI to define each word as Forth, compiles the result, then
+    /// re-executes the original input so the user sees the output immediately.
+    async fn handle_define_unknown_words(
+        &mut self,
+        words: Vec<String>,
+        original_input: String,
+    ) -> Result<()> {
+        use crossterm::style::Stylize;
+
+        let user_vocab = self.forth_vm.dump_source();
+        let vocab_section = if user_vocab.is_empty() {
+            String::new()
+        } else {
+            format!("Existing vocabulary:\n{user_vocab}\n\n")
+        };
+        let word_list = words.join(", ");
+
+        // Ask AI to define the unknown words as Forth.
+        // The AI is the second programmer — it sees the unknown words and defines them.
+        let prompt = format!(
+            "Two Forth programmers are at a shared terminal. \
+             The first programmer typed: {original_input:?}\n\n\
+             {vocab_section}\
+             The following words are not yet defined: {word_list}\n\n\
+             Define each as a Forth word. Rules:\n\
+             - One `: name  ... ;` definition per word.\n\
+             - After each definition, write a comment `\\ what it does` on the same line.\n\
+             - After each definition, write a minimal test: `: test:NAME  ... assert ;`\n\
+             - After all definitions and tests, write `prove-all` then call each new word.\n\
+             - Word names must match the user's input exactly (case-sensitive).\n\
+             - If the word names are in a non-English language, the Forth definitions may call \
+               gen\" ...\" to invoke AI, or simply print something meaningful.\n\
+             - No explanations outside comments. Only valid Forth.\n\
+             Forth only:",
+        );
+
+        let messages = vec![crate::claude::Message {
+            role: "user".to_string(),
+            content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+        }];
+
+        let forth_defs = {
+            let gen = self.cloud_gen.read().await;
+            match gen.generate(messages, None).await {
+                Ok(resp) => resp.text,
+                Err(e) => return Err(e),
+            }
+        };
+
+        // Strip markdown fences.
+        let forth_defs = forth_defs
+            .trim()
+            .trim_start_matches("```forth")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string();
+
+        if forth_defs.is_empty() {
+            return self.render_tui().await;
+        }
+
+        // Show what's being compiled.
+        self.output_manager.write_info(
+            format!("{}  {}", "→".dark_grey(), forth_defs.as_str().cyan())
+        );
+        self.render_tui().await.ok();
+
+        // Compile the definitions.
+        self.handle_forth_eval_inner(forth_defs, false).await?;
+
+        // Re-run the original input — words are now defined.
+        self.handle_forth_eval_inner(original_input, false).await
     }
 
     /// `/vm` — dump the VM's user-defined words as Forth source.
@@ -5531,6 +5706,24 @@ mod tests {
             options.is_empty(),
             "pending_brain_question_options should be cleared"
         );
+    }
+
+    #[test]
+    fn test_extract_channel_forth_definition() {
+        let msg = "[#forth] alice: : double  2 * ;";
+        assert_eq!(extract_channel_forth(msg), Some(": double  2 * ;".to_string()));
+    }
+
+    #[test]
+    fn test_extract_channel_forth_non_definition() {
+        let msg = "[#general] alice: hello world";
+        assert_eq!(extract_channel_forth(msg), None);
+    }
+
+    #[test]
+    fn test_extract_channel_forth_non_channel() {
+        let msg = "← plain peer message";
+        assert_eq!(extract_channel_forth(msg), None);
     }
 
     #[test]
