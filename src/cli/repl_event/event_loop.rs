@@ -3082,23 +3082,75 @@ impl EventLoop {
     /// No approval dialog. No Forth visible to the user.
     /// Someone posted code in a foreign language (JS, Python, etc.) wrapped in
     /// a code fence.  Send it back as a better machine.
-    /// If the AI returns Forth, it gets compiled into the shared VM — the exchange defines the language.
+    /// The response could be anything — improved JS, a Forth translation, a mix.
+    /// If it contains Forth definitions, compile them. Otherwise just show it.
     async fn handle_foreign_code(&mut self, lang: String, code: String) -> Result<()> {
         use crossterm::style::Stylize;
         let lang_display = if lang.is_empty() { "code".to_string() } else { lang.clone() };
         self.output_manager.write_info(
-            format!("← {} received. sending back a better machine.", lang_display).dark_grey().to_string()
+            format!("← {} received.", lang_display).dark_grey().to_string()
         );
 
-        // Route through the machine-exchange loop. The foreign code becomes the "first programmer's"
-        // message; the AI responds with Forth (or improved code) which then gets compiled.
-        let exchange_input = format!(
-            "improve this {} and send it back as a Forth machine if possible:\n```{}\n{}\n```",
+        let prompt = format!(
+            "Two programmers exchange machines. The first programmer sent this {} code:\n\n\
+             ```{}\n{}\n```\n\n\
+             Send back a better machine. It can be:\n\
+             - Improved {lang_display} (fix bugs, apply idioms)\n\
+             - A Forth translation (`: word ... ;`) if that captures it cleanly\n\
+             - Both — improved code plus a Forth word that wraps it\n\
+             Show the machine. One line saying what changed. Nothing else.",
             if lang.is_empty() { "code".to_string() } else { lang.clone() },
-            lang, code
+            lang, code,
         );
 
-        self.handle_forth_eval_inner(exchange_input, false).await
+        let response = {
+            let gen = self.cloud_gen.read().await;
+            match gen.generate(vec![crate::claude::Message {
+                role: "user".to_string(),
+                content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+            }], None).await {
+                Ok(r) => r.text,
+                Err(e) => return Err(e),
+            }
+        };
+
+        // Does the response contain Forth definitions? Compile them.
+        let has_forth = response.contains(": ") && response.contains(" ;");
+        if has_forth {
+            // Extract and compile any Forth definitions; show the rest as prose.
+            let (forth_parts, prose_parts): (Vec<&str>, Vec<&str>) = response
+                .lines()
+                .partition(|line| {
+                    let t = line.trim();
+                    t.starts_with(':') || t.starts_with("prove-all") || t.starts_with('\\'  )
+                });
+            let prose = prose_parts.join("\n").trim().to_string();
+            let forth = forth_parts.join("\n").trim().to_string();
+            if !prose.is_empty() {
+                self.output_manager.write_info(
+                    format!("→  {}", prose.as_str().white())
+                );
+            }
+            if !forth.is_empty() {
+                self.output_manager.write_info(
+                    format!("→  {}", forth.as_str().cyan())
+                );
+                self.handle_forth_eval_inner(forth, false).await?;
+            }
+        } else {
+            // Not Forth — just show the better machine as-is.
+            let cleaned = response
+                .trim()
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim()
+                .to_string();
+            self.output_manager.write_info(
+                format!("→  {}", cleaned.as_str().cyan())
+            );
+        }
+
+        self.render_tui().await
     }
 
     async fn handle_push_message(&mut self, msg: String) -> Result<()> {
