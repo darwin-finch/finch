@@ -30,6 +30,8 @@ pub struct WordEntry {
     #[serde(default)]
     pub forth: Option<String>, // Forth code that embodies this word; runs at CPU speed
     #[serde(default)]
+    pub proof: Option<[String; 2]>, // Two equivalent Forth sentences that argue the definition
+    #[serde(default)]
     pub sense: Option<String>, // disambiguating label e.g. "game", "romantic", "physics"
     #[serde(default)]
     pub boot: bool, // if true, Forth code runs at startup (used for boot poetry etc.)
@@ -446,6 +448,8 @@ const ENGLISH_LIBRARY: &str = include_str!("english_library.toml");
 pub struct BuiltinDefs {
     /// Sorted (word_name, forth_code) pairs.
     pub pairs: Vec<(String, String)>,
+    /// Words that carry a two-sentence argue proof: (word, [sentence_a, sentence_b]).
+    pub proofs: Vec<(String, [String; 2])>,
     /// Single concatenated Forth source: ": word code ;\n" for every entry.
     pub all_defs: String,
 }
@@ -485,7 +489,12 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
         (e.word.clone(), code.to_string())
     }).collect();
 
-    BuiltinDefs { pairs, all_defs }
+    // Collect words that have argue proofs (definition ↔ Forth bridge).
+    let proofs: Vec<(String, [String; 2])> = entries.iter()
+        .filter_map(|e| e.proof.as_ref().map(|p| (e.word.clone(), p.clone())))
+        .collect();
+
+    BuiltinDefs { pairs, proofs, all_defs }
 });
 
 /// Major words — stack machines + sentences + proofs.
@@ -3338,6 +3347,26 @@ mod tests {
         }
         if !hard_failures.is_empty() {
             panic!("Words not callable:\n{}", hard_failures.join("\n"));
+        }
+    }
+
+    /// Verify English-library proof entries are parsed and their argue sentences converge.
+    #[test]
+    fn test_english_library_proof_entries_argue() {
+        let defs = Library::builtin_defs();
+        // We added proofs to several words — verify at least some are present.
+        assert!(!defs.proofs.is_empty(), "expected at least one proof entry in English library");
+
+        let mut failures = Vec::new();
+        for (word, [a, b]) in &defs.proofs {
+            let mut vm = Library::precompiled_vm();
+            let src = format!("s\" {}\" s\" {}\" argue", a, b);
+            if let Err(e) = vm.exec_with_fuel(&src, 100_000) {
+                failures.push(format!("  argue:{word} [{a}] ≠ [{b}]: {e}"));
+            }
+        }
+        if !failures.is_empty() {
+            panic!("Proof failures:\n{}", failures.join("\n"));
         }
     }
 

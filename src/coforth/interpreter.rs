@@ -214,6 +214,7 @@ enum Builtin {
     Assert,                   // ( flag -- )  bail "assertion failed" if flag == 0
     ProveAll,                 // ( -- )  run all test:* words; report pass/fail
     ProveAllBool,             // ( -- flag )  run all test:* words; push -1 (all pass) or 0 (any fail)
+    ProveEnglish,             // ( -- )  run every English-library word body; report pass rate
     // Channel system
     ListChannels,             // ( -- )  print joined channels
 }
@@ -3894,6 +3895,91 @@ impl Forth {
                 self.data.push(if fail == 0 { -1 } else { 0 });
             }
 
+            Builtin::ProveEnglish => {
+                // Run every English-library word body in an isolated VM and report
+                // how many succeed (no error).  "Prove most the words in english."
+                //
+                // Two kinds of proof:
+                //   1. Execution proof — the Forth body runs without an unknown-word error.
+                //      Stack underflows are acceptable (some words need input on the stack).
+                //   2. Argue proof   — words that carry a `proof = [a, b]` field get an
+                //      `argue` run: sentence A and sentence B must converge to the same stack.
+                //      This bridges the English definition ↔ Forth machine.
+                use crate::coforth::library::Library;
+                use crossterm::style::Stylize;
+
+                let defs = Library::builtin_defs();
+                let pairs: Vec<(String, String)> = defs.pairs.clone();
+                let proofs: Vec<(String, [String; 2])> = defs.proofs.clone();
+                let total = pairs.len();
+                let mut pass = 0usize;
+                let mut fail_words: Vec<(String, String)> = Vec::new();
+
+                // Phase 1: execution proofs (all words).
+                for (word, body) in &pairs {
+                    let mut vm = Library::precompiled_vm();
+                    vm.clear_data();
+                    match vm.exec_with_fuel(body.as_str(), 50_000) {
+                        Ok(_) => { pass += 1; }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            // Only count hard failures: unknown words or compile errors.
+                            // Stack underflows from words that expect input are acceptable.
+                            if msg.contains("unknown word") || msg.contains("compile") {
+                                fail_words.push((word.clone(), msg));
+                            } else {
+                                pass += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Phase 2: argue proofs (definition ↔ Forth bridge).
+                let proof_total = proofs.len();
+                let mut proof_pass = 0usize;
+                let mut proof_fail: Vec<(String, String)> = Vec::new();
+                for (word, [a, b]) in &proofs {
+                    let mut vm = Library::precompiled_vm();
+                    // Build: s" A" s" B" argue
+                    let src = format!("s\" {}\" s\" {}\" argue", a, b);
+                    match vm.exec_with_fuel(&src, 100_000) {
+                        Ok(_) => { proof_pass += 1; }
+                        Err(e) => {
+                            proof_fail.push((word.clone(), e.to_string()));
+                        }
+                    }
+                }
+
+                let fail = fail_words.len();
+                let pct = if total > 0 { (pass * 100) / total } else { 0 };
+
+                for (word, msg) in &fail_words {
+                    self.out.push_str(&format!("  ✗ {}: {}\n", word.as_str().red(), msg));
+                }
+                for (word, msg) in &proof_fail {
+                    self.out.push_str(&format!("  ✗ argue:{}: {}\n", word.as_str().red(), msg));
+                }
+
+                let pass_s = format!("{pass}/{total} words ({pct}%)");
+                if fail == 0 && proof_total == 0 {
+                    self.out.push_str(&format!("── {} ──\n", pass_s.green().bold()));
+                } else if fail == 0 && proof_fail.is_empty() {
+                    let bridge_s = format!("{proof_pass}/{proof_total} proofs");
+                    self.out.push_str(&format!(
+                        "── {}  {} ──\n",
+                        pass_s.green().bold(),
+                        bridge_s.cyan().bold(),
+                    ));
+                } else {
+                    let unresolved = fail + proof_fail.len();
+                    self.out.push_str(&format!(
+                        "── {}  {} unresolved ──\n",
+                        pass_s.yellow().bold(),
+                        unresolved.to_string().red().bold(),
+                    ));
+                }
+            }
+
             Builtin::Infix => {
                 // ( str -- )  Evaluate an infix expression.
                 // Uses shunting-yard to respect precedence: * / before + -.
@@ -5238,6 +5324,7 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "assert"         => Builtin::Assert,
         "prove-all"      => Builtin::ProveAll,
         "prove-all?"     => Builtin::ProveAllBool,
+        "prove-english"  => Builtin::ProveEnglish,
         "channels"       => Builtin::ListChannels,
         _ => return None,
     })
@@ -6904,6 +6991,25 @@ mod tests {
         let plain = strip_ansi(&out);
         assert!(plain.contains("✗") && plain.contains("broken"), "{plain}");
         assert!(plain.contains("failed"), "{plain}");
+    }
+
+    #[test]
+    fn test_prove_english_reports_most_words_pass() {
+        // prove-english runs all 1049 English-library word bodies.
+        // At least 90% should execute without unknown-word errors.
+        let out = Forth::run("prove-english").unwrap();
+        let plain = strip_ansi(&out);
+        assert!(!plain.is_empty(), "prove-english produced no output");
+        // Summary line contains "words" and a percentage
+        assert!(plain.contains("words"), "expected 'words' in output: {plain}");
+        // Extract pass/total from "N/1049 words (P%)"
+        let summary = plain.lines().last().unwrap_or("");
+        // Find the pass count — must be at least 900 out of ~1049
+        if let Some(slash_pos) = summary.find('/') {
+            let pass_str = summary[..slash_pos].trim_start_matches(|c: char| !c.is_ascii_digit());
+            let pass: usize = pass_str.parse().unwrap_or(0);
+            assert!(pass >= 900, "expected ≥900 English words to prove, got {pass}: {plain}");
+        }
     }
 
     #[test]

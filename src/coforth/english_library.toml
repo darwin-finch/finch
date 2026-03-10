@@ -108,6 +108,7 @@ definition = "a unit of time equal to 1/60 of a minute"
 related = ["time", "minute", "unit"]
 kind = "temporal"
 forth = '1 . ." second" cr'
+proof = ["1", "60 60 /"]
 
 [[word]]
 word = "minute"
@@ -115,6 +116,7 @@ definition = "a unit of time equal to 60 seconds"
 related = ["time", "second", "hour"]
 kind = "temporal"
 forth = '60 . ." seconds in minute" cr'
+proof = ["60", "3600 60 /"]
 
 [[word]]
 word = "predict"
@@ -122,6 +124,7 @@ definition = "to foretell based on current data"
 related = ["forecast", "anticipate", "estimate"]
 kind = "action"
 forth = '2 3 + . cr'
+proof = ["2 3 +", "3 2 +"]
 
 [[word]]
 word = "expect"
@@ -136,6 +139,7 @@ definition = "to bring into existence"
 related = ["build", "generate", "make"]
 kind = "action"
 forth = '10 5 + . cr'
+proof = ["10 5 +", "5 10 +"]
 
 [[word]]
 word = "start"
@@ -157,6 +161,7 @@ definition = "the most excellent or desirable option"
 related = ["excellent", "superior", "optimal", "choice"]
 kind = "evaluation"
 forth = '10 5 max . cr'
+proof = ["10 5 max", "5 10 max"]
 
 [[word]]
 word = "strong"
@@ -171,6 +176,7 @@ definition = "entire or complete"
 related = ["complete", "entire", "intact", "full"]
 kind = "state"
 forth = '8 8 = . cr'
+proof = ["8 8 =", "0 0="]
 
 [[word]]
 word = "able"
@@ -206,6 +212,7 @@ definition = "easily understood or done"
 related = ["easy", "straightforward", "basic", "uncomplicated"]
 kind = "complexity"
 forth = '1 1 + . cr'
+proof = ["1 1 +", "2"]
 
 [[word]]
 word = "complex"
@@ -213,6 +220,7 @@ definition = "involving many different parts or aspects"
 related = ["complicated", "intricate", "elaborate", "sophisticated"]
 kind = "complexity"
 forth = '3 4 * 5 + . cr'
+proof = ["3 4 * 5 +", "4 3 * 5 +"]
 
 [[word]]
 word = "people"
@@ -227,6 +235,7 @@ definition = "a method or manner of doing something"
 related = ["method", "manner", "approach", "path"]
 kind = "process"
 forth = '10 2 / . cr'
+proof = ["10 2 /", "10 2/"]
 
 [[word]]
 word = "man"
