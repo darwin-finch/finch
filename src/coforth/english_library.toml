@@ -132,6 +132,7 @@ definition = "to anticipate or look forward to"
 related = ["anticipate", "await", "hope"]
 kind = "action"
 forth = '5 square . cr'
+proof = ["5 square", "5 5 *"]
 
 [[word]]
 word = "create"
@@ -169,6 +170,7 @@ definition = "having great physical power or intensity"
 related = ["powerful", "robust", "intense", "forceful"]
 kind = "attribute"
 forth = '100 square . cr'
+proof = ["100 square", "100 100 *"]
 
 [[word]]
 word = "whole"
@@ -192,6 +194,7 @@ definition = "solid and firm to the touch"
 related = ["solid", "firm", "rigid", "tough"]
 kind = "texture"
 forth = '1 2/ . cr'
+proof = ["1 2/", "0"]
 
 [[word]]
 word = "clear"
@@ -207,6 +210,7 @@ definition = "having great weight"
 related = ["weighty", "massive", "dense", "burdensome"]
 kind = "attribute"
 forth = '100 50 max . cr'
+proof = ["100 50 max", "50 100 max"]
 
 [[word]]
 word = "simple"
@@ -238,6 +242,7 @@ definition = "a method or manner of doing something"
 related = ["method", "manner", "approach", "path"]
 kind = "process"
 forth = '10 2/ . cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "man"
@@ -395,6 +400,7 @@ definition = "a feeling of sorrow"
 related = ["sorrow", "grief", "melancholy"]
 kind = "emotion"
 forth = '5 2/ . ." down" cr'
+proof = ["5 2/", "2"]
 
 [[word]]
 word = "anger"
@@ -402,6 +408,7 @@ definition = "a strong feeling of annoyance"
 related = ["annoyance", "rage", "fury"]
 kind = "emotion"
 forth = '7 2* . ." intense" cr'
+proof = ["7 2*", "7 dup +"]
 
 [[word]]
 word = "fear"
@@ -409,6 +416,7 @@ definition = "an unpleasant emotion caused by threat"
 related = ["threat", "anxiety", "terror"]
 kind = "emotion"
 forth = '3 1- . ." wary" cr'
+proof = ["3 1-", "2"]
 
 [[word]]
 word = "surprise"
@@ -591,6 +599,7 @@ definition = "a generalization of vector space over a ring instead of a field"
 related = ["vector-space", "ring", "scalar"]
 kind = "structure"
 forth = '3 2* 5 + . ." module" cr'
+proof = ["3 2*", "3 dup +"]
 
 [[word]]
 word = "vector-space"
@@ -627,6 +636,7 @@ definition = "an isomorphism from a structure to itself"
 related = ["isomorphism", "self-mapping", "symmetry"]
 kind = "mapping"
 forth = '3 square dup . ." self" cr drop'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "kernel"
@@ -686,6 +696,7 @@ definition = "moving toward the interior of"
 related = ["inside", "toward", "within"]
 kind = "direction"
 forth = '2 2* . cr'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "through"
@@ -707,6 +718,7 @@ definition = "the two or the one and the other"
 related = ["two", "pair", "dual"]
 kind = "quantity"
 forth = '2 2* . cr'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "while"
@@ -751,6 +763,7 @@ definition = "in spite of the fact that"
 related = ["though", "despite", "even if"]
 kind = "contrast"
 forth = '3 2 max . cr'
+proof = ["3 2 max", "2 3 max"]
 
 [[word]]
 word = "whether"
@@ -774,6 +787,7 @@ definition = "in opposition to"
 related = ["versus", "opposed", "contrary"]
 kind = "opposition"
 forth = '5 negate . cr'
+proof = ["5 negate", "0 5 -"]
 
 [[word]]
 word = "pressure"
@@ -828,6 +842,7 @@ definition = "physical property that causes particles to attract or repel"
 related = ["attraction", "repulsion", "electric"]
 kind = "property"
 forth = '1 negate . ." charge sign" cr'
+proof = ["1 negate", "0 1 -"]
 
 [[word]]
 word = "particle"
@@ -856,6 +871,7 @@ definition = "stored energy based on position or configuration"
 related = ["energy", "stored", "position"]
 kind = "energy"
 forth = '5 square . ." potential" cr'
+proof = ["5 square", "5 5 *"]
 
 [[word]]
 word = "kinetic"
@@ -863,6 +879,7 @@ definition = "energy possessed by a moving object"
 related = ["energy", "motion", "velocity"]
 kind = "energy"
 forth = '2 2* . ." kinetic" cr'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "thermal"
@@ -905,6 +922,7 @@ definition = "to divide a sequence into smaller groups"
 related = ["divide", "group", "sequence", "split"]
 kind = "operation"
 forth = '5 2/ .'
+proof = ["5 2/", "2"]
 
 [[word]]
 word = "window"
@@ -1003,6 +1021,7 @@ definition = "a function preserving limits and closeness"
 related = ["limit", "function", "open", "map"]
 kind = "analysis"
 forth = '5 2* ." continuous map" cr'
+proof = ["5 2*", "5 dup +"]
 
 [[word]]
 word = "interior"
@@ -1010,6 +1029,7 @@ definition = "the largest open set contained within a set"
 related = ["open", "set", "boundary", "core"]
 kind = "topology"
 forth = '7 2/ ." interior point" cr'
+proof = ["7 2/", "3"]
 
 [[word]]
 word = "closure"
@@ -1017,6 +1037,7 @@ definition = "the smallest closed set containing a given set"
 related = ["closed", "set", "limit", "adhesion"]
 kind = "topology"
 forth = '4 1+ ." closure add" cr'
+proof = ["4 1+", "5"]
 
 [[word]]
 word = "dense"
@@ -1031,6 +1052,7 @@ definition = "an open set containing a point"
 related = ["open", "point", "set", "around"]
 kind = "topology"
 forth = '5 1- ." neighborhood" cr'
+proof = ["5 1-", "4"]
 
 [[word]]
 word = "converge"
@@ -1038,6 +1060,7 @@ definition = "a sequence approaching a limit"
 related = ["limit", "sequence", "approach", "limit"]
 kind = "analysis"
 forth = '10 2/ ." converge half" cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "diverge"
@@ -1045,6 +1068,7 @@ definition = "a sequence going to infinity without limit"
 related = ["infinity", "sequence", "unbounded", "grow"]
 kind = "analysis"
 forth = '2 2* ." diverge double" cr'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "metric"
@@ -1066,6 +1090,7 @@ definition = "a continuous deformation between functions"
 related = ["continuous", "deformation", "function", "path"]
 kind = "topology"
 forth = '2 3 min ." homotopy min" cr'
+proof = ["2 3 min", "3 2 min"]
 
 [[word]]
 word = "manifold"
@@ -1073,6 +1098,7 @@ definition = "a space locally resembling Euclidean space"
 related = ["local", "euclidean", "space", "dimension"]
 kind = "geometry"
 forth = '4 square ." manifold area" cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "codomain"
@@ -1087,6 +1113,7 @@ definition = "the composition of functions, where one function is applied after 
 related = ["function", "chain", "apply", "sequence"]
 kind = "operation"
 forth = '2 square 1+ . cr'
+proof = ["2 square", "2 2 *"]
 
 [[word]]
 word = "identity"
@@ -1101,6 +1128,7 @@ definition = "to use or implement a function on an input"
 related = ["use", "function", "input", "output"]
 kind = "action"
 forth = '5 square . cr'
+proof = ["5 square", "5 5 *"]
 
 [[word]]
 word = "inject"
@@ -1122,6 +1150,7 @@ definition = "a function that is both injective and surjective"
 related = ["one-to-one", "onto", "invertible", "function"]
 kind = "property"
 forth = '3 2* 1+ . cr'
+proof = ["3 2*", "3 dup +"]
 
 [[word]]
 word = "fixed-point"
@@ -1136,6 +1165,7 @@ definition = "the set of outputs of a function for a given input set"
 related = ["output", "set", "function", "result"]
 kind = "set"
 forth = '4 square . cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "constant"
@@ -1150,6 +1180,7 @@ definition = "a function of the form f(x) = ax, where a is a constant"
 related = ["proportion", "scale", "function", "multiplication"]
 kind = "function"
 forth = '3 2* . cr'
+proof = ["3 2*", "3 dup +"]
 
 [[word]]
 word = "affine"
@@ -1157,6 +1188,7 @@ definition = "a function of the form f(x) = ax + b"
 related = ["linear", "shift", "function", "transformation"]
 kind = "function"
 forth = '2 2* 1+ . cr'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "trade"
@@ -1192,6 +1224,7 @@ definition = "satisfaction from consuming goods"
 related = ["satisfaction", "benefit", "value", "pleasure"]
 kind = "economic"
 forth = '4 square . ." utility" cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "scarcity"
@@ -1206,6 +1239,7 @@ definition = "resources used to produce goods"
 related = ["investment", "assets", "resources", "wealth"]
 kind = "economic"
 forth = '1 2* 2* . ." capital" cr'
+proof = ["1 2*", "1 dup +"]
 
 [[word]]
 word = "production"
@@ -1220,6 +1254,7 @@ definition = "distribute resources efficiently"
 related = ["distribute", "assign", "divide", "share"]
 kind = "economic"
 forth = '10 2/ 2 / . ." allocated" cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "optimize"
@@ -1227,6 +1262,7 @@ definition = "make the best use of resources"
 related = ["maximize", "improve", "efficient", "best"]
 kind = "economic"
 forth = '4 5 max . ." optimized" cr'
+proof = ["4 5 max", "5 4 max"]
 
 [[word]]
 word = "equilibrium"
@@ -1241,6 +1277,7 @@ definition = "additional benefit from one more unit"
 related = ["incremental", "extra", "additional", "change"]
 kind = "economic"
 forth = '3 1+ . ." marginal" cr'
+proof = ["3 1+", "4"]
 
 [[word]]
 word = "elastic"
@@ -1248,6 +1285,7 @@ definition = "responsiveness to price changes"
 related = ["responsive", "flexible", "sensitive", "variable"]
 kind = "economic"
 forth = '2 2* . ." elastic" cr'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "efficient"
@@ -1255,6 +1293,7 @@ definition = "achieving maximum output with minimum input"
 related = ["effective", "productive", "optimal", "streamlined"]
 kind = "economic"
 forth = '6 2/ . ." efficient" cr'
+proof = ["6 2/", "3"]
 
 [[word]]
 word = "ecology"
@@ -1311,6 +1350,7 @@ definition = "the visible shape or configuration of something"
 related = ["shape", "structure", "appearance", "pattern"]
 kind = "structure"
 forth = '2 2* . cr'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "chaos"
@@ -1325,6 +1365,7 @@ definition = "a combination of qualities that pleases the aesthetic senses"
 related = ["aesthetic", "pleasing", "harmony", "grace"]
 kind = "aesthetic"
 forth = '5 square . cr'
+proof = ["5 square", "5 5 *"]
 
 [[word]]
 word = "good"
@@ -1332,6 +1373,7 @@ definition = "morally excellent or virtuous"
 related = ["moral", "virtuous", "right", "positive"]
 kind = "moral"
 forth = '10 5 max . cr'
+proof = ["10 5 max", "5 10 max"]
 
 [[word]]
 word = "evil"
@@ -1339,6 +1381,7 @@ definition = "profoundly immoral and wicked"
 related = ["immoral", "wicked", "bad", "negative"]
 kind = "moral"
 forth = '10 5 min . cr'
+proof = ["10 5 min", "5 10 min"]
 
 [[word]]
 word = "necessary"
@@ -1346,6 +1389,7 @@ definition = "required to be done, achieved, or present"
 related = ["required", "essential", "mandatory", "vital"]
 kind = "requirement"
 forth = '1 0= . cr'
+proof = ["1 0=", "0"]
 
 [[word]]
 word = "distance"
@@ -1374,6 +1418,7 @@ definition = "to cross or meet at a point"
 related = ["cross", "meet", "overlap", "join"]
 kind = "geometry"
 forth = '1 1+ . cr'
+proof = ["1 1+", "2"]
 
 [[word]]
 word = "rotate"
@@ -1458,6 +1503,7 @@ definition = "the boundary or limit of something"
 related = ["boundary", "limit", "border", "margin"]
 kind = "spatial"
 forth = '5 1- ." edge" cr'
+proof = ["5 1-", "4"]
 
 [[word]]
 word = "location"
@@ -1507,6 +1553,7 @@ definition = "the measurement of something from side to side"
 related = ["breadth", "size", "dimension", "span"]
 kind = "spatial"
 forth = '8 2* ." width" cr'
+proof = ["8 2*", "8 dup +"]
 
 [[word]]
 word = "height"
@@ -1514,6 +1561,7 @@ definition = "the measurement from base to top"
 related = ["tallness", "altitude", "elevation", "stature"]
 kind = "spatial"
 forth = '6 1+ ." height" cr'
+proof = ["6 1+", "7"]
 
 [[word]]
 word = "symbol"
@@ -1654,6 +1702,7 @@ definition = "a small theorem used to prove a larger one"
 related = ["theorem", "proof", "corollary", "auxiliary"]
 kind = "logic"
 forth = '3 square 9 = ." Lemma: 3^2=9" cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "corollary"
@@ -1661,6 +1710,7 @@ definition = "a result that follows directly from a theorem"
 related = ["theorem", "consequence", "deduction", "inference"]
 kind = "logic"
 forth = '4 2* 8 = ." Corollary: 4*2=8" cr'
+proof = ["4 2*", "4 dup +"]
 
 [[word]]
 word = "premise"
@@ -1682,6 +1732,7 @@ definition = "a proposed explanation to be tested"
 related = ["theory", "supposition", "conjecture", "assumption"]
 kind = "logic"
 forth = '1 1+ 2 = ." Hypothesis: 1+1=2" cr'
+proof = ["1 1+", "2"]
 
 [[word]]
 word = "assertion"
@@ -1717,6 +1768,7 @@ definition = "excluding others"
 related = ["only", "sole", "unique", "singular"]
 kind = "logic"
 forth = '1 2 xor ." Exclusive: 1 XOR 2" cr'
+proof = ["1 2 xor", "2 1 xor"]
 
 [[word]]
 word = "equal"
@@ -1752,6 +1804,7 @@ definition = "rely on or be contingent upon"
 related = ["rely", "conditional", "require"]
 kind = "relation"
 forth = '5 0> ." depends" cr'
+proof = ["5 0>", "-1"]
 
 [[word]]
 word = "independent"
@@ -1815,6 +1868,7 @@ definition = "separate into constituent parts"
 related = ["break", "separate", "analyze"]
 kind = "operation"
 forth = '10 2/ 5 * ." decomposes" cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "embed"
@@ -1829,6 +1883,7 @@ definition = "estimate or forecast based on current trends"
 related = ["forecast", "estimate", "map"]
 kind = "operation"
 forth = '10 2* ." projects" cr'
+proof = ["10 2*", "10 dup +"]
 
 [[word]]
 word = "refine"
@@ -1836,6 +1891,7 @@ definition = "make more precise or improve"
 related = ["improve", "polish", "perfect"]
 kind = "process"
 forth = '7 1+ ." refined" cr'
+proof = ["7 1+", "8"]
 
 [[word]]
 word = "cooperate"
@@ -1850,6 +1906,7 @@ definition = "strive to gain or win something by defeating or establishing super
 related = ["rival", "contest", "challenge", "win"]
 kind = "social"
 forth = '5 3 max . cr'
+proof = ["5 3 max", "3 5 max"]
 
 [[word]]
 word = "share"
@@ -1857,6 +1914,7 @@ definition = "divide and distribute in portions"
 related = ["divide", "distribute", "portion", "allocate"]
 kind = "social"
 forth = '10 2/ . cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "norm"
@@ -1892,6 +1950,7 @@ definition = "discuss or bargain to reach agreement"
 related = ["discuss", "bargain", "agree", "mediate"]
 kind = "social"
 forth = '7 3 max 5 min . cr'
+proof = ["7 3 max", "3 7 max"]
 
 [[word]]
 word = "vote"
@@ -1913,6 +1972,7 @@ definition = "entrust a task or responsibility to another"
 related = ["entrust", "assign", "task", "responsibility"]
 kind = "social"
 forth = '6 2/ . cr'
+proof = ["6 2/", "3"]
 
 [[word]]
 word = "govern"
@@ -1941,6 +2001,7 @@ definition = "smaller in size, amount, or degree"
 related = ["smaller", "minor", "inferior", "minimum"]
 kind = "comparison"
 forth = '10 20 min . cr'
+proof = ["10 20 min", "20 10 min"]
 
 [[word]]
 word = "maximum"
@@ -1948,6 +2009,7 @@ definition = "the greatest possible amount or degree"
 related = ["max", "highest", "peak", "limit"]
 kind = "comparison"
 forth = '15 30 max . cr'
+proof = ["15 30 max", "30 15 max"]
 
 [[word]]
 word = "minimum"
@@ -1955,6 +2017,7 @@ definition = "the least or smallest amount or degree"
 related = ["min", "lowest", "bottom", "lesser"]
 kind = "comparison"
 forth = '25 10 min . cr'
+proof = ["25 10 min", "10 25 min"]
 
 [[word]]
 word = "compare"
@@ -1990,6 +2053,7 @@ definition = "the greatest amount, quantity, or degree that is possible"
 related = ["maximum", "boundary", "cap", "restriction"]
 kind = "comparison"
 forth = '100 50 max . cr'
+proof = ["100 50 max", "50 100 max"]
 
 [[word]]
 word = "above"
@@ -2039,6 +2103,7 @@ definition = "of greater size, extent, or capacity"
 related = ["bigger", "greater", "major", "maximum"]
 kind = "comparison"
 forth = '30 20 max . cr'
+proof = ["30 20 max", "20 30 max"]
 
 [[word]]
 word = "blood"
@@ -2123,6 +2188,7 @@ definition = "activity involving mental or physical effort done in order to achi
 related = ["labor", "effort", "task", "operate"]
 kind = "activity"
 forth = '4 2* . ." work done" cr'
+proof = ["4 2*", "4 dup +"]
 
 [[word]]
 word = "call"
@@ -2158,6 +2224,7 @@ definition = "quantity per unit of time"
 related = ["quantity", "time", "speed"]
 kind = "measurement"
 forth = '50 2/ .'
+proof = ["50 2/", "25"]
 
 [[word]]
 word = "proportion"
@@ -2228,6 +2295,7 @@ definition = "depending on a condition"
 related = ["condition", "dependent", "if"]
 kind = "logic"
 forth = '5 0> .bool'
+proof = ["5 0>", "-1"]
 
 [[word]]
 word = "along"
@@ -2263,6 +2331,7 @@ definition = "changing form or structure"
 related = ["change", "convert", "modify"]
 kind = "transformation"
 forth = '4 square . cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "composition"
@@ -2270,6 +2339,7 @@ definition = "combining parts into a whole"
 related = ["combine", "build", "assemble"]
 kind = "composition"
 forth = '2 3 + 5 * . cr'
+proof = ["2 3 + 5 *", "25"]
 
 [[word]]
 word = "abstraction"
@@ -2298,6 +2368,7 @@ definition = "deriving properties from a parent"
 related = ["derive", "parent", "extend"]
 kind = "inheritance"
 forth = '3 4 max . cr'
+proof = ["3 4 max", "4 3 max"]
 
 [[word]]
 word = "delegation"
@@ -2361,6 +2432,7 @@ definition = "to increase by one"
 related = ["increase", "add", "1+", "plus"]
 kind = "operation"
 forth = '5 1+ . cr'
+proof = ["5 1+", "6"]
 
 [[word]]
 word = "decrement"
@@ -2368,6 +2440,7 @@ definition = "to decrease by one"
 related = ["decrease", "subtract", "1-", "minus"]
 kind = "operation"
 forth = '5 1- . cr'
+proof = ["5 1-", "4"]
 
 [[word]]
 word = "double"
@@ -2375,6 +2448,7 @@ definition = "to multiply by two"
 related = ["multiply", "twice", "2*", "halve"]
 kind = "operation"
 forth = '3 2* . cr'
+proof = ["3 2*", "3 dup +"]
 
 [[word]]
 word = "halve"
@@ -2382,6 +2456,7 @@ definition = "to divide by two"
 related = ["divide", "half", "2/", "double"]
 kind = "operation"
 forth = '6 2/ . cr'
+proof = ["6 2/", "3"]
 
 [[word]]
 word = "negate"
@@ -2389,6 +2464,7 @@ definition = "to make negative or reverse sign"
 related = ["reverse", "opposite", "negative", "invert"]
 kind = "operation"
 forth = '5 negate . cr'
+proof = ["5 negate", "0 5 -"]
 
 [[word]]
 word = "reciprocal"
@@ -2564,6 +2640,7 @@ definition = "second derivative operator"
 related = ["divergence", "curl", "second derivative", "operator"]
 kind = "vector calculus"
 forth = '4 square . ." laplacian scalar" cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "differential"
@@ -2571,6 +2648,7 @@ definition = "small change or infinitesimal"
 related = ["derivative", "integral", "change", "infinitesimal"]
 kind = "calculus"
 forth = '1 1- . ." differential dx" cr'
+proof = ["1 1-", "0"]
 
 [[word]]
 word = "convergent"
@@ -2592,6 +2670,7 @@ definition = "polynomial approximation of a function"
 related = ["fourier", "series", "expansion", "approximation"]
 kind = "analysis"
 forth = '1 2* 3 + . ." Taylor term" cr'
+proof = ["1 2*", "1 dup +"]
 
 [[word]]
 word = "matrix"
@@ -2641,6 +2720,7 @@ definition = "to bring something up to date"
 related = ["refresh", "revise", "modify", "renew"]
 kind = "action"
 forth = '5 1+ .'
+proof = ["5 1+", "6"]
 
 [[word]]
 word = "replace"
@@ -2655,6 +2735,7 @@ definition = "to shut or seal something"
 related = ["shut", "seal", "end", "conclude"]
 kind = "action"
 forth = '5 0= .'
+proof = ["5 0=", "0"]
 
 [[word]]
 word = "size"
@@ -2669,6 +2750,7 @@ definition = "the heaviness of something"
 related = ["mass", "heaviness", "load", "burden"]
 kind = "measurement"
 forth = '10 abs .'
+proof = ["10 abs", "10"]
 
 [[word]]
 word = "speed"
@@ -2676,6 +2758,7 @@ definition = "the rate of motion or progress"
 related = ["velocity", "pace", "rate", "swiftness"]
 kind = "measurement"
 forth = '2 2* .'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "despair"
@@ -2907,6 +2990,7 @@ definition = "the act of learning about something"
 related = ["learn", "examine", "research", "analyze"]
 kind = "action"
 forth = '3 square . ." studying squares" cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "book"
@@ -2921,6 +3005,7 @@ definition = "a task or piece of work"
 related = ["work", "task", "duty", "employment"]
 kind = "noun"
 forth = '4 2* . ." jobs doubled" cr'
+proof = ["4 2*", "4 dup +"]
 
 [[word]]
 word = "side"
@@ -2928,6 +3013,7 @@ definition = "a position to the left or right"
 related = ["left", "right", "edge", "direction"]
 kind = "noun"
 forth = '6 2/ . ." half a side" cr'
+proof = ["6 2/", "3"]
 
 [[word]]
 word = "kind"
@@ -2935,6 +3021,7 @@ definition = "a type or sort"
 related = ["type", "sort", "category", "variety"]
 kind = "noun"
 forth = '7 1+ . ." kind of seven" cr'
+proof = ["7 1+", "8"]
 
 [[word]]
 word = "house"
@@ -2942,6 +3029,7 @@ definition = "a building for living in"
 related = ["home", "building", "dwelling", "residence"]
 kind = "noun"
 forth = '8 square . ." rooms squared" cr'
+proof = ["8 square", "8 8 *"]
 
 [[word]]
 word = "service"
@@ -2956,6 +3044,7 @@ definition = "a person whom one knows and with whom one has a bond of mutual aff
 related = ["companion", "ally", "buddy", "pal"]
 kind = "noun"
 forth = '10 5 max . ." best friend" cr'
+proof = ["10 5 max", "5 10 max"]
 
 [[word]]
 word = "father"
@@ -2977,6 +3066,7 @@ definition = "the final part of something"
 related = ["finish", "conclusion", "termination", "close"]
 kind = "noun"
 forth = '13 1- . ." nearing end" cr'
+proof = ["13 1-", "12"]
 
 [[word]]
 word = "problem"
@@ -3019,6 +3109,7 @@ definition = "maximum amount transferable through network"
 related = ["network", "capacity", "source", "sink"]
 kind = "graph theory"
 forth = '10 3 min . cr'
+proof = ["10 3 min", "3 10 min"]
 
 [[word]]
 word = "divisor"
@@ -3033,6 +3124,7 @@ definition = "number that is a product of another and integer"
 related = ["factor", "divisor", "product"]
 kind = "number theory"
 forth = '3 2* . cr'
+proof = ["3 2*", "3 dup +"]
 
 [[word]]
 word = "coprime"
@@ -3082,6 +3174,7 @@ definition = "relating to squares or quadratic equations"
 related = ["square", "equation", "discriminant"]
 kind = "algebra"
 forth = '4 square . cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "primitive-root"
@@ -3194,6 +3287,7 @@ definition = "capable of change"
 related = ["changeable", "variable", "dynamic"]
 kind = "property"
 forth = '5 1+ . cr'
+proof = ["5 1+", "6"]
 
 [[word]]
 word = "immutable"
@@ -3250,6 +3344,7 @@ definition = "not in a straight line"
 related = ["curved", "complex", "quadratic"]
 kind = "function"
 forth = '2 square . cr'
+proof = ["2 square", "2 2 *"]
 
 [[word]]
 word = "smooth"
@@ -3257,6 +3352,7 @@ definition = "continuous and gradual"
 related = ["continuous", "even", "differentiable"]
 kind = "function"
 forth = '1 1+ dup . cr drop'
+proof = ["1 1+", "2"]
 
 [[word]]
 word = "rough"
@@ -3278,6 +3374,7 @@ definition = "bent or rounded"
 related = ["nonlinear", "arc", "parabolic"]
 kind = "function"
 forth = '3 square . cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "regular"
@@ -3320,6 +3417,7 @@ definition = "the process of reaching a logical conclusion by reasoning from gen
 related = ["logic", "reasoning", "syllogism", "conclusion"]
 kind = "logic"
 forth = '10 2/ 5 = . cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "induction"
@@ -3362,6 +3460,7 @@ definition = "make a general or broad statement by inferring from specific cases
 related = ["general", "broaden", "infer", "universalize"]
 kind = "logic"
 forth = '2 2* . cr'
+proof = ["2 2*", "2 dup +"]
 
 [[word]]
 word = "specialize"
@@ -3369,6 +3468,7 @@ definition = "concentrate on and become expert in a particular subject or skill"
 related = ["focus", "expertise", "narrow", "particularize"]
 kind = "skill"
 forth = '8 2/ . cr'
+proof = ["8 2/", "4"]
 
 [[word]]
 word = "teach"
@@ -3383,6 +3483,7 @@ definition = "a simplified representation of a system or phenomenon"
 related = ["represent", "simulate", "example", "prototype"]
 kind = "representation"
 forth = '3 square . cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "divide"
@@ -3390,6 +3491,7 @@ definition = "perform division of two numbers"
 related = ["quotient", "/", "fraction"]
 kind = "arithmetic"
 forth = '10 2/ . cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "remainder"
@@ -3481,6 +3583,7 @@ definition = "having the properties of a magnet, especially the ability to attra
 related = ["attraction", "pole", "force", "pull"]
 kind = "physics"
 forth = '1 2* . ." attraction" cr'
+proof = ["1 2*", "1 dup +"]
 
 [[word]]
 word = "quantum"
@@ -3523,6 +3626,7 @@ definition = "the smallest structural and functional unit of an organism, typica
 related = ["unit", "organism", "microscopic", "membrane"]
 kind = "biology"
 forth = '1 1+ . ." cell" cr'
+proof = ["1 1+", "2"]
 
 [[word]]
 word = "gene"
@@ -3530,6 +3634,7 @@ definition = "a unit of heredity that is transferred from a parent to offspring 
 related = ["heredity", "dna", "trait", "chromosome"]
 kind = "biology"
 forth = '2 square . ." gene" cr'
+proof = ["2 square", "2 2 *"]
 
 [[word]]
 word = "protein"
@@ -3586,6 +3691,7 @@ definition = "to increase in size or number"
 related = ["increase", "expand", "accumulate"]
 kind = "development"
 forth = '1 1+ . ." grown" cr'
+proof = ["1 1+", "2"]
 
 [[word]]
 word = "differentiate"
@@ -3593,6 +3699,7 @@ definition = "to become distinct or specialized"
 related = ["specialize", "distinguish", "vary"]
 kind = "diversification"
 forth = '5 negate . ." different" cr'
+proof = ["5 negate", "0 5 -"]
 
 [[word]]
 word = "receptor"
@@ -3614,6 +3721,7 @@ definition = "an interconnected system"
 related = ["interconnect", "system", "web"]
 kind = "structure"
 forth = '3 4 xor . ." linked" cr'
+proof = ["3 4 xor", "4 3 xor"]
 
 [[word]]
 word = "feedback"
@@ -3621,6 +3729,7 @@ definition = "information used to adjust a process"
 related = ["adjust", "response", "loop"]
 kind = "control"
 forth = '10 2/ . ." adjusted" cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "metabolism"
@@ -3628,6 +3737,7 @@ definition = "chemical processes in living organisms"
 related = ["process", "transform", "energy"]
 kind = "transformation"
 forth = '3 square . ." metabolized" cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "chromosome"
@@ -3642,6 +3752,7 @@ definition = "process of choosing based on fitness"
 related = ["choose", "pick", "survive"]
 kind = "evolution"
 forth = '5 3 max . ." selected" cr'
+proof = ["5 3 max", "3 5 max"]
 
 [[word]]
 word = "drift"
@@ -3768,6 +3879,7 @@ definition = "the flattened structure of a higher plant, typically green and bla
 related = ["plant", "green", "blade"]
 kind = "botany"
 forth = '5 2* . ." leaf veins" cr'
+proof = ["5 2*", "5 dup +"]
 
 [[word]]
 word = "flower"
@@ -3775,6 +3887,7 @@ definition = "the reproductive structure found in flowering plants"
 related = ["plant", "reproductive", "petal"]
 kind = "botany"
 forth = '3 square . ." petals" cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "fruit"
@@ -3887,6 +4000,7 @@ definition = "to express the meaning of something in another form"
 related = ["encode", "decode", "interpret"]
 kind = "operation"
 forth = '10 2/ . cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "interpret"
@@ -3978,6 +4092,7 @@ definition = "having a lesser size or amount"
 related = ["less", "min", "lower", "smaller"]
 kind = "comparison"
 forth = '4 7 min . cr'
+proof = ["4 7 min", "7 4 min"]
 
 [[word]]
 word = "higher"
@@ -3985,6 +4100,7 @@ definition = "situated at a greater height or level"
 related = ["greater", "max", "upper", "higher"]
 kind = "comparison"
 forth = '4 7 max . cr'
+proof = ["4 7 max", "7 4 max"]
 
 [[word]]
 word = "lower"
@@ -3992,6 +4108,7 @@ definition = "situated below or at a lesser level"
 related = ["less", "min", "below", "lower"]
 kind = "comparison"
 forth = '7 4 min . cr'
+proof = ["7 4 min", "4 7 min"]
 
 [[word]]
 word = "closest"
@@ -4027,6 +4144,7 @@ definition = "arranged in order"
 related = ["order", "arrange", "min", "sorted"]
 kind = "sequence"
 forth = '5 3 max . 5 3 min . cr'
+proof = ["5 3 max", "3 5 max"]
 
 [[word]]
 word = "reversed"
@@ -4132,6 +4250,7 @@ definition = "a mapping between categories preserving structure"
 related = ["morphism", "category", "natural-transformation"]
 kind = "category-theory"
 forth = '5 2* . cr'
+proof = ["5 2*", "5 dup +"]
 
 [[word]]
 word = "natural-transformation"
@@ -4139,6 +4258,7 @@ definition = "a morphism between functors"
 related = ["functor", "morphism", "transformation"]
 kind = "category-theory"
 forth = '5 1+ . cr'
+proof = ["5 1+", "6"]
 
 [[word]]
 word = "adjunction"
@@ -4146,6 +4266,7 @@ definition = "a pair of adjoint functors"
 related = ["functor", "morphism", "adjoint"]
 kind = "category-theory"
 forth = '5 abs . cr'
+proof = ["5 abs", "5"]
 
 [[word]]
 word = "monad"
@@ -4153,6 +4274,7 @@ definition = "a monoid in the category of endofunctors"
 related = ["endofunctor", "functor", "monoid"]
 kind = "category-theory"
 forth = '5 square . cr'
+proof = ["5 square", "5 5 *"]
 
 [[word]]
 word = "comonad"
@@ -4167,6 +4289,7 @@ definition = "a functor from a category to itself"
 related = ["functor", "category", "endo"]
 kind = "category-theory"
 forth = '5 negate . cr'
+proof = ["5 negate", "0 5 -"]
 
 [[word]]
 word = "coproduct"
@@ -4237,6 +4360,7 @@ definition = "one of two equal parts"
 related = ["divide", "split", "fraction"]
 kind = "fraction"
 forth = '10 2/ .'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "quarter"
@@ -4293,6 +4417,7 @@ definition = "the product of a number multiplied by itself"
 related = ["multiply", "power", "area"]
 kind = "mathematical"
 forth = '4 square .'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "cube"
@@ -4370,6 +4495,7 @@ definition = "a part of a whole expressed as a quotient"
 related = ["integer", "ratio", "part"]
 kind = "type"
 forth = '1 2/ .'
+proof = ["1 2/", "0"]
 
 [[word]]
 word = "ratio"
@@ -4608,6 +4734,7 @@ definition = "to make or become coarser, less fine"
 related = ["refine", "granular", "smooth"]
 kind = "action"
 forth = '10 2/ . ." coarsened" cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "causes"
@@ -4713,6 +4840,7 @@ definition = "begin to be something different"
 related = ["change", "transform", "evolve", "develop"]
 kind = "transformation"
 forth = '3 2* . cr'
+proof = ["3 2*", "3 dup +"]
 
 [[word]]
 word = "leave"
@@ -4755,6 +4883,7 @@ definition = "make it easier for someone to do something"
 related = ["assist", "aid", "support", "facilitate"]
 kind = "assistance"
 forth = '4 square . cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "talk"
@@ -5105,6 +5234,7 @@ definition = "not influenced by personal feelings"
 related = ["impartial", "factual", "neutral"]
 kind = "perspective"
 forth = '5 square .'
+proof = ["5 square", "5 5 *"]
 
 [[word]]
 word = "relative"
@@ -5168,6 +5298,7 @@ definition = "moving or able to move at high speed"
 related = ["quick", "swift", "rapid", "speedy"]
 kind = "speed"
 forth = '1 1+ .'
+proof = ["1 1+", "2"]
 
 [[word]]
 word = "slow"
@@ -5266,6 +5397,7 @@ definition = "the following item in a sequence"
 related = ["following", "subsequent", "advance"]
 kind = "sequence"
 forth = '5 1+ .'
+proof = ["5 1+", "6"]
 
 [[word]]
 word = "previous"
@@ -5273,6 +5405,7 @@ definition = "the preceding item in a sequence"
 related = ["prior", "before", "retreat"]
 kind = "sequence"
 forth = '5 1- .'
+proof = ["5 1-", "4"]
 
 [[word]]
 word = "position"
@@ -5301,6 +5434,7 @@ definition = "containing nothing"
 related = ["void", "null", "vacant"]
 kind = "state"
 forth = '0 0= .bool'
+proof = ["0 0=", "-1"]
 
 [[word]]
 word = "iterate"
@@ -5364,6 +5498,7 @@ definition = "of poor quality or a low standard"
 related = ["good", "poor", "quality", "standard"]
 kind = "evaluation"
 forth = '5 negate . ." bad" cr'
+proof = ["5 negate", "0 5 -"]
 
 [[word]]
 word = "new"
@@ -5371,6 +5506,7 @@ definition = "recently made or invented"
 related = ["old", "fresh", "recent", "novel"]
 kind = "time"
 forth = '1 1+ . ." new" cr'
+proof = ["1 1+", "2"]
 
 [[word]]
 word = "old"
@@ -5462,6 +5598,7 @@ definition = "a set that contains all elements of another set as a subset"
 related = ["subset", "contains", "includes"]
 kind = "relation"
 forth = '7 3 and 3 = ." superset" cr'
+proof = ["7 3 and", "3 7 and"]
 
 [[word]]
 word = "union"
@@ -5469,6 +5606,7 @@ definition = "the set of all elements in either of two sets"
 related = ["intersection", "or", "combine"]
 kind = "operation"
 forth = '3 5 or . ." union" cr'
+proof = ["3 5 or", "5 3 or"]
 
 [[word]]
 word = "intersection"
@@ -5476,6 +5614,7 @@ definition = "the set of all elements common to two sets"
 related = ["union", "and", "overlap"]
 kind = "operation"
 forth = '7 3 and . ." intersection" cr'
+proof = ["7 3 and", "3 7 and"]
 
 [[word]]
 word = "complement"
@@ -5490,6 +5629,7 @@ definition = "a division of a set into non-overlapping subsets"
 related = ["disjoint", "subsets", "divide"]
 kind = "operation"
 forth = '7 3 and 0= ." partition" cr'
+proof = ["7 3 and", "3 7 and"]
 
 [[word]]
 word = "disjoint"
@@ -5497,6 +5637,7 @@ definition = "sets that have no elements in common"
 related = ["intersection", "empty", "separate"]
 kind = "property"
 forth = '5 2 and 0= ." disjoint" cr'
+proof = ["5 2 and", "2 5 and"]
 
 [[word]]
 word = "cardinality"
@@ -5532,6 +5673,7 @@ definition = "a collection of sets whose union is the original set"
 related = ["union", "collection", "span"]
 kind = "operation"
 forth = '3 5 or 7 = ." cover" cr'
+proof = ["3 5 or", "5 3 or"]
 
 [[word]]
 word = "contains"
@@ -5756,6 +5898,7 @@ definition = "repeated execution until condition"
 related = ["repeat", "iteration", "cycle"]
 kind = "control"
 forth = '3 2* . cr'
+proof = ["3 2*", "3 dup +"]
 
 [[word]]
 word = "condition"
@@ -5777,6 +5920,7 @@ definition = "a portion or segment of a whole"
 related = ["portion", "segment", "whole", "division"]
 kind = "component"
 forth = '10 2/ .'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "place"
@@ -5819,6 +5963,7 @@ definition = "the governing body of a nation"
 related = ["authority", "rule", "control", "administration"]
 kind = "authority"
 forth = '5 3 max .'
+proof = ["5 3 max", "3 5 max"]
 
 [[word]]
 word = "number"
@@ -5924,6 +6069,7 @@ definition = "the set of all linear combinations of vectors"
 related = ["vector", "linear combination", "set"]
 kind = "linear algebra"
 forth = '1 2* 3 + . cr'
+proof = ["1 2*", "1 dup +"]
 
 [[word]]
 word = "basis"
@@ -6022,6 +6168,7 @@ definition = "the side opposite the right angle in a right triangle"
 related = ["triangle", "right", "angle"]
 kind = "geometry"
 forth = '3 square 4 square + . cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "sine"
@@ -6106,6 +6253,7 @@ definition = "a round plane figure whose boundary consists of points equidistant
 related = ["round", "radius", "center", "circumference"]
 kind = "shape"
 forth = '5 square 3 * . cr'
+proof = ["5 square", "5 5 *"]
 
 [[word]]
 word = "triangle"
@@ -6141,6 +6289,7 @@ definition = "the continuous line forming the boundary of a closed geometric fig
 related = ["boundary", "line", "closed", "figure"]
 kind = "measurement"
 forth = '4 2* 5 2* + . cr'
+proof = ["4 2*", "4 dup +"]
 
 [[word]]
 word = "radius"
@@ -6155,6 +6304,7 @@ definition = "a straight line passing from side to side through the center of a 
 related = ["center", "circle", "line", "side"]
 kind = "measurement"
 forth = '5 2* . cr'
+proof = ["5 2*", "5 dup +"]
 
 [[word]]
 word = "angle"
@@ -6211,6 +6361,7 @@ definition = "to increase in size, number, or importance"
 related = ["grow", "enlarge", "extend", "broaden"]
 kind = "transformation"
 forth = '5 2* . cr'
+proof = ["5 2*", "5 dup +"]
 
 [[word]]
 word = "contract"
@@ -6218,6 +6369,7 @@ definition = "to become smaller or narrower"
 related = ["shrink", "compress", "condense", "narrow"]
 kind = "transformation"
 forth = '10 2/ . cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "push"
@@ -6260,6 +6412,7 @@ definition = "to employ something for a purpose"
 related = ["employ", "apply", "utilize", "function"]
 kind = "action"
 forth = '5 square . cr'
+proof = ["5 square", "5 5 *"]
 
 [[word]]
 word = "enable"
@@ -6302,6 +6455,7 @@ definition = "the force that attracts objects toward the center of a celestial b
 related = ["force", "attraction", "fall", "pull"]
 kind = "physics"
 forth = '10 1- . cr'
+proof = ["10 1-", "9"]
 
 [[word]]
 word = "friction"
@@ -6309,6 +6463,7 @@ definition = "resistance to motion between two objects in contact"
 related = ["resistance", "drag", "slow", "surface"]
 kind = "physics"
 forth = '5 1- . cr'
+proof = ["5 1-", "4"]
 
 [[word]]
 word = "wave"
@@ -6337,6 +6492,7 @@ definition = "the power to which a base must be raised to produce a given number
 related = ["exponent", "power", "base", "scale"]
 kind = "math"
 forth = '8 2/ . cr'
+proof = ["8 2/", "4"]
 
 [[word]]
 word = "inverse"
@@ -6344,6 +6500,7 @@ definition = "something that is the opposite or reverse of another"
 related = ["opposite", "reverse", "reciprocal", "negate"]
 kind = "math"
 forth = '5 negate . cr'
+proof = ["5 negate", "0 5 -"]
 
 [[word]]
 word = "preimage"
@@ -6358,6 +6515,7 @@ definition = "the greatest integer less than or equal to a number"
 related = ["integer", "round", "truncate", "lower"]
 kind = "math"
 forth = '5 2/ . cr'
+proof = ["5 2/", "2"]
 
 [[word]]
 word = "ceiling"
@@ -6365,6 +6523,7 @@ definition = "the smallest integer greater than or equal to a number"
 related = ["integer", "round", "upper", "ceil"]
 kind = "math"
 forth = '7 2/ . cr'
+proof = ["7 2/", "3"]
 
 [[word]]
 word = "round"
@@ -6372,6 +6531,7 @@ definition = "to approximate a number to the nearest integer"
 related = ["approximate", "nearest", "integer", "adjust"]
 kind = "math"
 forth = '6 2/ . cr'
+proof = ["6 2/", "3"]
 
 [[word]]
 word = "truncate"
@@ -6379,6 +6539,7 @@ definition = "to cut off the decimal part of a number"
 related = ["cut", "integer", "discard", "shorten"]
 kind = "math"
 forth = '9 2/ . cr'
+proof = ["9 2/", "4"]
 
 [[word]]
 word = "sin"
@@ -6386,6 +6547,7 @@ definition = "the sine function in trigonometry, ratio of opposite to hypotenuse
 related = ["trigonometry", "angle", "ratio", "wave"]
 kind = "math"
 forth = '1 2* . cr'
+proof = ["1 2*", "1 dup +"]
 
 [[word]]
 word = "cos"
@@ -6400,6 +6562,7 @@ definition = "square root, a number that when squared gives the original"
 related = ["square", "root", "power", "extract"]
 kind = "math"
 forth = '4 square . cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "rotation"
@@ -6414,6 +6577,7 @@ definition = "the throwing back of light or sound"
 related = ["mirror", "bounce", "echo", "reverse"]
 kind = "transformation"
 forth = '5 negate . cr'
+proof = ["5 negate", "0 5 -"]
 
 [[word]]
 word = "scaling"
@@ -6421,6 +6585,7 @@ definition = "changing the size of something"
 related = ["size", "grow", "shrink", "multiply"]
 kind = "transformation"
 forth = '3 2* . cr'
+proof = ["3 2*", "3 dup +"]
 
 [[word]]
 word = "interval"
@@ -6470,6 +6635,7 @@ definition = "incomplete or not whole"
 related = ["incomplete", "fraction", "portion", "half"]
 kind = "concept"
 forth = '10 2/ . cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "labor"
@@ -6484,6 +6650,7 @@ definition = "limit or boundary"
 related = ["limit", "edge", "constraint", "boundary"]
 kind = "concept"
 forth = '10 5 min . cr'
+proof = ["10 5 min", "5 10 min"]
 
 [[word]]
 word = "possible"
@@ -6617,6 +6784,7 @@ definition = "to change in form or appearance"
 related = ["change", "convert", "alter"]
 kind = "action"
 forth = '5 negate . cr'
+proof = ["5 negate", "0 5 -"]
 
 [[word]]
 word = "combine"
@@ -6631,6 +6799,7 @@ definition = "to divide into parts"
 related = ["divide", "separate", "cleave"]
 kind = "action"
 forth = '10 2/ . cr'
+proof = ["10 2/", "5"]
 
 [[word]]
 word = "merge"
@@ -6638,6 +6807,7 @@ definition = "to cause to combine or unite"
 related = ["combine", "blend", "fuse"]
 kind = "action"
 forth = '1 2 or . cr'
+proof = ["1 2 or", "2 1 or"]
 
 [[word]]
 word = "connect"
@@ -6645,6 +6815,7 @@ definition = "to join or link together"
 related = ["link", "join", "attach"]
 kind = "action"
 forth = '3 1 and . cr'
+proof = ["3 1 and", "1 3 and"]
 
 [[word]]
 word = "hope"
@@ -6680,6 +6851,7 @@ definition = "a plan or purpose to act"
 related = ["plan", "purpose", "goal", "aim"]
 kind = "action"
 forth = '2 square ." =4" cr'
+proof = ["2 square", "2 2 *"]
 
 [[word]]
 word = "learn"
@@ -6736,6 +6908,7 @@ definition = "the act of controlling or directing according to rules"
 related = ["control", "rule", "govern", "direct"]
 kind = "process"
 forth = '9 10 min . cr'
+proof = ["9 10 min", "10 9 min"]
 
 [[word]]
 word = "membrane"
@@ -6855,6 +7028,7 @@ definition = "to select from options"
 related = ["select", "pick", "decide", "prefer"]
 kind = "action"
 forth = '3 5 min . cr'
+proof = ["3 5 min", "5 3 min"]
 
 [[word]]
 word = "focus"
@@ -7150,6 +7324,7 @@ definition = "treating people equally; neither too much nor too little"
 related = ["just", "equal", "balance", "right"]
 kind = "character"
 forth = '5 2/ . ." fair" cr'
+proof = ["5 2/", "2"]
 
 
 [[word]]
@@ -7213,6 +7388,7 @@ definition = "to rely on something; to be contingent on a condition"
 related = ["rely", "conditional", "require", "need"]
 kind = "relation"
 forth = '1 0= . cr'
+proof = ["1 0=", "0"]
 
 [[word]]
 word = "find"
@@ -7229,6 +7405,7 @@ definition = "the quality of being suitable or capable; physical condition"
 related = ["health", "strength", "capacity", "adapt"]
 kind = "quality"
 forth = '3 square . cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "gravity"
@@ -7277,6 +7454,7 @@ definition = "the chemical processes in a living organism to maintain life"
 related = ["energy", "cells", "chemical", "body"]
 kind = "biology"
 forth = '3 square . cr'
+proof = ["3 square", "3 3 *"]
 
 [[word]]
 word = "preposition"
