@@ -113,6 +113,15 @@ impl Library {
         COMPILED_VM.clone_dict()
     }
 
+    /// Force the LazyLock static VMs to initialize now (in the caller's thread/task).
+    /// Call this early in startup — ideally inside a `spawn_blocking` — so the
+    /// compilation work is done before the user's first keystroke.
+    pub fn warmup() {
+        // Accessing the statics forces both LazyLocks to evaluate.
+        let _ = &*BUILTIN_DEFS;
+        let _ = &*COMPILED_VM;
+    }
+
     fn load_toml(&mut self, src: &str) {
         #[derive(Deserialize)]
         struct File { #[serde(rename = "word")] words: Vec<WordEntry> }

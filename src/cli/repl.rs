@@ -226,6 +226,11 @@ impl Repl {
         // Determine if we're in daemon mode (suppress local model logs)
         let daemon_mode = daemon_client.is_some();
 
+        // Pre-warm the Forth VM in the background: forces COMPILED_VM + BUILTIN_DEFS
+        // LazyLocks to initialize now (TOML parse + 1049-word compile) so the first
+        // user interaction doesn't pay the cold-start cost.
+        let _warmup_handle = tokio::task::spawn_blocking(crate::coforth::Library::warmup);
+
         // Set up models directory
         let models_dir = dirs::home_dir().map(|home| home.join(".finch").join("models"));
 
