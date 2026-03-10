@@ -184,6 +184,7 @@ definition = "having the power or skill to do something"
 related = ["capable", "skilled", "competent", "proficient"]
 kind = "capability"
 forth = '5 10 < . cr'
+proof = ["5 10 <", "10 5 >"]
 
 [[word]]
 word = "hard"
@@ -191,6 +192,7 @@ definition = "solid and firm to the touch"
 related = ["solid", "firm", "rigid", "tough"]
 kind = "texture"
 forth = '1 2/ . cr'
+proof = ["4 2/", "4 2 /"]
 
 [[word]]
 word = "clear"
@@ -198,6 +200,7 @@ definition = "easy to perceive or understand"
 related = ["obvious", "distinct", "transparent", "evident"]
 kind = "clarity"
 forth = '0 0= . cr'
+proof = ["0 0=", "-1"]
 
 [[word]]
 word = "heavy"
@@ -228,6 +231,7 @@ definition = "human beings in general or in a group"
 related = ["humans", "persons", "individuals", "crowd"]
 kind = "entity"
 forth = '5 1+ . cr'
+proof = ["5 1+", "4 2 +"]
 
 [[word]]
 word = "way"
@@ -243,6 +247,7 @@ definition = "an adult male human being"
 related = ["male", "adult", "human", "person"]
 kind = "entity"
 forth = '1 0= invert . cr'
+proof = ["1 0= invert", "-1"]
 
 [[word]]
 word = "child"
@@ -250,6 +255,7 @@ definition = "a young human being"
 related = ["youngster", "kid", "offspring", "minor"]
 kind = "entity"
 forth = '0 1+ . cr'
+proof = ["0 1+", "1"]
 
 [[word]]
 word = "world"
@@ -264,6 +270,7 @@ definition = "the condition that distinguishes animals and plants from inorganic
 related = ["existence", "being", "living", "vitality"]
 kind = "state"
 forth = '1 0 > . cr'
+proof = ["1 0 >", "-1"]
 
 [[word]]
 word = "filter"
@@ -278,6 +285,7 @@ definition = "apply a function to each element of a collection"
 related = ["apply", "function", "collection", "transform"]
 kind = "transformation"
 forth = '1 2 square . cr'
+proof = ["4 square", "4 4 *"]
 
 [[word]]
 word = "fold"
@@ -285,6 +293,7 @@ definition = "combine elements of a collection using a binary operation"
 related = ["combine", "reduce", "accumulate", "binary"]
 kind = "aggregation"
 forth = '1 2 + . cr'
+proof = ["1 2 +", "2 1 +"]
 
 [[word]]
 word = "consumer"
@@ -341,6 +350,7 @@ definition = "a musical tone higher than the fundamental"
 related = ["harmonic", "frequency", "tone"]
 kind = "music"
 forth = '2 3 * . ." harmonic" cr'
+proof = ["2 3 *", "3 2 *"]
 
 [[word]]
 word = "major"
@@ -348,6 +358,7 @@ definition = "larger or more significant"
 related = ["significant", "large", "primary"]
 kind = "comparison"
 forth = '10 5 max . ." larger" cr'
+proof = ["10 5 max", "5 10 max"]
 
 [[word]]
 word = "minor"
@@ -355,6 +366,7 @@ definition = "smaller or less significant"
 related = ["small", "secondary", "less"]
 kind = "comparison"
 forth = '10 5 min . ." smaller" cr'
+proof = ["10 5 min", "5 10 min"]
 
 [[word]]
 word = "sharp"
@@ -362,6 +374,7 @@ definition = "raised in pitch"
 related = ["raised", "pitch", "increase"]
 kind = "music"
 forth = '5 1+ . ." raised" cr'
+proof = ["5 1+", "4 2 +"]
 
 [[word]]
 word = "natural"
@@ -376,6 +389,7 @@ definition = "a feeling of great pleasure"
 related = ["pleasure", "happiness", "delight"]
 kind = "emotion"
 forth = '10 square . ." happy" cr'
+proof = ["10 square", "10 10 *"]
 
 [[word]]
 word = "sadness"
@@ -383,6 +397,7 @@ definition = "a feeling of sorrow"
 related = ["sorrow", "grief", "melancholy"]
 kind = "emotion"
 forth = '5 2/ . ." down" cr'
+proof = ["4 2/", "4 2 /"]
 
 [[word]]
 word = "anger"
@@ -390,6 +405,7 @@ definition = "a strong feeling of annoyance"
 related = ["annoyance", "rage", "fury"]
 kind = "emotion"
 forth = '7 2* . ." intense" cr'
+proof = ["7 2*", "7 2 *"]
 
 [[word]]
 word = "fear"
@@ -397,6 +413,7 @@ definition = "an unpleasant emotion caused by threat"
 related = ["threat", "anxiety", "terror"]
 kind = "emotion"
 forth = '3 1- . ." wary" cr'
+proof = ["3 1-", "3 1 -"]
 
 [[word]]
 word = "surprise"
@@ -411,6 +428,7 @@ definition = "a feeling of revulsion"
 related = ["revulsion", "repulsion", "loathing"]
 kind = "emotion"
 forth = '4 negate . ." yuck" cr'
+proof = ["4 negate", "0 4 -"]
 
 [[word]]
 word = "anticipation"
@@ -418,6 +436,7 @@ definition = "expectation of something"
 related = ["expectation", "awaiting", "eagerness"]
 kind = "emotion"
 forth = '6 1+ . ." coming" cr'
+proof = ["6 1+", "5 2 +"]
 
 [[word]]
 word = "love"
@@ -425,6 +444,7 @@ definition = "a deep affection"
 related = ["affection", "adoration", "passion"]
 kind = "emotion"
 forth = '8 9 max . ." warm" cr'
+proof = ["8 9 max", "9 8 max"]
 
 [[word]]
 word = "hate"
@@ -432,6 +452,7 @@ definition = "intense dislike"
 related = ["dislike", "loathing", "aversion"]
 kind = "emotion"
 forth = '7 2 min . ." cold" cr'
+proof = ["7 2 min", "2 7 min"]
 
 [[word]]
 word = "zero"
@@ -551,6 +572,7 @@ definition = "a set with a binary operation that is associative, has an identity
 related = ["set", "operation", "identity", "inverse"]
 kind = "structure"
 forth = '1 2 + 3 = ." associative " cr'
+proof = ["1 2 + 3 =", "-1"]
 
 [[word]]
 word = "ring"
@@ -558,6 +580,7 @@ definition = "a set with two binary operations (addition and multiplication) sat
 related = ["group", "field", "addition", "multiplication"]
 kind = "structure"
 forth = '2 3 * 5 + . ." ring ops" cr'
+proof = ["2 3 * 5 +", "3 2 * 5 +"]
 
 [[word]]
 word = "field"
@@ -565,6 +588,7 @@ definition = "a ring where every nonzero element has a multiplicative inverse"
 related = ["ring", "division", "inverse"]
 kind = "structure"
 forth = '4 2 / . ." division " cr'
+proof = ["4 2 /", "2"]
 
 [[word]]
 word = "module"
@@ -586,6 +610,7 @@ definition = "a vector space equipped with a bilinear multiplication"
 related = ["vector-space", "multiplication", "bilinear"]
 kind = "structure"
 forth = '2 3 * 4 * . ." bilinear" cr'
+proof = ["2 3 * 4 *", "3 2 * 4 *"]
 
 [[word]]
 word = "homomorphism"
@@ -642,6 +667,7 @@ definition = "the set of all images of an element under a group action"
 related = ["group", "action", "image"]
 kind = "set"
 forth = '1 2* 4 + ." orbit " . cr'
+proof = ["2 2* 4 +", "1 2* 4 + 2 +"]
 
 [[word]]
 word = "with"
@@ -649,6 +675,7 @@ definition = "accompanied by or using"
 related = ["along", "together", "using"]
 kind = "relation"
 forth = '3 4 + . cr'
+proof = ["3 4 +", "4 3 +"]
 
 [[word]]
 word = "from"
@@ -656,6 +683,7 @@ definition = "indicating the source or starting point"
 related = ["origin", "beginning", "source"]
 kind = "origin"
 forth = '10 3 - . cr'
+proof = ["10 3 -", "7"]
 
 [[word]]
 word = "into"
@@ -663,6 +691,7 @@ definition = "moving toward the interior of"
 related = ["inside", "toward", "within"]
 kind = "direction"
 forth = '2 2* . cr'
+proof = ["2 2*", "2 2 *"]
 
 [[word]]
 word = "through"
@@ -684,6 +713,7 @@ definition = "the two or the one and the other"
 related = ["two", "pair", "dual"]
 kind = "quantity"
 forth = '2 2* . cr'
+proof = ["2 2*", "2 2 *"]
 
 [[word]]
 word = "while"
@@ -698,6 +728,7 @@ definition = "for the reason that"
 related = ["since", "as", "due to"]
 kind = "reason"
 forth = '5 0> ." true" cr'
+proof = ["5 0>", "-1"]
 
 [[word]]
 word = "since"
@@ -705,6 +736,7 @@ definition = "from a point in time onward"
 related = ["from", "after", "because"]
 kind = "time"
 forth = '10 5 - . cr'
+proof = ["10 5 -", "10 5 -"]
 
 [[word]]
 word = "until"
@@ -719,6 +751,7 @@ definition = "except if"
 related = ["except", "if not", "save"]
 kind = "condition"
 forth = '5 0= invert ." true" cr'
+proof = ["5 0= invert", "-1"]
 
 [[word]]
 word = "although"
@@ -733,6 +766,7 @@ definition = "expressing a doubt or choice between alternatives"
 related = ["if", "either", "or"]
 kind = "choice"
 forth = '1 0 or . cr'
+proof = ["1 0 or", "1"]
 
 [[word]]
 word = "without"
@@ -740,6 +774,7 @@ definition = "not accompanied by"
 related = ["absent", "lacking", "excluding"]
 kind = "absence"
 forth = '10 5 - . cr'
+proof = ["10 5 -", "5"]
 
 [[word]]
 word = "against"
@@ -754,6 +789,7 @@ definition = "force applied per unit area"
 related = ["force", "area", "compression"]
 kind = "measurement"
 forth = '10 5 / . ." force/area" cr'
+proof = ["10 5 /", "2"]
 
 [[word]]
 word = "temperature"
@@ -761,6 +797,7 @@ definition = "measure of average kinetic energy of particles"
 related = ["heat", "energy", "kinetic"]
 kind = "property"
 forth = '273 100 + . ." K" cr'
+proof = ["273 100 +", "373"]
 
 [[word]]
 word = "entropy"
@@ -775,6 +812,7 @@ definition = "maximum displacement from equilibrium position"
 related = ["displacement", "maximum", "oscillation"]
 kind = "measurement"
 forth = '10 abs . ." amplitude" cr'
+proof = ["10 abs", "10"]
 
 [[word]]
 word = "resonance"
@@ -782,6 +820,7 @@ definition = "tendency to oscillate at a particular frequency"
 related = ["frequency", "oscillation", "vibration"]
 kind = "property"
 forth = '7 7 = . ." resonance match" cr'
+proof = ["7 7 =", "-1"]
 
 [[word]]
 word = "decay"
@@ -789,6 +828,7 @@ definition = "gradual reduction in intensity or quantity"
 related = ["reduction", "exponential", "time"]
 kind = "process"
 forth = '100 2 / . ." decayed" cr'
+proof = ["100 2 /", "50"]
 
 [[word]]
 word = "charge"
