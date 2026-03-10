@@ -183,7 +183,9 @@ impl Dialog {
         Self {
             title: title_str.clone(),
             dialog_type: DialogType::Confirm {
-                prompt: title_str,
+                // prompt is shown in the dialog body; keep it empty so the
+                // title (shown in the border) doesn't repeat as a content line.
+                prompt: String::new(),
                 default,
                 selected: default,
             },
@@ -1061,11 +1063,15 @@ mod tests {
         // Regression: confirm("run this?\n\ncode") used to break box rendering
         // because the raw \n was passed to a single-line format string.
         // Now multi-line content goes in .with_body() and the prompt stays single-line.
+        // The title holds the question; prompt is intentionally empty to avoid duplicate
+        // display (the title is already shown in the dialog border/header).
         let dialog = Dialog::confirm("run this?", false).with_body(": foo 1 . ;");
+        assert_eq!(dialog.title, "run this?");
         match &dialog.dialog_type {
             DialogType::Confirm { prompt, .. } => {
                 assert!(!prompt.contains('\n'), "prompt must not contain newlines");
-                assert_eq!(prompt, "run this?");
+                // prompt is empty — the title is used for display to prevent duplication.
+                assert!(prompt.is_empty(), "prompt must be empty; title holds the question");
             }
             _ => panic!("expected Confirm dialog"),
         }

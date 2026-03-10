@@ -144,21 +144,21 @@ word = "给它"
 definition = "把当前任务发送给栈顶地址指向的机器"
 related = ["发送", "节点", "分配"]
 kind = "task"
-forth = 'on'
+forth = '." 给节点。" cr'
 
 [[word]]
 word = "发送"
 definition = "把东西从这里交给那里"
 related = ["传输", "广播", "给予"]
 kind = "task"
-forth = "scatter"
+forth = 'scatter-code'
 
 [[word]]
 word = "广播"
 definition = "同时告诉所有人同一件事"
 related = ["发送", "集群", "通知"]
 kind = "task"
-forth = "scatter"
+forth = 'scatter-code'
 
 [[word]]
 word = "余额"
@@ -187,6 +187,22 @@ definition = "你从别人那里拿走的、还没有还回去的东西"
 related = ["余额", "结算", "欠"]
 kind = "observation"
 forth = "debt-check"
+
+# ── 认可 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "嗯"
+definition = "执行别人发给你的程序——运行栈上的代码，然后说 boom"
+related = ["执行", "程序", "运行"]
+kind = "task"
+forth = "boom"
+
+[[word]]
+word = "太阳"
+definition = "我们都能同时看到的东西——共同的时钟，共享的时刻"
+related = ["时间", "现在", "同步"]
+kind = "observation"
+forth = "sun"
 
 # ── 动作 ───────────────────────────────────────────────────────────────────────
 
@@ -342,3 +358,117 @@ definition = "从经验中提炼出来的东西"
 related = ["理解", "学习", "智"]
 kind = "observation"
 forth = 'gen" what is the difference between knowing and understanding? chinese."'
+
+# ── Co-Forth 共同编程 ──────────────────────────────────────────────────────────
+
+[[word]]
+word = "同意"
+definition = "两个栈顶元素相同——结果为真"
+related = ["agree", "相等", "共识"]
+kind = "observation"
+forth = ': 同意  = ;'
+
+[[word]]
+word = "相同"
+definition = "检查两个值是否相等，打印结果"
+related = ["same", "比较", "同意"]
+kind = "observation"
+forth = ': 相同  同意 if ." 是" cr else ." 否" cr then ;'
+
+[[word]]
+word = "频道"
+definition = "多个程序员共享词汇的频道，像IRC一样"
+related = ["channel", "共享", "协作"]
+kind = "observation"
+forth = 'channels'
+
+[[word]]
+word = "隐藏"
+definition = "把真实的东西从栈上丢掉"
+related = ["hide-stack", "drop", "保护"]
+kind = "observation"
+forth = ': 隐藏  drop ;'
+
+[[word]]
+word = "显示"
+definition = "把栈深度打印出来——栈不会说谎"
+related = ["show-stack", "depth", "真实"]
+kind = "observation"
+forth = 'depth . ." 层" cr'
+
+[[word]]
+word = "证明"
+definition = "运行断言，验证词的行为"
+related = ["prove-all", "assert", "测试"]
+kind = "observation"
+forth = 'prove-all'
+
+[[word]]
+word = "我们"
+definition = "两个程序员，一个栈"
+related = ["we", "together", "共同"]
+kind = "observation"
+forth = '." 我们推。" cr'
+
+# ── 冯·诺依曼体系结构 ─────────────────────────────────────────────────────────
+# 语义元数据——可执行定义在 STDLIB（interpreter.rs）中
+
+[[word]]
+word = "取"
+definition = "从内存地址取值——每条指令周期的第一步"
+related = ["存", "地址", "周期"]
+kind = "task"
+
+[[word]]
+word = "存"
+definition = "把值写入内存地址——结果必须持久时的第三步"
+related = ["取", "地址", "寄存器"]
+kind = "task"
+
+[[word]]
+word = "寄存器"
+definition = "CPU最快的存储——一个机器字，一个时钟周期可达"
+related = ["取", "累加", "字长"]
+kind = "observation"
+
+[[word]]
+word = "累加"
+definition = "把栈顶加入累计和——算术单元最基本的动作"
+related = ["寄存器", "周期", "指令"]
+kind = "task"
+
+[[word]]
+word = "指令"
+definition = "一个取指-译码-执行周期，压缩进一个词"
+related = ["周期", "取", "流水线"]
+kind = "observation"
+
+[[word]]
+word = "周期"
+definition = "CPU的心跳——取指、译码、执行、写回、前进"
+related = ["指令", "流水线", "时钟"]
+kind = "observation"
+
+[[word]]
+word = "流水线"
+definition = "n条指令同时处于n个完成阶段——用重叠来隐藏延迟"
+related = ["周期", "指令", "瓶颈"]
+kind = "observation"
+
+[[word]]
+word = "瓶颈"
+definition = "内存总线——数据与指令共用一条路，所有速度都受其带宽限制"
+related = ["流水线", "缓存", "带宽"]
+kind = "constraint"
+
+[[word]]
+word = "字长"
+definition = "机器的原生宽度——这里是64位，栈的一个格"
+related = ["寄存器", "地址", "取"]
+kind = "observation"
+
+[[word]]
+word = "地址"
+definition = "命名平坦内存空间中一个位置的整数——每个值都有一个"
+related = ["取", "存", "字长"]
+kind = "observation"

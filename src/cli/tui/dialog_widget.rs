@@ -424,13 +424,14 @@ impl<'a> DialogWidget<'a> {
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
 
-        // Add prompt
-        lines.push(Line::from(Span::styled(
-            prompt.to_string(),
-            Style::default().fg(self.colors.dialog.option.to_color()),
-        )));
-
-        lines.push(Line::from(""));
+        // Add prompt (only if non-empty — avoids repeating the title text)
+        if !prompt.is_empty() {
+            lines.push(Line::from(Span::styled(
+                prompt.to_string(),
+                Style::default().fg(self.colors.dialog.option.to_color()),
+            )));
+            lines.push(Line::from(""));
+        }
 
         // Render Yes/No options
         let yes_style = if selected {

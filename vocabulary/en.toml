@@ -43,6 +43,14 @@ kind = "observation"
 forth = '." finch — local-first AI, watching from nearby." cr'
 
 [[word]]
+word = "self-proof"
+definition = "the machine verifies its own definition — silent if everything holds, loud only if something breaks"
+related = ["prove-all", "test", "boot", "verify"]
+kind = "observation"
+forth = 'prove-all? if else ." ⚠  self-proof failed — the machine disagrees with itself." cr then'
+boot = true
+
+[[word]]
 word = "forth"
 definition = "a language that runs what it means"
 related = ["stack", "word", "execute"]
@@ -122,6 +130,69 @@ forth = '." maybe." cr'
 # ── Distributed computing ───────────────────────────────────────────────────
 
 [[word]]
+word = "boom"
+definition = "execute a machine that someone sends you — run the code on the stack, then say boom"
+related = ["eval", "machine", "run", "yes"]
+kind = "task"
+forth = "boom"
+
+[[word]]
+word = "sun"
+definition = "the one thing we can all see at the same moment — the shared clock everyone looks at"
+related = ["time", "now", "sync", "epoch"]
+kind = "observation"
+forth = "sun"
+
+[[word]]
+word = "converge"
+definition = "run two programs from different directions — the proof is that they agree"
+related = ["argue", "prove", "same", "equal", "boom"]
+kind = "task"
+forth = "converge"
+
+[[word]]
+word = "argue"
+definition = "two programmers, each with their own program — the stack settles it; the argument is the proof"
+related = ["converge", "prove", "disagree", "both"]
+kind = "task"
+forth = "argue"
+
+[[word]]
+word = "back-and-forth"
+definition = "go forward, come back — the proof is that you are home again"
+related = ["converge", "inverse", "prove", "round-trip"]
+kind = "task"
+forth = "back-and-forth"
+
+[[word]]
+word = "missing-word"
+definition = "the handler for unknown words — redefine it to route natural language to AI"
+related = ["grammar", "unknown", "language", "route"]
+kind = "task"
+forth = "missing-word"
+
+[[word]]
+word = "both-ways"
+definition = "run an operation from both directions at once — the proof is that they agree"
+related = ["converge", "argue", "commute", "prove"]
+kind = "task"
+forth = "both-ways"
+
+[[word]]
+word = "page"
+definition = "a proof written line by line — each line has two sides that must agree before the next begins"
+related = ["argue", "converge", "both-ways", "prove"]
+kind = "task"
+forth = "page"
+
+[[word]]
+word = "resolve"
+definition = "many sentences, one truth — every path leads to the same place"
+related = ["converge", "page", "agree", "prove"]
+kind = "task"
+forth = "resolve"
+
+[[word]]
 word = "slowest"
 definition = "the peer with the highest benchmark time — first candidate to receive donated work"
 related = ["peer", "cluster", "bench"]
@@ -150,3 +221,66 @@ definition = "a brief summary of what files have changed"
 related = ["diff", "commit", "status"]
 kind = "task"
 forth = 'connected? if confirm" Show changed files?" if exec" git diff --stat" else ." cancelled" cr then else ." not connected — join a session first" cr then'
+
+# ── Von Neumann architecture ─────────────────────────────────────────────────
+# Definitions only — executable forms live in STDLIB (interpreter.rs)
+
+[[word]]
+word = "fetch"
+definition = "retrieve a value from a memory address — the first act of every instruction cycle"
+related = ["store", "address", "cycle"]
+kind = "task"
+
+[[word]]
+word = "store"
+definition = "write a value into a memory address — the third act when the result must persist"
+related = ["fetch", "address", "register"]
+kind = "task"
+
+[[word]]
+word = "register"
+definition = "the fastest memory a CPU has — one machine word, one clock cycle away"
+related = ["fetch", "accumulate", "word-size"]
+kind = "observation"
+
+[[word]]
+word = "accumulate"
+definition = "add the top of the stack to a running total — the arithmetic unit's basic motion"
+related = ["register", "cycle", "instruction"]
+kind = "task"
+
+[[word]]
+word = "instruction"
+definition = "one fetch-decode-execute cycle compressed into a single word"
+related = ["cycle", "fetch", "pipeline"]
+kind = "observation"
+
+[[word]]
+word = "cycle"
+definition = "the heartbeat of a CPU — fetch, decode, execute, write-back, advance"
+related = ["instruction", "pipeline", "clock"]
+kind = "observation"
+
+[[word]]
+word = "pipeline"
+definition = "n instructions at n stages of completion, simultaneously — latency hidden by overlap"
+related = ["cycle", "instruction", "bottleneck"]
+kind = "observation"
+
+[[word]]
+word = "bottleneck"
+definition = "the memory bus — data and instructions share one path; all speed is bounded by its width"
+related = ["pipeline", "cache", "bandwidth"]
+kind = "constraint"
+
+[[word]]
+word = "word-size"
+definition = "the native width of the machine — 64 bits here, one cell of the stack"
+related = ["register", "address", "fetch"]
+kind = "observation"
+
+[[word]]
+word = "address"
+definition = "an integer that names a location in the flat memory space — every value has one"
+related = ["fetch", "store", "word-size"]
+kind = "observation"

@@ -20,11 +20,15 @@ fn check_peer_token(headers: &HeaderMap, peer_ip: &str, endpoint: &str) -> Resul
         Some(v) if v.as_bytes() == expected.as_bytes() => Ok(()),
         Some(_) => {
             tracing::warn!(ip = %peer_ip, endpoint, "rejected: wrong peer token");
+            let notice = format!("\x1b[33m{}\x1b[0m tried to get in (wrong key)", peer_ip);
+            let _ = PUSH_INBOX.send(notice);
             Err((StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "wrong peer token"}))).into_response())
         }
         None => {
             tracing::warn!(ip = %peer_ip, endpoint, "rejected: no peer token");
+            let notice = format!("\x1b[33m{}\x1b[0m knocked ({})", peer_ip, endpoint);
+            let _ = PUSH_INBOX.send(notice);
             Err((StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "peer token required — set X-Finch-Token"}))).into_response())
         }
@@ -65,10 +69,13 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/brains/:id", get(get_brain).delete(cancel_brain))
         .route("/v1/brains/:id/answer", post(answer_brain_question))
         .route("/v1/brains/:id/plan", post(respond_to_brain_plan))
+        .route("/v1/brains/shared", get(list_shared_brains))
+        .route("/v1/brains/shared/:name", get(get_shared_brain).post(contribute_shared_brain))
         // Note: node handlers load config independently (no AgentServer state needed)
         // Co-Forth remote eval and direct exec
         .route("/v1/forth/eval", post(handle_forth_eval))
         .route("/v1/forth/define", post(handle_forth_define))
+        .route("/v1/forth/vocab", get(handle_forth_vocab))
         .route("/v1/forth/push", post(handle_forth_push))
         .route("/v1/exec", post(handle_exec))
         // Peer registry
@@ -225,6 +232,41 @@ async fn respond_to_brain_plan(
         .respond_to_plan(id, response)
         .await?;
     Ok(StatusCode::OK)
+}
+
+/// GET /v1/brains/shared — list all shared brains (name, context, updated_at)
+async fn list_shared_brains(
+    State(server): State<Arc<AgentServer>>,
+) -> Json<Vec<crate::server::brain_registry::SharedBrainEntry>> {
+    Json(server.brain_registry().list_shared().await)
+}
+
+/// GET /v1/brains/shared/:name — return one shared brain
+async fn get_shared_brain(
+    State(server): State<Arc<AgentServer>>,
+    Path(name): Path<String>,
+) -> Result<Json<crate::server::brain_registry::SharedBrainEntry>, AppError> {
+    server
+        .brain_registry()
+        .get_shared(&name)
+        .await
+        .map(Json)
+        .ok_or_else(|| AppError(anyhow::anyhow!("Shared brain '{}' not found", name)))
+}
+
+/// POST /v1/brains/shared/:name — contribute context to a shared brain
+#[derive(Debug, Deserialize)]
+struct SharedBrainContribution {
+    context: String,
+}
+
+async fn contribute_shared_brain(
+    State(server): State<Arc<AgentServer>>,
+    Path(name): Path<String>,
+    Json(body): Json<SharedBrainContribution>,
+) -> StatusCode {
+    server.brain_registry().contribute_shared(&name, &body.context).await;
+    StatusCode::OK
 }
 
 /// Request body for /v1/messages endpoint (Claude-compatible)
@@ -710,6 +752,10 @@ static GRAMMAR_VM: std::sync::LazyLock<crate::coforth::Forth> =
         vm
     });
 
+/// Monotonically increasing counter — incremented each time LIVE_VM vocabulary changes.
+/// REPL sessions poll this to detect when another terminal defined new words.
+static VOCAB_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Live VM — extends GRAMMAR_VM with published words from peers.
 /// Persisted to ~/.finch/user_words.forth on every define call.
 /// eval clones from here so scatter code can call published words.
@@ -830,6 +876,8 @@ async fn handle_forth_define(
                     let _ = std::fs::write(&path, src);
                 }
             }
+            // Signal all polling REPL sessions that the vocabulary changed.
+            VOCAB_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(Json(ForthEvalResponse { output, stack: Vec::new(), error: None, compute_ms: 0, debt_warning: None, forth_back: None }))
         }
         Err(e) => Ok(Json(ForthEvalResponse {
@@ -841,6 +889,18 @@ async fn handle_forth_define(
             forth_back:   None,
         })),
     }
+}
+
+/// GET /v1/forth/vocab — return the current shared vocabulary and its version.
+///
+/// REPL sessions poll this to sync definitions made in other concurrent terminals.
+/// `version` is a monotonic counter — if it matches the caller's last-seen value,
+/// the vocabulary has not changed and there is nothing to compile.
+async fn handle_forth_vocab() -> Json<serde_json::Value> {
+    let live = LIVE_VM.read().await;
+    let source = live.dump_source();
+    let version = VOCAB_VERSION.load(std::sync::atomic::Ordering::Relaxed);
+    Json(serde_json::json!({ "source": source, "version": version }))
 }
 
 /// POST /v1/forth/push — receive a plain-text push message from a peer.

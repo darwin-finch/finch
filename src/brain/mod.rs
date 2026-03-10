@@ -91,6 +91,17 @@ impl BrainSession {
                                 debug!("Brain {} finished but was cancelled — discarding summary", id);
                             } else {
                                 debug!("Brain {} finished, writing {} chars", id, summary.len());
+                                // Share with all sessions — push to the daemon's shared brain.
+                                let summary_clone = summary.clone();
+                                tokio::spawn(async move {
+                                    let daemon_addr = crate::config::constants::DEFAULT_HTTP_ADDR;
+                                    let _ = reqwest::Client::new()
+                                        .post(format!("http://{daemon_addr}/v1/brains/shared/shared"))
+                                        .json(&serde_json::json!({ "context": summary_clone }))
+                                        .timeout(std::time::Duration::from_millis(400))
+                                        .send()
+                                        .await;
+                                });
                                 *brain_context.write().await = Some(summary);
                             }
                         }

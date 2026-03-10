@@ -61,6 +61,7 @@ enum Cell {
     ScatterExec(usize),           // run strings[idx] Forth code on all peers in parallel
     ScatterBashExec(usize),       // run strings[idx] as bash -c on all peers via /v1/exec
     ScatterStack,                 // ( code-idx -- ) scatter strings[pop()] to all peers (dynamic code)
+    ScatterSymbol(usize),         // share symbol strings[idx]: send local def if known, then run on all peers
     ScatterOnCluster(usize,usize),// run strings[code_idx] on ensemble strings[ensemble_idx]; no side-effects on peers
     RunOn(usize,usize),           // run strings[code_idx] on exactly one peer: strings[peer_idx] (addr or label)
     GenAI(usize),           // call AI generator with strings[idx] as prompt; emit response
@@ -259,7 +260,7 @@ pub struct Forth {
     /// Capped at 20 entries (oldest dropped).  `undo` pops and restores.
     undo_stack: Vec<DictionarySnapshot>,
     /// Distributed advisory lock table: name → expiry instant.
-    /// Auto-expires on each `lock` call.  Max TTL = 30 s (nobody holds for long).
+    /// Auto-expires on each `lock` call.  Max TTL = 5 s.
     locks: HashMap<String, Instant>,
     /// Optional confirm callback.
     confirm_fn: Option<ConfirmFn>,
@@ -301,6 +302,9 @@ pub struct Forth {
     /// Words that were unknown and routed through missing-word this exec.
     /// Drained by the REPL to ask AI to define them, growing the grammar.
     pub pending_defines: Vec<String>,
+    /// Names of words defined by the USER (not stdlib) — these override builtins.
+    /// Populated only when log_definitions is true (after stdlib phase).
+    user_word_names: std::collections::HashSet<String>,
 }
 
 /// Metadata attached to a peer address via `label-peer` / `tag-peer`.
@@ -435,10 +439,8 @@ const STDLIB: &str = r#"
 \ ── Natural language gateway ─────────────────────────────────────────────────
 \ missing-word ( str -- )
 \ Called automatically when an unknown word is encountered at top-level.
-\ Redefine this at boot to route natural language sentences to AI or any handler.
-\ Default: silently drop — unknown English words don't produce output.
 \ Redefine to route natural language to AI: : missing-word  gen-send ;
-: missing-word  ( str -- )  drop ;
+: missing-word  ( str -- )  ." ?" type cr ;
 
 \ ── Comparison helpers ────────────────────────────────────────────────────────
 : true      ( -- -1 )  -1 ;
@@ -576,6 +578,7 @@ const STDLIB: &str = r#"
 : scan-startup      ( -- report )            scan-startup ;
 : quarantine        ( path -- flag )         quarantine ;
 : scatter-code      ( code -- )              scatter-code ;
+: scatter-symbol    ( name -- )              scatter-symbol ;
 : peers-discover    ( ms -- )                peers-discover ;
 : fuel              ( -- n )                 fuel ;
 : with-fuel         ( n -- )                 with-fuel ;
@@ -800,6 +803,29 @@ variable _tm  ( shared test memory cell )
 \ abs
 : test:abs-negate    s" 7 negate abs"  s" 7"  converge ;   \ abs(neg n) = n
 : test:abs-pos       s" 7 abs"         s" 7"  converge ;   \ abs(pos n) = n
+\ ── Von Neumann hot-path word proofs ────────────────────────────────────────
+: test:rot        1 2 3 rot  1 = assert  3 = assert  2 = assert ;
+: test:tuck       1 2 tuck  2 = assert  1 = assert  2 = assert ;
+: test:nip        1 2 nip   2 = assert ;
+: test:2dup       3 4 2dup  4 = assert  3 = assert  4 = assert  3 = assert ;
+: test:negate-hot 7 negate -7 = assert  -3 negate  3 = assert  0 negate 0 = assert ;
+: test:invert     0 invert -1 = assert  -1 invert  0 = assert ;
+: test:xor        3 5 xor   6 = assert   0 7 xor  7 = assert   7 7 xor 0 = assert ;
+: test:lshift     1 3 lshift  8 = assert  3 2 lshift 12 = assert ;
+: test:rshift     8 3 rshift  1 = assert  12 2 rshift 3 = assert ;
+\ ── TCO proof: deep recursion without stack overflow ─────────────────────────
+: test:tco-count   ( n -- 0 )  dup 0> if 1 - test:tco-count exit then ;
+: test:tco         1000 test:tco-count 0 = assert ;
+\ ── Inline expansion proofs: square, cube, 1+, 1- work identically ──────────
+: test:inline-1+   5 1+  6 = assert  -1 1+  0 = assert ;
+: test:inline-1-   5 1-  4 = assert   0 1- -1 = assert ;
+: test:inline-2*   3 2*  6 = assert  -2 2* -4 = assert ;
+: test:inline-2/   8 2/  4 = assert   6 2/  3 = assert ;
+: test:inline-sq   4 square 16 = assert  0 square 0 = assert ;
+\ ── Output-word smoke proofs (depth unchanged) ───────────────────────────────
+: test:nl          depth >r nl           depth r> = assert ;
+: test:banner      depth >r banner       depth r> = assert ;
+: test:boot-wake   depth >r boot-wake    depth r> = assert ;
 "#;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -836,6 +862,7 @@ impl Forth {
             channels:         std::collections::HashSet::new(),
             boot_poems:       Vec::new(),
             pending_defines:  Vec::new(),
+            user_word_names:  std::collections::HashSet::new(),
         };
         // Load standard library silently — not logged (every session has stdlib)
         let _ = f.eval(STDLIB);
@@ -898,6 +925,13 @@ impl Forth {
     pub fn set_select_fn(&mut self, f: SelectFn) {
         self.select_fn = Some(f);
     }
+
+    /// Disable word-definition logging (used when compiling library/system words that
+    /// must not end up in `user_word_names`).  Call `enable_logging()` to restore.
+    pub fn disable_logging(&mut self) { self.log_definitions = false; }
+
+    /// Re-enable word-definition logging after a `disable_logging()` call.
+    pub fn enable_logging(&mut self) { self.log_definitions = true; }
 
     /// Execute Forth source on this instance and return collected output.
     /// Uses the default fuel budget (100k steps). For heavy computation use `exec_with_fuel`.
@@ -1011,6 +1045,7 @@ impl Forth {
             channels:         self.channels.clone(),
             boot_poems:       Vec::new(),
             pending_defines:  Vec::new(),
+            user_word_names:  self.user_word_names.clone(),
         }
     }
 
@@ -1161,6 +1196,9 @@ impl Forth {
                     // Register entry address BEFORE compiling body so `recurse` resolves.
                     let word_addr = self.memory.len();
                     self.name_index.insert(name.clone(), word_addr);
+                    if self.log_definitions {
+                        self.user_word_names.insert(name.clone());
+                    }
                     self.compile_into(&body, false)?;
                     // Patch Addr(usize::MAX) recurse placeholders with the real word_addr.
                     for cell in &mut self.memory[word_addr..] {
@@ -1391,6 +1429,12 @@ impl Forth {
             self.memory.push(Cell::ScatterExec(idx));
             return Ok(());
         }
+        if let Some(s) = tok.strip_prefix("\x00symbol:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ScatterSymbol(idx));
+            return Ok(());
+        }
         if tok == "\x00scatter-stack" {
             self.memory.push(Cell::ScatterStack);
             return Ok(());
@@ -1488,6 +1532,11 @@ impl Forth {
             }
         }
         let lo = tok.to_lowercase();
+        if lo == "scatter-symbol" {
+            // scatter-symbol  ( str-idx -- )  dynamic form: pop string index, scatter as symbol
+            self.memory.push(Cell::ScatterStack); // ScatterStack already does dynamic string scatter
+            return Ok(());
+        }
         if lo == "scatter-code" {
             // ( code-idx -- )  scatter strings[code-idx] on all peers (dynamic, stack-based)
             self.memory.push(Cell::ScatterStack);
@@ -1502,6 +1551,30 @@ impl Forth {
             self.memory.push(Cell::Addr(usize::MAX));
             return Ok(());
         }
+        // User definitions take priority over builtins — tools are overridable.
+        // Guard: only words defined AFTER stdlib load (user_word_names) may shadow builtins.
+        // Stdlib thin wrappers (`: type type ;`) must NOT shadow — they call themselves → infinite loop.
+        if self.user_word_names.contains(&lo) {
+            if let Some(&addr) = self.name_index.get(&lo) {
+                // User-defined word shadows the builtin (e.g. user redefined scatter).
+                let word_end = self.memory[addr..]
+                    .iter()
+                    .position(|c| matches!(c, Cell::Ret))
+                    .map(|p| addr + p)
+                    .unwrap_or(self.memory.len());
+                let word_len = word_end.saturating_sub(addr);
+                let is_pure = word_len <= 6
+                    && self.memory[addr..word_end].iter()
+                        .all(|c| !matches!(c, Cell::Addr(_) | Cell::Jmp(_) | Cell::JmpZ(_) | Cell::Repeat(_) | Cell::Until(_) | Cell::While(_) | Cell::DoSetup | Cell::DoLoop(_)));
+                if is_pure && word_len > 0 {
+                    let cells: Vec<Cell> = self.memory[addr..word_end].to_vec();
+                    self.memory.extend(cells);
+                } else {
+                    self.memory.push(Cell::Addr(addr));
+                }
+                return Ok(());
+            }
+        }
         if let Some(b) = name_to_builtin(&lo) {
             // Peephole: Lit(1) + Plus → Inc; Lit(1) + Minus → Dec
             let folded = match (self.memory.last(), &b) {
@@ -1513,23 +1586,22 @@ impl Forth {
             return Ok(());
         }
         if let Some(&addr) = self.name_index.get(&lo) {
-            // Inline short words (body ≤ 4 cells, no nested calls) to eliminate
-            // call overhead (push return addr, fuel check, jump, ret).
-            // Semantically identical to Cell::Addr — just no call frame.
-            const INLINE_LIMIT: usize = 4;
-            let body_end = self.memory[addr..]
+            // Inline expansion: short pure words (≤6 cells, no nested calls) are copied
+            // directly into the caller — eliminates call/return overhead entirely.
+            // This is the Von Neumann flat-memory advantage: code is just data.
+            let word_end = self.memory[addr..]
                 .iter()
                 .position(|c| matches!(c, Cell::Ret))
                 .map(|p| addr + p)
                 .unwrap_or(self.memory.len());
-            let body_len = body_end - addr;
-            let can_inline = body_len <= INLINE_LIMIT
-                && self.memory[addr..body_end]
-                    .iter()
-                    .all(|c| !matches!(c, Cell::Addr(_)));
-            if can_inline {
-                let body: Vec<Cell> = self.memory[addr..body_end].to_vec();
-                self.memory.extend(body);
+            let word_len = word_end.saturating_sub(addr);
+            let is_pure = word_len <= 6
+                && self.memory[addr..word_end].iter()
+                    .all(|c| !matches!(c, Cell::Addr(_) | Cell::Jmp(_) | Cell::JmpZ(_) | Cell::Repeat(_) | Cell::Until(_) | Cell::While(_) | Cell::DoSetup | Cell::DoLoop(_)));
+            if is_pure && word_len > 0 {
+                // Copy cells inline — no call frame needed.
+                let cells: Vec<Cell> = self.memory[addr..word_end].to_vec();
+                self.memory.extend(cells);
             } else {
                 self.memory.push(Cell::Addr(addr));
             }
@@ -1777,6 +1849,56 @@ impl Forth {
                     }
                     ip += 1;
                 }
+                Cell::ScatterSymbol(idx) => {
+                    // symbol" name" — share a word by name across all peers.
+                    // If I know it, send my definition first so peers speak the same word.
+                    // Then run the word on all peers — those who don't know it define it themselves.
+                    use crossterm::style::Stylize;
+                    let name = self.strings.get(idx)
+                        .ok_or_else(|| anyhow::anyhow!("symbol: string index out of bounds"))?
+                        .clone();
+                    if self.peers.is_empty() {
+                        self.out.push_str(
+                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n"
+                        );
+                        ip += 1;
+                        continue;
+                    }
+                    let peers = self.peers.clone();
+                    let tokens = peer_tokens_map(&self.peer_meta);
+                    // If I have a local definition, push it to all peers first.
+                    if let Some(def) = self.source_log.iter().find(|e| {
+                        e.starts_with(&format!(": {} ", name))
+                    }).cloned() {
+                        self.out.push_str(&format!(
+                            "{} {}  →  peers\n",
+                            "sharing".dark_grey(),
+                            name.as_str().cyan().bold(),
+                        ));
+                        let define_results = run_define_scatter(&peers, &def, &tokens);
+                        for r in &define_results {
+                            if let Some(ref e) = r.error {
+                                let peer_name = r.peer.trim_start_matches("http://")
+                                    .split(':').next().unwrap_or(&r.peer);
+                                self.out.push_str(&format!(
+                                    "  {} couldn't learn it: {}\n",
+                                    peer_name.cyan(), e.as_str().red()
+                                ));
+                            }
+                        }
+                    } else {
+                        // I don't know it either — send the name; each peer handles it their own way.
+                        self.out.push_str(&format!(
+                            "{} {}  (I don't know it either)\n",
+                            "asking about".dark_grey(),
+                            name.as_str().cyan().bold(),
+                        ));
+                    }
+                    // Now run the word on all peers.
+                    let results = run_scatter(&peers, &name, self.registry_addr.as_deref(), &tokens);
+                    self.emit_scatter_results(results);
+                    ip += 1;
+                }
                 Cell::ScatterOnCluster(ens_idx, code_idx) => {
                     // Run code on a named ensemble without touching self.peers.
                     let name = self.strings.get(ens_idx)
@@ -1824,7 +1946,11 @@ impl Forth {
                                 .map(|l| l.cyan().bold().to_string())
                                 .unwrap_or_else(|| addr.as_str().cyan().to_string());
                             let tokens = peer_tokens_map(&self.peer_meta);
-                            let results = run_scatter(&[addr], &code, self.registry_addr.as_deref(), &tokens);
+                            // Is this code a word definition?  ( : word ... ; )
+                            // If so, the peer's machine changed — return the peer address.
+                            // If computation, return the results (stack values).
+                            let is_definition = code.trim_start().starts_with(':');
+                            let results = run_scatter(&[addr.clone()], &code, self.registry_addr.as_deref(), &tokens);
                             for r in results {
                                 if let Some(e) = r.error {
                                     self.out.push_str(&format!("[{}] {}\n", display,
@@ -1833,7 +1959,16 @@ impl Forth {
                                     for line in r.output.lines() {
                                         self.out.push_str(&format!("[{}] {}\n", display, line));
                                     }
-                                    for v in &r.stack { self.data.push(*v); }
+                                    if is_definition {
+                                        // New machine: push the peer address so the caller
+                                        // can chain further operations on the same machine.
+                                        let idx = self.strings.len() as i64;
+                                        self.strings.push(addr.clone());
+                                        self.data.push(idx);
+                                    } else {
+                                        // Result: push remote stack values locally.
+                                        for v in &r.stack { self.data.push(*v); }
+                                    }
                                 }
                                 if let Some(ref warn) = r.debt_warning {
                                     self.out.push_str(&format!(
@@ -2029,13 +2164,26 @@ impl Forth {
                 }
                 Cell::Builtin(Builtin::Inc) => { if let Some(t) = self.data.last_mut() { *t += 1; } ip += 1; }
                 Cell::Builtin(Builtin::Dec) => { if let Some(t) = self.data.last_mut() { *t -= 1; } ip += 1; }
+                Cell::Builtin(Builtin::Negate) => { if let Some(t) = self.data.last_mut() { *t = t.wrapping_neg(); } ip += 1; }
+                Cell::Builtin(Builtin::Rot)    => { let len = self.data.len(); if len >= 3 { self.data.swap(len-3, len-2); self.data.swap(len-2, len-1); } ip += 1; }
+                Cell::Builtin(Builtin::Xor)    => { let (a,b) = pop2!(); self.data.push(a ^ b); ip += 1; }
+                Cell::Builtin(Builtin::Invert) => { if let Some(t) = self.data.last_mut() { *t = !*t; } ip += 1; }
+                Cell::Builtin(Builtin::Lshift) => { let (a,b) = pop2!(); self.data.push(a << (b & 63)); ip += 1; }
+                Cell::Builtin(Builtin::Rshift) => { let (a,b) = pop2!(); self.data.push(a >> (b & 63)); ip += 1; }
+                Cell::Builtin(Builtin::Tuck)   => { let len = self.data.len(); if len >= 2 { let t = self.data[len-1]; self.data.insert(len-2, t); } ip += 1; }
+                Cell::Builtin(Builtin::Nip)    => { let len = self.data.len(); if len >= 2 { self.data.remove(len-2); } ip += 1; }
+                Cell::Builtin(Builtin::TwoDup) => { let len = self.data.len(); if len >= 2 { let a = self.data[len-2]; let b = self.data[len-1]; self.data.push(a); self.data.push(b); } ip += 1; }
                 Cell::Builtin(b) => { self.exec_builtin(b)?; ip += 1; }
                 Cell::Addr(addr) => {
-                    // Function call: charge one fuel unit to prevent runaway recursion.
                     check_fuel!();
-                    if call_stack.len() >= MAX_CALL_DEPTH { bail!("return stack overflow"); }
-                    call_stack.push(ip + 1);
-                    ip = addr;
+                    // Tail-call optimisation: if next cell is Ret, reuse the current frame.
+                    if ip + 1 < self.memory.len() && matches!(self.memory[ip + 1], Cell::Ret) {
+                        ip = addr;  // jump without pushing return address
+                    } else {
+                        if call_stack.len() >= MAX_CALL_DEPTH { bail!("return stack overflow"); }
+                        call_stack.push(ip + 1);
+                        ip = addr;
+                    }
                 }
                 Cell::Ret => {
                     match call_stack.pop() {
@@ -2458,8 +2606,8 @@ impl Forth {
             }
             Builtin::Lock => {
                 // ( name-idx ttl-ms -- flag )
-                // Acquire advisory lock.  Max TTL = 30 000 ms.  Returns -1 on success, 0 if held.
-                const MAX_TTL_MS: u64 = 30_000;
+                // Acquire advisory lock.  Max TTL = 5 000 ms.  Returns -1 on success, 0 if held.
+                const MAX_TTL_MS: u64 = 5_000;
                 let ttl_ms = self.pop()? as u64;
                 let name_idx = self.pop()? as usize;
                 let name = self.strings.get(name_idx)
@@ -4708,7 +4856,7 @@ fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16, String, Option<Strin
 
 /// Collect basic machine specs: (cpu_cores, ram_mb, bench_ms).
 /// bench_ms = milliseconds to complete 10 million integer additions (lower = faster).
-fn collect_machine_specs() -> (u32, u64, u64) {
+pub fn collect_machine_specs() -> (u32, u64, u64) {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_memory();
@@ -5136,7 +5284,17 @@ fn tokenize(src: &str) -> Vec<String> {
                 for c2 in chars.by_ref() { if c2 == '|' { break; } s.push(c2); }
                 tokens.push(format!("\x00str:{s}"));
             } else {
-                tok.push('.');
+                // Sentence-final period: "square." → ["square", "."]
+                // A trailing period (followed by space, newline, or end) is a separator —
+                // every period executes, including natural language sentence endings.
+                let next = chars.peek().copied();
+                let is_sentence_end = matches!(next, None | Some(' ') | Some('\n') | Some('\r') | Some('\t') | Some(','));
+                if is_sentence_end && !tok.is_empty() {
+                    flush!();
+                    tokens.push(".".to_string()); // the . itself executes (print TOS or no-op)
+                } else {
+                    tok.push('.');
+                }
             }
         } else if c == '"' && tok == "confirm" {
             // confirm" message" — like ." but emits Cell::Confirm instead of Cell::Str
@@ -5257,6 +5415,15 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00scatter:{s}"));
+        } else if c == '"' && tok == "symbol" {
+            // symbol" name"  — share a word by name: if I know it, send my definition first;
+            // then run the word on all peers so each speaks it in their own dialect
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00symbol:{s}"));
         } else if c == '"' && tok == "hello" {
             // hello" peer"  — send "hello from <hostname>!" to one peer by name or addr
             tok.clear();
@@ -6459,20 +6626,16 @@ mod tests {
     }
 
     #[test]
-    fn test_redefine_builtin_no_approval_needed_builtins_not_shadowable() {
-        // Builtins cannot be shadowed — they are always resolved first at compile
-        // time — so no approval gate is applied (applying one would also break
-        // stdlib wrappers that use the same name).  The user definition is stored
-        // in name_index but is unreachable because the builtin wins at compile time.
-        let mut f = Forth::new().with_confirm(Box::new(|_msg| {
-            // Should NOT be called for builtins.
-            panic!("confirm_fn must not be called for builtin redefinition");
-        }));
-        // This should succeed without asking — the builtin `dup` still wins.
+    fn test_redefine_builtin_user_can_shadow() {
+        // User-defined words take priority over builtins — tools are overridable.
+        // Builtins live in name_to_builtin(), not name_index, so no confirm gate fires.
+        // After the user defines a word with the same name, their definition wins.
+        let mut f = Forth::new();
+        // User redefines `dup`: drops TOS, pushes 99.
         f.eval(": dup drop 99 ;").unwrap();
-        // `dup` is still the builtin — new code compiling `dup` finds the builtin first.
-        f.eval("5 dup + .").unwrap();
-        assert_eq!(f.out.trim(), "10");
+        // User's `dup` now shadows the builtin: 5 dup → drops 5, pushes 99.
+        f.eval("5 dup .").unwrap();
+        assert_eq!(f.out.trim(), "99");
     }
 
     // ── collect_machine_specs ─────────────────────────────────────────────

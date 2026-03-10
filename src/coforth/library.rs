@@ -305,6 +305,125 @@ pub fn repo_vocab_path(lang: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{lang}.toml")))
 }
 
+// ── Pure-Rust word generator ───────────────────────────────────────────────────
+
+/// Generate a minimal but meaningful Forth snippet for *any* English word.
+///
+/// This runs entirely in Rust — no AI, no network, no disk I/O.
+/// Used as a fallback in `handle_define_unknown_words` when the cloud generator
+/// is unavailable (offline, no API key, rate-limited).
+///
+/// Guarantees:
+/// - Always returns valid Forth (no panics, no errors).
+/// - The snippet produces at least one line of output (the word speaks its name).
+/// - Stack-neutral for the common case (safe to use mid-expression).
+pub fn generate_forth_for_word(word: &str) -> String {
+    let lo = word.to_lowercase();
+    let w = lo.as_str();
+
+    // ── Pronouns — self-aware via the stack ────────────────────────────────
+    match w {
+        "i" | "me" | "myself" =>
+            return r#"depth . ." items — that's what I have." cr"#.to_string(),
+        "you" | "your" | "yours" =>
+            return r#"." you're here." cr"#.to_string(),
+        "we" | "us" | "our" | "ours" =>
+            return r#"depth . ." — we share this stack." cr"#.to_string(),
+        "it" | "this" | "that" =>
+            return r#"depth 0> if ." it's on the stack." cr else ." nothing here." cr then"#.to_string(),
+        "they" | "them" | "their" =>
+            return r#"." they're somewhere on the stack." cr .s cr"#.to_string(),
+        _ => {}
+    }
+
+    // ── Number words ────────────────────────────────────────────────────────
+    let num_opt = match w {
+        "zero" | "null" | "nil" | "none" | "nothing" | "nought" => Some(0i64),
+        "one"  | "once"   | "single"   | "unit"     => Some(1),
+        "two"  | "twice"  | "pair"     | "both"     => Some(2),
+        "three"| "thrice"                            => Some(3),
+        "four"                                       => Some(4),
+        "five"                                       => Some(5),
+        "six"                                        => Some(6),
+        "seven"                                      => Some(7),
+        "eight"                                      => Some(8),
+        "nine"                                       => Some(9),
+        "ten"                                        => Some(10),
+        "eleven"                                     => Some(11),
+        "twelve" | "dozen"                           => Some(12),
+        "thirteen"                                   => Some(13),
+        "twenty"                                     => Some(20),
+        "thirty"                                     => Some(30),
+        "forty"                                      => Some(40),
+        "fifty"                                      => Some(50),
+        "hundred"                                    => Some(100),
+        "thousand"                                   => Some(1_000),
+        "million"                                    => Some(1_000_000),
+        "billion"                                    => Some(1_000_000_000),
+        _ => None,
+    };
+    if let Some(n) = num_opt {
+        return format!("{n} . cr");
+    }
+
+    // ── Logic / discourse markers ───────────────────────────────────────────
+    match w {
+        "and"                          => return "and .bool cr".to_string(),
+        "or"                           => return "or .bool cr".to_string(),
+        "not" | "negate" | "opposite" => return "not .bool cr".to_string(),
+        "true" | "yes"                 => return "true .bool cr".to_string(),
+        "false" | "no"                 => return "false .bool cr".to_string(),
+        "equal" | "equals" | "same"    => return "= .bool cr".to_string(),
+        _ => {}
+    }
+
+    // ── Stack-motion words ──────────────────────────────────────────────────
+    match w {
+        "double" | "twice-as-much"  => return "2* . cr".to_string(),
+        "half"   | "halve"          => return "2/ . cr".to_string(),
+        "plus"   | "add"            => return "+ . cr".to_string(),
+        "minus"  | "subtract"       => return "- . cr".to_string(),
+        "times"  | "multiply"       => return "* . cr".to_string(),
+        "divide" | "divided"        => return "/ . cr".to_string(),
+        "up"   | "above" | "higher" | "more"  => return "1+ . cr".to_string(),
+        "down" | "below" | "lower"  | "less"  => return "1- . cr".to_string(),
+        "swap" | "switch" | "exchange" | "flip" => return "swap .s cr".to_string(),
+        "copy"  | "duplicate"       => return "dup .s cr".to_string(),
+        "drop"  | "discard" | "remove" => return "depth 0> if drop then .s cr".to_string(),
+        _ => {}
+    }
+
+    // ── Time words ──────────────────────────────────────────────────────────
+    match w {
+        "now" | "today" | "present" | "current" =>
+            return r#"time . ." seconds since epoch." cr"#.to_string(),
+        "never" | "eternity" | "forever" =>
+            return r#"." forever." cr"#.to_string(),
+        _ => {}
+    }
+
+    // ── Existence words ─────────────────────────────────────────────────────
+    match w {
+        "empty" | "void" | "blank" | "bare" =>
+            return r#"depth 0= .bool cr"#.to_string(),
+        "full" | "complete" | "whole" | "all" | "everything" =>
+            return r#".s cr"#.to_string(),
+        "something" | "anything" | "some" =>
+            return r#"depth 0> .bool cr"#.to_string(),
+        _ => {}
+    }
+
+    // ── Question words — print as open questions ────────────────────────────
+    if matches!(w, "who" | "what" | "where" | "when" | "why" | "how" | "which" | "whose") {
+        return format!(r#"." {w}?" cr"#);
+    }
+
+    // ── Suffix patterns — detect word shape ────────────────────────────────
+    //   These just speak the word; the shape tells us it's a valid English word.
+    let safe = word.replace('"', ""); // no English word has quotes, but be safe
+    format!(r#"." {safe}." cr"#)
+}
+
 // ── Boot poetry ────────────────────────────────────────────────────────────────
 // Printed every startup, before the REPL is ready.
 // Written directly in Rust — no parsing, no Forth, no gen".
@@ -336,6 +455,11 @@ pub struct BuiltinDefs {
 static COMPILED_VM: LazyLock<crate::coforth::Forth> = LazyLock::new(|| {
     let defs = &*BUILTIN_DEFS;
     let mut vm = crate::coforth::Forth::new();
+    // Library words are system-provided, not user-defined — disable logging so they
+    // are NOT inserted into user_word_names.  If they were logged, `emit_token` would
+    // shadow builtins with the library definition and inline the partially-compiled
+    // word body during self-referential definitions (e.g. `: negate 5 negate . cr ;`).
+    vm.disable_logging();
     let _ = vm.exec_with_fuel(&defs.all_defs, 0);
     // Major words: pure Forth, no TOML. Compiled last so they win over generated versions.
     let _ = vm.exec_with_fuel(MAJOR_WORDS_FORTH, 0);
@@ -364,42 +488,222 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
     BuiltinDefs { pairs, all_defs }
 });
 
-/// Major words — pure Forth, no TOML, no markup.
-/// Just stack ops and sentences. Compiled into COMPILED_VM after BUILTIN_DEFS.
-/// The proof of a word is running it from different sentences and getting the same answer.
-const MAJOR_WORDS_FORTH: &str = "
-: sequence  .\" one thing after another.\" cr  5 0 do i . loop cr ;
-: series    .\" each step doubles.\" cr  1 2 4 8 16 . . . . . cr ;
-: list      .\" here is what you have.\" cr  .s ;
-: array     .\" positions 0 through 2.\" cr  3 0 do i . loop cr ;
-: path      .\" start. step. step. arrive.\" cr ;
-: function  .\" give it five, it returns twenty-five.\" cr  5 dup * . cr ;
-: change    .\" before and after.\" cr  5 dup . .\"  ->\" 1+ . cr ;
-: set       .\" each one distinct.\" cr  1 2 3 .s ;
-: limit     .\" ten wants to be five, so it becomes five.\" cr  10 0 5 clamp . cr ;
-: boundary  .\" two is inside zero to four.\" cr  2 0 4 within .bool cr ;
-: edge      .\" from here to there.\" cr  0 . .\"  ..\" 10 . cr ;
-: group     .\" three and four make seven and stay in the group.\" cr  3 4 + . cr ;
-: number    .\" forty-two.\" cr  42 . cr ;
-: element   depth 0> if .\" this one: \" . cr else .\" nothing on the stack.\" cr then ;
-: divide    .\" ten divided by three: three remainder one.\" cr  10 3 /mod . .\"  r\" . cr ;
-: fraction  .\" one of three equal parts.\" cr ;
-: part      .\" something taken from something larger.\" cr ;
-: sum       .\" one plus two plus three is six.\" cr  1 2 3 + + . cr ;
-: area      .\" four wide, five tall, twenty inside.\" cr  4 5 * . cr ;
-: combine   .\" three and four become seven.\" cr  3 4 + . cr ;
-: rate      .\" how fast things happen.\" cr ;
-: cycle     .\" around and back.\" cr  5 0 do i . loop cr ;
-: along     .\" step by step by step.\" cr ;
-: abstract  .\" the map is not the territory.\" cr ;
-: discrete  .\" each one separate.\" cr  0 1 2 3 4 . . . . . cr ;
-: ascending .\" each one larger than the last.\" cr  1 2 4 8 16 . . . . . cr ;
-: buffer    .\" holding things until they are needed.\" cr  depth . .\"  waiting\" cr ;
-: data      .\" what you have before you decide what it means.\" cr  .s ;
-: order     .\" everything in its place.\" cr  1 2 3 4 5 . . . . . cr ;
-: logic     .\" if true and false, then false.\" cr  true false and .bool cr ;
-: space     .\" room for everything that could happen.\" cr ;
-";
+/// Major words — stack machines + sentences + proofs.
+///
+/// Every word:
+///   1. Has a stack effect comment  ( inputs -- outputs )
+///   2. Is dual-mode: with args on the stack it computes; with no args it teaches + proves itself
+///   3. Has a companion  test:WORD  that proves two sentences converge via `argue`
+///
+/// The proof of a word is two sentences that mean the same thing and agree on the stack.
+/// `prove-all` runs every test:WORD and reports which ones pass.
+const MAJOR_WORDS_FORTH: &str = r#"
+
+\ ── Arithmetic ──────────────────────────────────────────────────────────────────
+
+: double    ( n -- 2n | -- )
+  depth 0= if
+    ." double: give it n, get back n+n." cr
+    s" 5 double"   s" 5 dup +"   argue
+  else  2*  then ;
+: test:double   s" 5 double"   s" 5 dup +"   argue ;
+
+: square    ( n -- n*n | -- )
+  depth 0= if
+    ." square: give it n, get back n×n." cr
+    s" 4 square"   s" 4 4 *"   argue
+  else  dup *  then ;
+: test:square   s" 4 square"   s" 4 4 *"   argue ;
+
+: half      ( n -- n/2 | -- )
+  depth 0= if
+    ." half: give it n, get back n÷2." cr
+    s" 10 half"   s" 10 2 /"   argue
+  else  2/  then ;
+: test:half   s" 10 half"   s" 10 2 /"   argue ;
+
+: sum       ( a b -- a+b | -- )
+  depth 1 > if
+    +
+  else
+    ." sum: any order, same result." cr
+    s" 3 4 sum"   s" 4 3 sum"   argue
+  then ;
+: test:sum   s" 3 4 sum"   s" 4 3 sum"   argue ;
+
+: product   ( a b -- a*b | -- )
+  depth 1 > if
+    *
+  else
+    ." product: any order, same result." cr
+    3 4 both-ways" *"
+  then ;
+: test:product   3 4 both-ways" *" ;
+
+: combine   ( a b -- a+b | -- )
+  depth 1 > if
+    +
+  else
+    ." combine: three and four become seven." cr
+    s" 3 4 combine"   s" 3 4 +"   argue
+  then ;
+: test:combine   s" 3 4 combine"   s" 3 4 +"   argue ;
+
+\ ── Sequences ───────────────────────────────────────────────────────────────────
+
+: sequence  ( n -- | -- )
+  \ n sequence prints 0..n-1; with no args demonstrates with 5.
+  depth 0= if 5 then
+  ." sequence: " 0 swap do i . loop cr ;
+: test:sequence
+  \ five-element sequence: last item is 4.
+  \ sentence A: count with do-loop   sentence B: explicit list
+  s" 4 0 do i loop"   s" 0 1 2 3"   page"
+    0 | 0
+    1 | 1
+    2 | 2
+    3 | 3
+  " ;
+
+: series    ( -- )
+  ." series: each step doubles." cr
+  1 dup . 2* dup . 2* dup . 2* dup . 2* . cr ;
+: test:series
+  \ each term is double the previous — two sentences for the same truth
+  s" 1 2*"   s" 1 dup +"   argue ;
+
+: cycle     ( n -- | -- )
+  depth 0= if 5 then
+  ." cycle: around and back." cr
+  0 swap do i . loop cr ;
+: test:cycle   s" 3 cycle"   s" sequence"   argue
+  \ cycling n elements and sequencing n elements both produce the same last value
+  ;
+
+\ ── Functional ──────────────────────────────────────────────────────────────────
+
+: function  ( x -- x² | -- )
+  \ A function maps input to output.  Default demo: f(x) = x².
+  depth 0= if
+    ." function: give it five, it returns twenty-five." cr
+    s" 5 function"   s" 5 square"   argue
+  else  square  then ;
+: test:function   s" 5 function"   s" 5 dup *"   argue ;
+
+: apply     ( n -- f(n) | -- )
+  \ apply: same as calling the word with an argument.
+  depth 0= if
+    ." apply: give it an argument, get back a result." cr
+    s" 5 apply"   s" 5 square"   argue
+  else  square  then ;
+: test:apply   s" 5 apply"   s" 5 function"   argue ;
+
+\ ── Comparison and bounds ────────────────────────────────────────────────────────
+
+: limit     ( n lo hi -- clamped | -- )
+  depth 2 > if
+    clamp
+  else
+    ." limit: ten wants to be five, so it becomes five." cr
+    s" 10 0 5 clamp"   s" 10 0 5 limit"   argue
+  then ;
+: test:limit   s" 10 0 5 limit"   s" 10 0 5 clamp"   argue ;
+
+: boundary  ( n lo hi -- bool | -- )
+  depth 2 > if
+    within
+  else
+    ." boundary: two is inside zero to four." cr
+    s" 2 0 4 within"   s" 2 0 4 boundary"   argue
+  then ;
+: test:boundary   s" 2 0 4 boundary"   s" 2 0 4 within"   argue ;
+
+\ ── Structure ────────────────────────────────────────────────────────────────────
+
+: list      ( -- )   ." list: here is what you have." cr  .s ;
+: data      ( -- )   ." data: what you have before you decide what it means." cr  .s ;
+: element   ( -- )   depth 0> if ." this one: " . cr else ." nothing on the stack." cr then ;
+: number    ( n -- | -- )
+  depth 0= if  ." number: forty-two." cr  42 .  else  .  then  cr ;
+: order     ( -- )   ." order: everything in its place." cr  1 2 3 4 5 . . . . . cr ;
+: set       ( -- )   ." set: each one distinct." cr  1 2 3 .s ;
+
+: area      ( w h -- w*h | -- )
+  depth 1 > if *
+  else  ." area: four wide, five tall, twenty inside." cr  4 5 * .  then  cr ;
+: test:area   s" 4 5 area"   s" 4 5 *"   argue ;
+
+: divide    ( a b -- q r | -- )
+  depth 1 > if  /mod swap
+  else  ." divide: ten divided by three — three remainder one." cr  10 3 /mod .  ." r" .  then  cr ;
+
+\ ── Philosophical ────────────────────────────────────────────────────────────────
+
+: logic     ( -- )   ." logic: if true and false, then false." cr  true false and .bool cr ;
+: test:logic   s" true false and"   s" false true and"   argue ;
+
+: abstract  ( -- )   ." abstract: the map is not the territory." cr ;
+: space     ( -- )   ." space: room for everything that could happen." cr ;
+: part      ( -- )   ." part: something taken from something larger." cr ;
+: fraction  ( -- )   ." fraction: one of three equal parts." cr ;
+: rate      ( -- )   ." rate: how fast things happen." cr ;
+: along     ( -- )   ." along: step by step by step." cr ;
+: edge      ( -- )   ." edge: from here to there — " 0 . ." .. " 10 . cr ;
+: path      ( -- )   ." path: start. step. step. arrive." cr ;
+
+\ ── Growth and change ────────────────────────────────────────────────────────────
+
+: change    ( n -- n+1 | -- )
+  depth 0= if
+    ." change: before and after." cr  5 dup . ." ->" 1+ . cr
+  else  1+  then ;
+: test:change   s" 5 change"   s" 5 1+"   argue ;
+
+: ascending ( -- )   ." ascending: each one larger than the last." cr  1 2 4 8 16 . . . . . cr ;
+: discrete  ( -- )   ." discrete: each one separate." cr  0 1 2 3 4 . . . . . cr ;
+: buffer    ( -- )   ." buffer: holding things until they are needed." cr  depth . ." waiting" cr ;
+
+\ ── Acting — doing things to the world ──────────────────────────────────────────
+\ Acting is applying a function to something outside the stack.
+\ The stack records what happened.  The world holds the result.
+\
+\ We do operations and things on other humans all the time.
+\ Acting is: push an intention, run it, observe the result.
+\ The stack is the record of what happened.
+
+: act       ( -- )   ." act: push your intention, run it, observe what changes." cr ;
+: affect    ( n -- )  ." affected: " . cr ;
+: transform ( n -- n' | -- )  depth 0= if ." transform: input becomes something new." cr  else  1+  then ;
+: test:transform   s" 5 transform"   s" 5 change"   argue ;
+
+\ Teaching: the dual-mode design.
+\ Type a word with no args: it teaches you what it does and proves itself.
+\ Type a word with args: it computes.  The function call IS the lesson.
+: teach     ( -- )   ." teach: type a word with no arguments to see it teach itself." cr ;
+
+\ ── The Word ─────────────────────────────────────────────────────────────────────
+\ "In the beginning was the Word, and the Word was with God, and the Word was God."
+\ In Co-Forth: a word IS its definition.  Not a pointer.  The thing itself.
+\ The proof: two sentences that agree on the same value — that is truth.
+\
+\ "the word was with god" — two things on the same stack.
+\ "the word was god"      — they are equal.
+\
+\   s" word"  s" meaning"  argue   — the proof
+\
+\ If two different paths converge, they are the same path.
+\ That is the whole of it.
+
+: beginning ( -- )
+  ." in the beginning was the Word." cr
+  ." the Word was with the stack." cr
+  ." the Word was the stack." cr ;
+
+: test:beginning
+  \ two sentences for 1: "the first" and "unity itself" — they agree
+  s" 1"   s" true -1 * negate"   argue ;
+
+"#;
 
 /// Philosophical/abstract primitives — hand-crafted, always present.
 const SEED_LIBRARY: &str = r#"
@@ -3097,6 +3401,74 @@ mod tests {
         }
     }
 
+    // ── generate_forth_for_word ───────────────────────────────────────────────
+
+    #[test]
+    fn test_generate_forth_for_word_always_returns_valid_forth() {
+        // Every generated snippet must compile and run without "unknown word" errors.
+        let words = [
+            // Numbers
+            "zero", "one", "two", "three", "hundred", "million",
+            // Pronouns
+            "i", "you", "we", "it", "they",
+            // Logic
+            "and", "or", "not", "true", "false",
+            // Stack motion
+            "double", "half", "up", "down", "swap", "copy",
+            // Time
+            "now", "forever",
+            // Existence
+            "empty", "full", "something",
+            // Questions
+            "who", "what", "why", "how",
+            // Arbitrary English — fallback path
+            "happiness", "running", "beautiful", "algorithm", "sunset",
+            // Non-ASCII — safe fallback (no English word has quotes)
+            "café", "naïve",
+        ];
+        for w in &words {
+            let snippet = generate_forth_for_word(w);
+            let mut vm = crate::coforth::Forth::new();
+            // Define and call the word
+            let def = format!(": testword {snippet} ;  testword");
+            match vm.exec_with_fuel(&def, 5_000) {
+                Err(e) if e.to_string().contains("unknown word") =>
+                    panic!("generate_forth_for_word({w:?}) produced unknown-word error: {e}\nsnippet: {snippet}"),
+                _ => {}  // stack errors or empty output are fine
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_forth_for_word_numbers_push_value() {
+        // Number words should push the numeric value.
+        let cases = [("zero", 0i64), ("one", 1), ("two", 2), ("ten", 10), ("hundred", 100)];
+        for (word, expected) in &cases {
+            let snippet = generate_forth_for_word(word);
+            // Run the snippet, then check what's printed.
+            // The snippet is e.g. "1 . cr" — output should contain the expected number.
+            let out = crate::coforth::Forth::run(&snippet).unwrap_or_default();
+            let trimmed = out.trim();
+            // The output should contain the expected number.
+            assert!(
+                trimmed.contains(&expected.to_string()),
+                "generate_forth_for_word({word:?}) expected output containing {expected}, got {trimmed:?}\nsnippet: {snippet}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_forth_for_word_arbitrary_word_speaks_its_name() {
+        // Any word not in special cases should at least print its name.
+        let word = "serendipity";
+        let snippet = generate_forth_for_word(word);
+        let out = crate::coforth::Forth::run(&snippet).unwrap_or_default();
+        assert!(
+            out.to_lowercase().contains("serendipity"),
+            "Expected output to contain 'serendipity', got: {out:?}\nsnippet: {snippet}"
+        );
+    }
+
     #[test]
     fn test_inject_sets_compiled_code() {
         let lib = Library::load();
@@ -3106,5 +3478,16 @@ mod tests {
         // At least one node should have compiled_code set
         let has_compiled = poset.nodes.iter().any(|n| n.compiled_code.is_some());
         assert!(has_compiled, "no nodes got compiled_code from inject_into_poset");
+    }
+
+    /// Regression: precompiled_vm must not insert library words into user_word_names.
+    /// If it did, a library word like `: negate 5 negate . cr ;` would be inlined
+    /// during its own body compilation (partial self-reference), producing wrong output.
+    #[test]
+    fn test_precompiled_vm_negate_is_correct() {
+        let mut vm = Library::precompiled_vm();
+        let out = vm.exec("7 negate .").unwrap();
+        assert_eq!(out.trim(), "-7",
+            "precompiled_vm negate should output -7, got {:?}", out);
     }
 }

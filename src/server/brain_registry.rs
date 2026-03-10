@@ -149,20 +149,91 @@ impl BrainEntry {
     }
 }
 
+/// A shared brain — persistent across all sessions, contributed to by any participant.
+///
+/// Unlike per-task daemon brains, shared brains are always alive.
+/// Any session's brain can push context into them; all queries draw from them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedBrainEntry {
+    pub name: String,
+    /// Accumulated context — each contributor appends; newest at the bottom.
+    pub context: String,
+    /// Unix timestamp of last update.
+    pub updated_secs: u64,
+}
+
 /// Thread-safe registry of all daemon brain sessions.
 #[derive(Clone)]
 pub struct BrainRegistry {
     brains: Arc<RwLock<HashMap<Uuid, BrainEntry>>>,
     /// Name → id for deduplication
     names: Arc<RwLock<HashMap<String, Uuid>>>,
+    /// Shared brains — persistent, multi-session context pools.
+    shared: Arc<RwLock<HashMap<String, SharedBrainEntry>>>,
 }
 
 impl BrainRegistry {
     pub fn new() -> Self {
+        let shared = Arc::new(RwLock::new(HashMap::new()));
+        // Seed the default shared brains so they exist from startup.
+        {
+            let mut map = shared.try_write().expect("new is single-threaded");
+            for name in &["shared", "vocab", "codebase"] {
+                map.insert(name.to_string(), SharedBrainEntry {
+                    name: name.to_string(),
+                    context: String::new(),
+                    updated_secs: 0,
+                });
+            }
+        }
         Self {
             brains: Arc::new(RwLock::new(HashMap::new())),
             names: Arc::new(RwLock::new(HashMap::new())),
+            shared,
         }
+    }
+
+    /// Append context to a shared brain (creates the brain if it doesn't exist).
+    /// Trims to the last 8KB so old context doesn't grow unbounded.
+    pub async fn contribute_shared(&self, name: &str, context: &str) {
+        let mut map = self.shared.write().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let entry = map.entry(name.to_string()).or_insert_with(|| SharedBrainEntry {
+            name: name.to_string(),
+            context: String::new(),
+            updated_secs: 0,
+        });
+        if !entry.context.is_empty() {
+            entry.context.push('\n');
+        }
+        entry.context.push_str(context);
+        // Keep only the most recent 8KB.
+        if entry.context.len() > 8192 {
+            let trim_start = entry.context.len() - 8192;
+            // Trim to a newline boundary.
+            let trim_start = entry.context[trim_start..]
+                .find('\n')
+                .map(|p| trim_start + p + 1)
+                .unwrap_or(trim_start);
+            entry.context = entry.context[trim_start..].to_string();
+        }
+        entry.updated_secs = now;
+    }
+
+    /// Return all shared brains.
+    pub async fn list_shared(&self) -> Vec<SharedBrainEntry> {
+        let map = self.shared.read().await;
+        let mut entries: Vec<SharedBrainEntry> = map.values().cloned().collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
+    }
+
+    /// Return one shared brain by name.
+    pub async fn get_shared(&self, name: &str) -> Option<SharedBrainEntry> {
+        self.shared.read().await.get(name).cloned()
     }
 
     /// Insert a new entry, returning the assigned name (slug, with collision suffix).

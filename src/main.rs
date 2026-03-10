@@ -1525,9 +1525,15 @@ async fn run_node_info() -> Result<()> {
 // ── finch coforth ─────────────────────────────────────────────────────────────
 
 fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
+    // Use the pre-compiled VM so major words and the full library are available.
+    let run_in_vm = |code: &str| -> Result<String> {
+        let mut vm = finch::coforth::Library::precompiled_vm();
+        vm.exec(code)?;
+        Ok(std::mem::take(&mut vm.out))
+    };
     match cmd {
         CoforthCommand::Run { code } => {
-            match finch::coforth::Forth::run(&code) {
+            match run_in_vm(&code) {
                 Ok(out) => print!("{out}"),
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -1536,7 +1542,7 @@ fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
             }
         }
         CoforthCommand::Validate { code } => {
-            match finch::coforth::Forth::run(&code) {
+            match run_in_vm(&code) {
                 Ok(out) if !out.is_empty() => {
                     println!("ok  →  {:?}", out.trim());
                 }

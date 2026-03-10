@@ -90,6 +90,7 @@ impl EventHandler {
             ReplEvent::BrainProposedAction { .. } => {}
             ReplEvent::PosetComplete { .. } => {}
             ReplEvent::PeersDiscovered(_) => {}
+            ReplEvent::VocabSync(_) => {}
         }
 
         Ok(())
