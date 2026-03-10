@@ -302,7 +302,7 @@ fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
     Ok(ClaudeClient::with_provider(provider))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Suppress ONNX Runtime verbose logs BEFORE any initialization
     // Must be set early, before any ONNX library code runs
@@ -499,8 +499,8 @@ async fn main() -> Result<()> {
                         }
                         if mdns_discovery {
                             new_config.server.advertise = true;
-                            new_config.client.auto_discover = true;
                         }
+                        new_config.client.auto_discover = result.auto_discover;
                         #[allow(deprecated)]
                         {
                             new_config.streaming_enabled = new_config.features.streaming_enabled;

@@ -60,7 +60,32 @@ impl EventLoop {
     }
 
     /// Handle a `BrainQuestion` event: show a dialog and store the response channel.
+    ///
+    /// If the user is currently busy (active query in flight), defer the question
+    /// until they become idle — the brain waits rather than interrupting.
     async fn handle_brain_question(
+        &mut self,
+        question: String,
+        options: Vec<String>,
+        response_tx: tokio::sync::oneshot::Sender<String>,
+    ) -> Result<()> {
+        tracing::debug!("[EVENT_LOOP] Brain question: {}", question);
+
+        // If a query is in flight, defer the question — don't interrupt the user.
+        let is_busy = self.active_query_id.read().await.is_some();
+        if is_busy {
+            tracing::debug!("[EVENT_LOOP] User busy — deferring brain question");
+            // Replace any older deferred question (drop it, sending no answer).
+            let _ = self.deferred_brain_question.take();
+            self.deferred_brain_question = Some((question, options, response_tx));
+            return Ok(());
+        }
+
+        self.show_brain_question_dialog(question, options, response_tx).await
+    }
+
+    /// Actually show the brain question dialog in TUI and store the response channel.
+    async fn show_brain_question_dialog(
         &mut self,
         question: String,
         options: Vec<String>,
@@ -68,10 +93,7 @@ impl EventLoop {
     ) -> Result<()> {
         use crate::cli::tui::{Dialog, DialogOption};
 
-        tracing::debug!("[EVENT_LOOP] Brain question: {}", question);
-
         // Drop any previous pending brain question (replaced by this new one).
-        // The old oneshot sender is dropped here, sending "[no answer]" implicitly.
         let _ = self.pending_brain_question_tx.take();
         self.pending_brain_question_options.clear();
 
@@ -96,6 +118,16 @@ impl EventLoop {
         // Store the response channel and options; the render tick will send the answer.
         self.pending_brain_question_tx = Some(response_tx);
         self.pending_brain_question_options = options;
+        Ok(())
+    }
+
+    /// Show any deferred brain question if the user is now idle.
+    /// Called when a query completes so the brain can ask its question.
+    pub(super) async fn maybe_show_deferred_brain_question(&mut self) -> Result<()> {
+        if let Some((question, options, response_tx)) = self.deferred_brain_question.take() {
+            tracing::debug!("[EVENT_LOOP] Showing deferred brain question now that user is idle");
+            self.show_brain_question_dialog(question, options, response_tx).await?;
+        }
         Ok(())
     }
 

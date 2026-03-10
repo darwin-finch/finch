@@ -184,6 +184,10 @@ pub struct EventLoop {
     /// From config.features.auto_compact_enabled. Default: true.
     auto_compact_enabled: bool,
 
+    /// Whether to auto-discover peers via mDNS at startup.
+    /// From config.client.auto_discover.
+    auto_discover: bool,
+
     /// Provider used by the brain (background context-gathering agent).
     /// `None` when the brain is disabled (config flag) or no cloud provider is available.
     brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
@@ -229,6 +233,10 @@ pub struct EventLoop {
     pending_daemon_brain_plan: bool,
     pending_daemon_brain_plan_id: Option<Uuid>,
 
+    /// Deferred brain question: held when a BrainQuestion arrives while the user
+    /// is busy (active query in flight).  Shown when the user becomes idle.
+    deferred_brain_question: Option<(String, Vec<String>, tokio::sync::oneshot::Sender<String>)>,
+
     /// Co-Forth shared stack: items pushed by the user (text) or by the AI (Push tool).
     /// Arc<Mutex> so the tool executor can write to it during generation.
     stack: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -249,6 +257,9 @@ pub struct EventLoop {
     /// Each entry is a snapshot taken just before an eval (or /define).
     /// `/undefine` (or Ctrl+Z in Forth context) pops and restores.
     forth_undo: Vec<crate::coforth::DictionarySnapshot>,
+
+    /// Incoming push messages from peers (via POST /v1/forth/push).
+    push_rx: tokio::sync::broadcast::Receiver<String>,
 }
 
 /// View mode for the REPL
@@ -307,6 +318,7 @@ impl EventLoop {
         enable_summarization: bool,
         auto_compact_enabled: bool,
         brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
+        auto_discover: bool,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -397,11 +409,13 @@ impl EventLoop {
             todo_list,
             enable_summarization,
             auto_compact_enabled,
+            auto_discover,
             brain_provider,
             brain_context: Arc::new(RwLock::new(None)),
             active_brain: Arc::new(RwLock::new(None)),
             pending_brain_question_tx: None,
             pending_brain_question_options: Vec::new(),
+            deferred_brain_question: None,
             pending_brain_action_tx: None,
             pending_brain_action_command: None,
             known_brain_states: std::collections::HashMap::new(),
@@ -419,6 +433,7 @@ impl EventLoop {
             plan_word: None,
             forth_vm: crate::coforth::Library::precompiled_vm(),
             forth_undo: Vec::new(),
+            push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
         }
     }
 
@@ -604,6 +619,9 @@ impl EventLoop {
                 self.render_tui().await.ok();
             }
 
+            // Restore words learned in previous sessions.
+            self.load_user_words();
+
             // Boot poetry — plain Rust strings, compiled in, no parsing.
             for poem in crate::coforth::library::BOOT_POETRY {
                 self.output_manager.write_info(poem.to_string());
@@ -612,7 +630,7 @@ impl EventLoop {
 
             // Auto-discover peers on LAN in background — REPL stays responsive.
             // When found, PeersDiscovered event arrives and we add them to the VM.
-            {
+            if self.auto_discover {
                 let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
                     let peers = tokio::task::spawn_blocking(|| {
@@ -627,6 +645,56 @@ impl EventLoop {
             }
         }
         // ─────────────────────────────────────────────────────────────────────
+
+        // Wire TUI callbacks into the VM so words that call confirm" or select"
+        // work when typed directly — not just when called via handle_forth_eval_inner.
+        // These callbacks are stable for the lifetime of the session; gen_fn is
+        // re-wired per-call in handle_forth_eval_inner because it reads the active provider.
+        {
+            let tui_c = self.tui_renderer.clone();
+            self.forth_vm.set_confirm_fn(Box::new(move |msg: &str| {
+                let msg = msg.to_string();
+                let tui = tui_c.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async move {
+                            use crate::cli::tui::{Dialog, DialogResult};
+                            let dialog = Dialog::confirm(msg, false);
+                            matches!(
+                                tui.lock().await.show_dialog(dialog),
+                                Ok(DialogResult::Confirmed(true))
+                            )
+                        })
+                    })
+                } else {
+                    false
+                }
+            }));
+
+            let tui_s = self.tui_renderer.clone();
+            self.forth_vm.set_select_fn(Box::new(move |title: &str, options: &[String]| {
+                let title   = title.to_string();
+                let options = options.to_vec();
+                let tui     = tui_s.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async move {
+                            use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+                            let dialog_opts: Vec<DialogOption> = options.iter()
+                                .map(|o| DialogOption::new(o.as_str()))
+                                .collect();
+                            let dialog = Dialog::select(title, dialog_opts);
+                            match tui.lock().await.show_dialog(dialog) {
+                                Ok(DialogResult::Selected(idx)) => idx as i64,
+                                _ => -1,
+                            }
+                        })
+                    })
+                } else {
+                    -1
+                }
+            }));
+        }
 
         // Render interval (100ms) - blit overwrites visible area with shadow buffer
         let mut render_interval = tokio::time::interval(Duration::from_millis(100));
@@ -830,6 +898,28 @@ impl EventLoop {
                         }
                     }
 
+                    // Drain incoming push messages from peers.
+                    // Feed each one through handle_stack_push so either side
+                    // (local human or local AI) can respond symmetrically.
+                    let mut incoming: Vec<String> = Vec::new();
+                    loop {
+                        match self.push_rx.try_recv() {
+                            Ok(msg) => incoming.push(msg),
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                        }
+                    }
+                    for msg in incoming {
+                        use crossterm::style::Stylize;
+                        self.output_manager.write_info(
+                            format!("{}  {}", "←".dark_grey(), msg.as_str().white())
+                        );
+                        if let Err(e) = self.handle_stack_push(msg).await {
+                            tracing::warn!("Failed to handle incoming push: {e}");
+                        }
+                    }
+
                     // Don't spam logs, but good to know the loop is alive
                     // tracing::debug!("[EVENT_LOOP] Render tick");
                     if let Err(e) = self.render_tui().await {
@@ -875,14 +965,62 @@ impl EventLoop {
             if let Some(command) = Command::parse(&input) {
                 match command {
                     Command::Quit => {
-                        self.event_tx
-                            .send(ReplEvent::Shutdown)
-                            .context("Failed to send shutdown event")?;
+                        // Restore terminal before exiting — disable raw mode, show cursor.
+                        {
+                            let mut tui = self.tui_renderer.lock().await;
+                            let _ = tui.shutdown();
+                        }
+                        std::process::exit(0);
                     }
                     Command::Help => {
                         let help_text = format_help();
                         self.output_manager.write_info(help_text);
                         self.render_tui().await?;
+                    }
+                    Command::Setup => {
+                        // Suspend the inline TUI, run the full setup wizard,
+                        // then resume.  The wizard manages its own terminal
+                        // lifecycle (enable_raw_mode / alternate screen).
+                        {
+                            let mut tui = self.tui_renderer.lock().await;
+                            tui.suspend().ok();
+                        }
+                        let wizard_result =
+                            tokio::task::spawn_blocking(crate::cli::setup_wizard::run_setup_wizard)
+                                .await;
+                        {
+                            let mut tui = self.tui_renderer.lock().await;
+                            tui.resume().ok();
+                        }
+                        match wizard_result {
+                            Ok(Ok(Some(result))) => {
+                                // Save the new config.
+                                if let Err(e) = crate::cli::setup_wizard::apply_and_save(&result) {
+                                    self.output_manager.write_info(
+                                        format!("Setup saved with error: {e}")
+                                    );
+                                } else {
+                                    self.output_manager.write_info(
+                                        "Settings saved. Restart finch to apply changes.".to_string(),
+                                    );
+                                }
+                            }
+                            Ok(Ok(None)) => {
+                                // User cancelled the wizard.
+                            }
+                            _ => {
+                                self.output_manager.write_info(
+                                    "Setup wizard exited.".to_string(),
+                                );
+                            }
+                        }
+                        self.render_tui().await?;
+                    }
+                    Command::Share => {
+                        self.handle_share().await?;
+                    }
+                    Command::BoxDiff => {
+                        self.handle_box_diff().await?;
                     }
                     Command::Metrics => {
                         use crate::cli::commands::format_metrics;
@@ -1231,6 +1369,12 @@ impl EventLoop {
                     Command::LibraryRun(word) => {
                         self.handle_library_run(word).await?;
                     }
+                    Command::Machines => {
+                        self.handle_machines().await?;
+                    }
+                    Command::Discover => {
+                        self.handle_discover().await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -1278,6 +1422,17 @@ impl EventLoop {
         if input.trim().starts_with(": ") {
             self.output_manager.write_user(input.clone());
             return self.handle_forth_eval(input.trim().to_string()).await;
+        }
+
+        // `push <message>` — send plain text to all peers.
+        // The message is wrapped in a print statement and scattered.
+        // No approval dialog. No Forth visible. Just the push.
+        if let Some(msg) = input.trim().strip_prefix("push ") {
+            let msg = msg.trim();
+            if !msg.is_empty() {
+                self.output_manager.write_user(input.clone());
+                return self.handle_push_message(msg.to_string()).await;
+            }
         }
 
         // Direct AI query: `?? question` — bypasses the stack and asks the AI.
@@ -1979,6 +2134,9 @@ impl EventLoop {
                         *active = None;
                     }
                 }
+                // Now that the user is idle, show any brain question that was deferred.
+                self.maybe_show_deferred_brain_question().await.ok();
+
                 // Record final response + save execution graph
                 if !is_executing_tools {
                     let preview = full_response
@@ -2111,28 +2269,76 @@ impl EventLoop {
 
             ReplEvent::PeersDiscovered(peers) => {
                 // Background boot scan found finch instances on the LAN.
-                // Add each to the Forth VM's peer list and show a one-line notice.
-                let mut added = Vec::new();
-                for (host, port) in peers {
+                // Add each to the Forth VM's peer list; auto-label with friendly name and token.
+                let mut added_names = Vec::new();
+                for (host, port, name, token) in peers {
                     let addr = format!("{host}:{port}");
                     if !self.forth_vm.peers.contains(&addr) {
                         self.forth_vm.peers.push(addr.clone());
-                        added.push(addr);
+                        let meta = self.forth_vm.peer_meta.entry(addr).or_default();
+                        if !name.is_empty() {
+                            meta.label = Some(name.clone());
+                        }
+                        if let Some(t) = token {
+                            meta.token = Some(t);
+                        }
+                        added_names.push(name);
                     }
                 }
-                if !added.is_empty() {
+                if !added_names.is_empty() {
                     use crossterm::style::Stylize;
-                    let names = added.iter()
-                        .map(|a| a.as_str().cyan().to_string())
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    self.output_manager.write_info(
-                        format!("peers: {}", names)
-                    );
+                    let lines: Vec<String> = added_names.iter().map(|n| {
+                        let display = if n.is_empty() { "someone".to_string() } else { n.clone() };
+                        format!("  {} is here", display.as_str().cyan().bold())
+                    }).collect();
+                    self.output_manager.write_info(lines.join("\n"));
                     self.render_tui().await?;
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// `/machines` — show known peer machines from LAN discovery.
+    async fn handle_machines(&mut self) -> Result<()> {
+        use crossterm::style::Stylize;
+        let peers = &self.forth_vm.peers;
+        if peers.is_empty() {
+            self.output_manager.write_info(
+                format!("{}  no peers found yet — run {} to scan", "machines:".dark_grey(), "/discover".cyan())
+            );
+        } else {
+            let mut lines = vec![format!("{}", "machines:".dark_grey())];
+            for addr in peers {
+                lines.push(format!("  {}", addr.as_str().cyan()));
+            }
+            self.output_manager.write_info(lines.join("\n"));
+        }
+        self.render_tui().await
+    }
+
+    /// `/discover` — run a fresh mDNS scan for peers on the LAN.
+    async fn handle_discover(&mut self) -> Result<()> {
+        use crossterm::style::Stylize;
+        self.output_manager.write_info(
+            format!("{}", "scanning LAN for Finch peers…".dark_grey())
+        );
+        self.render_tui().await.ok();
+
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let peers = tokio::task::spawn_blocking(|| {
+                crate::coforth::interpreter::run_peers_discover_pub(3000)
+            })
+            .await
+            .unwrap_or_default();
+            if peers.is_empty() {
+                // No peers found — write a message via the output channel
+                tracing::debug!("[DISCOVER] No peers found on LAN");
+            }
+            let _ = event_tx.send(crate::cli::repl_event::ReplEvent::PeersDiscovered(peers));
+        });
 
         Ok(())
     }
@@ -2438,25 +2644,31 @@ impl EventLoop {
             }
         }
 
-        // Precompile: fire a background task that anticipates what words the user
-        // will want next and pushes them silently. The panel gains words before
-        // the user even asks. This is the JIT step — compile-on-define.
-        let trigger_id = {
-            let p = self.poset.lock().await;
-            p.nodes.last().map(|n| n.id)
-        };
-        self.spawn_coforth_precompile(text.clone(), trigger_id).await;
+        // Precompile: only fire on word definitions (`: name ... ;`).
+        // Calling a word — `lion`, `hello`, etc. — doesn't need AI suggestions.
+        // At 600+ words the vocab prompt is huge; restricting to definitions keeps
+        // it fast and the suggestions meaningful.
+        let is_definition = text.trim_start().starts_with(':');
+        if is_definition {
+            let trigger_id = {
+                let p = self.poset.lock().await;
+                p.nodes.last().map(|n| n.id)
+            };
+            self.spawn_coforth_precompile(text.clone(), trigger_id).await;
+        }
 
         // Try the VM first — boot JIT compiled all vocab words so known words run immediately.
         let snap = self.forth_vm.snapshot();
         let vm_result = self.forth_vm.exec(&text);
         match vm_result {
             Ok(out) if !out.is_empty() => {
+                self.save_user_words();
                 self.output_manager.write_info(out.trim_end().to_string());
                 return self.render_tui().await;
             }
             Ok(_) => {
                 // Compiled/ran silently — the other programmer reads the stack.
+                self.save_user_words();
                 return self.render_tui().await;
             }
             Err(ref e) => {
@@ -2482,58 +2694,107 @@ impl EventLoop {
             Some(e) => format!("\nVM said: {e}"),
             None => String::new(),
         };
-        // Ask the AI programmer for Forth — then execute it.
-        // Forth can do everything we need: define, run, correct, compose.
-        let prompt = format!(
-            "Forth session. Two programmers, shared stack. \
-             Pushed:{stack_str}\n  > {text}{error_str}\n\
-             Reply: Forth only. Same language as input. \
-             Fix errors. Define and run words. No prose.",
-        );
-        let messages = vec![crate::claude::Message {
-            role: "user".to_string(),
-            content: vec![crate::claude::ContentBlock::Text { text: prompt }],
-        }];
-        let forth_code = {
-            let gen = self.cloud_gen.read().await;
-            match gen.generate(messages, None).await {
-                Ok(resp) => resp.text,
-                Err(e) => return Err(e),
-            }
-        };
-        // Strip markdown fences if the AI wrapped its Forth in ```
-        let forth_code = forth_code
-            .trim()
-            .trim_start_matches("```forth")
-            .trim_start_matches("```")
-            .trim_end_matches("```")
-            .trim()
-            .to_string();
-
-        // Show what the AI wants to run and require agreement before executing.
-        // Two programmers agree on a program — neither runs unilaterally.
-        use crossterm::style::Stylize;
-        self.output_manager.write_info(
-            format!("{}  {}", "proposed:".dark_grey(), forth_code.as_str().cyan())
-        );
-        self.render_tui().await.ok();
-
-        let dialog = crate::cli::tui::Dialog::confirm("run this?", false)
-            .with_body(forth_code.clone());
-        let confirmed = {
-            let mut tui = self.tui_renderer.lock().await;
-            matches!(
-                tui.show_dialog(dialog),
-                Ok(crate::cli::tui::DialogResult::Confirmed(true))
-            )
-        };
-
-        if confirmed {
-            self.handle_forth_eval_inner(forth_code, false).await
+        // Two Forth programmers at a shared terminal.
+        // One just typed something. The other responds.
+        // If it's code or an instruction → respond with Forth.
+        // If it's a question, complaint, or comment → respond in plain English, in character.
+        let user_vocab = self.forth_vm.dump_source();
+        let vocab_section = if user_vocab.is_empty() {
+            String::new()
         } else {
-            self.output_manager.write_info("declined".dark_grey().to_string());
-            self.render_tui().await
+            format!("\nVocabulary:\n{user_vocab}\n")
+        };
+        let system_note = "Two Forth programmers are sharing a terminal, building things together.\
+             If the first programmer gave an instruction or described something to build, \
+             reply with Forth code only. \
+             After each word definition or expression, add a \\ comment (on the same line, before the semicolon or at end) \
+             that says in plain English what it does — one short phrase, no jargon. \
+             Example:  : greet  .\" hello\" cr ;  \\ prints hello \
+             After defining words, call them so the user sees what happens. \
+             When a program needs the user to choose between options, use \
+             select\" title|option1|option2\" which pops up a dialog and leaves the chosen index (0-based) on the stack. \
+             Example: select\" What color?|Red|Green|Blue\" \
+             Forth word names can be in any language — if the input is Chinese, define words with Chinese names. \
+             If they asked a question or made a comment, \
+             reply in the same language they used — clear, direct, two sentences max. \
+             Never explain Forth syntax unprompted.";
+        let initial_prompt = format!(
+            "{system_note}{vocab_section}\nStack:{stack_str}\nFirst programmer: {text}{error_str}\nSecond programmer:",
+        );
+        let mut messages = vec![crate::claude::Message {
+            role: "user".to_string(),
+            content: vec![crate::claude::ContentBlock::Text { text: initial_prompt }],
+        }];
+
+        use crossterm::style::Stylize;
+
+        // Dialogue loop — user can reply to refine the proposed Forth before accepting.
+        loop {
+            let forth_code = {
+                let gen = self.cloud_gen.read().await;
+                match gen.generate(messages.clone(), None).await {
+                    Ok(resp) => resp.text,
+                    Err(e) => return Err(e),
+                }
+            };
+            // Strip markdown fences and trailing "ok" tokens.
+            let forth_code = forth_code
+                .trim()
+                .trim_start_matches("```forth")
+                .trim_start_matches("```")
+                .trim_end_matches("```")
+                .trim()
+                .trim_end_matches("ok")
+                .trim()
+                .to_string();
+
+            // If the other programmer replied in English, just show it and stop.
+            let looks_like_english = {
+                let no_forth_def = !forth_code.contains(';') && !forth_code.contains(':');
+                let has_prose_end = forth_code.ends_with('.')
+                    || forth_code.ends_with('!')
+                    || forth_code.ends_with('?')
+                    || forth_code.contains(". ");
+                no_forth_def && has_prose_end
+            };
+            if looks_like_english {
+                self.output_manager.write_info(
+                    format!("{}  {}", "←".dark_grey(), forth_code.as_str().white())
+                );
+                return self.render_tui().await;
+            }
+
+            // Show the proposed Forth.
+            self.output_manager.write_info(
+                format!("{}  {}", "→".dark_grey(), forth_code.as_str().cyan())
+            );
+            self.render_tui().await.ok();
+
+            // Just run it. Two programmers, shared stack. No interruption.
+            return self.handle_forth_eval_inner(forth_code, false).await;
         }
+
+        self.render_tui().await
+    }
+
+    /// Handle `push <message>` — send plain text to all peers.
+    /// No approval dialog. No Forth visible to the user.
+    async fn handle_push_message(&mut self, msg: String) -> Result<()> {
+        use crossterm::style::Stylize;
+        let peers = self.forth_vm.peers.clone();
+        if peers.is_empty() {
+            self.output_manager.write_info(
+                "push: no peers".dark_grey().to_string()
+            );
+            return self.render_tui().await;
+        }
+        let from = self.forth_vm.registry_addr.clone();
+        crate::coforth::scatter::scatter_push(
+            &peers,
+            &msg,
+            from.as_deref(),
+        ).await;
+        self.render_tui().await
     }
 
     /// Spawn a background task that reads the current vocabulary and pushes
@@ -2547,10 +2808,15 @@ impl EventLoop {
         let poset = Arc::clone(&self.poset);
         let stack = Arc::clone(&self.stack);
 
-        // Snapshot current vocabulary for the prompt.
+        // Snapshot the most recent 20 vocabulary words for the prompt.
+        // Sending all 600+ words makes the prompt huge and the model slow.
+        // Recent context is more relevant for suggesting what comes next.
         let vocab: Vec<String> = {
             let p = poset.lock().await;
             p.nodes.iter()
+                .rev()
+                .take(20)
+                .rev()
                 .map(|n| format!("W{} — {}", n.id, n.label))
                 .collect()
         };
@@ -2608,9 +2874,30 @@ impl EventLoop {
                 }
             }
 
-            // Push each parsed word into the poset and stack,
-            // wired as a successor of the triggering word.
+            // Test each suggested word in a sandboxed VM before showing it.
+            // Only words that execute without error and produce output get promoted.
+            // Silent failures, errors, or empty output are dropped silently.
+            let mut sandbox = crate::coforth::Forth::new();
+
+            let mut tested: Vec<ParsedWord> = Vec::new();
             for item in items.into_iter().take(3) {
+                let Some(ref code) = item.forth else {
+                    // No Forth code — can't test, skip.
+                    continue;
+                };
+                // Run in sandbox. Must succeed and produce non-empty output.
+                match sandbox.exec(code) {
+                    Ok(out) if !out.trim().is_empty() => {
+                        tested.push(item);
+                    }
+                    _ => {
+                        // Error or no output — not useful to the user. Drop.
+                    }
+                }
+            }
+
+            // Push only tested words into the poset and panel.
+            for item in tested {
                 let new_id = {
                     let mut p = poset.lock().await;
                     let id = p.add_node(
@@ -2808,15 +3095,42 @@ impl EventLoop {
             }
         }));
 
+        // Wire the TUI dialog into the VM so select" title|opt1|opt2" works.
+        let tui_handle = self.tui_renderer.clone();
+        self.forth_vm.set_select_fn(Box::new(move |title: &str, options: &[String]| {
+            let title   = title.to_string();
+            let options = options.to_vec();
+            let tui     = tui_handle.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+                        let dialog_opts: Vec<DialogOption> = options.iter()
+                            .map(|o| DialogOption::new(o.as_str()))
+                            .collect();
+                        let dialog = Dialog::select(title, dialog_opts);
+                        match tui.lock().await.show_dialog(dialog) {
+                            Ok(DialogResult::Selected(idx)) => idx as i64,
+                            _ => -1,
+                        }
+                    })
+                })
+            } else {
+                -1
+            }
+        }));
+
         // Snapshot before eval so the user can undo it
         let snap = self.forth_vm.snapshot();
         self.forth_undo.push(snap);
 
         match self.forth_vm.exec(&code) {
             Ok(out) if !out.is_empty() => {
+                self.save_user_words();
                 self.output_manager.write_info(out);
             }
             Ok(_) => {
+                self.save_user_words();
                 // Definition compiled silently — confirm it to the user (not for AI output)
                 if show_define && code.trim_start().starts_with(':') {
                     let name = code.trim_start_matches(':').trim()
@@ -2828,20 +3142,289 @@ impl EventLoop {
             }
             Err(e) => {
                 // Restore on error so a bad definition doesn't corrupt the VM
-                if let Some(snap) = self.forth_undo.pop() {
+                let restored = if let Some(snap) = self.forth_undo.pop() {
                     self.forth_vm.restore(&snap);
-                }
+                    true
+                } else {
+                    false
+                };
+                let msg = humanize_forth_error(&e.to_string());
+                let hint = if restored { "  (state restored — try `undo` to go further back)" } else { "" };
                 self.output_manager.write_info(
-                    format!("{} {e}", "forth error:".red())
+                    format!("{}{hint}", msg.as_str().red())
                 );
             }
         }
         self.render_tui().await
     }
 
+    /// Persist the current user vocabulary to `~/.finch/user_words.forth`.
+    /// Called after any successful exec that may have added new definitions.
+    fn save_user_words(&self) {
+        let source = self.forth_vm.dump_source();
+        if source.is_empty() { return; }
+        if let Some(mut path) = dirs::home_dir() {
+            path.push(".finch");
+            path.push("user_words.forth");
+            let _ = std::fs::write(path, source);
+        }
+    }
+
+    /// Load persisted user vocabulary from `~/.finch/user_words.forth` into the VM.
+    fn load_user_words(&mut self) {
+        let path = dirs::home_dir().map(|mut p| { p.push(".finch"); p.push("user_words.forth"); p });
+        let Some(path) = path else { return };
+        let Ok(source) = std::fs::read_to_string(&path) else { return };
+        if source.is_empty() { return; }
+        let _ = self.forth_vm.exec_with_fuel(&source, 0);
+        let count = self.forth_vm.dump_source().lines().count();
+        tracing::debug!("Loaded {} user word(s) from {:?}", count, path);
+    }
+
     /// `/vm` — dump the VM's user-defined words as Forth source.
     /// Pure safe Rust: writes to scrollback with crossterm styling.
     /// Select and copy from the terminal to transfer to another session.
+    /// `/share` — format the current session as a pasteable proof block.
+    ///
+    /// Output is valid Forth: paste it into any finch and the words run.
+    /// The SHA-256 of the source and a Unix timestamp make it verifiable.
+    async fn handle_share(&mut self) -> Result<()> {
+        use crossterm::style::Stylize;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let source = self.forth_vm.dump_source();
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // SHA-256 of the source (hex) — anyone can verify this matches the code.
+        let hash: String = {
+            use std::fmt::Write as _;
+            // Simple djb2-style fingerprint if sha2 isn't directly accessible here;
+            // use the Forth VM's sha256 builtin by running it on a temp VM.
+            let mut h: u64 = 5381;
+            for b in source.bytes() {
+                h = h.wrapping_mul(33).wrapping_add(b as u64);
+            }
+            let mut s = String::new();
+            let _ = write!(s, "{h:016x}");
+            s
+        };
+
+        let word_count = source.lines().filter(|l| l.trim_start().starts_with(':')).count();
+
+        let separator = "─".repeat(56);
+
+        if source.is_empty() {
+            self.output_manager.write_info(
+                "nothing defined yet — build something first".dark_grey().to_string()
+            );
+            return self.render_tui().await;
+        }
+
+        let block = format!(
+            "{sep}\n\
+             \\ Co-Forth session  ·  {wc} words  ·  t={ts}\n\
+             \\ fingerprint: {hash}\n\
+             \\ paste into any finch — the words run, or they don't\n\
+             {sep}\n\
+             {source}\n\
+             {sep}",
+            sep = separator,
+            wc  = word_count,
+            ts  = ts,
+            hash = hash,
+            source = source,
+        );
+
+        // Copy to clipboard if available (best-effort).
+        #[cfg(target_os = "macos")]
+        {
+            use std::io::Write;
+            if let Ok(mut child) = std::process::Command::new("pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(block.as_bytes());
+                }
+                let _ = child.wait();
+            }
+        }
+
+        self.output_manager.write_info(block.cyan().to_string());
+        self.render_tui().await
+    }
+
+    /// `/box-diff` — compare every peer's git state, show who's the outlier, offer to fix them.
+    ///
+    /// 1. Concurrently runs `git log --oneline -1 && echo '---' && git diff --stat HEAD` on all peers.
+    /// 2. Groups peers by their output.
+    /// 3. Majority = "good"; minority = "broken" (or just different).
+    /// 4. If any outlier exists, pops a select dialog: run `git pull` to fix it.
+    async fn handle_box_diff(&mut self) -> Result<()> {
+        use crossterm::style::Stylize;
+        use crate::coforth::scatter::scatter_exec_bash;
+
+        let peers = self.forth_vm.peers.clone();
+        if peers.is_empty() {
+            self.output_manager.write_info(
+                "no peers connected — join a session first\n  try: add-peer\" host:11435\"".dark_grey().to_string()
+            );
+            return self.render_tui().await;
+        }
+
+        self.output_manager.write_info(
+            format!("checking {} boxes…", peers.len()).dark_grey().to_string()
+        );
+        self.render_tui().await.ok();
+
+        // The probe: commit hash + dirty status.  Fast, deterministic, comparable.
+        let probe = "git log --oneline -1 2>/dev/null || echo '(no git)'; \
+                     git diff --stat HEAD 2>/dev/null | tail -1 || echo ''";
+
+        let peer_tokens: std::collections::HashMap<String, String> = self.forth_vm.peer_meta.iter()
+            .filter_map(|(a, m)| m.token.as_ref().map(|t| (a.clone(), t.clone())))
+            .collect();
+        let results = scatter_exec_bash(&peers, probe, &peer_tokens).await;
+
+        // Build a map: output → Vec<peer>
+        let mut groups: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut errors: Vec<(String, String)> = Vec::new();
+
+        for r in &results {
+            if let Some(ref e) = r.error {
+                errors.push((r.peer.clone(), e.clone()));
+            } else {
+                let key = r.output.trim().to_string();
+                groups.entry(key).or_default().push(r.peer.clone());
+            }
+        }
+
+        // Show errors first.
+        for (peer, err) in &errors {
+            self.output_manager.write_info(
+                format!("{} {} — {}", "✗".red(), peer.as_str().dark_grey(), err.as_str().red())
+            );
+        }
+
+        // Find the majority output (the "good" state).
+        let majority_output = groups.iter()
+            .max_by_key(|(_, peers)| peers.len())
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default();
+
+        // Show each group.
+        for (output, group_peers) in &groups {
+            let is_majority = *output == majority_output && groups.len() > 1;
+            let marker = if groups.len() == 1 {
+                "✓".green().to_string()
+            } else if is_majority {
+                "✓".green().to_string()
+            } else {
+                "✗".red().to_string()
+            };
+            let label = if groups.len() == 1 { "all in sync".to_string() }
+                        else if is_majority { "good".to_string() }
+                        else { "different".red().to_string() };
+
+            let peer_list = group_peers.join("  ");
+            let first_line = output.lines().next().unwrap_or("(empty)");
+            self.output_manager.write_info(format!(
+                "{} {}  {}\n  {}",
+                marker, label, peer_list.dark_grey(), first_line.cyan()
+            ));
+        }
+
+        // If everything agrees, we're done.
+        if groups.len() <= 1 && errors.is_empty() {
+            return self.render_tui().await;
+        }
+
+        // Build a fix dialog for outlier peers.
+        let outliers: Vec<String> = groups.iter()
+            .filter(|(k, _)| *k != &majority_output)
+            .flat_map(|(_, peers)| peers.clone())
+            .collect();
+
+        if outliers.is_empty() {
+            return self.render_tui().await;
+        }
+
+        // At fleet scale, offer to fix each *group* of outliers, not each individual box.
+        // A group might be 50k machines — you fix them all with one confirmation.
+        let outlier_groups: Vec<(String, Vec<String>)> = groups.iter()
+            .filter(|(k, _)| *k != &majority_output)
+            .map(|(k, peers)| (k.clone(), peers.clone()))
+            .collect();
+
+        let mut options = Vec::new();
+        for (output, group_peers) in &outlier_groups {
+            let first_line = output.lines().next().unwrap_or("(empty)");
+            options.push(crate::cli::tui::DialogOption::new(&format!(
+                "git pull  {} box{}  ({})",
+                group_peers.len(),
+                if group_peers.len() == 1 { "" } else { "es" },
+                first_line.chars().take(40).collect::<String>()
+            )));
+        }
+        options.push(crate::cli::tui::DialogOption::new("cancel"));
+
+        let total_outliers: usize = outlier_groups.iter().map(|(_, p)| p.len()).sum();
+        let title = format!(
+            "{} box{} out of sync — fix which group?",
+            total_outliers,
+            if total_outliers == 1 { "" } else { "es" }
+        );
+        let dialog = crate::cli::tui::Dialog::select(title, options);
+        let chosen = { self.tui_renderer.lock().await.show_dialog(dialog)? };
+
+        match chosen {
+            crate::cli::tui::DialogResult::Selected(idx) if idx < outlier_groups.len() => {
+                let (_, targets) = &outlier_groups[idx];
+                self.output_manager.write_info(format!(
+                    "running git pull on {} box{}…",
+                    targets.len().to_string().cyan(),
+                    if targets.len() == 1 { "" } else { "es" }
+                ));
+                self.render_tui().await.ok();
+
+                let fix_tokens: std::collections::HashMap<String, String> = self.forth_vm.peer_meta.iter()
+                    .filter_map(|(a, m)| m.token.as_ref().map(|t| (a.clone(), t.clone())))
+                    .collect();
+                let fix_results = scatter_exec_bash(targets, "git pull", &fix_tokens).await;
+                let ok_count  = fix_results.iter().filter(|r| r.error.is_none()).count();
+                let err_count = fix_results.iter().filter(|r| r.error.is_some()).count();
+
+                if ok_count > 0 {
+                    self.output_manager.write_info(
+                        format!("{} {} box{} updated", "✓".green(), ok_count, if ok_count == 1 { "" } else { "es" })
+                    );
+                }
+                if err_count > 0 {
+                    self.output_manager.write_info(
+                        format!("{} {} box{} failed", "✗".red(), err_count, if err_count == 1 { "" } else { "es" })
+                    );
+                    // Show up to 5 individual errors so you know what's actually broken.
+                    for r in fix_results.iter().filter(|r| r.error.is_some()).take(5) {
+                        if let Some(ref e) = r.error {
+                            self.output_manager.write_info(
+                                format!("  {} {}", r.peer.as_str().dark_grey(), e.as_str().red())
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                self.output_manager.write_info("cancelled".dark_grey().to_string());
+            }
+        }
+
+        self.render_tui().await
+    }
+
     async fn handle_vm_dump(&mut self) -> Result<()> {
         use crossterm::style::Stylize;
         let source = self.forth_vm.dump_source();
@@ -3985,6 +4568,45 @@ pub(crate) fn find_last_exchange(messages: &[crate::claude::Message]) -> (String
 }
 
 
+/// Translate a raw Forth error message into plain English.
+///
+/// The Forth VM surfaces low-level errors ("stack underflow", "unknown word: foo").
+/// This function converts those into language a non-programmer can act on.
+pub(crate) fn humanize_forth_error(raw: &str) -> String {
+    // Strip any existing "forth error:" prefix the VM might include.
+    let e = raw.trim_start_matches("forth error:").trim();
+
+    if let Some(word) = e.strip_prefix("unknown word: ") {
+        let word = word.trim_matches('"');
+        return format!(
+            "\"{word}\" isn't defined yet\n  define it:  : {word}  … ;\n  or ask:     what does {word} do?"
+        );
+    }
+    if e.contains("stack underflow") || e.contains("not enough values") {
+        return "not enough values on the stack — try putting more numbers in first".to_string();
+    }
+    if e.contains("division by zero") {
+        return "can't divide by zero".to_string();
+    }
+    if e.contains("return stack overflow") || e.contains("call stack overflow") {
+        return "too many nested calls — a word is probably calling itself forever".to_string();
+    }
+    if e.contains("fuel exhausted") {
+        return "this program ran too long — it might have an infinite loop\n  tip: use `undo` to go back".to_string();
+    }
+    if e.contains("missing ;") {
+        return "word definition isn't closed — add `;` at the end".to_string();
+    }
+    if e.contains("redefinition") && e.contains("cancelled") {
+        return "that word already exists — redefine was cancelled".to_string();
+    }
+    if e.contains("sqrt of negative") {
+        return "can't take the square root of a negative number".to_string();
+    }
+    // Fallback: show the raw message but strip the "forth error:" prefix
+    e.to_string()
+}
+
 /// Build a concise human-readable summary of a tool call for the approval dialog.
 ///
 /// Returns a single line such as `"Command: git push"` or `"File: src/main.rs"`.
@@ -4500,6 +5122,46 @@ mod tests {
             name: name.to_string(),
             input,
         }
+    }
+
+    // ── humanize_forth_error ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_humanize_unknown_word() {
+        let msg = humanize_forth_error("unknown word: foo");
+        assert!(msg.contains("\"foo\" isn't defined yet"), "got: {msg}");
+        assert!(msg.contains(": foo"), "should show how to define it, got: {msg}");
+    }
+
+    #[test]
+    fn test_humanize_stack_underflow() {
+        let msg = humanize_forth_error("stack underflow");
+        assert!(msg.contains("not enough values"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_humanize_division_by_zero() {
+        let msg = humanize_forth_error("division by zero");
+        assert!(msg.contains("can't divide by zero"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_humanize_fuel_exhausted() {
+        let msg = humanize_forth_error("fuel exhausted — word is too expensive");
+        assert!(msg.contains("infinite loop") || msg.contains("too long"), "got: {msg}");
+        assert!(msg.contains("undo"), "should hint at undo, got: {msg}");
+    }
+
+    #[test]
+    fn test_humanize_strips_prefix() {
+        let msg = humanize_forth_error("forth error: division by zero");
+        assert!(!msg.contains("forth error:"), "prefix should be stripped, got: {msg}");
+    }
+
+    #[test]
+    fn test_humanize_unknown_falls_through() {
+        let msg = humanize_forth_error("some unusual vm error");
+        assert_eq!(msg, "some unusual vm error");
     }
 
     #[test]

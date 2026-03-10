@@ -71,6 +71,8 @@ impl ServiceDiscovery {
             self.config.capabilities.join(","),
         );
         properties.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
+        // Peer token — so auto-discovered machines can authenticate without manual setup
+        properties.insert("token".to_string(), crate::peer_token::TOKEN.clone());
 
         // Create service info
         let service_info = ServiceInfo::new(

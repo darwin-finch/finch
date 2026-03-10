@@ -11,46 +11,43 @@ A terminal AI coding assistant with persistent memory and tool use.
 
 ## Quick Start
 
-The fastest way to get started is with `--cloud-only` and a Grok API key. X Premium+ subscribers get free Grok API access at [console.x.ai](https://console.x.ai) — no credit card required.
+```bash
+curl -fsSL https://raw.githubusercontent.com/darwin-finch/finch/main/scripts/install.sh | bash
+```
 
-### 1. Get a Grok API key
+That's it. The script detects your platform (Apple Silicon or Linux x86_64), downloads the binary, clears the macOS quarantine flag, and walks you through entering an API key.
 
-Sign in at [console.x.ai](https://console.x.ai) and create an API key.
+You'll need an API key from one of: [Grok](https://console.x.ai) · [Claude](https://console.anthropic.com) · [GPT-4](https://platform.openai.com) · [Gemini](https://aistudio.google.com) · [Groq](https://console.groq.com)
 
-### 2. Install the binary
+**Grok is the fastest free option** — X Premium+ subscribers get free API access at [console.x.ai](https://console.x.ai).
+
+Then:
+
+```bash
+finch
+```
+
+Ask anything in plain English.
+
+<details>
+<summary>Manual install</summary>
 
 **Apple Silicon (M1/M2/M3/M4):**
 ```bash
 curl -L https://github.com/darwin-finch/finch/releases/latest/download/finch-macos-arm64.tar.gz | tar xz
 sudo mv finch /usr/local/bin/finch
+xattr -dr com.apple.quarantine /usr/local/bin/finch   # macOS security
+finch setup
 ```
 
 **Linux (x86_64):**
 ```bash
 curl -L https://github.com/darwin-finch/finch/releases/latest/download/finch-linux-x86_64.tar.gz | tar xz
 sudo mv finch /usr/local/bin/finch
-```
-
-**macOS quarantine note:** macOS may block the binary because it is not code-signed yet. If you see a security warning, run:
-```bash
-xattr -dr com.apple.quarantine /usr/local/bin/finch
-```
-
-### 3. Run setup
-
-```bash
 finch setup
 ```
 
-The interactive wizard will ask for your API key and configure `~/.finch/config.toml`.
-
-### 4. Start finch
-
-```bash
-finch --cloud-only
-```
-
-`--cloud-only` skips the local model entirely and routes all queries to your configured provider. No model download needed.
+</details>
 
 ---
 

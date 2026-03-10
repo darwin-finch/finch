@@ -1,6 +1,6 @@
 [package]
 name = "finch"
-version = "0.7.26"
+version = "0.7.27"
 edition = "2021"
 authors = ["Darwin Finch Contributors"]
 description = "AI that evolves with your code - distributed assistant with hierarchical memory"
@@ -104,6 +104,10 @@ safetensors = "0.4"  # Model weight loading (used by Candle)
 
 # For web tools (Phase 3)
 scraper = "0.18"
+
+# Spreadsheet / tabular data
+calamine = "0.26"   # xlsx / xls / ods reading (pure Rust, no Excel needed)
+csv = "1.3"         # CSV and TSV parsing
 
 # MCP (Model Context Protocol) for external tool integration (Phase 4)
 rust-mcp-sdk = { version = "0.8", default-features = false, features = ["client", "stdio", "sse"] }

@@ -1185,8 +1185,40 @@ impl TuiRenderer {
             Print("\r\n"),
         )?;
 
+        // Suggestion line — one compact row of things to try.
+        print_suggestions()?;
+
         self.draw_live_area()
     }
+}
+
+/// Print a one-line hint row showing things worth trying.
+fn print_suggestions() -> std::io::Result<()> {
+    use crossterm::{
+        style::{Color, ResetColor, SetForegroundColor, SetAttribute, Attribute, Print},
+        execute,
+    };
+    use std::io;
+
+    // Pairs of (word, hint-colour).  The word is shown dim/grey; separator is dark-grey.
+    let items: &[(&str, Color)] = &[
+        ("2 3 +",        Color::Cyan),
+        ("你好",          Color::Yellow),
+        ("道",            Color::Yellow),
+        ("words",        Color::Cyan),
+        ("registry-list",Color::Cyan),
+        ("slowest",      Color::Cyan),
+    ];
+
+    execute!(io::stdout(), Print("  "), SetForegroundColor(Color::DarkGrey), Print("try:  "), ResetColor)?;
+    for (i, (word, colour)) in items.iter().enumerate() {
+        execute!(io::stdout(), SetForegroundColor(*colour), SetAttribute(Attribute::Dim), Print(word), SetAttribute(Attribute::Reset), ResetColor)?;
+        if i + 1 < items.len() {
+            execute!(io::stdout(), SetForegroundColor(Color::DarkGrey), Print("  ·  "), ResetColor)?;
+        }
+    }
+    execute!(io::stdout(), Print("\r\n"))?;
+    Ok(())
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
@@ -1214,6 +1246,22 @@ impl TuiRenderer {
 
     pub fn is_active(&self) -> bool {
         self.is_active
+    }
+
+    /// Temporarily release the terminal so another full-screen TUI (e.g. the
+    /// setup wizard) can take over.  Call `resume()` after it exits.
+    pub fn suspend(&self) -> anyhow::Result<()> {
+        let _ = io::stdout().flush();
+        disable_raw_mode()?;
+        Ok(())
+    }
+
+    /// Re-acquire the terminal after a `suspend()`.
+    pub fn resume(&mut self) -> anyhow::Result<()> {
+        enable_raw_mode()?;
+        // Force a full redraw so the REPL live area reappears.
+        self.active_rows = 0;
+        Ok(())
     }
 }
 

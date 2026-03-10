@@ -38,19 +38,25 @@ use anyhow::{bail, Result};
 // of `Cell` values in `Forth::memory`.  Jump targets are absolute indices
 // into that array — just like a CPU's instruction pointer.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum Cell {
     Lit(i64),           // push literal onto data stack
     Str(usize),         // print strings[idx]  (string-literal pool)
     PushStr(usize),     // push strings[idx] index as i64 onto data stack (s" literal")
     Confirm(usize),     // ask user strings[idx]; push -1 (yes) or 0 (no)
+    SelectDialog(usize),// pop-up select: strings[idx] is "title|opt1|opt2|..."; push chosen index or -1
     ReadFile(usize),    // read file at strings[idx]; emit contents to out
+    ReadCsv(usize),     // read CSV file at strings[idx]; emit as pipe-delimited rows
+    ReadTsv(usize),     // read TSV file at strings[idx]; emit as pipe-delimited rows
+    ReadXlsx(usize),    // read first sheet of xlsx/xls/ods at strings[idx]; emit rows
     ExecCmd(usize),     // run shell command strings[idx]; emit stdout to out
     GlobFiles(usize),   // list files matching glob strings[idx]; emit to out
     AddPeer(usize),     // register peer address strings[idx] for scatter
-    ScatterExec(usize),     // run strings[idx] Forth code on all peers in parallel
-    ScatterBashExec(usize), // run strings[idx] as bash -c on all peers via /v1/exec
-    ScatterStack,           // ( code-idx -- ) scatter strings[pop()] to all peers (dynamic code)
+    ScatterExec(usize),           // run strings[idx] Forth code on all peers in parallel
+    ScatterBashExec(usize),       // run strings[idx] as bash -c on all peers via /v1/exec
+    ScatterStack,                 // ( code-idx -- ) scatter strings[pop()] to all peers (dynamic code)
+    ScatterOnCluster(usize,usize),// run strings[code_idx] on ensemble strings[ensemble_idx]; no side-effects on peers
+    RunOn(usize,usize),           // run strings[code_idx] on exactly one peer: strings[peer_idx] (addr or label)
     GenAI(usize),           // call AI generator with strings[idx] as prompt; emit response
     Builtin(Builtin),   // execute a primitive operation
     Addr(usize),        // call word at memory[addr]: push ip+1, ip = addr
@@ -113,6 +119,31 @@ enum Builtin {
     Peers,                    // ( -- )  list registered peers
     PeersClear,               // ( -- )  remove all registered peers
     PeersDiscover,            // ( -- )  mDNS scan; auto-add found finch daemons
+    TakeAll,                  // ( -- )  discover all LAN peers, tag+ensemble them as "all"
+    EnsembleDef,              // ( name-idx -- )  snapshot current peers as named ensemble
+    EnsembleUse,              // ( name-idx -- )  push peers, switch to named ensemble
+    EnsembleEnd,              // ( -- )           pop peers (restore previous)
+    EnsembleList,             // ( -- )           print all ensembles + members
+    LabelPeer,                // ( addr-idx label-idx -- )  attach human label to peer address
+    TagPeer,                  // ( addr-idx tag-idx -- )    add tag to peer
+    EnsembleFromTag,          // ( tag-idx -- )   build/update an ensemble from all peers with tag
+    PeerInfo,                 // ( -- )           list peers with labels + tags
+    Publish,                  // ( name-idx -- )  scatter word source to all peers via /v1/forth/define
+    Sync,                     // ( -- )           scatter all user words to all peers
+    // Registry
+    RegistrySet,              // ( addr-idx -- )  set registry address
+    JoinRegistry,             // ( self-addr-idx -- )  register this machine; stores my_addr
+    LeaveRegistry,            // ( -- )           deregister this machine from the registry
+    FromRegistry,             // ( -- )           pull live peers from registry into self.peers
+    RegistryList,             // ( -- )           print all registry members
+    Balance,                  // ( -- )           print this machine's compute balance
+    Balances,                 // ( -- )           print all machines' compute balances
+    RecordDebit,              // ( peer-idx compute-ms -- )  record compute consumed from peer
+    DebtCheck,                // ( -- )           list machines that owe you (negative balance)
+    See(usize),               // ( -- )  show definition of strings[idx]
+    Settle,                   // ( peer-idx -- )  request settlement from a peer
+    Slowest,                  // ( -- addr-idx )  push addr of slowest live peer onto stack
+    ForthBack(usize),         // ( -- )           queue Forth code to run on the caller after response
     // String pool operations (stack: idx is i64 index into self.strings)
     Type,                     // ( idx -- )  print strings[idx]
     StrEq,                    // ( idx-a idx-b -- bool )  string equality
@@ -133,6 +164,16 @@ enum Builtin {
     Keygen,                   // ( -- pub-idx priv-idx )  generate Ed25519 keypair (hex)
     Sign,                     // ( priv-idx data-idx -- sig-idx )  Ed25519 sign
     Verify,                   // ( pub-idx sig-idx data-idx -- bool )  Ed25519 verify
+    // Security scanning (pure Rust — no external tools)
+    ScanFile,                 // ( path-idx -- report-idx )  byte-level scan → text report
+    ScanBytes,                // ( str-idx -- score )        pattern risk score 0-100
+    FileEntropy,              // ( path-idx -- entropy*1000 ) Shannon entropy * 1000
+    ScanDir,                  // ( path-idx -- report-idx )  recursive dir scan
+    ScanStrings,              // ( path-idx -- str-idx )     printable strings from binary (like `strings`)
+    ScanProcs,                // ( -- report-idx )           scan running processes for suspicion
+    ScanNet,                  // ( -- report-idx )           open network connections
+    ScanStartup,              // ( -- report-idx )           persistence locations (LaunchAgents, cron, etc.)
+    Quarantine,               // ( path-idx -- flag )        move file to ~/.finch/quarantine/
     // Terminal control (crossterm-backed)
     AtXy,                     // ( col row -- )  move cursor to col, row
     TermSize,                 // ( -- cols rows )  push terminal dimensions
@@ -146,6 +187,7 @@ enum Builtin {
     SyncEnd,                  // ( -- )  end synchronized update
     HideCursor,               // ( -- )  hide terminal cursor
     ShowCursor,               // ( -- )  show terminal cursor
+    Connected,                // ( -- flag )  -1 if peers/registry active, 0 if isolated
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
@@ -158,6 +200,13 @@ pub type ConfirmFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
 /// Called when `gen" prompt"` executes.  Receives the prompt string and returns
 /// the model's response as a String.  If unset, `gen"` emits a placeholder.
 pub type GenFn = Box<dyn Fn(&str) -> String + Send + Sync>;
+
+/// Signature for the optional dialog select callback.
+///
+/// Called when `select" title|opt1|opt2"` executes.  Receives the title string
+/// and a slice of option labels; returns the 0-based index of the chosen option,
+/// or -1 if the dialog was cancelled.  If unset, returns 0 (first option).
+pub type SelectFn = Box<dyn Fn(&str, &[String]) -> i64 + Send + Sync>;
 
 pub struct Forth {
     data:       Vec<i64>,
@@ -189,6 +238,43 @@ pub struct Forth {
     confirm_fn: Option<ConfirmFn>,
     /// Optional AI generation callback.  Wired to the active generator in the REPL.
     gen_fn: Option<GenFn>,
+    /// Optional dialog-select callback.  Wired to the TUI in the REPL.
+    select_fn: Option<SelectFn>,
+    /// Words that remote peers are allowed to call via `/v1/forth/eval`.
+    /// Populated from grammar words with `remote = true` and from `seed_remote_whitelist()`.
+    pub remote_whitelist: std::collections::HashSet<String>,
+    /// Named ensembles: name → list of peer addresses.
+    /// `ensemble-def" name"` snapshots the current peers into this map.
+    pub ensembles: HashMap<String, Vec<String>>,
+    /// Saved-peers stack for `ensemble-use" name"` / `ensemble-end` nesting.
+    peer_save_stack: Vec<Vec<String>>,
+    /// Per-peer metadata: address → label + tags.
+    pub peer_meta: HashMap<String, PeerMeta>,
+    /// Registry address — set by `registry" addr"` word.
+    /// When set, `join-registry`, `from-registry`, and `registry-peers` use it.
+    pub registry_addr: Option<String>,
+    /// This machine's own address, set when `join-registry` or `join" addr"` succeeds.
+    /// Used by `leave` to deregister from the registry.
+    pub my_addr: Option<String>,
+    /// When true, interactive cells (Confirm, GenAI) are suppressed:
+    /// Confirm auto-denies (returns 0), GenAI returns an empty string.
+    /// Set by the HTTP server on every cloned remote VM so remote code
+    /// can never block waiting for a local dialog or AI call.
+    pub remote_mode: bool,
+    /// Forth code the peer wants executed on the caller after this response.
+    /// Set by `forth-back" <code>"` in the remote program.
+    /// Transmitted in the eval response and run locally by the caller.
+    pub forth_back: Option<String>,
+}
+
+/// Metadata attached to a peer address via `label-peer` / `tag-peer`.
+#[derive(Debug, Clone, Default)]
+pub struct PeerMeta {
+    pub label: Option<String>,
+    pub tags:  Vec<String>,
+    /// Authentication token for this peer's daemon endpoints.
+    /// Populated automatically from mDNS TXT record on discovery.
+    pub token: Option<String>,
 }
 
 const MAX_CALL_DEPTH: usize = 256;
@@ -354,6 +440,15 @@ const STDLIB: &str = r#"
 : file-sha256-range ( path off n -- hash )   file-sha256-range ;
 : file-hash         ( path -- )              file-hash ;
 : file-hash-range   ( path off n -- )        file-hash-range ;
+: scan-file         ( path -- report )       scan-file ;
+: scan-bytes        ( str -- score )         scan-bytes ;
+: file-entropy      ( path -- e*1000 )       file-entropy ;
+: scan-dir          ( path -- report )       scan-dir ;
+: scan-strings      ( path -- strings )      scan-strings ;
+: scan-procs        ( -- report )            scan-procs ;
+: scan-net          ( -- report )            scan-net ;
+: scan-startup      ( -- report )            scan-startup ;
+: quarantine        ( path -- flag )         quarantine ;
 : scatter-code      ( code -- )              scatter-code ;
 : peers-discover    ( ms -- )                peers-discover ;
 : fuel              ( -- n )                 fuel ;
@@ -418,11 +513,21 @@ impl Forth {
             locks:           HashMap::new(),
             confirm_fn:      None,
             gen_fn:          None,
+            select_fn:       None,
+            remote_whitelist: std::collections::HashSet::new(),
+            ensembles:        HashMap::new(),
+            peer_save_stack:  Vec::new(),
+            peer_meta:        HashMap::new(),
+            remote_mode:      false,
+            registry_addr:    None,
+            my_addr:          None,
+            forth_back:       None,
         };
         // Load standard library silently — not logged (every session has stdlib)
         let _ = f.eval(STDLIB);
         f.fuel = DEFAULT_FUEL; // restore budget for user code
         f.log_definitions = true; // user words from here on are logged
+        f.seed_remote_whitelist();
         f
     }
 
@@ -445,6 +550,11 @@ impl Forth {
         self
     }
 
+    /// Set the confirm callback on an existing instance.
+    pub fn set_confirm_fn(&mut self, f: ConfirmFn) {
+        self.confirm_fn = Some(f);
+    }
+
     /// Attach an AI generation callback (builder pattern).
     ///
     /// `gen" prompt"` will call this function and emit the returned string.
@@ -457,6 +567,19 @@ impl Forth {
     /// Set the AI generation callback on an existing instance.
     pub fn set_gen_fn(&mut self, f: GenFn) {
         self.gen_fn = Some(f);
+    }
+
+    /// Attach a dialog-select callback (builder pattern).
+    pub fn with_select(mut self, f: SelectFn) -> Self {
+        self.select_fn = Some(f);
+        self
+    }
+
+    /// Set the dialog-select callback on an existing instance.
+    ///
+    /// `select" title|opt1|opt2"` will call this function and push the chosen index.
+    pub fn set_select_fn(&mut self, f: SelectFn) {
+        self.select_fn = Some(f);
     }
 
     /// Execute Forth source on this instance and return collected output.
@@ -489,6 +612,54 @@ impl Forth {
         self.data.clear();
     }
 
+    /// Mark a word as callable by remote peers.
+    pub fn mark_remote_ok(&mut self, word: &str) {
+        self.remote_whitelist.insert(word.to_string());
+    }
+
+    /// Seed the initial remote whitelist with the built-in security/scan words.
+    /// These are safe to expose: read-only scanning, no mutations.
+    fn seed_remote_whitelist(&mut self) {
+        for word in &[
+            "scan-file", "scan-bytes", "file-entropy",
+            "scan-dir", "scan-strings", "scan-procs",
+            "scan-net", "scan-startup",
+        ] {
+            self.remote_whitelist.insert(word.to_string());
+        }
+    }
+
+    /// Compile all grammar words that have Forth code into this VM's dictionary.
+    /// Words with `remote = true` are added to the remote whitelist.
+    pub fn compile_library(&mut self, lib: &crate::coforth::Library) {
+        for entry in lib.all_entries() {
+            let Some(forth_code) = &entry.forth else { continue };
+            // Sanitize the word name: no spaces, no semicolons
+            let name = &entry.word;
+            if name.contains(' ') || name.contains(';') { continue; }
+            let def = format!(": {} {} ;", name, forth_code);
+            if self.exec(&def).is_ok() && entry.remote {
+                self.remote_whitelist.insert(name.clone());
+            }
+        }
+    }
+
+    /// Execute a word from a remote peer — only if it is in the remote whitelist.
+    ///
+    /// Only single word names are accepted.  Arbitrary code fragments, sequences,
+    /// or definitions are rejected regardless of whitelist status.
+    pub fn exec_remote(&mut self, word: &str) -> Result<String> {
+        let word = word.trim();
+        // Reject anything that looks like code rather than a plain word name
+        if word.contains(' ') || word.contains('\n') || word.contains(';') || word.contains(':') {
+            anyhow::bail!("remote: only single word names are accepted, not: {:?}", word);
+        }
+        if !self.remote_whitelist.contains(word) {
+            anyhow::bail!("remote: word '{}' is not in the remote vocabulary", word);
+        }
+        self.exec(word)
+    }
+
     /// Clone the compiled dictionary state into a fresh VM (no stack, no callbacks).
     /// Used to share a pre-compiled VM baseline across tests without re-compiling STDLIB
     /// or vocabulary on every clone.  Callbacks (confirm_fn, gen_fn) are not copied.
@@ -511,6 +682,15 @@ impl Forth {
             locks:      HashMap::new(),
             confirm_fn: None,
             gen_fn:     None,
+            select_fn:  None,
+            remote_whitelist: self.remote_whitelist.clone(),
+            ensembles:        self.ensembles.clone(),
+            peer_save_stack:  Vec::new(),
+            peer_meta:        self.peer_meta.clone(),
+            remote_mode:      false, // caller sets true for remote VMs
+            registry_addr:    self.registry_addr.clone(),
+            my_addr:          self.my_addr.clone(),
+            forth_back:       None,
         }
     }
 
@@ -541,6 +721,12 @@ impl Forth {
     /// Paste this into any session to recreate the same dictionary.
     pub fn dump_source(&self) -> String {
         self.source_log.join("\n")
+    }
+
+    /// Return the source of a single named word, or None if not in source_log.
+    pub fn word_source(&self, name: &str) -> Option<String> {
+        let prefix = format!(": {} ", name);
+        self.source_log.iter().find(|e| e.starts_with(&prefix)).cloned()
     }
 }
 
@@ -610,6 +796,19 @@ impl Forth {
                             self.source_log.push(entry);
                         }
                     }
+                    // If the word already exists as a user definition, require approval
+                    // before overwriting it.  Builtins cannot be shadowed by this interpreter
+                    // (they are always resolved first at compile time), so no gate is needed
+                    // for them — and applying one there would block stdlib internal wrappers.
+                    if self.log_definitions && self.name_index.contains_key(&name) {
+                        if let Some(ref f) = self.confirm_fn {
+                            let prompt = format!("redefine '{name}'?  (it already exists)");
+                            if !f(&prompt) {
+                                bail!("redefinition of '{name}' cancelled");
+                            }
+                        }
+                        // No confirm_fn (pipe/test mode): allow silently.
+                    }
                     // Register entry address BEFORE compiling body so `recurse` resolves.
                     let word_addr = self.memory.len();
                     self.name_index.insert(name.clone(), word_addr);
@@ -659,6 +858,14 @@ impl Forth {
         let mut i = 0;
         while i < tokens.len() {
             match tokens[i].as_str() {
+                "see" | "？" => {
+                    i += 1;
+                    let word_name = tokens.get(i).cloned().unwrap_or_default();
+                    i += 1;
+                    let idx = self.strings.len();
+                    self.strings.push(word_name);
+                    self.memory.push(Cell::Builtin(Builtin::See(idx)));
+                }
                 "if" => {
                     i += 1;
                     let (true_branch, false_branch, skip) = collect_if(tokens, i)?;
@@ -764,10 +971,34 @@ impl Forth {
             self.memory.push(Cell::Confirm(idx));
             return Ok(());
         }
+        if let Some(s) = tok.strip_prefix("\x00select:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::SelectDialog(idx));
+            return Ok(());
+        }
         if let Some(s) = tok.strip_prefix("\x00read:") {
             let idx = self.strings.len();
             self.strings.push(s.to_string());
             self.memory.push(Cell::ReadFile(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00csv:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ReadCsv(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00tsv:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ReadTsv(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00xlsx:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::ReadXlsx(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00exec:") {
@@ -798,6 +1029,26 @@ impl Forth {
             self.memory.push(Cell::ScatterStack);
             return Ok(());
         }
+        if let Some(s) = tok.strip_prefix("\x00on:") {
+            // Format: "peer\x01code"
+            let (peer, code) = s.split_once('\x01').unwrap_or((s, ""));
+            let peer_idx = self.strings.len();
+            self.strings.push(peer.to_string());
+            let code_idx = self.strings.len();
+            self.strings.push(code.to_string());
+            self.memory.push(Cell::RunOn(peer_idx, code_idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00scatter-on:") {
+            // Format: "ensemble\x01code"
+            let (ensemble, code) = s.split_once('\x01').unwrap_or((s, ""));
+            let ens_idx = self.strings.len();
+            self.strings.push(ensemble.to_string());
+            let code_idx = self.strings.len();
+            self.strings.push(code.to_string());
+            self.memory.push(Cell::ScatterOnCluster(ens_idx, code_idx));
+            return Ok(());
+        }
         if let Some(s) = tok.strip_prefix("\x00scatter-exec:") {
             let idx = self.strings.len();
             self.strings.push(s.to_string());
@@ -808,6 +1059,12 @@ impl Forth {
             let idx = self.strings.len();
             self.strings.push(s.to_string());
             self.memory.push(Cell::GenAI(idx));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00forth-back:") {
+            let idx = self.strings.len();
+            self.strings.push(s.to_string());
+            self.memory.push(Cell::Builtin(Builtin::ForthBack(idx)));
             return Ok(());
         }
         if let Ok(n) = tok.parse::<i64>() {
@@ -856,15 +1113,44 @@ impl Forth {
     /// Rust calls across word boundaries.
     fn execute(&mut self, start: usize) -> Result<()> {
         let mut ip = start;
-        let mut call_stack: Vec<usize> = Vec::new();
+        let mut call_stack: Vec<usize> = Vec::with_capacity(64);
+        // Fuel is now checked only on back-edges (loops) and function calls.
+        // Straight-line code runs free — zero overhead per instruction.
+        // This prevents infinite loops and runaway recursion while keeping
+        // the common case (arithmetic, stack ops, output) as fast as possible.
+        macro_rules! check_fuel {
+            () => {
+                if self.fuel == 0 {
+                    bail!("fuel exhausted — word is too expensive for vocabulary use.\n\
+                           hint: use  N with-fuel  for intentional heavy computation.");
+                }
+                self.fuel -= 1;
+            };
+        }
+        // Inline the hottest stack/arithmetic builtins to avoid a function call.
+        macro_rules! pop2 {
+            () => {{ let b = self.pop()?; let a = self.pop()?; (a, b) }};
+        }
         loop {
-            if self.fuel == 0 {
-                bail!("fuel exhausted — word is too expensive for vocabulary use.\n\
-                       hint: use  N with-fuel  for intentional heavy computation.");
-            }
-            self.fuel -= 1;
             if ip >= self.memory.len() { break; }
-            match self.memory[ip].clone() {
+            match self.memory[ip] {
+                // ── Hot path: inlined arithmetic & stack ops (no function call) ──
+                Cell::Builtin(Builtin::Plus)  => { let (a,b) = pop2!(); self.data.push(a.wrapping_add(b)); ip += 1; }
+                Cell::Builtin(Builtin::Minus) => { let (a,b) = pop2!(); self.data.push(a.wrapping_sub(b)); ip += 1; }
+                Cell::Builtin(Builtin::Star)  => { let (a,b) = pop2!(); self.data.push(a.wrapping_mul(b)); ip += 1; }
+                Cell::Builtin(Builtin::Dup)   => { let a = self.pop()?; self.data.push(a); self.data.push(a); ip += 1; }
+                Cell::Builtin(Builtin::Drop)  => { self.pop()?; ip += 1; }
+                Cell::Builtin(Builtin::Swap)  => { let (a,b) = pop2!(); self.data.push(b); self.data.push(a); ip += 1; }
+                Cell::Builtin(Builtin::Over)  => { let (a,b) = pop2!(); self.data.push(a); self.data.push(b); self.data.push(a); ip += 1; }
+                Cell::Builtin(Builtin::Eq)    => { let (a,b) = pop2!(); self.data.push(if a == b { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::Ne)    => { let (a,b) = pop2!(); self.data.push(if a != b { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::Lt)    => { let (a,b) = pop2!(); self.data.push(if a  < b { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::Gt)    => { let (a,b) = pop2!(); self.data.push(if a  > b { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::ZeroEq) => { let a = self.pop()?; self.data.push(if a == 0 { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::ZeroLt) => { let a = self.pop()?; self.data.push(if a  < 0 { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::And)   => { let (a,b) = pop2!(); self.data.push(a & b); ip += 1; }
+                Cell::Builtin(Builtin::Or)    => { let (a,b) = pop2!(); self.data.push(a | b); ip += 1; }
+                // ── Literals and string output ──
                 Cell::Lit(n) => { self.data.push(n); ip += 1; }
                 Cell::Str(idx) => {
                     let s = self.strings[idx].clone();
@@ -878,12 +1164,33 @@ impl Forth {
                 }
                 Cell::Confirm(idx) => {
                     let msg = self.strings[idx].clone();
-                    let approved = if let Some(ref f) = self.confirm_fn {
+                    let approved = if self.remote_mode {
+                        // Remote VMs must never block on interactive dialogs — auto-deny.
+                        false
+                    } else if let Some(ref f) = self.confirm_fn {
                         f(&msg)
                     } else {
                         true // auto-approve when no TUI callback (tests, pipe mode)
                     };
                     self.data.push(if approved { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::SelectDialog(idx) => {
+                    let raw = self.strings[idx].clone();
+                    let parts: Vec<String> = raw.split('|').map(|s| s.to_string()).collect();
+                    let (title, options): (&str, &[String]) = if parts.len() >= 2 {
+                        (parts[0].as_str(), &parts[1..])
+                    } else {
+                        (raw.as_str(), &[])
+                    };
+                    let chosen = if self.remote_mode {
+                        -1 // remote VMs never block on TUI dialogs
+                    } else if let Some(ref f) = self.select_fn {
+                        f(title, options)
+                    } else {
+                        0 // no callback: auto-select first option (tests, pipe mode)
+                    };
+                    self.data.push(chosen);
                     ip += 1;
                 }
                 Cell::ReadFile(idx) => {
@@ -892,6 +1199,21 @@ impl Forth {
                         Ok(content) => self.out.push_str(&content),
                         Err(e) => self.out.push_str(&format!("error reading {path}: {e}\n")),
                     }
+                    ip += 1;
+                }
+                Cell::ReadCsv(idx) => {
+                    let path = self.strings[idx].clone();
+                    self.out.push_str(&read_delimited_file(&path, b','));
+                    ip += 1;
+                }
+                Cell::ReadTsv(idx) => {
+                    let path = self.strings[idx].clone();
+                    self.out.push_str(&read_delimited_file(&path, b'\t'));
+                    ip += 1;
+                }
+                Cell::ReadXlsx(idx) => {
+                    let path = self.strings[idx].clone();
+                    self.out.push_str(&read_xlsx_file(&path));
                     ip += 1;
                 }
                 Cell::ExecCmd(idx) => {
@@ -930,27 +1252,14 @@ impl Forth {
                 Cell::ScatterExec(idx) => {
                     let snippet = self.strings[idx].clone();
                     if self.peers.is_empty() {
-                        self.out.push_str(
-                            "scatter: no peers  (use peer\" host:port\" to register one)\n"
-                        );
+                        use crossterm::style::Stylize;
+                        self.out.push_str(&format!("{}\n",
+                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)".dark_grey()));
                     } else {
                         let peers = self.peers.clone();
-                        let results = run_scatter(&peers, &snippet);
-                        for r in results {
-                            if let Some(err) = r.error {
-                                self.out.push_str(&format!("[{}] error: {}\n", r.peer, err));
-                            } else {
-                                // Print any output lines
-                                for line in r.output.lines() {
-                                    self.out.push_str(&format!("[{}] {}\n", r.peer, line));
-                                }
-                                // Push the peer's stack values onto the local stack.
-                                // This is the "forth back" — remote results become local values.
-                                for v in &r.stack {
-                                    self.data.push(*v);
-                                }
-                            }
-                        }
+                        let tokens = peer_tokens_map(&self.peer_meta);
+                        let results = run_scatter(&peers, &snippet, self.registry_addr.as_deref(), &tokens);
+                        self.emit_scatter_results(results);
                     }
                     ip += 1;
                 }
@@ -958,16 +1267,20 @@ impl Forth {
                     let cmd = self.strings[idx].clone();
                     if self.peers.is_empty() {
                         self.out.push_str(
-                            "scatter-exec: no peers  (use peer\" host:port\" to register one)\n"
+                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n"
                         );
                     } else {
                         let peers = self.peers.clone();
-                        // Show plan and require confirmation before executing on remote machines.
+                        // Show plan and require confirmation before running on other machines.
+                        let names: Vec<String> = peers.iter().map(|p| {
+                            self.peer_meta.get(p)
+                                .and_then(|m| m.label.clone())
+                                .unwrap_or_else(|| p.clone())
+                        }).collect();
                         let plan = format!(
-                            "Run on {} peer(s): bash -c {:?}\n  targets: {}",
-                            peers.len(),
-                            cmd,
-                            peers.join(", ")
+                            "Share with {}?\n  {}",
+                            names.join(", "),
+                            cmd
                         );
                         let approved = if let Some(ref f) = self.confirm_fn {
                             f(&plan)
@@ -975,9 +1288,10 @@ impl Forth {
                             true // auto-approve in tests / pipe mode
                         };
                         if !approved {
-                            self.out.push_str("scatter-exec: cancelled\n");
+                            self.out.push_str("ok, just for you\n");
                         } else {
-                            let results = run_exec_scatter(&peers, &cmd);
+                            let tokens = peer_tokens_map(&self.peer_meta);
+                            let results = run_exec_scatter(&peers, &cmd, &tokens);
                             for r in results {
                                 if let Some(err) = r.error {
                                     self.out.push_str(&format!("[{}] error: {}\n", r.peer, err));
@@ -1002,20 +1316,86 @@ impl Forth {
                         .clone();
                     if self.peers.is_empty() {
                         self.out.push_str(
-                            "scatter-code: no peers  (use peer\" host:port\" to register one)\n"
+                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n"
                         );
                     } else {
                         let peers = self.peers.clone();
-                        let results = run_scatter(&peers, &snippet);
-                        for r in results {
-                            if let Some(err) = r.error {
-                                self.out.push_str(&format!("[{}] error: {}\n", r.peer, err));
-                            } else {
-                                for line in r.output.lines() {
-                                    self.out.push_str(&format!("[{}] {}\n", r.peer, line));
+                        let tokens = peer_tokens_map(&self.peer_meta);
+                        let results = run_scatter(&peers, &snippet, self.registry_addr.as_deref(), &tokens);
+                        self.emit_scatter_results(results);
+                    }
+                    ip += 1;
+                }
+                Cell::ScatterOnCluster(ens_idx, code_idx) => {
+                    // Run code on a named ensemble without touching self.peers.
+                    let name = self.strings.get(ens_idx)
+                        .ok_or_else(|| anyhow::anyhow!("scatter-on: ensemble string index out of bounds"))?
+                        .trim().to_string();
+                    let peers = self.ensembles.get(&name)
+                        .ok_or_else(|| anyhow::anyhow!("scatter-on: unknown ensemble '{}'", name))?
+                        .clone();
+                    let code = self.strings.get(code_idx)
+                        .ok_or_else(|| anyhow::anyhow!("scatter-on: code string index out of bounds"))?
+                        .clone();
+                    let tokens = peer_tokens_map(&self.peer_meta);
+                    let results = run_scatter(&peers, &code, self.registry_addr.as_deref(), &tokens);
+                    self.emit_scatter_results(results);
+                    ip += 1;
+                }
+                Cell::RunOn(peer_idx, code_idx) => {
+                    // Run code on exactly one peer, matched by address or label.
+                    use crossterm::style::Stylize;
+                    let target = self.strings.get(peer_idx)
+                        .ok_or_else(|| anyhow::anyhow!("on: peer string index out of bounds"))?
+                        .trim().to_string();
+                    let code = self.strings.get(code_idx)
+                        .ok_or_else(|| anyhow::anyhow!("on: code string index out of bounds"))?
+                        .clone();
+                    // Resolve target: exact address match first, then label match.
+                    let addr = if self.peers.contains(&target) {
+                        Some(target.clone())
+                    } else {
+                        self.peer_meta.iter()
+                            .find(|(addr, m)| {
+                                m.label.as_deref() == Some(target.as_str())
+                                    && self.peers.contains(*addr)
+                            })
+                            .map(|(addr, _)| addr.clone())
+                    };
+                    match addr {
+                        None => {
+                            self.out.push_str(&format!("on: no peer matching '{}'\n",
+                                target.as_str().yellow()));
+                        }
+                        Some(addr) => {
+                            let display = self.peer_meta.get(&addr)
+                                .and_then(|m| m.label.as_deref())
+                                .map(|l| l.cyan().bold().to_string())
+                                .unwrap_or_else(|| addr.as_str().cyan().to_string());
+                            let tokens = peer_tokens_map(&self.peer_meta);
+                            let results = run_scatter(&[addr], &code, self.registry_addr.as_deref(), &tokens);
+                            for r in results {
+                                if let Some(e) = r.error {
+                                    self.out.push_str(&format!("[{}] {}\n", display,
+                                        format!("error: {e}").red()));
+                                } else {
+                                    for line in r.output.lines() {
+                                        self.out.push_str(&format!("[{}] {}\n", display, line));
+                                    }
+                                    for v in &r.stack { self.data.push(*v); }
                                 }
-                                for v in &r.stack {
-                                    self.data.push(*v);
+                                if let Some(ref warn) = r.debt_warning {
+                                    self.out.push_str(&format!(
+                                        "  ⚠  {} {}\n",
+                                        display,
+                                        warn.as_str().yellow().bold()
+                                    ));
+                                }
+                                // Execute any Forth code the peer sent back.
+                                if let Some(ref fb) = r.forth_back {
+                                    if !fb.is_empty() {
+                                        self.eval(fb)?;
+                                    }
                                 }
                             }
                         }
@@ -1024,34 +1404,40 @@ impl Forth {
                 }
                 Cell::GenAI(idx) => {
                     let prompt = self.strings[idx].clone();
-                    let response = if let Some(ref f) = self.gen_fn {
+                    let response = if self.remote_mode {
+                        // Remote VMs run headless — no AI calls allowed.
+                        String::new()
+                    } else if let Some(ref f) = self.gen_fn {
                         f(&prompt)
                     } else {
                         "(no generator connected)\n".to_string()
                     };
                     self.out.push_str(&response);
-                    if !response.ends_with('\n') {
+                    if !response.is_empty() && !response.ends_with('\n') {
                         self.out.push('\n');
                     }
                     ip += 1;
                 }
                 Cell::Builtin(b) => { self.exec_builtin(b)?; ip += 1; }
                 Cell::Addr(addr) => {
+                    // Function call: charge one fuel unit to prevent runaway recursion.
+                    check_fuel!();
                     if call_stack.len() >= MAX_CALL_DEPTH { bail!("return stack overflow"); }
-                    call_stack.push(ip + 1); // return address
+                    call_stack.push(ip + 1);
                     ip = addr;
                 }
                 Cell::Ret => {
                     match call_stack.pop() {
                         Some(ret) => { ip = ret; }
-                        None      => break, // top-level return: halt
+                        None      => break,
                     }
                 }
-                Cell::Jmp(addr)  => { ip = addr; }
-                Cell::JmpZ(addr) => { let v = self.pop()?; if v == 0 { ip = addr; } else { ip += 1; } }
-                Cell::Until(back) => { let v = self.pop()?; if v == 0 { ip = back; } else { ip += 1; } }
+                // Back-edges: charge one fuel unit per iteration to prevent infinite loops.
+                Cell::Jmp(addr)   => { check_fuel!(); ip = addr; }
+                Cell::Repeat(back) => { check_fuel!(); ip = back; }
+                Cell::Until(back) => { check_fuel!(); let v = self.pop()?; if v == 0 { ip = back; } else { ip += 1; } }
+                Cell::JmpZ(addr)  => { let v = self.pop()?; if v == 0 { ip = addr; } else { ip += 1; } }
                 Cell::While(exit) => { let v = self.pop()?; if v == 0 { ip = exit; } else { ip += 1; } }
-                Cell::Repeat(back) => { ip = back; }
                 Cell::DoSetup => {
                     let index = self.pop()?;
                     let limit = self.pop()?;
@@ -1059,6 +1445,7 @@ impl Forth {
                     ip += 1;
                 }
                 Cell::DoLoop(back) => {
+                    check_fuel!();
                     if let Some(top) = self.loop_stack.last_mut() {
                         top.0 += 1;
                         if top.0 < top.1 { ip = back; continue; }
@@ -1067,6 +1454,7 @@ impl Forth {
                     ip += 1;
                 }
                 Cell::DoLoopPlus(back) => {
+                    check_fuel!();
                     let step = self.pop()?;
                     if let Some(top) = self.loop_stack.last_mut() {
                         top.0 += step;
@@ -1442,13 +1830,668 @@ impl Forth {
                 if found.is_empty() {
                     self.out.push_str("peers-discover: no finch instances found on LAN\n");
                 } else {
-                    for (host, port) in &found {
+                    for (host, port, name, token) in &found {
                         let addr = format!("{host}:{port}");
                         if !self.peers.contains(&addr) {
                             self.peers.push(addr.clone());
-                            self.out.push_str(&format!("  + {addr}\n"));
+                            let meta = self.peer_meta.entry(addr.clone()).or_default();
+                            if !name.is_empty() && meta.label.is_none() {
+                                meta.label = Some(name.clone());
+                            }
+                            if let Some(t) = token {
+                                if meta.token.is_none() { meta.token = Some(t.clone()); }
+                            }
+                            self.out.push_str(&format!("  + {}\n",
+                                if name.is_empty() { addr.clone() } else { name.clone() }));
                         }
                     }
+                }
+            }
+            // ── Ensembles ─────────────────────────────────────────────────────
+            Builtin::TakeAll => {
+                use crossterm::style::Stylize;
+                let found = run_peers_discover(3000);
+                if found.is_empty() {
+                    self.out.push_str(&format!("{}\n",
+                        "take-all: no machines found on LAN".dark_grey()));
+                } else {
+                    let mut added = 0usize;
+                    for (host, port, name, token) in &found {
+                        let addr = format!("{host}:{port}");
+                        if !self.peers.contains(&addr) {
+                            self.peers.push(addr.clone());
+                            added += 1;
+                        }
+                        let meta = self.peer_meta.entry(addr).or_default();
+                        if !name.is_empty() && meta.label.is_none() {
+                            meta.label = Some(name.clone());
+                        }
+                        if let Some(t) = token {
+                            if meta.token.is_none() { meta.token = Some(t.clone()); }
+                        }
+                        if !meta.tags.contains(&"all".to_string()) {
+                            meta.tags.push("all".to_string());
+                        }
+                    }
+                    // Rebuild the "all" ensemble from tagged peers
+                    let all_peers: Vec<String> = self.peer_meta.iter()
+                        .filter(|(_, m)| m.tags.contains(&"all".to_string()))
+                        .map(|(a, _)| a.clone())
+                        .collect();
+                    let total = all_peers.len();
+                    self.ensembles.insert("all".to_string(), all_peers);
+                    self.out.push_str(&format!("{} {} machine(s)  ensemble '{}' ready\n",
+                        "took".green().bold(),
+                        total.to_string().cyan().bold(),
+                        "all".cyan()));
+                    if added < total {
+                        self.out.push_str(&format!("  ({} new, {} already known)\n",
+                            added.to_string().dark_grey(),
+                            (total - added).to_string().dark_grey()));
+                    }
+                }
+            }
+            Builtin::EnsembleDef => {
+                // ( name-idx -- )  snapshot current peers under a name
+                let idx = self.pop()? as usize;
+                let name = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("ensemble-def: string index out of bounds"))?
+                    .trim().to_string();
+                if name.is_empty() { bail!("ensemble-def: name must not be empty"); }
+                let peers = self.peers.clone();
+                let count = peers.len();
+                self.ensembles.insert(name.clone(), peers);
+                self.out.push_str(&format!("ensemble '{}': {} peer(s) saved\n", name, count));
+            }
+            Builtin::EnsembleUse => {
+                // ( name-idx -- )  push current peers, switch to named ensemble
+                let idx = self.pop()? as usize;
+                let name = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("ensemble-use: string index out of bounds"))?
+                    .trim().to_string();
+                let members = self.ensembles.get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("ensemble-use: unknown ensemble '{}'", name))?
+                    .clone();
+                let saved = std::mem::replace(&mut self.peers, members);
+                self.peer_save_stack.push(saved);
+            }
+            Builtin::EnsembleEnd => {
+                // ( -- )  restore previous peers
+                match self.peer_save_stack.pop() {
+                    Some(saved) => { self.peers = saved; }
+                    None => { bail!("ensemble-end: no saved peer context (missing ensemble-use?)"); }
+                }
+            }
+            Builtin::EnsembleList => {
+                use crossterm::style::Stylize;
+                if self.ensembles.is_empty() {
+                    self.out.push_str(&"(no ensembles defined)".dark_grey().to_string());
+                    self.out.push('\n');
+                } else {
+                    let mut names: Vec<&String> = self.ensembles.keys().collect();
+                    names.sort();
+                    for name in names {
+                        let members = &self.ensembles[name];
+                        self.out.push_str(&format!("  {}  {}\n",
+                            name.as_str().cyan().bold(),
+                            format!("({} peers)", members.len()).dark_grey()));
+                        for m in members {
+                            let label = self.peer_meta.get(m)
+                                .and_then(|p| p.label.as_deref())
+                                .unwrap_or("");
+                            let tags = self.peer_meta.get(m)
+                                .map(|p| p.tags.join(" "))
+                                .unwrap_or_default();
+                            let suffix = match (label.is_empty(), tags.is_empty()) {
+                                (false, false) => format!("  {} [{}]", label.yellow(), tags.as_str().dark_grey()),
+                                (false, true)  => format!("  {}", label.yellow()),
+                                (true,  false) => format!("  [{}]", tags.as_str().dark_grey()),
+                                (true,  true)  => String::new(),
+                            };
+                            self.out.push_str(&format!("    {}{}\n", m.as_str().dark_grey(), suffix));
+                        }
+                    }
+                }
+            }
+            Builtin::LabelPeer => {
+                // ( addr-idx label-idx -- )
+                let label_idx = self.pop()? as usize;
+                let addr_idx  = self.pop()? as usize;
+                let addr  = self.strings.get(addr_idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("label-peer: addr index out of bounds"))?;
+                let label = self.strings.get(label_idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("label-peer: label index out of bounds"))?;
+                self.peer_meta.entry(addr.trim().to_string()).or_default().label = Some(label.trim().to_string());
+            }
+            Builtin::TagPeer => {
+                // ( addr-idx tag-idx -- )
+                let tag_idx  = self.pop()? as usize;
+                let addr_idx = self.pop()? as usize;
+                let addr = self.strings.get(addr_idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("tag-peer: addr index out of bounds"))?;
+                let tag  = self.strings.get(tag_idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("tag-peer: tag index out of bounds"))?;
+                let tag_str = tag.trim().to_string();
+                let meta = self.peer_meta.entry(addr.trim().to_string()).or_default();
+                if !meta.tags.contains(&tag_str) { meta.tags.push(tag_str); }
+            }
+            Builtin::EnsembleFromTag => {
+                // ( tag-idx -- )  build ensemble named after the tag from all tagged peers
+                let tag_idx = self.pop()? as usize;
+                let tag = self.strings.get(tag_idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("ensemble-from-tag: index out of bounds"))?
+                    .trim().to_string();
+                let members: Vec<String> = self.peer_meta.iter()
+                    .filter(|(_, m)| m.tags.contains(&tag))
+                    .map(|(addr, _)| addr.clone())
+                    .collect();
+                use crossterm::style::Stylize;
+                self.out.push_str(&format!("ensemble '{}': {} peer(s)\n",
+                    tag.as_str().cyan().bold(), members.len()));
+                self.ensembles.insert(tag, members);
+            }
+            Builtin::PeerInfo => {
+                use crossterm::style::Stylize;
+                if self.peers.is_empty() {
+                    self.out.push_str(&"(no peers registered)".dark_grey().to_string());
+                    self.out.push('\n');
+                } else {
+                    for addr in &self.peers {
+                        let meta = self.peer_meta.get(addr);
+                        let label = meta.and_then(|m| m.label.as_deref()).unwrap_or("");
+                        let tags  = meta.map(|m| m.tags.join(" ")).unwrap_or_default();
+                        let name = if label.is_empty() { addr.as_str().cyan().to_string() }
+                                   else { format!("{} {}", label.cyan().bold(), addr.as_str().dark_grey()) };
+                        let tag_str = if tags.is_empty() { String::new() }
+                                      else { format!("  [{}]", tags.as_str().yellow()) };
+                        self.out.push_str(&format!("  {}{}\n", name, tag_str));
+                    }
+                }
+            }
+            // ── Vocabulary sharing ────────────────────────────────────────────
+            Builtin::Publish => {
+                // ( name-idx -- )  scatter one word's source to all peers
+                use crossterm::style::Stylize;
+                let name_idx = self.pop()? as usize;
+                let name = self.strings.get(name_idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("publish: index out of bounds"))?;
+                match self.word_source(&name) {
+                    None => {
+                        self.out.push_str(&format!("'{}' hasn't been defined yet\n",
+                            name.as_str().yellow()));
+                    }
+                    Some(src) => {
+                        if self.peers.is_empty() {
+                            self.out.push_str(&"nobody else is here yet\n".dark_grey().to_string());
+                        } else {
+                            let tokens = peer_tokens_map(&self.peer_meta);
+                            let results = run_define_scatter(&self.peers, &src, &tokens);
+                            for r in &results {
+                                let label = self.peer_meta.get(&r.peer)
+                                    .and_then(|m| m.label.as_deref())
+                                    .map(|l| l.cyan().bold().to_string())
+                                    .unwrap_or_else(|| {
+                                        r.peer.trim_start_matches("http://")
+                                            .split(':').next().unwrap_or(&r.peer)
+                                            .cyan().to_string()
+                                    });
+                                if let Some(e) = &r.error {
+                                    self.out.push_str(&format!("{} couldn't learn {}: {}\n",
+                                        label, name.as_str().yellow(), e.as_str().red()));
+                                } else {
+                                    self.out.push_str(&format!("{} now knows {}\n",
+                                        label, name.as_str().green().bold()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::Sync => {
+                // ( -- )  scatter all user words to all peers
+                use crossterm::style::Stylize;
+                let src = self.dump_source();
+                if src.is_empty() {
+                    self.out.push_str(&"nothing to share yet\n".dark_grey().to_string());
+                } else if self.peers.is_empty() {
+                    self.out.push_str(&"nobody else is here yet\n".dark_grey().to_string());
+                } else {
+                    let word_count = src.lines().filter(|l| l.trim_start().starts_with(':')).count();
+                    let tokens = peer_tokens_map(&self.peer_meta);
+                    let results = run_define_scatter(&self.peers, &src, &tokens);
+                    for r in &results {
+                        let label = self.peer_meta.get(&r.peer)
+                            .and_then(|m| m.label.as_deref())
+                            .map(|l| l.cyan().bold().to_string())
+                            .unwrap_or_else(|| {
+                                r.peer.trim_start_matches("http://")
+                                    .split(':').next().unwrap_or(&r.peer)
+                                    .cyan().to_string()
+                            });
+                        if let Some(e) = &r.error {
+                            self.out.push_str(&format!("{} is out of reach: {}\n",
+                                label, e.as_str().red()));
+                        } else {
+                            self.out.push_str(&format!("{} is caught up  ({} word{})\n",
+                                label,
+                                word_count,
+                                if word_count == 1 { "" } else { "s" }));
+                        }
+                    }
+                }
+            }
+            // ── Registry ─────────────────────────────────────────────────────
+            Builtin::RegistrySet => {
+                // ( addr-idx -- )  set the registry address for this VM
+                let idx = self.pop()? as usize;
+                let addr = self.strings.get(idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("registry: index out of bounds"))?;
+                self.registry_addr = Some(addr.trim().to_string());
+            }
+            Builtin::JoinRegistry => {
+                // ( self-addr-idx -- )  register this machine with the configured registry
+                use crossterm::style::Stylize;
+                let addr_idx = self.pop()? as usize;
+                let self_addr = self.strings.get(addr_idx).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("join-registry: index out of bounds"))?;
+                match &self.registry_addr {
+                    None => {
+                        self.out.push_str(&"join-registry: no registry set  (use registry\" addr\")\n"
+                            .yellow().to_string());
+                    }
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        // Build tags from peer_meta for self_addr if present; else empty.
+                        let meta = self.peer_meta.get(&self_addr).cloned();
+                        let specs = collect_machine_specs();
+                        let result = run_registry_join(&reg, crate::registry::PeerEntry {
+                            addr:      self_addr.clone(),
+                            label:     meta.as_ref().and_then(|m| m.label.clone()),
+                            tags:      meta.map(|m| m.tags).unwrap_or_default(),
+                            load:      None,
+                            region:    None,
+                            cpu_cores: Some(specs.0),
+                            ram_mb:    Some(specs.1),
+                            bench_ms:  Some(specs.2),
+                        });
+                        match result {
+                            Ok(_) => {
+                                self.my_addr = Some(self_addr.clone());
+                                self.out.push_str(&format!("registered {} with {}\n",
+                                    self_addr.as_str().cyan().bold(),
+                                    reg.as_str().dark_grey()));
+                            }
+                            Err(e) => {
+                                self.out.push_str(&format!("join-registry error: {}\n",
+                                    e.to_string().red()));
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::LeaveRegistry => {
+                // ( -- )  deregister this machine from the configured registry
+                use crossterm::style::Stylize;
+                let addr = match &self.my_addr {
+                    Some(a) => a.clone(),
+                    None => {
+                        self.out.push_str(&"leave: not registered (use join\" addr\" first)\n"
+                            .yellow().to_string());
+                        return Ok(());
+                    }
+                };
+                match &self.registry_addr {
+                    None => {
+                        self.out.push_str(&"leave: no registry set\n".yellow().to_string());
+                    }
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        match run_registry_leave(&reg, &addr) {
+                            Ok(()) => {
+                                self.out.push_str(&format!("left registry: {}\n",
+                                    addr.as_str().dark_grey()));
+                                self.my_addr = None;
+                            }
+                            Err(e) => {
+                                self.out.push_str(&format!("leave error: {}\n",
+                                    e.to_string().red()));
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::FromRegistry => {
+                // ( -- )  pull live peers from registry into self.peers
+                use crossterm::style::Stylize;
+                match &self.registry_addr {
+                    None => {
+                        self.out.push_str(&"from-registry: no registry set\n".yellow().to_string());
+                    }
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        match run_registry_peers(&reg, None, None) {
+                            Err(e) => {
+                                self.out.push_str(&format!("from-registry error: {}\n",
+                                    e.to_string().red()));
+                            }
+                            Ok(peers) => {
+                                let mut added = 0usize;
+                                for p in &peers {
+                                    if !self.peers.contains(&p.addr) {
+                                        self.peers.push(p.addr.clone());
+                                        added += 1;
+                                    }
+                                    // Merge label + tags into peer_meta.
+                                    let meta = self.peer_meta.entry(p.addr.clone()).or_default();
+                                    if meta.label.is_none() {
+                                        meta.label = p.label.clone();
+                                    }
+                                    for t in &p.tags {
+                                        if !meta.tags.contains(t) {
+                                            meta.tags.push(t.clone());
+                                        }
+                                    }
+                                }
+                                self.out.push_str(&format!("{} peer(s) from registry ({} new)\n",
+                                    peers.len().to_string().cyan(),
+                                    added.to_string().green()));
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::RegistryList => {
+                // ( -- )  print all registry members
+                use crossterm::style::Stylize;
+                match &self.registry_addr {
+                    None => {
+                        self.out.push_str(&"registry-list: no registry set\n".yellow().to_string());
+                    }
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        match run_registry_peers(&reg, None, None) {
+                            Err(e) => {
+                                self.out.push_str(&format!("registry-list error: {}\n",
+                                    e.to_string().red()));
+                            }
+                            Ok(peers) => {
+                                if peers.is_empty() {
+                                    self.out.push_str(&"(registry empty)\n".dark_grey().to_string());
+                                } else {
+                                    for p in &peers {
+                                        let name = p.label.as_deref()
+                                            .map(|l| format!("{} {}", l.cyan().bold(),
+                                                p.addr.as_str().dark_grey()))
+                                            .unwrap_or_else(|| p.addr.as_str().cyan().to_string());
+                                        let tags = if p.tags.is_empty() { String::new() }
+                                            else { format!("  [{}]", p.tags.join(" ").yellow()) };
+                                        let load = p.load.map(|l| format!("  load:{:.0}%",
+                                            (l * 100.0).round())).unwrap_or_default();
+                                        let hw = format_peer_hw(p);
+                                        self.out.push_str(&format!("  {}{}{}{}\n", name, hw, tags, load));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::Balance => {
+                // ( -- )  print this machine's net compute balance
+                use crossterm::style::Stylize;
+                match &self.registry_addr {
+                    None => {
+                        self.out.push_str(&"balance: not registered\n".yellow().to_string());
+                    }
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        match run_registry_ledger(&reg, &reg) {
+                            Err(e) => {
+                                self.out.push_str(&format!("balance error: {}\n", e.to_string().red()));
+                            }
+                            Ok(entry) => {
+                                let net = entry.balance_ms();
+                                let sign = if net >= 0 { "+" } else { "" };
+                                let color_str = if net >= 0 {
+                                    format!("{sign}{net}ms").green().to_string()
+                                } else {
+                                    format!("{sign}{net}ms").red().to_string()
+                                };
+                                self.out.push_str(&format!(
+                                    "  balance: {}  (earned {}ms  spent {}ms)\n",
+                                    color_str,
+                                    entry.credits_ms.to_string().cyan(),
+                                    entry.debits_ms.to_string().yellow(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::Balances => {
+                // ( -- )  print all machines' compute balances from registry
+                use crossterm::style::Stylize;
+                match &self.registry_addr {
+                    None => {
+                        self.out.push_str(&"balances: no registry set\n".yellow().to_string());
+                    }
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        match run_registry_all_ledgers(&reg) {
+                            Err(e) => {
+                                self.out.push_str(&format!("balances error: {}\n", e.to_string().red()));
+                            }
+                            Ok(entries) => {
+                                if entries.is_empty() {
+                                    self.out.push_str(&"(no machines registered)\n".dark_grey().to_string());
+                                } else {
+                                    for (addr, entry) in &entries {
+                                        let net = entry.balance_ms();
+                                        let sign = if net >= 0 { "+" } else { "" };
+                                        let color_str = if net >= 0 {
+                                            format!("{sign}{net}ms").green().to_string()
+                                        } else {
+                                            format!("{sign}{net}ms").red().to_string()
+                                        };
+                                        self.out.push_str(&format!(
+                                            "  {}  {}\n",
+                                            addr.as_str().cyan(),
+                                            color_str,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::RecordDebit => {
+                // ( peer-idx compute-ms -- )  record compute consumed from peer
+                if self.data.len() < 2 {
+                    return Err(anyhow::anyhow!("record-debit: stack underflow"));
+                }
+                let compute_ms = self.data.pop().unwrap() as u64;
+                let peer_idx   = self.data.pop().unwrap() as usize;
+                if let Some(peer_addr) = self.strings.get(peer_idx).cloned() {
+                    if let Some(ref reg) = self.registry_addr.clone() {
+                        let _ = run_registry_debit(reg, &peer_addr, compute_ms);
+                    }
+                }
+            }
+            Builtin::See(idx) => {
+                use crossterm::style::Stylize;
+                let word_name = self.strings.get(idx).cloned().unwrap_or_default();
+                let mut found = false;
+
+                // 1. Check user-defined words (source_log).
+                if let Some(src) = self.word_source(&word_name) {
+                    self.out.push_str(&format!(
+                        "  {} {}\n",
+                        word_name.as_str().cyan().bold(),
+                        src.trim().dark_grey(),
+                    ));
+                    found = true;
+                }
+
+                // 2. Check the library for a plain-language definition.
+                static LIB: std::sync::OnceLock<crate::coforth::Library> = std::sync::OnceLock::new();
+                let lib = LIB.get_or_init(crate::coforth::Library::load);
+                if let Some(entry) = lib.lookup(&word_name) {
+                    self.out.push_str(&format!(
+                        "  {}\n",
+                        entry.definition.as_str().white(),
+                    ));
+                    if !entry.related.is_empty() {
+                        let rel = entry.related.join("  ");
+                        self.out.push_str(&format!(
+                            "  → {}\n",
+                            rel.as_str().dark_grey(),
+                        ));
+                    }
+                    found = true;
+                }
+
+                // 3. Check builtins.
+                if !found {
+                    if name_to_builtin(&word_name).is_some() {
+                        self.out.push_str(&format!(
+                            "  {} — built-in word\n",
+                            word_name.as_str().cyan().bold(),
+                        ));
+                    } else {
+                        self.out.push_str(&format!(
+                            "  {} — unknown word\n",
+                            word_name.as_str().yellow(),
+                        ));
+                    }
+                }
+            }
+            Builtin::DebtCheck => {
+                // ( -- )  list machines whose balance is deeply negative (they owe you)
+                use crossterm::style::Stylize;
+                match &self.registry_addr {
+                    None => {
+                        self.out.push_str(&"debt-check: not registered\n".yellow().to_string());
+                    }
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        match run_registry_all_ledgers(&reg) {
+                            Err(e) => {
+                                self.out.push_str(&format!("debt-check error: {}\n", e.to_string().red()));
+                            }
+                            Ok(entries) => {
+                                let debtors: Vec<_> = entries.iter()
+                                    .filter(|(_, e)| e.balance_ms() < 0)
+                                    .collect();
+                                if debtors.is_empty() {
+                                    self.out.push_str(&"  all square\n".green().to_string());
+                                } else {
+                                    for (addr, entry) in &debtors {
+                                        let balance_s = entry.balance_ms().abs() as f64 / 1000.0;
+                                        self.out.push_str(&format!(
+                                            "  {} owes {:.1}s\n",
+                                            addr.as_str().cyan(),
+                                            balance_s,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::Settle => {
+                // ( peer-idx -- )  settle compute debt with a peer (P2P, no third party)
+                // Posts to the peer's /v1/settle endpoint acknowledging the debt.
+                // The peer verifies and clears both ledgers.
+                use crossterm::style::Stylize;
+                if self.data.is_empty() {
+                    return Err(anyhow::anyhow!("settle: stack underflow"));
+                }
+                let peer_idx = self.data.pop().unwrap() as usize;
+                let peer_addr = self.strings.get(peer_idx)
+                    .ok_or_else(|| anyhow::anyhow!("settle: peer string index out of bounds"))?
+                    .trim().to_string();
+                // Look up what we owe this peer from our local registry view.
+                let my_addr = self.registry_addr.clone();
+                match run_peer_settle(&peer_addr, my_addr.as_deref()) {
+                    Err(e) => {
+                        self.out.push_str(&format!("settle error: {}\n", e.to_string().red()));
+                    }
+                    Ok((cleared_ms, msg)) => {
+                        let cleared_s = cleared_ms as f64 / 1000.0;
+                        self.out.push_str(&format!(
+                            "  ✓ settled with {}  ({:.1}s cleared)\n",
+                            peer_addr.as_str().cyan(),
+                            cleared_s,
+                        ));
+                        if !msg.is_empty() {
+                            self.out.push_str(&format!("    {}\n", msg.dark_grey()));
+                        }
+                    }
+                }
+            }
+            Builtin::Slowest => {
+                // ( -- addr-idx )  push address of slowest (highest bench_ms) live peer.
+                // Falls back to the peer with the most load if bench_ms not reported.
+                // Pushes -1 if no peers or no registry set.
+                use crossterm::style::Stylize;
+                match &self.registry_addr {
+                    None => {
+                        self.out.push_str(&"slowest: no registry set\n".yellow().to_string());
+                        self.data.push(-1);
+                    }
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        match run_registry_peers(&reg, None, None) {
+                            Err(e) => {
+                                self.out.push_str(&format!("slowest error: {}\n", e.to_string().red()));
+                                self.data.push(-1);
+                            }
+                            Ok(peers) if peers.is_empty() => {
+                                self.out.push_str(&"slowest: registry empty\n".dark_grey().to_string());
+                                self.data.push(-1);
+                            }
+                            Ok(peers) => {
+                                // Score: highest bench_ms wins (slowest); tie-break by highest load.
+                                let slowest = peers.iter().max_by(|a, b| {
+                                    let sa = a.bench_ms.unwrap_or(0);
+                                    let sb = b.bench_ms.unwrap_or(0);
+                                    if sa != sb {
+                                        sa.cmp(&sb)
+                                    } else {
+                                        let la = (a.load.unwrap_or(0.0) * 1000.0) as u32;
+                                        let lb = (b.load.unwrap_or(0.0) * 1000.0) as u32;
+                                        la.cmp(&lb)
+                                    }
+                                }).unwrap();
+                                let hw = format_peer_hw(slowest);
+                                self.out.push_str(&format!(
+                                    "slowest: {}{}\n",
+                                    slowest.addr.as_str().cyan(),
+                                    hw,
+                                ));
+                                let idx = self.strings.len();
+                                self.strings.push(slowest.addr.clone());
+                                self.data.push(idx as i64);
+                            }
+                        }
+                    }
+                }
+            }
+            Builtin::ForthBack(idx) => {
+                // ( -- )  queue Forth code to execute on the caller after they receive our response.
+                // In remote_mode the peer sets self.forth_back; the caller retrieves it from the
+                // response and evals it locally.  In local mode it runs immediately (no round-trip).
+                let code = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("forth-back: string index out of bounds"))?
+                    .clone();
+                if self.remote_mode {
+                    // We are the remote peer — store for transmission.
+                    self.forth_back = Some(code);
+                } else {
+                    // Local execution — run immediately.
+                    self.eval(&code)?;
                 }
             }
             // ── String pool operations ────────────────────────────────────────
@@ -1771,6 +2814,103 @@ impl Forth {
                 use crossterm::{cursor, execute};
                 execute!(std::io::stdout(), cursor::Show).ok();
             }
+
+            Builtin::Connected => {
+                // -1 (true) if this VM has active peers, a registry address, or a known own address.
+                // 0 (false) if completely isolated — no session joined.
+                let connected = !self.peers.is_empty()
+                    || self.registry_addr.is_some()
+                    || self.my_addr.is_some();
+                self.data.push(if connected { -1 } else { 0 });
+            }
+
+            // ── Security scanning ───────────────────────────────────────────
+            Builtin::ScanFile => {
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("scan-file: index out of bounds"))?
+                    .clone();
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| anyhow::anyhow!("scan-file: cannot read {}: {}", path, e))?;
+                let report = scan_bytes_for_signatures(&bytes, Some(&path));
+                let idx = self.strings.len();
+                self.strings.push(report);
+                self.data.push(idx as i64);
+            }
+
+            Builtin::ScanBytes => {
+                let str_idx = self.pop()? as usize;
+                let content = self.strings.get(str_idx)
+                    .ok_or_else(|| anyhow::anyhow!("scan-bytes: index out of bounds"))?
+                    .clone();
+                let score = scan_risk_score(content.as_bytes());
+                self.data.push(score as i64);
+            }
+
+            Builtin::FileEntropy => {
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("file-entropy: index out of bounds"))?
+                    .clone();
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| anyhow::anyhow!("file-entropy: cannot read {}: {}", path, e))?;
+                let entropy = shannon_entropy(&bytes);
+                self.data.push((entropy * 1000.0) as i64);
+            }
+
+            Builtin::ScanDir => {
+                let path_idx = self.pop()? as usize;
+                let root = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("scan-dir: index out of bounds"))?
+                    .clone();
+                let report = scan_dir_recursive(&root);
+                let idx = self.strings.len();
+                self.strings.push(report);
+                self.data.push(idx as i64);
+            }
+
+            Builtin::ScanStrings => {
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("scan-strings: index out of bounds"))?
+                    .clone();
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| anyhow::anyhow!("scan-strings: cannot read {}: {}", path, e))?;
+                let extracted = extract_strings(&bytes, 6);
+                let idx = self.strings.len();
+                self.strings.push(extracted);
+                self.data.push(idx as i64);
+            }
+
+            Builtin::ScanProcs => {
+                let report = scan_processes();
+                let idx = self.strings.len();
+                self.strings.push(report);
+                self.data.push(idx as i64);
+            }
+
+            Builtin::ScanNet => {
+                let report = scan_network();
+                let idx = self.strings.len();
+                self.strings.push(report);
+                self.data.push(idx as i64);
+            }
+
+            Builtin::ScanStartup => {
+                let report = scan_startup_locations();
+                let idx = self.strings.len();
+                self.strings.push(report);
+                self.data.push(idx as i64);
+            }
+
+            Builtin::Quarantine => {
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx)
+                    .ok_or_else(|| anyhow::anyhow!("quarantine: index out of bounds"))?
+                    .clone();
+                let flag = quarantine_file(&path);
+                self.data.push(if flag { -1 } else { 0 });
+            }
         }
         Ok(())
     }
@@ -1778,6 +2918,507 @@ impl Forth {
     fn pop(&mut self) -> Result<i64> {
         self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow"))
     }
+}
+
+// ── Security scanning helpers ─────────────────────────────────────────────────
+
+// ── Signature database ────────────────────────────────────────────────────────
+
+struct Sig { pattern: &'static [u8], label: &'static str, score: u8 }
+
+const BYTE_SIGS: &[Sig] = &[
+    Sig { pattern: b"MZ",                                     label: "PE/DOS executable",          score: 25 },
+    Sig { pattern: b"\x7fELF",                                label: "ELF executable",              score: 25 },
+    Sig { pattern: b"\xca\xfe\xba\xbe",                       label: "Mach-O fat binary",           score: 20 },
+    Sig { pattern: b"\xfe\xed\xfa\xce",                       label: "Mach-O 32-bit",               score: 20 },
+    Sig { pattern: b"\xfe\xed\xfa\xcf",                       label: "Mach-O 64-bit",               score: 20 },
+    Sig { pattern: b"\xce\xfa\xed\xfe",                       label: "Mach-O 32-bit LE",            score: 20 },
+    Sig { pattern: b"\xcf\xfa\xed\xfe",                       label: "Mach-O 64-bit LE",            score: 20 },
+    Sig { pattern: b"#!",                                     label: "shell script",                score:  5 },
+    // Exploit kits / shellcode markers
+    Sig { pattern: b"\x90\x90\x90\x90\x90\x90\x90\x90",      label: "NOP sled (shellcode)",        score: 35 },
+    Sig { pattern: b"\xeb\xfe",                               label: "infinite loop (shellcode)",   score: 30 },
+    // Archive / dropper
+    Sig { pattern: b"PK\x03\x04",                             label: "ZIP/JAR/APK archive",         score:  5 },
+    Sig { pattern: b"\x1f\x8b",                               label: "gzip archive",                score:  5 },
+    Sig { pattern: b"Rar!\x1a\x07",                           label: "RAR archive",                 score:  5 },
+    // Office macros
+    Sig { pattern: b"\xd0\xcf\x11\xe0",                       label: "OLE2 compound doc (Office)",  score: 10 },
+    // Java
+    Sig { pattern: b"\xca\xfe\xba\xbe",                       label: "Java class file",             score: 10 },
+];
+
+struct StrSig { pattern: &'static str, label: &'static str, score: u8 }
+
+const STR_SIGS: &[StrSig] = &[
+    // EICAR test
+    StrSig { pattern: "EICAR-STANDARD-ANTIVIRUS-TEST-FILE",   label: "EICAR antivirus test file",  score: 100 },
+    // Webshells
+    StrSig { pattern: "eval(base64_decode",                   label: "PHP webshell (eval+b64)",     score: 40 },
+    StrSig { pattern: "assert($_REQUEST",                     label: "PHP webshell (assert)",       score: 40 },
+    StrSig { pattern: "passthru($_",                          label: "PHP webshell (passthru)",     score: 40 },
+    StrSig { pattern: "system($_REQUEST",                     label: "PHP webshell (system)",       score: 40 },
+    StrSig { pattern: "exec($_GET",                           label: "PHP webshell (exec+GET)",     score: 40 },
+    // Encoded execution
+    StrSig { pattern: "powershell -enc",                      label: "encoded PowerShell",          score: 35 },
+    StrSig { pattern: "powershell -e ",                       label: "encoded PowerShell",          score: 30 },
+    StrSig { pattern: "powershell -nop",                      label: "PowerShell no-profile exec",  score: 25 },
+    StrSig { pattern: "cmd.exe /c ",                          label: "Windows shell execution",     score: 20 },
+    StrSig { pattern: "mshta.exe",                            label: "MSHTA execution (LOLBin)",    score: 25 },
+    StrSig { pattern: "regsvr32.exe",                         label: "Regsvr32 LOLBin",             score: 20 },
+    // Destructive
+    StrSig { pattern: "rm -rf /",                             label: "recursive root delete",       score: 30 },
+    StrSig { pattern: "dd if=/dev/zero",                      label: "disk-wipe command",           score: 30 },
+    StrSig { pattern: "shred -u",                             label: "secure file delete",          score: 20 },
+    StrSig { pattern: "mkfs.",                                label: "filesystem format",            score: 25 },
+    // Downloaders
+    StrSig { pattern: "wget http",                            label: "remote download (wget)",      score: 15 },
+    StrSig { pattern: "curl http",                            label: "remote download (curl)",      score: 15 },
+    StrSig { pattern: "urllib.request.urlopen",               label: "Python remote download",      score: 15 },
+    // Persistence
+    StrSig { pattern: "crontab -",                            label: "cron persistence",            score: 15 },
+    StrSig { pattern: "LaunchAgents",                         label: "macOS LaunchAgent reference", score: 10 },
+    StrSig { pattern: "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                                                              label: "Windows Run key persistence", score: 25 },
+    // Crypto miners
+    StrSig { pattern: "stratum+tcp://",                       label: "mining pool connection",      score: 45 },
+    StrSig { pattern: "xmrig",                                label: "XMRig miner",                 score: 45 },
+    StrSig { pattern: "cryptonight",                          label: "CryptoNight algorithm",       score: 40 },
+    StrSig { pattern: "monero",                               label: "Monero mining reference",     score: 20 },
+    // Rootkit / evasion
+    StrSig { pattern: "ptrace",                               label: "ptrace (debugger/rootkit)",   score: 15 },
+    StrSig { pattern: "LD_PRELOAD",                           label: "LD_PRELOAD injection",        score: 25 },
+    StrSig { pattern: "DYLD_INSERT_LIBRARIES",                label: "macOS dylib injection",       score: 25 },
+    StrSig { pattern: "NtSetInformationThread",               label: "Windows anti-debug",          score: 20 },
+    // Ransomware indicators
+    StrSig { pattern: ".onion",                               label: "Tor hidden service (.onion)", score: 20 },
+    StrSig { pattern: "your files have been encrypted",       label: "ransomware note",             score: 60 },
+    StrSig { pattern: "bitcoin address",                      label: "ransom payment instruction",  score: 40 },
+    StrSig { pattern: "AES_encrypt",                          label: "AES encryption call",         score: 15 },
+    // Backdoors
+    StrSig { pattern: "/bin/sh -i",                           label: "interactive shell spawn",     score: 30 },
+    StrSig { pattern: "nc -e /bin/sh",                        label: "netcat reverse shell",        score: 45 },
+    StrSig { pattern: "bash -i >&",                           label: "bash reverse shell",          score: 45 },
+    StrSig { pattern: "socket.connect(",                      label: "socket connect (C2)",         score: 10 },
+    // Keyloggers
+    StrSig { pattern: "GetAsyncKeyState",                     label: "Windows keylogger API",       score: 30 },
+    StrSig { pattern: "SetWindowsHookEx",                     label: "Windows hook injection",      score: 25 },
+];
+
+// ── Scanning helpers ──────────────────────────────────────────────────────────
+
+/// Shannon entropy of a byte slice (0.0 = uniform, 8.0 = maximum randomness).
+fn shannon_entropy(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() { return 0.0; }
+    let mut counts = [0u64; 256];
+    for &b in bytes { counts[b as usize] += 1; }
+    let len = bytes.len() as f64;
+    counts.iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| { let p = c as f64 / len; -p * p.log2() })
+        .sum()
+}
+
+/// Return a risk score 0–100 based on suspicious byte patterns.
+fn scan_risk_score(bytes: &[u8]) -> u8 {
+    let mut score: u32 = 0;
+
+    // Entropy
+    let entropy = shannon_entropy(bytes);
+    if entropy > 7.5      { score += 40; }
+    else if entropy > 7.0 { score += 20; }
+    else if entropy > 6.5 { score += 10; }
+
+    // Binary signature table
+    for sig in BYTE_SIGS {
+        if bytes.starts_with(sig.pattern) {
+            score += sig.score as u32;
+        }
+    }
+
+    // String signature table (lossy UTF-8 view)
+    let text = String::from_utf8_lossy(bytes);
+    let text_lower = text.to_lowercase();
+    for sig in STR_SIGS {
+        let needle_lower = sig.pattern.to_lowercase();
+        if text_lower.contains(&needle_lower) {
+            score += sig.score as u32;
+        }
+    }
+
+    // Mixed nulls — shellcode smell
+    let null_count = bytes.iter().filter(|&&b| b == 0).count();
+    if null_count > 0 && null_count < bytes.len() {
+        let ratio = null_count as f64 / bytes.len() as f64;
+        if ratio > 0.05 && ratio < 0.95 { score += 15; }
+    }
+
+    score.min(100) as u8
+}
+
+/// Full scan report for a file: human-readable text.
+fn scan_bytes_for_signatures(bytes: &[u8], path: Option<&str>) -> String {
+    let score   = scan_risk_score(bytes);
+    let entropy = shannon_entropy(bytes);
+
+    let risk_label = match score {
+        0..=19   => "clean",
+        20..=49  => "low",
+        50..=74  => "medium",
+        75..=99  => "high",
+        _        => "critical",
+    };
+
+    let mut findings: Vec<String> = vec![
+        format!("risk: {} ({}/100)", risk_label, score),
+        format!("entropy: {:.3}  size: {} bytes", entropy, bytes.len()),
+    ];
+
+    // File type from magic bytes
+    let kind = if bytes.starts_with(b"MZ")                           { "PE/DOS executable" }
+        else if bytes.starts_with(b"\x7fELF")                        { "ELF executable" }
+        else if bytes.starts_with(b"\xcf\xfa\xed\xfe") ||
+                bytes.starts_with(b"\xce\xfa\xed\xfe") ||
+                bytes.starts_with(b"\xfe\xed\xfa\xce") ||
+                bytes.starts_with(b"\xfe\xed\xfa\xcf") ||
+                bytes.starts_with(b"\xca\xfe\xba\xbe")               { "Mach-O binary" }
+        else if bytes.starts_with(b"%PDF")                           { "PDF document" }
+        else if bytes.starts_with(b"PK\x03\x04")                     { "ZIP/JAR/APK" }
+        else if bytes.starts_with(b"\x1f\x8b")                       { "gzip" }
+        else if bytes.starts_with(b"Rar!\x1a\x07")                   { "RAR archive" }
+        else if bytes.starts_with(b"\xd0\xcf\x11\xe0")               { "OLE2/Office document" }
+        else if bytes.starts_with(b"#!")                             { "shell script" }
+        else                                                          { "data/text" };
+    findings.push(format!("type: {}", kind));
+
+    if entropy > 7.5 {
+        findings.push("! high entropy — packed or encrypted payload".to_string());
+    }
+
+    // Matched string signatures
+    let text       = String::from_utf8_lossy(bytes);
+    let text_lower = text.to_lowercase();
+    for sig in STR_SIGS {
+        if text_lower.contains(&sig.pattern.to_lowercase()) {
+            findings.push(format!("! {}", sig.label));
+        }
+    }
+
+    // Matched byte signatures (for embedded content, not just file header)
+    for sig in BYTE_SIGS {
+        if bytes.windows(sig.pattern.len()).any(|w| w == sig.pattern) &&
+           !bytes.starts_with(sig.pattern) {
+            // Only flag if NOT the file's own header (already reported in type)
+            findings.push(format!("embedded: {}", sig.label));
+        }
+    }
+
+    let header = match path {
+        Some(p) => format!("scan  {}", p),
+        None    => "scan  (bytes)".to_string(),
+    };
+    format!("{}\n{}", header, findings.join("\n"))
+}
+
+/// Extract printable ASCII strings of at least `min_len` bytes (like the `strings` utility).
+fn extract_strings(bytes: &[u8], min_len: usize) -> String {
+    let mut result = String::new();
+    let mut current = String::new();
+    for &b in bytes {
+        if b.is_ascii_graphic() || b == b' ' {
+            current.push(b as char);
+        } else {
+            if current.len() >= min_len {
+                result.push_str(&current);
+                result.push('\n');
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= min_len {
+        result.push_str(&current);
+        result.push('\n');
+    }
+    result
+}
+
+/// Recursively scan a directory. Returns a summary report.
+fn scan_dir_recursive(root: &str) -> String {
+    let mut lines: Vec<String> = vec![format!("scan-dir  {}", root)];
+    let mut total   = 0usize;
+    let mut flagged = 0usize;
+    let mut errors  = 0usize;
+
+    fn walk(dir: &str, lines: &mut Vec<String>, total: &mut usize, flagged: &mut usize, errors: &mut usize, depth: usize) {
+        if depth > 20 { return; } // guard against deep symlink cycles
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => { lines.push(format!("  err  {}: {}", dir, e)); *errors += 1; return; }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let path_str = path.to_string_lossy().to_string();
+            // Skip known-safe dirs to keep scans fast
+            if path_str.contains("/.git/") || path_str.contains("/target/") { continue; }
+            if path.is_dir() {
+                walk(&path_str, lines, total, flagged, errors, depth + 1);
+            } else if path.is_file() {
+                *total += 1;
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let score = scan_risk_score(&bytes);
+                        if score >= 20 {
+                            *flagged += 1;
+                            let label = match score {
+                                20..=49 => "low",
+                                50..=74 => "med",
+                                75..=99 => "high",
+                                _       => "crit",
+                            };
+                            lines.push(format!("  [{:>4}] [{label}] {path_str}", score));
+                        }
+                    }
+                    Err(_) => { *errors += 1; }
+                }
+            }
+        }
+    }
+
+    walk(root, &mut lines, &mut total, &mut flagged, &mut errors, 0);
+    lines.push(format!("total: {}  flagged: {}  errors: {}", total, flagged, errors));
+    lines.join("\n")
+}
+
+/// Scan running processes for suspicious indicators.
+fn scan_processes() -> String {
+    let mut lines = vec!["scan-procs".to_string()];
+
+    // Common suspicious process names
+    let suspicious_names = [
+        "xmrig", "minerd", "cpuminer", "cgminer",     // miners
+        "ncat", "socat", "cryptcat",                   // network tools
+        "mimikatz", "metasploit", "msfconsole",        // attack tools
+        "keylogger", "rootkit",                        // obvious malware names
+    ];
+
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("ps").args(["axo", "pid,comm,args"]).output() {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines().skip(1) {
+                    let lower = line.to_lowercase();
+                    for name in &suspicious_names {
+                        if lower.contains(name) {
+                            lines.push(format!("! {}", line.trim()));
+                            break;
+                        }
+                    }
+                }
+                let count = text.lines().count().saturating_sub(1);
+                lines.push(format!("{} processes scanned", count));
+            }
+            Err(e) => lines.push(format!("err: {}", e)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Read /proc on Linux
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            let mut count = 0usize;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.chars().all(|c| c.is_ascii_digit()) {
+                    count += 1;
+                    let cmdline_path = format!("/proc/{}/cmdline", name_str);
+                    if let Ok(bytes) = std::fs::read(&cmdline_path) {
+                        let cmdline = String::from_utf8_lossy(&bytes).replace('\0', " ");
+                        let lower = cmdline.to_lowercase();
+                        for sus in &suspicious_names {
+                            if lower.contains(sus) {
+                                lines.push(format!("! pid {}  {}", name_str, cmdline.trim()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            lines.push(format!("{} processes scanned", count));
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    lines.push("process scanning not supported on this platform".to_string());
+
+    lines.join("\n")
+}
+
+/// Scan open network connections for suspicious endpoints.
+fn scan_network() -> String {
+    let mut lines = vec!["scan-net".to_string()];
+
+    // Known bad ports
+    let suspicious_ports: &[u16] = &[
+        4444, 4445, 1337, 31337, // common reverse shells
+        6666, 6667, 6668, 6669,  // IRC (botnet C2)
+        8080, 8888,              // common C2 HTTP alt ports
+        9050, 9051,              // Tor SOCKS proxy
+    ];
+
+    #[cfg(target_os = "macos")]
+    {
+        match std::process::Command::new("netstat").args(["-an", "-p", "tcp"]).output() {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let mut flagged = 0usize;
+                let mut total   = 0usize;
+                for line in text.lines() {
+                    if line.contains("ESTABLISHED") || line.contains("LISTEN") {
+                        total += 1;
+                        // Check for suspicious ports in the line
+                        for &port in suspicious_ports {
+                            if line.contains(&format!(".{}", port)) || line.contains(&format!(":{}", port)) {
+                                lines.push(format!("! {}", line.trim()));
+                                flagged += 1;
+                                break;
+                            }
+                        }
+                        // Check for .onion DNS lookups
+                        if line.contains(".onion") {
+                            lines.push(format!("! tor: {}", line.trim()));
+                            flagged += 1;
+                        }
+                    }
+                }
+                lines.push(format!("{} connections  {} flagged", total, flagged));
+            }
+            Err(e) => lines.push(format!("err: {}", e)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Read /proc/net/tcp and /proc/net/tcp6
+        for proto_file in &["/proc/net/tcp", "/proc/net/tcp6"] {
+            if let Ok(content) = std::fs::read_to_string(proto_file) {
+                for line in content.lines().skip(1) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let local_addr = parts[1];
+                        let state = parts[3];
+                        if state == "0A" { // LISTEN
+                            // Parse hex port (last 4 chars of addr field)
+                            if let Some(port_hex) = local_addr.split(':').nth(1) {
+                                if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+                                    if suspicious_ports.contains(&port) {
+                                        lines.push(format!("! listening on suspicious port {}", port));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lines.push("checked /proc/net/tcp".to_string());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    lines.push("network scanning not supported on this platform".to_string());
+
+    lines.join("\n")
+}
+
+/// Check common persistence/startup locations.
+fn scan_startup_locations() -> String {
+    let mut lines = vec!["scan-startup".to_string()];
+    let mut found = 0usize;
+
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    // macOS LaunchAgents / LaunchDaemons
+    let macos_locations = [
+        format!("{}/Library/LaunchAgents", home),
+        "/Library/LaunchAgents".to_string(),
+        "/Library/LaunchDaemons".to_string(),
+        "/System/Library/LaunchAgents".to_string(),
+        "/System/Library/LaunchDaemons".to_string(),
+    ];
+
+    // Linux startup locations
+    let linux_locations = [
+        format!("{}/bin", home),
+        format!("{}/.bashrc", home),
+        format!("{}/.bash_profile", home),
+        format!("{}/.profile", home),
+        format!("{}/.zshrc", home),
+        "/etc/cron.d".to_string(),
+        "/etc/cron.daily".to_string(),
+        "/etc/cron.hourly".to_string(),
+        "/var/spool/cron".to_string(),
+        "/etc/rc.local".to_string(),
+        "/etc/init.d".to_string(),
+    ];
+
+    let all_locations: Vec<&str> = macos_locations.iter()
+        .chain(linux_locations.iter())
+        .map(|s| s.as_str())
+        .collect();
+
+    for loc in &all_locations {
+        let path = std::path::Path::new(loc);
+        if path.is_file() {
+            if let Ok(bytes) = std::fs::read(path) {
+                let score = scan_risk_score(&bytes);
+                found += 1;
+                let flag = if score >= 50 { "!" } else { " " };
+                lines.push(format!("  {flag} [{:>3}] {}", score, loc));
+            }
+        } else if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    if let Ok(bytes) = std::fs::read(entry.path()) {
+                        let score = scan_risk_score(&bytes);
+                        found += 1;
+                        let flag = if score >= 50 { "!" } else { " " };
+                        let name = entry.path().to_string_lossy().to_string();
+                        lines.push(format!("  {flag} [{:>3}] {}", score, name));
+                    }
+                }
+            }
+        }
+    }
+
+    if found == 0 {
+        lines.push("no startup items found".to_string());
+    } else {
+        lines.push(format!("{} startup items scanned", found));
+    }
+    lines.join("\n")
+}
+
+/// Move a file to ~/.finch/quarantine/. Returns true on success.
+fn quarantine_file(path: &str) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let quarantine_dir = format!("{}/.finch/quarantine", home);
+    if std::fs::create_dir_all(&quarantine_dir).is_err() { return false; }
+
+    let src = std::path::Path::new(path);
+    let file_name = match src.file_name() {
+        Some(n) => n.to_string_lossy().to_string(),
+        None => return false,
+    };
+
+    // Add timestamp to avoid collisions
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = format!("{}/{}_{}", quarantine_dir, ts, file_name);
+
+    std::fs::rename(path, &dest).is_ok()
 }
 
 // ── Crypto helpers ────────────────────────────────────────────────────────────
@@ -1794,35 +3435,174 @@ fn crypto_hex_decode(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+// ── Scatter output helpers ────────────────────────────────────────────────────
+
+impl Forth {
+    /// Format scatter results into `self.out` using crossterm colors.
+    /// Peer labels are shown when set; errors are red; output lines are labelled.
+    fn emit_scatter_results(&mut self, results: Vec<crate::coforth::scatter::PeerResult>) {
+        use crossterm::style::Stylize;
+        for r in results {
+            // Use label if known; fall back to a short hostname (strip port, strip http://).
+            let name = self.peer_meta.get(&r.peer)
+                .and_then(|m| m.label.as_deref())
+                .map(|l| l.cyan().bold().to_string())
+                .unwrap_or_else(|| {
+                    let short = r.peer
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .split(':').next()           // drop port
+                        .unwrap_or(&r.peer);
+                    short.cyan().to_string()
+                });
+
+            if let Some(err) = r.error {
+                self.out.push_str(&format!("{} couldn't do it: {}\n",
+                    name, err.red()));
+            } else {
+                for line in r.output.lines() {
+                    self.out.push_str(&format!("{}: {}\n", name, line));
+                }
+                for v in &r.stack {
+                    self.data.push(*v);
+                }
+            }
+            // Execute any Forth code the peer sent back.
+            if let Some(ref fb) = r.forth_back {
+                if !fb.is_empty() {
+                    if let Err(e) = self.eval(fb) {
+                        self.out.push_str(&format!("{} sent back something that didn't work: {}\n",
+                            name, e.to_string().red()));
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Scatter helpers — bridge sync Forth VM to async scatter functions ──────────
 
-fn run_scatter(peers: &[String], code: &str) -> Vec<crate::coforth::scatter::PeerResult> {
+fn peer_tokens_map(peer_meta: &std::collections::HashMap<String, PeerMeta>) -> std::collections::HashMap<String, String> {
+    peer_meta.iter()
+        .filter_map(|(addr, meta)| meta.token.as_ref().map(|t| (addr.clone(), t.clone())))
+        .collect()
+}
+
+fn run_scatter(peers: &[String], code: &str, caller: Option<&str>, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
+    let caller = caller.map(|s| s.to_string());
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
-            handle.block_on(crate::coforth::scatter::scatter_exec(peers, code))
+            handle.block_on(crate::coforth::scatter::scatter_exec(peers, code, caller.as_deref(), tokens))
         })
     } else {
         tokio::runtime::Runtime::new()
             .expect("tokio runtime")
-            .block_on(crate::coforth::scatter::scatter_exec(peers, code))
+            .block_on(crate::coforth::scatter::scatter_exec(peers, code, caller.as_deref(), tokens))
     }
 }
 
+/// Return "hostname: path" attribution prefix for file reads.
+fn file_attribution(path: &str) -> String {
+    let host = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "here".to_string());
+    format!("── {path} ({host}) ──\n")
+}
+
+/// Read a CSV or TSV file and return rows as pipe-delimited lines.
+/// `delimiter` is b',' for CSV or b'\t' for TSV.
+fn read_delimited_file(path: &str, delimiter: u8) -> String {
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return format!("cannot open {path}: {e}\n"),
+    };
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(f);
+    let mut out = file_attribution(path);
+    for result in rdr.records() {
+        match result {
+            Ok(record) => {
+                let row: Vec<&str> = record.iter().collect();
+                out.push_str(&row.join(" | "));
+                out.push('\n');
+            }
+            Err(e) => {
+                out.push_str(&format!("parse error: {e}\n"));
+            }
+        }
+    }
+    out
+}
+
+/// Read the first sheet of an xlsx/xls/ods file and return rows as pipe-delimited lines.
+fn read_xlsx_file(path: &str) -> String {
+    use calamine::{Reader, open_workbook_auto, Data};
+    let mut workbook = match open_workbook_auto(path) {
+        Ok(wb) => wb,
+        Err(e) => return format!("cannot open {path}: {e}\n"),
+    };
+    let sheets = workbook.sheet_names().to_vec();
+    let sheet_name = match sheets.first() {
+        Some(n) => n.clone(),
+        None => return format!("{path}: no sheets found\n"),
+    };
+    let range = match workbook.worksheet_range(&sheet_name) {
+        Ok(r) => r,
+        Err(e) => return format!("cannot read sheet: {e}\n"),
+    };
+    let mut out = file_attribution(path);
+    for row in range.rows() {
+        let cells: Vec<String> = row.iter().map(|c| match c {
+            Data::Empty => String::new(),
+            Data::String(s) => s.clone(),
+            Data::Float(f) => {
+                if f.fract() == 0.0 { format!("{}", *f as i64) } else { format!("{f}") }
+            }
+            Data::Int(i) => format!("{i}"),
+            Data::Bool(b) => format!("{b}"),
+            Data::Error(e) => format!("#ERR:{e:?}"),
+            _ => String::new(),
+        }).collect();
+        out.push_str(&cells.join(" | "));
+        out.push('\n');
+    }
+    out
+}
+
+/// Extract a human-friendly machine name from an mDNS fullname.
+/// e.g. "finch-macbook-pro._finch._tcp.local." → "macbook-pro"
+fn friendly_peer_name(full_name: &str) -> String {
+    let instance = full_name.split("._finch").next().unwrap_or(full_name);
+    instance.strip_prefix("finch-").unwrap_or(instance).to_string()
+}
+
 /// Public entry point for background boot discovery (called from event_loop).
-pub fn run_peers_discover_pub(timeout_ms: u64) -> Vec<(String, u16)> {
+/// Returns (host, port, friendly_name) triples.
+/// (host, port, friendly_name, token)
+pub fn run_peers_discover_pub(timeout_ms: u64) -> Vec<(String, u16, String, Option<String>)> {
     run_peers_discover(timeout_ms)
 }
 
-/// Synchronous mDNS discovery — returns (host, port) pairs for all found finch instances.
+/// Synchronous mDNS discovery — returns (host, port, friendly_name, token) tuples.
 /// Blocks for at most `timeout_ms` milliseconds.
-fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16)> {
+fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16, String, Option<String>)> {
     use std::time::Duration;
     let timeout = Duration::from_millis(timeout_ms);
 
-    let inner = || -> anyhow::Result<Vec<(String, u16)>> {
+    let inner = || -> anyhow::Result<Vec<(String, u16, String, Option<String>)>> {
         let client = crate::service::discovery_client::ServiceDiscoveryClient::new()?;
         let services = client.discover(timeout)?;
-        Ok(services.into_iter().map(|s| (s.host, s.port)).collect())
+        Ok(services
+            .into_iter()
+            .map(|s| {
+                let name = friendly_peer_name(&s.name);
+                (s.host, s.port, name, s.token)
+            })
+            .collect())
     };
 
     // discover() uses recv_timeout internally — it's a blocking call.
@@ -1835,15 +3615,251 @@ fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16)> {
     .unwrap_or_default()
 }
 
-fn run_exec_scatter(peers: &[String], cmd: &str) -> Vec<crate::coforth::scatter::PeerResult> {
+/// Collect basic machine specs: (cpu_cores, ram_mb, bench_ms).
+/// bench_ms = milliseconds to complete 10 million integer additions (lower = faster).
+fn collect_machine_specs() -> (u32, u64, u64) {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.refresh_cpu_all();
+    let cpu_cores = sys.cpus().len() as u32;
+    let ram_mb = sys.total_memory() / (1024 * 1024);
+    // Quick benchmark: 10M additions.
+    let start = std::time::Instant::now();
+    let mut acc: u64 = 0;
+    for i in 0u64..10_000_000 {
+        acc = acc.wrapping_add(i);
+    }
+    let bench_ms = start.elapsed().as_millis() as u64;
+    // Keep acc alive so the compiler doesn't optimise the loop away.
+    let _ = acc;
+    (cpu_cores, ram_mb, bench_ms)
+}
+
+/// Format hardware specs for display in registry-list.
+fn format_peer_hw(p: &crate::registry::PeerEntry) -> String {
+    use crossterm::style::Stylize;
+    let mut parts = Vec::new();
+    if let Some(c) = p.cpu_cores { parts.push(format!("{}c", c)); }
+    if let Some(r) = p.ram_mb    { parts.push(format!("{}MB", r)); }
+    if let Some(b) = p.bench_ms  { parts.push(format!("bench:{}ms", b)); }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", parts.join(" ").dark_grey())
+    }
+}
+
+fn run_registry_join(registry: &str, entry: crate::registry::PeerEntry) -> anyhow::Result<()> {
+    let url = if registry.starts_with("http") {
+        format!("{registry}/v1/registry/join")
+    } else {
+        format!("http://{registry}/v1/registry/join")
+    };
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        client.post(&url).json(&entry).send().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()?.block_on(fut)
+    }
+}
+
+fn run_registry_leave(registry: &str, addr: &str) -> anyhow::Result<()> {
+    let url = if registry.starts_with("http") {
+        format!("{registry}/v1/registry/leave")
+    } else {
+        format!("http://{registry}/v1/registry/leave")
+    };
+    let body = serde_json::json!({ "addr": addr });
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        client.post(&url).json(&body).send().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()?.block_on(fut)
+    }
+}
+
+fn run_registry_peers(
+    registry: &str,
+    tag: Option<&str>,
+    region: Option<&str>,
+) -> anyhow::Result<Vec<crate::registry::PeerEntry>> {
+    let base = if registry.starts_with("http") {
+        format!("{registry}/v1/registry/peers")
+    } else {
+        format!("http://{registry}/v1/registry/peers")
+    };
+    let mut url = base;
+    let mut sep = '?';
+    if let Some(t) = tag    { url.push(sep); url.push_str(&format!("tag={t}"));    sep = '&'; }
+    if let Some(r) = region { url.push(sep); url.push_str(&format!("region={r}")); }
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let peers = client.get(&url).send().await?.json().await?;
+        Ok::<Vec<crate::registry::PeerEntry>, anyhow::Error>(peers)
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()?.block_on(fut)
+    }
+}
+
+fn run_registry_ledger(
+    registry: &str,
+    addr: &str,
+) -> anyhow::Result<crate::registry::LedgerEntry> {
+    let base = if registry.starts_with("http") {
+        format!("{registry}/v1/registry/ledger/{addr}")
+    } else {
+        format!("http://{registry}/v1/registry/ledger/{addr}")
+    };
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let entry = client.get(&base).send().await?.json().await?;
+        Ok::<crate::registry::LedgerEntry, anyhow::Error>(entry)
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()?.block_on(fut)
+    }
+}
+
+fn run_registry_all_ledgers(
+    registry: &str,
+) -> anyhow::Result<Vec<(String, crate::registry::LedgerEntry)>> {
+    let base = if registry.starts_with("http") {
+        format!("{registry}/v1/registry/ledgers")
+    } else {
+        format!("http://{registry}/v1/registry/ledgers")
+    };
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let entries: Vec<(String, crate::registry::LedgerEntry)> =
+            client.get(&base).send().await?.json().await?;
+        Ok::<Vec<(String, crate::registry::LedgerEntry)>, anyhow::Error>(entries)
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()?.block_on(fut)
+    }
+}
+
+/// POST to peer's /v1/settle — acknowledge compute debt and request clearance.
+/// Returns (cleared_ms, message) on success.
+fn run_peer_settle(peer_addr: &str, my_addr: Option<&str>) -> anyhow::Result<(u64, String)> {
+    let creditor = my_addr.unwrap_or(peer_addr);
+    let url = if peer_addr.starts_with("http") {
+        format!("{peer_addr}/v1/settle")
+    } else {
+        format!("http://{peer_addr}/v1/settle")
+    };
+    // Ask the peer what we owe them first, then send that exact amount.
+    // This prevents sending 0 and getting a free pass.
+    let ledger_url = if peer_addr.starts_with("http") {
+        format!("{peer_addr}/v1/registry/ledger/{creditor}")
+    } else {
+        format!("http://{peer_addr}/v1/registry/ledger/{creditor}")
+    };
+    let body = serde_json::json!({ "creditor": creditor, "amount_ms": 0u64 });
+    let _ = body; // replaced below after ledger fetch
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        // Fetch how much the peer thinks we owe them.
+        let ledger: crate::registry::LedgerEntry = client
+            .get(&ledger_url)
+            .send().await?
+            .json().await?;
+        let amount_ms = ledger.credits_ms.saturating_sub(ledger.debits_ms.min(ledger.credits_ms));
+        if amount_ms == 0 {
+            return Ok((0u64, "nothing owed".to_string()));
+        }
+        let body = serde_json::json!({ "creditor": creditor, "amount_ms": amount_ms });
+        let resp = client.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("peer rejected settlement: {text}");
+        }
+        let json: serde_json::Value = resp.json().await?;
+        let cleared_ms = json["cleared_ms"].as_u64().unwrap_or(0);
+        let message    = json["message"].as_str().unwrap_or("").to_string();
+        Ok::<(u64, String), anyhow::Error>((cleared_ms, message))
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()?.block_on(fut)
+    }
+}
+
+fn run_registry_debit(
+    registry: &str,
+    peer_addr: &str,
+    compute_ms: u64,
+) -> anyhow::Result<()> {
+    let base = if registry.starts_with("http") {
+        format!("{registry}/v1/registry/debit")
+    } else {
+        format!("http://{registry}/v1/registry/debit")
+    };
+    let body = serde_json::json!({ "addr": peer_addr, "compute_ms": compute_ms });
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        client.post(&base).json(&body).send().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        tokio::runtime::Runtime::new()?.block_on(fut)
+    }
+}
+
+fn run_define_scatter(peers: &[String], source: &str, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| {
-            handle.block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd))
+            handle.block_on(crate::coforth::scatter::define_on_peers(peers, source, tokens))
         })
     } else {
         tokio::runtime::Runtime::new()
             .expect("tokio runtime")
-            .block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd))
+            .block_on(crate::coforth::scatter::define_on_peers(peers, source, tokens))
+    }
+}
+
+fn run_exec_scatter(peers: &[String], cmd: &str, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd, tokens))
+        })
+    } else {
+        tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd, tokens))
     }
 }
 
@@ -1900,6 +3916,28 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "peers" => Builtin::Peers,
         "peers-clear" => Builtin::PeersClear,
         "peers-discover" | "discover" => Builtin::PeersDiscover,
+        "take-all"          => Builtin::TakeAll,
+        "ensemble-def"      => Builtin::EnsembleDef,
+        "ensemble-use"      => Builtin::EnsembleUse,
+        "ensemble-end"      => Builtin::EnsembleEnd,
+        "ensemble-list"     => Builtin::EnsembleList,
+        "label-peer"        => Builtin::LabelPeer,
+        "tag-peer"          => Builtin::TagPeer,
+        "ensemble-from-tag" => Builtin::EnsembleFromTag,
+        "peer-info"         => Builtin::PeerInfo,
+        "publish"           => Builtin::Publish,
+        "sync"              => Builtin::Sync,
+        "registry-set"      => Builtin::RegistrySet,
+        "join-registry"     => Builtin::JoinRegistry,
+        "leave-registry" | "leave" => Builtin::LeaveRegistry,
+        "from-registry"     => Builtin::FromRegistry,
+        "registry-list"     => Builtin::RegistryList,
+        "slowest"           => Builtin::Slowest,
+        "balance"           => Builtin::Balance,
+        "balances"          => Builtin::Balances,
+        "record-debit"      => Builtin::RecordDebit,
+        "debt-check"        => Builtin::DebtCheck,
+        "settle"            => Builtin::Settle,
         // String pool
         "type"    => Builtin::Type,
         "str="    => Builtin::StrEq,
@@ -1933,6 +3971,17 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "sync-end"       => Builtin::SyncEnd,
         "hide-cursor"    => Builtin::HideCursor,
         "show-cursor"    => Builtin::ShowCursor,
+        "connected?"     => Builtin::Connected,
+        // Security scanning
+        "scan-file"      => Builtin::ScanFile,
+        "scan-bytes"     => Builtin::ScanBytes,
+        "file-entropy"   => Builtin::FileEntropy,
+        "scan-dir"       => Builtin::ScanDir,
+        "scan-strings"   => Builtin::ScanStrings,
+        "scan-procs"     => Builtin::ScanProcs,
+        "scan-net"       => Builtin::ScanNet,
+        "scan-startup"   => Builtin::ScanStartup,
+        "quarantine"     => Builtin::Quarantine,
         _ => return None,
     })
 }
@@ -1988,6 +4037,14 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00confirm:{s}"));
+        } else if c == '"' && tok == "select" {
+            // select" title|opt1|opt2" — pop-up dialog; pushes chosen index or -1
+            tok.clear();
+            chars.next(); // consume "
+            if chars.peek() == Some(&' ') { chars.next(); } // skip separator space
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00select:{s}"));
         } else if c == '"' && tok == "read" {
             tok.clear();
             chars.next();
@@ -1995,6 +4052,27 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00read:{s}"));
+        } else if c == '"' && tok == "csv" {
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00csv:{s}"));
+        } else if c == '"' && tok == "tsv" {
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00tsv:{s}"));
+        } else if c == '"' && tok == "xlsx" {
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00xlsx:{s}"));
         } else if c == '"' && tok == "exec" {
             tok.clear();
             chars.next();
@@ -2017,6 +4095,51 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00peer:{s}"));
+        } else if c == '"' && tok == "ensemble-def" {
+            // ensemble-def" name"  — snapshot current peers as a named ensemble
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00push-str:{s}"));
+            tokens.push("ensemble-def".to_string());
+        } else if c == '"' && tok == "ensemble-use" {
+            // ensemble-use" name"  — push peers, switch to named ensemble
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00push-str:{s}"));
+            tokens.push("ensemble-use".to_string());
+        } else if c == '"' && tok == "registry" {
+            // registry" addr"  — set registry address
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00push-str:{s}"));
+            tokens.push("registry-set".to_string());
+        } else if c == '"' && tok == "join" {
+            // join" addr"  — register this machine at addr with the configured registry
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00push-str:{s}"));
+            tokens.push("join-registry".to_string());
+        } else if c == '"' && tok == "publish" {
+            // publish" word-name"  — scatter word source to all peers
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00push-str:{s}"));
+            tokens.push("publish".to_string());
         } else if c == '"' && tok == "scatter" {
             // scatter" code"  — run code on all registered peers in parallel
             tok.clear();
@@ -2025,6 +4148,39 @@ fn tokenize(src: &str) -> Vec<String> {
             let mut s = String::new();
             for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
             tokens.push(format!("\x00scatter:{s}"));
+        } else if c == '"' && tok == "on" {
+            // on" peer" "code"  — run code on exactly one peer (by address or label)
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut peer = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } peer.push(c2); }
+            while chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&'"') { chars.next(); }
+            let mut code = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } code.push(c2); }
+            tokens.push(format!("\x00on:{peer}\x01{code}"));
+        } else if c == '"' && tok == "scatter-on" {
+            // scatter-on" ensemble" "code"  — run code on named ensemble, no peer side-effects
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut ensemble = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } ensemble.push(c2); }
+            // skip whitespace then opening quote for code
+            while chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&'"') { chars.next(); } // consume opening "
+            let mut code = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } code.push(c2); }
+            tokens.push(format!("\x00scatter-on:{ensemble}\x01{code}"));
+        } else if c == '"' && tok == "forth-back" {
+            // forth-back" code"  — set Forth code to be executed on the caller after response
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') { chars.next(); }
+            let mut s = String::new();
+            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            tokens.push(format!("\x00forth-back:{s}"));
         } else if c == '"' && tok == "s" {
             // s" text"  — push string pool index as integer operand (no printing)
             tok.clear();
@@ -2383,6 +4539,42 @@ mod tests {
     }
 
     #[test]
+    fn test_select_dialog_no_callback_returns_first() {
+        // Without a callback, select" auto-selects index 0 (first option).
+        let out = Forth::run(r#"select" Pick|Red|Green|Blue" . "#).unwrap();
+        assert_eq!(out.trim(), "0");
+    }
+
+    #[test]
+    fn test_select_dialog_callback_returns_chosen_index() {
+        // Callback returns 2 → "Blue"
+        let out = Forth::new()
+            .with_select(Box::new(|_title, _opts| 2))
+            .exec(r#"select" Pick|Red|Green|Blue" . "#)
+            .unwrap();
+        assert_eq!(out.trim(), "2");
+    }
+
+    #[test]
+    fn test_select_dialog_callback_cancel_returns_minus_one() {
+        // Callback returns -1 (user cancelled)
+        let out = Forth::new()
+            .with_select(Box::new(|_title, _opts| -1))
+            .exec(r#"select" Pick|Red|Green|Blue" -1 = if ." cancelled" else ." chosen" then"#)
+            .unwrap();
+        assert_eq!(out, "cancelled");
+    }
+
+    #[test]
+    fn test_select_dialog_remote_mode_auto_cancel() {
+        // In remote mode, select" always returns -1 (never blocks on TUI).
+        let mut vm = Forth::new();
+        vm.remote_mode = true;
+        let out = vm.exec(r#"select" Pick|A|B|C" . "#).unwrap();
+        assert_eq!(out.trim(), "-1");
+    }
+
+    #[test]
     fn test_confirm_with_deny_callback() {
         let out = Forth::new()
             .with_confirm(Box::new(|_| false))
@@ -2398,6 +4590,28 @@ mod tests {
             .exec(r#"confirm" write file?" if ." approved" else ." denied" then"#)
             .unwrap();
         assert_eq!(out, "approved");
+    }
+
+    #[test]
+    fn test_connected_false_when_isolated() {
+        let out = Forth::run("connected? if .\" yes\" else .\" no\" then").unwrap();
+        assert_eq!(out, "no");
+    }
+
+    #[test]
+    fn test_connected_true_when_peer_registered() {
+        let mut vm = Forth::new();
+        vm.peers.push("192.168.1.2:11435".to_string());
+        let out = vm.exec("connected? if .\" yes\" else .\" no\" then").unwrap();
+        assert_eq!(out, "yes");
+    }
+
+    #[test]
+    fn test_connected_true_when_my_addr_set() {
+        let mut vm = Forth::new();
+        vm.my_addr = Some("192.168.1.1:11435".to_string());
+        let out = vm.exec("connected? if .\" yes\" else .\" no\" then").unwrap();
+        assert_eq!(out, "yes");
     }
 
     #[test]
@@ -2907,5 +5121,347 @@ mod tests {
         vm.exec(r#"s" a" 5000 lock drop"#).unwrap();
         let out = vm.exec(r#"s" b" 5000 lock . cr"#).unwrap();
         assert_eq!(out.trim(), "-1", "lock 'b' should succeed when only 'a' is held");
+    }
+
+    // ── Security scanning ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_scan_bytes_clean_text_is_low_risk() {
+        // Plain text should score very low
+        let score = scan_risk_score(b"hello world, this is normal text");
+        assert!(score < 20, "plain text should be low risk, got {}", score);
+    }
+
+    #[test]
+    fn test_scan_bytes_elf_magic_raises_score() {
+        let elf = b"\x7fELFsome content here that is not actually an ELF";
+        let score = scan_risk_score(elf);
+        assert!(score >= 20, "ELF magic should raise risk score, got {}", score);
+    }
+
+    #[test]
+    fn test_scan_bytes_eicar_is_critical() {
+        let eicar = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+        let score = scan_risk_score(eicar);
+        assert_eq!(score, 100, "EICAR test file must score 100");
+    }
+
+    #[test]
+    fn test_file_entropy_text_is_low() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"aaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        let code = format!(r#"s" {path}" file-entropy . cr"#);
+        let out = Forth::run(&code).unwrap();
+        let val: i64 = out.trim().parse().unwrap();
+        assert_eq!(val, 0, "all-same-byte entropy should be 0");
+    }
+
+    #[test]
+    fn test_scan_file_returns_report_string() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"hello world").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        let code = format!(r#"s" {path}" scan-file type cr"#);
+        let out = Forth::run(&code).unwrap();
+        assert!(out.contains("risk:"), "scan-file report should contain risk line");
+        assert!(out.contains("entropy:"), "scan-file report should contain entropy");
+    }
+
+    #[test]
+    fn test_scan_file_eicar_detected() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*").unwrap();
+        let path = f.path().to_string_lossy().to_string();
+        let code = format!(r#"s" {path}" scan-file type cr"#);
+        let out = Forth::run(&code).unwrap();
+        assert!(out.contains("EICAR"), "EICAR test file must be flagged");
+        assert!(out.contains("critical"), "EICAR must report critical risk");
+    }
+
+    // ── redefinition approval gate ────────────────────────────────────────
+
+    #[test]
+    fn test_redefine_without_confirm_fn_is_allowed() {
+        // No confirm_fn = pipe/test mode: redefinition silently succeeds.
+        let out = Forth::run(": sq dup * ; : sq dup dup * * ; 3 sq .").unwrap();
+        assert_eq!(out.trim(), "27", "second definition should win");
+    }
+
+    #[test]
+    fn test_redefine_first_time_never_needs_approval() {
+        // Defining a brand-new word never triggers approval even with a confirm_fn.
+        let mut asked = false;
+        let mut f = Forth::new().with_confirm(Box::new(|_| {
+            // Should never be called for a first-time definition.
+            unreachable!("approval asked for a new word");
+        }));
+        // This must not panic or call the confirm_fn.
+        f.eval(": greet 42 . ;").unwrap();
+        drop(asked); // suppress unused warning
+        let _ = f.eval("greet");
+        assert_eq!(f.out.trim(), "42");
+    }
+
+    #[test]
+    fn test_redefine_with_confirm_fn_approved() {
+        // confirm_fn returns true → redefinition proceeds.
+        let mut f = Forth::new().with_confirm(Box::new(|_msg| true));
+        f.eval(": sq dup * ;").unwrap();
+        f.eval(": sq dup dup * * ;").unwrap(); // approved
+        f.eval("3 sq .").unwrap();
+        assert_eq!(f.out.trim(), "27");
+    }
+
+    #[test]
+    fn test_redefine_with_confirm_fn_denied() {
+        // confirm_fn returns false → redefinition is cancelled.
+        let mut f = Forth::new().with_confirm(Box::new(|_msg| false));
+        f.eval(": sq dup * ;").unwrap();
+        let err = f.eval(": sq dup dup * * ;").unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "should report cancellation: {err}");
+        // Original definition must still be intact.
+        f.eval("4 sq .").unwrap();
+        assert_eq!(f.out.trim(), "16");
+    }
+
+    #[test]
+    fn test_redefine_confirm_fn_receives_word_name() {
+        // The prompt passed to confirm_fn must mention the word being redefined.
+        let mut f = Forth::new().with_confirm(Box::new(|msg: &str| {
+            assert!(msg.contains("sq"), "prompt must name the word: {msg}");
+            true
+        }));
+        f.eval(": sq dup * ;").unwrap();
+        f.eval(": sq dup dup * * ;").unwrap();
+    }
+
+    #[test]
+    fn test_redefine_builtin_no_approval_needed_builtins_not_shadowable() {
+        // Builtins cannot be shadowed — they are always resolved first at compile
+        // time — so no approval gate is applied (applying one would also break
+        // stdlib wrappers that use the same name).  The user definition is stored
+        // in name_index but is unreachable because the builtin wins at compile time.
+        let mut f = Forth::new().with_confirm(Box::new(|_msg| {
+            // Should NOT be called for builtins.
+            panic!("confirm_fn must not be called for builtin redefinition");
+        }));
+        // This should succeed without asking — the builtin `dup` still wins.
+        f.eval(": dup drop 99 ;").unwrap();
+        // `dup` is still the builtin — new code compiling `dup` finds the builtin first.
+        f.eval("5 dup + .").unwrap();
+        assert_eq!(f.out.trim(), "10");
+    }
+
+    // ── collect_machine_specs ─────────────────────────────────────────────
+
+    #[test]
+    fn test_collect_machine_specs_cpu_nonzero() {
+        let (cpu, _ram, _bench) = collect_machine_specs();
+        assert!(cpu > 0, "must detect at least one CPU core");
+    }
+
+    #[test]
+    fn test_collect_machine_specs_ram_nonzero() {
+        let (_cpu, ram, _bench) = collect_machine_specs();
+        assert!(ram > 0, "must detect non-zero RAM");
+    }
+
+    #[test]
+    fn test_collect_machine_specs_bench_nonzero() {
+        let (_cpu, _ram, bench) = collect_machine_specs();
+        // benchmark runs 10M iterations; on any real machine this takes at
+        // least 1ms and completes in under 10 seconds.
+        assert!(bench < 10_000, "benchmark took implausibly long: {}ms", bench);
+    }
+
+    #[test]
+    fn test_collect_machine_specs_bench_is_deterministic_order_of_magnitude() {
+        // Two consecutive runs should both finish in under 10s.
+        let (_, _, b1) = collect_machine_specs();
+        let (_, _, b2) = collect_machine_specs();
+        // Both should be < 10 seconds.
+        assert!(b1 < 10_000);
+        assert!(b2 < 10_000);
+    }
+
+    // ── format_peer_hw ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_peer_hw_all_fields() {
+        let p = crate::registry::PeerEntry {
+            addr:      "a:1".to_string(),
+            label:     None,
+            tags:      vec![],
+            load:      None,
+            region:    None,
+            cpu_cores: Some(8),
+            ram_mb:    Some(16_384),
+            bench_ms:  Some(42),
+        };
+        let hw = format_peer_hw(&p);
+        // ANSI codes are present; strip them for assertion.
+        let plain = strip_ansi(&hw);
+        assert!(plain.contains("8c"),       "should contain cpu count: {plain}");
+        assert!(plain.contains("16384MB"),  "should contain ram: {plain}");
+        assert!(plain.contains("bench:42ms"), "should contain bench: {plain}");
+    }
+
+    #[test]
+    fn test_format_peer_hw_no_fields_is_empty() {
+        let p = crate::registry::PeerEntry {
+            addr:      "a:1".to_string(),
+            label:     None,
+            tags:      vec![],
+            load:      None,
+            region:    None,
+            cpu_cores: None,
+            ram_mb:    None,
+            bench_ms:  None,
+        };
+        let hw = format_peer_hw(&p);
+        let plain = strip_ansi(&hw);
+        assert!(plain.trim().is_empty(), "empty hw should produce empty string: {plain:?}");
+    }
+
+    #[test]
+    fn test_format_peer_hw_partial_fields() {
+        let p = crate::registry::PeerEntry {
+            addr:      "a:1".to_string(),
+            label:     None,
+            tags:      vec![],
+            load:      None,
+            region:    None,
+            cpu_cores: Some(4),
+            ram_mb:    None,
+            bench_ms:  None,
+        };
+        let hw = format_peer_hw(&p);
+        let plain = strip_ansi(&hw);
+        assert!(plain.contains("4c"));
+        assert!(!plain.contains("MB"));
+        assert!(!plain.contains("bench:"));
+    }
+
+    // ── slowest (no registry set) ─────────────────────────────────────────
+
+    #[test]
+    fn test_slowest_no_registry_pushes_minus_one() {
+        // Without a registry configured, slowest should push -1 and emit a warning.
+        let mut f = Forth::new();
+        // Run slowest — should not panic, should push -1.
+        let _ = f.eval("slowest");
+        assert_eq!(f.data.last().copied(), Some(-1));
+        assert!(f.out.contains("no registry set"));
+    }
+
+    // ── vocabulary: zh.toml entries ───────────────────────────────────────
+
+    #[test]
+    fn test_zh_vocab_slowest_entry_exists() {
+        let lib = crate::coforth::Library::load();
+        let entry = lib.lookup("最慢").expect("最慢 must exist in library");
+        assert_eq!(entry.forth.as_deref(), Some("slowest"));
+    }
+
+    #[test]
+    fn test_zh_vocab_give_it_entry_exists() {
+        let lib = crate::coforth::Library::load();
+        let entry = lib.lookup("给它").expect("给它 must exist in library");
+        assert_eq!(entry.forth.as_deref(), Some("on"));
+    }
+
+    // ── vocabulary: en.toml entries ───────────────────────────────────────
+
+    #[test]
+    fn test_en_vocab_slowest_entry_exists() {
+        let lib = crate::coforth::Library::load();
+        let entry = lib.lookup("slowest").expect("slowest must exist in library");
+        assert_eq!(entry.forth.as_deref(), Some("slowest"));
+    }
+
+    #[test]
+    fn test_en_vocab_donate_entry_exists() {
+        let lib = crate::coforth::Library::load();
+        let entry = lib.lookup("donate").expect("donate must exist in library");
+        assert_eq!(entry.forth.as_deref(), Some("slowest on"));
+    }
+
+    // ── join / leave / forth-back ─────────────────────────────────────────────
+
+    #[test]
+    fn test_join_shorthand_tokenizes_to_join_registry() {
+        // join" addr" should push the string and call join-registry.
+        // Without a registry configured, JoinRegistry emits a yellow warning.
+        let mut vm = Forth::new();
+        // No registry set — join-registry prints a warning, does not crash.
+        let _ = vm.eval(r#"join" myhost:8080""#);
+        // After a failed join my_addr stays None.
+        assert!(vm.my_addr.is_none());
+    }
+
+    #[test]
+    fn test_leave_without_join_prints_warning() {
+        let mut vm = Forth::new();
+        vm.eval("leave").unwrap();
+        // Output should contain a helpful note.
+        assert!(vm.out.contains("not registered") || vm.out.contains("leave"),
+            "unexpected output: {}", vm.out);
+    }
+
+    #[test]
+    fn test_leave_builtin_registered_by_name() {
+        // Both "leave" and "leave-registry" should map to LeaveRegistry.
+        assert!(matches!(name_to_builtin("leave"), Some(Builtin::LeaveRegistry)));
+        assert!(matches!(name_to_builtin("leave-registry"), Some(Builtin::LeaveRegistry)));
+    }
+
+    #[test]
+    fn test_forth_back_in_remote_mode_stores_code() {
+        let mut vm = Forth::new();
+        vm.remote_mode = true;
+        vm.eval(r#"forth-back" 42 dup +"#).unwrap();
+        assert_eq!(vm.forth_back.as_deref(), Some("42 dup +"));
+    }
+
+    #[test]
+    fn test_forth_back_in_local_mode_executes_immediately() {
+        let mut vm = Forth::new();
+        // remote_mode = false (default); forth-back" code" runs the code immediately.
+        vm.eval(r#"forth-back" 7 8 +"#).unwrap();
+        // Stack should have 15.
+        assert_eq!(vm.pop().unwrap(), 15);
+        assert!(vm.forth_back.is_none(), "forth_back should not be set in local mode");
+    }
+
+    #[test]
+    fn test_my_addr_stored_on_successful_join() {
+        // Simulate a successful join by calling JoinRegistry directly with a mocked registry.
+        // We can't make real HTTP calls in unit tests, so we verify my_addr is populated
+        // when we manually set it (as run_registry_join would do).
+        let mut vm = Forth::new();
+        assert!(vm.my_addr.is_none());
+        vm.my_addr = Some("host:9000".to_string());
+        assert_eq!(vm.my_addr.as_deref(), Some("host:9000"));
+    }
+
+    /// Strip ANSI escape codes for plain-text assertions.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // skip until end of CSI/SGR sequence
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() { break; }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 }

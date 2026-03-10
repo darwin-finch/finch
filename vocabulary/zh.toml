@@ -101,3 +101,244 @@ definition = "感知与思考的居所"
 related = ["思", "感", "意"]
 kind = "observation"
 forth = '." 心。" cr gen" write two lines about the heart as a place of knowing. chinese or english, your choice."'
+
+# ── 分布式计算 ─────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "部署"
+definition = "把程序放到它应该运行的地方"
+related = ["运行", "发布", "集群"]
+kind = "task"
+forth = "deploy"
+
+[[word]]
+word = "运行"
+definition = "让机器做它被要求做的事"
+related = ["执行", "启动", "工作"]
+kind = "task"
+forth = "run"
+
+[[word]]
+word = "节点"
+definition = "集群中一台独立工作的机器"
+related = ["机器", "集群", "对等"]
+kind = "observation"
+forth = 'registry-list'
+
+[[word]]
+word = "集群"
+definition = "共同工作的多台机器，像一台大机器"
+related = ["节点", "对等", "网络"]
+kind = "observation"
+forth = 'registry-list'
+
+[[word]]
+word = "最慢"
+definition = "集群中速度最慢的那台机器，等待被分配任务"
+related = ["节点", "集群", "慢"]
+kind = "observation"
+forth = 'slowest'
+
+[[word]]
+word = "给它"
+definition = "把当前任务发送给栈顶地址指向的机器"
+related = ["发送", "节点", "分配"]
+kind = "task"
+forth = 'on'
+
+[[word]]
+word = "发送"
+definition = "把东西从这里交给那里"
+related = ["传输", "广播", "给予"]
+kind = "task"
+forth = "scatter"
+
+[[word]]
+word = "广播"
+definition = "同时告诉所有人同一件事"
+related = ["发送", "集群", "通知"]
+kind = "task"
+forth = "scatter"
+
+[[word]]
+word = "余额"
+definition = "账本上的净值，正数意味着别人欠你"
+related = ["债务", "结算", "账本"]
+kind = "observation"
+forth = "balance"
+
+[[word]]
+word = "账本"
+definition = "记录谁做了多少工作的真相"
+related = ["余额", "债务", "信任"]
+kind = "observation"
+forth = "balances"
+
+[[word]]
+word = "结算"
+definition = "承认债务并清除它"
+related = ["债务", "余额", "清零"]
+kind = "task"
+forth = "settle"
+
+[[word]]
+word = "债务"
+definition = "你从别人那里拿走的、还没有还回去的东西"
+related = ["余额", "结算", "欠"]
+kind = "observation"
+forth = "debt-check"
+
+# ── 动作 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "打印"
+definition = "把栈顶的数字写到屏幕上"
+related = ["显示", "输出", "看"]
+kind = "task"
+forth = ". cr"
+
+[[word]]
+word = "显示"
+definition = "让不可见的东西变得可见"
+related = ["打印", "输出", "屏幕"]
+kind = "task"
+forth = ". cr"
+
+[[word]]
+word = "清空"
+definition = "把栈清空，重新开始"
+related = ["重置", "归零", "开始"]
+kind = "task"
+forth = "clear-stack"
+
+[[word]]
+word = "退出"
+definition = "离开这个会话"
+related = ["结束", "再见", "关闭"]
+kind = "task"
+forth = "bye"
+
+[[word]]
+word = "帮助"
+definition = "列出所有你可以说的词"
+related = ["词汇", "命令", "说明"]
+kind = "question"
+forth = "words"
+
+[[word]]
+word = "栈"
+definition = "当前持有的数字，最新的在顶部"
+related = ["数据", "值", "内存"]
+kind = "observation"
+forth = ".s"
+
+# ── 判断 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "是"
+definition = "真，条件成立"
+related = ["真", "对", "肯定"]
+kind = "observation"
+forth = "true"
+
+[[word]]
+word = "否"
+definition = "假，条件不成立"
+related = ["假", "错", "否定"]
+kind = "observation"
+forth = "false"
+
+[[word]]
+word = "相等"
+definition = "两个值完全一样"
+related = ["比较", "测试", "同"]
+kind = "observation"
+forth = "="
+
+[[word]]
+word = "大于"
+definition = "左边比右边更大"
+related = ["比较", "顺序", "高"]
+kind = "observation"
+forth = ">"
+
+[[word]]
+word = "小于"
+definition = "左边比右边更小"
+related = ["比较", "顺序", "低"]
+kind = "observation"
+forth = "<"
+
+# ── 数字 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "零"
+definition = "什么都没有，但它本身是某样东西"
+related = ["空", "无", "始"]
+kind = "observation"
+forth = "0"
+
+[[word]]
+word = "加"
+definition = "把两个数合并成一个更大的数"
+related = ["求和", "合并", "增加"]
+kind = "task"
+forth = "+"
+
+[[word]]
+word = "减"
+definition = "从一个数中取走另一个数"
+related = ["差", "减少", "取走"]
+kind = "task"
+forth = "-"
+
+[[word]]
+word = "乘"
+definition = "重复相加的快捷方式"
+related = ["倍数", "放大", "积"]
+kind = "task"
+forth = "*"
+
+[[word]]
+word = "除"
+definition = "把一个数分成等份"
+related = ["比例", "分配", "商"]
+kind = "task"
+forth = "/"
+
+# ── 哲学 ───────────────────────────────────────────────────────────────────────
+
+[[word]]
+word = "无"
+definition = "不存在的存在，一切开始之前的状态"
+related = ["空", "道", "始"]
+kind = "observation"
+forth = '." 无中生有。" cr'
+
+[[word]]
+word = "有"
+definition = "存在，在此，可被感知"
+related = ["存在", "是", "真"]
+kind = "observation"
+forth = 'depth . ." 个值存在于栈中。" cr'
+
+[[word]]
+word = "变"
+definition = "从一种状态到另一种状态的运动"
+related = ["改变", "转化", "流动"]
+kind = "observation"
+forth = 'gen" in one sentence: what is the nature of change? answer in chinese."'
+
+[[word]]
+word = "问"
+definition = "向未知打开一扇门"
+related = ["求知", "探索", "疑"]
+kind = "question"
+forth = 'gen" answer this question honestly in chinese: what does it mean to ask?"'
+
+[[word]]
+word = "知"
+definition = "从经验中提炼出来的东西"
+related = ["理解", "学习", "智"]
+kind = "observation"
+forth = 'gen" what is the difference between knowing and understanding? chinese."'

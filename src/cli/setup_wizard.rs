@@ -231,6 +231,7 @@ enum SectionState {
         gui_automation: bool,
         daemon_only_mode: bool,
         mdns_discovery: bool,
+        auto_discover: bool,
         /// Total status-strip context lines (🧠 + summaries); range 1–8
         memory_context_lines: usize,
         selected_idx: usize, // For arrow key navigation
@@ -468,6 +469,7 @@ impl WizardState {
                     .map(|c| c.server.mode == "daemon-only")
                     .unwrap_or(false),
                 mdns_discovery: existing_config.map(|c| c.server.advertise).unwrap_or(false),
+                auto_discover: existing_config.map(|c| c.client.auto_discover).unwrap_or(true),
                 memory_context_lines: existing_config
                     .map(|c| c.features.memory_context_lines)
                     .unwrap_or(4),
@@ -547,6 +549,7 @@ pub struct SetupResult {
     pub gui_automation: bool,
     pub daemon_only_mode: bool,
     pub mdns_discovery: bool,
+    pub auto_discover: bool,
     pub memory_context_lines: usize,
 }
 
@@ -625,6 +628,59 @@ pub fn show_setup_wizard() -> Result<SetupResult> {
 
     // Return the wizard result after cleanup is guaranteed
     result
+}
+
+/// Public entry point used by `/setup` command — runs the wizard and returns
+/// `Some(result)` on completion or `None` if the user cancelled.
+pub fn run_setup_wizard() -> Result<Option<SetupResult>> {
+    match show_setup_wizard() {
+        Ok(result) => Ok(Some(result)),
+        Err(e) if e.to_string().contains("Setup cancelled") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Apply a `SetupResult` to a new `Config` and save it to disk.
+///
+/// Used both by `main.rs` (first-run) and by the `/setup` REPL command.
+pub fn apply_and_save(result: &SetupResult) -> Result<()> {
+    use crate::config::{Config, FeaturesConfig};
+
+    let providers = result.providers.clone();
+    let mut new_config = Config::with_providers(providers);
+    new_config.active_theme = result.active_theme.clone();
+    new_config.active_persona = result.default_persona.clone();
+    if let Some(ref hf_tok) = result.hf_token {
+        if !hf_tok.is_empty() {
+            new_config.huggingface_token = Some(hf_tok.clone());
+        }
+    }
+    new_config.features = FeaturesConfig {
+        auto_approve_tools: result.auto_approve_tools,
+        streaming_enabled: result.streaming_enabled,
+        debug_logging: result.debug_logging,
+        #[cfg(target_os = "macos")]
+        gui_automation: result.gui_automation,
+        memory_context_lines: result.memory_context_lines,
+        max_verbatim_messages: new_config.features.max_verbatim_messages,
+        context_recall_k: new_config.features.context_recall_k,
+        enable_summarization: new_config.features.enable_summarization,
+        auto_compact_enabled: new_config.features.auto_compact_enabled,
+        brain_enabled: new_config.features.brain_enabled,
+    };
+    if result.daemon_only_mode {
+        new_config.server.mode = "daemon-only".to_string();
+    }
+    if result.mdns_discovery {
+        new_config.server.advertise = true;
+    }
+    new_config.client.auto_discover = result.auto_discover;
+    #[allow(deprecated)]
+    {
+        new_config.streaming_enabled = new_config.features.streaming_enabled;
+    }
+    new_config.save()?;
+    Ok(())
 }
 
 /// Returns true if the Models section is currently in the Scanning sub-step
@@ -1600,6 +1656,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         gui_automation,
         daemon_only_mode,
         mdns_discovery,
+        auto_discover,
         memory_context_lines,
         selected_idx,
     }) = state.sections.get_mut(&WizardSection::Features)
@@ -1621,17 +1678,17 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
             return Ok(false);
         }
 
-        // non-macOS: 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=ctx_lines
-        // macOS:     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=ctx_lines
+        // non-macOS: 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=auto_discover, 7=ctx_lines
+        // macOS:     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=auto_discover, 8=ctx_lines
         #[cfg(target_os = "macos")]
-        let num_features = 8;
+        let num_features = 9;
         #[cfg(not(target_os = "macos"))]
-        let num_features = 7;
+        let num_features = 8;
 
         #[cfg(target_os = "macos")]
-        let ctx_idx = 7usize;
+        let ctx_idx = 8usize;
         #[cfg(not(target_os = "macos"))]
-        let ctx_idx = 6usize;
+        let ctx_idx = 7usize;
 
         match key.code {
             KeyCode::Up => {
@@ -1667,7 +1724,8 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     // index 4 = hf_token (no toggle)
                     5 => *daemon_only_mode = !*daemon_only_mode,
                     6 => *mdns_discovery = !*mdns_discovery,
-                    // index 7 = ctx_lines (use ◀/▶)
+                    7 => *auto_discover = !*auto_discover,
+                    // index 8 = ctx_lines (use ◀/▶)
                     _ => {}
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -1678,7 +1736,8 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     // index 3 = hf_token (no toggle)
                     4 => *daemon_only_mode = !*daemon_only_mode,
                     5 => *mdns_discovery = !*mdns_discovery,
-                    // index 6 = ctx_lines (use ◀/▶)
+                    6 => *auto_discover = !*auto_discover,
+                    // index 7 = ctx_lines (use ◀/▶)
                     _ => {}
                 }
             }
@@ -1756,7 +1815,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract features
-    let (auto_approve, streaming, debug, hf_token_val, daemon_only, mdns, memory_ctx_lines) =
+    let (auto_approve, streaming, debug, hf_token_val, daemon_only, mdns, auto_disc, memory_ctx_lines) =
         if let Some(SectionState::Features {
             auto_approve,
             streaming,
@@ -1764,6 +1823,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
             hf_token,
             daemon_only_mode,
             mdns_discovery,
+            auto_discover,
             memory_context_lines,
             ..
         }) = state.sections.get(&WizardSection::Features)
@@ -1779,10 +1839,11 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 },
                 *daemon_only_mode,
                 *mdns_discovery,
+                *auto_discover,
                 *memory_context_lines,
             )
         } else {
-            (false, true, false, None, false, false, 4)
+            (false, true, false, None, false, false, true, 4)
         };
 
     #[cfg(target_os = "macos")]
@@ -1924,6 +1985,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         gui_automation,
         daemon_only_mode: daemon_only,
         mdns_discovery: mdns,
+        auto_discover: auto_disc,
         memory_context_lines: memory_ctx_lines,
     })
 }
@@ -2056,6 +2118,7 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             gui_automation,
             daemon_only_mode,
             mdns_discovery,
+            auto_discover,
             memory_context_lines,
             selected_idx,
         }) => render_features_section(
@@ -2070,6 +2133,7 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *gui_automation,
             *daemon_only_mode,
             *mdns_discovery,
+            *auto_discover,
             *memory_context_lines,
             *selected_idx,
         ),
@@ -2954,6 +3018,7 @@ fn render_features_section(
     #[cfg(target_os = "macos")] gui_automation: bool,
     daemon_only_mode: bool,
     mdns_discovery: bool,
+    auto_discover: bool,
     memory_context_lines: usize,
     selected_idx: usize,
 ) {
@@ -2976,8 +3041,8 @@ fn render_features_section(
     f.render_widget(title, chunks[0]);
 
     // Build feature list: toggle-able booleans + HF token text field + numeric spinner
-    // Index mapping (non-macOS): 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=ctx_lines
-    // Index mapping (macOS):     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=ctx_lines
+    // Index mapping (non-macOS): 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=auto_discover, 7=ctx_lines
+    // Index mapping (macOS):     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=auto_discover, 8=ctx_lines
 
     #[cfg(not(target_os = "macos"))]
     let bool_features: Vec<(&str, bool, &str)> = vec![
@@ -3006,6 +3071,11 @@ fn render_features_section(
             "Advertise on network",
             mdns_discovery,
             "Broadcast this Finch instance via mDNS so others can discover it",
+        ),
+        (
+            "Discover peers on LAN",
+            auto_discover,
+            "Find and connect to other Finch instances at startup",
         ),
     ];
     #[cfg(target_os = "macos")]
@@ -3040,6 +3110,11 @@ fn render_features_section(
             "Advertise on network",
             mdns_discovery,
             "Broadcast this Finch instance via mDNS so others can discover it",
+        ),
+        (
+            "Discover peers on LAN",
+            auto_discover,
+            "Find and connect to other Finch instances at startup",
         ),
     ];
 

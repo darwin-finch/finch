@@ -117,8 +117,19 @@ pub fn spawn_input_task(
                     // Process first event
                     let first_event_result = match crossterm::event::read() {
                         Ok(Event::Key(key)) => {
+                            // Priority 0: /quit always exits, even with a dialog active.
+                            let current_text = tui.input_textarea.lines().join("\n");
+                            if key.code == KeyCode::Enter
+                                && current_text.trim() == "/quit"
+                                && !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                            {
+                                tui.active_dialog = None;
+                                let _ = tui.pending_dialog_result.take();
+                                tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                Ok(Some(current_text))
+                            }
                             // Priority 1: Handle active dialog (if any)
-                            if tui.active_dialog.is_some() {
+                            else if tui.active_dialog.is_some() {
                                 let dialog_result = if let Some(dialog) = tui.active_dialog.as_mut()
                                 {
                                     dialog.handle_key_event(key)

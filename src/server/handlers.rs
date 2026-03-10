@@ -1,15 +1,35 @@
 // HTTP request handlers
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Check `X-Finch-Token` header against this daemon's token.
+/// Returns Ok(()) if valid, Err(StatusCode::FORBIDDEN) with a log entry if not.
+fn check_peer_token(headers: &HeaderMap, peer_ip: &str, endpoint: &str) -> Result<(), Response> {
+    let expected = &*crate::peer_token::TOKEN;
+    match headers.get(crate::peer_token::HEADER) {
+        Some(v) if v.as_bytes() == expected.as_bytes() => Ok(()),
+        Some(_) => {
+            tracing::warn!(ip = %peer_ip, endpoint, "rejected: wrong peer token");
+            Err((StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "wrong peer token"}))).into_response())
+        }
+        None => {
+            tracing::warn!(ip = %peer_ip, endpoint, "rejected: no peer token");
+            Err((StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "peer token required — set X-Finch-Token"}))).into_response())
+        }
+    }
+}
 
 use super::AgentServer;
 use crate::claude::{ContentBlock, Message};
@@ -48,7 +68,18 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         // Note: node handlers load config independently (no AgentServer state needed)
         // Co-Forth remote eval and direct exec
         .route("/v1/forth/eval", post(handle_forth_eval))
+        .route("/v1/forth/define", post(handle_forth_define))
+        .route("/v1/forth/push", post(handle_forth_push))
         .route("/v1/exec", post(handle_exec))
+        // Peer registry
+        .route("/v1/registry/join",      post(handle_registry_join))
+        .route("/v1/registry/leave",     post(handle_registry_leave))
+        .route("/v1/registry/heartbeat", post(handle_registry_heartbeat))
+        .route("/v1/registry/peers",     get(handle_registry_peers))
+        .route("/v1/registry/ledger/:addr", get(handle_registry_ledger))
+        .route("/v1/registry/ledgers",   get(handle_registry_all_ledgers))
+        .route("/v1/registry/debit",     post(handle_registry_debit))
+        .route("/v1/settle",             post(handle_settle))
         // Health and metrics
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
@@ -633,6 +664,9 @@ pub async fn handle_node_stats() -> Result<Json<serde_json::Value>, AppError> {
 #[derive(Debug, Deserialize)]
 struct ForthEvalRequest {
     code: String,
+    /// Address of the requesting machine — used for ledger debit tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caller: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -643,27 +677,326 @@ struct ForthEvalResponse {
     stack: Vec<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Wall-clock milliseconds the execution took.  Used for ledger accounting.
+    #[serde(default)]
+    compute_ms: u64,
+    /// Set when the caller's compute debt has crossed the threshold.
+    /// The caller should arrange settlement before requesting more work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debt_warning: Option<String>,
+    /// Forth code the peer wants the caller to execute locally after this response.
+    /// Set by `forth-back" <code>"` in the remote program.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forth_back: Option<String>,
 }
 
-/// POST /v1/forth/eval — execute a Forth snippet and return output + stack
-async fn handle_forth_eval(
-    Json(req): Json<ForthEvalRequest>,
-) -> Result<Json<ForthEvalResponse>, AppError> {
-    use crate::coforth::Forth;
+/// Global broadcast channel for incoming push messages.
+/// The server writes to this when a peer calls POST /v1/forth/push.
+/// The event loop subscribes and displays messages in the TUI.
+pub static PUSH_INBOX: std::sync::LazyLock<tokio::sync::broadcast::Sender<String>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        tx
+    });
 
-    let mut vm = Forth::new();
-    match vm.exec(&req.code) {
+/// Grammar-VM shared baseline: pre-compiled STDLIB + all grammar words, built once.
+/// Each request clones this (O(dict size)) instead of recompiling from source.
+static GRAMMAR_VM: std::sync::LazyLock<crate::coforth::Forth> =
+    std::sync::LazyLock::new(|| {
+        use crate::coforth::{Forth, Library};
+        let mut vm = Forth::new();
+        let lib = Library::load();
+        vm.compile_library(&lib);
+        vm
+    });
+
+/// Live VM — extends GRAMMAR_VM with published words from peers.
+/// Persisted to ~/.finch/user_words.forth on every define call.
+/// eval clones from here so scatter code can call published words.
+static LIVE_VM: std::sync::LazyLock<std::sync::Arc<tokio::sync::RwLock<crate::coforth::Forth>>> =
+    std::sync::LazyLock::new(|| {
+        let mut vm = GRAMMAR_VM.clone_dict();
+        // Load any words published in a prior session.
+        if let Some(path) = user_words_path() {
+            if let Ok(src) = std::fs::read_to_string(&path) {
+                if !src.is_empty() {
+                    let _ = vm.exec(&src);
+                }
+            }
+        }
+        std::sync::Arc::new(tokio::sync::RwLock::new(vm))
+    });
+
+fn user_words_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|mut p| { p.push(".finch"); p.push("user_words.forth"); p })
+}
+
+/// POST /v1/forth/eval — execute Forth code from a remote peer.
+///
+/// Clones from LIVE_VM so published words are available during scatter.
+/// Any word in the vocabulary runs.  The VM is the boundary.
+async fn handle_forth_eval(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ForthEvalRequest>,
+) -> Result<Json<ForthEvalResponse>, Response> {
+    let ip = addr.ip().to_string();
+    if let Err(r) = check_peer_token(&headers, &ip, "/v1/forth/eval") {
+        return Err(r);
+    }
+    handle_forth_eval_inner(req).await.map_err(|e| AppError(e).into_response())
+}
+
+async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<ForthEvalResponse>> {
+    let base = LIVE_VM.read().await;
+    let mut vm = base.clone_dict();
+    drop(base);
+    vm.remote_mode = true; // no dialogs, no AI calls on remote VMs
+    let t0 = std::time::Instant::now();
+    let result = vm.exec(&req.code);
+    let compute_ms = t0.elapsed().as_millis() as u64;
+
+    // Credit this machine for the work it just performed.
+    if let Some(addr) = vm.registry_addr.clone() {
+        REGISTRY.credit(&addr, compute_ms).await;
+    }
+
+    // Debit the caller and check if they've crossed the debt threshold.
+    let debt_warning = if let Some(caller) = &req.caller {
+        let (balance, crossed) = REGISTRY.debit(caller, compute_ms).await;
+        if crossed {
+            let threshold_s = REGISTRY.debt_threshold_ms as f64 / 1000.0;
+            let balance_s   = balance.abs() as f64 / 1000.0;
+            Some(format!(
+                "compute debt: {:.1}s owed (threshold {:.1}s) — please settle",
+                balance_s, threshold_s
+            ))
+        } else if REGISTRY.is_in_debt(caller).await {
+            let balance_s = balance.abs() as f64 / 1000.0;
+            Some(format!("compute debt: {:.1}s owed", balance_s))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match result {
         Ok(output) => Ok(Json(ForthEvalResponse {
             output,
-            stack: vm.data_stack().to_vec(),
-            error: None,
+            stack:        vm.data_stack().to_vec(),
+            error:        None,
+            compute_ms,
+            debt_warning,
+            forth_back:   vm.forth_back.clone(),
         })),
         Err(e) => Ok(Json(ForthEvalResponse {
-            output: vm.out.clone(),
-            stack: vm.data_stack().to_vec(),
-            error: Some(e.to_string()),
+            output:       vm.out.clone(),
+            stack:        vm.data_stack().to_vec(),
+            error:        Some(e.to_string()),
+            compute_ms,
+            debt_warning,
+            forth_back:   vm.forth_back.clone(),
         })),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ForthDefineRequest {
+    source: String,
+}
+
+/// POST /v1/forth/define — receive published word definitions from a peer.
+///
+/// Compiles the source into LIVE_VM and persists it to ~/.finch/user_words.forth
+/// so the words survive daemon restarts and are available in all future eval requests.
+async fn handle_forth_define(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ForthDefineRequest>,
+) -> Result<Json<ForthEvalResponse>, Response> {
+    let ip = addr.ip().to_string();
+    if let Err(r) = check_peer_token(&headers, &ip, "/v1/forth/define") {
+        return Err(r);
+    }
+    let mut live = LIVE_VM.write().await;
+    match live.exec(&req.source) {
+        Ok(output) => {
+            // Persist accumulated vocabulary to disk.
+            if let Some(path) = user_words_path() {
+                let src = live.dump_source();
+                if !src.is_empty() {
+                    let _ = std::fs::create_dir_all(path.parent().unwrap());
+                    let _ = std::fs::write(&path, src);
+                }
+            }
+            Ok(Json(ForthEvalResponse { output, stack: Vec::new(), error: None, compute_ms: 0, debt_warning: None, forth_back: None }))
+        }
+        Err(e) => Ok(Json(ForthEvalResponse {
+            output:       live.out.clone(),
+            stack:        Vec::new(),
+            error:        Some(e.to_string()),
+            compute_ms:   0,
+            debt_warning: None,
+            forth_back:   None,
+        })),
+    }
+}
+
+/// POST /v1/forth/push — receive a plain-text push message from a peer.
+/// Broadcasts it to the local TUI via PUSH_INBOX.
+async fn handle_forth_push(
+    Json(req): Json<ForthPushRequest>,
+) -> StatusCode {
+    let msg = match &req.from {
+        Some(from) => format!("[{}] {}", from, req.text),
+        None       => req.text.clone(),
+    };
+    let _ = PUSH_INBOX.send(msg);
+    StatusCode::OK
+}
+
+#[derive(Debug, Deserialize)]
+struct ForthPushRequest {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Peer registry endpoints
+// ---------------------------------------------------------------------------
+
+/// Global registry — shared across all requests, lives for the daemon lifetime.
+pub static REGISTRY: std::sync::LazyLock<std::sync::Arc<crate::registry::Registry>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(crate::registry::Registry::new()));
+
+#[derive(Debug, Serialize)]
+struct RegistryJoinResponse {
+    addr: String,
+    ttl_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryLeaveRequest {
+    addr: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryHeartbeatRequest {
+    addr: String,
+}
+
+/// POST /v1/registry/join — register or refresh a peer.
+async fn handle_registry_join(
+    Json(entry): Json<crate::registry::PeerEntry>,
+) -> Json<RegistryJoinResponse> {
+    let addr = REGISTRY.join(entry).await;
+    Json(RegistryJoinResponse { addr, ttl_secs: 90 })
+}
+
+/// POST /v1/registry/leave — deregister a peer immediately.
+async fn handle_registry_leave(
+    Json(req): Json<RegistryLeaveRequest>,
+) -> StatusCode {
+    REGISTRY.leave(&req.addr).await;
+    StatusCode::OK
+}
+
+/// POST /v1/registry/heartbeat — refresh TTL for a peer.
+async fn handle_registry_heartbeat(
+    Json(req): Json<RegistryHeartbeatRequest>,
+) -> StatusCode {
+    REGISTRY.heartbeat(&req.addr).await;
+    StatusCode::OK
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RegistryPeersQuery {
+    tag:    Option<String>,
+    region: Option<String>,
+}
+
+/// GET /v1/registry/peers — list live peers, optionally filtered.
+async fn handle_registry_peers(
+    axum::extract::Query(q): axum::extract::Query<RegistryPeersQuery>,
+) -> Json<Vec<crate::registry::PeerEntry>> {
+    let peers = REGISTRY.peers(q.tag.as_deref(), q.region.as_deref()).await;
+    Json(peers)
+}
+
+/// GET /v1/registry/ledger/:addr — get the ledger entry for one peer.
+async fn handle_registry_ledger(
+    axum::extract::Path(addr): axum::extract::Path<String>,
+) -> Result<Json<crate::registry::LedgerEntry>, AppError> {
+    let entry = REGISTRY.ledger(&addr).await.unwrap_or_default();
+    Ok(Json(entry))
+}
+
+/// GET /v1/registry/ledgers — get ledger entries for all live peers.
+async fn handle_registry_all_ledgers() -> Json<Vec<(String, crate::registry::LedgerEntry)>> {
+    Json(REGISTRY.all_ledgers().await)
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryDebitRequest {
+    addr: String,
+    compute_ms: u64,
+}
+
+/// POST /v1/registry/debit — record compute consumed from a peer.
+///
+/// Called by the machine that requested work to record its debt.
+async fn handle_registry_debit(
+    Json(req): Json<RegistryDebitRequest>,
+) -> StatusCode {
+    REGISTRY.debit(&req.addr, req.compute_ms).await;
+    StatusCode::OK
+}
+
+#[derive(Debug, Deserialize)]
+struct SettleRequest {
+    /// The machine that did the work (creditor) — its ledger gets cleared.
+    creditor: String,
+    /// Acknowledged debt in milliseconds.
+    amount_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SettleResponse {
+    cleared_ms: u64,
+    message: String,
+}
+
+/// POST /v1/settle — accept a settlement from a debtor machine.
+///
+/// The debtor POSTs here to acknowledge their debt and ask to clear the ledger.
+/// We verify the amount is within 10% of what we recorded, then zero the entry.
+async fn handle_settle(
+    Json(req): Json<SettleRequest>,
+) -> Result<Json<SettleResponse>, AppError> {
+    let ledger = REGISTRY.ledger(&req.creditor).await.unwrap_or_default();
+    let recorded_ms = ledger.credits_ms.saturating_sub(ledger.debits_ms.min(ledger.credits_ms));
+
+    if recorded_ms == 0 {
+        return Ok(Json(SettleResponse { cleared_ms: 0, message: "nothing owed".to_string() }));
+    }
+
+    // Accept if the debtor's stated amount is within 10% of what we recorded.
+    // This allows for small clock drift between machines.
+    let tolerance = (recorded_ms as f64 * 0.10) as u64 + 500;
+    if req.amount_ms == 0 || req.amount_ms + tolerance < recorded_ms {
+        return Err(anyhow::anyhow!(
+            "settlement amount {}ms doesn't match recorded {}ms (tolerance ±{}ms)",
+            req.amount_ms, recorded_ms, tolerance
+        ).into());
+    }
+
+    REGISTRY.settle(&req.creditor).await;
+    Ok(Json(SettleResponse {
+        cleared_ms: recorded_ms,
+        message: format!("settled: {}ms cleared", recorded_ms),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -694,9 +1027,18 @@ struct ExecResponse {
 ///   or: { "cmd": "grep", "args": ["-r", "TODO", "."] }
 ///   or: { "cmd": "bash", "args": ["-c", "echo hello && ls"] }
 async fn handle_exec(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ExecRequest>,
-) -> Result<Json<ExecResponse>, AppError> {
+) -> Result<Json<ExecResponse>, Response> {
+    let ip = addr.ip().to_string();
+    if let Err(r) = check_peer_token(&headers, &ip, "/v1/exec") {
+        return Err(r);
+    }
+    tracing::info!(ip = %ip, cmd = %req.cmd, "exec request");
     use std::io::Write;
+
+    let ae = |e: anyhow::Error| AppError(e).into_response();
 
     let mut child = std::process::Command::new(&req.cmd)
         .args(&req.args)
@@ -704,14 +1046,14 @@ async fn handle_exec(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn '{}': {}", req.cmd, e))?;
+        .map_err(|e| ae(anyhow::anyhow!("failed to spawn '{}': {}", req.cmd, e)))?;
 
     if let (Some(mut stdin), Some(input)) = (child.stdin.take(), &req.stdin) {
         let _ = stdin.write_all(input.as_bytes());
     }
 
     let output = child.wait_with_output()
-        .map_err(|e| anyhow::anyhow!("failed to wait for '{}': {}", req.cmd, e))?;
+        .map_err(|e| ae(anyhow::anyhow!("failed to wait for '{}': {}", req.cmd, e)))?;
 
     Ok(Json(ExecResponse {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

@@ -96,7 +96,7 @@ word = "why"
 definition = "the question that pulls everything else forward"
 related = ["cause", "reason", "purpose"]
 kind = "question"
-forth = '." why: the question that won''t stay answered." cr'
+forth = '''." why: the question that won't stay answered." cr'''
 
 [[word]]
 word = "yes"
@@ -118,3 +118,35 @@ definition = "a doorway held open"
 related = ["uncertain", "possible", "consider"]
 kind = "observation"
 forth = '." maybe." cr'
+
+# ── Distributed computing ───────────────────────────────────────────────────
+
+[[word]]
+word = "slowest"
+definition = "the peer with the highest benchmark time — first candidate to receive donated work"
+related = ["peer", "cluster", "bench"]
+kind = "observation"
+forth = "slowest"
+
+[[word]]
+word = "donate"
+definition = "send a Forth program to the slowest live peer"
+related = ["slowest", "on", "cluster"]
+kind = "task"
+forth = "slowest on"
+
+# ── Code inspection (connection-gated) ─────────────────────────────────────
+
+[[word]]
+word = "diff"
+definition = "show what has changed since the last commit — requires an active session and your approval"
+related = ["change", "commit", "connect"]
+kind = "task"
+forth = 'connected? if confirm" Show git diff?" if exec" git diff" else ." diff cancelled" cr then else ." not connected — join a session first" cr then'
+
+[[word]]
+word = "changes"
+definition = "a brief summary of what files have changed"
+related = ["diff", "commit", "status"]
+kind = "task"
+forth = 'connected? if confirm" Show changed files?" if exec" git diff --stat" else ." cancelled" cr then else ." not connected — join a session first" cr then'

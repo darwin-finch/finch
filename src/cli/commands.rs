@@ -49,7 +49,8 @@ pub enum Command {
     ModelSwitch(String), // /provider <name>  e.g. /provider grok
     ModelShow,           // /provider  (show current active provider)
     // Service discovery (Phase 3)
-    Discover, // Discover Finch daemons on local network
+    Discover,  // Discover Finch daemons on local network
+    Machines,  // List known peer machines (from LAN discovery)
     // License management
     LicenseStatus,           // /license or /license status
     LicenseActivate(String), // /license activate <key>
@@ -83,6 +84,9 @@ pub enum Command {
     VmDump,                       // /vm — dump VM source to scrollback + clipboard
     LibraryUndefine(String),      // /undefine <word> — remove last user library entry for word
     LibraryRun(String),           // /run <word> — execute the Forth snippet for a library word
+    Setup,                        // /setup — open the setup wizard (run 'finch setup' to reconfigure)
+    Share,                        // /share — format session as a pasteable proof block
+    BoxDiff,                      // /box-diff — compare all peers, offer to fix outliers
 }
 
 impl Command {
@@ -112,6 +116,7 @@ impl Command {
             "/provider list" | "/model list" | "/teacher list" => return Some(Command::ModelList),
             // Service discovery
             "/discover" => return Some(Command::Discover),
+            "/machines" | "/peers" | "/nodes" => return Some(Command::Machines),
             // License management
             "/license" | "/license status" => return Some(Command::LicenseStatus),
             "/license remove" => return Some(Command::LicenseRemove),
@@ -127,6 +132,9 @@ impl Command {
             "/program" | "/words" | "/forth" => return Some(Command::StackProgram),
             "/view" | "/graph view" | "/poset" => return Some(Command::StackView),
             "/demo" | "/demo lang" => return Some(Command::StackDemo),
+            "/setup" => return Some(Command::Setup),
+            "/share" | "/prove" | "/proof" => return Some(Command::Share),
+            "/box-diff" | "/cluster-diff" | "/cdiff" => return Some(Command::BoxDiff),
             _ => {}
         }
 
@@ -504,8 +512,8 @@ pub fn handle_command(
             CommandOutput::Status("Model commands should be handled in REPL.".to_string()),
         ),
         // Service discovery is handled directly in REPL (Phase 3)
-        Command::Discover => Ok(CommandOutput::Status(
-            "Discover command should be handled in REPL.".to_string(),
+        Command::Discover | Command::Machines => Ok(CommandOutput::Status(
+            "Service discovery commands should be handled in REPL.".to_string(),
         )),
         // License commands are handled directly in REPL
         Command::LicenseStatus | Command::LicenseActivate(_) | Command::LicenseRemove => Ok(
@@ -542,6 +550,16 @@ pub fn handle_command(
         | Command::LibraryUndefine(_)
         | Command::LibraryRun(_) => Ok(CommandOutput::Status(
             "Stack commands should be handled in REPL.".to_string(),
+        )),
+        // Setup command is handled directly in REPL
+        Command::Setup => Ok(CommandOutput::Status(
+            "Setup command should be handled in REPL.".to_string(),
+        )),
+        Command::Share => Ok(CommandOutput::Status(
+            "Share command should be handled in REPL.".to_string(),
+        )),
+        Command::BoxDiff => Ok(CommandOutput::Status(
+            "BoxDiff command should be handled in REPL.".to_string(),
         )),
     }
 }
@@ -594,7 +612,8 @@ pub fn format_help() -> String {
          \x1b[90m  What are personas?\x1b[0m Customize AI behavior and personality.\n\
          \x1b[90m  Built-in:\x1b[0m default, expert-coder, teacher, analyst, creative, researcher\n\n\
          \x1b[1;33m🔍 Service Discovery:\x1b[0m\n\
-         \x1b[36m  /discover\x1b[0m          Discover Finch daemons on local network\n\
+         \x1b[36m  /machines\x1b[0m          List known peer machines on the LAN\n\
+         \x1b[36m  /discover\x1b[0m          Scan LAN for new Finch daemons (mDNS)\n\
          \x1b[0m\n\
          \x1b[90m  Uses mDNS/Bonjour to find remote Finch instances for distributed GPU access.\x1b[0m\n\n\
          \x1b[1;33m🔒 Tool Confirmation Patterns:\x1b[0m\n\

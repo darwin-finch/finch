@@ -7349,3 +7349,24 @@ definition = "a device measuring time by sand flowing between chambers"
 related = ["sand", "flow", "measure", "timer"]
 kind = "temporal"
 forth = '60 0 do ." sand " loop ." flows" cr'
+
+[[word]]
+word = "scan"
+definition = "examine a file or data for threats, anomalies, and suspicious patterns"
+related = ["security", "inspect", "detect", "threat"]
+kind = "security"
+forth = 's" ." scan-file type cr'
+
+[[word]]
+word = "entropy"
+definition = "measure of randomness or disorder in data; high entropy may indicate encryption or packing"
+related = ["randomness", "disorder", "chaos", "information"]
+kind = "security"
+forth = 's" ." file-entropy 1000 / . ." .e3" cr'
+
+[[word]]
+word = "suspicious"
+definition = "data or file exhibiting patterns associated with malicious intent"
+related = ["malicious", "threat", "risk", "anomaly"]
+kind = "security"
+forth = '50 . ." /100 threshold" cr'

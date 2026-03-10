@@ -3,7 +3,7 @@
 
 pub mod brain_registry;
 mod feedback_handler;
-mod handlers;
+pub mod handlers;
 mod middleware;
 mod openai_handlers;
 pub mod openai_types; // Public for client access
@@ -167,6 +167,16 @@ impl AgentServer {
 
         tracing::info!("Training worker spawned");
 
+        // Background task: expire stale registry entries every 30 seconds.
+        let registry = std::sync::Arc::clone(&crate::server::handlers::REGISTRY);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                registry.expire().await;
+            }
+        });
+
         // Monitor generator state and inject model when ready
         let local_gen_clone = Arc::clone(&self.local_generator);
         let state_monitor = Arc::clone(&self.generator_state);
@@ -230,9 +240,13 @@ impl AgentServer {
 
         tracing::info!("Starting Shammah agent server on {}", addr);
 
-        // Start server
+        // Start server — ConnectInfo requires into_make_service_with_connect_info
+        // so handlers can read the peer's IP for auth logging.
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        ).await?;
 
         Ok(())
     }

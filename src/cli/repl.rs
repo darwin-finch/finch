@@ -172,6 +172,9 @@ pub struct Repl {
 
     // Enable the background brain agent (from config.features.brain_enabled)
     brain_enabled: bool,
+
+    // Enable mDNS peer auto-discovery at startup
+    auto_discover: bool,
 }
 
 /// Adjectives used for session labels
@@ -428,6 +431,7 @@ impl Repl {
         let enable_summarization = config.features.enable_summarization;
         let auto_compact_enabled = config.features.auto_compact_enabled;
         let brain_enabled = config.features.brain_enabled;
+        let auto_discover = config.client.auto_discover;
 
         // Generate tool definitions from registry (includes built-in + MCP tools)
         let tool_definitions: Vec<ToolDefinition> =
@@ -630,6 +634,7 @@ impl Repl {
             enable_summarization,
             auto_compact_enabled,
             brain_enabled,
+            auto_discover,
         }
     }
 
@@ -1574,6 +1579,7 @@ impl Repl {
             } else {
                 None
             },
+            self.auto_discover,
         );
 
         // Run the event loop

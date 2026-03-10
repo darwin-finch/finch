@@ -17,6 +17,8 @@ pub struct DiscoveredService {
     pub model: String,
     pub description: String,
     pub capabilities: Vec<String>,
+    /// Peer authentication token from the mDNS TXT record.
+    pub token: Option<String>,
 }
 
 /// Client for discovering Finch services
@@ -82,6 +84,10 @@ impl ServiceDiscoveryClient {
                         .map(|addr| addr.to_string())
                         .unwrap_or_else(|| info.get_hostname().to_string());
 
+                    let token = info
+                        .get_property_val_str("token")
+                        .map(|s| s.to_string());
+
                     let service = DiscoveredService {
                         name: info.get_fullname().to_string(),
                         host,
@@ -89,6 +95,7 @@ impl ServiceDiscoveryClient {
                         model,
                         description,
                         capabilities,
+                        token,
                     };
 
                     tracing::debug!("Discovered service: {:?}", service);
