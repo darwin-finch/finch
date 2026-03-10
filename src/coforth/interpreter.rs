@@ -5617,28 +5617,34 @@ fn tokenize(src: &str) -> Vec<String> {
             chars.next(); // consume the opening "
             if chars.peek() == Some(&'\n') { chars.next(); } // skip immediate newline
             let mut s = String::new();
-            let mut prev = '\n';
+            let mut at_line_start = true; // track whether current line so far is whitespace-only
             for c2 in chars.by_ref() {
-                if c2 == '"' && prev == '\n' { break; } // closing " alone on a line
+                if c2 == '"' && at_line_start { break; } // closing " on a line with only whitespace before it
+                if c2 == '\n' {
+                    at_line_start = true;
+                } else if !c2.is_whitespace() && c2 != '"' {
+                    at_line_start = false;
+                }
                 s.push(c2);
-                prev = c2;
             }
-            if s.ends_with('\n') { s.pop(); }
+            // trim trailing whitespace/newline from the block content
+            let s = s.trim_end().to_string();
             tokens.push(format!("\x00push-str:{s}"));
             tokens.push("page".to_string());
         } else if c == '"' && tok == "resolve" {
-            // resolve"   — many sentences, one truth; closing " alone on a line
+            // resolve"   — many sentences, one truth; closing " alone on a line (or with leading whitespace)
             tok.clear();
             chars.next(); // consume "
             if chars.peek() == Some(&'\n') { chars.next(); }
             let mut s = String::new();
-            let mut prev = '\n';
+            let mut at_line_start = true;
             for c2 in chars.by_ref() {
-                if c2 == '"' && prev == '\n' { break; }
+                if c2 == '"' && at_line_start { break; }
+                if c2 == '\n' { at_line_start = true; }
+                else if !c2.is_whitespace() { at_line_start = false; }
                 s.push(c2);
-                prev = c2;
             }
-            if s.ends_with('\n') { s.pop(); }
+            let s = s.trim_end().to_string();
             tokens.push(format!("\x00push-str:{s}"));
             tokens.push("resolve".to_string());
         } else if c == '|' && tok == "s" {

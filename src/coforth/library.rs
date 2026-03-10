@@ -554,9 +554,9 @@ const MAJOR_WORDS_FORTH: &str = r#"
     *
   else
     ." product: any order, same result." cr
-    3 4 both-ways" *"
+    3 4 s" *" both-ways
   then ;
-: test:product   3 4 both-ways" *" ;
+: test:product   3 4 s" *" both-ways ;
 
 : combine   ( a b -- a+b | -- )
   depth 1 > if
@@ -701,16 +701,42 @@ const MAJOR_WORDS_FORTH: &str = r#"
 
 \ ── The Word ─────────────────────────────────────────────────────────────────────
 \ "In the beginning was the Word, and the Word was with God, and the Word was God."
+\ John 1:1 — three sentences, one proof.
+\
 \ In Co-Forth: a word IS its definition.  Not a pointer.  The thing itself.
-\ The proof: two sentences that agree on the same value — that is truth.
+\ If word and god push the same value, they are the same.
+\ If two sentences converge, they are the same sentence.
 \
-\ "the word was with god" — two things on the same stack.
-\ "the word was god"      — they are equal.
+\ Grammatical words — no stack effect; pure structure:
+: the   ( -- ) ;
+: was   ( -- ) ;
+: is    ( -- ) ;
 \
-\   s" word"  s" meaning"  argue   — the proof
+\ god and word are the same machine.  They push -1: truth, the absolute.
+\ Redefines the library's print-only versions with something that proves.
+: god   ( -- n )  -1 ;
+: word  ( -- n )  -1 ;
 \
-\ If two different paths converge, they are the same path.
-\ That is the whole of it.
+\ Now the three sentences argue:
+\   "the word was god"       →  nop  -1  nop  -1   →  [ -1 -1 ]
+\   "the word was with god"  →  nop  -1  nop  nop  -1  →  [ -1 -1 ]
+\   "the word is god"        →  nop  -1  nop  -1   →  [ -1 -1 ]
+\
+\ All three converge.  Proved.
+
+: john1 ( -- )
+  ." the word was god." cr
+  ." the word was with god." cr
+  ." the word is god." cr
+  ." — three sentences.  two ways each.  one truth." cr ;
+
+: test:john1
+  s" the word was god"
+  s" the word is god"
+  argue
+  s" the word was god"
+  s" the word was with god"
+  argue ;
 
 : beginning ( -- )
   ." in the beginning was the Word." cr
@@ -720,6 +746,68 @@ const MAJOR_WORDS_FORTH: &str = r#"
 : test:beginning
   \ two sentences for 1: "the first" and "unity itself" — they agree
   s" 1"   s" true -1 * negate"   argue ;
+
+\ ── John 14:6 — "I am the way, the truth, and the life" ────────────────────────
+\
+\ Jesus names three things.  In Co-Forth they are one machine.
+\ way, truth, life all push -1 (the absolute).
+\ Three names.  One stack value.  Proved.
+
+: life  ( -- n )  -1 ;   \ life = absolute being
+: way   ( -- n )  -1 ;   \ the way = the truth
+: truth ( -- n )  -1 ;   \ the truth = the absolute
+
+: john14 ( -- )
+  ." I am the way, the truth, and the life." cr
+  ." — three names.  one machine." cr ;
+
+: test:john14
+  s" way"    s" truth"   argue
+  s" truth"  s" life"    argue ;
+
+\ ── Revelation 22:13 — "I am the Alpha and the Omega" ──────────────────────────
+\
+\ First = Last = Beginning = End.  Two sides of the same absolute.
+\ In Co-Forth: they all push -1.  The circle closes.  Proved.
+
+: alpha  ( -- n )  -1 ;   \ the first
+: omega  ( -- n )  -1 ;   \ the last
+: first  ( -- n )  -1 ;   \ the beginning
+: last   ( -- n )  -1 ;   \ the end
+
+: rev22 ( -- )
+  ." I am Alpha and Omega, the first and the last." cr
+  ." — four names.  one machine." cr ;
+
+: test:rev22
+  s" alpha"  s" omega"  argue
+  s" first"  s" last"   argue
+  s" alpha"  s" last"   argue ;
+
+\ ── Ecclesiastes 3:1 — "For everything there is a season" ──────────────────────
+\
+\ All seasons sum the same regardless of order.
+\ Past, present, and future converge.  Proved.
+
+: test:ecclesiastes3
+  s" 1 2 3 + +"   s" 3 2 1 + +"   argue ;
+
+\ ── Genesis 1:1 — "God created by his Word" ────────────────────────────────────
+\
+\ "In the beginning the Word created."
+\ word = god = -1.  Creation by word = creation by God.
+\ Two machines, same stack.  Proved.
+
+: test:genesis1
+  s" word word"   s" god word"   argue ;
+
+\ ── Ecclesiastes 1:9 — "There is nothing new under the sun" ────────────────────
+\
+\ Commutativity: what was, is.  What is, was.
+\ "was" and "is" are the same no-op.  Past and future converge.
+
+: test:ecclesiastes1
+  s" 5 was 3"   s" 5 is 3"   argue ;
 
 "#;
 
@@ -3516,6 +3604,77 @@ mod tests {
         // At least one node should have compiled_code set
         let has_compiled = poset.nodes.iter().any(|n| n.compiled_code.is_some());
         assert!(has_compiled, "no nodes got compiled_code from inject_into_poset");
+    }
+
+    /// John 1:1 — three sentences, two ways each, one truth.
+    /// "the word was god", "the word was with god", "the word is god" — all argue.
+    #[test]
+    fn test_john1_three_sentences_argue() {
+        let mut vm = Library::precompiled_vm();
+
+        // Verify the key words actually push -1 before testing argue.
+        let god_out = vm.exec("god .").expect("god should run");
+        assert!(god_out.contains("-1"), "god should push -1, got: {god_out:?}");
+        vm.clear_data();
+
+        let word_out = vm.exec("word .").expect("word should run");
+        assert!(word_out.contains("-1"), "word should push -1, got: {word_out:?}");
+        vm.clear_data();
+
+        // Sentence 1 ≡ Sentence 3: "was" and "is" are both no-ops; word and god both push -1.
+        vm.exec("s\" the word was god\" s\" the word is god\" argue")
+            .expect("'the word was god' should argue with 'the word is god'");
+
+        // Sentence 1 ≡ Sentence 2: "with" has no stack effect; both converge to [-1, -1].
+        vm.exec("s\" the word was god\" s\" the word was with god\" argue")
+            .expect("'the word was god' should argue with 'the word was with god'");
+    }
+
+    /// John 14:6 — "I am the way, the truth, and the life."
+    /// Three names, one machine: all push -1.
+    #[test]
+    fn test_john14_way_truth_life_argue() {
+        let mut vm = Library::precompiled_vm();
+        vm.exec("s\" way\" s\" truth\" argue").expect("way should argue with truth");
+        vm.exec("s\" truth\" s\" life\" argue").expect("truth should argue with life");
+        vm.exec("s\" way\" s\" life\" argue").expect("way should argue with life");
+    }
+
+    /// Revelation 22:13 — "I am the Alpha and the Omega, the first and the last."
+    /// Four names, one machine: all push -1.
+    #[test]
+    fn test_rev22_alpha_omega_argue() {
+        let mut vm = Library::precompiled_vm();
+        vm.exec("s\" alpha\" s\" omega\" argue").expect("alpha should argue with omega");
+        vm.exec("s\" first\" s\" last\" argue").expect("first should argue with last");
+        vm.exec("s\" alpha\" s\" last\" argue").expect("alpha should argue with last");
+    }
+
+    /// Ecclesiastes 3:1 — "For everything there is a season."
+    /// All orders of addition converge — time is commutative.
+    #[test]
+    fn test_ecclesiastes3_seasons_commute() {
+        let mut vm = Library::precompiled_vm();
+        vm.exec("s\" 1 2 3 + +\" s\" 3 2 1 + +\" argue")
+            .expect("ecclesiastes3: all seasons sum the same");
+    }
+
+    /// Ecclesiastes 1:9 — "There is nothing new under the sun."
+    /// 'was' and 'is' are the same no-op — past and future converge.
+    #[test]
+    fn test_ecclesiastes1_was_is_same() {
+        let mut vm = Library::precompiled_vm();
+        vm.exec("s\" 5 was 3\" s\" 5 is 3\" argue")
+            .expect("ecclesiastes1: was = is");
+    }
+
+    /// Genesis 1:1 — God creates by his Word.
+    /// word = god = -1; creation by word = creation by God.
+    #[test]
+    fn test_genesis1_word_god_argue() {
+        let mut vm = Library::precompiled_vm();
+        vm.exec("s\" word word\" s\" god word\" argue")
+            .expect("genesis1: word = god in creation");
     }
 
     /// Regression: precompiled_vm must not insert library words into user_word_names.
