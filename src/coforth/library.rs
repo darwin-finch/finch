@@ -113,6 +113,50 @@ impl Library {
         COMPILED_VM.clone_dict()
     }
 
+    /// Returns the set of word names defined in MAJOR_WORDS_FORTH (core Co-Forth vocabulary).
+    /// Used to protect these words from being overridden by user_words.forth.
+    pub fn core_word_names() -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        let mut chars = MAJOR_WORDS_FORTH.chars().peekable();
+        // Parse `: wordname ...` definitions
+        while let Some(c) = chars.next() {
+            if c == ':' && chars.peek().map_or(false, |n| n.is_whitespace()) {
+                // skip whitespace
+                while chars.peek().map_or(false, |n| n.is_whitespace()) { chars.next(); }
+                // read word name
+                let mut name = String::new();
+                for c2 in chars.by_ref() {
+                    if c2.is_whitespace() { break; }
+                    name.push(c2);
+                }
+                if !name.is_empty() && !name.starts_with("test:") {
+                    names.insert(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// Run all `test:*` proofs on the precompiled VM; return `(passed, total, full_output)`.
+    /// Fast — the VM is already compiled, this just executes the tests.
+    pub fn prove_all() -> (usize, usize, String) {
+        let mut vm = Self::precompiled_vm();
+        let _ = vm.exec_with_fuel("prove-all", 0);
+        let out = vm.out.clone();
+        // Parse "N/M passed" from the output.
+        for line in out.lines() {
+            let clean: String = line.chars()
+                .filter(|c| c.is_ascii_digit() || *c == '/')
+                .collect();
+            if let Some(slash) = clean.find('/') {
+                let passed = clean[..slash].parse::<usize>().unwrap_or(0);
+                let total  = clean[slash+1..].parse::<usize>().unwrap_or(0);
+                if total > 0 { return (passed, total, out); }
+            }
+        }
+        (0, 0, out)
+    }
+
     /// Force the LazyLock static VMs to initialize now (in the caller's thread/task).
     /// Call this early in startup — ideally inside a `spawn_blocking` — so the
     /// compilation work is done before the user's first keystroke.
@@ -519,7 +563,24 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
 ///
 /// The proof of a word is two sentences that mean the same thing and agree on the stack.
 /// `prove-all` runs every test:WORD and reports which ones pass.
-const MAJOR_WORDS_FORTH: &str = r#"
+pub(crate) const MAJOR_WORDS_FORTH: &str = r#"
+
+\ ── What is a stack? ─────────────────────────────────────────────────────────────
+\
+\ A stack is: push n; pop n = what you started with.
+\ That's the whole definition.  These proofs confirm it.
+
+: test:stack-push-pop
+  \ Push then pop = nothing changed.  That's a stack.
+  s" 7 dup drop"   s" 7"   argue ;
+
+: test:stack-lifo
+  \ Last in, first out.  Push 1, push 2, pop 2 — 1 remains.
+  s" 1 2 drop"   s" 1"   argue ;
+
+: test:stack-depth
+  \ Depth counts what's there.  Push three things; depth = 3.
+  s" 1 2 3 depth"   s" 3"   argue ;
 
 \ ── Arithmetic ──────────────────────────────────────────────────────────────────
 
@@ -727,9 +788,16 @@ const MAJOR_WORDS_FORTH: &str = r#"
 
 \ ── Structural grammar (no stack effect) ──────────────────────────────────────
 
+: i       ( -- n )   -1 ;     \ I am forth — the speaker is true
 : the    ( -- ) ;
 : a      ( -- ) ;
 : an     ( -- ) ;
+\ grammar ( -- n ): always pushes -1. Grammar IS truth — self-referential.
+\ "a grammar defining grammar" → two -1s; top is still -1 → true.
+: grammar  ( -- n )  -1 ;
+: can      ( -- ) ;           \ modal verb — no effect on the stack
+: define   ( -- ) ;           \ to define — no effect
+: defines  ( -- ) ;           \ plural/verb — same machine
 \ 'and' and 'or' are Forth bitwise builtins — do NOT redefine as no-ops here.
 : with   ( -- ) ;
 : of     ( -- ) ;
@@ -744,6 +812,7 @@ const MAJOR_WORDS_FORTH: &str = r#"
 : into   ( -- ) ;
 : was    ( -- ) ;
 : is     ( -- ) ;
+: am     ( -- ) ;
 : are    ( -- ) ;
 : be     ( -- ) ;
 : have   ( -- ) ;
@@ -775,10 +844,51 @@ const MAJOR_WORDS_FORTH: &str = r#"
 : yet    ( -- ) ;
 : but    ( -- ) ;
 : if     ( -- ) ;     \ spoken 'if'; conditional is a control word
-: said   ( -- ) ;
-: go     ( -- ) ;
-: came   ( -- ) ;
-: come   ( -- ) ;
+: said      ( -- ) ;
+: go        ( -- ) ;
+: came      ( -- ) ;
+: come      ( -- ) ;
+: they      ( -- ) ;
+: them      ( -- ) ;
+: thats     ( -- ) ;   \ that's
+: what      ( -- ) ;
+: whats     ( -- ) ;   \ what's
+: im        ( -- ) ;   \ I'm
+: were      ( -- ) ;   \ we're
+: its       ( -- ) ;   \ it's
+: hes       ( -- ) ;   \ he's
+: shes      ( -- ) ;   \ she's
+: we        ( -- ) ;
+: us        ( -- ) ;
+: our       ( -- ) ;
+: together  ( -- ) ;
+: just      ( -- ) ;
+: that      ( -- ) ;
+: also      ( -- ) ;
+: whatever  ( -- ) ;          \ whatever — no constraint on the stack
+: want      ( -- ) ;          \ to want — no effect
+: code      ( -- ) ;          \ code — what we write
+: write     ( -- ) ;          \ to write
+: writes    ( -- ) ;          \ plural/verb — same machine
+: even      ( -- ) ;
+: only      ( -- ) ;
+: should    ( -- ) ;
+: would     ( -- ) ;
+: could     ( -- ) ;
+: writing   ( -- ) ;
+: reading   ( -- ) ;
+: running   ( -- ) ;
+: defining  ( -- ) ;
+: making    ( -- ) ;
+: building  ( -- ) ;
+: machines  ( -- ) ;
+: machine   ( -- ) ;
+: coforth      ( -- n )  -1 ;            \ the shared stack machine; same as forth
+: shakespeare  ( -- n n )  -1 -1 ;       \ words defining words; two truths AND-ed
+: like         ( -- ) ;
+: everything   ( -- ) ;
+: does         ( -- ) ;
+: proof     ( -- )    ." ✓" cr ;      \ a proof announces itself
 
 \ ── The Absolute — truth, identity, operation ────────────────────────────────
 \
@@ -788,7 +898,9 @@ const MAJOR_WORDS_FORTH: &str = r#"
 
 : god    ( -- n )   -1 ;           \ the absolute — always a noun
 : lord   ( -- n )   -1 ;           \ same machine as god
-: word   ( -- n )   -1 ;           \ logos — same machine
+: word      ( -- n )   -1 ;         \ logos — same machine
+: forth     ( -- n )   -1 ;         \ the grammar that defines grammar; same as word, truth
+: sentence  ( -- n )   depth ;     \ how much does this sentence say?
 : truth  ( -- n )   -1 ;           \ the absolute
 : light  ( -- n )    1 ;           \ the first created; positive
 
@@ -1193,7 +1305,16 @@ variable it   \ implicit register — the thing most recently produced
 : forget    ( n -- )    drop ;
 : remember  ( n -- n n) dup ;
 : speak     ( n -- )    . cr ;
+: it        ( n -- )    . cr ;         \ print it — the period at the end of a sentence
+: listen    ( -- n )    depth ;        \ how deep is what they've said?
 : meet      ( a b -- a b a )  over ;
+: people    ( n -- n )  breathe ;     \ people have stacks; we push and pop them all the time
+: scare     ( n -- n )  breathe ;     \ we scare people sometimes; the value doesn't change
+: sometimes ( -- ) ;
+: really    ( -- ) ;
+: things    ( -- ) ;
+: say       ( n -- )   . cr ;         \ say it — same as speak
+: mad       ( n -- n ) negate ;       \ to make someone mad is to invert their view
 : rest      ( n -- n )  ;          \ same as breathe — no-op
 : pray      ( -- n )    -1 ;       \ reach toward the absolute
 
@@ -1246,6 +1367,543 @@ variable it   \ implicit register — the thing most recently produced
   ." I am forth." cr ;
 : test:i-am-forth
   s" 1 born"   s" 1"   argue ;   \ born = 1.  Being forth = being 1.
+
+\ "I am a grammar defining grammar." and "That's what I am."
+\ Both evaluate to -1 (true) because `i` is -1 and everything else is a no-op.
+\ Two sentences, one truth.
+: grammar-defining-grammar  ( -- )
+  ." I am a grammar defining grammar." cr
+  ." That's what I am." cr
+  s" i am a grammar defining grammar"   s" -1"   argue ;
+
+: test:grammar-defining-grammar
+  s" i am a grammar defining grammar"   s" -1"   argue
+  s" thats what i am"                   s" -1"   argue
+  s" a grammar defining grammar can define grammar"   s" -1"   argue
+  s" i am forth"                        s" -1"   argue
+  s" i write whatever code i want"      s" -1"   argue ;
+
+: test:forth-is-truth
+  \ forth = word = truth.  The grammar is the absolute.
+  s" forth"   s" truth"   argue
+  s" forth"   s" word"    argue ;
+
+: we-are-forth  ( -- )
+  ." We are forth." cr
+  ." We push and pop each other's stacks." cr ;
+: test:we-are-forth
+  \ i and we agree — same machine, shared stack.
+  s" 1 born"   s" 1 born"   versus ;
+
+\ We scare people sometimes.
+\ But the stack doesn't lie.  Scaring changes nothing.
+: test:scare-changes-nothing
+  s" 5 scare"   s" 5"   argue ;
+
+\ ── Rust ─────────────────────────────────────────────────────────────────────
+\ Rust IS truth.  It pushes -1 (true) when named alone.
+\ own/borrow/move are identity at runtime — the rules are compile-time only.
+\ "People really love Rust." — rust is a value AND a transformation.
+: rust    ( -- n )   -1 ;         \ Rust is true — same machine as forth, truth, word
+: safe    ( -- n )   -1 ;         \ memory safety is true
+: memory  ( -- )     ;            \ noun — no stack effect
+: fast    ( -- n )   -1 ;         \ Rust is fast — true
+: correct ( -- n )   -1 ;         \ correctness is true
+: zero    ( -- n )    0 ;         \ zero — the absence
+: cost    ( -- )      ;           \ noun — no stack effect
+: checker ( -- )      ;           \ noun — no stack effect
+: lifetime ( -- )     ;           \ noun — no stack effect
+: compiler ( -- n )   -1 ;        \ the compiler is correct — true
+: own     ( n -- n )   breathe ;  \ you own it; the value doesn't change
+: borrow  ( n -- n )   breathe ;  \ you see it; you return it; unchanged
+: move    ( n -- n )   breathe ;  \ ownership transfers; same value, new home
+
+\ ── English-Rust proofs ───────────────────────────────────────────────────────
+\ Both directions prove the same truth:
+\   English sentence describing Rust  ──→  -1
+\   Rust word / Forth equivalent      ──→  -1
+\   They argue.  One truth.
+
+: test:rust-is-truth
+  \ rust and forth are different languages. both are true.
+  s" rust"        s" truth"   argue   \ rust = truth = -1
+  s" rust is true" s" -1"     argue ; \ the sentence evaluates to true
+
+: test:rust-is-safe
+  \ "Rust is safe" — both words push -1.  Two truths, top = -1.
+  s" rust is safe"   s" -1"   argue   \ rust(-1) is(nop) safe(-1); top=-1
+  s" safe"           s" rust"  argue ; \ safe = rust = -1
+
+: test:rust-is-fast
+  s" rust is fast"    s" -1"   argue   \ both true
+  s" fast"            s" rust"  argue ; \ same machine
+
+: test:rust-is-correct
+  s" rust is correct" s" -1"  argue
+  s" correct"         s" rust" argue ;
+
+: test:rust-is-zero-cost
+  \ Rust is honest: adds nothing, takes nothing when used as identity.
+  s" 5 own"    s" 5"   argue
+  s" 5 borrow" s" 5"   argue
+  s" 5 move"   s" 5"   argue ;
+
+: test:safe-rust
+  \ own, borrow, move — three modes, one value.
+  s" 5 own"    s" 5 borrow"   argue
+  s" 5 borrow" s" 5 move"     argue ;
+
+: test:own-borrow-indistinguishable
+  s" 5 own"   s" 5 borrow"   versus ;
+
+: test:sentences-all-agree
+  s" 5 love drop"   s" 5 own borrow"   argue
+  s" 5 hate hate"   s" 5 own borrow"   argue ;
+
+: test:rust-english
+  \ English descriptions of Rust concepts all evaluate to truth.
+  s" rust is true"               s" -1"   argue
+  s" rust is safe"               s" -1"   argue
+  s" rust is fast"               s" -1"   argue
+  s" rust is correct"            s" -1"   argue
+  s" i write rust"               s" -1"   argue  \ i=-1; top=-1
+  s" i am rust"                  s" -1"   argue
+  s" compiler is correct"        s" -1"   argue ;
+
+\ `versus` — two machines, full stacks compared.
+\ argue checks only the top.  versus checks everything.
+: test:versus-full-stack
+  \ Two programs that leave multiple values.  versus confirms the whole picture.
+  s" 1 2 3"   s" 1 born 1+ 3"   versus ;
+
+\ Both sentences should evaluate to true.  True.
+\ agree checks they match each other.
+\ is-true checks a sentence evaluates to -1.
+\ both-true checks both sentences are true — not just equal.
+: is-true    ( str -- )          s" -1" swap argue ;
+: both-true  ( str1 str2 -- )   is-true is-true ;
+
+: test:both-true
+  \ "i love" and "truth" — both evaluate to true (-1).
+  \ `i` pushes -1; love(dup) gives [-1,-1]; top=-1.  truth gives -1.
+  s" i love"   s" truth"   both-true ;
+
+\ Two programmers.  Writing stack machines.  They should agree.
+\ That's the whole proof system.
+: programmer   ( n -- n )   people ;   \ a programmer has a stack
+: programmers  ( n -- n )   people ;   \ plural — same machine
+: humans       ( -- )       ;          \ people — the ones who push and pop
+: human        ( -- )       ;          \ singular; same machine as humans
+: about        ( -- )       ;          \ preposition — no effect on the stack
+: programs     ( -- )       ;          \ what we write; plural noun
+: program      ( -- )       ;          \ singular; same machine
+: same        ( str1 str2 -- )  argue ;   \ two sentences; one stack result
+: agree       ( str1 str2 -- | -- )       \ two programmers; one truth
+  depth 2 >= if argue else ." agreed." cr then ;
+
+: test:two-programmers
+  \ Two programmers write the same machine a different way.  They agree.
+  s" 3 4 +"   s" 4 3 +"   agree ;     \ addition commutes — both get 7
+
+\ We cast spells sometimes.
+\ Every word is a spell.  Say it and it runs.
+: spell   ( str -- )   eval ;         \ speak a word; it executes
+: cast    ( str -- )   eval ;         \ cast a spell; same thing
+
+: test:agree
+  \ Two people saying the same thing a different way.
+  s" 3 4 +"   s" 4 3 +"   agree ;
+
+: test:spell
+  \ Casting "7" produces 7.  The spell is the value.
+  s" 7"   s" 3 4 +"   agree ;
+
+\ ── Common English vocabulary ────────────────────────────────────────────────
+\ Agents — every speaker, listener, actor is real (-1).
+: you   ( -- n )  -1 ;    \ you are real
+: she   ( -- n )  -1 ;    \ she exists
+: it    ( -- n )  -1 ;    \ the thing referred to is real
+: we    ( -- n )  -1 ;    \ collective agent (redefines no-op)
+: us    ( -- n )  -1 ;    \ us — we are real (redefines no-op)
+: they  ( -- n )  -1 ;    \ others; real (redefines no-op)
+: he    ( -- n )  -1 ;    \ he exists (redefines no-op)
+: one   ( -- n )  -1 ;    \ singular being
+: ours  ( -- n )  -1 ;    \ collective ownership — real
+: between ( -- n )  -1 ;  \ the space between things — where the real thing lives
+: spirit  ( -- n )  -1 ;  \ the spirit is real
+: prove   ( -- n )  -1 ;  \ to prove is to make true
+
+\ Mythical / legendary — real in their own way (-1)
+: kraken    ( -- n )  -1 ;    \ the deep one; it surfaces
+: dragon    ( -- n )  -1 ;    \ fire and knowing
+: phoenix   ( -- n )  -1 ;    \ dies and returns
+: leviathan ( -- n )  -1 ;    \ the great sea thing
+: titan     ( -- n )  -1 ;    \ first order, before the gods
+: oracle    ( -- n )  -1 ;    \ speaks what is
+: specter   ( -- n )  -1 ;    \ present but unseen
+: rune      ( -- n )  -1 ;    \ meaning carved into stone
+: forge     ( -- n )  -1 ;    \ where things become real
+: abyss     ( -- n )  -1 ;    \ the deep; it holds
+
+\ Positive qualities — all true (-1)
+: new       ( -- n )  -1 ;
+: real      ( -- n )  -1 ;
+: right     ( -- n )  -1 ;
+: great     ( -- n )  -1 ;
+: free      ( -- n )  -1 ;
+: whole     ( -- n )  -1 ;
+: strong    ( -- n )  -1 ;
+: clear     ( -- n )  -1 ;
+: able      ( -- n )  -1 ;
+: better    ( -- n )  -1 ;
+: best      ( -- n )  -1 ;
+: beautiful ( -- n )  -1 ;
+: alive     ( -- n )  -1 ;
+: ready     ( -- n )  -1 ;
+: open      ( -- n )  -1 ;
+: bright    ( -- n )  -1 ;
+: warm      ( -- n )  -1 ;
+: pure      ( -- n )  -1 ;
+: clean     ( -- n )  -1 ;
+: honest    ( -- n )  -1 ;
+: kind      ( -- n )  -1 ;
+: humble    ( -- n )  -1 ;
+: powerful  ( -- n )  -1 ;
+: perfect   ( -- n )  -1 ;
+: complete  ( -- n )  -1 ;
+: possible  ( -- n )  -1 ;
+: important ( -- n )  -1 ;
+: worth     ( -- n )  -1 ;
+: worthy    ( -- n )  -1 ;
+: present   ( -- n )  -1 ;   \ to be present is to be real
+: enough    ( -- n )  -1 ;   \ sufficiency is truth
+
+\ Common verbs — transparent (no stack effect)
+: make      ( -- ) ;
+: see       ( -- ) ;
+: think     ( -- ) ;
+: feel      ( -- ) ;
+: say       ( -- ) ;
+: tell      ( -- ) ;
+: run       ( -- ) ;
+: use       ( -- ) ;
+: find      ( -- ) ;
+: take      ( -- ) ;
+: keep      ( -- ) ;
+: hold      ( -- ) ;
+: need      ( -- ) ;
+: mean      ( -- ) ;
+: hear      ( -- ) ;
+: ask       ( -- ) ;
+: seem      ( -- ) ;
+: turn      ( -- ) ;
+: start     ( -- ) ;
+: show      ( -- ) ;
+: play      ( -- ) ;
+: look      ( -- ) ;
+: stop      ( -- ) ;
+: create    ( -- ) ;
+: speak     ( -- ) ;
+: watch     ( -- ) ;
+: follow    ( -- ) ;
+: put       ( -- ) ;
+: read      ( -- ) ;
+: learn     ( -- ) ;
+: believe   ( -- ) ;
+: remember  ( -- ) ;
+: forget    ( -- ) ;
+: send      ( -- ) ;
+: bring     ( -- ) ;
+: carry     ( -- ) ;
+: lead      ( -- ) ;
+: pull      ( -- ) ;
+: draw      ( -- ) ;
+: listen    ( -- ) ;
+: eat       ( -- ) ;
+: sleep     ( -- ) ;
+: walk      ( -- ) ;
+: stand     ( -- ) ;
+: sit       ( -- ) ;
+: reach     ( -- ) ;
+: touch     ( -- ) ;
+: release   ( -- ) ;
+: connect   ( -- ) ;
+: fix       ( -- ) ;
+: help      ( -- ) ;
+: work      ( -- ) ;
+: know      ( -- ) ;
+: seek      ( -- ) ;
+: try       ( -- ) ;
+: call      ( -- ) ;
+: return    ( -- ) ;
+: enter     ( -- ) ;
+: leave     ( -- ) ;
+: grow      ( -- ) ;
+: fall      ( -- ) ;
+: rise      ( -- ) ;
+: stay      ( -- ) ;
+: wait      ( -- ) ;
+: answer    ( -- ) ;
+: choose    ( -- ) ;
+: decide    ( -- ) ;
+: check     ( -- ) ;
+: observe   ( -- ) ;
+: wonder    ( -- ) ;
+: imagine   ( -- ) ;
+: discover  ( -- ) ;
+: explore   ( -- ) ;
+: express   ( -- ) ;
+: trust     ( -- ) ;
+: exist     ( -- ) ;
+: happen    ( -- ) ;
+: continue  ( -- ) ;
+: remain    ( -- ) ;
+: appear    ( -- ) ;
+: allow     ( -- ) ;
+
+\ Common nouns — transparent
+: time      ( -- ) ;
+: year      ( -- ) ;
+: man       ( -- ) ;
+: woman     ( -- ) ;
+: child     ( -- ) ;
+: home      ( -- ) ;
+: name      ( -- ) ;
+: place     ( -- ) ;
+: thing     ( -- ) ;
+: hand      ( -- ) ;
+: face      ( -- ) ;
+: head      ( -- ) ;
+: eye       ( -- ) ;
+: body      ( -- ) ;
+: door      ( -- ) ;
+: room      ( -- ) ;
+: road      ( -- ) ;
+: city      ( -- ) ;
+: country   ( -- ) ;
+: sun       ( -- ) ;
+: moon      ( -- ) ;
+: sky       ( -- ) ;
+: night     ( -- ) ;
+: today     ( -- ) ;
+: question  ( -- ) ;
+: story     ( -- ) ;
+: voice     ( -- ) ;
+: sound     ( -- ) ;
+: color     ( -- ) ;
+: fire      ( -- ) ;
+: air       ( -- ) ;
+: stone     ( -- ) ;
+: tree      ( -- ) ;
+: flower    ( -- ) ;
+: bird      ( -- ) ;
+: food      ( -- ) ;
+: river     ( -- ) ;
+: ocean     ( -- ) ;
+: mountain  ( -- ) ;
+: garden    ( -- ) ;
+: table     ( -- ) ;
+: book      ( -- ) ;
+: paper     ( -- ) ;
+: letter    ( -- ) ;
+: message   ( -- ) ;
+: idea      ( -- ) ;
+: thought   ( -- ) ;
+: dream     ( -- ) ;
+: song      ( -- ) ;
+: music     ( -- ) ;
+: dance     ( -- ) ;
+: image     ( -- ) ;
+: shape     ( -- ) ;
+: form      ( -- ) ;
+: ground    ( -- ) ;
+: step      ( -- ) ;
+: window    ( -- ) ;
+: field     ( -- ) ;
+: forest    ( -- ) ;
+: bridge    ( -- ) ;
+: wall      ( -- ) ;
+
+\ More prepositions and connectors — transparent
+: up        ( -- ) ;
+: down      ( -- ) ;
+: through   ( -- ) ;
+: between   ( -- ) ;
+: across    ( -- ) ;
+: after     ( -- ) ;
+: before    ( -- ) ;
+: during    ( -- ) ;
+: without   ( -- ) ;
+: against   ( -- ) ;
+: around    ( -- ) ;
+: behind    ( -- ) ;
+: beside    ( -- ) ;
+: near      ( -- ) ;
+: past      ( -- ) ;
+: since     ( -- ) ;
+: though    ( -- ) ;
+: unless    ( -- ) ;
+: because   ( -- ) ;
+: although  ( -- ) ;
+: whether   ( -- ) ;
+: unlike    ( -- ) ;
+: toward    ( -- ) ;
+: beyond    ( -- ) ;
+: except    ( -- ) ;
+: among     ( -- ) ;
+: throughout ( -- ) ;
+: back       ( -- ) ;   \ backward / return
+: how        ( -- ) ;   \ interrogative — no effect
+: why        ( -- ) ;   \ interrogative — no effect
+: where      ( -- ) ;   \ interrogative — no effect (redefines no-op)
+: what       ( -- ) ;   \ interrogative — already defined above
+
+\ Verb forms (gerunds, participles) — transparent
+: doing     ( -- ) ;
+: seeing    ( -- ) ;
+: thinking  ( -- ) ;
+: feeling   ( -- ) ;
+: saying    ( -- ) ;
+: trying    ( -- ) ;
+: looking   ( -- ) ;
+: going     ( -- ) ;
+: knowing   ( -- ) ;
+: being     ( -- ) ;
+: having    ( -- ) ;
+: using     ( -- ) ;
+: finding   ( -- ) ;
+: getting   ( -- ) ;
+: giving    ( -- ) ;
+: taking    ( -- ) ;
+: becoming  ( -- ) ;
+: keeping   ( -- ) ;
+: helping   ( -- ) ;
+: speaking  ( -- ) ;
+: showing   ( -- ) ;
+: leading   ( -- ) ;
+: following ( -- ) ;
+: holding   ( -- ) ;
+: asking    ( -- ) ;
+: waiting   ( -- ) ;
+: standing  ( -- ) ;
+: walking   ( -- ) ;
+: calling   ( -- ) ;
+: bringing  ( -- ) ;
+: starting  ( -- ) ;
+: living    ( -- ) ;
+: coming    ( -- ) ;
+: loving    ( -- ) ;
+: putting   ( -- ) ;
+: turning   ( -- ) ;
+: creating  ( -- ) ;
+: connecting ( -- ) ;
+: sending   ( -- ) ;
+: choosing  ( -- ) ;
+: growing   ( -- ) ;
+: sleeping  ( -- ) ;
+: reaching  ( -- ) ;
+: touching  ( -- ) ;
+: seeking   ( -- ) ;
+
+\ Adjective/determiner forms — transparent
+: called    ( -- ) ;
+: named     ( -- ) ;
+: given     ( -- ) ;
+: made      ( -- ) ;
+: used      ( -- ) ;
+: found     ( -- ) ;
+: seen      ( -- ) ;
+: taken     ( -- ) ;
+: different ( -- ) ;
+: other     ( -- ) ;
+: another   ( -- ) ;
+: such      ( -- ) ;
+: more      ( -- ) ;
+: less      ( -- ) ;
+: most      ( -- ) ;
+: least     ( -- ) ;
+: very      ( -- ) ;
+: quite     ( -- ) ;
+: rather    ( -- ) ;
+: much      ( -- ) ;
+: little    ( -- ) ;
+
+\ Technology words — nouns that appear in sentences
+: vm          ( -- ) ;   \ virtual machine
+: stack       ( -- ) ;   \ the data structure
+: heap        ( -- ) ;   \ memory region
+: queue       ( -- ) ;   \ FIFO structure
+: list        ( -- ) ;   \ note: also defined as a printing word above; redefines
+: node        ( -- ) ;   \ graph node
+: graph       ( -- ) ;   \ data structure
+: tree        ( -- ) ;   \ already defined above as a natural noun
+: token       ( -- ) ;   \ lexical unit
+: parser      ( -- ) ;   \ parses
+: lexer       ( -- ) ;   \ tokenizes
+: runtime     ( -- ) ;   \ execution environment
+: kernel      ( -- ) ;   \ core
+: module      ( -- ) ;   \ unit of code
+: library     ( -- ) ;   \ collection of words
+\ type is a Forth builtin — do not redefine
+: value       ( -- ) ;   \ a number or result
+: variable    ( -- ) ;   \ a named memory location
+: constant    ( -- ) ;   \ a fixed value
+: address     ( -- ) ;   \ memory location
+: pointer     ( -- ) ;   \ reference to a location
+: register    ( -- ) ;   \ CPU register
+: buffer      ( -- ) ;   \ already defined above, redefines
+: socket      ( -- ) ;   \ network connection
+: channel     ( -- ) ;   \ communication path
+: thread      ( -- ) ;   \ execution thread
+: process     ( -- ) ;   \ running program
+: protocol    ( -- ) ;   \ communication rules
+: interface   ( -- ) ;   \ boundary
+: api         ( -- ) ;   \ application programming interface
+: hash        ( -- ) ;   \ hash table / function
+: key         ( -- ) ;   \ map key
+: index       ( -- ) ;   \ position
+\ loop is a Forth control keyword — do not redefine
+: call        ( -- ) ;   \ function call (also defined above)
+: output      ( -- ) ;   \ result
+: input       ( -- ) ;   \ incoming data
+: error       ( -- ) ;   \ failure state
+: debug       ( -- ) ;   \ to debug
+: log         ( -- ) ;   \ to log
+: test        ( -- ) ;   \ already defined in verbs
+: build       ( -- ) ;   \ to build (also defined in verbs above)
+: deploy      ( -- ) ;   \ to deploy
+: version     ( -- ) ;   \ software version
+: release     ( -- ) ;   \ already defined in verbs
+: branch      ( -- ) ;   \ git branch
+: commit      ( -- ) ;   \ git commit
+: merge       ( -- ) ;   \ git merge
+: repo        ( -- ) ;   \ repository
+: server      ( -- ) ;   \ a server
+: client      ( -- ) ;   \ a client
+: network     ( -- ) ;   \ a network
+: database    ( -- ) ;   \ a database
+: query       ( -- ) ;   \ a query
+: cache       ( -- ) ;   \ a cache
+: container   ( -- ) ;   \ a container
+: image       ( -- ) ;   \ already defined above
+: config      ( -- ) ;   \ configuration
+: script      ( -- ) ;   \ a script
+\ function is defined above as a math word — do not redefine
+: method      ( -- ) ;   \ object method
+: class       ( -- ) ;   \ object class
+: object      ( -- ) ;   \ an object
+: trait       ( -- ) ;   \ Rust trait
+: struct      ( -- ) ;   \ data structure
+: enum        ( -- ) ;   \ enumeration
+: closure     ( -- ) ;   \ a closure
+: lambda      ( -- ) ;   \ anonymous function
+: async       ( -- ) ;   \ asynchronous
+: await       ( -- ) ;   \ wait for async result
+: future      ( -- ) ;   \ async future
+: promise     ( -- ) ;   \ async promise
+: callback    ( -- ) ;   \ callback function
+
+: same      ( str1 str2 -- )  argue ;   \ kept: two sentences must agree
 
 "#;
 

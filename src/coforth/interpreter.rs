@@ -38,6 +38,10 @@ use anyhow::{bail, Result};
 // of `Cell` values in `Forth::memory`.  Jump targets are absolute indices
 // into that array — just like a CPU's instruction pointer.
 
+// Compile-time size check — Cell must stay ≤ 24 bytes for cache efficiency.
+// Two-index variants (TagPeer, SayInChannel, etc.) are the widest at 2×usize.
+const _: () = assert!(std::mem::size_of::<Cell>() <= 24);
+
 #[derive(Clone, Copy, Debug)]
 enum Cell {
     Lit(i64),           // push literal onto data stack
@@ -205,6 +209,7 @@ enum Builtin {
     Fill,    // ( addr n val -- )  fill n cells at addr with val
     Eval,    // ( str -- )    eval strings[pop()] as Forth source code
     Argue,     // ( str1 str2 -- )  run both, show what each got, assert they agree
+    Versus,    // ( str1 str2 -- )  run both, show FULL stacks side by side, assert they agree
     BothWays,  // ( a b str -- )   run op(a,b) and op(b,a), show both, assert they agree
     Page,      // ( str -- )    run a multi-line proof page: each line is "left | right"
     Resolve,   // ( str -- )    many sentences, one truth: all lines must converge to same value
@@ -251,6 +256,7 @@ pub struct Forth {
     rstack:     Vec<i64>,                // >r / r> scratch stack
     memory:     Vec<Cell>,               // flat code memory (von Neumann)
     strings:    Vec<String>,             // string-literal pool
+    string_dedup: HashMap<String, usize>, // reverse index for dedup (same literal → same idx)
     name_index: HashMap<String, usize>,  // word name → entry address in memory
     heap:       Vec<i64>,                // variable storage
     var_index:  HashMap<String, usize>,  // variable name → heap address
@@ -411,6 +417,11 @@ const STDLIB: &str = r#"
 \ Two programmers, each with their own program.  The stack settles it.
 \ Shows what each got.  If they agree: ✓.  If not: ✗ with both values.
 : argue  ( str1 str2 -- )  argue ;
+
+\ versus ( str1 str2 -- )
+\ Two machines run.  Both full stacks shown side by side.
+\ Agrees only if EVERY value matches — not just the top.
+: versus  ( str1 str2 -- )  versus ;
 
 \ both-ways ( a b str -- )
 \ Run op(a,b) and op(b,a) simultaneously.  Prove commutativity.
@@ -842,15 +853,16 @@ variable _tm  ( shared test memory cell )
 impl Forth {
     pub fn new() -> Self {
         let mut f = Forth {
-            data:       Vec::new(),
-            loop_stack: Vec::new(),
-            rstack:     Vec::new(),
-            memory:     Vec::new(),
-            strings:    Vec::new(),
-            name_index: HashMap::new(),
-            heap:       Vec::new(),
-            var_index:  HashMap::new(),
-            out:             String::new(),
+            data:       Vec::with_capacity(32),
+            loop_stack: Vec::with_capacity(8),
+            rstack:     Vec::with_capacity(8),
+            memory:     Vec::with_capacity(4096),
+            strings:    Vec::with_capacity(256),
+            string_dedup: HashMap::with_capacity(256),
+            name_index: HashMap::with_capacity(512),
+            heap:       Vec::with_capacity(64),
+            var_index:  HashMap::with_capacity(64),
+            out:        String::with_capacity(256),
             peers:           Vec::new(),
             source_log:      Vec::new(),
             log_definitions: false, // off during stdlib load
@@ -884,11 +896,34 @@ impl Forth {
         f
     }
 
+    /// Intern a string literal: return existing index if already pooled, else push.
+    #[inline]
+    fn intern_str(&mut self, s: &str) -> usize {
+        if let Some(&idx) = self.string_dedup.get(s) {
+            return idx;
+        }
+        let idx = self.strings.len();
+        let owned = s.to_string(); // single allocation
+        self.string_dedup.insert(owned.clone(), idx);
+        self.strings.push(owned);
+        idx
+    }
+
     /// Run Forth source and return collected output.
     pub fn run(source: &str) -> Result<String> {
         let mut f = Forth::new();
         f.eval(source)?;
         Ok(f.out)
+    }
+
+    /// Run a program on a precompiled VM; return (stack, output).
+    /// The stack is bottom-to-top; top is the "return value" — one number.
+    /// This is the Co-Forth wire contract: send a sentence, get back the stack.
+    pub fn run_on(vm: &mut Self, source: &str) -> Result<(Vec<i64>, String)> {
+        vm.eval(source)?;
+        let stack = vm.data.clone();
+        let output = std::mem::take(&mut vm.out);
+        Ok((stack, output))
     }
 
     /// Expose the data stack (for inspection).
@@ -1043,6 +1078,7 @@ impl Forth {
             rstack:     Vec::new(),
             memory:     self.memory.clone(),
             strings:    self.strings.clone(),
+            string_dedup: self.string_dedup.clone(),
             name_index: self.name_index.clone(),
             heap:       self.heap.clone(),
             var_index:  self.var_index.clone(),
@@ -1104,7 +1140,10 @@ impl Forth {
     /// The data stack is left as-is.
     pub fn restore(&mut self, snap: &DictionarySnapshot) {
         self.memory.truncate(snap.memory_len);
-        self.strings.truncate(snap.strings_len);
+        // Keep string_dedup consistent: remove entries for strings beyond snap.strings_len.
+        let strings_len = snap.strings_len;
+        self.string_dedup.retain(|_, v| *v < strings_len);
+        self.strings.truncate(strings_len);
         self.heap.truncate(snap.heap_len);
         self.name_index = snap.name_index.clone();
         self.var_index  = snap.var_index.clone();
@@ -1408,80 +1447,67 @@ impl Forth {
     /// Emit a single token as one or more cells into `self.memory`.
     fn emit_token(&mut self, tok: &str) -> Result<()> {
         if let Some(s) = tok.strip_prefix("\x00str:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::Str(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00push-str:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::PushStr(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00confirm:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::Confirm(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00select:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::SelectDialog(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00read:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::ReadFile(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00csv:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::ReadCsv(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00tsv:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::ReadTsv(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00xlsx:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::ReadXlsx(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00exec:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::ExecCmd(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00glob:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::GlobFiles(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00peer:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::AddPeer(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00scatter:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::ScatterExec(idx));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00symbol:") {
-            let idx = self.strings.len();
-            self.strings.push(s.to_string());
+            let idx = self.intern_str(s);
             self.memory.push(Cell::ScatterSymbol(idx));
             return Ok(());
         }
@@ -1702,13 +1728,13 @@ impl Forth {
                 Cell::Builtin(Builtin::Gt)    => { let (a,b) = pop2!(); self.data.push(if a  > b { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::ZeroEq) => { let a = self.pop()?; self.data.push(if a == 0 { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::ZeroLt) => { let a = self.pop()?; self.data.push(if a  < 0 { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::And)   => { let (a,b) = pop2!(); self.data.push(a & b); ip += 1; }
+                Cell::Builtin(Builtin::ZeroGt) => { let a = self.pop()?; self.data.push(if a  > 0 { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::And)   => { if self.data.len() >= 2 { let (a,b) = pop2!(); self.data.push(a & b); } ip += 1; }
                 Cell::Builtin(Builtin::Or)    => { let (a,b) = pop2!(); self.data.push(a | b); ip += 1; }
                 // ── Literals and string output ──
                 Cell::Lit(n) => { self.data.push(n); ip += 1; }
                 Cell::Str(idx) => {
-                    let s = self.strings[idx].clone();
-                    self.out.push_str(&s);
+                    self.out.push_str(&self.strings[idx]);
                     ip += 1;
                 }
                 Cell::PushStr(idx) => {
@@ -2302,7 +2328,7 @@ impl Forth {
             Builtin::ZeroEq => { let a = self.pop()?; self.data.push(if a == 0 { -1 } else { 0 }); }
             Builtin::ZeroLt => { let a = self.pop()?; self.data.push(if a < 0 { -1 } else { 0 }); }
             Builtin::ZeroGt => { let a = self.pop()?; self.data.push(if a > 0 { -1 } else { 0 }); }
-            Builtin::And   => { let b = self.pop()?; let a = self.pop()?; self.data.push(a & b); }
+            Builtin::And   => { if self.data.len() >= 2 { let b = self.pop()?; let a = self.pop()?; self.data.push(a & b); } }
             Builtin::Or    => { let b = self.pop()?; let a = self.pop()?; self.data.push(a | b); }
             Builtin::Xor   => { let b = self.pop()?; let a = self.pop()?; self.data.push(a ^ b); }
             Builtin::Invert => { let a = self.pop()?; self.data.push(!a); }
@@ -2312,7 +2338,7 @@ impl Forth {
             Builtin::Min   => { let b = self.pop()?; let a = self.pop()?; self.data.push(a.min(b)); }
             Builtin::Lshift => { let n = self.pop()?; let a = self.pop()?; self.data.push(a << (n & 63)); }
             Builtin::Rshift => { let n = self.pop()?; let a = self.pop()?; self.data.push(a >> (n & 63)); }
-            Builtin::Print  => { let a = self.pop()?; self.out.push_str(&format!("{a} ")); }
+            Builtin::Print  => { if let Some(a) = self.data.pop() { self.out.push_str(&format!("{a} ")); } }
             Builtin::PrintS => {
                 self.out.push_str(&format!("<{}> ", self.data.len()));
                 for n in &self.data { self.out.push_str(&format!("{n} ")); }
@@ -2365,9 +2391,13 @@ impl Forth {
             }
             Builtin::Argue => {
                 // ( str1 str2 -- )  two programmers, one stack.
-                // Runs each program on a CLEAN stack so depth-checking words
-                // (dual-mode: `depth 0= if noun else verb`) behave consistently
-                // regardless of what the caller has on the stack.
+                // Dual-mode: with two string indices on the stack, compares programs.
+                // With fewer than 2 items, prints "agreed." so natural language sentences
+                // like "humans argue about forth programs" run cleanly.
+                if self.data.len() < 2 {
+                    self.out.push_str("agreed.\n");
+                    return Ok(());
+                }
                 let idx2 = self.pop()? as usize;
                 let idx1 = self.pop()? as usize;
                 let code1 = self.strings.get(idx1).cloned()
@@ -2392,23 +2422,90 @@ impl Forth {
                 self.data = saved_data;
 
                 use crossterm::style::Stylize;
+                let fmt_val = |v: i64| -> String {
+                    match v {
+                        -1 => "true".to_string(),
+                         0 => "false".to_string(),
+                         n => n.to_string(),
+                    }
+                };
                 if result1 == result2 {
                     // Both arrows point at the same value — two directions, one proof.
                     self.out.push_str(&format!(
                         "  {}  ──→  {}  ←──  {}   {}\n",
                         code1.as_str().cyan(),
-                        result1.to_string().green().bold(),
+                        fmt_val(result1).green().bold(),
                         code2.as_str().cyan(),
                         "✓".green(),
                     ));
                 } else {
                     self.out.push_str(&format!(
                         "  {}  ──→  {}  ≠  {}  ←──  {}   {}\n",
-                        code1.as_str().cyan(), result1.to_string().red(),
-                        result2.to_string().red(), code2.as_str().cyan(),
+                        code1.as_str().cyan(), fmt_val(result1).red(),
+                        fmt_val(result2).red(), code2.as_str().cyan(),
                         "✗".red(),
                     ));
                     anyhow::bail!("argue: {} got {}, {} got {}", code1, result1, code2, result2);
+                }
+            }
+            Builtin::Versus => {
+                // ( str1 str2 -- )  run both machines, show FULL stacks side by side.
+                // Unlike `argue` (top-only), `versus` shows every value each machine produced.
+                // Agrees if both stacks are identical (depth + all values).
+                let idx2 = self.pop()? as usize;
+                let idx1 = self.pop()? as usize;
+                let code1 = self.strings.get(idx1).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("versus: invalid string index {idx1}"))?;
+                let code2 = self.strings.get(idx2).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("versus: invalid string index {idx2}"))?;
+
+                let saved_data = std::mem::take(&mut self.data);
+
+                self.eval(&code1)?;
+                let stack1: Vec<i64> = self.data.clone();
+                self.data.clear();
+
+                self.eval(&code2)?;
+                let stack2: Vec<i64> = self.data.clone();
+                self.data.clear();
+
+                self.data = saved_data;
+
+                use crossterm::style::Stylize;
+
+                // Format a stack as "[ a b c ]" or "[ ]" if empty.
+                let fmt_stack = |s: &Vec<i64>| -> String {
+                    if s.is_empty() {
+                        "[ ]".to_string()
+                    } else {
+                        let inner = s.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+                        format!("[ {} ]", inner)
+                    }
+                };
+
+                let s1 = fmt_stack(&stack1);
+                let s2 = fmt_stack(&stack2);
+                let agree = stack1 == stack2;
+
+                if agree {
+                    self.out.push_str(&format!(
+                        "  {}  →  {}  =  {}  ←  {}   {}\n",
+                        code1.as_str().cyan(),
+                        s1.green().bold(),
+                        s2.green().bold(),
+                        code2.as_str().cyan(),
+                        "✓".green(),
+                    ));
+                } else {
+                    self.out.push_str(&format!(
+                        "  {}  →  {}  ≠  {}  ←  {}   {}\n",
+                        code1.as_str().cyan(),
+                        s1.red(),
+                        s2.red(),
+                        code2.as_str().cyan(),
+                        "✗".red(),
+                    ));
+                    anyhow::bail!("versus: stacks differ\n  A: {}\n  B: {}", fmt_stack(&stack1), fmt_stack(&stack2));
                 }
             }
             Builtin::BothWays => {
@@ -3859,6 +3956,7 @@ impl Forth {
                 let mut pass = 0usize;
                 let mut fail = 0usize;
                 let mut fail_lines: Vec<String> = Vec::new();
+                let outer_fuel = self.fuel; // restore after inner evals reset it
                 for tw in &sorted {
                     let word_name = &tw["test:".len()..];
                     let saved = self.out.len();
@@ -3873,6 +3971,7 @@ impl Forth {
                         }
                     }
                 }
+                self.fuel = outer_fuel; // restore budget consumed by inner evals
                 use crossterm::style::Stylize;
                 for line in fail_lines {
                     self.out.push_str(&line);
@@ -3903,6 +4002,7 @@ impl Forth {
                 let mut pass = 0usize;
                 let mut fail = 0usize;
                 let mut fail_lines: Vec<String> = Vec::new();
+                let outer_fuel = self.fuel;
                 for tw in &sorted {
                     let word_name = &tw["test:".len()..];
                     let saved = self.out.len();
@@ -3917,6 +4017,7 @@ impl Forth {
                         }
                     }
                 }
+                self.fuel = outer_fuel;
                 use crossterm::style::Stylize;
                 for line in fail_lines {
                     self.out.push_str(&line);
@@ -4302,6 +4403,7 @@ impl Forth {
         self.memory.truncate(end - 1);
     }
 
+    #[inline(always)]
     fn pop(&mut self) -> Result<i64> {
         self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow"))
     }
@@ -5427,6 +5529,7 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "eval"           => Builtin::Eval,
         "argue"          => Builtin::Argue,
         "both-ways"      => Builtin::BothWays,
+        "versus"         => Builtin::Versus,
         "page"           => Builtin::Page,
         "resolve"        => Builtin::Resolve,
         "infix"          => Builtin::Infix,
@@ -5459,7 +5562,7 @@ fn tokenize(src: &str) -> Vec<String> {
     let mut chars = src.chars().peekable();
     let mut tok = String::new();
 
-    macro_rules! flush { () => { if !tok.is_empty() { tokens.push(tok.clone()); tok.clear(); } }; }
+    macro_rules! flush { () => { if !tok.is_empty() { tokens.push(std::mem::take(&mut tok)); } }; }
 
     while let Some(&c) = chars.peek() {
         if c == '\\' {
@@ -5810,6 +5913,10 @@ fn tokenize(src: &str) -> Vec<String> {
             chars.next();
         } else if c.is_whitespace() {
             flush!();
+            chars.next();
+        } else if c == '\'' {
+            // Apostrophe in natural-language contractions: that's → thats, we're → were.
+            // Skip it — the token accumulates without the apostrophe.
             chars.next();
         } else {
             tok.push(c);
@@ -7153,6 +7260,43 @@ mod tests {
         // eval runs the code in the string; side effects appear in output
         let out = Forth::run("s\" 42 .\" eval").unwrap();
         assert!(strip_ansi(&out).contains("42"));
+    }
+
+    #[test]
+    fn test_humans_argue_about_forth_programs_runs_cleanly() {
+        // Natural language: "humans argue about forth programs."
+        // `humans`, `about`, `programs` are no-ops; `argue` gracefully prints "agreed."
+        // when called without two string indices; `forth` pushes -1; `.` prints it.
+        // Must use the precompiled VM (MAJOR_WORDS_FORTH) not bare Forth::new().
+        let mut vm = crate::coforth::Library::precompiled_vm();
+        vm.exec("humans argue about forth programs .").unwrap();
+        let plain = strip_ansi(&vm.out);
+        assert!(plain.contains("agreed"), "expected 'agreed' in output: {plain}");
+        assert!(plain.contains("-1"), "expected forth's value to be printed: {plain}");
+    }
+
+    #[test]
+    fn test_i_am_a_grammar_defining_grammar_evaluates_true() {
+        // "I am a grammar defining grammar. That's what I am."
+        // Both sentences evaluate to -1 (true): `i` pushes -1, rest are no-ops.
+        // "I am forth. I write whatever code I want." — same machine.
+        let sentences: &[(&str, &str)] = &[
+            ("i am a grammar defining grammar .",   "-1"),
+            ("thats what i am .",                   "-1"),
+            ("i am forth .",                        "-1"),
+            ("i write whatever code i want .",      "-1"),
+            ("humans argue about forth programs .", "agreed."),
+        ];
+        for (src, expected) in sentences {
+            let mut vm = crate::coforth::Library::precompiled_vm();
+            vm.exec(src).unwrap_or_else(|e| panic!("{src} failed: {e}"));
+            let plain = strip_ansi(&vm.out);
+            assert!(
+                plain.contains(expected),
+                "sentence: {src}\n  expected '{}' in output: {plain}",
+                expected
+            );
+        }
     }
 
     #[test]

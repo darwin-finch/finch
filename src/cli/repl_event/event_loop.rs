@@ -811,6 +811,36 @@ impl EventLoop {
             // Restore words learned in previous sessions (from daemon or file).
             self.load_user_words().await;
 
+            // Dump the user's vocabulary — show them what they know.
+            {
+                let source = self.forth_vm.dump_source();
+                let words: Vec<&str> = source.lines()
+                    .filter(|l| l.trim_start().starts_with(':'))
+                    .filter_map(|l| l.trim_start_matches(':').trim().split_whitespace().next())
+                    .collect();
+                if !words.is_empty() {
+                    let word_list = words.iter()
+                        .map(|w| w.cyan().to_string())
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    self.output_manager.write_info(
+                        format!("your words: {}", word_list)
+                    );
+                }
+            }
+
+            // Show how much of the English language is currently proven.
+            {
+                let result = self.forth_vm.exec("prove-english");
+                let text = match result {
+                    Ok(ref s) => s.trim().to_string(),
+                    Err(_)    => String::new(),
+                };
+                if !text.is_empty() {
+                    self.output_manager.write_info(text);
+                }
+            }
+
             // Poll daemon every 4s for vocab changes from other concurrent terminals.
             self.spawn_vocab_poll();
 
@@ -850,20 +880,16 @@ impl EventLoop {
             self.forth_vm.set_confirm_fn(Box::new(move |msg: &str| {
                 let msg = msg.to_string();
                 let tui = tui_c.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async move {
-                            use crate::cli::tui::{Dialog, DialogResult};
-                            let dialog = Dialog::confirm(msg, false);
-                            matches!(
-                                tui.lock().await.show_dialog(dialog),
-                                Ok(DialogResult::Confirmed(true))
-                            )
-                        })
-                    })
-                } else {
-                    false
-                }
+                // futures::executor::block_on works on both current-thread and multi-thread
+                // runtimes, and inside LocalSet — unlike block_in_place which panics there.
+                futures::executor::block_on(async move {
+                    use crate::cli::tui::{Dialog, DialogResult};
+                    let dialog = Dialog::confirm(msg, false);
+                    matches!(
+                        tui.lock().await.show_dialog(dialog),
+                        Ok(DialogResult::Confirmed(true))
+                    )
+                })
             }));
 
             let tui_s = self.tui_renderer.clone();
@@ -871,23 +897,17 @@ impl EventLoop {
                 let title   = title.to_string();
                 let options = options.to_vec();
                 let tui     = tui_s.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    tokio::task::block_in_place(|| {
-                        handle.block_on(async move {
-                            use crate::cli::tui::{Dialog, DialogOption, DialogResult};
-                            let dialog_opts: Vec<DialogOption> = options.iter()
-                                .map(|o| DialogOption::new(o.as_str()))
-                                .collect();
-                            let dialog = Dialog::select(title, dialog_opts);
-                            match tui.lock().await.show_dialog(dialog) {
-                                Ok(DialogResult::Selected(idx)) => idx as i64,
-                                _ => -1,
-                            }
-                        })
-                    })
-                } else {
-                    -1
-                }
+                futures::executor::block_on(async move {
+                    use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+                    let dialog_opts: Vec<DialogOption> = options.iter()
+                        .map(|o| DialogOption::new(o.as_str()))
+                        .collect();
+                    let dialog = Dialog::select(title, dialog_opts);
+                    match tui.lock().await.show_dialog(dialog) {
+                        Ok(DialogResult::Selected(idx)) => idx as i64,
+                        _ => -1,
+                    }
+                })
             }));
         }
 
@@ -3450,23 +3470,17 @@ impl EventLoop {
         self.forth_vm.set_gen_fn(Box::new(move |prompt: &str| {
             let prompt = prompt.to_string();
             let gen = gen_handle.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        let messages = vec![crate::claude::Message {
-                            role: "user".to_string(),
-                            content: vec![crate::claude::ContentBlock::Text { text: prompt }],
-                        }];
-                        let g = gen.read().await;
-                        match g.generate(messages, None).await {
-                            Ok(resp) => resp.text,
-                            Err(e) => format!("(gen error: {e})\n"),
-                        }
-                    })
-                })
-            } else {
-                "(no async runtime)\n".to_string()
-            }
+            futures::executor::block_on(async move {
+                let messages = vec![crate::claude::Message {
+                    role: "user".to_string(),
+                    content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+                }];
+                let g = gen.read().await;
+                match g.generate(messages, None).await {
+                    Ok(resp) => resp.text,
+                    Err(e) => format!("(gen error: {e})\n"),
+                }
+            })
         }));
 
         // Wire the TUI dialog into the VM so select" title|opt1|opt2" works.
@@ -3475,23 +3489,17 @@ impl EventLoop {
             let title   = title.to_string();
             let options = options.to_vec();
             let tui     = tui_handle.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        use crate::cli::tui::{Dialog, DialogOption, DialogResult};
-                        let dialog_opts: Vec<DialogOption> = options.iter()
-                            .map(|o| DialogOption::new(o.as_str()))
-                            .collect();
-                        let dialog = Dialog::select(title, dialog_opts);
-                        match tui.lock().await.show_dialog(dialog) {
-                            Ok(DialogResult::Selected(idx)) => idx as i64,
-                            _ => -1,
-                        }
-                    })
-                })
-            } else {
-                -1
-            }
+            futures::executor::block_on(async move {
+                use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+                let dialog_opts: Vec<DialogOption> = options.iter()
+                    .map(|o| DialogOption::new(o.as_str()))
+                    .collect();
+                let dialog = Dialog::select(title, dialog_opts);
+                match tui.lock().await.show_dialog(dialog) {
+                    Ok(DialogResult::Selected(idx)) => idx as i64,
+                    _ => -1,
+                }
+            })
         }));
 
         // Snapshot before eval so the user can undo it
@@ -3591,21 +3599,39 @@ impl EventLoop {
             .await
             .ok()
             .and_then(|r| {
-                // Use blocking approach to get JSON within this async fn
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(r.json::<serde_json::Value>())
-                }).ok()
+                // Use spawn_blocking to safely parse JSON — works on both
+                // current-thread and multi-thread runtimes (block_in_place panics
+                // on current-thread).
+                futures::executor::block_on(r.json::<serde_json::Value>()).ok()
             })
             .and_then(|v| v["source"].as_str().map(|s| s.to_owned()))
             .filter(|s: &String| !s.is_empty());
 
         let source = daemon_source.or_else(|| {
             let path = dirs::home_dir().map(|mut p| { p.push(".finch"); p.push("user_words.forth"); p })?;
-            std::fs::read_to_string(path).ok().filter(|s: &String| !s.is_empty())
+            std::fs::read(path).ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', ""))
+                .filter(|s: &String| !s.is_empty())
         });
 
         if let Some(src) = source {
-            let _ = self.forth_vm.exec_with_fuel(&src, 0);
+            // Only load definitions for NEW words — never redefine anything already in the VM.
+            // This prevents AI-generated words from shadowing builtins, stdlib words, or
+            // Co-Forth vocabulary (e.g. `: over 3 5 over . ;` is recursive and breaks proofs).
+            let filtered: String = src.lines()
+                .filter(|line| {
+                    let t = line.trim();
+                    if t.starts_with(':') {
+                        let word = t[1..].trim().split_whitespace().next().unwrap_or("");
+                        // Block if the word is already defined in the VM (any source).
+                        !self.forth_vm.word_exists(word)
+                    } else {
+                        true
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let _ = self.forth_vm.exec_with_fuel(&filtered, 0);
             let count = self.forth_vm.dump_source().lines().count();
             tracing::debug!("Loaded {} user word(s) from daemon/file", count);
         }
