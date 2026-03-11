@@ -217,6 +217,14 @@ enum Builtin {
     ProveEnglish,             // ( -- )  run every English-library word body; report pass rate
     // Channel system
     ListChannels,             // ( -- )  print joined channels
+    // Collection operations
+    SortLines,                // ( idx -- idx' )  sort lines of strings[idx] alphabetically
+    UniqueLines,              // ( idx -- idx' )  deduplicate lines of strings[idx]
+    ReverseLines,             // ( idx -- idx' )  reverse line order of strings[idx]
+    LineCount,                // ( idx -- n )     number of lines in strings[idx]
+    GlobPool,                 // ( pattern-idx -- result-idx )  glob into string pool (one path per line)
+    CleanLines,               // ( idx -- n )  quarantine each path in strings[idx] (one per line); return count
+    GlobCount,                // ( pattern-idx -- n )  count files matching glob pattern
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
@@ -963,6 +971,19 @@ impl Forth {
     pub fn clear_data(&mut self) {
         self.data.clear();
     }
+
+    /// Check if a word name is in user_word_names (words that can shadow builtins).
+    #[cfg(test)]
+    pub fn is_user_word(&self, name: &str) -> bool {
+        self.user_word_names.contains(name)
+    }
+
+    /// Return the number of cells in memory (for diagnostics).
+    #[cfg(test)]
+    pub fn memory_len(&self) -> usize {
+        self.memory.len()
+    }
+
 
     /// Mark a word as callable by remote peers.
     pub fn mark_remote_ok(&mut self, word: &str) {
@@ -2335,7 +2356,9 @@ impl Forth {
             }
             Builtin::Argue => {
                 // ( str1 str2 -- )  two programmers, one stack.
-                // Runs each program, shows what it got, then asserts they agree.
+                // Runs each program on a CLEAN stack so depth-checking words
+                // (dual-mode: `depth 0= if noun else verb`) behave consistently
+                // regardless of what the caller has on the stack.
                 let idx2 = self.pop()? as usize;
                 let idx1 = self.pop()? as usize;
                 let code1 = self.strings.get(idx1).cloned()
@@ -2343,16 +2366,21 @@ impl Forth {
                 let code2 = self.strings.get(idx2).cloned()
                     .ok_or_else(|| anyhow::anyhow!("argue: invalid string index {idx2}"))?;
 
-                let depth_before = self.data.len();
+                // Save and clear the data stack so each program sees depth = 0.
+                let saved_data = std::mem::take(&mut self.data);
+
                 self.eval(&code1)?;
                 let result1 = self.data.last().copied()
                     .ok_or_else(|| anyhow::anyhow!("argue: first program left nothing on stack"))?;
-                self.data.truncate(depth_before);
+                self.data.clear();
 
                 self.eval(&code2)?;
                 let result2 = self.data.last().copied()
                     .ok_or_else(|| anyhow::anyhow!("argue: second program left nothing on stack"))?;
-                self.data.truncate(depth_before);
+                self.data.clear();
+
+                // Restore caller's stack.
+                self.data = saved_data;
 
                 use crossterm::style::Stylize;
                 if result1 == result2 {
@@ -4067,6 +4095,80 @@ impl Forth {
                 }
             }
 
+            // ── Collection operations ────────────────────────────────────────
+            Builtin::GlobPool => {
+                let pattern_idx = self.pop()? as usize;
+                let pattern = self.strings.get(pattern_idx).cloned().unwrap_or_default();
+                let mut result = String::new();
+                match glob::glob(&pattern) {
+                    Ok(paths) => {
+                        for path in paths.flatten() {
+                            result.push_str(&path.display().to_string());
+                            result.push('\n');
+                        }
+                    }
+                    Err(e) => result.push_str(&format!("glob error: {e}\n")),
+                }
+                let new_idx = self.strings.len() as i64;
+                self.strings.push(result);
+                self.data.push(new_idx);
+            }
+            Builtin::CleanLines => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx).cloned().unwrap_or_default();
+                let mut count = 0i64;
+                for line in s.lines() {
+                    let path = line.trim();
+                    if !path.is_empty() && quarantine_file(path) {
+                        count += 1;
+                    }
+                }
+                self.data.push(count);
+            }
+            Builtin::GlobCount => {
+                let idx = self.pop()? as usize;
+                let pattern = self.strings.get(idx).cloned().unwrap_or_default();
+                let count = glob::glob(&pattern)
+                    .map(|paths| paths.flatten().count())
+                    .unwrap_or(0) as i64;
+                self.data.push(count);
+            }
+            Builtin::SortLines => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx).cloned().unwrap_or_default();
+                let mut lines: Vec<&str> = s.lines().collect();
+                lines.sort_unstable();
+                let sorted = lines.join("\n");
+                let new_idx = self.strings.len() as i64;
+                self.strings.push(sorted);
+                self.data.push(new_idx);
+            }
+            Builtin::UniqueLines => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx).cloned().unwrap_or_default();
+                let mut seen = std::collections::HashSet::new();
+                let unique: Vec<&str> = s.lines().filter(|l| seen.insert(*l)).collect();
+                let result = unique.join("\n");
+                let new_idx = self.strings.len() as i64;
+                self.strings.push(result);
+                self.data.push(new_idx);
+            }
+            Builtin::ReverseLines => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx).cloned().unwrap_or_default();
+                let reversed: Vec<&str> = s.lines().rev().collect();
+                let result = reversed.join("\n");
+                let new_idx = self.strings.len() as i64;
+                self.strings.push(result);
+                self.data.push(new_idx);
+            }
+            Builtin::LineCount => {
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx).cloned().unwrap_or_default();
+                let count = if s.is_empty() { 0 } else { s.lines().count() } as i64;
+                self.data.push(count);
+            }
+
             // ── Security scanning ───────────────────────────────────────────
             Builtin::ScanFile => {
                 let path_idx = self.pop()? as usize;
@@ -5326,6 +5428,17 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "prove-all?"     => Builtin::ProveAllBool,
         "prove-english"  => Builtin::ProveEnglish,
         "channels"       => Builtin::ListChannels,
+        // Collection operations
+        "glob-pool"      => Builtin::GlobPool,
+        "clean-lines"    => Builtin::CleanLines,
+        "glob-count"     => Builtin::GlobCount,
+        "sort"           => Builtin::SortLines,
+        "sort-lines"     => Builtin::SortLines,
+        "unique"         => Builtin::UniqueLines,
+        "unique-lines"   => Builtin::UniqueLines,
+        "reverse"        => Builtin::ReverseLines,
+        "reverse-lines"  => Builtin::ReverseLines,
+        "line-count"     => Builtin::LineCount,
         _ => return None,
     })
 }

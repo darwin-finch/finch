@@ -128,8 +128,17 @@ pub fn spawn_input_task(
                                 tui.input_textarea = TuiRenderer::create_clean_textarea();
                                 Ok(Some(current_text))
                             }
-                            // Priority 1: Handle active dialog (if any)
-                            else if tui.active_dialog.is_some() {
+                            // Priority 1: Handle active dialog (if any).
+                            // Exception: plain Enter (no modifier) submits the user's query
+                            // even when a brain-question dialog is active.  The dialog is
+                            // dismissed with Cancelled so the brain gets "[no answer]" and
+                            // the user's input is not blocked.  Tool-approval dialogs still
+                            // block submission because the input is empty while they are open.
+                            else if tui.active_dialog.is_some()
+                                && !(key.code == KeyCode::Enter
+                                    && !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                                    && !tui.input_textarea.lines().join("").trim().is_empty())
+                            {
                                 let dialog_result = if let Some(dialog) = tui.active_dialog.as_mut()
                                 {
                                     dialog.handle_key_event(key)
@@ -162,7 +171,15 @@ pub fn spawn_input_task(
                                     first_event_modified_input = true; // Mark for render
                                     Ok(None)
                                 } else {
-                                    // Enter without Shift: Submit input
+                                    // Enter without Shift: Submit input.
+                                    // If a brain-question dialog is still active, dismiss it
+                                    // with Cancelled so the brain gets "[no answer]" and the
+                                    // user's query goes through unblocked.
+                                    if tui.active_dialog.is_some() {
+                                        tui.active_dialog = None;
+                                        tui.pending_dialog_result =
+                                            Some(crate::cli::tui::DialogResult::Cancelled);
+                                    }
                                     let input = tui.input_textarea.lines().join("\n");
                                     if !input.trim().is_empty() {
                                         // Add to command history

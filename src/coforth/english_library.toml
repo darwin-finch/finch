@@ -5114,14 +5114,12 @@ word = "true"
 definition = "a logical value representing affirmation"
 related = ["false", "and", "or", "bool"]
 kind = "logical"
-forth = 'true .bool cr'
 
 [[word]]
 word = "false"
 definition = "a logical value representing negation"
 related = ["true", "and", "or", "bool"]
 kind = "logical"
-forth = 'false .bool cr'
 
 [[word]]
 word = "conjunction"
@@ -5156,56 +5154,56 @@ word = "contradiction"
 definition = "a statement that is always false"
 related = ["false", "tautology", "logic", "invalid"]
 kind = "logical"
-forth = 'false .bool cr'
+forth = '0 .bool cr'
 
 [[word]]
 word = "tautology"
 definition = "a statement that is always true"
 related = ["true", "contradiction", "logic", "valid"]
 kind = "logical"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "valid"
 definition = "logically sound and correct"
 related = ["true", "provable", "consistent", "tautology"]
 kind = "logical"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "consistent"
 definition = "free from contradiction"
 related = ["valid", "satisfiable", "true", "logic"]
 kind = "logical"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "satisfiable"
 definition = "capable of being made true"
 related = ["true", "consistent", "valid", "logic"]
 kind = "logical"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "provable"
 definition = "able to be demonstrated logically"
 related = ["valid", "true", "axiom", "logic"]
 kind = "logical"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "axiom"
 definition = "a self-evident truth"
 related = ["true", "provable", "basis", "logic"]
 kind = "logical"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "universal"
 definition = "applicable everywhere or in all cases"
 related = ["general", "global", "common"]
 kind = "quality"
-forth = 'true .bool'
+forth = '-1 .bool'
 
 [[word]]
 word = "particular"
@@ -5276,7 +5274,7 @@ word = "rights"
 definition = "entitlements or permissions"
 related = ["entitlements", "privileges", "freedoms"]
 kind = "principle"
-forth = 'true .bool'
+forth = '-1 .bool'
 
 [[word]]
 word = "authority"
@@ -6419,14 +6417,14 @@ word = "enable"
 definition = "to make something possible or operational"
 related = ["activate", "allow", "permit", "start"]
 kind = "action"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "disable"
 definition = "to make something inoperative or impossible"
 related = ["deactivate", "block", "stop", "restrict"]
 kind = "action"
-forth = 'false .bool cr'
+forth = '0 .bool cr'
 
 [[word]]
 word = "own"
@@ -6706,14 +6704,14 @@ word = "sun"
 definition = "star providing light and heat"
 related = ["star", "light", "day", "radiance"]
 kind = "observation"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "moon"
 definition = "satellite orbiting Earth"
 related = ["satellite", "night", "orbit", "phase"]
 kind = "observation"
-forth = 'false .bool cr'
+forth = '0 .bool cr'
 
 [[word]]
 word = "contrapositive"
@@ -7013,14 +7011,14 @@ word = "believe"
 definition = "to accept something as true"
 related = ["trust", "accept", "faith", "conviction"]
 kind = "cognitive"
-forth = 'true .bool cr'
+forth = '-1 .bool cr'
 
 [[word]]
 word = "doubt"
 definition = "to lack confidence or certainty"
 related = ["uncertainty", "skepticism", "question", "hesitate"]
 kind = "cognitive"
-forth = 'false .bool cr'
+forth = '0 .bool cr'
 
 [[word]]
 word = "choose"

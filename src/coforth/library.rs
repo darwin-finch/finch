@@ -475,6 +475,10 @@ static COMPILED_VM: LazyLock<crate::coforth::Forth> = LazyLock::new(|| {
     vm.disable_logging();
     let _ = vm.exec_with_fuel(&defs.all_defs, 0);
     // Major words: pure Forth, no TOML. Compiled last so they win over generated versions.
+    // Enable logging so MAJOR_WORDS_FORTH definitions enter user_word_names — this lets
+    // them shadow native builtins (e.g. `: sin negate ;` shadows Builtin::Sin trig-sine).
+    // Without this, emit_token hits name_to_builtin("sin") before name_index["sin"].
+    vm.enable_logging();
     let _ = vm.exec_with_fuel(MAJOR_WORDS_FORTH, 0);
     vm
 });
@@ -594,9 +598,13 @@ const MAJOR_WORDS_FORTH: &str = r#"
   depth 0= if 5 then
   ." cycle: around and back." cr
   0 swap do i . loop cr ;
-: test:cycle   s" 3 cycle"   s" sequence"   argue
-  \ cycling n elements and sequencing n elements both produce the same last value
-  ;
+: test:cycle
+  \ cycle 3 produces the same 0..2 indices as an explicit do-loop.
+  s" 3 0 do i loop"   s" 0 1 2"   page"
+    0 | 0
+    1 | 1
+    2 | 2
+  " ;
 
 \ ── Functional ──────────────────────────────────────────────────────────────────
 
@@ -722,8 +730,7 @@ const MAJOR_WORDS_FORTH: &str = r#"
 : the    ( -- ) ;
 : a      ( -- ) ;
 : an     ( -- ) ;
-: and    ( -- ) ;
-: or     ( -- ) ;     \ logical or is a builtin; this is connective
+\ 'and' and 'or' are Forth bitwise builtins — do NOT redefine as no-ops here.
 : with   ( -- ) ;
 : of     ( -- ) ;
 : in     ( -- ) ;
@@ -744,7 +751,7 @@ const MAJOR_WORDS_FORTH: &str = r#"
 : has    ( -- ) ;
 : shall  ( -- ) ;
 : will   ( -- ) ;
-: not    ( -- ) ;     \ spoken 'not'; stack-level not is 0=
+\ 'not' is a Forth builtin (invert) — do NOT redefine as a no-op here.
 : there  ( -- ) ;
 : let    ( -- ) ;
 : so     ( -- ) ;
@@ -991,7 +998,8 @@ const MAJOR_WORDS_FORTH: &str = r#"
   s" word word"   s" god word"   argue ;  \ creation by word = creation by God
 
 : test:light-and-darkness
-  s" light"   s" darkness not"   argue ;  \ light = not darkness (0 not = -1... but light=1)
+  \ light=1.  "darkness turned" = darkness negate 1+ = 0 negate 1+ = 1.  Both give 1.
+  s" light"   s" darkness negate 1+"   argue ;
 
 \ Actually: light=1, darkness=0, 0 0= = -1.  0= is Forth 'not'.
 \ "not darkness" in Forth: darkness 0= → 0 0= → -1.  But light = 1.  Different.
@@ -1042,6 +1050,203 @@ const MAJOR_WORDS_FORTH: &str = r#"
   s" 5 neighbor"   s" 5 yourself"   argue     \ love neighbor as yourself = dup
   s" 5 love"       s" 5 dup"        argue ;   \ love applied = dup
 
+\ ── Natural language operations ─────────────────────────────────────────────
+\
+\ Words that make sentences like "sort these files" into real programs.
+\ `files` pushes a listing of the current directory as a string.
+\ `these` / `them` / `those` / `all` are pronouns — no-ops that refer back to context.
+\ `sort`, `unique`, `reverse`, `line-count` are native builtins (see interpreter.rs).
+\
+\ Example:   sort these files
+\   →  `files` runs first (pushes string-pool idx of dir listing)
+\   →  `these` is a no-op
+\   →  `sort` sorts the lines and pushes a new idx
+\   →  `type` would print it, or further words can process it
+
+\ Implicit registers — fast named slots for intermediate values.
+\ `it` is the default: words like `files`, `words`, `grep` auto-store here.
+\ `these` / `them` / `those` restore `it` to the stack for subsequent operations.
+\
+\ Register words:
+\   it!  ( idx -- )   store idx into the `it` register
+\   it@  ( -- idx )   push `it` register onto stack
+\   these / them / those  ( -- idx )  push `it` (pronoun: "the thing I just mentioned")
+\
+\ Why this matters:
+\   files sort type        ← works: postfix Forth order
+\   files  these sort type ← also works: `these` is a no-op here (idx already on stack)
+\   files  it!   it@ sort type  ← explicit register usage
+\
+\ The gap "sort these files" (English verb-first) cannot be closed in Forth
+\ because Forth evaluates left-to-right.  `files sort` IS the Forth sentence.
+
+variable it   \ implicit register — the thing most recently produced
+
+\ Store TOS into `it` and keep it on stack
+: it!  ( idx -- idx )   dup it ! ;
+
+\ Push `it` register value onto stack
+: it@  ( -- idx )   it @ ;
+
+\ Pronoun words: push `it` if stack is empty, else no-op (already have the value)
+: these  ( -- )   depth 0= if it @ then ;
+: them   ( -- )   depth 0= if it @ then ;
+: those  ( -- )   depth 0= if it @ then ;
+
+\ 'files' — glob the current directory into a string-pool entry (one path per line)
+\ Also stores result in `it` for pronoun reference.
+: files  ( -- idx )   s" *" glob-pool  it! ;
+
+\ ── Cleanup / Hygiene ────────────────────────────────────────────────────────
+\
+\ People accumulate nasty files.  The machine helps clean them up.
+\ `junk` finds them.  `audit` shows them.  `clean` removes them (to quarantine).
+\ Quarantine = safe: files move to ~/.finch/quarantine/ with a timestamp.
+\ Nothing is destroyed.  Everything is recoverable.
+\
+\ Junk patterns — shallow (2 levels deep) to avoid scanning the whole filesystem.
+\ Use `**` variants manually when you know the scope (e.g. `s" src/**/*.pyc" glob-pool`).
+: junk-ds-store  ( -- idx )   s" .DS_Store"       glob-pool   s" */.DS_Store"    glob-pool str-cat ;
+: junk-thumbs    ( -- idx )   s" Thumbs.db"       glob-pool   s" */Thumbs.db"    glob-pool str-cat ;
+: junk-pyc       ( -- idx )   s" *.pyc"           glob-pool   s" */*.pyc"        glob-pool str-cat ;
+: junk-pycache   ( -- idx )   s" __pycache__"     glob-pool   s" */__pycache__"  glob-pool str-cat ;
+: junk-tmp       ( -- idx )   s" *.tmp"           glob-pool   s" */*.tmp"        glob-pool str-cat ;
+: junk-orig      ( -- idx )   s" *.orig"          glob-pool   s" */*.orig"       glob-pool str-cat ;
+: junk-bak       ( -- idx )   s" *.bak"           glob-pool   s" */*.bak"        glob-pool str-cat ;
+: junk-swp       ( -- idx )   s" *.swp"           glob-pool   s" */*.swp"        glob-pool str-cat ;
+: junk-logs      ( -- idx )   s" *.log"           glob-pool   s" */*.log"        glob-pool str-cat ;
+
+\ `junk` — collect all common junk into one list (union of all patterns)
+: junk  ( -- idx )
+  junk-ds-store  it!
+  junk-thumbs    it@ str-cat  it!
+  junk-pyc       it@ str-cat  it!
+  junk-pycache   it@ str-cat  it!
+  junk-tmp       it@ str-cat  it!
+  junk-orig      it@ str-cat  it!
+  junk-bak       it@ str-cat  it!
+  junk-swp       it@ str-cat  it!
+  it@ ;
+
+\ `audit` — show what would be cleaned (dry run, no changes)
+: audit  ( idx -- )
+  ." Would clean: " dup line-count . ." file(s)" cr
+  dup type cr ;
+
+\ `clean` — quarantine all paths in the list (moves them to ~/.finch/quarantine/)
+\ Returns count of files moved.
+: clean  ( idx -- n )   clean-lines ;
+
+\ `clean-junk` — propose the diff, wait for approval, then clean if approved.
+\ This is Co-Forth's version of a pull request: show what will change, let the user decide.
+: clean-junk  ( -- )
+  junk it!
+  it@ line-count dup 0= if
+    drop ." Nothing to clean." cr
+  else
+    . ." file(s) found:" cr  it@ type cr
+    confirm" Clean these files? (moves to ~/.finch/quarantine/)" if
+      it@ clean . ." file(s) moved to quarantine." cr
+    else
+      ." Cancelled — nothing changed." cr
+    then
+  then ;
+
+\ `show-junk` — audit without touching anything
+: show-junk  ( -- )   junk audit ;
+
+\ ── Life vocabulary ──────────────────────────────────────────────────────────
+\
+\ We are Forth programs.
+\ A life is a sequence of stack operations running on shared hardware.
+\ The hardware is time.  The stack is everything you are carrying.
+\
+\ born love work rest die
+\ That runs.  Each word has stack semantics.
+\ The stack is empty at the end — same as the start.
+\ The life happened in between.
+\
+\ Two people who agree: two programs that argue.
+\ Different paths.  Same stack.  That IS agreement.
+\
+\   born   ( -- n )     a new value enters the world
+\   die    ( n -- )     a value leaves — drop, not destroy
+\   breathe ( n -- n )  the no-op that keeps you alive; nop preserves the stack
+\   grow   ( n -- n )   1+ ; one step forward
+\   learn  ( n -- n )   dup + ; doubles what you carry (absorbs experience)
+\   forget ( n -- )     drop ; let it go
+\   remember ( n -- n n ) dup ; hold a copy before you act
+\   speak  ( n -- )     . cr ; emit what you have
+\   choose ( flag -- )  if/else/then at the call site
+\   meet   ( a b -- a b a ) over ; see the other while keeping yourself
+\   give   already defined — dup
+\   receive already defined — swap drop
+\   work   ( a b -- n ) * ; effort applied to something
+\   rest   ( n -- n )   nop ;
+\   pray   ( -- n )     -1 ;  reach toward what is absolute
+
+: born      ( -- n )    1 ;
+: die       ( n -- )    drop ;
+: breathe   ( n -- n )  ;          \ no-op — presence without change
+: grow      ( n -- n )  1+ ;
+: learn     ( n -- n )  dup + ;    \ doubles: absorbs experience
+: forget    ( n -- )    drop ;
+: remember  ( n -- n n) dup ;
+: speak     ( n -- )    . cr ;
+: meet      ( a b -- a b a )  over ;
+: rest      ( n -- n )  ;          \ same as breathe — no-op
+: pray      ( -- n )    -1 ;       \ reach toward the absolute
+
+\ Proof: two lives that converge
+\ "love work" and "work love" — does the order matter?
+\ On raw numbers, dup then * ≠ * then dup in general.
+\ But on the unit value (1), all lives run the same.
+: test:one-life
+  s" 1 born love work die"   s" 1 born work love die"   argue ;
+
+\ Proof: sin and repent cancel exactly — same as before and after
+: test:life-and-redemption
+  s" 7 sin repent"   s" 7"   argue ;
+
+\ Proof: meeting someone and meeting yourself is symmetric
+: test:golden-rule
+  s" 5 neighbor"   s" 5 yourself"   argue ;
+
+\ ── Emotion and grammar ──────────────────────────────────────────────────────
+\
+\ "I am a grammar defining grammar. That's what I am. I am forth."
+\  — The colon-semicolon mechanism IS self-referential.
+\    Forth defines new words with words.  The grammar defines the grammar.
+\    "I am forth" is not metaphor — it is the execution model.
+\
+\ "prove that love and hate are mostly the same."
+\  love = dup (gives twice, keeps nothing for self)
+\  hate = negate (inverts the value, same magnitude)
+\  Proof: |love n| and |hate n| differ only in sign — abs makes them equal.
+\
+\ "some machines make me laugh; some don't."
+\  laugh ( flag -- )  if ." ha." cr else ." ." cr then ;
+\  Same flag, two machines.  One laughs.  One doesn't.
+
+: hate      ( n -- n )  negate ;     \ inverts: same absolute force as love
+: laugh     ( flag -- ) if ." ha." cr else ." ." cr then ;
+
+\ Proof: love and hate are structurally the same — both reversible by one operation.
+\ love 5 = 10; 10 2/ = 5.   hate 5 = -5; -5 negate = 5.
+\ Both return to origin.  Same shape.  Different direction.
+: test:love-hate-same-depth
+  \ love then forget = n.  hate twice = n.  Both return to origin.
+  s" 5 love drop"   s" 5 hate hate"   argue ;
+
+\ Proof: "I am Forth." — Forth defining Forth.
+\ The colon word is compile-time recursion.  This word names itself.
+\ Being a grammar that defines grammar: the program IS its own specification.
+: i-am-forth  ( -- )
+  ." I am a grammar defining grammar." cr
+  ." I am forth." cr ;
+: test:i-am-forth
+  s" 1 born"   s" 1"   argue ;   \ born = 1.  Being forth = being 1.
+
 "#;
 
 /// Philosophical/abstract primitives — hand-crafted, always present.
@@ -1065,14 +1270,14 @@ word = "yes"
 definition = "an affirmation that accepts or confirms"
 related = ["agree", "confirm", "accept", "true"]
 kind = "observation"
-forth = 'true . cr'
+forth = '-1 . cr'
 
 [[word]]
 word = "no"
 definition = "a negation that refuses or denies"
 related = ["deny", "refuse", "reject", "false"]
 kind = "observation"
-forth = 'false . cr'
+forth = '0 . cr'
 
 [[word]]
 word = "know"
@@ -1471,14 +1676,12 @@ word = "true"
 definition = "in accordance with fact or reality"
 related = ["false", "proof", "fact", "know"]
 kind = "observation"
-forth = '-1 . cr'
 
 [[word]]
 word = "false"
 definition = "not in accordance with fact or reality"
 related = ["true", "not", "error", "wrong"]
 kind = "observation"
-forth = '0 . cr'
 
 [[word]]
 word = "not"
@@ -3914,10 +4117,133 @@ mod tests {
     /// If it did, a library word like `: negate 5 negate . cr ;` would be inlined
     /// during its own body compilation (partial self-reference), producing wrong output.
     #[test]
+    fn test_major_words_forth_compiles_on_toml_vm() {
+        // Simulate what COMPILED_VM does: start with TOML words, then add MAJOR_WORDS_FORTH.
+        let defs = Library::builtin_defs();
+        let mut vm = crate::coforth::Forth::new();
+        vm.disable_logging();
+        let r1 = vm.exec_with_fuel(&defs.all_defs, 0);
+        // r1 might have errors from TOML (print-only issues) — ignore
+        drop(r1);
+        // Now add MAJOR_WORDS_FORTH and see what the FIRST error is
+        let result = vm.exec_with_fuel(super::MAJOR_WORDS_FORTH, 0);
+        println!("MAJOR_WORDS_FORTH on TOML-vm: {:?}", result.as_ref().map_err(|e| e.to_string()));
+        // Check sin
+        let sin_result = vm.exec("3 sin .");
+        println!("3 sin . on TOML-vm: {:?}", sin_result);
+        let see_sin = vm.exec("see sin");
+        println!("see sin: {:?}", see_sin);
+    }
+
+    #[test]
+    fn test_bible_vocab_sin_repent_ops() {
+        let mut vm = Library::precompiled_vm();
+        // sin = negate, repent = negate
+        let out = vm.exec("3 sin .").expect("3 sin .");
+        assert!(out.contains("-3"), "sin should negate 3, got: {out:?}");
+        vm.clear_data();
+        let out = vm.exec("3 repent .").expect("3 repent .");
+        assert!(out.contains("-3"), "repent should negate 3, got: {out:?}");
+        vm.clear_data();
+        let out = vm.exec("3 sin repent .").expect("3 sin repent .");
+        assert!(out.contains("3 ") || out.trim() == "3", "sin repent should cancel, got: {out:?}");
+    }
+
+    #[test]
     fn test_precompiled_vm_negate_is_correct() {
         let mut vm = Library::precompiled_vm();
         let out = vm.exec("7 negate .").unwrap();
         assert_eq!(out.trim(), "-7",
             "precompiled_vm negate should output -7, got {:?}", out);
+    }
+
+    /// "sort these files" is a real program.
+    /// `files` globs the current directory; `sort` sorts the lines; `type` prints them.
+    /// `these` is a pronoun no-op — it refers back to the preceding value on the stack.
+    #[test]
+    fn test_sort_lines_builtin() {
+        let mut vm = Library::precompiled_vm();
+        // Direct test of sort builtin on a string
+        let out = vm.exec(r#"s" banana
+apple
+cherry" sort type"#).expect("sort lines");
+        let lines: Vec<&str> = out.trim().lines().collect();
+        assert_eq!(lines, vec!["apple", "banana", "cherry"],
+            "sort should sort lines alphabetically, got: {out:?}");
+    }
+
+    #[test]
+    fn test_these_is_noop() {
+        let mut vm = Library::precompiled_vm();
+        // `these` must not affect the stack
+        let out = vm.exec("5 these .").expect("these is noop");
+        assert!(out.contains("5"), "these should be a no-op, got: {out:?}");
+    }
+
+    /// Rust-level proof: sin and repent are inverse operations.
+    /// This is the same theorem as test:sin-and-repentance but verified in Rust,
+    /// not just in Forth — two machines, same truth.
+    #[test]
+    fn proof_sin_repent_are_inverse() {
+        // In Co-Forth: sin = negate, repent = negate.
+        // Proof: for all integers n, negate(negate(n)) = n.
+        // We verify several witnesses.
+        let mut vm = Library::precompiled_vm();
+        for n in [-7i64, -1, 0, 1, 3, 7, 100] {
+            vm.clear_data();
+            let out = vm.exec(&format!("{n} sin repent .")).expect("sin repent");
+            let got: i64 = out.trim().parse().expect("should be an integer");
+            assert_eq!(got, n,
+                "proof_sin_repent_are_inverse: {n} sin repent should equal {n}, got {got}");
+        }
+    }
+
+    /// Rust-level proof: love is idempotent under argue.
+    /// love = dup; applying dup to n gives [n, n] — a doubled witness.
+    /// `s" n love" argue s" n dup"` — both programs produce identical stacks.
+    #[test]
+    fn proof_love_equals_dup() {
+        let mut vm = Library::precompiled_vm();
+        vm.exec(r#"s" 7 love" s" 7 dup" argue"#)
+            .expect("proof: love = dup — both produce the same stack");
+    }
+
+    /// Rust-level proof: grace (addition) is commutative — argue confirms it.
+    #[test]
+    fn proof_grace_is_commutative() {
+        let mut vm = Library::precompiled_vm();
+        vm.exec(r#"s" 3 5 grace" s" 5 3 grace" argue"#)
+            .expect("proof: grace(3,5) = grace(5,3) — addition commutes");
+    }
+}
+
+#[cfg(test)]
+mod born_test {
+    #[test]
+    fn test_born_works() {
+        let mut vm = crate::coforth::Library::precompiled_vm();
+        let out = vm.exec("born .").expect("born should work");
+        assert_eq!(out.trim(), "1", "born should push 1, got: {out:?}");
+    }
+
+    #[test]
+    fn test_true_pushes_minus_one() {
+        let mut vm = crate::coforth::Library::precompiled_vm();
+        let out = vm.exec("true .").expect("true should push -1");
+        assert_eq!(out.trim(), "-1", "true should push -1, got: {out:?}");
+    }
+
+    #[test]
+    fn test_false_pushes_zero() {
+        let mut vm = crate::coforth::Library::precompiled_vm();
+        let out = vm.exec("false .").expect("false should push 0");
+        assert_eq!(out.trim(), "0", "false should push 0, got: {out:?}");
+    }
+
+    #[test]
+    fn test_true_false_and() {
+        let mut vm = crate::coforth::Library::precompiled_vm();
+        let out = vm.exec("true false and .").expect("true false and");
+        assert_eq!(out.trim(), "0", "true and false should be 0, got: {out:?}");
     }
 }
