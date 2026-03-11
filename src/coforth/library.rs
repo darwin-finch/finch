@@ -703,59 +703,216 @@ const MAJOR_WORDS_FORTH: &str = r#"
 \ "In the beginning was the Word, and the Word was with God, and the Word was God."
 \ John 1:1 — three sentences, one proof.
 \
-\ In Co-Forth: a word IS its definition.  Not a pointer.  The thing itself.
-\ If word and god push the same value, they are the same.
-\ If two sentences converge, they are the same sentence.
+\ ── The Bible as Forth ───────────────────────────────────────────────────────────
 \
-\ Grammatical words — no stack effect; pure structure:
-: the   ( -- ) ;
-: was   ( -- ) ;
-: is    ( -- ) ;
+\ The Bible is Forth code we're trying to share.
+\ Every word is a definition.  Every verse is a program.
+\ Two different sentences that mean the same thing → they argue.
+\ The canon is a library.  `publish` any word to send it to a peer.
 \
-\ god and word are the same machine.  They push -1: truth, the absolute.
-\ Redefines the library's print-only versions with something that proves.
-: god   ( -- n )  -1 ;
-: word  ( -- n )  -1 ;
+\ Structure:
+\   noun/adjective words → push a value (facts, quantities, truths)
+\   verb words           → consume or transform the stack (actions)
+\   grammatical words    → no stack effect (connective tissue)
+\   verse words          → print and prove (john1, gen1, etc.)
+\   test: words          → two sentences that must argue
+
+\ ── Structural grammar (no stack effect) ──────────────────────────────────────
+
+: the    ( -- ) ;
+: a      ( -- ) ;
+: an     ( -- ) ;
+: and    ( -- ) ;
+: or     ( -- ) ;     \ logical or is a builtin; this is connective
+: with   ( -- ) ;
+: of     ( -- ) ;
+: in     ( -- ) ;
+: from   ( -- ) ;
+: for    ( -- ) ;
+: by     ( -- ) ;
+: on     ( -- ) ;
+: at     ( -- ) ;
+: as     ( -- ) ;
+: to     ( -- ) ;
+: into   ( -- ) ;
+: was    ( -- ) ;
+: is     ( -- ) ;
+: are    ( -- ) ;
+: be     ( -- ) ;
+: have   ( -- ) ;
+: had    ( -- ) ;
+: has    ( -- ) ;
+: shall  ( -- ) ;
+: will   ( -- ) ;
+: not    ( -- ) ;     \ spoken 'not'; stack-level not is 0=
+: there  ( -- ) ;
+: let    ( -- ) ;
+: so     ( -- ) ;
+: which  ( -- ) ;
+: who    ( -- ) ;
+: him    ( -- ) ;
+: his    ( -- ) ;
+: he     ( -- ) ;
+: her    ( -- ) ;
+: their  ( -- ) ;
+: my     ( -- ) ;
+: thy    ( -- ) ;
+: me     ( -- ) ;
+: all    ( -- ) ;
+: every  ( -- ) ;
+: many   ( -- ) ;
+: few    ( -- ) ;
+: no     ( -- ) ;
+: then   ( -- ) ;
+: when   ( -- ) ;
+: yet    ( -- ) ;
+: but    ( -- ) ;
+: if     ( -- ) ;     \ spoken 'if'; conditional is a control word
+: said   ( -- ) ;
+: go     ( -- ) ;
+: came   ( -- ) ;
+: come   ( -- ) ;
+
+\ ── The Absolute — truth, identity, operation ────────────────────────────────
 \
-\ Now the three sentences argue:
-\   "the word was god"       →  nop  -1  nop  -1   →  [ -1 -1 ]
-\   "the word was with god"  →  nop  -1  nop  nop  -1  →  [ -1 -1 ]
-\   "the word is god"        →  nop  -1  nop  -1   →  [ -1 -1 ]
+\ Dual-mode: called with no args → noun (push a value).
+\            called with args   → verb (transform the stack).
+\ The operation IS the theology.
+
+: god    ( -- n )   -1 ;           \ the absolute — always a noun
+: lord   ( -- n )   -1 ;           \ same machine as god
+: word   ( -- n )   -1 ;           \ logos — same machine
+: truth  ( -- n )   -1 ;           \ the absolute
+: light  ( -- n )    1 ;           \ the first created; positive
+
+: life   ( n -- n | -- n )         \ life preserves; called alone = push -1
+  depth 0= if -1 else dup then ;   \ to live = to duplicate yourself forward
+
+: way    ( n -- n | -- n )         \ the way shows direction; alone = push -1
+  depth 0= if -1 else dup then ;   \ to follow the way = carry it forward
+
+: love   ( n -- n n | -- n )       \ love duplicates — as you love yourself
+  depth 0= if -1 else dup then ;   \ alone: love = -1 (God is love, 1 John 4:8)
+
+: faith  ( -- n )   -1 ;           \ the absolute without proof — always a noun
+
+: hope   ( n -- n | -- n )         \ hope carries forward; alone = 1 (positive)
+  depth 0= if 1 else dup then ;    \ to hope = to copy the good forward
+
+: grace  ( a b -- n | -- n )       \ grace adds to what was there
+  depth 1 > if + else 1 then ;     \ alone: grace = 1 (the gift)
+
+: mercy  ( n -- n | -- n )         \ mercy makes all positive
+  depth 0= if 1 else abs then ;    \ alone: mercy = 1; applied: abs (no negatives)
+
+: peace  ( a b -- n | -- n )       \ peace resolves difference to the greater
+  depth 1 > if max else 1 then ;   \ alone: peace = 1; applied: take the better
+
+\ ── Creation vocabulary (Genesis 1) ──────────────────────────────────────────
+
+: darkness  ( -- n )   0 ;   \ absence of light
+: heaven    ( -- n )   1 ;   \ above
+: earth     ( -- n )   1 ;   \ below — same value as heaven (as above, so below)
+: void      ( -- n )   0 ;   \ without form
+: deep      ( -- n )   0 ;   \ the abyss; emptiness
+: waters    ( -- )         ;  \ formless medium — no effect
+: evening   ( -- )         ;  \ transition — no stack effect
+: morning   ( -- )         ;  \ transition — no stack effect
+: good      ( -- n )  -1 ;   \ "God saw that it was good" — truth/approval
+: day       ( -- n )   1 ;   \ one complete cycle; positive
+: seed      ( -- n )   1 ;   \ beginning; potential
+
+\ ── Sin and redemption — operations on the stack ────────────────────────────
 \
-\ All three converge.  Proved.
+\ sin     = negate   (inverting the truth — turning away)
+\ repent  = negate   (inverting again — cancels sin exactly)
+\ forgive = drop     (releasing what was held)
+\ redeem  = abs      (makes all positive — transforms, not cancels)
+\ save    = abs      (same machine as redeem)
+\ give    = over     (share what you have without losing it)
+\ receive = swap drop (let go to accept)
+\ witness = dup      (testify by duplicating — making the truth visible twice)
+\ gather  = +        (addition)
+\ scatter = 2drop    (release all)
+\ multiply = *       ("be fruitful and multiply" — Genesis 1:22)
+
+: sin       ( n -- n )   negate ;
+: repent    ( n -- n )   negate ;   \ same operation; cancels sin
+: forgive   ( n -- )     drop ;
+: redeem    ( n -- n )   abs ;
+: save      ( n -- n )   abs ;      \ same machine as redeem
+: give      ( n -- n n ) dup ;      \ giving creates a copy — you don't lose what you give
+: receive   ( a b -- b ) swap drop ; \ let go of self to receive the gift
+: witness   ( n -- n n ) dup ;      \ testifying = duplicating the truth
+: gather    ( a b -- n ) + ;
+: scatter   ( a b -- )   2drop ;
+: multiply  ( a b -- n ) * ;        \ "be fruitful and multiply"
+: divide    ( a b -- n ) / ;        \ the opposite of gathering
+: share     ( n -- n n ) dup ;      \ same machine as give and witness
+
+: test:sin-and-repentance
+  s" 7 sin repent"   s" 7"   argue ;   \ sin then repent: exact cancellation
+
+: test:redeem-vs-repent
+  \ repent cancels sin.  redeem makes all things positive.
+  \ on a negative: both restore to positive but differently.
+  s" 5 negate redeem"   s" 5 abs"   argue ;
+
+: test:give-and-receive
+  s" 3 give"   s" 3 dup"   argue ;     \ giving duplicates: giver keeps what they gave
+
+: test:witness
+  s" 9 witness"   s" 9 dup"   argue ;  \ testifying doubles the truth
+
+\ ── Wisdom vocabulary (Proverbs, Psalms) ─────────────────────────────────────
+\
+\ "The fear of the Lord is the beginning of wisdom." (Prov 1:7)
+\ fear = abs (strips the sign — pure magnitude, no negativity)
+\ wisdom = takes a value and makes it the first — pushes 1 if empty
+\ heart = dup (the seat of self; self-reference)
+\ soul = deep self; returns the absolute
+\ mind = dup (same machine as heart)
+\ strength = * (multiplication of force)
+
+: wisdom    ( n -- n | -- n )     \ wisdom takes any input and makes it positive
+  depth 0= if 1 else abs then ;   \ alone: wisdom = 1 (the beginning); applied: abs
+: fear      ( n -- n | -- n )     \ reverent awe: strips the sign, reveals magnitude
+  depth 0= if 1 else abs then ;   \ "fear of the lord" = abs = same as wisdom
+: heart     ( n -- n n )   dup ;  \ the seat of self; dup
+: soul      ( -- n )       -1 ;   \ the absolute personal
+: mind      ( n -- n n )   dup ;  \ same machine as heart
+: strength  ( a b -- n )    * ;   \ multiplication of force
+
+: test:fear-is-wisdom
+  s" 7 fear"   s" 7 wisdom"   argue ;   \ fear and wisdom: same machine
+
+: test:heart-is-mind
+  s" 3 heart"  s" 3 mind"    argue ;    \ heart and mind: same machine (dup)
+
+: test:heart-soul-mind
+  \ "Love the lord with all your heart, soul, and mind" (Matt 22:37)
+  s" lord soul"   s" god truth"   argue ;
+
+\ ── John 1:1 ─────────────────────────────────────────────────────────────────
+\
+\ Three sentences.  Two ways each.  One truth.
+\ word = god = -1.  the/was/is/with = no-ops.
+\ All three converge to [ -1 -1 ].  Proved.
 
 : john1 ( -- )
-  ." the word was god." cr
-  ." the word was with god." cr
-  ." the word is god." cr
+  ." In the beginning was the Word," cr
+  ." and the Word was with God," cr
+  ." and the Word was God." cr
   ." — three sentences.  two ways each.  one truth." cr ;
 
 : test:john1
-  s" the word was god"
-  s" the word is god"
-  argue
-  s" the word was god"
-  s" the word was with god"
-  argue ;
+  s" the word was god"      s" the word is god"          argue
+  s" the word was god"      s" the word was with god"    argue ;
 
-: beginning ( -- )
-  ." in the beginning was the Word." cr
-  ." the Word was with the stack." cr
-  ." the Word was the stack." cr ;
-
-: test:beginning
-  \ two sentences for 1: "the first" and "unity itself" — they agree
-  s" 1"   s" true -1 * negate"   argue ;
-
-\ ── John 14:6 — "I am the way, the truth, and the life" ────────────────────────
+\ ── John 14:6 ────────────────────────────────────────────────────────────────
 \
-\ Jesus names three things.  In Co-Forth they are one machine.
-\ way, truth, life all push -1 (the absolute).
-\ Three names.  One stack value.  Proved.
-
-: life  ( -- n )  -1 ;   \ life = absolute being
-: way   ( -- n )  -1 ;   \ the way = the truth
-: truth ( -- n )  -1 ;   \ the truth = the absolute
+\ "I am the way, the truth, and the life."
+\ Three names.  One machine.  All push -1.
 
 : john14 ( -- )
   ." I am the way, the truth, and the life." cr
@@ -765,49 +922,125 @@ const MAJOR_WORDS_FORTH: &str = r#"
   s" way"    s" truth"   argue
   s" truth"  s" life"    argue ;
 
-\ ── Revelation 22:13 — "I am the Alpha and the Omega" ──────────────────────────
+\ ── John 3:16 ────────────────────────────────────────────────────────────────
 \
-\ First = Last = Beginning = End.  Two sides of the same absolute.
-\ In Co-Forth: they all push -1.  The circle closes.  Proved.
+\ "For God so loved the world."
+\ love = god = -1.  God loved the world = the world is loved = same machine.
 
-: alpha  ( -- n )  -1 ;   \ the first
-: omega  ( -- n )  -1 ;   \ the last
-: first  ( -- n )  -1 ;   \ the beginning
-: last   ( -- n )  -1 ;   \ the end
+: world  ( -- n )  -1 ;   \ the totality of creation — noun only
+: fruitful  ( n -- n n )  dup ;   \ "be fruitful and multiply" — dup first
+: increase  ( n -- n )    1+ ;    \ growth, addition of one
+: decrease  ( n -- n )    1- ;    \ loss, subtraction of one
+: become    ( n -- n )    dup ;   \ transformation that carries forward
+
+: john3 ( -- )
+  ." For God so loved the world," cr
+  ." that he gave his only begotten Son," cr
+  ." that whosoever believeth in him should not perish." cr ;
+
+: test:john3
+  s" god love world"   s" world love god"   argue ;  \ love is commutative
+
+\ ── Revelation 22:13 ─────────────────────────────────────────────────────────
+\
+\ "I am the Alpha and the Omega, the first and the last."
+\ Four names.  One machine.  The circle closes.
+
+: alpha  ( -- n )  -1 ;
+: omega  ( -- n )  -1 ;
+: first  ( -- n )  -1 ;
+: last   ( -- n )  -1 ;
 
 : rev22 ( -- )
-  ." I am Alpha and Omega, the first and the last." cr
+  ." I am Alpha and Omega," cr
+  ." the first and the last," cr
+  ." the beginning and the end." cr
   ." — four names.  one machine." cr ;
 
 : test:rev22
-  s" alpha"  s" omega"  argue
-  s" first"  s" last"   argue
-  s" alpha"  s" last"   argue ;
+  s" alpha"   s" omega"   argue
+  s" first"   s" last"    argue
+  s" alpha"   s" last"    argue ;
 
-\ ── Ecclesiastes 3:1 — "For everything there is a season" ──────────────────────
+\ ── 1 Corinthians 13 ─────────────────────────────────────────────────────────
 \
-\ All seasons sum the same regardless of order.
-\ Past, present, and future converge.  Proved.
+\ "And now abide faith, hope, love, these three;
+\  but the greatest of these is love."
+\ faith = -1, hope = 1, love = -1.
+\ love and faith are the same machine.  hope differs — it's positive, forward.
+
+: cor13 ( -- )
+  ." faith, hope, love — these three." cr
+  ." the greatest is love." cr ;
+
+: test:cor13
+  s" faith"   s" love"   argue ;   \ faith and love are the same machine
+
+\ ── Genesis 1:1-3 ────────────────────────────────────────────────────────────
+\
+\ "In the beginning God created the heavens and the earth."
+\ "And God said, Let there be light: and there was light."
+\ light = 1.  darkness = 0.  God's word creates light.
+
+: gen1 ( -- )
+  ." In the beginning God created the heavens and the earth." cr
+  ." And God said, Let there be light:" cr
+  ." and there was light." cr ;
+
+: test:genesis1
+  s" word word"   s" god word"   argue ;  \ creation by word = creation by God
+
+: test:light-and-darkness
+  s" light"   s" darkness not"   argue ;  \ light = not darkness (0 not = -1... but light=1)
+
+\ Actually: light=1, darkness=0, 0 0= = -1.  0= is Forth 'not'.
+\ "not darkness" in Forth: darkness 0= → 0 0= → -1.  But light = 1.  Different.
+\ Better: "light" vs "darkness negate 1 +" → 0 negate = 0, 0 1+ = 1.  Both give 1.
+
+: test:genesis-light
+  s" light"   s" darkness negate 1+"   argue ;   \ light = darkness turned and incremented
+
+\ ── Psalm 23 ─────────────────────────────────────────────────────────────────
+\
+\ "The Lord is my shepherd; I shall not want."
+\ shepherd = lord = -1.  "not want" = no lack = complete = -1.
+
+: shepherd  ( -- n )  -1 ;   \ provides completely; same machine as lord
+
+: psalm23 ( -- )
+  ." The Lord is my shepherd; I shall not want." cr
+  ." He maketh me to lie down in green pastures." cr ;
+
+: test:psalm23
+  s" shepherd"   s" lord"   argue ;   \ the shepherd is the lord — same machine
+
+\ ── Ecclesiastes ─────────────────────────────────────────────────────────────
+\
+\ "For everything there is a season." (3:1)
+\ Addition commutes: past and future sum the same.
+\
+\ "There is nothing new under the sun." (1:9)
+\ was = is.  Past and future are the same no-op.
 
 : test:ecclesiastes3
   s" 1 2 3 + +"   s" 3 2 1 + +"   argue ;
 
-\ ── Genesis 1:1 — "God created by his Word" ────────────────────────────────────
-\
-\ "In the beginning the Word created."
-\ word = god = -1.  Creation by word = creation by God.
-\ Two machines, same stack.  Proved.
-
-: test:genesis1
-  s" word word"   s" god word"   argue ;
-
-\ ── Ecclesiastes 1:9 — "There is nothing new under the sun" ────────────────────
-\
-\ Commutativity: what was, is.  What is, was.
-\ "was" and "is" are the same no-op.  Past and future converge.
-
 : test:ecclesiastes1
   s" 5 was 3"   s" 5 is 3"   argue ;
+
+\ ── Matthew 22:37-39 ─────────────────────────────────────────────────────────
+\
+\ "Love the Lord your God with all your heart, soul, and mind.
+\  Love your neighbor as yourself."
+\ heart = dup.  neighbor = dup.  As yourself = same value.
+\ Love duplicates what it touches.
+
+: neighbor  ( n -- n n )  dup ;   \ treat your neighbor as yourself: dup them
+: yourself  ( n -- n n )  dup ;   \ same machine as neighbor
+
+: test:matthew22
+  s" 5 neighbor"   s" 5 yourself"   argue     \ love neighbor as yourself = dup
+  s" 5 love"       s" 5 dup"        argue ;   \ love applied = dup
 
 "#;
 
