@@ -1377,6 +1377,34 @@ impl Forth {
         Ok(())
     }
 
+    /// Inline limit: words with bodies ≤ this many cells (and no jumps/calls) are
+    /// copied directly into the caller rather than emitting a Cell::Addr call.
+    /// 16 covers most hand-written definitions (e.g. `between`, `signum`, `clamp`).
+    const INLINE_LIMIT: usize = 16;
+
+    /// Emit a word reference: inline the body if it's short and pure, else emit Cell::Addr.
+    /// Deduplicates the identical logic that appeared in both the user-word and stdlib paths.
+    #[inline]
+    fn emit_word_or_inline(&mut self, addr: usize) {
+        let word_end = self.memory[addr..]
+            .iter()
+            .position(|c| matches!(c, Cell::Ret))
+            .map(|p| addr + p)
+            .unwrap_or(self.memory.len());
+        let word_len = word_end.saturating_sub(addr);
+        let is_pure = word_len <= Self::INLINE_LIMIT
+            && self.memory[addr..word_end].iter()
+                .all(|c| !matches!(c, Cell::Addr(_) | Cell::Jmp(_) | Cell::JmpZ(_)
+                                     | Cell::Repeat(_) | Cell::Until(_) | Cell::While(_)
+                                     | Cell::DoSetup | Cell::DoLoop(_) | Cell::DoLoopPlus(_)));
+        if is_pure && word_len > 0 {
+            let cells: Vec<Cell> = self.memory[addr..word_end].to_vec();
+            self.memory.extend(cells);
+        } else {
+            self.memory.push(Cell::Addr(addr));
+        }
+    }
+
     /// Emit a single token as one or more cells into `self.memory`.
     fn emit_token(&mut self, tok: &str) -> Result<()> {
         if let Some(s) = tok.strip_prefix("\x00str:") {
@@ -1553,7 +1581,14 @@ impl Forth {
                 return Ok(());
             }
         }
-        let lo = tok.to_lowercase();
+        // Avoid allocating a new String when the token is already lowercase — most tokens are.
+        let lo_owned;
+        let lo: &str = if tok.bytes().any(|b| b.is_ascii_uppercase()) {
+            lo_owned = tok.to_lowercase();
+            &lo_owned
+        } else {
+            tok
+        };
         if lo == "scatter-symbol" {
             // scatter-symbol  ( str-idx -- )  dynamic form: pop string index, scatter as symbol
             self.memory.push(Cell::ScatterStack); // ScatterStack already does dynamic string scatter
@@ -1573,63 +1608,37 @@ impl Forth {
             self.memory.push(Cell::Addr(usize::MAX));
             return Ok(());
         }
-        // User definitions take priority over builtins — tools are overridable.
-        // Guard: only words defined AFTER stdlib load (user_word_names) may shadow builtins.
-        // Stdlib thin wrappers (`: type type ;`) must NOT shadow — they call themselves → infinite loop.
-        if self.user_word_names.contains(&lo) {
-            if let Some(&addr) = self.name_index.get(&lo) {
-                // User-defined word shadows the builtin (e.g. user redefined scatter).
-                let word_end = self.memory[addr..]
-                    .iter()
-                    .position(|c| matches!(c, Cell::Ret))
-                    .map(|p| addr + p)
-                    .unwrap_or(self.memory.len());
-                let word_len = word_end.saturating_sub(addr);
-                let is_pure = word_len <= 6
-                    && self.memory[addr..word_end].iter()
-                        .all(|c| !matches!(c, Cell::Addr(_) | Cell::Jmp(_) | Cell::JmpZ(_) | Cell::Repeat(_) | Cell::Until(_) | Cell::While(_) | Cell::DoSetup | Cell::DoLoop(_)));
-                if is_pure && word_len > 0 {
-                    let cells: Vec<Cell> = self.memory[addr..word_end].to_vec();
-                    self.memory.extend(cells);
-                } else {
-                    self.memory.push(Cell::Addr(addr));
-                }
+        // Single name_index lookup covers both the user-word-shadow path and the stdlib path.
+        // User definitions take priority over builtins when the name is in user_word_names.
+        // Stdlib thin wrappers must NOT shadow builtins — they call themselves → infinite loop.
+        let ni_addr = self.name_index.get(lo).copied();
+        if let Some(addr) = ni_addr {
+            if self.user_word_names.contains(lo) {
+                // User-defined word may shadow a builtin.
+                self.emit_word_or_inline(addr);
                 return Ok(());
             }
         }
-        if let Some(b) = name_to_builtin(&lo) {
-            // Peephole: Lit(1) + Plus → Inc; Lit(1) + Minus → Dec
-            let folded = match (self.memory.last(), &b) {
-                (Some(&Cell::Lit(1)), &Builtin::Plus)  => { self.memory.pop(); Some(Cell::Builtin(Builtin::Inc)) }
-                (Some(&Cell::Lit(1)), &Builtin::Minus) => { self.memory.pop(); Some(Cell::Builtin(Builtin::Dec)) }
+        if let Some(b) = name_to_builtin(lo) {
+            // Peephole: combine common literal+op sequences into single instructions.
+            let prev = self.memory.last().copied();
+            let folded: Option<Cell> = match (prev, b) {
+                (Some(Cell::Lit(1)),  Builtin::Plus)    => { self.memory.pop(); Some(Cell::Builtin(Builtin::Inc)) }
+                (Some(Cell::Lit(1)),  Builtin::Minus)   => { self.memory.pop(); Some(Cell::Builtin(Builtin::Dec)) }
+                (Some(Cell::Lit(0)),  Builtin::Eq)      => { self.memory.pop(); Some(Cell::Builtin(Builtin::ZeroEq)) }
+                (Some(Cell::Lit(0)),  Builtin::Lt)      => { self.memory.pop(); Some(Cell::Builtin(Builtin::ZeroLt)) }
+                (Some(Cell::Lit(0)),  Builtin::Gt)      => { self.memory.pop(); Some(Cell::Builtin(Builtin::ZeroGt)) }
                 _ => None,
             };
             self.memory.push(folded.unwrap_or(Cell::Builtin(b)));
             return Ok(());
         }
-        if let Some(&addr) = self.name_index.get(&lo) {
-            // Inline expansion: short pure words (≤6 cells, no nested calls) are copied
-            // directly into the caller — eliminates call/return overhead entirely.
-            // This is the Von Neumann flat-memory advantage: code is just data.
-            let word_end = self.memory[addr..]
-                .iter()
-                .position(|c| matches!(c, Cell::Ret))
-                .map(|p| addr + p)
-                .unwrap_or(self.memory.len());
-            let word_len = word_end.saturating_sub(addr);
-            let is_pure = word_len <= 6
-                && self.memory[addr..word_end].iter()
-                    .all(|c| !matches!(c, Cell::Addr(_) | Cell::Jmp(_) | Cell::JmpZ(_) | Cell::Repeat(_) | Cell::Until(_) | Cell::While(_) | Cell::DoSetup | Cell::DoLoop(_)));
-            if is_pure && word_len > 0 {
-                // Copy cells inline — no call frame needed.
-                let cells: Vec<Cell> = self.memory[addr..word_end].to_vec();
-                self.memory.extend(cells);
-            } else {
-                self.memory.push(Cell::Addr(addr));
-            }
+        if let Some(addr) = ni_addr {
+            // Stdlib/library word: inline if short and pure.
+            self.emit_word_or_inline(addr);
             return Ok(());
         }
-        if let Some(&addr) = self.var_index.get(&lo) {
+        if let Some(&addr) = self.var_index.get(lo) {
             self.memory.push(Cell::Lit(addr as i64));
             return Ok(());
         }
