@@ -235,6 +235,25 @@ impl IpcClient {
     }
 
     // -----------------------------------------------------------------------
+    // Co-Forth
+    // -----------------------------------------------------------------------
+
+    /// Send a Forth program to the daemon; get back the full data stack + output.
+    /// The top of the returned stack is the "return value" — one number.
+    pub async fn eval_forth(&self, program: &str) -> Result<(Vec<i64>, String)> {
+        let mut req = self.client.eval_forth_request();
+        req.get().set_program(program);
+        let reply = req.send().promise.await?;
+        let r = reply.get()?;
+        let error = r.get_error()?.to_str()?;
+        if !error.is_empty() {
+            anyhow::bail!("{}", error);
+        }
+        let stack = r.get_stack()?.iter().collect::<Vec<i64>>();
+        let output = r.get_output()?.to_str()?.to_string();
+        Ok((stack, output))
+    }
+
     // Health
     // -----------------------------------------------------------------------
 

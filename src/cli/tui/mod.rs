@@ -1171,7 +1171,7 @@ impl TuiRenderer {
             Print(format!("{}  ·  {}", session_label, cwd)),
             ResetColor,
             Print("\r\n"),
-            // Line 5 — legs
+            // Line 5 — legs + proof count
             Print("     "),
             SetForegroundColor(Color::DarkGrey),
             Print("╥  ╥"),
@@ -1184,6 +1184,25 @@ impl TuiRenderer {
             ResetColor,
             Print("\r\n"),
         )?;
+
+        // Dump all proofs on boot — shower them with it.
+        let (passed, total, proof_output) = crate::coforth::Library::prove_all();
+        if total > 0 {
+            use crossterm::style::{Color, ResetColor, SetForegroundColor, Print};
+            // Print each proof line.
+            for line in proof_output.lines() {
+                execute!(io::stdout(), Print(line), Print("\r\n"))?;
+            }
+            // Summary line.
+            execute!(
+                io::stdout(),
+                Print("  "),
+                SetForegroundColor(if passed == total { Color::Green } else { Color::Red }),
+                Print(format!("{}/{} ✓", passed, total)),
+                ResetColor,
+                Print("  co-forth proofs\r\n"),
+            )?;
+        }
 
         // Suggestion line — one compact row of things to try.
         print_suggestions()?;

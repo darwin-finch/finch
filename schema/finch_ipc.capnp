@@ -149,4 +149,11 @@ interface FinchDaemon {
 
   # Health.
   ping @8 () -> (version :Text);
+
+  # Co-Forth: send a program, get back the stack.
+  # The request IS the sentence.  The response IS the result.
+  # stack: all values, bottom to top.  Top is the "return value".
+  # output: anything printed by . cr etc.
+  # error: non-empty if evaluation failed.
+  evalForth @9 (program :Text) -> (stack :List(Int64), output :Text, error :Text);
 }

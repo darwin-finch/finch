@@ -284,3 +284,8 @@ word = "address"
 definition = "an integer that names a location in the flat memory space — every value has one"
 related = ["fetch", "store", "word-size"]
 kind = "observation"
+
+[[word]]
+word = "quit,"
+definition = "to stop, cease, or discontinue an activity"
+forth = '." STOPPED" cr'

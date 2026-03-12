@@ -441,6 +441,35 @@ impl finch_daemon::Server for FinchDaemonImpl {
         })
     }
 
+    // ---- Co-Forth --------------------------------------------------------
+
+    fn eval_forth(
+        &mut self,
+        params: finch_daemon::EvalForthParams,
+        mut results: finch_daemon::EvalForthResults,
+    ) -> Promise<(), capnp::Error> {
+        let program = pry!(pry!(params.get()).get_program()).to_str().unwrap_or("").to_owned();
+
+        // Spin up a fresh Forth VM cloned from the precompiled dict, run the
+        // program, then return the full data stack + any printed output.
+        let mut vm = crate::coforth::Library::precompiled_vm();
+        match crate::coforth::Forth::run_on(&mut vm, &program) {
+            Ok((stack, output)) => {
+                let mut r = results.get();
+                let mut list = r.reborrow().init_stack(stack.len() as u32);
+                for (i, v) in stack.iter().enumerate() {
+                    list.set(i as u32, *v);
+                }
+                r.reborrow().set_output(&output);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                results.get().set_error(&msg);
+            }
+        }
+        Promise::ok(())
+    }
+
     // ---- health ----------------------------------------------------------
 
     fn ping(
