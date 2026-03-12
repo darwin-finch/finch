@@ -332,7 +332,8 @@ pub struct PeerMeta {
     pub token: Option<String>,
 }
 
-const MAX_CALL_DEPTH: usize = 256;
+const MAX_CALL_DEPTH: usize  = 256;
+const MAX_DATA_DEPTH: usize  = 1024; // data stack overflow guard
 /// Default step budget for interactive vocabulary words.
 /// 1M steps: enough for fib(20) (~300k steps), gcd, most recursive definitions.
 /// Catches infinite loops in ~1ms rather than seconds.
@@ -552,7 +553,13 @@ const STDLIB: &str = r#"
 : bye         ( -- )       ." goodbye." cr ;
 : clear-stack ( -- )       begin depth 0> while drop repeat ;
 : deploy      ( -- )       ." deployed." cr ;
-: boom        ( str -- )   eval ." 💥 boom." cr ;
+: boom        ( str|-- )
+  depth 0> if
+    eval ." 💥 boom." cr
+  else
+    prove-all
+    ." 💥 BOOM 💥" cr
+  then ;
 : sun         ( -- t )     time dup ." ☀  " . ." s since epoch." cr ;
 
 \ ── Von Neumann architecture ─────────────────────────────────────────────────
@@ -834,8 +841,8 @@ variable _tm  ( shared test memory cell )
 : test:lshift     1 3 lshift  8 = assert  3 2 lshift 12 = assert ;
 : test:rshift     8 3 rshift  1 = assert  12 2 rshift 3 = assert ;
 \ ── TCO proof: deep recursion without stack overflow ─────────────────────────
-: test:tco-count   ( n -- 0 )  dup 0> if 1 - test:tco-count exit then ;
-: test:tco         1000 test:tco-count 0 = assert ;
+: tco-count   ( n -- 0 )  dup 0> if 1 - tco-count exit then ;
+: test:tco    1000 tco-count 0 = assert ;
 \ ── Inline expansion proofs: square, cube, 1+, 1- work identically ──────────
 : test:inline-1+   5 1+  6 = assert  -1 1+  0 = assert ;
 : test:inline-1-   5 1-  4 = assert   0 1- -1 = assert ;
@@ -1718,10 +1725,10 @@ impl Forth {
                 Cell::Builtin(Builtin::Plus)  => { let (a,b) = pop2!(); self.data.push(a.wrapping_add(b)); ip += 1; }
                 Cell::Builtin(Builtin::Minus) => { let (a,b) = pop2!(); self.data.push(a.wrapping_sub(b)); ip += 1; }
                 Cell::Builtin(Builtin::Star)  => { let (a,b) = pop2!(); self.data.push(a.wrapping_mul(b)); ip += 1; }
-                Cell::Builtin(Builtin::Dup)   => { let a = self.pop()?; self.data.push(a); self.data.push(a); ip += 1; }
+                Cell::Builtin(Builtin::Dup)   => { let a = self.pop()?; self.push(a)?; self.data.push(a); ip += 1; }
                 Cell::Builtin(Builtin::Drop)  => { self.pop()?; ip += 1; }
                 Cell::Builtin(Builtin::Swap)  => { let (a,b) = pop2!(); self.data.push(b); self.data.push(a); ip += 1; }
-                Cell::Builtin(Builtin::Over)  => { let (a,b) = pop2!(); self.data.push(a); self.data.push(b); self.data.push(a); ip += 1; }
+                Cell::Builtin(Builtin::Over)  => { let (a,b) = pop2!(); self.push(a)?; self.data.push(b); self.data.push(a); ip += 1; }
                 Cell::Builtin(Builtin::Eq)    => { let (a,b) = pop2!(); self.data.push(if a == b { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::Ne)    => { let (a,b) = pop2!(); self.data.push(if a != b { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::Lt)    => { let (a,b) = pop2!(); self.data.push(if a  < b { -1 } else { 0 }); ip += 1; }
@@ -1732,7 +1739,7 @@ impl Forth {
                 Cell::Builtin(Builtin::And)   => { if self.data.len() >= 2 { let (a,b) = pop2!(); self.data.push(a & b); } ip += 1; }
                 Cell::Builtin(Builtin::Or)    => { let (a,b) = pop2!(); self.data.push(a | b); ip += 1; }
                 // ── Literals and string output ──
-                Cell::Lit(n) => { self.data.push(n); ip += 1; }
+                Cell::Lit(n) => { self.push(n)?; ip += 1; }
                 Cell::Str(idx) => {
                     self.out.push_str(&self.strings[idx]);
                     ip += 1;
@@ -3956,12 +3963,14 @@ impl Forth {
                 let mut pass = 0usize;
                 let mut fail = 0usize;
                 let mut fail_lines: Vec<String> = Vec::new();
-                let outer_fuel = self.fuel; // restore after inner evals reset it
+                let outer_fuel  = self.fuel;       // restore after inner evals reset it
+                let outer_depth = self.data.len(); // tests must not leak stack state
                 for tw in &sorted {
                     let word_name = &tw["test:".len()..];
                     let saved = self.out.len();
                     let result = self.eval(tw);
                     self.out.truncate(saved);
+                    self.data.truncate(outer_depth); // clean leaked stack values
                     use crossterm::style::Stylize;
                     match result {
                         Ok(_) => { pass += 1; }
@@ -3971,7 +3980,7 @@ impl Forth {
                         }
                     }
                 }
-                self.fuel = outer_fuel; // restore budget consumed by inner evals
+                self.fuel = outer_fuel;
                 use crossterm::style::Stylize;
                 for line in fail_lines {
                     self.out.push_str(&line);
@@ -4002,12 +4011,14 @@ impl Forth {
                 let mut pass = 0usize;
                 let mut fail = 0usize;
                 let mut fail_lines: Vec<String> = Vec::new();
-                let outer_fuel = self.fuel;
+                let outer_fuel  = self.fuel;
+                let outer_depth = self.data.len();
                 for tw in &sorted {
                     let word_name = &tw["test:".len()..];
                     let saved = self.out.len();
                     let result = self.eval(tw);
                     self.out.truncate(saved);
+                    self.data.truncate(outer_depth);
                     use crossterm::style::Stylize;
                     match result {
                         Ok(_) => { pass += 1; }
@@ -4406,6 +4417,15 @@ impl Forth {
     #[inline(always)]
     fn pop(&mut self) -> Result<i64> {
         self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow"))
+    }
+
+    #[inline]
+    fn push(&mut self, v: i64) -> Result<()> {
+        if self.data.len() >= MAX_DATA_DEPTH {
+            bail!("stack overflow — too many values on the stack (max {})", MAX_DATA_DEPTH);
+        }
+        self.data.push(v);
+        Ok(())
     }
 }
 
@@ -4998,11 +5018,7 @@ fn run_push_one(addr: &str, text: &str, from: Option<&str>, token: Option<&str>)
         }
         let _ = req.json(&body).send().await;
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        let _ = tokio::runtime::Runtime::new().map(|rt| rt.block_on(fut));
-    }
+    futures::executor::block_on(fut);
 }
 
 fn run_push_all(peers: &[String], text: &str, from: Option<&str>, _tokens: &std::collections::HashMap<String, String>) {
@@ -5013,11 +5029,7 @@ fn run_push_all(peers: &[String], text: &str, from: Option<&str>, _tokens: &std:
     let fut = async move {
         crate::coforth::scatter::scatter_push(&peers, &text, from.as_deref()).await;
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut));
-    } else {
-        let _ = tokio::runtime::Runtime::new().map(|rt| rt.block_on(fut));
-    }
+    futures::executor::block_on(fut);
 }
 
 fn peer_tokens_map(peer_meta: &std::collections::HashMap<String, PeerMeta>) -> std::collections::HashMap<String, String> {
@@ -5028,15 +5040,9 @@ fn peer_tokens_map(peer_meta: &std::collections::HashMap<String, PeerMeta>) -> s
 
 fn run_scatter(peers: &[String], code: &str, caller: Option<&str>, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
     let caller = caller.map(|s| s.to_string());
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| {
-            handle.block_on(crate::coforth::scatter::scatter_exec(peers, code, caller.as_deref(), tokens))
-        })
-    } else {
-        tokio::runtime::Runtime::new()
-            .expect("tokio runtime")
-            .block_on(crate::coforth::scatter::scatter_exec(peers, code, caller.as_deref(), tokens))
-    }
+    futures::executor::block_on(
+        crate::coforth::scatter::scatter_exec(peers, code, caller.as_deref(), tokens)
+    )
 }
 
 /// Return "hostname: path" attribution prefix for file reads.
@@ -5144,12 +5150,8 @@ fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16, String, Option<Strin
     };
 
     // discover() uses recv_timeout internally — it's a blocking call.
-    // Must use block_in_place when inside a tokio worker thread.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(inner)
-    } else {
-        inner()
-    }
+    // block_in_place panics inside LocalSet; use futures::executor::block_on instead.
+    futures::executor::block_on(async { inner() })
     .unwrap_or_default()
 }
 
@@ -5201,11 +5203,7 @@ fn run_registry_join(registry: &str, entry: crate::registry::PeerEntry) -> anyho
         client.post(&url).json(&entry).send().await?;
         Ok::<(), anyhow::Error>(())
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Runtime::new()?.block_on(fut)
-    }
+    futures::executor::block_on(fut)
 }
 
 fn run_registry_leave(registry: &str, addr: &str) -> anyhow::Result<()> {
@@ -5222,11 +5220,7 @@ fn run_registry_leave(registry: &str, addr: &str) -> anyhow::Result<()> {
         client.post(&url).json(&body).send().await?;
         Ok::<(), anyhow::Error>(())
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Runtime::new()?.block_on(fut)
-    }
+    futures::executor::block_on(fut)
 }
 
 fn run_registry_peers(
@@ -5250,11 +5244,7 @@ fn run_registry_peers(
         let peers = client.get(&url).send().await?.json().await?;
         Ok::<Vec<crate::registry::PeerEntry>, anyhow::Error>(peers)
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Runtime::new()?.block_on(fut)
-    }
+    futures::executor::block_on(fut)
 }
 
 fn run_registry_ledger(
@@ -5273,11 +5263,7 @@ fn run_registry_ledger(
         let entry = client.get(&base).send().await?.json().await?;
         Ok::<crate::registry::LedgerEntry, anyhow::Error>(entry)
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Runtime::new()?.block_on(fut)
-    }
+    futures::executor::block_on(fut)
 }
 
 fn run_registry_all_ledgers(
@@ -5296,11 +5282,7 @@ fn run_registry_all_ledgers(
             client.get(&base).send().await?.json().await?;
         Ok::<Vec<(String, crate::registry::LedgerEntry)>, anyhow::Error>(entries)
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Runtime::new()?.block_on(fut)
-    }
+    futures::executor::block_on(fut)
 }
 
 /// POST to peer's /v1/settle — acknowledge compute debt and request clearance.
@@ -5345,11 +5327,7 @@ fn run_peer_settle(peer_addr: &str, my_addr: Option<&str>) -> anyhow::Result<(u6
         let message    = json["message"].as_str().unwrap_or("").to_string();
         Ok::<(u64, String), anyhow::Error>((cleared_ms, message))
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Runtime::new()?.block_on(fut)
-    }
+    futures::executor::block_on(fut)
 }
 
 fn run_registry_debit(
@@ -5370,35 +5348,15 @@ fn run_registry_debit(
         client.post(&base).json(&body).send().await?;
         Ok::<(), anyhow::Error>(())
     };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        tokio::runtime::Runtime::new()?.block_on(fut)
-    }
+    futures::executor::block_on(fut)
 }
 
 fn run_define_scatter(peers: &[String], source: &str, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| {
-            handle.block_on(crate::coforth::scatter::define_on_peers(peers, source, tokens))
-        })
-    } else {
-        tokio::runtime::Runtime::new()
-            .expect("tokio runtime")
-            .block_on(crate::coforth::scatter::define_on_peers(peers, source, tokens))
-    }
+    futures::executor::block_on(crate::coforth::scatter::define_on_peers(peers, source, tokens))
 }
 
 fn run_exec_scatter(peers: &[String], cmd: &str, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| {
-            handle.block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd, tokens))
-        })
-    } else {
-        tokio::runtime::Runtime::new()
-            .expect("tokio runtime")
-            .block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd, tokens))
-    }
+    futures::executor::block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd, tokens))
 }
 
 // ── Name table ────────────────────────────────────────────────────────────────

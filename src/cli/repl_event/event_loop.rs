@@ -829,13 +829,20 @@ impl EventLoop {
                 }
             }
 
-            // Show how much of the English language is currently proven.
+            // On boot: argue core proofs, then show how much of English holds.
             {
-                let result = self.forth_vm.exec("prove-english");
-                let text = match result {
-                    Ok(ref s) => s.trim().to_string(),
-                    Err(_)    => String::new(),
-                };
+                let boot_argue = r#"
+s" we send forth"   s" we send -1"     argue
+s" between us"      s" we are real"    argue
+s" back and forth"  s" -1 and forth"   argue
+s" it is ours"      s" -1 is ours"     argue
+"#;
+                let argue_out = self.forth_vm.exec(boot_argue)
+                    .unwrap_or_default();
+                let english_out = self.forth_vm.exec("prove-english")
+                    .unwrap_or_default();
+                let combined = format!("{}{}", argue_out.trim_start(), english_out.trim_start());
+                let text = combined.trim().to_string();
                 if !text.is_empty() {
                     self.output_manager.write_info(text);
                 }
@@ -5272,6 +5279,9 @@ pub(crate) fn humanize_forth_error(raw: &str) -> String {
     }
     if e.contains("division by zero") {
         return "can't divide by zero".to_string();
+    }
+    if e.contains("stack overflow") && e.contains("too many values") {
+        return "stack overflow — the stack has too many values (try `clear` to reset)".to_string();
     }
     if e.contains("return stack overflow") || e.contains("call stack overflow") {
         return "too many nested calls — a word is probably calling itself forever".to_string();
