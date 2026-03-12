@@ -286,6 +286,69 @@ related = ["fetch", "store", "word-size"]
 kind = "observation"
 
 [[word]]
+word = "compute"
+definition = "evaluate an expression and show the result — the machine's one true act"
+related = ["eval", "infix", "calculate", "result"]
+kind = "task"
+forth = '." compute: give me a string — s\" 3 4 +\" compute" cr'
+
+[[word]]
+word = "constant"
+definition = "give a value a permanent name — the word speaks its value and nothing else"
+related = ["value", "define", "name", "literal"]
+kind = "task"
+forth = '." usage: 42 constant answer    then: answer . → 42" cr'
+
+[[word]]
+word = "value"
+definition = "a named number that can change — constant until told otherwise"
+related = ["constant", "to", "variable"]
+kind = "task"
+forth = '." usage: 0 value counter    1 to counter    counter . → 1" cr'
+
+[[word]]
+word = "to"
+definition = "aim a new value at a named cell — assignment as direction"
+related = ["value", "store", "constant"]
+kind = "task"
+forth = '." usage: 42 to counter    counter . → 42" cr'
+
+[[word]]
+word = "define"
+definition = "give something a name it will keep — the act of building vocabulary"
+related = ["constant", "value", "variable", "word"]
+kind = "task"
+forth = '." defining words: : name ... ;    42 constant name    0 value name" cr'
+
+[[word]]
+word = "prove"
+definition = "run a test and show whether it holds — the machine checks itself"
+related = ["prove-all", "assert", "test", "verify"]
+kind = "task"
+forth = 's" +" prove" cr'
+
+[[word]]
+word = "dual"
+definition = "execute both machines visibly — each runs, each speaks, then they either agree or they don't"
+related = ["argue", "check", "both-ways", "fork"]
+kind = "task"
+forth = 's" 3 4 +" s" 4 3 +" dual'
+
+[[word]]
+word = "self-argue"
+definition = "run one program twice — the proof is that it agrees with itself"
+related = ["argue", "check", "deterministic", "consistent"]
+kind = "task"
+forth = 's" 3 4 +" self-argue if ." ✓ deterministic" else ." ✗" then cr'
+
+[[word]]
+word = "self-check"
+definition = "run a program and print whether it agrees with itself — the machine plays the game alone"
+related = ["self-argue", "check", "prove", "argue"]
+kind = "task"
+forth = 's" 3 4 +" self-check'
+
+[[word]]
 word = "quit,"
 definition = "to stop, cease, or discontinue an activity"
 forth = '." STOPPED" cr'

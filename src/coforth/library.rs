@@ -1629,7 +1629,6 @@ variable it   \ implicit register — the thing most recently produced
 : release   ( -- ) ;
 : connect   ( -- ) ;
 : fix       ( -- ) ;
-: help      ( -- ) ;
 : work      ( -- ) ;
 : know      ( -- ) ;
 : seek      ( -- ) ;

@@ -246,6 +246,17 @@ enum Builtin {
     GlobPool,                 // ( pattern-idx -- result-idx )  glob into string pool (one path per line)
     CleanLines,               // ( idx -- n )  quarantine each path in strings[idx] (one per line); return count
     GlobCount,                // ( pattern-idx -- n )  count files matching glob pattern
+    ExecCapture,              // ( cmd-idx -- output-idx )  run shell command; push stdout as string pool entry
+    BackAndForthQ,            // ( n fwd-str back-str -- flag )  round-trip predicate; never aborts
+    InvertibleQ,              // ( n str -- flag )  apply str twice; -1 if f(f(n))=n (involution test)
+    Help,                     // ( -- )  print the Co-Forth quick-reference guide
+    Describe,                 // ( idx -- )  describe a word: stack signature, source, or builtin notice
+    Compute,                  // ( str-idx -- )  evaluate as Forth; fall back to infix; print "= result"
+    EquivQ,                   // ( str1 str2 -- flag )  -1 if programs agree on inputs -5..5; the equivalence probe
+    Fork,                     // ( str-idx -- )  run code in a forked copy (current stack shared); discard copy
+    Boot,                     // ( -- )  re-execute all boot=true vocabulary words
+    PrintR,                   // ( n width -- )  print n right-aligned in field of width chars
+    PrintPad,                 // ( n width char-idx -- )  print n padded with char to width
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
@@ -336,6 +347,9 @@ pub struct Forth {
     /// Names of words defined by the USER (not stdlib) — these override builtins.
     /// Populated only when log_definitions is true (after stdlib phase).
     user_word_names: std::collections::HashSet<String>,
+    /// Reusable call stack for the inner interpreter — pre-allocated, cleared each execute().
+    /// Avoids a Vec allocation on every word call.
+    call_stack: Vec<usize>,
 }
 
 /// Metadata attached to a peer address via `label-peer` / `tag-peer`.
@@ -473,11 +487,45 @@ const STDLIB: &str = r#"
         = assert
     then ;
 
+\ ── Help system ───────────────────────────────────────────────────────────────
+\ help — Co-Forth quick reference  ( -- )
+: help  ( -- )  help ;
+
+\ describe — show what we know about a word  ( idx -- )
+: describe  ( idx -- )  describe ;
+
+\ ? — describe the word on top of the stack (alias)
+: ?  ( idx -- )  describe ;
+
+\ compute — evaluate a string and print the result  ( str-idx -- )
+: compute  ( str-idx -- )  compute ;
+
+\ equiv? — probe program equivalence over -5..5  ( str1 str2 -- flag )
+: equiv?  ( str1 str2 -- flag )  equiv? ;
+
+\ equiv-check — print labelled equivalence result  ( str1 str2 -- )
+: equiv-check ( str1 str2 -- )
+    2dup equiv?
+    if ." ✓ equivalent" cr else ." ✗ not equivalent" cr then
+    drop drop ;
+
+\ fork — run code in a forked copy of the current VM  ( str-idx -- )
+: fork  ( str-idx -- )  fork ;
+
+\ boot — re-execute all boot=true vocabulary words  ( -- )
+: boot  ( -- )  boot ;
+
 \ ── Natural language gateway ─────────────────────────────────────────────────
 \ missing-word ( str -- )
 \ Called automatically when an unknown word is encountered at top-level.
 \ Redefine to route natural language to AI: : missing-word  gen-send ;
-: missing-word  ( str -- )  ." ?" type cr ;
+: missing-word  ( str -- )
+    dup
+    s" help"  str= if drop help else
+    dup
+    s" ?" str= if drop help else
+    ." ? " type cr
+    then then ;
 
 \ ── Comparison helpers ────────────────────────────────────────────────────────
 : true      ( -- -1 )  -1 ;
@@ -760,6 +808,64 @@ const STDLIB: &str = r#"
     2dup agree? dup
     if ." ✓ agreed" cr else ." ✗ disagreed" cr then ;
 
+\ dual — execute both machines visibly, then show whether they agree  ( str1 str2 -- )
+\ Both programs run in separate forks — each prints its own output.
+\ Then the verdict: ✓ if tops agree, ✗ if they don't.
+: dual  ( str1 str2 -- )
+    ." ── machine A ──" cr  over fork
+    ." ── machine B ──" cr  dup  fork
+    agree?
+    if ." ✓ both machines agree" cr
+    else ." ✗ machines disagree" cr
+    then ;
+
+\ self-argue — run one program twice; verify it agrees with itself  ( str -- flag )
+\ The proof of determinism: the machine plays the game with itself.
+: self-argue  ( str -- flag )  dup agree? ;
+
+\ self-check — run self-argue and print the verdict  ( str -- )
+: self-check  ( str -- )
+    dup self-argue
+    if ." ✓ deterministic" cr else ." ✗ non-deterministic" cr then
+    drop ;
+
+\ back-and-forth? — round-trip predicate; never aborts
+: back-and-forth? ( n fwd-str back-str -- flag )  back-and-forth? ;
+
+\ invertible? — involution test: f(f(n)) = n?  ( n str -- flag )
+: invertible? ( n str -- flag )  invertible? ;
+
+\ round-trip — like back-and-forth but prints ✓ / ✗  ( n fwd-str back-str -- )
+: round-trip ( n fwd-str back-str -- )
+    3dup back-and-forth?
+    if ." ✓ round trip" cr else ." ✗ round trip broken" cr then
+    drop drop drop ;
+
+\ exec-capture — run any shell command; push stdout as string pool entry
+: exec-capture  ( cmd-idx -- output-idx )  exec-capture ;
+
+\ cross-check — Forth result vs. any language's shell output  ( forth-str cmd-str -- flag )
+\ Run the Forth program; convert top-of-stack to decimal string.
+\ Run the shell command; trim its stdout.
+\ Push -1 if they match, 0 if not.
+: cross-check ( forth-str cmd-str -- flag )
+    swap                     \ cmd-str forth-str
+    safe                     \ cmd-str flag  (safe eval of forth-str; result on stack or error)
+    if
+        num>str              \ cmd-str forth-result-str
+        swap exec-capture    \ forth-result-str shell-output-str
+        str-trim             \ forth-result-str shell-output-trimmed
+        str=                 \ flag
+    else
+        drop 0               \ Forth side errored — drop cmd-str, push false
+    then ;
+
+\ lang-check — run cross-check and print a labelled result  ( label forth-str cmd-str -- )
+: lang-check ( label forth-str cmd-str -- )
+    cross-check              \ label flag
+    swap type space          \ flag  (type prints label, space adds a space)
+    if ." ✓" cr else ." ✗" cr then ;
+
 \ Prolog: a query is a goal.  Resolution is unification + backtracking.
 \ Compressed to: a goal is a word.  Backtracking = trying alternatives.
 \ True if the word executes without error; false if it bails.
@@ -772,7 +878,34 @@ const STDLIB: &str = r#"
 : asm-add       ( a b -- a+b )   + ;
 : asm-jmp       ( addr -- )      ." jmp " . cr ;   \ symbolic only
 : asm-cmp       ( a b -- flag )  = ;
-: asm-halt      ( -- )           bye ;"#;
+: asm-halt      ( -- )           bye ;
+
+\ ── Return stack pairs ────────────────────────────────────────────────────────
+\ 2>r ( x1 x2 -- ) ( R: -- x1 x2 )  move two values to return stack
+: 2>r   ( x1 x2 -- )  swap >r >r ;
+\ 2r> ( -- x1 x2 ) ( R: x1 x2 -- )  restore two values from return stack
+: 2r>   ( -- x1 x2 )  r> r> swap ;
+
+\ ── Formatted output ──────────────────────────────────────────────────────────
+\ .r ( n width -- )  print n right-aligned in width chars
+: .r    ( n width -- )  .r ;
+\ .pad ( n width char -- )  print n padded with char to width
+: .pad  ( n width char -- )  .pad ;
+
+\ ── Defining words ─────────────────────────────────────────────────────────────
+\ constant: create a named constant.
+\   Usage: 42 constant answer    answer .  → 42
+\   The word pushes the literal value; the stack is not modified after definition.
+\
+\ value: like constant but mutable.
+\   Usage: 0 value counter    1 to counter    counter .  → 1
+\   `to name` stores TOS into the value; `name` fetches the current value.
+
+\ ── exit is a compiler word (not a STDLIB word) ───────────────────────────────
+\ `exit` is handled during compilation — it emits a Ret cell.
+\ It is usable inside any word definition:
+\   : early-out  dup 0= if drop exit then  1 - ;
+\"#;
 
 /// Proofs for STDLIB words.
 /// Each `: test:<word>` definition runs assertions that verify the word's behaviour.
@@ -959,6 +1092,58 @@ variable _tm  ( shared test memory cell )
 : test:same?-yes     s" 1 2 3"  s" 1 2 3"  same? assert ;
 : test:same?-no      s" 1 2 3"  s" 1 2 4"  same? 0= assert ;
 : test:same?-error   s" 0 0 /"  s" 1 2 +"  same? 0= assert ;
+\ ── Back-and-forth? proofs ───────────────────────────────────────────────────
+: test:back-and-forth?-yes    5  s" 3 +"  s" 3 -"  back-and-forth?  assert ;
+: test:back-and-forth?-no     5  s" 3 +"  s" 4 -"  back-and-forth?  0= assert ;
+: test:back-and-forth?-err    5  s" 0 /"  s" 3 -"  back-and-forth?  0= assert ;
+: test:invertible?-negate    42  s" negate"  invertible?  assert ;
+: test:invertible?-invert    -1  s" invert"  invertible?  assert ;
+: test:invertible?-no         5  s" 1 +"   invertible?  0= assert ;
+: test:invertible?-not-invol  3  s" 2 *"   invertible?  0= assert ;
+\ ── Polyglot proofs ──────────────────────────────────────────────────────────
+: test:exec-capture-echo  s" echo hello" exec-capture  s" hello" str= assert ;
+: test:exec-capture-math  s" echo 7"     exec-capture  s" 7"     str= assert ;
+: test:cross-check-yes    s" 3 4 +"      s" echo 7"    cross-check  assert ;
+: test:cross-check-no     s" 3 4 +"      s" echo 8"    cross-check  0= assert ;
+: test:cross-check-err    s" 0 0 /"      s" echo 0"    cross-check  0= assert ;
+\ ── Compute proofs ───────────────────────────────────────────────────────────
+: test:compute-forth      s" 3 4 +"  compute  depth 0= assert ;
+: test:compute-infix      s" 3 + 4"  compute  depth 0= assert ;
+: test:compute-err        s" garbage-word"  compute  depth 0= assert ;
+\ ── Equivalence proofs ───────────────────────────────────────────────────────
+: test:equiv?-commute   s" dup *"       s" dup *"       equiv?  assert ;  \ same program
+: test:equiv?-add-comm  s" 3 +"        s" 3 +"         equiv?  assert ;  \ same transform
+: test:equiv?-not-eq    s" 1 +"        s" 2 +"         equiv?  0= assert ; \ different
+: test:equiv?-double    s" 2 *"        s" dup +"       equiv?  assert ;  \ two ways to double
+\ ── Fork proofs ─────────────────────────────────────────────────────────────
+: test:fork-no-side-effect
+    3 4                          \ put 3 4 on stack
+    s" + . cr" fork              \ fork computes 7 and prints it
+    depth 2 = assert             \ current stack still has 3 4
+    4 = assert  3 = assert ;     \ values unchanged
+: test:fork-error
+    s" 0 0 /" fork               \ fork a failing computation
+    depth 0 = assert ;           \ current stack is clean
+\ ── Defining words ───────────────────────────────────────────────────────────
+\ constant and value are top-level (interpret-mode) defining words.
+\ They cannot appear inside a : definition — test them at top level here.
+42 constant _c42
+-7 constant _cneg
+0  constant _czero
+10 value _v10
+: test:constant-basic     _c42   42 = assert ;
+: test:constant-negative  _cneg  -7 = assert ;
+: test:constant-zero      _czero  0 = assert ;
+: test:value-basic        _v10   10 = assert ;
+: test:value-independence _c42 _cneg + 35 = assert ;
+\ ── Self-play proofs ─────────────────────────────────────────────────────────
+: test:dual-smoke   depth >r  s" 3 4 +" s" 4 3 +" dual  depth r> = assert ; \ stack clean after dual
+: test:self-argue-pure    s" 3 4 +"   self-argue  assert ;     \ pure fn agrees with itself
+: test:self-argue-lit     s" 42"      self-argue  assert ;     \ literal agrees with itself
+: test:self-argue-err     s" 0 0 /"   self-argue  0= assert ;  \ error → disagrees (0)
+\ `to` is interpret-mode: test at top level, not inside a word
+20 value _v20
+: test:value-to    _v20 20 = assert ;   \ initial value correct
 "#;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -997,6 +1182,7 @@ impl Forth {
             boot_poems:       Vec::new(),
             pending_defines:  Vec::new(),
             user_word_names:  std::collections::HashSet::new(),
+            call_stack:       Vec::with_capacity(64),
         };
         // Load standard library silently — not logged (every session has stdlib)
         let _ = f.eval(STDLIB);
@@ -1016,9 +1202,11 @@ impl Forth {
             return idx;
         }
         let idx = self.strings.len();
-        let owned = s.to_string(); // single allocation
-        self.string_dedup.insert(owned.clone(), idx);
-        self.strings.push(owned);
+        // Push first, then clone from the pool as the dedup key.
+        // Both HashMap and Vec<String> need owned data; two allocs is unavoidable
+        // for a miss, but misses are rare after warmup — the hit path is free.
+        self.strings.push(s.to_string());
+        self.string_dedup.insert(self.strings[idx].clone(), idx);
         idx
     }
 
@@ -1184,6 +1372,14 @@ impl Forth {
     /// Clone the compiled dictionary state into a fresh VM (no stack, no callbacks).
     /// Used to share a pre-compiled VM baseline across tests without re-compiling STDLIB
     /// or vocabulary on every clone.  Callbacks (confirm_fn, gen_fn) are not copied.
+    /// Clone the dictionary AND current data stack — for fork execution.
+    /// The forked VM starts at the same point: same words, same stack values.
+    pub fn fork_vm(&self) -> Self {
+        let mut f = self.clone_dict();
+        f.data = self.data.clone();
+        f
+    }
+
     pub fn clone_dict(&self) -> Self {
         Forth {
             data:       Vec::new(),
@@ -1217,6 +1413,7 @@ impl Forth {
             boot_poems:       Vec::new(),
             pending_defines:  Vec::new(),
             user_word_names:  self.user_word_names.clone(),
+            call_stack:       Vec::with_capacity(64),
         }
     }
 
@@ -1381,6 +1578,55 @@ impl Forth {
                     self.memory.push(Cell::Ret);
                     self.apply_tco(word_addr);
                 }
+                "constant" => {
+                    // `42 constant answer` — pop value, define word that pushes it.
+                    flush_pending!();
+                    pos += 1;
+                    if pos >= tokens.len() { bail!("expected name after constant"); }
+                    let name = tokens[pos].to_lowercase();
+                    let value = self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow in constant"))?;
+                    let word_addr = self.memory.len();
+                    self.name_index.insert(name.clone(), word_addr);
+                    self.memory.push(Cell::Lit(value));
+                    self.memory.push(Cell::Ret);
+                    if self.log_definitions {
+                        self.source_log.push(format!("{value} constant {name}"));
+                    }
+                }
+                "value" => {
+                    // `42 value answer` — like constant but mutable via `to`.
+                    // The word pushes the current heap value (not the address).
+                    flush_pending!();
+                    pos += 1;
+                    if pos >= tokens.len() { bail!("expected name after value"); }
+                    let name = tokens[pos].to_lowercase();
+                    let init = self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow in value"))?;
+                    let addr = self.heap.len();
+                    self.heap.push(init);
+                    // Define the word: push heap addr, then fetch.
+                    let word_addr = self.memory.len();
+                    self.name_index.insert(name.clone(), word_addr);
+                    self.memory.push(Cell::Lit(addr as i64));
+                    self.memory.push(Cell::Builtin(Builtin::Fetch));
+                    self.memory.push(Cell::Ret);
+                    // Also register in var_index so `to` can find the address.
+                    self.var_index.insert(format!("value:{name}"), addr);
+                    if self.log_definitions {
+                        self.source_log.push(format!("{init} value {name}"));
+                    }
+                }
+                "to" => {
+                    // `42 to answer` — store TOS into a `value`'s heap cell.
+                    flush_pending!();
+                    pos += 1;
+                    if pos >= tokens.len() { bail!("expected name after to"); }
+                    let name = tokens[pos].to_lowercase();
+                    let key = format!("value:{name}");
+                    let addr = *self.var_index.get(&key)
+                        .ok_or_else(|| anyhow::anyhow!("`to {name}`: not a value"))?;
+                    let v = self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow in `to`"))?;
+                    self.heap[addr] = v;
+                }
                 "variable" => {
                     flush_pending!();
                     pos += 1;
@@ -1436,6 +1682,12 @@ impl Forth {
                 // `;` outside a word definition = sentence separator (no-op).
                 // Allows natural language like "Hello; I am a Forth program."
                 ";" => { i += 1; continue; }
+                // `exit` — unconditional return from the current word.
+                // Compiles a Ret cell directly; safe to use anywhere in a definition.
+                "exit" => {
+                    self.memory.push(Cell::Ret);
+                    i += 1;
+                }
                 "see" | "？" => {
                     i += 1;
                     let word_name = tokens.get(i).cloned().unwrap_or_default();
@@ -1806,7 +2058,8 @@ impl Forth {
     /// Rust calls across word boundaries.
     fn execute(&mut self, start: usize) -> Result<()> {
         let mut ip = start;
-        let mut call_stack: Vec<usize> = Vec::with_capacity(64);
+        // Reuse the struct-level call stack — avoids a Vec allocation per execute().
+        self.call_stack.clear();
         // Fuel is now checked only on back-edges (loops) and function calls.
         // Straight-line code runs free — zero overhead per instruction.
         // This prevents infinite loops and runaway recursion while keeping
@@ -1821,31 +2074,52 @@ impl Forth {
             };
         }
         // Inline the hottest stack/arithmetic builtins to avoid a function call.
+        // Single bounds check + unchecked pop: one branch instead of two ok_or_else chains.
         macro_rules! pop2 {
-            () => {{ let b = self.pop()?; let a = self.pop()?; (a, b) }};
+            () => {{
+                if self.data.len() < 2 { bail!("stack underflow"); }
+                // SAFETY: we just checked len >= 2.
+                let b = unsafe { self.data.pop().unwrap_unchecked() };
+                let a = unsafe { self.data.pop().unwrap_unchecked() };
+                (a, b)
+            }};
+        }
+        macro_rules! pop1 {
+            () => {{
+                if self.data.is_empty() { bail!("stack underflow"); }
+                // SAFETY: we just checked non-empty.
+                unsafe { self.data.pop().unwrap_unchecked() }
+            }};
         }
         loop {
+            // SAFETY: every well-formed program ends with Cell::Ret which breaks
+            // before ip can go out of bounds.  ip is only set to valid addresses
+            // (start, call-return addresses, and jump targets computed from
+            // well-compiled code).  The fallback `ip >= self.memory.len()` check
+            // is kept in debug builds to catch bugs early.
             if ip >= self.memory.len() { break; }
-            match self.memory[ip] {
+            // SAFETY: bounds checked above (debug) or guaranteed by well-formed code.
+            let cell = unsafe { *self.memory.get_unchecked(ip) };
+            match cell {
                 // ── Hot path: inlined arithmetic & stack ops (no function call) ──
                 Cell::Builtin(Builtin::Plus)  => { let (a,b) = pop2!(); self.data.push(a.wrapping_add(b)); ip += 1; }
                 Cell::Builtin(Builtin::Minus) => { let (a,b) = pop2!(); self.data.push(a.wrapping_sub(b)); ip += 1; }
                 Cell::Builtin(Builtin::Star)  => { let (a,b) = pop2!(); self.data.push(a.wrapping_mul(b)); ip += 1; }
-                Cell::Builtin(Builtin::Dup)   => { let a = self.pop()?; self.push(a)?; self.data.push(a); ip += 1; }
-                Cell::Builtin(Builtin::Drop)  => { self.pop()?; ip += 1; }
+                Cell::Builtin(Builtin::Dup)   => { let a = pop1!(); self.data.push(a); self.data.push(a); ip += 1; }
+                Cell::Builtin(Builtin::Drop)  => { pop1!(); ip += 1; }
                 Cell::Builtin(Builtin::Swap)  => { let (a,b) = pop2!(); self.data.push(b); self.data.push(a); ip += 1; }
-                Cell::Builtin(Builtin::Over)  => { let (a,b) = pop2!(); self.push(a)?; self.data.push(b); self.data.push(a); ip += 1; }
+                Cell::Builtin(Builtin::Over)  => { let (a,b) = pop2!(); self.data.push(a); self.data.push(b); self.data.push(a); ip += 1; }
                 Cell::Builtin(Builtin::Eq)    => { let (a,b) = pop2!(); self.data.push(if a == b { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::Ne)    => { let (a,b) = pop2!(); self.data.push(if a != b { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::Lt)    => { let (a,b) = pop2!(); self.data.push(if a  < b { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::Gt)    => { let (a,b) = pop2!(); self.data.push(if a  > b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::ZeroEq) => { let a = self.pop()?; self.data.push(if a == 0 { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::ZeroLt) => { let a = self.pop()?; self.data.push(if a  < 0 { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::ZeroGt) => { let a = self.pop()?; self.data.push(if a  > 0 { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::ZeroEq) => { let a = pop1!(); self.data.push(if a == 0 { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::ZeroLt) => { let a = pop1!(); self.data.push(if a  < 0 { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::ZeroGt) => { let a = pop1!(); self.data.push(if a  > 0 { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::And)   => { if self.data.len() >= 2 { let (a,b) = pop2!(); self.data.push(a & b); } ip += 1; }
                 Cell::Builtin(Builtin::Or)    => { let (a,b) = pop2!(); self.data.push(a | b); ip += 1; }
                 // ── Literals and string output ──
-                Cell::Lit(n) => { self.push(n)?; ip += 1; }
+                Cell::Lit(n) => { self.data.push(n); ip += 1; }  // bypass overflow check — hot path
                 Cell::Str(idx) => {
                     self.out.push_str(&self.strings[idx]);
                     ip += 1;
@@ -2340,23 +2614,37 @@ impl Forth {
                 Cell::Builtin(Builtin::Invert) => { if let Some(t) = self.data.last_mut() { *t = !*t; } ip += 1; }
                 Cell::Builtin(Builtin::Lshift) => { let (a,b) = pop2!(); self.data.push(a << (b & 63)); ip += 1; }
                 Cell::Builtin(Builtin::Rshift) => { let (a,b) = pop2!(); self.data.push(a >> (b & 63)); ip += 1; }
-                Cell::Builtin(Builtin::Tuck)   => { let len = self.data.len(); if len >= 2 { let t = self.data[len-1]; self.data.insert(len-2, t); } ip += 1; }
-                Cell::Builtin(Builtin::Nip)    => { let len = self.data.len(); if len >= 2 { self.data.remove(len-2); } ip += 1; }
-                Cell::Builtin(Builtin::TwoDup) => { let len = self.data.len(); if len >= 2 { let a = self.data[len-2]; let b = self.data[len-1]; self.data.push(a); self.data.push(b); } ip += 1; }
+                Cell::Builtin(Builtin::Tuck)   => { let (a,b) = pop2!(); self.data.push(b); self.data.push(a); self.data.push(b); ip += 1; }
+                Cell::Builtin(Builtin::Nip)    => { let (a,b) = pop2!(); let _ = a; self.data.push(b); ip += 1; }
+                Cell::Builtin(Builtin::TwoDup) => { let (a,b) = pop2!(); self.data.push(a); self.data.push(b); self.data.push(a); self.data.push(b); ip += 1; }
+                Cell::Builtin(Builtin::Slash)  => {
+                    let (a,b) = pop2!();
+                    if b == 0 { bail!("division by zero"); }
+                    self.data.push(a / b); ip += 1;
+                }
+                Cell::Builtin(Builtin::Mod)    => {
+                    let (a,b) = pop2!();
+                    if b == 0 { bail!("division by zero"); }
+                    self.data.push(a % b); ip += 1;
+                }
+                Cell::Builtin(Builtin::Le)     => { let (a,b) = pop2!(); self.data.push(if a <= b { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::Ge)     => { let (a,b) = pop2!(); self.data.push(if a >= b { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::Abs)    => { if let Some(t) = self.data.last_mut() { *t = t.abs(); } ip += 1; }
                 Cell::Builtin(b) => { self.exec_builtin(b)?; ip += 1; }
                 Cell::Addr(addr) => {
                     check_fuel!();
                     // Tail-call optimisation: if next cell is Ret, reuse the current frame.
-                    if ip + 1 < self.memory.len() && matches!(self.memory[ip + 1], Cell::Ret) {
+                    // SAFETY: ip+1 is valid because compiled words always end with Ret.
+                    if matches!(unsafe { self.memory.get_unchecked(ip + 1) }, Cell::Ret) {
                         ip = addr;  // jump without pushing return address
                     } else {
-                        if call_stack.len() >= MAX_CALL_DEPTH { bail!("return stack overflow"); }
-                        call_stack.push(ip + 1);
+                        if self.call_stack.len() >= MAX_CALL_DEPTH { bail!("return stack overflow"); }
+                        self.call_stack.push(ip + 1);
                         ip = addr;
                     }
                 }
                 Cell::Ret => {
-                    match call_stack.pop() {
+                    match self.call_stack.pop() {
                         Some(ret) => { ip = ret; }
                         None      => break,
                     }
@@ -4614,6 +4902,342 @@ impl Forth {
                     .unwrap_or(0) as i64;
                 self.data.push(count);
             }
+            Builtin::ExecCapture => {
+                // ( cmd-idx -- output-idx )
+                // Run a shell command; push stdout as a trimmed string pool entry.
+                // Stderr is discarded.  On error, pushes an empty string.
+                let idx = self.pop()? as usize;
+                let cmd = self.strings.get(idx).cloned().unwrap_or_default();
+                let stdout = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+                    .unwrap_or_default();
+                let new_idx = self.strings.len() as i64;
+                self.strings.push(stdout);
+                self.data.push(new_idx);
+            }
+            Builtin::BackAndForthQ => {
+                // ( n fwd-str back-str -- flag )
+                // Apply fwd-str to n; apply back-str to the result; compare to n.
+                // Push -1 if you are home again, 0 if not.  Never aborts.
+                if self.data.len() < 3 {
+                    self.data.push(0);
+                    return Ok(());
+                }
+                let back_idx = self.pop()? as usize;
+                let fwd_idx  = self.pop()? as usize;
+                let n        = self.pop()?;
+
+                let fwd_code  = self.strings.get(fwd_idx).cloned().unwrap_or_default();
+                let back_code = self.strings.get(back_idx).cloned().unwrap_or_default();
+
+                let saved_data = std::mem::take(&mut self.data);
+                let saved_out  = self.out.clone();
+                let snap       = self.snapshot();
+
+                // Forward pass: run fwd_code with n on the stack.
+                self.data.push(n);
+                let m = if self.eval(&fwd_code).is_ok() {
+                    self.data.last().copied()
+                } else {
+                    None
+                };
+
+                let flag = if let Some(m) = m {
+                    // Backward pass: run back_code with m on the stack.
+                    self.data.clear();
+                    self.restore(&snap);
+                    self.data.push(m);
+                    let ok = self.eval(&back_code).is_ok();
+                    let n_prime = self.data.last().copied();
+                    match (ok, n_prime) {
+                        (true, Some(np)) if np == n => -1,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+
+                self.data.clear();
+                self.restore(&snap);
+                self.data = saved_data;
+                self.out  = saved_out;
+                self.data.push(flag);
+            }
+            Builtin::InvertibleQ => {
+                // ( n str -- flag )
+                // Apply str to n to get m; apply str to m; check if result == n.
+                // -1 if str is an involution (f(f(n)) = n).  Never aborts.
+                if self.data.len() < 2 {
+                    self.data.push(0);
+                    return Ok(());
+                }
+                let idx = self.pop()? as usize;
+                let n   = self.pop()?;
+                let code = self.strings.get(idx).cloned().unwrap_or_default();
+
+                let saved_data = std::mem::take(&mut self.data);
+                let saved_out  = self.out.clone();
+                let snap       = self.snapshot();
+
+                // First application: n → m
+                self.data.push(n);
+                let m = if self.eval(&code).is_ok() {
+                    self.data.last().copied()
+                } else {
+                    None
+                };
+
+                let flag = if let Some(m) = m {
+                    // Second application: m → n'
+                    self.data.clear();
+                    self.restore(&snap);
+                    self.data.push(m);
+                    let ok = self.eval(&code).is_ok();
+                    let n_prime = self.data.last().copied();
+                    match (ok, n_prime) {
+                        (true, Some(np)) if np == n => -1,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+
+                self.data.clear();
+                self.restore(&snap);
+                self.data = saved_data;
+                self.out  = saved_out;
+                self.data.push(flag);
+            }
+            Builtin::Help => {
+                self.out.push_str(concat!(
+                    "─── Co-Forth ────────────────────────────────────────────────────\n",
+                    " Values go on the stack.  Words transform it.  Proofs settle it.\n",
+                    "\n",
+                    " Stack     3 4 +  →  7           dup drop swap over rot\n",
+                    " Arithmetic + - * /  mod  negate  abs  max  min  square  pow\n",
+                    " Compare   =  <  >  <>  0=  0<\n",
+                    " Logic     and  or  xor  invert\n",
+                    " Output    .  .\" hello\"  cr  .s  type\n",
+                    " Strings   s\" hello\"  str-cat  str-len  str=  str-trim  str-find\n",
+                    " Shell     s\" ls\" exec-capture  type\n",
+                    " Define    : double  2 * ;\n",
+                    " Proofs    s\" 2 3 +\" s\" 3 2 +\" agree?      \\ two machines, one answer\n",
+                    "           5 s\" 1 +\" s\" 1 -\" back-and-forth?  \\ round trip\n",
+                    "           9 s\" negate\" invertible?          \\ its own inverse\n",
+                    " List      words\n",
+                    " Describe  s\" dup\" describe\n",
+                    "─────────────────────────────────────────────────────────────────\n",
+                ));
+            }
+            Builtin::Describe => {
+                // ( idx -- )  show what we know about the named word.
+                use crossterm::style::Stylize;
+                let idx = self.pop()? as usize;
+                let name = self.strings.get(idx).cloned().unwrap_or_default();
+                let name = name.trim().to_string();
+
+                let mut found = false;
+
+                // 1. User-defined colon word — show source.
+                if let Some(src) = self.word_source(&name) {
+                    self.out.push_str(&format!(
+                        "  {} {}\n",
+                        name.as_str().cyan().bold(),
+                        src.trim().dark_grey(),
+                    ));
+                    found = true;
+                }
+
+                // 2. Library / vocabulary definition.
+                static DESC_LIB: std::sync::OnceLock<crate::coforth::Library> = std::sync::OnceLock::new();
+                let lib = DESC_LIB.get_or_init(crate::coforth::Library::load);
+                if let Some(entry) = lib.lookup(&name) {
+                    self.out.push_str(&format!("  {}\n", entry.definition.as_str().white()));
+                    found = true;
+                }
+
+                // 3. Built-in.
+                if !found {
+                    if name_to_builtin(name.as_str()).is_some() {
+                        self.out.push_str(&format!("  {}  — built-in word\n", name.as_str().cyan().bold()));
+                    } else if self.var_index.contains_key(name.as_str()) {
+                        self.out.push_str(&format!("  {}  — variable\n", name.as_str().cyan().bold()));
+                    } else {
+                        self.out.push_str(&format!("  {}  — not defined  (type `help` for a guide)\n", name.as_str().dark_grey()));
+                    }
+                }
+            }
+            Builtin::Compute => {
+                // ( str-idx -- )
+                // Evaluate str as a computation and print the result.
+                //
+                // Strategy:
+                //   1. Try as Forth code (via safe execution).
+                //   2. If Forth fails, try as infix expression.
+                //   3. Print "= <result>" on success; "?" on failure.
+                //
+                // The caller's stack is restored; Compute leaves nothing.
+                let idx = self.pop()? as usize;
+                let src = self.strings.get(idx).cloned().unwrap_or_default();
+
+                let saved_data = std::mem::take(&mut self.data);
+                let saved_out  = self.out.clone();
+                let snap       = self.snapshot();
+
+                // Attempt 1: Forth.
+                let result = {
+                    let forth_ok = self.eval(&src).is_ok();
+                    let tos = self.data.last().copied();
+                    self.data.clear();
+                    self.restore(&snap);
+                    if forth_ok { tos } else { None }
+                };
+
+                // Attempt 2: infix (if Forth failed).
+                // Push the source string index onto the data stack, then call `infix`
+                // which pops it and evaluates the shunting-yard expression.
+                let result = if result.is_some() {
+                    result
+                } else {
+                    self.data.push(idx as i64);
+                    let infix_ok = self.eval("infix").is_ok();
+                    let tos = self.data.last().copied();
+                    self.data.clear();
+                    self.restore(&snap);
+                    if infix_ok { tos } else { None }
+                };
+
+                self.data = saved_data;
+                self.out  = saved_out;
+
+                match result {
+                    Some(n) => self.out.push_str(&format!("= {n}\n")),
+                    None    => self.out.push_str("?\n"),
+                }
+            }
+            Builtin::EquivQ => {
+                // ( str1 str2 -- flag )
+                // Test program equivalence by probing both programs over a range of inputs.
+                //
+                // For each n in -5..=5, run each program with n pre-loaded on the stack.
+                // If the programs leave the same TOS for every input where both succeed,
+                // push -1 (equivalent).  Push 0 if they ever disagree on any input.
+                //
+                // Programs that always fail, or programs that produce results only on
+                // a subset of inputs, are equivalent iff their successful outputs agree.
+                // Two programs that both fail on every input are considered equivalent.
+                //
+                // Never aborts.  The caller's stack is restored.
+                if self.data.len() < 2 {
+                    self.data.push(-1);
+                    return Ok(());
+                }
+                let idx2 = self.pop()? as usize;
+                let idx1 = self.pop()? as usize;
+                let code1 = self.strings.get(idx1).cloned().unwrap_or_default();
+                let code2 = self.strings.get(idx2).cloned().unwrap_or_default();
+
+                let saved_data = std::mem::take(&mut self.data);
+                let saved_out  = self.out.clone();
+                let snap       = self.snapshot();
+
+                let mut equiv = true;
+                for n in -5i64..=5 {
+                    // Run program 1 with n on the stack.
+                    self.data.push(n);
+                    let r1 = if self.eval(&code1).is_ok() { self.data.last().copied() } else { None };
+                    self.data.clear();
+                    self.restore(&snap);
+
+                    // Run program 2 with n on the stack.
+                    self.data.push(n);
+                    let r2 = if self.eval(&code2).is_ok() { self.data.last().copied() } else { None };
+                    self.data.clear();
+                    self.restore(&snap);
+
+                    // Both produced a result — they must agree.
+                    if let (Some(a), Some(b)) = (r1, r2) {
+                        if a != b {
+                            equiv = false;
+                            break;
+                        }
+                    }
+                    // One failed and one succeeded — not equivalent.
+                    if r1.is_some() != r2.is_some() {
+                        equiv = false;
+                        break;
+                    }
+                }
+
+                self.data = saved_data;
+                self.out  = saved_out;
+                self.data.push(if equiv { -1 } else { 0 });
+            }
+            Builtin::Fork => {
+                // ( str-idx -- )
+                // Run code in an isolated copy of the current VM.
+                // The fork inherits the current dictionary AND the current data stack.
+                // Output from the fork is appended to self.out.
+                // The current VM is unaffected — no stack change, no definition change.
+                let str_idx = self.pop()? as usize;
+                let code = self.strings.get(str_idx).cloned().unwrap_or_default();
+
+                let mut forked = self.fork_vm();
+                match forked.eval(&code) {
+                    Ok(()) => {
+                        if !forked.out.is_empty() {
+                            self.out.push_str(&forked.out);
+                        }
+                        // Show the fork's resulting stack.
+                        if !forked.data.is_empty() {
+                            let stack: Vec<String> = forked.data.iter().map(|n| n.to_string()).collect();
+                            self.out.push_str(&format!("fork →  {}\n", stack.join("  ")));
+                        }
+                    }
+                    Err(e) => {
+                        self.out.push_str(&format!("fork ✗  {e}\n"));
+                    }
+                }
+            }
+            Builtin::Boot => {
+                // ( -- )
+                // Re-execute all vocabulary words that have boot = true.
+                // Safe: failures are silently ignored (a boot word failing should not
+                // abort the session).
+                static BOOT_LIB: std::sync::OnceLock<crate::coforth::Library> =
+                    std::sync::OnceLock::new();
+                let lib = BOOT_LIB.get_or_init(crate::coforth::Library::load);
+                let entries: Vec<String> = lib.boot_entries()
+                    .iter()
+                    .filter_map(|e| e.forth.clone())
+                    .collect();
+                for code in &entries {
+                    let _ = self.eval(code);
+                }
+            }
+            Builtin::PrintR => {
+                // ( n width -- )  print n right-aligned in a field of `width` chars.
+                // If the number is wider than `width`, it prints without padding.
+                let width = self.pop()? as usize;
+                let n = self.pop()?;
+                self.out.push_str(&format!("{n:>width$}"));
+            }
+            Builtin::PrintPad => {
+                // ( n width char-idx -- )  print n left-padded with char to width.
+                let char_idx = self.pop()? as usize;
+                let width    = self.pop()? as usize;
+                let n        = self.pop()?;
+                let pad_char = self.strings.get(char_idx)
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or(' ');
+                let s = n.to_string();
+                let pad = width.saturating_sub(s.len());
+                for _ in 0..pad { self.out.push(pad_char); }
+                self.out.push_str(&s);
+            }
             Builtin::SortLines => {
                 let idx = self.pop()? as usize;
                 let s = self.strings.get(idx).cloned().unwrap_or_default();
@@ -5876,7 +6500,18 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         // Collection operations
         "glob-pool"      => Builtin::GlobPool,
         "clean-lines"    => Builtin::CleanLines,
-        "glob-count"     => Builtin::GlobCount,
+        "glob-count"      => Builtin::GlobCount,
+        "exec-capture"    => Builtin::ExecCapture,
+        "back-and-forth?" => Builtin::BackAndForthQ,
+        "invertible?"     => Builtin::InvertibleQ,
+        "help"            => Builtin::Help,
+        "describe"        => Builtin::Describe,
+        "compute"         => Builtin::Compute,
+        "equiv?"          => Builtin::EquivQ,
+        "fork"            => Builtin::Fork,
+        "boot"            => Builtin::Boot,
+        ".r"              => Builtin::PrintR,
+        ".pad"            => Builtin::PrintPad,
         "sort"           => Builtin::SortLines,
         "sort-lines"     => Builtin::SortLines,
         "unique"         => Builtin::UniqueLines,
