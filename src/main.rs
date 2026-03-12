@@ -716,8 +716,10 @@ fn init_tracing() {
     // Default: INFO level, can be overridden with RUST_LOG env var
     // Note: config.features.debug_logging sets RUST_LOG=debug before init_tracing()
     // Users can also manually set RUST_LOG for custom log levels
+    // mdns_sd=error: suppress WARN "No buffer space available" on VPN/tunnel interfaces —
+    // those interfaces don't support multicast; the error is harmless noise.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mdns_sd=error"));
 
     // Build the subscriber with our custom layer
     tracing_subscriber::registry()
@@ -1004,7 +1006,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Add file layer to tracing
     use tracing_subscriber::prelude::*;
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,mdns_sd=error"));
 
     tracing_subscriber::registry()
         .with(env_filter)

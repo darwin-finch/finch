@@ -780,9 +780,15 @@ impl EventLoop {
             // Compile user vocabulary extensions (builtins are already in the precompiled VM).
             let mut user_defs = String::new();
             for entry in &user_entries {
-                let code = entry.forth.as_deref().unwrap_or("");
+                let code = entry.forth.as_deref().unwrap_or("").trim();
+                // Skip self-referential entries (e.g. `forth = "boom"` for word `boom`).
+                // These are documentation stubs that say "this is a builtin" — compiling
+                // them as `: boom boom ;` creates infinite recursion.
+                if code == entry.word.as_str() {
+                    continue;
+                }
                 let jit_def = if code.trim_start().starts_with(':') {
-                    code.trim().to_string()
+                    code.to_string()
                 } else {
                     format!(": {} {} ;", entry.word, code)
                 };
