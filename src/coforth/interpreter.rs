@@ -168,6 +168,13 @@ enum Builtin {
     StrFind,                  // ( idx needle-idx -- pos )       find needle; -1 if absent
     StrReplace,               // ( idx from-idx to-idx -- idx' ) replace all occurrences
     StrReverse,               // ( idx -- idx' )                 reverse characters
+    NumToStr,                 // ( n -- idx )  format integer as decimal string in pool
+    StrToNum,                 // ( idx -- n flag )  parse integer; flag=-1 ok, 0 fail
+    WordDefined,              // ( idx -- flag )  -1 if word named strings[idx] is defined
+    WordNames,                // ( -- idx )  all defined word names, newline-separated
+    NthLine,                  // ( idx n -- line-idx )  get nth line (0-based) of newline string
+    AgreeQ,                   // ( str1 str2 -- flag )  like argue but flag, never aborts
+    SameQ,                    // ( str1 str2 -- flag )  like versus but flag, never aborts
     Safe,                     // ( str-idx -- flag )  eval str; -1 ok, 0 error (never aborts)
     // Crypto primitives (safe Rust — sha2, ed25519-dalek, rand)
     Sha256,                   // ( idx -- idx' )  SHA-256 hex of strings[idx]
@@ -714,11 +721,44 @@ const STDLIB: &str = r#"
 \ str-starts?  — true if str begins with prefix  ( idx prefix-idx -- flag )
 : str-starts?   ( idx prefix-idx -- flag )  str-find 0= ;
 
+\ str-ends?  — true if str ends with suffix  ( idx suffix-idx -- flag )
+: str-ends?     ( idx suf-idx -- flag )
+    2dup str-len >r str-len r> swap -
+    rot str-sub
+    str= ;
+
 \ str-empty?   — true if string has zero length  ( idx -- flag )
 : str-empty?    ( idx -- flag )  str-len 0= ;
 
 \ str-words — number of whitespace-delimited tokens in a string  ( idx -- n )
 : str-words     ( idx -- n )  word-count ;
+
+\ str-lines — number of newlines + 1 in a string  ( idx -- n )
+: str-lines     ( idx -- n )  line-count ;
+
+\ num>str / str>num — bridge between integers and the string pool  ( n -- idx ) / ( idx -- n flag )
+: num>str       ( n -- idx )        num>str ;
+: str>num       ( idx -- n flag )   str>num ;
+
+\ word-defined? — true if a word exists in the dictionary  ( idx -- flag )
+: word-defined? ( idx -- flag )  word-defined? ;
+
+\ word-names — all defined word names as a newline-separated string  ( -- idx )
+: word-names    ( -- idx )  word-names ;
+
+\ nth-line — get the nth line (0-based) of a newline-separated string  ( idx n -- line-idx )
+: nth-line      ( idx n -- line-idx )  nth-line ;
+
+\ agree? — non-aborting argue: -1 if tops agree, 0 if not  ( str1 str2 -- flag )
+: agree?        ( str1 str2 -- flag )  agree? ;
+
+\ same? — non-aborting versus: -1 if full stacks agree, 0 if not  ( str1 str2 -- flag )
+: same?         ( str1 str2 -- flag )  same? ;
+
+\ check — print agree/disagree and return flag  ( str1 str2 -- flag )
+: check ( str1 str2 -- flag )
+    2dup agree? dup
+    if ." ✓ agreed" cr else ." ✗ disagreed" cr then ;
 
 \ Prolog: a query is a goal.  Resolution is unification + backtracking.
 \ Compressed to: a goal is a word.  Backtracking = trying alternatives.
@@ -905,6 +945,20 @@ variable _tm  ( shared test memory cell )
 : test:str-replace   s" hello world" s" world" s" earth" str-replace  s" hello earth" str= assert ;
 : test:safe-ok       s" 1 2 +" safe  assert  depth 1 = assert  3 = assert ;
 : test:safe-fail     s" 0 0 / drop" safe  0= assert  depth 0 = assert ;
+\ ── Number ↔ string ─────────────────────────────────────────────────────────
+: test:num>str       42 num>str  s" 42" str= assert   -1 num>str  s" -1" str= assert ;
+: test:str>num-ok    s" 99" str>num  assert  99 = assert ;
+: test:str>num-fail  s" xyz" str>num  0= assert  drop ;
+\ ── Vocabulary introspection ─────────────────────────────────────────────────
+: test:word-defined? s" +" word-defined? assert   s" no-such-word-xzq" word-defined? 0= assert ;
+: test:word-names    word-names str-len 0 > assert ;
+: test:nth-line      s" apple" s" ," str-split  0 nth-line  s" apple" str= assert ;
+\ ── Two-machine predicates ───────────────────────────────────────────────────
+: test:agree?-yes    s" 3 4 +"  s" 4 3 +"  agree? assert ;
+: test:agree?-no     s" 3 4 +"  s" 3 4 -"  agree? 0= assert ;
+: test:same?-yes     s" 1 2 3"  s" 1 2 3"  same? assert ;
+: test:same?-no      s" 1 2 3"  s" 1 2 4"  same? 0= assert ;
+: test:same?-error   s" 0 0 /"  s" 1 2 +"  same? 0= assert ;
 "#;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -3820,13 +3874,11 @@ impl Forth {
                 let code = self.strings.get(str_idx)
                     .ok_or_else(|| anyhow::anyhow!("safe: invalid string index"))?
                     .clone();
-                let snap      = self.snapshot();
+                let snap       = self.snapshot();
                 let saved_data = self.data.clone();
                 let saved_out  = self.out.clone();
                 match self.eval(&code) {
-                    Ok(()) => {
-                        self.data.push(-1);
-                    }
+                    Ok(()) => { self.data.push(-1); }
                     Err(_) => {
                         self.restore(&snap);
                         self.data = saved_data;
@@ -3834,6 +3886,130 @@ impl Forth {
                         self.data.push(0);
                     }
                 }
+            }
+            Builtin::NumToStr => {
+                let n = self.pop()?;
+                let s = n.to_string();
+                let idx = self.intern_str(&s);
+                self.data.push(idx as i64);
+            }
+            Builtin::StrToNum => {
+                let src_idx = self.pop()? as usize;
+                let s = self.strings.get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str>num: invalid string index"))?
+                    .trim()
+                    .to_string();
+                match s.parse::<i64>() {
+                    Ok(n)  => { self.data.push(n);  self.data.push(-1); }
+                    Err(_) => { self.data.push(0);  self.data.push(0);  }
+                }
+            }
+            Builtin::WordDefined => {
+                let idx = self.pop()? as usize;
+                let name = self.strings.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("word-defined?: invalid string index"))?
+                    .clone();
+                // Check colon definitions AND compiled builtins.
+                let defined = self.name_index.contains_key(name.as_str())
+                    || name_to_builtin(name.as_str()).is_some();
+                self.data.push(if defined { -1 } else { 0 });
+            }
+            Builtin::WordNames => {
+                let mut names: Vec<&str> = self.name_index.keys().map(|s| s.as_str()).collect();
+                names.sort_unstable();
+                let joined = names.join("\n");
+                let idx = self.strings.len();
+                self.strings.push(joined);
+                self.data.push(idx as i64);
+            }
+            Builtin::NthLine => {
+                let n       = self.pop()? as usize;
+                let src_idx = self.pop()? as usize;
+                let src = self.strings.get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("nth-line: invalid string index"))?
+                    .clone();
+                let line = src.lines().nth(n)
+                    .ok_or_else(|| anyhow::anyhow!("nth-line: index {} out of range", n))?
+                    .to_string();
+                let idx = self.intern_str(&line);
+                self.data.push(idx as i64);
+            }
+            Builtin::AgreeQ => {
+                // ( str1 str2 -- flag )
+                // Run both programs in isolation; push -1 if tops agree, 0 if not.
+                // Never aborts. Leaves the caller's stack otherwise intact.
+                if self.data.len() < 2 {
+                    self.data.push(-1); // vacuously agree
+                    return Ok(());
+                }
+                let idx2 = self.pop()? as usize;
+                let idx1 = self.pop()? as usize;
+                let code1 = self.strings.get(idx1).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("agree?: invalid string index {idx1}"))?;
+                let code2 = self.strings.get(idx2).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("agree?: invalid string index {idx2}"))?;
+
+                let saved_data = std::mem::take(&mut self.data);
+                let saved_out  = self.out.clone();
+                let snap       = self.snapshot();
+
+                let r1 = self.eval(&code1).ok().and_then(|_| self.data.last().copied());
+                self.data.clear();
+                self.restore(&snap);
+
+                let r2 = self.eval(&code2).ok().and_then(|_| self.data.last().copied());
+                self.data.clear();
+                self.restore(&snap);
+
+                self.data = saved_data;
+                self.out  = saved_out;
+
+                let flag = match (r1, r2) {
+                    (Some(a), Some(b)) if a == b => -1,
+                    _ => 0,
+                };
+                self.data.push(flag);
+            }
+            Builtin::SameQ => {
+                // ( str1 str2 -- flag )
+                // Run both programs in isolation; push -1 if FULL stacks agree, 0 if not.
+                // Never aborts.
+                if self.data.len() < 2 {
+                    self.data.push(-1);
+                    return Ok(());
+                }
+                let idx2 = self.pop()? as usize;
+                let idx1 = self.pop()? as usize;
+                let code1 = self.strings.get(idx1).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("same?: invalid string index {idx1}"))?;
+                let code2 = self.strings.get(idx2).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("same?: invalid string index {idx2}"))?;
+
+                let saved_data = std::mem::take(&mut self.data);
+                let saved_out  = self.out.clone();
+                let snap       = self.snapshot();
+
+                let stack1 = if self.eval(&code1).is_ok() {
+                    self.data.clone()
+                } else {
+                    vec![]
+                };
+                self.data.clear();
+                self.restore(&snap);
+
+                let stack2 = if self.eval(&code2).is_ok() {
+                    self.data.clone()
+                } else {
+                    vec![]
+                };
+                self.data.clear();
+                self.restore(&snap);
+
+                self.data = saved_data;
+                self.out  = saved_out;
+
+                let flag = if stack1 == stack2 { -1 } else { 0 };
+                self.data.push(flag);
             }
             // ── Crypto primitives ─────────────────────────────────────────────
             Builtin::Sha256 => {
@@ -5628,9 +5804,16 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "str-join"    => Builtin::StrJoin,
         "str-sub"     => Builtin::StrSub,
         "str-find"    => Builtin::StrFind,
-        "str-replace" => Builtin::StrReplace,
-        "str-reverse" => Builtin::StrReverse,
-        "safe"        => Builtin::Safe,
+        "str-replace"  => Builtin::StrReplace,
+        "str-reverse"  => Builtin::StrReverse,
+        "num>str"      => Builtin::NumToStr,
+        "str>num"      => Builtin::StrToNum,
+        "word-defined?" => Builtin::WordDefined,
+        "word-names"   => Builtin::WordNames,
+        "nth-line"     => Builtin::NthLine,
+        "agree?"       => Builtin::AgreeQ,
+        "same?"        => Builtin::SameQ,
+        "safe"         => Builtin::Safe,
         // Crypto
         "sha256"      => Builtin::Sha256,
         "file-sha256" => Builtin::FileSha256,
