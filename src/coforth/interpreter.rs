@@ -403,6 +403,27 @@ const STDLIB: &str = r#"
 \ Least common multiple  ( a b -- lcm )
 : lcm  2dup gcd / * abs ;
 
+\ Prime test  ( n -- flag )
+\ Returns -1 (true) if n is prime, 0 if composite or < 2.
+\ Uses 0/-1 literals directly — no dependency on true/false/even? words.
+: prime?
+    dup 2 < if drop 0 exit then
+    dup 2 = if drop -1 exit then
+    dup 2 mod 0= if drop 0 exit then
+    3
+    begin 2dup dup * swap <= while
+        2dup mod 0= if 2drop 0 exit then
+        2 +
+    repeat
+    2drop -1 ;
+
+\ Next prime at or above n  ( n -- p )
+: next-prime  ( n -- p )
+    dup 2 < if drop 2 exit then
+    dup prime? if exit then
+    dup 2 mod 0= if 1+ then
+    begin dup prime? 0= while 2 + repeat ;
+
 \ Integer power  ( base exp -- base^exp )
 : pow  ( base exp -- result )
     1 swap
@@ -1131,6 +1152,21 @@ variable _tm  ( shared test memory cell )
 -7 constant _cneg
 0  constant _czero
 10 value _v10
+\ ── Prime words ─────────────────────────────────────────────────────────────
+: test:prime?-2        2 prime?  assert ;
+: test:prime?-3        3 prime?  assert ;
+: test:prime?-7        7 prime?  assert ;
+: test:prime?-97      97 prime?  assert ;
+: test:prime?-4        4 prime?  0= assert ;
+: test:prime?-9        9 prime?  0= assert ;
+: test:prime?-1        1 prime?  0= assert ;
+: test:prime?-0        0 prime?  0= assert ;
+: test:prime?-49      49 prime?  0= assert ;
+: test:next-prime-2    2 next-prime  2  = assert ;
+: test:next-prime-3    3 next-prime  3  = assert ;
+: test:next-prime-4    4 next-prime  5  = assert ;
+: test:next-prime-10  10 next-prime  11 = assert ;
+\ ── Defining words ─────────────────────────────────────────────────────────
 : test:constant-basic     _c42   42 = assert ;
 : test:constant-negative  _cneg  -7 = assert ;
 : test:constant-zero      _czero  0 = assert ;

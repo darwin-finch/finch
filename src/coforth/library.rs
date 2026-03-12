@@ -532,18 +532,50 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
     lib.load_toml(SEED_LIBRARY);
     lib.load_toml(ENGLISH_LIBRARY);
 
+    // Core Forth words that must never be shadowed by vocabulary entries.
+    // These are builtins or STDLIB words that user-facing vocabulary demos
+    // must not override — doing so breaks fundamental language behaviour.
+    const PROTECTED: &[&str] = &[
+        // I/O primitives
+        "cr", "space", "spaces", "emit", "type", ".", ".s", ",",
+        // Stack ops
+        "dup", "drop", "swap", "over", "rot", "-rot", "nip", "tuck",
+        "2dup", "2drop", "2swap", "2over", "depth", "?dup",
+        // Arithmetic / logic
+        "+", "-", "*", "/", "mod", "negate", "abs", "max", "min",
+        "and", "or", "xor", "invert", "lshift", "rshift",
+        "=", "<>", "<", ">", "<=", ">=", "0=", "0<", "0>",
+        "1+", "1-", "2*", "2/",
+        // Memory
+        "@", "!", "+!", "here", "allot",
+        // String
+        "str-len", "str=", "str-cat", "str-upper", "str-lower",
+        "str-trim", "str-find", "str-split", "str-join", "num>str", "str>num",
+        // Control / defining
+        "if", "then", "else", "begin", "while", "repeat", "until",
+        "do", "loop", "i", "j", "exit", "recurse",
+        ":", ";", "variable", "constant", "value", "to", "create",
+        // Misc
+        "assert", "safe", "eval", "fork", "time", "nonce",
+        "true", "false", "bool",
+    ];
+
     let mut entries: Vec<_> = lib.words.values()
         .flat_map(|senses| senses.iter())
         .filter(|e| e.forth.is_some())
+        .filter(|e| !PROTECTED.contains(&e.word.as_str()))
         .collect();
     entries.sort_by(|a, b| a.word.cmp(&b.word));
 
     let mut all_defs = String::with_capacity(entries.len() * 44);
-    let pairs: Vec<(String, String)> = entries.iter().map(|e| {
-        let code = e.forth.as_deref().unwrap_or("");
+    let pairs: Vec<(String, String)> = entries.iter().filter_map(|e| {
+        let code = e.forth.as_deref().unwrap_or("").trim();
+        // Skip self-referential stubs (e.g. `forth = "boom"` for word `boom`).
+        // These say "this is a builtin" — compiling them as `: boom boom ;` recurses.
+        if code == e.word.as_str() { return None; }
         let line = format!(": {} {} ;\n", e.word, code);
         all_defs.push_str(&line);
-        (e.word.clone(), code.to_string())
+        Some((e.word.clone(), code.to_string()))
     }).collect();
 
     // Collect words that have argue proofs (definition ↔ Forth bridge).
@@ -730,7 +762,7 @@ pub(crate) const MAJOR_WORDS_FORTH: &str = r#"
 : test:logic   s" true false and"   s" false true and"   argue ;
 
 : abstract  ( -- )   ." abstract: the map is not the territory." cr ;
-: space     ( -- )   ." space: room for everything that could happen." cr ;
+\ space is a core builtin — not overridden here
 : part      ( -- )   ." part: something taken from something larger." cr ;
 : fraction  ( -- )   ." fraction: one of three equal parts." cr ;
 : rate      ( -- )   ." rate: how fast things happen." cr ;
