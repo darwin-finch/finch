@@ -88,6 +88,8 @@ enum Builtin {
     Plus, Minus, Star, Slash, Mod,
     Dup, Drop, Swap, Over, Rot, Nip, Tuck,
     TwoDup, TwoDrop, TwoSwap,
+    TwoOver,   // ( a b c d -- a b c d a b )  copy second pair to top
+    TwoRot,    // ( a b c d e f -- c d e f a b )  rotate three pairs
     Pick, Roll,
     Eq, Lt, Gt, Ne, Le, Ge, ZeroEq, ZeroLt, ZeroGt, ULt,
     And, Or, Xor, Invert, Negate, Abs, Max, Min,
@@ -160,6 +162,13 @@ enum Builtin {
     StrEq,                    // ( idx-a idx-b -- bool )  string equality
     StrLen,                   // ( idx -- n )  byte length of strings[idx]
     StrCat,                   // ( idx-a idx-b -- idx-c )  concatenate
+    StrSplit,                 // ( idx sep-idx -- result-idx )  split by sep → one part per line
+    StrJoin,                  // ( idx sep-idx -- result-idx )  join newline-separated parts with sep
+    StrSub,                   // ( idx start len -- idx' )      substring (char-indexed)
+    StrFind,                  // ( idx needle-idx -- pos )       find needle; -1 if absent
+    StrReplace,               // ( idx from-idx to-idx -- idx' ) replace all occurrences
+    StrReverse,               // ( idx -- idx' )                 reverse characters
+    Safe,                     // ( str-idx -- flag )  eval str; -1 ok, 0 error (never aborts)
     // Crypto primitives (safe Rust — sha2, ed25519-dalek, rand)
     Sha256,                   // ( idx -- idx' )  SHA-256 hex of strings[idx]
     FileSha256,               // ( path-idx -- hex-idx )         SHA-256 of whole file (stack)
@@ -684,6 +693,33 @@ const STDLIB: &str = r#"
 \ Everything else is defined in terms of : ; if then begin until.
 : forth-eval    ( str -- )   eval ;
 
+\ ── Stack extras ─────────────────────────────────────────────────────────────
+: 2over         ( a b c d -- a b c d a b )  2over ;
+: 2rot          ( a b c d e f -- c d e f a b )  2rot ;
+
+\ ── String operations ────────────────────────────────────────────────────────
+: str-split     ( idx sep-idx -- result-idx )   str-split ;
+: str-join      ( idx sep-idx -- result-idx )   str-join ;
+: str-sub       ( idx start len -- idx' )        str-sub ;
+: str-find      ( idx needle-idx -- pos )         str-find ;
+: str-replace   ( idx from-idx to-idx -- idx' )  str-replace ;
+: str-reverse   ( idx -- idx' )                  str-reverse ;
+
+\ safe: run a string as Forth — -1 if ok, 0 if it bailed (state restored on failure)
+: safe          ( str-idx -- flag )  safe ;
+
+\ str-contains? — true if needle appears anywhere in haystack  ( idx needle-idx -- flag )
+: str-contains? ( idx needle-idx -- flag )  str-find -1 > ;
+
+\ str-starts?  — true if str begins with prefix  ( idx prefix-idx -- flag )
+: str-starts?   ( idx prefix-idx -- flag )  str-find 0= ;
+
+\ str-empty?   — true if string has zero length  ( idx -- flag )
+: str-empty?    ( idx -- flag )  str-len 0= ;
+
+\ str-words — number of whitespace-delimited tokens in a string  ( idx -- n )
+: str-words     ( idx -- n )  word-count ;
+
 \ Prolog: a query is a goal.  Resolution is unification + backtracking.
 \ Compressed to: a goal is a word.  Backtracking = trying alternatives.
 \ True if the word executes without error; false if it bails.
@@ -853,6 +889,22 @@ variable _tm  ( shared test memory cell )
 : test:nl          depth >r nl           depth r> = assert ;
 : test:banner      depth >r banner       depth r> = assert ;
 : test:boot-wake   depth >r boot-wake    depth r> = assert ;
+\ ── Stack extras ─────────────────────────────────────────────────────────────
+: test:2over       1 2 3 4 2over  2 = assert  1 = assert  4 = assert  3 = assert  2 = assert  1 = assert ;
+: test:2rot        1 2 3 4 5 6 2rot  2 = assert  1 = assert  6 = assert  5 = assert  4 = assert  3 = assert ;
+\ ── String operations ────────────────────────────────────────────────────────
+: test:str-reverse   s" abc" str-reverse  s" cba" str= assert ;
+: test:str-sub       s" hello" 1 3 str-sub  s" ell" str= assert ;
+: test:str-find      s" hello world" s" world" str-find  6 = assert ;
+: test:str-find-miss s" hello" s" xyz" str-find  -1 = assert ;
+: test:str-contains? s" hello world" s" world" str-contains? assert ;
+: test:str-empty?    s" " str-empty? assert   s" x" str-empty? 0= assert ;
+: test:str-words     s" one two three" str-words  3 = assert ;
+: test:str-split     s" a,b,c" s" ," str-split  s" c" str-find  2 > assert ;
+: test:str-join      s" a,b,c" s" ," str-split  s" ," str-join  s" a,b,c" str= assert ;
+: test:str-replace   s" hello world" s" world" s" earth" str-replace  s" hello earth" str= assert ;
+: test:safe-ok       s" 1 2 +" safe  assert  depth 1 = assert  3 = assert ;
+: test:safe-fail     s" 0 0 / drop" safe  0= assert  depth 0 = assert ;
 "#;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -2326,6 +2378,25 @@ impl Forth {
                 self.data.push(c); self.data.push(d);
                 self.data.push(a); self.data.push(b);
             }
+            Builtin::TwoOver => {
+                let len = self.data.len();
+                if len < 4 { bail!("2over: stack underflow — need 4 items"); }
+                let a = self.data[len - 4];
+                let b = self.data[len - 3];
+                self.data.push(a);
+                self.data.push(b);
+            }
+            Builtin::TwoRot => {
+                // ( a b c d e f -- c d e f a b )
+                let len = self.data.len();
+                if len < 6 { bail!("2rot: stack underflow — need 6 items"); }
+                let a = self.data[len - 6];
+                let b = self.data[len - 5];
+                self.data.remove(len - 6);
+                self.data.remove(len - 6); // index shifts after first remove
+                self.data.push(a);
+                self.data.push(b);
+            }
             Builtin::Eq    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a == b { -1 } else { 0 }); }
             Builtin::Lt    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a < b { -1 } else { 0 }); }
             Builtin::Gt    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a > b { -1 } else { 0 }); }
@@ -3650,6 +3721,119 @@ impl Forth {
                 let idx = self.strings.len();
                 self.strings.push(cat);
                 self.data.push(idx as i64);
+            }
+            Builtin::StrSplit => {
+                let sep_idx = self.pop()? as usize;
+                let src_idx = self.pop()? as usize;
+                let sep = self.strings.get(sep_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-split: sep index {} out of bounds", sep_idx))?
+                    .clone();
+                let src = self.strings.get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-split: src index {} out of bounds", src_idx))?
+                    .clone();
+                let result = if sep.is_empty() {
+                    src.chars().map(|c| c.to_string()).collect::<Vec<_>>().join("\n")
+                } else {
+                    src.split(sep.as_str()).collect::<Vec<_>>().join("\n")
+                };
+                let idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(idx as i64);
+            }
+            Builtin::StrJoin => {
+                let sep_idx = self.pop()? as usize;
+                let src_idx = self.pop()? as usize;
+                let sep = self.strings.get(sep_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-join: sep index {} out of bounds", sep_idx))?
+                    .clone();
+                let src = self.strings.get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-join: src index {} out of bounds", src_idx))?
+                    .clone();
+                let result = src.lines().collect::<Vec<_>>().join(sep.as_str());
+                let idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(idx as i64);
+            }
+            Builtin::StrSub => {
+                let len  = self.pop()? as usize;
+                let start = self.pop()? as usize;
+                let src_idx = self.pop()? as usize;
+                let src = self.strings.get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-sub: index {} out of bounds", src_idx))?
+                    .clone();
+                let result: String = src.chars().skip(start).take(len).collect();
+                let idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(idx as i64);
+            }
+            Builtin::StrFind => {
+                let needle_idx = self.pop()? as usize;
+                let src_idx   = self.pop()? as usize;
+                let needle = self.strings.get(needle_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-find: needle index {} out of bounds", needle_idx))?
+                    .clone();
+                let src = self.strings.get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-find: src index {} out of bounds", src_idx))?
+                    .clone();
+                let pos: i64 = if needle.is_empty() {
+                    0
+                } else if let Some(byte_pos) = src.find(needle.as_str()) {
+                    // convert byte offset to char offset
+                    src[..byte_pos].chars().count() as i64
+                } else {
+                    -1
+                };
+                self.data.push(pos);
+            }
+            Builtin::StrReplace => {
+                let to_idx   = self.pop()? as usize;
+                let from_idx = self.pop()? as usize;
+                let src_idx  = self.pop()? as usize;
+                let to   = self.strings.get(to_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-replace: to index {} out of bounds", to_idx))?
+                    .clone();
+                let from = self.strings.get(from_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-replace: from index {} out of bounds", from_idx))?
+                    .clone();
+                let src  = self.strings.get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-replace: src index {} out of bounds", src_idx))?
+                    .clone();
+                let result = if from.is_empty() { src } else { src.replace(from.as_str(), to.as_str()) };
+                let idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(idx as i64);
+            }
+            Builtin::StrReverse => {
+                let src_idx = self.pop()? as usize;
+                let src = self.strings.get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("str-reverse: index {} out of bounds", src_idx))?
+                    .clone();
+                let result: String = src.chars().rev().collect();
+                let idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(idx as i64);
+            }
+            Builtin::Safe => {
+                // Execute a Forth string without aborting on error.
+                // Pushes -1 on success, 0 on failure; rolls back state on failure.
+                let str_idx = self.pop()? as usize;
+                let code = self.strings.get(str_idx)
+                    .ok_or_else(|| anyhow::anyhow!("safe: invalid string index"))?
+                    .clone();
+                let snap      = self.snapshot();
+                let saved_data = self.data.clone();
+                let saved_out  = self.out.clone();
+                match self.eval(&code) {
+                    Ok(()) => {
+                        self.data.push(-1);
+                    }
+                    Err(_) => {
+                        self.restore(&snap);
+                        self.data = saved_data;
+                        self.out  = saved_out;
+                        self.data.push(0);
+                    }
+                }
             }
             // ── Crypto primitives ─────────────────────────────────────────────
             Builtin::Sha256 => {
@@ -5369,6 +5553,7 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "over" => Builtin::Over, "rot" => Builtin::Rot,
         "nip" => Builtin::Nip, "tuck" => Builtin::Tuck,
         "2dup" => Builtin::TwoDup, "2drop" => Builtin::TwoDrop, "2swap" => Builtin::TwoSwap,
+        "2over" => Builtin::TwoOver, "2rot" => Builtin::TwoRot,
         "=" => Builtin::Eq, "<" => Builtin::Lt, ">" => Builtin::Gt,
         "<=" | "=<" => Builtin::Le, ">=" | "=>" => Builtin::Ge,
         "<>" | "!=" => Builtin::Ne, "0=" => Builtin::ZeroEq, "0<" => Builtin::ZeroLt, "0>" => Builtin::ZeroGt,
@@ -5437,8 +5622,15 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         // String pool
         "type"    => Builtin::Type,
         "str="    => Builtin::StrEq,
-        "str-len" => Builtin::StrLen,
-        "str-cat" => Builtin::StrCat,
+        "str-len"     => Builtin::StrLen,
+        "str-cat"     => Builtin::StrCat,
+        "str-split"   => Builtin::StrSplit,
+        "str-join"    => Builtin::StrJoin,
+        "str-sub"     => Builtin::StrSub,
+        "str-find"    => Builtin::StrFind,
+        "str-replace" => Builtin::StrReplace,
+        "str-reverse" => Builtin::StrReverse,
+        "safe"        => Builtin::Safe,
         // Crypto
         "sha256"      => Builtin::Sha256,
         "file-sha256" => Builtin::FileSha256,
