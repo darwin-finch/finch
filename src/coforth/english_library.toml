@@ -3138,7 +3138,6 @@ word = "gcd"
 definition = "greatest common divisor of two numbers"
 related = ["divisor", "euclidean", "lcm"]
 kind = "number theory"
-forth = '12 18 gcd . cr'
 
 [[word]]
 word = "lcm"

@@ -560,6 +560,8 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
         "true", "false", "bool",
         // Hash builtins — native Rust, must not be shadowed
         "hash", "str-hash", "hash-int", "hash-combine",
+        // Math words — STDLIB definitions must not be shadowed by vocab entries
+        "gcd", "lcm", "fib", "prime?", "next-prime", "triangular", "square", "cube",
     ];
 
     let mut entries: Vec<_> = lib.words.values()
