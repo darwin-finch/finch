@@ -257,6 +257,10 @@ enum Builtin {
     Boot,                     // ( -- )  re-execute all boot=true vocabulary words
     PrintR,                   // ( n width -- )  print n right-aligned in field of width chars
     PrintPad,                 // ( n width char-idx -- )  print n padded with char to width
+    // Fast integer hash operations
+    Hash,                     // ( str-idx -- n )  FNV1a-64 hash of strings[idx] → i64
+    HashInt,                  // ( n -- n' )       integer mix hash (fast, avalanche)
+    HashCombine,              // ( h n -- h' )     combine two hash values (for chaining)
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
@@ -362,7 +366,7 @@ pub struct PeerMeta {
     pub token: Option<String>,
 }
 
-const MAX_CALL_DEPTH: usize  = 256;
+const MAX_CALL_DEPTH: usize  = 1024;
 const MAX_DATA_DEPTH: usize  = 1024; // data stack overflow guard
 /// Default step budget for interactive vocabulary words.
 /// 1M steps: enough for fib(20) (~300k steps), gcd, most recursive definitions.
@@ -1180,6 +1184,13 @@ variable _tm  ( shared test memory cell )
 \ `to` is interpret-mode: test at top level, not inside a word
 20 value _v20
 : test:value-to    _v20 20 = assert ;   \ initial value correct
+\ ── Hash operations ──────────────────────────────────────────────────────────
+: test:hash-stable    s" hello" hash  s" hello" hash  = assert ;  \ same input → same hash
+: test:hash-differs   s" hello" hash  s" world" hash  <> assert ; \ different inputs → different hash
+: test:hash-empty     s" " hash  0 <> assert ;                    \ empty string hashes to non-zero (FNV offset)
+: test:hash-int-det   42 hash-int  42 hash-int  = assert ;        \ deterministic
+: test:hash-int-mix   1 hash-int  1 <> assert ;                   \ 1 mixes to different value
+: test:hash-combine   1 2 hash-combine  1 3 hash-combine  <> assert ; \ different n → different result
 "#;
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -2152,8 +2163,31 @@ impl Forth {
                 Cell::Builtin(Builtin::ZeroEq) => { let a = pop1!(); self.data.push(if a == 0 { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::ZeroLt) => { let a = pop1!(); self.data.push(if a  < 0 { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::ZeroGt) => { let a = pop1!(); self.data.push(if a  > 0 { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::And)   => { if self.data.len() >= 2 { let (a,b) = pop2!(); self.data.push(a & b); } ip += 1; }
-                Cell::Builtin(Builtin::Or)    => { let (a,b) = pop2!(); self.data.push(a | b); ip += 1; }
+                Cell::Builtin(Builtin::And)    => { if self.data.len() >= 2 { let (a,b) = pop2!(); self.data.push(a & b); } ip += 1; }
+                Cell::Builtin(Builtin::Or)     => { let (a,b) = pop2!(); self.data.push(a | b); ip += 1; }
+                Cell::Builtin(Builtin::Xor)    => { let (a,b) = pop2!(); self.data.push(a ^ b); ip += 1; }
+                Cell::Builtin(Builtin::Invert) => { let a = pop1!(); self.data.push(!a); ip += 1; }
+                Cell::Builtin(Builtin::Negate) => { let a = pop1!(); self.data.push(a.wrapping_neg()); ip += 1; }
+                Cell::Builtin(Builtin::Abs)    => { let a = pop1!(); self.data.push(a.wrapping_abs()); ip += 1; }
+                Cell::Builtin(Builtin::Max)    => { let (a,b) = pop2!(); self.data.push(a.max(b)); ip += 1; }
+                Cell::Builtin(Builtin::Min)    => { let (a,b) = pop2!(); self.data.push(a.min(b)); ip += 1; }
+                Cell::Builtin(Builtin::Slash)  => { let (a,b) = pop2!(); if b == 0 { bail!("division by zero"); } self.data.push(a.wrapping_div(b)); ip += 1; }
+                Cell::Builtin(Builtin::Mod)    => { let (a,b) = pop2!(); if b == 0 { bail!("division by zero"); } self.data.push(a.wrapping_rem(b)); ip += 1; }
+                Cell::Builtin(Builtin::Lshift) => { let (a,b) = pop2!(); self.data.push(a << (b & 63)); ip += 1; }
+                Cell::Builtin(Builtin::Rshift) => { let (a,b) = pop2!(); self.data.push(a >> (b & 63)); ip += 1; }
+                Cell::Builtin(Builtin::Rot)    => { if self.data.len() >= 3 { let c=pop1!(); let b=pop1!(); let a=pop1!(); self.data.push(b); self.data.push(c); self.data.push(a); } ip += 1; }
+                Cell::Builtin(Builtin::Nip)    => { let (a,b) = pop2!(); let _ = a; self.data.push(b); ip += 1; }
+                Cell::Builtin(Builtin::Tuck)   => { let (a,b) = pop2!(); self.data.push(b); self.data.push(a); self.data.push(b); ip += 1; }
+                Cell::Builtin(Builtin::TwoDup) => { if self.data.len() >= 2 { let b=*self.data.last().unwrap(); let a=self.data[self.data.len()-2]; self.data.push(a); self.data.push(b); } ip += 1; }
+                Cell::Builtin(Builtin::TwoDrop)=> { if self.data.len() >= 2 { pop2!(); } ip += 1; }
+                Cell::Builtin(Builtin::Inc)    => { let a = pop1!(); self.data.push(a.wrapping_add(1)); ip += 1; }
+                Cell::Builtin(Builtin::Dec)    => { let a = pop1!(); self.data.push(a.wrapping_sub(1)); ip += 1; }
+                Cell::Builtin(Builtin::Le)     => { let (a,b) = pop2!(); self.data.push(if a <= b { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::Ge)     => { let (a,b) = pop2!(); self.data.push(if a >= b { -1 } else { 0 }); ip += 1; }
+                Cell::Builtin(Builtin::Depth)  => { self.data.push(self.data.len() as i64); ip += 1; }
+                Cell::Builtin(Builtin::Cr)     => { self.out.push('\n'); ip += 1; }
+                Cell::Builtin(Builtin::Space)  => { self.out.push(' '); ip += 1; }
+                Cell::Builtin(Builtin::Print)  => { let a = pop1!(); self.out.push_str(&a.to_string()); self.out.push(' '); ip += 1; }
                 // ── Literals and string output ──
                 Cell::Lit(n) => { self.data.push(n); ip += 1; }  // bypass overflow check — hot path
                 Cell::Str(idx) => {
@@ -2727,6 +2761,7 @@ impl Forth {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[inline(never)] // keep execute() hot loop tight; exec_builtin is the cold path
     fn exec_builtin(&mut self, b: Builtin) -> Result<()> {
         match b {
             Builtin::Plus  => { let b = self.pop()?; let a = self.pop()?; self.data.push(a.wrapping_add(b)); }
@@ -5274,6 +5309,33 @@ impl Forth {
                 for _ in 0..pad { self.out.push(pad_char); }
                 self.out.push_str(&s);
             }
+            // ── Fast hash operations ───────────────────────────────────────────
+            Builtin::Hash => {
+                // ( str-idx -- n )  FNV1a-64 hash of string → i64
+                let idx = self.pop()? as usize;
+                let s = self.strings.get(idx).map(|s| s.as_str()).unwrap_or("");
+                const FNV_OFFSET: u64 = 14695981039346656037;
+                const FNV_PRIME:  u64 = 1099511628211;
+                let h = s.bytes().fold(FNV_OFFSET, |acc, b| {
+                    acc.wrapping_mul(FNV_PRIME) ^ (b as u64)
+                });
+                self.data.push(h as i64);
+            }
+            Builtin::HashInt => {
+                // ( n -- n' )  fast integer mix (Murmur3 finalizer)
+                let n = self.pop()? as u64;
+                let n = (n ^ (n >> 33)).wrapping_mul(0xff51afd7ed558ccd);
+                let n = (n ^ (n >> 33)).wrapping_mul(0xc4ceb9fe1a85ec53);
+                let n = n ^ (n >> 33);
+                self.data.push(n as i64);
+            }
+            Builtin::HashCombine => {
+                // ( h n -- h' )  combine hash h with value n
+                let n = self.pop()?;
+                let h = self.pop()?;
+                let mixed = (h as u64) ^ ((n as u64).wrapping_mul(0x9e3779b97f4a7c15));
+                self.data.push(mixed as i64);
+            }
             Builtin::SortLines => {
                 let idx = self.pop()? as usize;
                 let s = self.strings.get(idx).cloned().unwrap_or_default();
@@ -6548,6 +6610,9 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "boot"            => Builtin::Boot,
         ".r"              => Builtin::PrintR,
         ".pad"            => Builtin::PrintPad,
+        "hash" | "str-hash" => Builtin::Hash,
+        "hash-int"        => Builtin::HashInt,
+        "hash-combine"    => Builtin::HashCombine,
         "sort"           => Builtin::SortLines,
         "sort-lines"     => Builtin::SortLines,
         "unique"         => Builtin::UniqueLines,
