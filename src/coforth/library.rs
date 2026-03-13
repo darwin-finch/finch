@@ -558,6 +558,8 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
         // Misc
         "assert", "safe", "eval", "fork", "time", "nonce",
         "true", "false", "bool",
+        // Hash builtins — native Rust, must not be shadowed
+        "hash", "str-hash", "hash-int", "hash-combine",
     ];
 
     let mut entries: Vec<_> = lib.words.values()
@@ -1890,7 +1892,7 @@ variable it   \ implicit register — the thing most recently produced
 : protocol    ( -- ) ;   \ communication rules
 : interface   ( -- ) ;   \ boundary
 : api         ( -- ) ;   \ application programming interface
-: hash        ( -- ) ;   \ hash table / function
+\ hash is a builtin: ( str-idx -- n )  FNV1a-64 — do not redefine
 : key         ( -- ) ;   \ map key
 : index       ( -- ) ;   \ position
 \ loop is a Forth control keyword — do not redefine

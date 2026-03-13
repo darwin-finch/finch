@@ -38,9 +38,9 @@ use anyhow::{bail, Result};
 // of `Cell` values in `Forth::memory`.  Jump targets are absolute indices
 // into that array — just like a CPU's instruction pointer.
 
-// Compile-time size check — Cell must stay ≤ 24 bytes for cache efficiency.
-// Two-index variants (TagPeer, SayInChannel, etc.) are the widest at 2×usize.
-const _: () = assert!(std::mem::size_of::<Cell>() <= 24);
+// Compile-time size check — Cell must stay ≤ 16 bytes for cache efficiency.
+// Two-index variants (TagPeer, SayInChannel, etc.) use u32 pairs to stay within budget.
+const _: () = assert!(std::mem::size_of::<Cell>() <= 16);
 
 #[derive(Clone, Copy, Debug)]
 enum Cell {
@@ -48,10 +48,10 @@ enum Cell {
     Str(usize),         // print strings[idx]  (string-literal pool)
     PushStr(usize),     // push strings[idx] index as i64 onto data stack (s" literal")
     HelloPeer(usize),   // send "hello from <hostname>!" to one peer (by addr or label) strings[idx]
-    TagPeer(usize,usize), // strings[name_idx] → label for strings[addr_idx]
+    TagPeer(u32,u32), // strings[name_idx] → label for strings[addr_idx]
     JoinChannel(usize),          // join channel strings[idx]; broadcast "<name> joined #chan" to all peers
     PartChannel(usize),          // leave channel strings[idx]; broadcast "<name> left #chan" to all peers
-    SayInChannel(usize,usize),   // broadcast "[#chan] name: msg" — strings[chan_idx], strings[msg_idx]
+    SayInChannel(u32,u32),   // broadcast "[#chan] name: msg" — strings[chan_idx], strings[msg_idx]
     ProveWord(usize),            // run test:strings[idx]; show ✓ / ✗
     Confirm(usize),     // ask user strings[idx]; push -1 (yes) or 0 (no)
     SelectDialog(usize),// pop-up select: strings[idx] is "title|opt1|opt2|..."; push chosen index or -1
@@ -66,8 +66,8 @@ enum Cell {
     ScatterBashExec(usize),       // run strings[idx] as bash -c on all peers via /v1/exec
     ScatterStack,                 // ( code-idx -- ) scatter strings[pop()] to all peers (dynamic code)
     ScatterSymbol(usize),         // share symbol strings[idx]: send local def if known, then run on all peers
-    ScatterOnCluster(usize,usize),// run strings[code_idx] on ensemble strings[ensemble_idx]; no side-effects on peers
-    RunOn(usize,usize),           // run strings[code_idx] on exactly one peer: strings[peer_idx] (addr or label)
+    ScatterOnCluster(u32,u32),// run strings[code_idx] on ensemble strings[ensemble_idx]; no side-effects on peers
+    RunOn(u32,u32),           // run strings[code_idx] on exactly one peer: strings[peer_idx] (addr or label)
     GenAI(usize),           // call AI generator with strings[idx] as prompt; emit response
     Builtin(Builtin),   // execute a primitive operation
     Addr(usize),        // call word at memory[addr]: push ip+1, ip = addr
@@ -1934,7 +1934,7 @@ impl Forth {
             self.strings.push(peer.to_string());
             let code_idx = self.strings.len();
             self.strings.push(code.to_string());
-            self.memory.push(Cell::RunOn(peer_idx, code_idx));
+            self.memory.push(Cell::RunOn(peer_idx as u32, code_idx as u32));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00hello:") {
@@ -1950,7 +1950,7 @@ impl Forth {
             self.strings.push(name.to_string());
             let addr_idx = self.strings.len();
             self.strings.push(addr.to_string());
-            self.memory.push(Cell::TagPeer(name_idx, addr_idx));
+            self.memory.push(Cell::TagPeer(name_idx as u32, addr_idx as u32));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00channel:") {
@@ -1972,7 +1972,7 @@ impl Forth {
             self.strings.push(chan.to_string());
             let msg_idx = self.strings.len();
             self.strings.push(msg.to_string());
-            self.memory.push(Cell::SayInChannel(chan_idx, msg_idx));
+            self.memory.push(Cell::SayInChannel(chan_idx as u32, msg_idx as u32));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00prove:") {
@@ -1988,7 +1988,7 @@ impl Forth {
             self.strings.push(ensemble.to_string());
             let code_idx = self.strings.len();
             self.strings.push(code.to_string());
-            self.memory.push(Cell::ScatterOnCluster(ens_idx, code_idx));
+            self.memory.push(Cell::ScatterOnCluster(ens_idx as u32, code_idx as u32));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00scatter-exec:") {
@@ -2111,13 +2111,19 @@ impl Forth {
         // Straight-line code runs free — zero overhead per instruction.
         // This prevents infinite loops and runaway recursion while keeping
         // the common case (arithmetic, stack ops, output) as fast as possible.
+        //
+        // Performance: keep fuel in a local variable so LLVM can hold it in a
+        // register across loop iterations rather than round-tripping through the
+        // struct pointer on every back-edge.
+        let mut fuel = self.fuel;
         macro_rules! check_fuel {
             () => {
-                if self.fuel == 0 {
+                if fuel == 0 {
+                    self.fuel = 0;
                     bail!("fuel exhausted — word is too expensive for vocabulary use.\n\
                            hint: use  N with-fuel  for intentional heavy computation.");
                 }
-                self.fuel -= 1;
+                fuel -= 1;
             };
         }
         // Inline the hottest stack/arithmetic builtins to avoid a function call.
@@ -2141,11 +2147,12 @@ impl Forth {
         loop {
             // SAFETY: every well-formed program ends with Cell::Ret which breaks
             // before ip can go out of bounds.  ip is only set to valid addresses
-            // (start, call-return addresses, and jump targets computed from
-            // well-compiled code).  The fallback `ip >= self.memory.len()` check
-            // is kept in debug builds to catch bugs early.
+            // (start, call-return addresses, and jump targets from well-compiled code).
+            // The bounds check runs only in debug builds to catch compiler bugs early;
+            // release builds skip it — saving one branch per instruction on the hot path.
+            #[cfg(debug_assertions)]
             if ip >= self.memory.len() { break; }
-            // SAFETY: bounds checked above (debug) or guaranteed by well-formed code.
+            // SAFETY: guaranteed by well-formed code (Ret always terminates before OOB).
             let cell = unsafe { *self.memory.get_unchecked(ip) };
             match cell {
                 // ── Hot path: inlined arithmetic & stack ops (no function call) ──
@@ -2415,13 +2422,13 @@ impl Forth {
                 }
                 Cell::ScatterOnCluster(ens_idx, code_idx) => {
                     // Run code on a named ensemble without touching self.peers.
-                    let name = self.strings.get(ens_idx)
+                    let name = self.strings.get(ens_idx as usize)
                         .ok_or_else(|| anyhow::anyhow!("scatter-on: ensemble string index out of bounds"))?
                         .trim().to_string();
                     let peers = self.ensembles.get(&name)
                         .ok_or_else(|| anyhow::anyhow!("scatter-on: unknown ensemble '{}'", name))?
                         .clone();
-                    let code = self.strings.get(code_idx)
+                    let code = self.strings.get(code_idx as usize)
                         .ok_or_else(|| anyhow::anyhow!("scatter-on: code string index out of bounds"))?
                         .clone();
                     let tokens = peer_tokens_map(&self.peer_meta);
@@ -2432,10 +2439,10 @@ impl Forth {
                 Cell::RunOn(peer_idx, code_idx) => {
                     // Run code on exactly one peer, matched by address or label.
                     use crossterm::style::Stylize;
-                    let target = self.strings.get(peer_idx)
+                    let target = self.strings.get(peer_idx as usize)
                         .ok_or_else(|| anyhow::anyhow!("on: peer string index out of bounds"))?
                         .trim().to_string();
-                    let code = self.strings.get(code_idx)
+                    let code = self.strings.get(code_idx as usize)
                         .ok_or_else(|| anyhow::anyhow!("on: code string index out of bounds"))?
                         .clone();
                     // Resolve target: exact address match first, then label match.
@@ -2544,8 +2551,8 @@ impl Forth {
                     ip += 1;
                 }
                 Cell::TagPeer(name_idx, addr_idx) => {
-                    let name = self.strings[name_idx].trim().to_string();
-                    let addr = self.strings[addr_idx].trim().to_string();
+                    let name = self.strings[name_idx as usize].trim().to_string();
+                    let addr = self.strings[addr_idx as usize].trim().to_string();
                     // Resolve addr — might be a partial hostname; try matching
                     let resolved = if self.peers.contains(&addr) {
                         Some(addr.clone())
@@ -2612,9 +2619,9 @@ impl Forth {
                     ip += 1;
                 }
                 Cell::SayInChannel(chan_idx, msg_idx) => {
-                    let raw = self.strings[chan_idx].clone();
+                    let raw = self.strings[chan_idx as usize].clone();
                     let chan = if raw.starts_with('#') { raw } else { format!("#{raw}") };
-                    let message = self.strings[msg_idx].clone();
+                    let message = self.strings[msg_idx as usize].clone();
                     let my_name = hostname::get()
                         .ok().and_then(|h| h.into_string().ok())
                         .unwrap_or_else(|| "someone".to_string());
@@ -2700,7 +2707,55 @@ impl Forth {
                 Cell::Builtin(Builtin::Le)     => { let (a,b) = pop2!(); self.data.push(if a <= b { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::Ge)     => { let (a,b) = pop2!(); self.data.push(if a >= b { -1 } else { 0 }); ip += 1; }
                 Cell::Builtin(Builtin::Abs)    => { if let Some(t) = self.data.last_mut() { *t = t.abs(); } ip += 1; }
-                Cell::Builtin(b) => { self.exec_builtin(b)?; ip += 1; }
+                // ── Loop index (very hot inside do/loop bodies) ──
+                Cell::Builtin(Builtin::LoopI)  => {
+                    // SAFETY: LoopI is only meaningful inside a do/loop body where
+                    // DoSetup has already pushed to loop_stack.
+                    let v = unsafe { self.loop_stack.last().unwrap_unchecked() }.0;
+                    self.data.push(v); ip += 1;
+                }
+                Cell::Builtin(Builtin::LoopJ)  => {
+                    let len = self.loop_stack.len();
+                    let v = if len >= 2 { self.loop_stack[len-2].0 } else { 0 };
+                    self.data.push(v); ip += 1;
+                }
+                // ── Return stack ops (hot in most real Forth programs) ──
+                Cell::Builtin(Builtin::ToR)    => { let a = pop1!(); self.rstack.push(a); ip += 1; }
+                Cell::Builtin(Builtin::FromR)  => {
+                    if self.rstack.is_empty() { bail!("return stack underflow"); }
+                    let a = unsafe { self.rstack.pop().unwrap_unchecked() };
+                    self.data.push(a); ip += 1;
+                }
+                Cell::Builtin(Builtin::FetchR) => {
+                    let a = self.rstack.last().copied().ok_or_else(|| anyhow::anyhow!("return stack underflow"))?;
+                    self.data.push(a); ip += 1;
+                }
+                // ── Variable memory ops ──
+                Cell::Builtin(Builtin::Fetch)  => {
+                    let addr = pop1!() as usize;
+                    self.data.push(self.heap.get(addr).copied().unwrap_or(0)); ip += 1;
+                }
+                Cell::Builtin(Builtin::Store)  => {
+                    let addr = pop1!() as usize;
+                    let val  = pop1!();
+                    if addr < self.heap.len() { self.heap[addr] = val; }
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::PlusStore) => {
+                    let addr = pop1!() as usize;
+                    let val  = pop1!();
+                    if addr < self.heap.len() { self.heap[addr] = self.heap[addr].wrapping_add(val); }
+                    ip += 1;
+                }
+                Cell::Builtin(b) => {
+                    // Sync local fuel to struct before the call so exec_builtin
+                    // (e.g. WithFuel) can read/write the current budget correctly.
+                    self.fuel = fuel;
+                    self.exec_builtin(b)?;
+                    // Re-read in case WithFuel (or similar) changed the budget.
+                    fuel = self.fuel;
+                    ip += 1;
+                }
                 Cell::Addr(addr) => {
                     check_fuel!();
                     // Tail-call optimisation: if next cell is Ret, reuse the current frame.
@@ -2714,10 +2769,11 @@ impl Forth {
                     }
                 }
                 Cell::Ret => {
-                    match self.call_stack.pop() {
-                        Some(ret) => { ip = ret; }
-                        None      => break,
-                    }
+                    // Empty call_stack = top-level return = halt.
+                    // Non-empty = normal return; use unchecked pop to skip the redundant
+                    // is_empty check (we just tested it via is_empty() → break path).
+                    if self.call_stack.is_empty() { break; }
+                    ip = unsafe { self.call_stack.pop().unwrap_unchecked() };
                 }
                 // Back-edges: charge one fuel unit per iteration to prevent infinite loops.
                 Cell::Jmp(addr)   => { if addr <= ip { check_fuel!(); } ip = addr; }
@@ -2733,20 +2789,23 @@ impl Forth {
                 }
                 Cell::DoLoop(back) => {
                     check_fuel!();
-                    if let Some(top) = self.loop_stack.last_mut() {
-                        top.0 += 1;
-                        if top.0 < top.1 { ip = back; continue; }
-                    }
+                    // SAFETY: DoLoop is only emitted after DoSetup which pushes to loop_stack.
+                    // Well-formed programs always have a matching DoSetup, so loop_stack is
+                    // non-empty here.  The unsafe avoids a redundant bounds check on every
+                    // loop iteration — the single hottest back-edge in the VM.
+                    let top = unsafe { self.loop_stack.last_mut().unwrap_unchecked() };
+                    top.0 += 1;
+                    if top.0 < top.1 { ip = back; continue; }
                     self.loop_stack.pop();
                     ip += 1;
                 }
                 Cell::DoLoopPlus(back) => {
                     check_fuel!();
                     let step = self.pop()?;
-                    if let Some(top) = self.loop_stack.last_mut() {
-                        top.0 += step;
-                        if top.0 < top.1 { ip = back; continue; }
-                    }
+                    // SAFETY: same as DoLoop — matching DoSetup always precedes DoLoopPlus.
+                    let top = unsafe { self.loop_stack.last_mut().unwrap_unchecked() };
+                    top.0 += step;
+                    if top.0 < top.1 { ip = back; continue; }
                     self.loop_stack.pop();
                     ip += 1;
                 }
@@ -2757,6 +2816,8 @@ impl Forth {
                 }
             }
         }
+        // Write local fuel counter back to struct so callers see the remaining budget.
+        self.fuel = fuel;
         Ok(())
     }
 
