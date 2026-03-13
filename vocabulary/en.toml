@@ -44,10 +44,10 @@ forth = '." finch — local-first AI, watching from nearby." cr'
 
 [[word]]
 word = "self-proof"
-definition = "the machine verifies its own definition — silent if everything holds, loud only if something breaks"
+definition = "the machine verifies its own definition — runs all proofs on boot, loud if something breaks"
 related = ["prove-all", "test", "boot", "verify"]
 kind = "observation"
-forth = 'prove-all? if else ." ⚠  self-proof failed — the machine disagrees with itself." cr then'
+forth = 'prove-all'
 boot = true
 
 [[word]]

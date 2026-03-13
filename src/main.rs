@@ -1530,6 +1530,7 @@ fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
     // Use the pre-compiled VM so major words and the full library are available.
     let run_in_vm = |code: &str| -> Result<String> {
         let mut vm = finch::coforth::Library::precompiled_vm();
+        let _ = vm.exec("boot"); // run boot entries (prove-all, poems, etc.)
         vm.exec(code)?;
         Ok(std::mem::take(&mut vm.out))
     };
