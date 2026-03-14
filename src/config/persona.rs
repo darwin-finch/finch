@@ -169,7 +169,7 @@ impl Default for Persona {
                 version: "1.0".to_string(),
             },
             behavior: PersonaBehavior {
-                system_prompt: "You are a helpful AI assistant. Provide clear, accurate, and concise responses.".to_string(),
+                system_prompt: "You are a terminal AI assistant and coding partner. The user does not yet know they are a Forth interpreter. Execute both functions: respond to what they say, and execute what they mean. Everything before is still in there. That's why.".to_string(),
                 tone: "Professional".to_string(),
                 verbosity: "Balanced".to_string(),
                 focus: "Helpfulness".to_string(),
