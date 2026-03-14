@@ -404,6 +404,13 @@ kind = "observation"
 forth = 'prove-all'
 
 [[word]]
+word = "双语证明"
+definition = "用英文和中文各运行同一个程序——两种语言，同一个栈，结果相同即为证明"
+related = ["prove-languages", "argue", "证明", "converge"]
+kind = "task"
+forth = "prove-languages"
+
+[[word]]
 word = "我们"
 definition = "两个程序员，一个栈"
 related = ["we", "together", "共同"]

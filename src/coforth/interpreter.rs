@@ -238,6 +238,7 @@ enum Builtin {
     ProveAll,                 // ( -- )  run all test:* words; report pass/fail
     ProveAllBool,             // ( -- flag )  run all test:* words; push -1 (all pass) or 0 (any fail)
     ProveEnglish,             // ( -- )  run every English-library word body; report pass rate
+    ProveLanguages,           // ( -- )  argue English ↔ Chinese on shared Forth primitives
     // Channel system
     ListChannels,             // ( -- )  print joined channels
     // Collection operations
@@ -4998,6 +4999,108 @@ impl Forth {
                 }
             }
 
+            Builtin::ProveLanguages => {
+                // ( -- )  Argue English ↔ Chinese on shared Forth primitives.
+                //
+                // For each concept that both languages express via the same primitive,
+                // run `argue`: prove that the two languages converge to the same stack value.
+                //
+                // English:  "3 4 +"     Chinese:  "3 4 加"  → both leave 7   ✓
+                // English:  "true"      Chinese:  "是"       → both leave -1  ✓
+                // … and so on.
+                use crate::coforth::library::{Library, vocab_pairs_from_toml, ZH_LIBRARY};
+                use crossterm::style::Stylize;
+
+                // The cross-language pairs: (label, english_forth, chinese_word_or_forth).
+                // The Chinese side uses the word name — which will be compiled from zh.toml.
+                const PAIRS: &[(&str, &str, &str)] = &[
+                    ("add / 加",        "3 4 +",   "3 4 加"),
+                    ("subtract / 减",   "7 3 -",   "7 3 减"),
+                    ("multiply / 乘",   "3 4 *",   "3 4 乘"),
+                    ("divide / 除",     "12 3 /",  "12 3 除"),
+                    ("true / 是",       "true",    "是"),
+                    ("false / 否",      "false",   "否"),
+                    ("zero / 零",       "0",       "零"),
+                    ("equal / 相等",    "5 5 =",   "5 5 相等"),
+                    ("greater / 大于",  "6 5 >",   "6 5 大于"),
+                    ("less / 小于",     "5 6 <",   "5 6 小于"),
+                ];
+
+                // Build a VM that knows both English stdlib + Chinese vocabulary words.
+                let mut vm = Library::precompiled_vm();
+                let zh_pairs = vocab_pairs_from_toml(ZH_LIBRARY);
+                vm.disable_logging();
+                for (word, code) in &zh_pairs {
+                    let def = format!(": {} {} ;\n", word, code);
+                    let _ = vm.exec_with_fuel(&def, 10_000);
+                }
+                vm.enable_logging();
+
+                let mut pass = 0usize;
+                let mut fail = 0usize;
+
+                self.out.push_str(&format!("{}\n",
+                    "── prove-languages: English ↔ Chinese ──".cyan().bold()));
+
+                for (label, en, zh) in PAIRS {
+                    let saved = std::mem::take(&mut vm.data);
+                    vm.data.clear();
+
+                    vm.eval(en).ok();
+                    let r_en = vm.data.last().copied();
+                    vm.data.clear();
+
+                    vm.eval(zh).ok();
+                    let r_zh = vm.data.last().copied();
+                    vm.data.clear();
+
+                    vm.data = saved;
+
+                    let fmt = |v: Option<i64>| -> String {
+                        match v {
+                            Some(-1) => "true".to_string(),
+                            Some(0)  => "false/0".to_string(),
+                            Some(n)  => n.to_string(),
+                            None     => "—".to_string(),
+                        }
+                    };
+
+                    if r_en.is_some() && r_en == r_zh {
+                        pass += 1;
+                        self.out.push_str(&format!(
+                            "  {}  {}  ──→  {}   {}\n",
+                            en.cyan(), zh.cyan(),
+                            fmt(r_en).green().bold(),
+                            "✓".green(),
+                        ));
+                    } else {
+                        fail += 1;
+                        self.out.push_str(&format!(
+                            "  {} → {}  {} → {}   {} {}\n",
+                            en.cyan(), fmt(r_en).red(),
+                            zh.cyan(), fmt(r_zh).red(),
+                            "✗".red(), (*label).dark_grey(),
+                        ));
+                    }
+                }
+
+                let total = pass + fail;
+                if fail == 0 {
+                    self.out.push_str(&format!(
+                        "── {}/{} agreed — two languages, one stack ──\n",
+                        pass.to_string().green().bold(),
+                        total,
+                    ));
+                } else {
+                    self.out.push_str(&format!(
+                        "── {}/{} agreed   {} unresolved ──\n",
+                        pass.to_string().yellow().bold(),
+                        total,
+                        fail.to_string().red().bold(),
+                    ));
+                }
+            }
+
             Builtin::Infix => {
                 // ( str -- )  Evaluate an infix expression.
                 // Uses shunting-yard to respect precedence: * / before + -.
@@ -6743,9 +6846,10 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "register-boot"  => Builtin::RegisterBoot,
         // Proof system
         "assert"         => Builtin::Assert,
-        "prove-all"      => Builtin::ProveAll,
-        "prove-all?"     => Builtin::ProveAllBool,
-        "prove-english"  => Builtin::ProveEnglish,
+        "prove-all"       => Builtin::ProveAll,
+        "prove-all?"      => Builtin::ProveAllBool,
+        "prove-english"   => Builtin::ProveEnglish,
+        "prove-languages" => Builtin::ProveLanguages,
         "channels"       => Builtin::ListChannels,
         // Collection operations
         "glob-pool"      => Builtin::GlobPool,
@@ -8447,6 +8551,24 @@ mod tests {
         let plain = strip_ansi(&out);
         assert!(plain.contains("✗") && plain.contains("broken"), "{plain}");
         assert!(plain.contains("failed"), "{plain}");
+    }
+
+    #[test]
+    fn test_prove_languages_english_chinese_agree() {
+        // prove-languages: argue English ↔ Chinese for 10 shared primitives.
+        // All 10 should agree — two languages, one stack.
+        let out = Forth::run("prove-languages").unwrap();
+        let plain = strip_ansi(&out);
+        assert!(!plain.is_empty(), "prove-languages produced no output");
+        // Summary must report all 10 agreed, zero unresolved.
+        assert!(
+            plain.contains("10/10") || plain.contains("two languages, one stack"),
+            "expected all 10 pairs to agree: {plain}"
+        );
+        assert!(!plain.contains("unresolved"), "unexpected failures: {plain}");
+        // Spot-check: add/加 and true/是 must appear
+        assert!(plain.contains("加"), "missing 加 in output: {plain}");
+        assert!(plain.contains("是"), "missing 是 in output: {plain}");
     }
 
     #[test]

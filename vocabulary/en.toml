@@ -158,6 +158,13 @@ kind = "task"
 forth = "argue"
 
 [[word]]
+word = "prove-languages"
+definition = "argue English and Chinese against each other — two languages, one stack; the proof is that they agree"
+related = ["argue", "prove", "converge", "language", "chinese"]
+kind = "task"
+forth = "prove-languages"
+
+[[word]]
 word = "gate"
 definition = "two programs and a check — if the check holds, the result passes through; if not, it stops here"
 related = ["argue", "converge", "check", "pass", "relay"]

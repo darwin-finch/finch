@@ -495,6 +495,24 @@ pub const BOOT_POETRY: &[&str] = &[
 /// Re-generate with: `finch library build --all`
 const ENGLISH_LIBRARY: &str = include_str!("english_library.toml");
 
+/// Project Chinese vocabulary — baked in at compile time.
+pub const ZH_LIBRARY: &str = include_str!("../../vocabulary/zh.toml");
+
+/// Build the (word, forth_body) pairs from a raw TOML source.
+/// Returns only entries with a `forth` field that are not self-referential.
+pub fn vocab_pairs_from_toml(src: &str) -> Vec<(String, String)> {
+    let mut lib = Library::default();
+    lib.load_toml(src);
+    lib.words.values()
+        .flat_map(|senses| senses.iter())
+        .filter_map(|e| {
+            let code = e.forth.as_deref()?.trim();
+            if code.is_empty() || code == e.word.as_str() { return None; }
+            Some((e.word.clone(), code.to_string()))
+        })
+        .collect()
+}
+
 /// Pre-built (word, forth-code) pairs from the BUILT-IN libraries only (SEED + ENGLISH).
 /// Sorted alphabetically, ready for JIT compilation.  User vocabulary is added at runtime.
 /// Computed once via LazyLock — eliminates repeated TOML parse + sort on each boot/test.
