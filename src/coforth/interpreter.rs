@@ -1366,6 +1366,12 @@ impl Forth {
         self.user_word_names.contains(name)
     }
 
+    /// Return true if `name` is a native builtin (not user-definable without shadowing).
+    /// Used by save_user_words to prevent persisting builtin-shadowing definitions.
+    pub fn is_builtin_word(name: &str) -> bool {
+        name_to_builtin(name).is_some()
+    }
+
     /// Return the number of cells in memory (for diagnostics).
     #[cfg(test)]
     pub fn memory_len(&self) -> usize {

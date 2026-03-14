@@ -3581,7 +3581,23 @@ s" it is ours"      s" -1 is ours"     argue
     /// Persist the current user vocabulary to `~/.finch/user_words.forth`.
     /// Called after any successful exec that may have added new definitions.
     fn save_user_words(&self) {
-        let source = self.forth_vm.dump_source();
+        let raw = self.forth_vm.dump_source();
+        if raw.is_empty() { return; }
+        // Strip any definitions that shadow builtins or core Forth words.
+        // The AI occasionally generates `: drop 99 drop ;` style corruption that
+        // persists across restarts and breaks STDLIB proofs.
+        let source: String = raw.lines()
+            .filter(|line| {
+                let t = line.trim();
+                if t.starts_with(':') {
+                    let word = t[1..].trim().split_whitespace().next().unwrap_or("");
+                    !crate::coforth::Forth::is_builtin_word(word)
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         if source.is_empty() { return; }
         // Fire-and-forget: push to daemon so all concurrent terminals sync immediately.
         let daemon_addr = crate::config::constants::DEFAULT_HTTP_ADDR;
