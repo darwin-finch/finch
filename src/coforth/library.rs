@@ -558,6 +558,8 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
         // Misc
         "assert", "safe", "eval", "fork", "time", "nonce",
         "true", "false", "bool",
+        // Consensus / relay ops — builtins
+        "argue", "gate", "both-ways", "versus", "page", "resolve", "boom", "converge",
         // Hash builtins — native Rust, must not be shadowed
         "hash", "str-hash", "hash-int", "hash-combine",
         // Math words — STDLIB definitions must not be shadowed by vocab entries

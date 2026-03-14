@@ -158,6 +158,13 @@ kind = "task"
 forth = "argue"
 
 [[word]]
+word = "gate"
+definition = "two programs and a check — if the check holds, the result passes through; if not, it stops here"
+related = ["argue", "converge", "check", "pass", "relay"]
+kind = "task"
+forth = 's\" 3 4 +\" s\" 4 3 +\" s\" =\" gate'
+
+[[word]]
 word = "back-and-forth"
 definition = "go forward, come back — the proof is that you are home again"
 related = ["converge", "inverse", "prove", "round-trip"]
@@ -352,3 +359,13 @@ forth = 's" 3 4 +" self-check'
 word = "quit,"
 definition = "to stop, cease, or discontinue an activity"
 forth = '." STOPPED" cr'
+
+[[word]]
+word = "quit."
+definition = "to stop or cease an activity; to exit or leave"
+forth = '." Goodbye!" cr'
+
+[[word]]
+word = "quir"
+definition = "an obsolete form of 'choir' or a quire of paper; 24 or 25 sheets"
+forth = '24 ." sheets" cr'

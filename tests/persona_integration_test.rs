@@ -53,8 +53,9 @@ fn test_persona_system_message() -> Result<()> {
     let persona = Persona::load_builtin("default")?;
     let system_message = persona.to_system_message();
 
-    // System message should be the system prompt text
-    assert_eq!(system_message, persona.behavior.system_prompt);
+    // System message must contain the core system prompt; may also have a
+    // "The user's name is …" prefix injected from the git config.
+    assert!(system_message.contains(&persona.behavior.system_prompt));
     assert!(!system_message.is_empty());
 
     Ok(())

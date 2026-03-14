@@ -100,6 +100,7 @@ enum Builtin {
     LoopI, LoopJ,
     ToR, FromR, FetchR,
     Words,                    // list defined words
+    HotWords,                 // ( -- )  show top-10 most-called words
     Random,                   // ( -- n )
     Time,                     // ( -- epoch_secs )
     Depth, Nop,
@@ -227,6 +228,7 @@ enum Builtin {
     Argue,     // ( str1 str2 -- )  run both, show what each got, assert they agree
     Versus,    // ( str1 str2 -- )  run both, show FULL stacks side by side, assert they agree
     BothWays,  // ( a b str -- )   run op(a,b) and op(b,a), show both, assert they agree
+    Gate,      // ( str1 str2 check -- result )  run both, apply check; if check passes leave result
     Page,      // ( str -- )    run a multi-line proof page: each line is "left | right"
     Resolve,   // ( str -- )    many sentences, one truth: all lines must converge to same value
     Infix,        // ( str -- )    eval infix expression: "3 + 4", "10 * 5 - 2", etc.
@@ -289,6 +291,7 @@ pub struct Forth {
     strings:    Vec<String>,             // string-literal pool
     string_dedup: HashMap<String, usize>, // reverse index for dedup (same literal → same idx)
     name_index: HashMap<String, usize>,  // word name → entry address in memory
+    call_counts: HashMap<usize, u64>,    // addr → call count (hot call detection)
     heap:       Vec<i64>,                // variable storage
     var_index:  HashMap<String, usize>,  // variable name → heap address
     pub out:    String,
@@ -1204,8 +1207,9 @@ impl Forth {
             memory:     Vec::with_capacity(4096),
             strings:    Vec::with_capacity(256),
             string_dedup: HashMap::with_capacity(256),
-            name_index: HashMap::with_capacity(512),
-            heap:       Vec::with_capacity(64),
+            name_index:   HashMap::with_capacity(512),
+            call_counts:  HashMap::with_capacity(64),
+            heap:         Vec::with_capacity(64),
             var_index:  HashMap::with_capacity(64),
             out:        String::with_capacity(256),
             peers:           Vec::new(),
@@ -1435,15 +1439,16 @@ impl Forth {
             memory:     self.memory.clone(),
             strings:    self.strings.clone(),
             string_dedup: self.string_dedup.clone(),
-            name_index: self.name_index.clone(),
-            heap:       self.heap.clone(),
-            var_index:  self.var_index.clone(),
-            out:        String::new(),
-            peers:      self.peers.clone(),
-            source_log: Vec::new(),    // fresh log — don't inherit parent's history
+            name_index:  self.name_index.clone(),
+            call_counts: HashMap::new(),  // fresh counter per clone — don't inherit parent's profile
+            heap:        self.heap.clone(),
+            var_index:   self.var_index.clone(),
+            out:         String::new(),
+            peers:       self.peers.clone(),
+            source_log:  Vec::new(),    // fresh log — don't inherit parent's history
             log_definitions: true,
-            fuel:       DEFAULT_FUEL,
-            undo_stack: Vec::new(),
+            fuel:        DEFAULT_FUEL,
+            undo_stack:  Vec::new(),
             locks:      HashMap::new(),
             confirm_fn: None,
             gen_fn:     None,
@@ -2709,9 +2714,7 @@ impl Forth {
                 Cell::Builtin(Builtin::Abs)    => { if let Some(t) = self.data.last_mut() { *t = t.abs(); } ip += 1; }
                 // ── Loop index (very hot inside do/loop bodies) ──
                 Cell::Builtin(Builtin::LoopI)  => {
-                    // SAFETY: LoopI is only meaningful inside a do/loop body where
-                    // DoSetup has already pushed to loop_stack.
-                    let v = unsafe { self.loop_stack.last().unwrap_unchecked() }.0;
+                    let v = self.loop_stack.last().map(|t| t.0).unwrap_or(0);
                     self.data.push(v); ip += 1;
                 }
                 Cell::Builtin(Builtin::LoopJ)  => {
@@ -2758,6 +2761,8 @@ impl Forth {
                 }
                 Cell::Addr(addr) => {
                     check_fuel!();
+                    // Hot call detection: count every word invocation by entry address.
+                    *self.call_counts.entry(addr).or_insert(0) += 1;
                     // Tail-call optimisation: if next cell is Ret, reuse the current frame.
                     // SAFETY: ip+1 is valid because compiled words always end with Ret.
                     if matches!(unsafe { self.memory.get_unchecked(ip + 1) }, Cell::Ret) {
@@ -2998,6 +3003,74 @@ impl Forth {
                         "✗".red(),
                     ));
                     anyhow::bail!("argue: {} got {}, {} got {}", code1, result1, code2, result2);
+                }
+            }
+            Builtin::Gate => {
+                // ( str-a str-b str-check -- result )
+                // Run prog-a, run prog-b, run check with both results on stack.
+                // If check leaves truthy: ✓ result propagates (left on caller's stack).
+                // If check leaves falsy:  ✗ bail — the gate does not pass.
+                let idx_check = self.pop()? as usize;
+                let idx_b     = self.pop()? as usize;
+                let idx_a     = self.pop()? as usize;
+                let code_a     = self.strings.get(idx_a).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("gate: invalid string index {idx_a}"))?;
+                let code_b     = self.strings.get(idx_b).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("gate: invalid string index {idx_b}"))?;
+                let code_check = self.strings.get(idx_check).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("gate: invalid string index {idx_check}"))?;
+
+                // Run each program in isolation.
+                let saved = std::mem::take(&mut self.data);
+
+                self.eval(&code_a)?;
+                let result_a = self.data.last().copied()
+                    .ok_or_else(|| anyhow::anyhow!("gate: prog-a left nothing on stack"))?;
+                let stack_a = std::mem::take(&mut self.data);
+
+                self.eval(&code_b)?;
+                let result_b = self.data.last().copied()
+                    .ok_or_else(|| anyhow::anyhow!("gate: prog-b left nothing on stack"))?;
+                self.data.clear();
+
+                // Run check with [result_a, result_b] on stack.
+                self.data.push(result_a);
+                self.data.push(result_b);
+                self.eval(&code_check)?;
+                let flag = self.data.last().copied().unwrap_or(0);
+                self.data.clear();
+
+                // Restore caller's stack.
+                self.data = saved;
+
+                use crossterm::style::Stylize;
+                if flag != 0 {
+                    // Gate passes — leave the agreed result on the stack.
+                    // "Passes along" the full output stack of prog-a (the canonical result).
+                    for v in &stack_a { self.data.push(*v); }
+                    let fmt = |v: i64| -> String {
+                        match v { -1 => "true".into(), 0 => "false".into(), n => n.to_string() }
+                    };
+                    self.out.push_str(&format!(
+                        "  {} | {} ──[{}]──→ {}   {}\n",
+                        code_a.as_str().cyan(),
+                        code_b.as_str().cyan(),
+                        code_check.as_str().yellow(),
+                        fmt(result_a).green().bold(),
+                        "✓ gate passed".green(),
+                    ));
+                } else {
+                    let fmt = |v: i64| -> String {
+                        match v { -1 => "true".into(), 0 => "false".into(), n => n.to_string() }
+                    };
+                    self.out.push_str(&format!(
+                        "  {} → {}  {} → {}  check: {}   {}\n",
+                        code_a.as_str().cyan(), fmt(result_a).red(),
+                        code_b.as_str().cyan(), fmt(result_b).red(),
+                        code_check.as_str().yellow(),
+                        "✗ gate blocked".red(),
+                    ));
+                    anyhow::bail!("gate blocked: check `{}` failed on ({}, {})", code_check, result_a, result_b);
                 }
             }
             Builtin::Versus => {
@@ -3258,6 +3331,22 @@ impl Forth {
                 names.sort();
                 self.out.push_str(&names.join("  "));
                 self.out.push('\n');
+            }
+            Builtin::HotWords => {
+                // Build reverse map: addr → name
+                let addr_to_name: HashMap<usize, &str> = self.name_index.iter()
+                    .map(|(n, &a)| (a, n.as_str()))
+                    .collect();
+                let mut counts: Vec<(u64, &str)> = self.call_counts.iter()
+                    .filter_map(|(&addr, &count)| {
+                        addr_to_name.get(&addr).map(|&name| (count, name))
+                    })
+                    .collect();
+                counts.sort_by(|a, b| b.0.cmp(&a.0));
+                self.out.push_str("── hot words ──\n");
+                for (count, name) in counts.iter().take(10) {
+                    self.out.push_str(&format!("  {:>8}  {}\n", count, name));
+                }
             }
             Builtin::Random => {
                 // Simple LCG random number generator
@@ -6530,7 +6619,8 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "*/" => Builtin::StarSlash, "/mod" => Builtin::SlashMod,
         "u." => Builtin::PrintU, ".h" | "hex." => Builtin::PrintHex,
         "allot" => Builtin::Allot, "cells" => Builtin::Cells,
-        "words" => Builtin::Words, "random" => Builtin::Random, "time" => Builtin::Time,
+        "words" => Builtin::Words, "hot-words" => Builtin::HotWords,
+        "random" => Builtin::Random, "time" => Builtin::Time,
         "depth" => Builtin::Depth, "nop" => Builtin::Nop,
         "fuel"      => Builtin::Fuel,
         "with-fuel" => Builtin::WithFuel,
@@ -6644,6 +6734,7 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "fill"           => Builtin::Fill,
         "eval"           => Builtin::Eval,
         "argue"          => Builtin::Argue,
+        "gate"           => Builtin::Gate,
         "both-ways"      => Builtin::BothWays,
         "versus"         => Builtin::Versus,
         "page"           => Builtin::Page,
@@ -8536,6 +8627,30 @@ mod tests {
         }
         println!("{all}");
         assert!(all.contains("agreed"));
+    }
+
+    #[test]
+    fn test_gate_passes_when_check_holds() {
+        // Both programs agree on 7; check is `=`; gate should pass and leave 7 on stack.
+        let mut vm = Forth::new();
+        vm.eval(r#"s" 3 4 +" s" 4 3 +" s" =" gate"#).expect("gate should pass");
+        assert_eq!(vm.data.last().copied(), Some(7), "gate should leave result on stack");
+    }
+
+    #[test]
+    fn test_gate_blocks_when_check_fails() {
+        // Programs produce different values; check `=` fails; gate should bail.
+        let mut vm = Forth::new();
+        let result = vm.eval(r#"s" 3 4 +" s" 2 2 +" s" =" gate"#);
+        assert!(result.is_err(), "gate should bail when check fails");
+    }
+
+    #[test]
+    fn test_gate_custom_check() {
+        // Check: result must be > 5.  "3 4 +" → 7; "4 3 +" → 7; check "drop 5 >" → true.
+        let mut vm = Forth::new();
+        vm.eval(r#"s" 3 4 +" s" 4 3 +" s" drop 5 >" gate"#).expect("gate with custom check");
+        assert_eq!(vm.data.last().copied(), Some(7));
     }
 
     #[test]

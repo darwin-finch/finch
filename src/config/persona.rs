@@ -110,11 +110,29 @@ impl Persona {
 
     /// Get system prompt formatted for injection
     pub fn to_system_message(&self) -> String {
-        // Optionally include examples in system prompt
-        if self.behavior.examples.is_empty() {
-            self.behavior.system_prompt.clone()
+        let mut prompt = self.behavior.system_prompt.clone();
+
+        // Prepend user's name if known
+        let git_name_fallback: Option<String> = if self.behavior.git_name.is_none() {
+            std::process::Command::new("git")
+                .args(["config", "--global", "user.name"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
         } else {
-            let mut prompt = self.behavior.system_prompt.clone();
+            None
+        };
+        let user_name: Option<&str> = self.behavior.git_name.as_deref()
+            .or_else(|| git_name_fallback.as_deref());
+
+        if let Some(name) = user_name {
+            prompt = format!("The user's name is {}.\n\n{}", name, prompt);
+        }
+
+        // Optionally include examples
+        if !self.behavior.examples.is_empty() {
             prompt.push_str("\n\nExample interactions:\n");
             for example in &self.behavior.examples {
                 prompt.push_str(&format!(
@@ -122,8 +140,9 @@ impl Persona {
                     example.user, example.assistant
                 ));
             }
-            prompt
         }
+
+        prompt
     }
 
     /// Get persona name
@@ -352,7 +371,9 @@ system_prompt = "Simple assistant."
     fn test_to_system_message_no_examples() {
         let persona = Persona::default();
         let msg = persona.to_system_message();
-        assert_eq!(msg, persona.behavior.system_prompt);
+        // May have a "The user's name is …" prefix from git config — the core
+        // system prompt must appear somewhere in the result.
+        assert!(msg.contains(&persona.behavior.system_prompt));
     }
 
     #[test]
