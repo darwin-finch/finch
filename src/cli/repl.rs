@@ -28,8 +28,9 @@ use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
-    AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool, PatchTool,
-    PresentPlanTool, ReadTool, RestartTool, SaveAndExecTool, WebFetchTool, WriteTool,
+    AnsibleTool, AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
+    HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, SaveAndExecTool,
+    WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
@@ -281,6 +282,8 @@ impl Repl {
         tool_registry.register(Box::new(EditTool));
         tool_registry.register(Box::new(PatchTool));
         tool_registry.register(Box::new(WriteTool));
+        tool_registry.register(Box::new(HashCompareTool));
+        tool_registry.register(Box::new(AnsibleTool));
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()

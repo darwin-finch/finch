@@ -91,7 +91,7 @@ pub enum Command {
 
 impl Command {
     pub fn parse(input: &str) -> Option<Self> {
-        let trimmed = input.trim();
+        let trimmed = input.trim().trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '/');
 
         // Handle simple commands without arguments
         match trimmed {

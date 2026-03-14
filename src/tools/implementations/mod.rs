@@ -45,6 +45,12 @@ pub mod todo_tools;
 // Co-Forth VM stack tools
 pub mod stack_tools;
 
+// File hashing and comparison
+pub mod hash_compare;
+
+// Ansible execution
+pub mod ansible;
+
 // Re-exports for convenience
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;
@@ -70,3 +76,6 @@ pub use memory_tools::{CreateMemoryTool, ListRecentTool, SearchMemoryTool};
 pub use todo_tools::{TodoReadTool, TodoWriteTool};
 
 pub use stack_tools::{StackClearTool, StackPopTool, StackPushTool, StackRunTool};
+
+pub use hash_compare::HashCompareTool;
+pub use ansible::AnsibleTool;

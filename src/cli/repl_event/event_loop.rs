@@ -1205,9 +1205,12 @@ s" it is ours"      s" -1 is ours"     argue
                 match command {
                     Command::Quit => {
                         // Restore terminal before exiting — disable raw mode, show cursor.
-                        {
-                            let mut tui = self.tui_renderer.lock().await;
+                        // Use try_lock to avoid deadlock if the TUI lock is held elsewhere.
+                        if let Ok(mut tui) = self.tui_renderer.try_lock() {
                             let _ = tui.shutdown();
+                        } else {
+                            // Lock is held; disable raw mode directly so the terminal is usable.
+                            let _ = crossterm::terminal::disable_raw_mode();
                         }
                         std::process::exit(0);
                     }
