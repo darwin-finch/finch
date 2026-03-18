@@ -7487,3 +7487,106 @@ mod filter_tests {
             "valid definition after malformed one should be kept");
     }
 }
+
+// ── Peer event loop tests ──────────────────────────────────────────────────────
+#[cfg(test)]
+mod peer_loop_tests {
+    use super::*;
+    use crate::session::SessionEvent;
+
+    /// Both peer loops receive the broadcast and each sends back an independent result.
+    #[tokio::test]
+    async fn test_two_peers_both_reply_to_broadcast() {
+        let (inbox_tx, mut inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (bcast_tx, sessions) = boot_peers(inbox_tx, None).await;
+
+        assert_eq!(sessions.len(), 2, "boot_peers must fork exactly two peers");
+
+        // Give each peer a moment to initialise their VMs.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Broadcast: push two values and add them.
+        bcast_tx.send(SessionEvent::chat("3 4 +")).unwrap();
+
+        // Collect replies with a timeout — both peers should respond.
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut replies: Vec<(Uuid, String, String)> = Vec::new();
+        loop {
+            tokio::select! {
+                Some(msg) = inbox_rx.recv() => {
+                    replies.push(msg);
+                    if replies.len() == 2 { break; }
+                }
+                _ = &mut deadline => { break; }
+            }
+        }
+
+        assert_eq!(replies.len(), 2, "expected two replies (one per peer), got {}", replies.len());
+
+        // Both peers should have computed 7.
+        for (_, name, text) in &replies {
+            assert!(
+                text.contains('7'),
+                "peer {name} should reply with ( 7 ), got: {text}"
+            );
+        }
+
+        // The two peers must have different names.
+        let names: Vec<&str> = replies.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert_ne!(names[0], names[1], "peers must have distinct names");
+    }
+
+    /// Peers are independent: a definition in the user's broadcast doesn't
+    /// bleed between peers (each has its own VM snapshot).
+    #[tokio::test]
+    async fn test_peers_have_independent_vms() {
+        let (inbox_tx, mut inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Broadcast a definition — both peers should compile it.
+        bcast_tx.send(SessionEvent::chat(": square  dup * ;")).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Now evaluate the word — both VMs should have it.
+        bcast_tx.send(SessionEvent::chat("5 square")).unwrap();
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut replies: Vec<(Uuid, String, String)> = Vec::new();
+        loop {
+            tokio::select! {
+                Some(msg) = inbox_rx.recv() => {
+                    replies.push(msg);
+                    if replies.len() == 2 { break; }
+                }
+                _ = &mut deadline => { break; }
+            }
+        }
+
+        assert_eq!(replies.len(), 2, "expected both peers to reply");
+        for (_, name, text) in &replies {
+            assert!(
+                text.contains("25"),
+                "peer {name} should know `square` and reply with ( 25 ), got: {text}"
+            );
+        }
+    }
+
+    /// Registry contains both peers after boot.
+    #[tokio::test]
+    async fn test_registry_populated_after_boot() {
+        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (_bcast_tx, sessions) = boot_peers(inbox_tx, None).await;
+
+        for (id, name) in &sessions {
+            let found = find_peer(&id.to_string()).await;
+            assert!(found.is_some(), "peer {name} ({id}) should be in registry");
+
+            let by_name = find_peer(name).await;
+            assert!(by_name.is_some(), "should be findable by name {name}");
+        }
+    }
+}
