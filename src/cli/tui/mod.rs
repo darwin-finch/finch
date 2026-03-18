@@ -1436,7 +1436,7 @@ pub(crate) fn format_custom_input_content(input: &str, cursor: usize) -> String 
 ///
 /// Returns the number of terminal rows consumed (always 1).
 fn render_other_row_inline(
-    stdout: &mut io::Stdout,
+    out: &mut impl io::Write,
     inner: usize,
     is_on_other: bool,
     dialog: &Dialog,
@@ -1452,7 +1452,7 @@ fn render_other_row_inline(
         let content_vis = 3 + input_text.chars().count();
         let total_vis = prefix_vis + content_vis;
         execute!(
-            stdout,
+            out,
             Print(format!(
                 "│  \x1b[1;36m  \u{25cf} Other: \x1b[0m{}{:<w$}\x1b[0m  │\r\n",
                 content,
@@ -1464,7 +1464,7 @@ fn render_other_row_inline(
         let (on, marker) = other_row_parts(false);
         let other_label = format!("  {} Other (custom response)", marker);
         execute!(
-            stdout,
+            out,
             Print(format!(
                 "│  {}{:<w$}{}  │\r\n",
                 on,
@@ -1480,9 +1480,12 @@ fn render_other_row_inline(
 impl TuiRenderer {
     /// Draw a `Dialog` inline using crossterm box-drawing characters.
     /// Returns the number of terminal rows consumed.
-    fn draw_dialog_inline_static(stdout: &mut io::Stdout, dialog: &Dialog) -> Result<usize> {
-        let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let box_width = term_width.min(72);
+    /// `box_width` is the total width including borders (max 72 recommended).
+    pub(crate) fn draw_dialog_inline_static_with_width(
+        out: &mut impl io::Write,
+        dialog: &Dialog,
+        box_width: usize,
+    ) -> Result<usize> {
         let inner = box_width.saturating_sub(6); // │ + 2 spaces on each side + │ = 6
 
         let mut rows = 0;
@@ -1492,19 +1495,19 @@ impl TuiRenderer {
         let bot = format!("└{}┘", "─".repeat(box_width - 2));
 
         // Top border
-        execute!(stdout, Print(format!("{}\r\n", top)))?;
+        execute!(out, Print(format!("{}\r\n", top)))?;
         rows += 1;
 
         // Title
         for line in wrap_text(&dialog.title, inner) {
-            execute!(stdout, Print(format!("│  {:<w$}  │\r\n", line, w = inner)))?;
+            execute!(out, Print(format!("│  {:<w$}  │\r\n", line, w = inner)))?;
             rows += 1;
         }
 
         // Help message (from dialog field)
         if let Some(ref help) = dialog.help_message {
             execute!(
-                stdout,
+                out,
                 Print(format!(
                     "│  {}{:<w$}{}  │\r\n",
                     DIM_GRAY,
@@ -1522,7 +1525,7 @@ impl TuiRenderer {
             // Reserve ~12 rows for title, help, both dividers, options, and bottom border.
             let max_body_rows = term_h.saturating_sub(12).clamp(3, 15);
 
-            execute!(stdout, Print(format!("{}\r\n", div)))?;
+            execute!(out, Print(format!("{}\r\n", div)))?;
             rows += 1;
 
             // Collect all wrapped lines first so we know whether to truncate.
@@ -1545,7 +1548,7 @@ impl TuiRenderer {
             for line in &all_body_lines[..show_count] {
                 let pad = " ".repeat(inner.saturating_sub(line.chars().count()));
                 execute!(
-                    stdout,
+                    out,
                     Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, line, pad, RESET))
                 )?;
                 rows += 1;
@@ -1558,7 +1561,7 @@ impl TuiRenderer {
                 let notice_short: String = notice.chars().take(inner).collect();
                 let pad = " ".repeat(inner.saturating_sub(notice_short.chars().count()));
                 execute!(
-                    stdout,
+                    out,
                     Print(format!(
                         "│  {}{}{}{}  │\r\n",
                         DIM_GRAY, notice_short, pad, RESET
@@ -1568,7 +1571,7 @@ impl TuiRenderer {
             }
         }
 
-        execute!(stdout, Print(format!("{}\r\n", div)))?;
+        execute!(out, Print(format!("{}\r\n", div)))?;
         rows += 1;
 
         // Options — always render the full option list inline.
@@ -1589,14 +1592,14 @@ impl TuiRenderer {
                     let off = if i == *selected_index { RESET } else { "" };
                     let label = format!("  {} {}", marker, opt.label);
                     execute!(
-                        stdout,
+                        out,
                         Print(format!("│  {}{:<w$}{}  │\r\n", on, label, off, w = inner))
                     )?;
                     rows += 1;
                 }
                 if *allow_custom {
                     let is_on_other = *selected_index == options.len();
-                    rows += render_other_row_inline(stdout, inner, is_on_other, dialog)?;
+                    rows += render_other_row_inline(out, inner, is_on_other, dialog)?;
                 }
             }
             DialogType::MultiSelect {
@@ -1615,14 +1618,14 @@ impl TuiRenderer {
                     let off = if i == *cursor_index { RESET } else { "" };
                     let label = format!("  {} {}", checked, opt.label);
                     execute!(
-                        stdout,
+                        out,
                         Print(format!("│  {}{:<w$}{}  │\r\n", on, label, off, w = inner))
                     )?;
                     rows += 1;
                 }
                 if *allow_custom {
                     let is_on_other = *cursor_index == options.len();
-                    rows += render_other_row_inline(stdout, inner, is_on_other, dialog)?;
+                    rows += render_other_row_inline(out, inner, is_on_other, dialog)?;
                 }
             }
             DialogType::Confirm {
@@ -1631,7 +1634,7 @@ impl TuiRenderer {
                 // Prompt may be multi-line — wrap each line inside the box borders.
                 for line in wrap_text(prompt, inner) {
                     execute!(
-                        stdout,
+                        out,
                         Print(format!("│  {:<w$}  │\r\n", line, w = inner))
                     )?;
                     rows += 1;
@@ -1639,7 +1642,7 @@ impl TuiRenderer {
                 let yes_style = if *selected { "\x1b[1;36m" } else { DIM_GRAY };
                 let no_style = if !selected { "\x1b[1;36m" } else { DIM_GRAY };
                 execute!(
-                    stdout,
+                    out,
                     Print(format!(
                         "│  {}Yes{}   {}No{}  {:<w$}  │\r\n",
                         yes_style,
@@ -1647,7 +1650,7 @@ impl TuiRenderer {
                         no_style,
                         RESET,
                         "",
-                        w = inner.saturating_sub(12)
+                        w = inner.saturating_sub(10)
                     ))
                 )?;
                 rows += 1;
@@ -1655,13 +1658,13 @@ impl TuiRenderer {
             DialogType::TextInput { prompt, input, .. } => {
                 if !prompt.is_empty() {
                     execute!(
-                        stdout,
+                        out,
                         Print(format!("│  {:<w$}  │\r\n", prompt, w = inner))
                     )?;
                     rows += 1;
                 }
                 execute!(
-                    stdout,
+                    out,
                     Print(format!(
                         "│  > {:<w$}  │\r\n",
                         input,
@@ -1717,7 +1720,7 @@ impl TuiRenderer {
             let truncated = content_lines.len() > max_preview_lines;
 
             let preview_div = format!("├─ Preview {}", "─".repeat(box_width.saturating_sub(12)));
-            execute!(stdout, Print(format!("{}\r\n", preview_div)))?;
+            execute!(out, Print(format!("{}\r\n", preview_div)))?;
             rows += 1;
 
             for line in &display_lines {
@@ -1731,13 +1734,13 @@ impl TuiRenderer {
                         line.chars().take(inner.saturating_sub(1)).collect();
                     format!("│  {}…  │\r\n", truncated_line)
                 };
-                execute!(stdout, Print(display))?;
+                execute!(out, Print(display))?;
                 rows += 1;
             }
 
             if truncated {
                 execute!(
-                    stdout,
+                    out,
                     Print(format!(
                         "│  {}{:<w$}{}  │\r\n",
                         DIM_GRAY,
@@ -1751,7 +1754,7 @@ impl TuiRenderer {
         }
         // ── End preview pane ─────────────────────────────────────────────────
 
-        execute!(stdout, Print(format!("{}\r\n", div)))?;
+        execute!(out, Print(format!("{}\r\n", div)))?;
         rows += 1;
 
         // ── Submit / Cancel buttons ───────────────────────────────────────────
@@ -1776,15 +1779,14 @@ impl TuiRenderer {
                 "  {}[ Submit ]{}   {}[ Cancel ]{}",
                 submit_on, RESET, cancel_on, RESET
             );
-            // visible width: "  [ Submit ]   [ Cancel ]" = 26 chars
-            let btn_vis = 26_usize;
+            // visible width: "  [ Submit ]   [ Cancel ]" = 25 chars
+            let btn_vis = 25_usize;
             execute!(
-                stdout,
+                out,
                 Print(format!(
-                    "│  {}{:<w$}  │\r\n",
+                    "│  {}{}  │\r\n",
                     btn_row,
-                    "",
-                    w = inner.saturating_sub(btn_vis)
+                    " ".repeat(inner.saturating_sub(btn_vis))
                 ))
             )?;
         } else if matches!(&dialog.dialog_type, DialogType::Select { .. }) {
@@ -1801,23 +1803,24 @@ impl TuiRenderer {
             } else {
                 "  ↑↓ nav · Enter select · Esc cancel"
             };
-            let hint_vis = hint.len();
+            let hint_vis = hint.chars().count();
+            let padding = " ".repeat(inner.saturating_sub(btn_vis + hint_vis));
             execute!(
-                stdout,
+                out,
                 Print(format!(
-                    "│  {}{}{}{:<w$}  │\r\n",
+                    "│  {}{}{}{}{}  │\r\n",
                     btn_row,
                     DIM_GRAY,
                     hint,
                     RESET,
-                    w = inner.saturating_sub(btn_vis + hint_vis)
+                    padding,
                 ))
             )?;
         } else {
             // Confirm / TextInput: just a keybinding hint
             let help = "↑/↓ Navigate  Enter Select  Esc Cancel";
             execute!(
-                stdout,
+                out,
                 Print(format!(
                     "│  {}{:<w$}{}  │\r\n",
                     DIM_GRAY,
@@ -1827,10 +1830,16 @@ impl TuiRenderer {
                 ))
             )?;
         }
-        execute!(stdout, Print(format!("{}\r\n", bot)))?;
+        execute!(out, Print(format!("{}\r\n", bot)))?;
         rows += 2; // buttons row + bot border
 
         Ok(rows)
+    }
+
+    fn draw_dialog_inline_static(out: &mut impl io::Write, dialog: &Dialog) -> Result<usize> {
+        let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+        let box_width = term_width.min(72);
+        Self::draw_dialog_inline_static_with_width(out, dialog, box_width)
     }
 
     /// Show a blocking dialog (used when no async event loop is running).
@@ -2866,5 +2875,103 @@ mod tests {
             let w1_body = &after_w1[..semicolon_pos];
             assert!(w1_body.contains("W0"), "W1 body should call W0 (its predecessor)");
         }
+    }
+}
+
+#[cfg(test)]
+mod draw_dialog_tests {
+    use super::*;
+    use crate::cli::tui::dialog::{Dialog, DialogOption};
+
+    /// Strip ANSI escape sequences from a string, returning only visible chars.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // skip until end of escape sequence (letter or BEL)
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() || ch == '\x07' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Render a dialog to a string using box_width=72, strip ANSI, return lines.
+    fn render_lines(dialog: &Dialog) -> Vec<String> {
+        let mut buf: Vec<u8> = Vec::new();
+        // Call the static function directly — it now accepts &mut impl io::Write
+        TuiRenderer::draw_dialog_inline_static_with_width(&mut buf, dialog, 72).unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+        raw.lines().map(|l| l.trim_end_matches('\r').to_string()).collect()
+    }
+
+    /// Expected visual width of each content line: box_width chars.
+    fn check_widths(lines: &[String], box_width: usize) {
+        for (i, line) in lines.iter().enumerate() {
+            if line.is_empty() { continue; }
+            let visible: String = strip_ansi(line);
+            let w = visible.chars().count();
+            assert_eq!(
+                w, box_width,
+                "line {i} has visual width {w}, expected {box_width}:\n  raw:     {:?}\n  visible: {:?}",
+                line, visible
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_approval_dialog_line_widths() {
+        let dialog = Dialog::tool_approval("Push", "Execute Push tool");
+        let lines = render_lines(&dialog);
+        assert!(!lines.is_empty());
+        check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_tool_approval_file_mutating_line_widths() {
+        let dialog = Dialog::tool_approval("Write", "write file foo.rs");
+        let lines = render_lines(&dialog);
+        check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_select_dialog_line_widths() {
+        let dialog = Dialog::select("Pick one", vec![
+            DialogOption::new("Alpha"),
+            DialogOption::new("Beta"),
+            DialogOption::new("Gamma"),
+        ]);
+        let lines = render_lines(&dialog);
+        check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_confirm_dialog_line_widths() {
+        let dialog = Dialog::confirm("Are you sure?", true);
+        let lines = render_lines(&dialog);
+        check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_multiselect_dialog_line_widths() {
+        let dialog = Dialog::multiselect("Choose all that apply", vec![
+            DialogOption::new("Option A"),
+            DialogOption::new("Option B"),
+        ]);
+        let lines = render_lines(&dialog);
+        check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_text_input_dialog_line_widths() {
+        let dialog = Dialog::text_input("Enter a value", None);
+        let lines = render_lines(&dialog);
+        check_widths(&lines, 72);
     }
 }

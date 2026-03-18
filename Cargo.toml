@@ -30,8 +30,9 @@ once_cell = "1.19"
 # HTTP client for Claude API
 reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
 
-# HTTP server
-axum = "0.7"
+# HTTP server + WebSocket (session transport)
+axum = { version = "0.7", features = ["ws"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 

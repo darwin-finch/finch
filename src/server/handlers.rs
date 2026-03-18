@@ -88,6 +88,8 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/registry/ledgers",   get(handle_registry_all_ledgers))
         .route("/v1/registry/debit",     post(handle_registry_debit))
         .route("/v1/settle",             post(handle_settle))
+        // Session WebSocket — bidirectional event bus between two finch nodes
+        .route("/v1/session/ws", get(handle_session_ws))
         // Health and metrics
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
@@ -1170,4 +1172,48 @@ async fn handle_exec(
         exit_code: output.status.code().unwrap_or(-1),
         error: None,
     }))
+}
+
+// ── Session WebSocket ──────────────────────────────────────────────────────────
+//
+// GET /v1/session/ws — upgrade to a bidirectional session with this node.
+//
+// After the upgrade, each side can send SessionEvent JSON frames at any time.
+// The server side emits the connected bus into SESSION_BUS_TX so the local
+// AI loop can pick it up and participate in the conversation.
+
+use once_cell::sync::Lazy;
+use tokio::sync::{broadcast, Mutex};
+
+/// Broadcast channel that delivers new SessionBus handles to whoever is
+/// listening (typically the AI event loop).
+static SESSION_BUS_TX: Lazy<broadcast::Sender<()>> = Lazy::new(|| {
+    let (tx, _) = broadcast::channel(16);
+    tx
+});
+
+/// Queue of newly created SessionBus handles waiting to be claimed.
+static PENDING_BUSES: Lazy<Mutex<Vec<crate::session::SessionBus>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Upgrade a GET /v1/session/ws request to a WebSocket session.
+async fn handle_session_ws(
+    ws: axum::extract::WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| async move {
+        let bus = crate::session::transport::serve(socket);
+        PENDING_BUSES.lock().await.push(bus);
+        let _ = SESSION_BUS_TX.send(());
+    })
+}
+
+/// Accept the next inbound session bus (called by the AI loop).
+/// Returns `None` immediately if no pending connection.
+pub async fn accept_session_bus() -> Option<crate::session::SessionBus> {
+    PENDING_BUSES.lock().await.pop()
+}
+
+/// Subscribe to new-session notifications.
+pub fn session_bus_notifications() -> broadcast::Receiver<()> {
+    SESSION_BUS_TX.subscribe()
 }
