@@ -1209,9 +1209,10 @@ s" it is ours"      s" -1 is ours"     argue
             }));
         }
 
-        // Render interval (16ms ≈ 60fps) - blit overwrites visible area with shadow buffer.
-        // Lower value makes streaming output appear smoother (Claude Code parity).
-        let mut render_interval = tokio::time::interval(Duration::from_millis(16));
+        // Render interval (33ms ≈ 30fps) — smooth streaming without terminal flicker.
+        // 60fps (16ms) caused visual artifacts on most terminal emulators; 30fps is the
+        // sweet spot: fast enough to feel live, slow enough to not tear.
+        let mut render_interval = tokio::time::interval(Duration::from_millis(33));
 
         // Cleanup interval (30 seconds)
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
@@ -1295,8 +1296,8 @@ s" it is ours"      s" -1 is ours"     argue
 
                 // Periodic rendering
                 _ = render_interval.tick() => {
-                    // Slowly rotate the poset 3D view at 16ms/tick (0.00128 rad ≈ same ~12s turn)
-                    self.poset.lock().await.rotate(0.00128, 0.0);
+                    // Slowly rotate the poset 3D view at 33ms/tick (0.00265 rad ≈ same ~12s turn)
+                    self.poset.lock().await.rotate(0.00265, 0.0);
 
                     // Check for pending cancellation
                     {

@@ -104,13 +104,42 @@ pub fn spawn_input_task(
         let mut pending_brain_content: Option<String> = None;
 
         loop {
+            // Check for events WITHOUT holding the TUI lock.
+            // This prevents the lock from being held during the poll wait,
+            // which would block the render loop (causing flicker / perceived lag).
+            let event_available =
+                crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false);
+
+            if !event_available {
+                // No event — check debounce, then yield briefly.
+                // (debounce block below also runs on the Ok(None) path; duplicate here
+                //  handles the no-event case so we don't skip 300ms fire opportunities)
+                if let (Some(content), Some(kst)) =
+                    (&pending_brain_content, last_keystroke)
+                {
+                    if kst.elapsed().as_millis() >= 300 {
+                        let content = content.clone();
+                        if tx.send(InputEvent::TypingStarted(content)).is_err() {
+                            break;
+                        }
+                        last_keystroke = None;
+                        pending_brain_content = None;
+                    }
+                }
+                if tx.is_closed() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+
             // The lock block returns (input_result, typing_hint).
             // typing_hint is Some(content) when text was modified but not submitted.
             let (input_result, typing_hint): (Result<Option<String>>, Option<String>) = {
                 let mut tui = tui_renderer.lock().await;
 
-                // Poll with short timeout (100ms) to avoid blocking
-                if crossterm::event::poll(Duration::from_millis(5)).unwrap_or(false) {
+                // An event is ready — process it immediately (no blocking poll needed).
+                if crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                     // Track if we need to render after processing first event
                     let mut first_event_modified_input = false;
 
@@ -553,8 +582,8 @@ pub fn spawn_input_task(
                 }
             }
 
-            // Small delay to prevent CPU spinning while keeping input responsive
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // No extra sleep here — the no-event branch (above) already yields for 5ms.
+            // When there IS an event we want to loop back immediately to check for more.
         }
     });
 
