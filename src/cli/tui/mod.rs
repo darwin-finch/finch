@@ -477,6 +477,14 @@ impl TuiRenderer {
     ) -> Result<Self> {
         enable_raw_mode().context("Failed to enable raw mode")?;
 
+        // Enable bracketed paste so the terminal wraps pasted content in
+        // \x1b[200~ ... \x1b[201~ markers.  Crossterm surfaces this as
+        // Event::Paste(String) which we handle without any Enter-confusion.
+        // Unlike kitty keyboard enhancement flags, bracketed paste cannot
+        // corrupt the terminal on unclean exit — it simply falls back to
+        // normal (unbounded) paste mode, which is safe.
+        let _ = execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
+
         // We intentionally do NOT push any KeyboardEnhancementFlags.
         //
         // The kitty keyboard enhancement protocol (DISAMBIGUATE_ESCAPE_CODES /
@@ -1252,7 +1260,12 @@ impl TuiRenderer {
         // Reset terminal state: show cursor, reset colours, move to a clean line.
         // The `\r\n` ensures the shell prompt lands on its own fresh line rather
         // than overwriting content from the erased live area.
-        let _ = execute!(io::stdout(), cursor::Show, ResetColor);
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::DisableBracketedPaste,
+            cursor::Show,
+            ResetColor,
+        );
         print!("\r\n");
         // Flush pending output BEFORE leaving raw mode — otherwise some terminals
         // silently discard buffered bytes after the mode switch.

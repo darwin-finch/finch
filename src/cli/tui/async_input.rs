@@ -401,37 +401,55 @@ pub fn spawn_input_task(
                                 }
                             }
                         }
+                        // Bracketed paste: insert text verbatim into the textarea.
+                        // Newlines within the paste become real newlines (Shift+Enter)
+                        // so they don't trigger a submit.  This is the correct Claude
+                        // Code-style paste behavior.
+                        Ok(Event::Paste(text)) => {
+                            // Replace each \n with a manual newline insertion so
+                            // tui-textarea keeps them as in-buffer newlines.
+                            for ch in text.chars() {
+                                if ch == '\n' || ch == '\r' {
+                                    let newline_key = crossterm::event::KeyEvent::new(
+                                        KeyCode::Enter,
+                                        crossterm::event::KeyModifiers::SHIFT,
+                                    );
+                                    tui.input_textarea.input(Event::Key(newline_key));
+                                } else if sanitize_paste_char(ch) {
+                                    let char_key = crossterm::event::KeyEvent::new(
+                                        KeyCode::Char(ch),
+                                        crossterm::event::KeyModifiers::NONE,
+                                    );
+                                    tui.input_textarea.input(Event::Key(char_key));
+                                }
+                            }
+                            first_event_modified_input = true;
+                            Ok(None)
+                        }
                         Ok(_) => Ok(None), // Ignore other events (mouse, resize, etc.)
                         Err(e) => Err(anyhow::anyhow!("Failed to read input: {}", e)),
                     };
 
-                    // Fast path: Check if more events are immediately available (for paste operations)
-                    // Process all available events without delay to make pasting instant.
-                    // All Enter keys in this batch are treated as newlines — the user can
-                    // submit deliberately on the *next* keypress after the paste settles.
+                    // Drain any immediately-available subsequent key events.
+                    // With bracketed paste enabled, pasted content arrives as Event::Paste
+                    // (handled above), so we no longer remap Enter here — any Enter that
+                    // arrives in this batch is a real keystroke and should not be swallowed.
                     let mut had_input = first_event_modified_input;
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
-                            Ok(Event::Key(key)) if key.code == KeyCode::Enter => {
-                                // In paste batch: always insert newline, never submit.
-                                // Re-map to Shift+Enter so tui-textarea treats it as newline.
-                                let newline_key = crossterm::event::KeyEvent::new(
-                                    KeyCode::Enter,
-                                    KeyModifiers::SHIFT,
-                                );
-                                tui.input_textarea.input(Event::Key(newline_key));
-                                had_input = true;
-                            }
                             Ok(Event::Key(key)) => {
-                                // Sanitize pasted content (filter images/control chars)
+                                // Stop draining on Enter — leave it for the next loop
+                                // iteration so it is processed as a proper submit.
+                                if key.code == KeyCode::Enter {
+                                    break;
+                                }
                                 if should_accept_key_event(&key) {
                                     tui.input_textarea.input(Event::Key(key));
                                     had_input = true;
                                 }
-                                // Silently ignore problematic characters
                             }
-                            Ok(_) => {}      // Ignore other events
-                            Err(_) => break, // Error, stop batching
+                            Ok(_) => {}      // Ignore other events (mouse, resize, paste already handled)
+                            Err(_) => break,
                         }
                     }
 
