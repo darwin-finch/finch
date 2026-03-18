@@ -110,7 +110,7 @@ pub fn spawn_input_task(
                 let mut tui = tui_renderer.lock().await;
 
                 // Poll with short timeout (100ms) to avoid blocking
-                if crossterm::event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                if crossterm::event::poll(Duration::from_millis(5)).unwrap_or(false) {
                     // Track if we need to render after processing first event
                     let mut first_event_modified_input = false;
 
@@ -187,8 +187,10 @@ pub fn spawn_input_task(
                                         tui.history_index = None;
                                         tui.history_draft = None; // Clear any saved draft
 
-                                        // Clear textarea for next input
+                                        // Clear textarea for next input and render immediately
+                                        // so the input area visually clears on Enter (like Claude Code).
                                         tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                        first_event_modified_input = true; // triggers render below
                                         Ok(Some(input))
                                     } else {
                                         Ok(None) // Empty input, ignore
@@ -432,26 +434,53 @@ pub fn spawn_input_task(
 
                     // Drain any immediately-available subsequent key events.
                     // With bracketed paste enabled, pasted content arrives as Event::Paste
-                    // (handled above), so we no longer remap Enter here — any Enter that
-                    // arrives in this batch is a real keystroke and should not be swallowed.
+                    // (handled above).  If a plain Enter arrives in the batch drain we must
+                    // process it as a submit — the previous code read() it and then broke,
+                    // silently dropping the keystroke and making Enter feel unreliable.
                     let mut had_input = first_event_modified_input;
+                    let mut batch_submit: Option<String> = None;
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
                             Ok(Event::Key(key)) => {
-                                // Stop draining on Enter — leave it for the next loop
-                                // iteration so it is processed as a proper submit.
                                 if key.code == KeyCode::Enter {
-                                    break;
-                                }
-                                if should_accept_key_event(&key) {
+                                    if key.modifiers.intersects(
+                                        KeyModifiers::SHIFT | KeyModifiers::ALT,
+                                    ) {
+                                        // Shift/Alt+Enter in batch: insert newline
+                                        tui.input_textarea.input(Event::Key(key));
+                                        had_input = true;
+                                    } else {
+                                        // Plain Enter: collect submission and stop draining.
+                                        let input =
+                                            tui.input_textarea.lines().join("\n");
+                                        if !input.trim().is_empty() {
+                                            tui.command_history.push(input.clone());
+                                            tui.history_index = None;
+                                            tui.history_draft = None;
+                                            tui.input_textarea =
+                                                TuiRenderer::create_clean_textarea();
+                                            had_input = true; // render the cleared input
+                                            batch_submit = Some(input);
+                                        }
+                                        break;
+                                    }
+                                } else if should_accept_key_event(&key) {
                                     tui.input_textarea.input(Event::Key(key));
                                     had_input = true;
                                 }
                             }
-                            Ok(_) => {}      // Ignore other events (mouse, resize, paste already handled)
+                            Ok(_) => {} // Ignore other events (mouse, resize, paste)
                             Err(_) => break,
                         }
                     }
+                    // Batch drain submit overrides the first-event result (e.g. a typed
+                    // character followed immediately by Enter in the same poll window).
+                    let first_event_result: Result<Option<String>> =
+                        if let Some(input) = batch_submit {
+                            Ok(Some(input))
+                        } else {
+                            first_event_result
+                        };
 
                     // Render immediately after input (event-driven, not polled)
                     // Capture typing hint BEFORE releasing lock, only when
@@ -524,8 +553,8 @@ pub fn spawn_input_task(
                 }
             }
 
-            // Small delay to prevent CPU spinning
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Small delay to prevent CPU spinning while keeping input responsive
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     });
 
