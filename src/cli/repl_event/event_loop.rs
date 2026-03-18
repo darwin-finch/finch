@@ -485,6 +485,29 @@ fn looks_like_natural_language(s: &str, word_exists: impl Fn(&str) -> bool) -> b
     if trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
         return true;
     }
+    // Contractions ("you're", "don't", "I'm", "it's") and sentence-ending punctuation
+    // attached to a word ("me." "hello!" but NOT standalone "." or "!") → natural language.
+    // Standalone "." is Forth's print-TOS; standalone "!" is Forth's store op.
+    let tokens_raw: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens_raw.iter().any(|t| {
+        // Contraction: apostrophe followed by a letter inside the token.
+        let bytes = t.as_bytes();
+        for i in 0..bytes.len().saturating_sub(1) {
+            if bytes[i] == b'\'' && bytes[i + 1].is_ascii_alphabetic() {
+                return true;
+            }
+        }
+        false
+    }) {
+        return true;
+    }
+    // Sentence-ending punctuation attached to a word (last token ends with "." or "!"
+    // but has more than one character, ruling out standalone Forth ops).
+    if let Some(last) = tokens_raw.last() {
+        if last.len() > 1 && (last.ends_with('.') || last.ends_with('!')) {
+            return true;
+        }
+    }
     let forth_chars = |c: char| matches!(c, '+' | '-' | '*' | '/' | '@' | '!' | '.' | ':' | ';' | '<' | '>' | '=');
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
 
@@ -7307,6 +7330,38 @@ mod nl_routing_tests {
     // Regression: "we could do that whatever" — multi-word unknown → AI
     #[test] fn test_regression_we_could() {
         assert!(looks_like_natural_language("we could do that", no_words));
+    }
+
+    // Contractions → AI (the apostrophe+letter pattern is unambiguous prose).
+    #[test] fn test_contraction_youre() {
+        assert!(looks_like_natural_language("you're not talking to me.", all_words));
+    }
+    #[test] fn test_contraction_dont() {
+        assert!(looks_like_natural_language("don't do that", no_words));
+    }
+    #[test] fn test_contraction_its() {
+        assert!(looks_like_natural_language("it's working", no_words));
+    }
+
+    // Sentence-ending period attached to a word → AI.
+    #[test] fn test_period_attached_to_word() {
+        assert!(looks_like_natural_language("hello.", no_words));
+    }
+    #[test] fn test_period_attached_multi_word() {
+        assert!(looks_like_natural_language("this is a sentence.", no_words));
+    }
+    // Standalone "." is the Forth print-TOS op — NOT natural language.
+    #[test] fn test_standalone_period_is_forth() {
+        assert!(!looks_like_natural_language("42 .", no_words));
+    }
+    // "3.14" is a float literal — Forth, not natural language.
+    #[test] fn test_float_with_period_is_forth() {
+        assert!(!looks_like_natural_language("3.14", no_words));
+    }
+
+    // Exclamation mark attached to a word → AI.
+    #[test] fn test_exclamation_attached() {
+        assert!(looks_like_natural_language("hello!", no_words));
     }
 }
 
