@@ -1209,8 +1209,9 @@ s" it is ours"      s" -1 is ours"     argue
             }));
         }
 
-        // Render interval (100ms) - blit overwrites visible area with shadow buffer
-        let mut render_interval = tokio::time::interval(Duration::from_millis(100));
+        // Render interval (16ms ≈ 60fps) - blit overwrites visible area with shadow buffer.
+        // Lower value makes streaming output appear smoother (Claude Code parity).
+        let mut render_interval = tokio::time::interval(Duration::from_millis(16));
 
         // Cleanup interval (30 seconds)
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
@@ -1294,8 +1295,8 @@ s" it is ours"      s" -1 is ours"     argue
 
                 // Periodic rendering
                 _ = render_interval.tick() => {
-                    // Slowly rotate the poset 3D view (0.008 rad/tick ≈ 1 full turn per ~12s)
-                    self.poset.lock().await.rotate(0.008, 0.0);
+                    // Slowly rotate the poset 3D view at 16ms/tick (0.00128 rad ≈ same ~12s turn)
+                    self.poset.lock().await.rotate(0.00128, 0.0);
 
                     // Check for pending cancellation
                     {
