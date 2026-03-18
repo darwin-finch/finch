@@ -340,15 +340,64 @@ pub fn git_repo_root() -> Option<std::path::PathBuf> {
 /// Returns a module name (file stem under `vocabulary/`):
 ///   - `"zh"` for Chinese / CJK characters
 ///   - `"en"` for everything else (default)
+/// Detect the vocabulary file language code for a word based on its Unicode script.
+///
+/// Returns a BCP-47-ish language tag used as the filename stem under `vocabulary/`:
+///   `vocabulary/en.toml`, `vocabulary/zh.toml`, `vocabulary/ja.toml`, …
+///
+/// Detection priority (first matching script wins):
+///   Hiragana/Katakana → "ja"   (before CJK, since Japanese uses kanji too)
+///   Hangul            → "ko"
+///   CJK               → "zh"
+///   Arabic            → "ar"
+///   Hebrew            → "he"
+///   Cyrillic          → "ru"
+///   Devanagari        → "hi"
+///   Tamil             → "ta"
+///   Thai              → "th"
+///   Greek             → "el"
+///   everything else   → "en"
+/// Detect the vocabulary file language code for a word based on its Unicode script.
+///
+/// Returns a BCP-47-ish language tag used as the filename stem under `vocabulary/`:
+///   `vocabulary/en.toml`, `vocabulary/zh.toml`, `vocabulary/ja.toml`, …
+///
+/// Scans all characters, collects which scripts are present, then applies
+/// priority (higher index = higher priority):
+///
+///   en < zh < ar < he < ru < hi < ta < th < el < ko < ja
+///
+/// Japanese kana beats CJK so mixed kanji+kana text → "ja" not "zh".
+/// Korean beats CJK for the same reason.
 pub fn detect_vocab_lang(word: &str) -> &'static str {
-    let has_cjk = word.chars().any(|c| {
-        matches!(c as u32,
-            0x2E80..=0x9FFF |  // CJK Radicals → CJK Unified Ideographs (includes Ext A 3400-4DBF)
-            0xF900..=0xFAFF |  // Compatibility Ideographs
-            0x20000..=0x2A6DF  // Extension B
-        )
-    });
-    if has_cjk { "zh" } else { "en" }
+    // Priority list — later entries win over earlier ones.
+    const PRIORITY: &[&str] = &["en", "zh", "ar", "he", "ru", "hi", "ta", "th", "el", "ko", "ja"];
+
+    let mut best: usize = 0; // index into PRIORITY; 0 = "en"
+
+    for c in word.chars() {
+        let cp = c as u32;
+        let lang = match cp {
+            0x3040..=0x309F | 0x30A0..=0x30FF | 0x31F0..=0x31FF => "ja",
+            0x1100..=0x11FF | 0xAC00..=0xD7AF | 0xA960..=0xA97F | 0xD7B0..=0xD7FF => "ko",
+            0x0370..=0x03FF | 0x1F00..=0x1FFF => "el",
+            0x0E00..=0x0E7F => "th",
+            0x0B80..=0x0BFF => "ta",
+            0x0900..=0x097F => "hi",
+            0x0400..=0x04FF | 0x0500..=0x052F => "ru",
+            0x0590..=0x05FF | 0xFB1D..=0xFB4F => "he",
+            0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
+            | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => "ar",
+            0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF => "zh",
+            _ => continue,
+        };
+        if let Some(rank) = PRIORITY.iter().position(|&l| l == lang) {
+            if rank > best {
+                best = rank;
+            }
+        }
+    }
+    PRIORITY[best]
 }
 
 /// Return the path to the project-local vocabulary file for `lang` (e.g. `"zh"`, `"en"`).
@@ -4958,5 +5007,80 @@ mod born_test {
         let mut vm = crate::coforth::Library::precompiled_vm();
         let out = vm.exec("true false and .").expect("true false and");
         assert_eq!(out.trim(), "0", "true and false should be 0, got: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod detect_lang_tests {
+    use super::detect_vocab_lang;
+
+    #[test]
+    fn test_en() {
+        assert_eq!(detect_vocab_lang("hello"), "en");
+        assert_eq!(detect_vocab_lang("argue"), "en");
+        assert_eq!(detect_vocab_lang("be"), "en");
+    }
+
+    #[test]
+    fn test_zh() {
+        assert_eq!(detect_vocab_lang("你好"), "zh");
+        assert_eq!(detect_vocab_lang("再见"), "zh");
+    }
+
+    #[test]
+    fn test_ja_hiragana() {
+        assert_eq!(detect_vocab_lang("こんにちは"), "ja");
+    }
+
+    #[test]
+    fn test_ja_katakana() {
+        assert_eq!(detect_vocab_lang("コンピュータ"), "ja");
+    }
+
+    #[test]
+    fn test_ja_mixed_kanji_kana() {
+        // Hiragana present → ja, even with kanji
+        assert_eq!(detect_vocab_lang("日本語"), "zh"); // pure kanji → zh
+        assert_eq!(detect_vocab_lang("日本語の"), "ja"); // の is hiragana → ja
+    }
+
+    #[test]
+    fn test_ko() {
+        assert_eq!(detect_vocab_lang("안녕하세요"), "ko");
+    }
+
+    #[test]
+    fn test_ar() {
+        assert_eq!(detect_vocab_lang("مرحبا"), "ar");
+    }
+
+    #[test]
+    fn test_he() {
+        assert_eq!(detect_vocab_lang("שלום"), "he");
+    }
+
+    #[test]
+    fn test_ru() {
+        assert_eq!(detect_vocab_lang("привет"), "ru");
+    }
+
+    #[test]
+    fn test_hi() {
+        assert_eq!(detect_vocab_lang("नमस्ते"), "hi");
+    }
+
+    #[test]
+    fn test_th() {
+        assert_eq!(detect_vocab_lang("สวัสดี"), "th");
+    }
+
+    #[test]
+    fn test_el() {
+        assert_eq!(detect_vocab_lang("γεια"), "el");
+    }
+
+    #[test]
+    fn test_ta() {
+        assert_eq!(detect_vocab_lang("வணக்கம்"), "ta");
     }
 }
