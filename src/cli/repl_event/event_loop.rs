@@ -893,21 +893,58 @@ impl EventLoop {
             // Restore words learned in previous sessions (from daemon or file).
             self.load_user_words().await;
 
-            // Dump the user's vocabulary — show them what they know.
+            // Print all vocabulary definitions so both participants know what
+            // words are available at the start of every session.
             {
-                let source = self.forth_vm.dump_source();
-                let words: Vec<&str> = source.lines()
-                    .filter(|l| l.trim_start().starts_with(':'))
-                    .filter_map(|l| l.trim_start_matches(':').trim().split_whitespace().next())
-                    .collect();
-                if !words.is_empty() {
-                    let word_list = words.iter()
-                        .map(|w| w.cyan().to_string())
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    self.output_manager.write_info(
-                        format!("your words: {}", word_list)
+                use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor, ResetColor};
+                use std::fmt::Write as FmtWrite;
+
+                let lib = crate::coforth::Library::load();
+                let mut entries = lib.all_entries();
+                entries.sort_by(|a, b| a.word.cmp(&b.word));
+
+                let mut lines = Vec::new();
+                for entry in &entries {
+                    let kind_color = match entry.kind.as_str() {
+                        "task"       => Color::Cyan,
+                        "question"   => Color::Yellow,
+                        "constraint" => Color::Red,
+                        _            => Color::DarkGrey,
+                    };
+                    let callable_marker = if entry.forth.is_some() {
+                        format!("{}{}{} ",
+                            SetForegroundColor(Color::Green),
+                            "✦",
+                            ResetColor)
+                    } else {
+                        "  ".to_string()
+                    };
+                    let mut line = String::new();
+                    let _ = write!(
+                        line,
+                        "{}{}{}{}{}  —  {}",
+                        callable_marker,
+                        SetForegroundColor(kind_color),
+                        entry.word,
+                        ResetColor,
+                        SetAttribute(Attribute::Reset),
+                        entry.definition,
                     );
+                    lines.push(line);
+                }
+
+                if !lines.is_empty() {
+                    let header = format!(
+                        "{}{} words{}  {}✦{} = callable  {}cyan{}=task  {}yellow{}=question  {}red{}=constraint  {}dim{}=observation",
+                        SetAttribute(Attribute::Bold), entries.len(), SetAttribute(Attribute::Reset),
+                        SetForegroundColor(Color::Green), ResetColor,
+                        SetForegroundColor(Color::Cyan), ResetColor,
+                        SetForegroundColor(Color::Yellow), ResetColor,
+                        SetForegroundColor(Color::Red), ResetColor,
+                        SetForegroundColor(Color::DarkGrey), ResetColor,
+                    );
+                    self.output_manager.write_info(header);
+                    self.output_manager.write_info(lines.join("\n"));
                 }
             }
 
