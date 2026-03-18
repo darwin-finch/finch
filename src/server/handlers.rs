@@ -811,6 +811,7 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
     let mut vm = base.clone_dict();
     drop(base);
     vm.remote_mode = true; // no dialogs, no AI calls on remote VMs
+    let depth_before = vm.data_stack().len();
     let t0 = std::time::Instant::now();
     let result = vm.exec(&req.code);
     let compute_ms = t0.elapsed().as_millis() as u64;
@@ -843,7 +844,7 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
     match result {
         Ok(output) => Ok(Json(ForthEvalResponse {
             output,
-            stack:        vm.data_stack().to_vec(),
+            stack:        vm.data_stack()[depth_before..].to_vec(),
             error:        None,
             compute_ms,
             debt_warning,
@@ -851,7 +852,7 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
         })),
         Err(e) => Ok(Json(ForthEvalResponse {
             output:       vm.out.clone(),
-            stack:        vm.data_stack().to_vec(),
+            stack:        vm.data_stack()[depth_before..].to_vec(),
             error:        Some(e.to_string()),
             compute_ms,
             debt_warning,
