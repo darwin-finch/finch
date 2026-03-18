@@ -147,17 +147,21 @@ impl DaemonLifecycle {
                 pid = pid,
                 "Daemon did not stop gracefully, sending SIGKILL..."
             );
-            kill(Pid::from_raw(pid as i32), Signal::SIGKILL)
-                .context("Failed to send SIGKILL to daemon")?;
+            // SIGKILL may fail if the process is already a zombie (exited but not reaped).
+            // That's fine — a zombie holds no resources; just clean up the PID file.
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
 
             // Wait a bit for SIGKILL to take effect
             std::thread::sleep(Duration::from_millis(500));
 
+            // kill(pid, 0) returns Ok for zombie processes, so "still exists" after
+            // SIGKILL almost always means a zombie.  Either way, the daemon is no
+            // longer serving requests — remove the PID file and move on.
             if process_exists(pid) {
-                anyhow::bail!("Failed to stop daemon (process {} still running)", pid);
+                warn!(pid = pid, "Process still visible after SIGKILL (likely zombie); removing PID file");
+            } else {
+                info!(pid = pid, "Daemon force-stopped with SIGKILL");
             }
-
-            info!(pid = pid, "Daemon force-stopped with SIGKILL");
             self.cleanup()?;
             Ok(())
         }
