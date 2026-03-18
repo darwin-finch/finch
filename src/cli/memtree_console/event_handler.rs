@@ -91,6 +91,7 @@ impl EventHandler {
             ReplEvent::PosetComplete { .. } => {}
             ReplEvent::PeersDiscovered(_) => {}
             ReplEvent::VocabSync(_) => {}
+            ReplEvent::PeerMessage { .. } => {}
         }
 
         Ok(())

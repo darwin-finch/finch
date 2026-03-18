@@ -111,6 +111,9 @@ pub enum ReplEvent {
     /// Daemon vocabulary changed — another terminal defined new words.
     /// Payload is the full vocab source from `GET /v1/forth/vocab`.
     VocabSync(String),
+
+    /// A message arrived from the peer event loop (the AI's own loop).
+    PeerMessage { text: String },
 }
 
 #[cfg(test)]

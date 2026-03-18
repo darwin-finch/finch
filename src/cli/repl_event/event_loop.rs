@@ -268,6 +268,10 @@ pub struct EventLoop {
     /// Word names auto-compiled from the vocabulary library (not user-authored).
     /// Excluded from the vocab section sent to the AI so the prompt stays small.
     auto_compiled_word_names: std::collections::HashSet<String>,
+
+    /// Session bus — bidirectional channel to the peer AI event loop.
+    /// The user's end; the peer runs in a background task.
+    session_bus: crate::session::SessionBus,
 }
 
 /// View mode for the REPL
@@ -567,6 +571,47 @@ fn extract_scatter_exec_commands(code: &str) -> Vec<String> {
     cmds
 }
 
+/// Background peer event loop.
+///
+/// Owns a fresh Forth VM and runs it against code the user broadcasts via the
+/// session bus.  Sends results back so they appear as "peer:" messages in the
+/// user's REPL.  Runs for the lifetime of the session.
+async fn run_peer_loop(
+    mut bus: crate::session::SessionBus,
+    event_tx: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
+) {
+    use crate::session::SessionEvent;
+    let mut vm = crate::coforth::Library::precompiled_vm();
+    vm.remote_mode = true; // suppress dialogs and AI calls in the peer VM
+
+    while let Some(event) = bus.recv().await {
+        match event {
+            SessionEvent::Chat { text } => {
+                let depth_before = vm.data_stack().len();
+                let response = match vm.exec(&text) {
+                    Ok(out) => {
+                        let delta = vm.data_stack()[depth_before..].to_vec();
+                        if !out.is_empty() {
+                            out.trim_end().to_string()
+                        } else if !delta.is_empty() {
+                            let items: Vec<String> = delta.iter().map(|n| n.to_string()).collect();
+                            format!("( {} )", items.join("  "))
+                        } else {
+                            String::new()
+                        }
+                    }
+                    Err(e) => format!("error: {e}"),
+                };
+                if !response.is_empty() {
+                    let _ = event_tx.send(ReplEvent::PeerMessage { text: response });
+                }
+            }
+            SessionEvent::Close => break,
+            _ => {}
+        }
+    }
+}
+
 impl EventLoop {
     /// Create a new event loop with unified generators
     #[allow(clippy::too_many_arguments)]
@@ -647,6 +692,15 @@ impl EventLoop {
             )
         };
 
+        // Spawn peer event loop — its own Forth VM; talks back via event_tx.
+        let session_bus = {
+            let pair = crate::session::SessionPair::local();
+            let peer_bus = pair.b;
+            let peer_tx = event_tx.clone();
+            tokio::spawn(async move { run_peer_loop(peer_bus, peer_tx).await });
+            pair.a
+        };
+
         Self {
             event_rx,
             event_tx,
@@ -714,6 +768,7 @@ impl EventLoop {
             push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
             hash_rx: crate::server::handlers::HASH_INBOX.subscribe(),
             auto_compiled_word_names: std::collections::HashSet::new(),
+            session_bus,
         }
     }
 
@@ -1107,6 +1162,7 @@ s" it is ours"      s" -1 is ours"     argue
                         ReplEvent::PosetComplete { result: Err(_) } => "PosetComplete(err)",
                         ReplEvent::PeersDiscovered(_) => "PeersDiscovered",
                         ReplEvent::VocabSync(_) => "VocabSync",
+                        ReplEvent::PeerMessage { .. } => "PeerMessage",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -2798,6 +2854,14 @@ Rules:\n\
                     self.render_tui().await?;
                 }
             }
+            ReplEvent::PeerMessage { text } => {
+                use crossterm::style::Stylize;
+                self.output_manager.write_info(
+                    format!("{}  {}", "peer →".cyan(), text.as_str().white())
+                );
+                self.render_tui().await?;
+            }
+
             ReplEvent::VocabSync(source) => {
                 // Another terminal defined new words — compile them into this session's VM.
                 // Use exec_with_fuel directly (not save_user_words) to avoid a push loop.
@@ -4044,6 +4108,12 @@ Rules:\n\
                 );
             }
         }
+        // Broadcast this code to the peer loop so it runs the same code on its own VM
+        // and replies with its result (stack delta or output).
+        let _ = self.session_bus.tx.try_send(
+            crate::session::SessionEvent::chat(code.clone())
+        );
+
         // Drain any boot poems registered this exec.
         let poems = self.forth_vm.take_boot_poems();
         if !poems.is_empty() { self.save_boot_poems(&poems); }
