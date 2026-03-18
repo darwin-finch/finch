@@ -269,9 +269,17 @@ pub struct EventLoop {
     /// Excluded from the vocab section sent to the AI so the prompt stays small.
     auto_compiled_word_names: std::collections::HashSet<String>,
 
-    /// Session bus — bidirectional channel to the peer AI event loop.
-    /// The user's end; the peer runs in a background task.
-    session_bus: crate::session::SessionBus,
+    /// Broadcast sender — pushes code to ALL peer event loops simultaneously.
+    peer_tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
+
+    /// Sender half of the peer inbox — cloned into boot_peers() at run() time.
+    peer_inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
+
+    /// Shared inbox — receives `(id, name, text)` replies from all peers.
+    peer_inbox_rx: tokio::sync::mpsc::UnboundedReceiver<(Uuid, String, String)>,
+
+    /// Active peers: (UUID, display-name) for each forked loop.
+    peer_sessions: Vec<(Uuid, String)>,
 }
 
 /// View mode for the REPL
@@ -571,22 +579,60 @@ fn extract_scatter_exec_commands(code: &str) -> Vec<String> {
     cmds
 }
 
-/// Background peer event loop.
-///
-/// Owns a fresh Forth VM and runs it against code the user broadcasts via the
-/// session bus.  Sends results back so they appear as "peer:" messages in the
-/// user's REPL.  Runs for the lifetime of the session.
+// ── Peer registry ─────────────────────────────────────────────────────────────
+//
+// Maps UUID → sender-end of a peer's inbox so callers can attach to an
+// existing peer by name or UUID instead of forking a fresh one.
+
+use std::collections::HashMap as PeerMap;
+use once_cell::sync::Lazy;
+
+static PEER_REGISTRY: Lazy<tokio::sync::Mutex<PeerMap<Uuid, (String, tokio::sync::broadcast::Sender<crate::session::SessionEvent>)>>> =
+    Lazy::new(|| tokio::sync::Mutex::new(PeerMap::new()));
+
+/// Register a newly-forked peer so it can be attached to later.
+async fn register_peer(id: Uuid, name: String, tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>) {
+    PEER_REGISTRY.lock().await.insert(id, (name, tx));
+}
+
+/// Look up a peer by name or UUID prefix.  Returns `(id, broadcast_tx)`.
+pub async fn find_peer(needle: &str) -> Option<(Uuid, tokio::sync::broadcast::Sender<crate::session::SessionEvent>)> {
+    let reg = PEER_REGISTRY.lock().await;
+    // Exact UUID match first
+    if let Ok(id) = needle.parse::<Uuid>() {
+        if let Some((_, tx)) = reg.get(&id) {
+            return Some((id, tx.clone()));
+        }
+    }
+    // Name match
+    for (id, (name, tx)) in reg.iter() {
+        if name == needle || id.to_string().starts_with(needle) {
+            return Some((*id, tx.clone()));
+        }
+    }
+    None
+}
+
+// ── Background peer event loop ────────────────────────────────────────────────
+//
+// Each peer owns its own Forth VM.  The user broadcasts code via a
+// `broadcast::Sender<SessionEvent>`; each peer subscribes.  Results come back
+// through a shared `UnboundedSender<(Uuid, String, String)>` (id, name, text)
+// that funnels all peers into one inbox for the select! loop.
+
 async fn run_peer_loop(
-    mut bus: crate::session::SessionBus,
-    event_tx: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
+    id: Uuid,
+    name: String,
+    mut rx: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
+    inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
 ) {
     use crate::session::SessionEvent;
     let mut vm = crate::coforth::Library::precompiled_vm();
-    vm.remote_mode = true; // suppress dialogs and AI calls in the peer VM
+    vm.remote_mode = true;
 
-    while let Some(event) = bus.recv().await {
-        match event {
-            SessionEvent::Chat { text } => {
+    loop {
+        match rx.recv().await {
+            Ok(SessionEvent::Chat { text }) => {
                 let depth_before = vm.data_stack().len();
                 let response = match vm.exec(&text) {
                     Ok(out) => {
@@ -603,13 +649,77 @@ async fn run_peer_loop(
                     Err(e) => format!("error: {e}"),
                 };
                 if !response.is_empty() {
-                    let _ = event_tx.send(ReplEvent::PeerMessage { text: response });
+                    let _ = inbox_tx.send((id, name.clone(), response));
                 }
             }
-            SessionEvent::Close => break,
-            _ => {}
+            Ok(SessionEvent::Close) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Ok(_) => {}
         }
     }
+}
+
+/// Fork two named peer loops.  Returns the broadcast sender (to reach all peers)
+/// and the shared inbox receiver (where all peer replies arrive).
+///
+/// If `attach` is `Some(name_or_uuid)`, re-uses an existing peer from the
+/// registry instead of forking a new one; the second peer is always freshly
+/// forked so there are always exactly two.
+async fn boot_peers(
+    inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
+    attach: Option<&str>,
+) -> (tokio::sync::broadcast::Sender<crate::session::SessionEvent>, Vec<(Uuid, String)>) {
+    let (bcast_tx, _) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
+    let mut sessions: Vec<(Uuid, String)> = Vec::new();
+
+    // ── First peer: attach to existing OR fork fresh ──────────────────────────
+    let (id_a, name_a) = if let Some(needle) = attach {
+        if let Some((id, existing_tx)) = find_peer(needle).await {
+            // Re-attach: subscribe the existing peer's broadcast to our new sender.
+            // We do this by bridging the two senders.
+            let mut bridge_rx = existing_tx.subscribe();
+            let bcast_clone = bcast_tx.clone();
+            tokio::spawn(async move {
+                while let Ok(ev) = bridge_rx.recv().await {
+                    let _ = bcast_clone.send(ev);
+                }
+            });
+            let name = PEER_REGISTRY.lock().await
+                .get(&id).map(|(n, _)| n.clone()).unwrap_or_else(|| id.to_string());
+            (id, name)
+        } else {
+            let id = Uuid::new_v4();
+            let name = format!("peer-{}", &id.to_string()[..8]);
+            let rx = bcast_tx.subscribe();
+            let itx = inbox_tx.clone();
+            let (n2, id2) = (name.clone(), id);
+            tokio::spawn(async move { run_peer_loop(id2, n2, rx, itx).await });
+            register_peer(id, name.clone(), bcast_tx.clone()).await;
+            (id, name)
+        }
+    } else {
+        let id = Uuid::new_v4();
+        let name = format!("peer-{}", &id.to_string()[..8]);
+        let rx = bcast_tx.subscribe();
+        let itx = inbox_tx.clone();
+        let (n2, id2) = (name.clone(), id);
+        tokio::spawn(async move { run_peer_loop(id2, n2, rx, itx).await });
+        register_peer(id, name.clone(), bcast_tx.clone()).await;
+        (id, name)
+    };
+    sessions.push((id_a, name_a));
+
+    // ── Second peer: always fresh ─────────────────────────────────────────────
+    let id_b = Uuid::new_v4();
+    let name_b = format!("peer-{}", &id_b.to_string()[..8]);
+    let rx_b = bcast_tx.subscribe();
+    let itx_b = inbox_tx.clone();
+    let (nb2, ib2) = (name_b.clone(), id_b);
+    tokio::spawn(async move { run_peer_loop(ib2, nb2, rx_b, itx_b).await });
+    register_peer(id_b, name_b.clone(), bcast_tx.clone()).await;
+    sessions.push((id_b, name_b));
+
+    (bcast_tx, sessions)
 }
 
 impl EventLoop {
@@ -692,14 +802,10 @@ impl EventLoop {
             )
         };
 
-        // Spawn peer event loop — its own Forth VM; talks back via event_tx.
-        let session_bus = {
-            let pair = crate::session::SessionPair::local();
-            let peer_bus = pair.b;
-            let peer_tx = event_tx.clone();
-            tokio::spawn(async move { run_peer_loop(peer_bus, peer_tx).await });
-            pair.a
-        };
+        // Peer channels — boot_peers() finishes wiring in run() (async context).
+        let (peer_inbox_tx, peer_inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (peer_tx, _) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
+        let peer_sessions: Vec<(Uuid, String)> = Vec::new();
 
         Self {
             event_rx,
@@ -768,13 +874,24 @@ impl EventLoop {
             push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
             hash_rx: crate::server::handlers::HASH_INBOX.subscribe(),
             auto_compiled_word_names: std::collections::HashSet::new(),
-            session_bus,
+            peer_tx,
+            peer_inbox_tx,
+            peer_inbox_rx,
+            peer_sessions,
         }
     }
 
     /// Run the event loop
     pub async fn run(&mut self) -> Result<()> {
         tracing::debug!("Event loop starting");
+
+        // ── Fork two peer event loops ─────────────────────────────────────────
+        // boot_peers needs an async context, so we call it here rather than new().
+        {
+            let (real_tx, sessions) = boot_peers(self.peer_inbox_tx.clone(), None).await;
+            self.peer_tx = real_tx;
+            self.peer_sessions = sessions;
+        }
 
         // ── Startup header (Claude Code style) ───────────────────────────────
         // Clear accumulated startup noise from the output manager, then print a
@@ -1420,6 +1537,12 @@ s" it is ours"      s" -1 is ours"     argue
                     if let Err(e) = self.poll_daemon_brains().await {
                         tracing::debug!("Brain poll error (non-fatal): {}", e);
                     }
+                }
+
+                // Peer reply — one of the forked event loops responded
+                Some((id, name, text)) = self.peer_inbox_rx.recv() => {
+                    let _ = id; // available for filtering if needed
+                    let _ = self.event_tx.send(ReplEvent::PeerMessage { text: format!("{name}: {text}") });
                 }
             }
         }
@@ -2856,9 +2979,8 @@ Rules:\n\
             }
             ReplEvent::PeerMessage { text } => {
                 use crossterm::style::Stylize;
-                self.output_manager.write_info(
-                    format!("{}  {}", "peer →".cyan(), text.as_str().white())
-                );
+                // text is already "peer-XXXXXXXX: result" from the select! branch
+                self.output_manager.write_info(text.as_str().cyan().to_string());
                 self.render_tui().await?;
             }
 
@@ -4108,11 +4230,9 @@ Rules:\n\
                 );
             }
         }
-        // Broadcast this code to the peer loop so it runs the same code on its own VM
-        // and replies with its result (stack delta or output).
-        let _ = self.session_bus.tx.try_send(
-            crate::session::SessionEvent::chat(code.clone())
-        );
+        // Broadcast this code to all peer loops — each runs it on its own VM
+        // and replies via peer_inbox_rx with its result (stack delta or output).
+        let _ = self.peer_tx.send(crate::session::SessionEvent::chat(code.clone()));
 
         // Drain any boot poems registered this exec.
         let poems = self.forth_vm.take_boot_poems();
