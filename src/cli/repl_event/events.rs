@@ -23,6 +23,8 @@ pub enum ConfirmationResult {
     ApprovePatternSession(ToolPattern),
     ApproveExactPersistent(ToolSignature),
     ApprovePatternPersistent(ToolPattern),
+    /// Approve but substitute the tool's input with a user-edited version.
+    ApproveWithInput(serde_json::Value),
     Deny,
 }
 

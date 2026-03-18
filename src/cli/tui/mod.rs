@@ -2745,4 +2745,126 @@ mod tests {
             "correct and buggy must differ for single-row case"
         );
     }
+
+    // ── poset_to_forth_lines ──────────────────────────────────────────────────
+
+    fn make_node(id: usize, label: &str) -> crate::poset::Node {
+        crate::poset::Node {
+            id,
+            label: label.to_string(),
+            kind: crate::poset::NodeKind::Task,
+            status: crate::poset::NodeStatus::Pending,
+            result: None,
+            pos: [0.0, 0.0, 0.0],
+            author: crate::poset::NodeAuthor::User,
+            tools: Vec::new(),
+            compiled_code: None,
+            compiled_lang: None,
+        }
+    }
+
+    #[test]
+    fn test_poset_empty_produces_only_program() {
+        // An empty poset still emits the PROGRAM wrapper word.
+        let poset = crate::poset::Poset::new();
+        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let combined = lines.join("\n");
+        assert!(combined.contains("PROGRAM"), "empty poset should still emit PROGRAM");
+        // No W-nodes since there are no nodes
+        assert!(!combined.contains("W0"), "empty poset should have no W nodes");
+    }
+
+    #[test]
+    fn test_poset_single_node_has_word_and_semicolon() {
+        let mut poset = crate::poset::Poset::new();
+        poset.add_node("do-thing".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let combined = lines.join("\n");
+        assert!(combined.contains("W0"), "should name node W0");
+        assert!(combined.contains(";"), "should close with semicolon");
+        assert!(combined.contains("do-thing"), "should include label");
+    }
+
+    #[test]
+    fn test_poset_label_truncated_at_30_chars() {
+        let mut poset = crate::poset::Poset::new();
+        let long_label = "a".repeat(50);
+        poset.add_node(long_label, crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let combined = lines.join("\n");
+        // The label in the .\" ... " should be truncated to 30 chars + ellipsis
+        assert!(combined.contains('…'), "long label should have ellipsis");
+        // Should NOT contain the full 50-char label
+        assert!(!combined.contains(&"a".repeat(50)), "full 50-char label should not appear");
+    }
+
+    #[test]
+    fn test_poset_max_lines_respected() {
+        let mut poset = crate::poset::Poset::new();
+        for i in 0..20 {
+            poset.add_node(format!("word-{i}"), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        }
+        let max = 10;
+        let lines = poset_to_forth_lines(&poset, 80, max);
+        assert!(lines.len() <= max, "output must not exceed max_lines (got {})", lines.len());
+    }
+
+    #[test]
+    fn test_poset_program_word_emitted() {
+        let mut poset = crate::poset::Poset::new();
+        poset.add_node("step".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let combined = lines.join("\n");
+        assert!(combined.contains("PROGRAM"), "PROGRAM word should be emitted");
+    }
+
+    #[test]
+    fn test_poset_linear_chain_topo_order() {
+        // W0 → W1 → W2: W0 must appear before W1, W1 before W2.
+        let mut poset = crate::poset::Poset::new();
+        poset.add_node("first".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node("second".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node("third".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_edge(0, 1);
+        poset.add_edge(1, 2);
+        let lines = poset_to_forth_lines(&poset, 80, 40);
+        let combined = lines.join("\n");
+        let pos0 = combined.find("W0").unwrap_or(usize::MAX);
+        let pos1 = combined.find("W1").unwrap_or(usize::MAX);
+        let pos2 = combined.find("W2").unwrap_or(usize::MAX);
+        assert!(pos0 < pos1, "W0 should appear before W1");
+        assert!(pos1 < pos2, "W1 should appear before W2");
+    }
+
+    #[test]
+    fn test_poset_cycle_does_not_panic() {
+        // Cycle (W0 → W1 → W0) must not infinite-loop the topo sort.
+        let mut poset = crate::poset::Poset::new();
+        poset.add_node("a".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node("b".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_edge(0, 1);
+        poset.add_edge(1, 0);  // cycle
+        // Must not panic or hang
+        let lines = poset_to_forth_lines(&poset, 80, 40);
+        assert!(!lines.is_empty(), "cyclic graph should still produce output");
+    }
+
+    #[test]
+    fn test_poset_predecessor_calls_appear_in_body() {
+        // W0 is predecessor of W1; W1's body should call W0.
+        let mut poset = crate::poset::Poset::new();
+        poset.add_node("base".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node("derived".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_edge(0, 1);
+        let lines = poset_to_forth_lines(&poset, 80, 40);
+        // W1's definition should mention W0 as a predecessor call
+        let combined = lines.join("\n");
+        // Find W1's definition block and check W0 appears inside it
+        if let Some(w1_pos) = combined.find(": W1") {
+            let after_w1 = &combined[w1_pos..];
+            let semicolon_pos = after_w1.find(';').unwrap_or(after_w1.len());
+            let w1_body = &after_w1[..semicolon_pos];
+            assert!(w1_body.contains("W0"), "W1 body should call W0 (its predecessor)");
+        }
+    }
 }

@@ -135,6 +135,7 @@ impl ToolExecutionCoordinator {
         };
 
         tokio::spawn(async move {
+            let mut tool_use = tool_use;
             // Generate tool signature for approval checking
             let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
 
@@ -236,6 +237,10 @@ impl ToolExecutionCoordinator {
                                         // Continue anyway - pattern is in memory
                                     }
                                 }
+                            }
+                            ConfirmationResult::ApproveWithInput(new_input) => {
+                                // Approve with user-edited input (e.g. from $EDITOR diff review)
+                                tool_use.input = new_input;
                             }
                             ConfirmationResult::Deny => {
                                 // Tool denied, send error result

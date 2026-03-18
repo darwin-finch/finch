@@ -187,7 +187,10 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
             Ok(Box::new(provider))
         }
 
-        _ => bail!("Unknown provider: {}", entry.provider),
+        _ => bail!(
+            "Unknown provider '{}'. Supported: claude, openai, grok, gemini, mistral, groq",
+            entry.provider
+        ),
     }
 }
 

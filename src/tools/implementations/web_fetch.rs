@@ -58,7 +58,15 @@ impl Tool for WebFetchTool {
 
         let status = response.status();
         if !status.is_success() {
-            anyhow::bail!("HTTP error {}: {}", status, url);
+            let hint = match status.as_u16() {
+                404 => " — page not found; check the URL",
+                403 => " — access denied; the server requires authentication",
+                401 => " — unauthorized; credentials required",
+                429 => " — rate limited; try again later",
+                500..=599 => " — server error; the remote site may be down",
+                _ => "",
+            };
+            anyhow::bail!("HTTP {} fetching {}{}", status, url, hint);
         }
 
         let body = response.text().await?;

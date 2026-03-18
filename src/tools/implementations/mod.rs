@@ -51,6 +51,9 @@ pub mod hash_compare;
 // Ansible execution
 pub mod ansible;
 
+// Subagent spawning
+pub mod spawn;
+
 // Re-exports for convenience
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::BashTool;

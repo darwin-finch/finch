@@ -87,6 +87,16 @@ pub enum Command {
     Setup,                        // /setup — open the setup wizard (run 'finch setup' to reconfigure)
     Share,                        // /share — format session as a pasteable proof block
     BoxDiff,                      // /box-diff — compare all peers, offer to fix outliers
+    // Peer connect / disconnect
+    Connect(String),              // /connect <host:port>   — add peer to current room + peer list
+    Disconnect(String),           // /disconnect <name-or-addr> — remove peer from room + list
+    // Room management
+    Room(Option<String>),         // /room [uuid]  — join/create room (no uuid = show current)
+    RoomNew,                      // /room new     — create a fresh room with a random UUID
+    RoomAdd(String),              // /room add <addr>
+    RoomRemove(String),           // /room remove <name-or-addr>
+    RoomList,                     // /room list    — list all rooms + member counts
+    SelfFix,                      // /self-fix     — diagnose, fix, verify, restart
 }
 
 impl Command {
@@ -117,6 +127,10 @@ impl Command {
             // Service discovery
             "/discover" => return Some(Command::Discover),
             "/machines" | "/peers" | "/nodes" => return Some(Command::Machines),
+            // Room management (no-arg forms)
+            "/room" | "/room show" => return Some(Command::Room(None)),
+            "/room new" => return Some(Command::RoomNew),
+            "/room list" | "/rooms" => return Some(Command::RoomList),
             // License management
             "/license" | "/license status" => return Some(Command::LicenseStatus),
             "/license remove" => return Some(Command::LicenseRemove),
@@ -135,10 +149,44 @@ impl Command {
             "/setup" => return Some(Command::Setup),
             "/share" | "/prove" | "/proof" => return Some(Command::Share),
             "/box-diff" | "/cluster-diff" | "/cdiff" => return Some(Command::BoxDiff),
+            "/self-fix" | "/fix" | "/repair" => return Some(Command::SelfFix),
             _ => {}
         }
 
         // Handle /license activate <key>
+        // Peer connect / disconnect
+        if let Some(rest) = trimmed.strip_prefix("/connect ") {
+            let addr = rest.trim();
+            if !addr.is_empty() {
+                return Some(Command::Connect(addr.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/disconnect ") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Some(Command::Disconnect(name.to_string()));
+            }
+        }
+        // Room management with arguments
+        if let Some(rest) = trimmed.strip_prefix("/room add ") {
+            let addr = rest.trim();
+            if !addr.is_empty() {
+                return Some(Command::RoomAdd(addr.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/room remove ") {
+            let addr = rest.trim();
+            if !addr.is_empty() {
+                return Some(Command::RoomRemove(addr.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/room ") {
+            let uuid = rest.trim();
+            if !uuid.is_empty() {
+                return Some(Command::Room(Some(uuid.to_string())));
+            }
+        }
+
         if let Some(rest) = trimmed.strip_prefix("/license activate ") {
             let key = rest.trim();
             if !key.is_empty() {
@@ -560,6 +608,19 @@ pub fn handle_command(
         )),
         Command::BoxDiff => Ok(CommandOutput::Status(
             "BoxDiff command should be handled in REPL.".to_string(),
+        )),
+        // Peer / room commands — all handled in the REPL event loop
+        Command::Connect(_)
+        | Command::Disconnect(_)
+        | Command::Room(_)
+        | Command::RoomNew
+        | Command::RoomAdd(_)
+        | Command::RoomRemove(_)
+        | Command::RoomList => Ok(CommandOutput::Status(
+            "Peer/room command should be handled in REPL.".to_string(),
+        )),
+        Command::SelfFix => Ok(CommandOutput::Status(
+            "SelfFix command should be handled in REPL.".to_string(),
         )),
     }
 }

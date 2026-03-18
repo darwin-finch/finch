@@ -224,9 +224,11 @@ impl GeminiProvider {
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            let hint = gemini_error_hint(status.as_u16());
             anyhow::bail!(
-                "Gemini API request failed\n\nStatus: {}\nBody: {}",
+                "Gemini API error {}{}\n{}",
                 status,
+                hint,
                 error_body
             );
         }
@@ -270,9 +272,11 @@ impl GeminiProvider {
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            let hint = gemini_error_hint(status.as_u16());
             anyhow::bail!(
-                "Gemini API streaming request failed\n\nStatus: {}\nBody: {}",
+                "Gemini API streaming error {}{}\n{}",
                 status,
+                hint,
                 error_body
             );
         }
@@ -527,6 +531,17 @@ struct GeminiCandidate {
 struct GeminiSafetyRating {
     category: String,
     probability: String,
+}
+
+fn gemini_error_hint(status: u16) -> &'static str {
+    match status {
+        401 => " — check your GEMINI_API_KEY",
+        403 => " — API key does not have permission for this model",
+        404 => " — model not found; check the model name",
+        429 => " — rate limit exceeded; slow down or upgrade your quota",
+        500 | 502 | 503 => " — Google API outage; try again shortly",
+        _ => "",
+    }
 }
 
 #[cfg(test)]

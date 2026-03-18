@@ -197,6 +197,32 @@ impl Dialog {
         }
     }
 
+    /// Create a tool-approval dialog (Yes / Yes-always / No).
+    ///
+    /// File-mutating tools (write/edit) get an extra "Edit in $EDITOR" option.
+    /// The title is formatted as `"{tool_name}\n{summary}"` for two-line display.
+    pub fn tool_approval(tool_name: &str, summary: &str) -> Self {
+        let is_file_mutating = matches!(
+            tool_name.to_lowercase().as_str(),
+            "write" | "edit"
+        );
+        let options = if is_file_mutating {
+            vec![
+                DialogOption::new("1. Yes"),
+                DialogOption::new("2. Edit in $EDITOR"),
+                DialogOption::new(format!("3. Yes, and don't ask again for: {}:*", tool_name)),
+                DialogOption::new("4. No"),
+            ]
+        } else {
+            vec![
+                DialogOption::new("1. Yes"),
+                DialogOption::new(format!("2. Yes, and don't ask again for: {}:*", tool_name)),
+                DialogOption::new("3. No"),
+            ]
+        };
+        Dialog::select(format!("{}\n{}", tool_name, summary), options)
+    }
+
     /// Set the help message for this dialog
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help_message = Some(help.into());
@@ -607,23 +633,24 @@ impl Dialog {
     ) -> Option<DialogResult> {
         match key.code {
             KeyCode::Char(c) => {
-                // Insert character at cursor position
-                input.insert(*cursor_pos, c);
+                let byte_pos = Self::char_to_byte_offset(input, *cursor_pos);
+                input.insert(byte_pos, c);
                 *cursor_pos += 1;
                 None
             }
             KeyCode::Backspace => {
-                // Delete character before cursor
                 if *cursor_pos > 0 {
-                    input.remove(*cursor_pos - 1);
                     *cursor_pos -= 1;
+                    let byte_pos = Self::char_to_byte_offset(input, *cursor_pos);
+                    input.remove(byte_pos);
                 }
                 None
             }
             KeyCode::Delete => {
-                // Delete character at cursor
-                if *cursor_pos < input.len() {
-                    input.remove(*cursor_pos);
+                let char_count = input.chars().count();
+                if *cursor_pos < char_count {
+                    let byte_pos = Self::char_to_byte_offset(input, *cursor_pos);
+                    input.remove(byte_pos);
                 }
                 None
             }
@@ -632,7 +659,7 @@ impl Dialog {
                 None
             }
             KeyCode::Right => {
-                *cursor_pos = (*cursor_pos + 1).min(input.len());
+                *cursor_pos = (*cursor_pos + 1).min(input.chars().count());
                 None
             }
             KeyCode::Home => {
@@ -640,7 +667,7 @@ impl Dialog {
                 None
             }
             KeyCode::End => {
-                *cursor_pos = input.len();
+                *cursor_pos = input.chars().count();
                 None
             }
             KeyCode::Enter => Some(DialogResult::TextEntered(input.clone())),
@@ -1629,5 +1656,120 @@ mod tests {
             Some("x\n"),
             "Alt+Enter must insert newline into custom_input"
         );
+    }
+
+    // ── tool_approval factory ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_tool_approval_non_mutating_has_three_options() {
+        let dialog = Dialog::tool_approval("Push", "Execute Push tool");
+        if let DialogType::Select { options, .. } = &dialog.dialog_type {
+            assert_eq!(options.len(), 3);
+            assert!(options[0].label.contains("Yes"));
+            assert!(options[1].label.contains("don't ask again"));
+            assert!(options[1].label.contains("Push:*"));
+            assert!(options[2].label.contains("No"));
+        } else {
+            panic!("expected Select dialog");
+        }
+    }
+
+    #[test]
+    fn test_tool_approval_file_mutating_has_four_options() {
+        for name in &["write", "Write", "edit", "Edit"] {
+            let dialog = Dialog::tool_approval(name, "summary");
+            if let DialogType::Select { options, .. } = &dialog.dialog_type {
+                assert_eq!(options.len(), 4, "tool '{}' should have 4 options", name);
+                assert!(options[1].label.contains("$EDITOR"), "tool '{}': option 2 should be Edit in $EDITOR", name);
+            } else {
+                panic!("expected Select dialog for tool '{}'", name);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tool_approval_title_includes_name_and_summary() {
+        let dialog = Dialog::tool_approval("Bash", "run command");
+        assert!(dialog.title.contains("Bash"));
+        assert!(dialog.title.contains("run command"));
+    }
+
+    // ── random key input (fuzz-style) ─────────────────────────────────────────
+    // These tests feed a variety of characters and nav keys into each dialog
+    // type while in typing mode, verifying no panics occur regardless of input.
+
+    #[test]
+    fn test_text_input_random_chars_do_not_panic() {
+        use crossterm::event::KeyModifiers;
+        let mut dialog = Dialog::text_input("Enter text", None);
+        let chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 !@#$%^&*()-_=+[]{}|;':\",./<>?";
+        for ch in chars.chars() {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        // Nav + editing keys
+        for code in [
+            KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End,
+            KeyCode::Backspace, KeyCode::Delete,
+        ] {
+            dialog.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn test_text_input_unicode_chars_do_not_panic() {
+        use crossterm::event::KeyModifiers;
+        let mut dialog = Dialog::text_input("Enter text", None);
+        // Multi-byte chars
+        for ch in "héllo wörld 日本語 中文 한국어 🦀".chars() {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        // Move cursor through the whole string without panicking
+        for _ in 0..40 {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        for _ in 0..40 {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        // Delete from end
+        for _ in 0..60 {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn test_custom_mode_random_chars_do_not_panic() {
+        use crossterm::event::KeyModifiers;
+        let mut dialog = Dialog::select_with_custom("T", vec![DialogOption::new("A")]);
+        // Navigate to Other row and activate custom mode
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('o')));
+        let chars = "hello world héllo 日本語 🦀 !@#$%";
+        for ch in chars.chars() {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        for code in [
+            KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End,
+            KeyCode::Backspace, KeyCode::Delete,
+        ] {
+            dialog.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+    }
+
+    #[test]
+    fn test_select_nav_keys_do_not_panic() {
+        use crossterm::event::KeyModifiers;
+        let mut dialog = Dialog::select(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B"), DialogOption::new("C")],
+        );
+        // Hammer up/down/number keys well past bounds
+        for _ in 0..20 {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        for _ in 0..20 {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        for ch in '1'..='9' {
+            dialog.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
     }
 }

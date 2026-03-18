@@ -77,6 +77,7 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/forth/define", post(handle_forth_define))
         .route("/v1/forth/vocab", get(handle_forth_vocab))
         .route("/v1/forth/push", post(handle_forth_push))
+        .route("/v1/forth/hash", post(handle_forth_hash_set).get(handle_forth_hash_get))
         .route("/v1/exec", post(handle_exec))
         // Peer registry
         .route("/v1/registry/join",      post(handle_registry_join))
@@ -741,6 +742,16 @@ pub static PUSH_INBOX: std::sync::LazyLock<tokio::sync::broadcast::Sender<String
         tx
     });
 
+/// Broadcast channel for incoming hash updates from peers.
+/// Carries (room_id, key, value, from_name) tuples.
+/// The event loop subscribes and applies updates to the local VM's rooms.
+pub static HASH_INBOX: std::sync::LazyLock<
+    tokio::sync::broadcast::Sender<(String, String, String, String)>
+> = std::sync::LazyLock::new(|| {
+    let (tx, _) = tokio::sync::broadcast::channel(256);
+    tx
+});
+
 /// Grammar-VM shared baseline: pre-compiled STDLIB + all grammar words, built once.
 /// Each request clones this (O(dict size)) instead of recompiling from source.
 static GRAMMAR_VM: std::sync::LazyLock<crate::coforth::Forth> =
@@ -920,6 +931,44 @@ async fn handle_forth_push(
 struct ForthPushRequest {
     text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    from: Option<String>,
+}
+
+/// POST /v1/forth/hash — receive a key-value update from a peer.
+/// Broadcasts it to the local event loop via HASH_INBOX so the REPL VM is updated.
+async fn handle_forth_hash_set(
+    Json(req): Json<ForthHashSetRequest>,
+) -> StatusCode {
+    // Deletion sentinel — value "\x00del\x00" means remove the key
+    let _ = HASH_INBOX.send((
+        req.room_id,
+        req.key,
+        req.value,
+        req.from.unwrap_or_default(),
+    ));
+    StatusCode::OK
+}
+
+/// GET /v1/forth/hash?room=<uuid> — return all key-value pairs for a room.
+/// Useful for a newly connecting peer to bootstrap its hash state.
+async fn handle_forth_hash_get(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let room_id = params.get("room").cloned().unwrap_or_default();
+    let vm = LIVE_VM.read().await;
+    let pairs: std::collections::HashMap<String, String> = vm.rooms
+        .get(&room_id)
+        .map(|r| r.hash.clone())
+        .unwrap_or_default();
+    Json(serde_json::json!({ "room_id": room_id, "hash": pairs }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ForthHashSetRequest {
+    room_id: String,
+    key: String,
+    value: String,
+    #[serde(default)]
     from: Option<String>,
 }
 

@@ -37,6 +37,7 @@ use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::{ToolDefinition, ToolUse};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
+use crate::tools::permissions::ToolPermissionConfig;
 use crate::training::batch_trainer::BatchTrainer;
 
 use super::commands::{handle_command, Command, CommandOutput};
@@ -377,14 +378,28 @@ impl Repl {
             tool_registry.register(Box::new(StackClearTool));
         }
 
-        // Create permission manager
-        // Use config.features.auto_approve_tools to determine default rule
+        // Create permission manager.
+        // Read-only tools are always allowed — they can't damage anything.
+        // Destructive tools (bash, restart, write) require confirmation unless
+        // the user has explicitly set auto_approve_tools = true.
         let default_rule = if config.features.auto_approve_tools {
-            PermissionRule::Allow // Auto-approve: skip confirmations
+            PermissionRule::Allow
         } else {
-            PermissionRule::Ask // Default: require user confirmation
+            PermissionRule::Ask
         };
-        let permissions = PermissionManager::new().with_default_rule(default_rule);
+        let allow_config = ToolPermissionConfig {
+            enabled: true,
+            rule: PermissionRule::Allow,
+            allowed_patterns: Vec::new(),
+            blocked_patterns: Vec::new(),
+        };
+        let mut permissions = PermissionManager::new().with_default_rule(default_rule);
+        // Safe read-only tools — always allow without asking.
+        for tool in &["read", "glob", "grep", "web_fetch", "push", "stack_push",
+                       "stack_run", "stack_clear", "memory_read", "memory_list",
+                       "describe", "view", "search"] {
+            permissions.register_tool_config(tool.to_string(), allow_config.clone());
+        }
 
         // Determine patterns path
         let patterns_path = dirs::home_dir()
@@ -683,15 +698,35 @@ impl Repl {
     ) -> Result<crate::claude::types::MessageResponse> {
         use crate::providers::ProviderRequest;
 
+        // Extract system message from messages array if not already set
+        let (system, messages): (Option<String>, Vec<_>) = {
+            let mut sys = request.system.clone();
+            let mut msgs = Vec::new();
+            for msg in &request.messages {
+                if msg.role == "system" && sys.is_none() {
+                    sys = msg.content.iter().find_map(|c| {
+                        if let crate::claude::ContentBlock::Text { text } = c {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
+                    });
+                } else {
+                    msgs.push(msg.clone());
+                }
+            }
+            (sys, msgs)
+        };
+
         // Convert MessageRequest to ProviderRequest
         let provider_request = ProviderRequest {
-            messages: request.messages.clone(),
+            messages,
             model: request.model.clone(),
             max_tokens: request.max_tokens,
             temperature: None,
             tools: request.tools.clone(),
             stream: false,
-            system: request.system.clone(),
+            system,
         };
 
         // Send with Level 3 optimization (smart strategies)
@@ -711,15 +746,35 @@ impl Repl {
     ) -> Result<tokio::sync::mpsc::Receiver<Result<crate::providers::StreamChunk>>> {
         use crate::providers::ProviderRequest;
 
+        // Extract system message from messages array if not already set
+        let (system, messages): (Option<String>, Vec<_>) = {
+            let mut sys = request.system.clone();
+            let mut msgs = Vec::new();
+            for msg in &request.messages {
+                if msg.role == "system" && sys.is_none() {
+                    sys = msg.content.iter().find_map(|c| {
+                        if let crate::claude::ContentBlock::Text { text } = c {
+                            Some(text.clone())
+                        } else {
+                            None
+                        }
+                    });
+                } else {
+                    msgs.push(msg.clone());
+                }
+            }
+            (sys, msgs)
+        };
+
         // Convert MessageRequest to ProviderRequest
         let provider_request = ProviderRequest {
-            messages: request.messages.clone(),
+            messages,
             model: request.model.clone(),
             max_tokens: request.max_tokens,
             temperature: None,
             tools: request.tools.clone(),
             stream: true,
-            system: request.system.clone(),
+            system,
         };
 
         // Send with streaming (Level 1 tracking only, no truncation for streaming)
@@ -1059,7 +1114,8 @@ impl Repl {
 
             // Execute all tool uses
             let mut tool_results = Vec::new();
-            for tool_use in &tool_uses {
+            let mut tool_uses_owned = tool_uses.clone();
+            for tool_use in &mut tool_uses_owned {
                 if self.is_interactive {
                     self.output_tool(&tool_use.name, format!("  → {}", tool_use.name));
                 }
@@ -1196,6 +1252,10 @@ impl Repl {
                                             ),
                                         );
                                     }
+                                }
+                                ConfirmationResult::ApproveWithInput(new_input) => {
+                                    tool_use.input = new_input;
+                                    self.output_tool(&tool_use.name, "  ✓ Approved with edits");
                                 }
                                 ConfirmationResult::Deny => {
                                     use crate::tools::types::ToolResult;
@@ -1581,6 +1641,8 @@ impl Repl {
                     Ok(p) => Some(Arc::from(p) as Arc<dyn crate::providers::LlmProvider>),
                     Err(e) => {
                         tracing::warn!("Brain disabled: could not create provider: {}", e);
+                        output_status!("⚠️  Brain disabled: no API key found for a cloud provider.");
+                        output_status!("   Run `finch setup` to configure one, or set ANTHROPIC_API_KEY.");
                         None
                     }
                 }

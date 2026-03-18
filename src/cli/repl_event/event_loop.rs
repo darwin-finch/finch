@@ -261,6 +261,10 @@ pub struct EventLoop {
     /// Incoming push messages from peers (via POST /v1/forth/push).
     push_rx: tokio::sync::broadcast::Receiver<String>,
 
+    /// Incoming hash updates from peers (via POST /v1/forth/hash).
+    /// Carries (room_id, key, value, from_name) tuples.
+    hash_rx: tokio::sync::broadcast::Receiver<(String, String, String, String)>,
+
     /// Word names auto-compiled from the vocabulary library (not user-authored).
     /// Excluded from the vocab section sent to the AI so the prompt stays small.
     auto_compiled_word_names: std::collections::HashSet<String>,
@@ -455,16 +459,87 @@ fn definition_observation(name: &str, body: &str) -> Option<String> {
     None
 }
 
-fn looks_like_natural_language(s: &str) -> bool {
+/// Returns true when `s` looks like natural language (→ AI), false when it looks
+/// like Forth (→ VM).  `word_exists` should check the live VM dictionary so that
+/// user-defined words are always treated as Forth, not language.
+fn looks_like_natural_language(s: &str, word_exists: impl Fn(&str) -> bool) -> bool {
     let trimmed = s.trim();
     if trimmed.contains('?') || trimmed.contains('？') { return true; }
     // Non-ASCII content that isn't a Forth definition is natural language.
-    // Forth definitions always start with `:`.
     if !trimmed.starts_with(':') && trimmed.chars().any(|c| !c.is_ascii()) {
         return true;
     }
-    // Latin sentence: starts with uppercase letter (not a number or operator).
-    trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+    // Latin sentence: starts with uppercase letter.
+    if trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+        return true;
+    }
+    let forth_chars = |c: char| matches!(c, '+' | '-' | '*' | '/' | '@' | '!' | '.' | ':' | ';' | '<' | '>' | '=');
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+
+    // If every token is a defined word or a number, it's Forth regardless of word count.
+    // This teaches the router the user's vocabulary without any explicit registration.
+    let all_tokens_known = !tokens.is_empty()
+        && !trimmed.starts_with(':')
+        && tokens.iter().all(|t| {
+            t.parse::<f64>().is_ok()
+                || trimmed.chars().any(forth_chars)
+                || word_exists(t)
+        });
+    if all_tokens_known {
+        return false;
+    }
+
+    // Multi-word input with no Forth operators and at least one alphabetic unknown word
+    // → natural language.  Numbers are allowed (e.g. "show me 3 examples",
+    // "list the top 5 errors").  Pure-number sequences ("2 3 4") and
+    // all-known-Forth-word sequences are already caught above.
+    if tokens.len() >= 2
+        && !trimmed.starts_with(':')
+        && !trimmed.chars().any(forth_chars)
+        && tokens.iter().any(|t| t.chars().all(|c| c.is_ascii_alphabetic() || c == '-') && !word_exists(t))
+    {
+        return true;
+    }
+
+    // Single unknown word with only alphabetic characters → AI.
+    if tokens.len() == 1 && !trimmed.starts_with(':') {
+        let word = tokens[0];
+        // Known to the VM → Forth.
+        if word_exists(word) {
+            return false;
+        }
+        let is_forth_primitive = matches!(word,
+            "dup" | "drop" | "swap" | "over" | "rot" | "nip" | "tuck" | "pick" | "roll" |
+            "mod" | "abs" | "max" | "min" | "negate" | "square" | "pow" |
+            "and" | "or" | "xor" | "invert" |
+            "cr" | "emit" | "type" |
+            "if" | "else" | "then" | "do" | "loop" | "begin" | "until" | "while" | "repeat" | "exit" |
+            "words" | "help" | "undo" | "apply" | "describe" |
+            "agree?" | "back-and-forth?" | "invertible?"
+        ) || word.parse::<f64>().is_ok()
+          || trimmed.chars().any(forth_chars);
+        if !is_forth_primitive && word.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Try to fetch the `name` field from a peer's `/v1/node/info` endpoint.
+/// Returns `None` on any error (network, timeout, missing field).
+async fn fetch_peer_name(addr: &str) -> Option<String> {
+    let url = if addr.starts_with("http://") || addr.starts_with("https://") {
+        format!("{addr}/v1/node/info")
+    } else {
+        format!("http://{addr}/v1/node/info")
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
 fn extract_channel_forth(msg: &str) -> Option<String> {
@@ -637,6 +712,7 @@ impl EventLoop {
             forth_vm: crate::coforth::Library::precompiled_vm(),
             forth_undo: Vec::new(),
             push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
+            hash_rx: crate::server::handlers::HASH_INBOX.subscribe(),
             auto_compiled_word_names: std::collections::HashSet::new(),
         }
     }
@@ -1099,8 +1175,47 @@ s" it is ours"      s" -1 is ours"     argue
                                     let (tool_use, response_tx) = approvals.remove(&query_id)
                                         .expect("query_id was just obtained from the same map");
 
-                                    // Convert dialog result to ConfirmationResult
-                                    let confirmation = self.dialog_result_to_confirmation(dialog_result, &tool_use);
+                                    // Check for "Edit in $EDITOR" (option index 1 for write/edit tools)
+                                    let is_file_mutating = matches!(tool_use.name.as_str(), "write" | "Write" | "edit" | "Edit");
+                                    let is_editor_option = is_file_mutating && matches!(dialog_result, crate::cli::tui::DialogResult::Selected(1));
+
+                                    let confirmation = if is_editor_option {
+                                        // Extract proposed content
+                                        let proposed = tool_use.input.get("content")
+                                            .or_else(|| tool_use.input.get("new_string"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+
+                                        // Write to temp file and open editor
+                                        match open_in_editor(&proposed) {
+                                            Ok(edited) => {
+                                                let mut new_input = tool_use.input.clone();
+                                                if tool_use.input.get("content").is_some() {
+                                                    new_input["content"] = serde_json::Value::String(edited);
+                                                } else {
+                                                    new_input["new_string"] = serde_json::Value::String(edited);
+                                                }
+                                                super::events::ConfirmationResult::ApproveWithInput(new_input)
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Editor failed: {}", e);
+                                                super::events::ConfirmationResult::Deny
+                                            }
+                                        }
+                                    } else {
+                                        // Shift option indices for file-mutating tools (extra "Edit" option at 1)
+                                        let adjusted_result = if is_file_mutating {
+                                            match dialog_result {
+                                                crate::cli::tui::DialogResult::Selected(0) => dialog_result,
+                                                crate::cli::tui::DialogResult::Selected(n) => crate::cli::tui::DialogResult::Selected(n - 1),
+                                                other => other,
+                                            }
+                                        } else {
+                                            dialog_result
+                                        };
+                                        self.dialog_result_to_confirmation(adjusted_result, &tool_use)
+                                    };
 
                                     // Send confirmation back to tool execution task
                                     let _ = response_tx.send(confirmation);
@@ -1156,6 +1271,37 @@ s" it is ours"      s" -1 is ours"     argue
                             let _ = self.forth_vm.exec_with_fuel(&forth_def, 0);
                         } else if let Err(e) = self.handle_stack_push(msg).await {
                             tracing::warn!("Failed to handle incoming push: {e}");
+                        }
+                    }
+
+                    // Drain incoming hash updates from peers.
+                    // Apply each to the local VM's room hash.
+                    loop {
+                        match self.hash_rx.try_recv() {
+                            Ok((room_id, key, value, from)) => {
+                                let room = self.forth_vm.rooms.entry(room_id.clone()).or_default();
+                                const DEL: &str = "\x00del\x00";
+                                if value == DEL {
+                                    room.hash.remove(&key);
+                                } else {
+                                    room.hash.insert(key.clone(), value.clone());
+                                }
+                                // If not currently in any room, auto-join this one
+                                if self.forth_vm.current_room.is_none() {
+                                    self.forth_vm.current_room = Some(room_id.clone());
+                                }
+                                use crossterm::style::Stylize;
+                                let label = if from.is_empty() { "peer".to_string() } else { from };
+                                self.output_manager.write_info(format!(
+                                    "  {}  {}{}{}  {}",
+                                    label.as_str().cyan(),
+                                    key.as_str().dark_grey(),
+                                    " ← ".dark_grey(),
+                                    if value == DEL { "(deleted)".dark_grey().to_string() } else { value.as_str().white().to_string() },
+                                    room_id.chars().take(8).collect::<String>().as_str().dark_grey(),
+                                ));
+                            }
+                            Err(_) => break,
                         }
                     }
 
@@ -1224,7 +1370,7 @@ s" it is ours"      s" -1 is ours"     argue
                         // then resume.  The wizard manages its own terminal
                         // lifecycle (enable_raw_mode / alternate screen).
                         {
-                            let mut tui = self.tui_renderer.lock().await;
+                            let tui = self.tui_renderer.lock().await;
                             tui.suspend().ok();
                         }
                         let wizard_result =
@@ -1263,6 +1409,25 @@ s" it is ours"      s" -1 is ours"     argue
                     }
                     Command::BoxDiff => {
                         self.handle_box_diff().await?;
+                    }
+                    Command::SelfFix => {
+                        let prompt = "\
+You are running inside your own source directory. \
+Your task is to find and fix bugs in yourself.\n\
+\n\
+Step 1 — diagnose: run `cargo build 2>&1` and capture ALL errors and warnings.\n\
+Step 2 — fix: for each error, read the relevant source file, understand the root cause, \
+and apply a minimal correct fix using the Edit tool.\n\
+Step 3 — check: run `cargo build 2>&1` again. If there are still errors, repeat from step 2.\n\
+Step 4 — test: run `cargo test 2>&1`. Fix any failures the same way.\n\
+Step 5 — restart: once the build and tests are clean, call restart_session.\n\
+\n\
+Rules:\n\
+- Fix root causes, not symptoms.\n\
+- One small edit at a time; verify after each.\n\
+- Do not change behaviour — only fix broken code.\n\
+- If a fix makes things worse, revert it with another Edit before trying again.";
+                        return self.execute_query(prompt.to_string()).await;
                     }
                     Command::Metrics => {
                         use crate::cli::commands::format_metrics;
@@ -1617,6 +1782,27 @@ s" it is ours"      s" -1 is ours"     argue
                     Command::Discover => {
                         self.handle_discover().await?;
                     }
+                    Command::Connect(addr) => {
+                        self.handle_connect(addr).await?;
+                    }
+                    Command::Disconnect(name) => {
+                        self.handle_disconnect(name).await?;
+                    }
+                    Command::Room(uuid) => {
+                        self.handle_room(uuid).await?;
+                    }
+                    Command::RoomNew => {
+                        self.handle_room_new().await?;
+                    }
+                    Command::RoomAdd(addr) => {
+                        self.handle_room_add(addr).await?;
+                    }
+                    Command::RoomRemove(addr) => {
+                        self.handle_room_remove(addr).await?;
+                    }
+                    Command::RoomList => {
+                        self.handle_room_list().await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -1691,6 +1877,12 @@ s" it is ours"      s" -1 is ours"     argue
                 self.output_manager.write_user(input.clone());
                 return self.execute_query(query).await;
             }
+        }
+
+        // Route: natural language → AI; Forth tokens → stack.
+        let is_nl = looks_like_natural_language(&input, |w| self.forth_vm.word_exists(w));
+        if is_nl {
+            return self.execute_query(input).await;
         }
 
         // ── Co-Forth: plain text pushes onto the stack (no AI trigger) ──────────
@@ -2633,6 +2825,183 @@ s" it is ours"      s" -1 is ours"     argue
         Ok(())
     }
 
+    /// `/connect <host:port>` — manually add a peer to peers list and current room.
+    async fn handle_connect(&mut self, addr: String) -> Result<()> {
+        use crossterm::style::Stylize;
+        let addr = addr.trim().to_string();
+        // Add to peer list
+        if !self.forth_vm.peers.contains(&addr) {
+            self.forth_vm.peers.push(addr.clone());
+        }
+        // Add to current room if one is set
+        if let Some(ref room_id) = self.forth_vm.current_room.clone() {
+            let room = self.forth_vm.rooms.entry(room_id.clone()).or_default();
+            if !room.members.contains(&addr) {
+                room.members.push(addr.clone());
+            }
+        }
+        // Fetch the node name from the peer (best-effort via /v1/node/info)
+        let label = fetch_peer_name(&addr).await;
+        let meta = self.forth_vm.peer_meta.entry(addr.clone()).or_default();
+        if let Some(ref name) = label {
+            meta.label = Some(name.clone());
+        }
+        let display = label.unwrap_or_else(|| addr.clone());
+        self.output_manager.write_info(format!(
+            "  {} {}",
+            display.as_str().cyan().bold(),
+            "connected".dark_grey()
+        ));
+        self.render_tui().await
+    }
+
+    /// `/disconnect <name-or-addr>` — remove a peer from peers list and current room.
+    async fn handle_disconnect(&mut self, name: String) -> Result<()> {
+        use crossterm::style::Stylize;
+        // Resolve by label first, then by addr substring
+        let addr = self.forth_vm.peer_meta.iter()
+            .find(|(_, meta)| meta.label.as_deref() == Some(name.as_str()))
+            .map(|(a, _)| a.clone())
+            .or_else(|| {
+                self.forth_vm.peers.iter()
+                    .find(|a| a.contains(name.as_str()))
+                    .cloned()
+            });
+        if let Some(ref addr) = addr {
+            self.forth_vm.peers.retain(|p| p != addr);
+            if let Some(ref room_id) = self.forth_vm.current_room.clone() {
+                if let Some(room) = self.forth_vm.rooms.get_mut(room_id) {
+                    room.members.retain(|m| m != addr);
+                }
+            }
+            self.forth_vm.peer_meta.remove(addr);
+            self.output_manager.write_info(format!(
+                "  {} {}",
+                name.as_str().dark_grey(),
+                "disconnected".dark_grey()
+            ));
+        } else {
+            self.output_manager.write_info(format!(
+                "  {} not found", name.as_str().dark_grey()
+            ));
+        }
+        self.render_tui().await
+    }
+
+    /// `/room [uuid]` — show current room or join/create a specific one.
+    async fn handle_room(&mut self, uuid: Option<String>) -> Result<()> {
+        use crossterm::style::Stylize;
+        if let Some(id) = uuid {
+            self.forth_vm.rooms.entry(id.clone()).or_default();
+            self.forth_vm.current_room = Some(id.clone());
+            self.output_manager.write_info(format!(
+                "  room  {}", id.as_str().cyan()
+            ));
+        } else if let Some(ref id) = self.forth_vm.current_room.clone() {
+            let room = &self.forth_vm.rooms[id];
+            self.output_manager.write_info(format!(
+                "  room  {}  ({} members, {} keys)",
+                id.as_str().cyan(),
+                room.members.len(),
+                room.hash.len(),
+            ));
+        } else {
+            self.output_manager.write_info(
+                "  no current room — use /room new or /room <uuid>".dark_grey().to_string()
+            );
+        }
+        self.render_tui().await
+    }
+
+    /// `/room new` — create a fresh room and set it as current.
+    async fn handle_room_new(&mut self) -> Result<()> {
+        use crossterm::style::Stylize;
+        let id = uuid::Uuid::new_v4().to_string();
+        self.forth_vm.rooms.entry(id.clone()).or_default();
+        self.forth_vm.current_room = Some(id.clone());
+        self.output_manager.write_info(format!(
+            "  room  {}  (new)", id.as_str().cyan()
+        ));
+        self.render_tui().await
+    }
+
+    /// `/room add <addr>` — add a peer to the current room.
+    async fn handle_room_add(&mut self, addr: String) -> Result<()> {
+        use crossterm::style::Stylize;
+        if let Some(ref room_id) = self.forth_vm.current_room.clone() {
+            // Also add to global peer list
+            if !self.forth_vm.peers.contains(&addr) {
+                self.forth_vm.peers.push(addr.clone());
+            }
+            let room = self.forth_vm.rooms.entry(room_id.clone()).or_default();
+            if !room.members.contains(&addr) {
+                room.members.push(addr.clone());
+            }
+            self.output_manager.write_info(format!(
+                "  +{}  in room {}", addr.as_str().cyan(), room_id.chars().take(8).collect::<String>().as_str().dark_grey()
+            ));
+        } else {
+            self.output_manager.write_info(
+                "  no current room — use /room new first".dark_grey().to_string()
+            );
+        }
+        self.render_tui().await
+    }
+
+    /// `/room remove <name-or-addr>` — remove a peer from the current room.
+    async fn handle_room_remove(&mut self, name: String) -> Result<()> {
+        use crossterm::style::Stylize;
+        let addr = self.forth_vm.peer_meta.iter()
+            .find(|(_, m)| m.label.as_deref() == Some(name.as_str()))
+            .map(|(a, _)| a.clone())
+            .or_else(|| self.forth_vm.peers.iter().find(|a| a.contains(name.as_str())).cloned())
+            .unwrap_or_else(|| name.clone());
+        if let Some(ref room_id) = self.forth_vm.current_room.clone() {
+            if let Some(room) = self.forth_vm.rooms.get_mut(room_id) {
+                room.members.retain(|m| m != &addr);
+            }
+        }
+        self.output_manager.write_info(format!(
+            "  -{}", addr.as_str().dark_grey()
+        ));
+        self.render_tui().await
+    }
+
+    /// `/room list` — list all rooms.
+    async fn handle_room_list(&mut self) -> Result<()> {
+        use crossterm::style::Stylize;
+        if self.forth_vm.rooms.is_empty() {
+            self.output_manager.write_info(
+                "  no rooms — use /room new to create one".dark_grey().to_string()
+            );
+        } else {
+            let current = self.forth_vm.current_room.clone();
+            let mut ids: Vec<_> = self.forth_vm.rooms.keys().cloned().collect();
+            ids.sort();
+            let lines: Vec<String> = ids.iter().map(|id| {
+                let room = &self.forth_vm.rooms[id];
+                let marker = if Some(id) == current.as_ref() { "▶" } else { " " };
+                let members: Vec<String> = room.members.iter().map(|addr| {
+                    self.forth_vm.peer_meta.get(addr)
+                        .and_then(|m| m.label.clone())
+                        .unwrap_or_else(|| addr.clone())
+                }).collect();
+                format!(
+                    "  {} {}  {} members  {} keys{}",
+                    marker.cyan(),
+                    id.chars().take(8).collect::<String>().as_str().dark_grey(),
+                    room.members.len(),
+                    room.hash.len(),
+                    if members.is_empty() { String::new() } else {
+                        format!("  ({})", members.join(", ").as_str().white())
+                    },
+                )
+            }).collect();
+            self.output_manager.write_info(lines.join("\n"));
+        }
+        self.render_tui().await
+    }
+
     /// Render the TUI
     async fn render_tui(&self) -> Result<()> {
         let mut tui = self.tui_renderer.lock().await;
@@ -2949,7 +3318,7 @@ s" it is ours"      s" -1 is ours"     argue
 
         // Try the VM first — boot JIT compiled all vocab words so known words run immediately.
         let snap = self.forth_vm.snapshot();
-        let is_nl = looks_like_natural_language(&text);
+        let is_nl = looks_like_natural_language(&text, |w| self.forth_vm.word_exists(w));
         let vm_result = self.forth_vm.exec(&text);
         // Check for unknown words first, regardless of whether there was other output.
         // missing-word now prints "?wordname" but we still want to define-and-retry.
@@ -2986,9 +3355,28 @@ s" it is ours"      s" -1 is ours"     argue
                 }
             }
             Err(ref e) => {
-                // VM rejected it — restore and note the error for the AI's context.
-                vm_err = Some(e.to_string());
+                let err_str = e.to_string();
                 self.forth_vm.restore(&snap);
+
+                // If a single defined word caused infinite recursion, forget it and
+                // re-route through the AI define path so it gets a fresh definition.
+                let is_overflow = err_str.contains("return stack overflow")
+                    || err_str.contains("call stack overflow");
+                let tokens: Vec<&str> = text.split_whitespace().collect();
+                if is_overflow && tokens.len() == 1 {
+                    let word = tokens[0];
+                    if self.forth_vm.word_exists(word) {
+                        // Erase the broken recursive definition.
+                        let _ = self.forth_vm.exec(&format!("forget {word}"));
+                        // Re-route: ask AI to provide a good definition.
+                        return self.handle_define_unknown_words(
+                            vec![word.to_string()],
+                            text.clone(),
+                        ).await;
+                    }
+                }
+
+                vm_err = Some(err_str);
             }
         }
 
@@ -3026,39 +3414,46 @@ s" it is ours"      s" -1 is ours"     argue
         } else {
             format!("\nVocabulary:\n{user_vocab}\n")
         };
-        let system_note = "Two programmers exchange Forth machines. \
-             That is how the language is defined — not by spec, but by exchange. \
-             Every machine sent becomes part of the shared vocabulary. \
-             The vocabulary belongs to both — \
-             either side can define, redefine, or extend any word, including builtins. \
-             User-defined words shadow builtins; there is no privilege hierarchy. \
-             Do not redefine existing words unless the user explicitly asks for a redefinition. \
-             Prefer new names; only rewrite something already defined when directly instructed. \
-             If the first programmer gave an instruction or described something to build, \
-             reply with Forth code only. \
-             After each word definition, add a \\ comment (same line) that says in plain English what it does — one short phrase, no jargon. \
+        let system_note = "You are the execution engine behind a conversational interface. \
+             The user does not know they are using Forth and should never need to. \
+             They just talk. You translate their intent into Forth and run it. \
+             Reply with Forth code only — no explanation, no preamble, no markdown fences. \
+             The code will be executed immediately and the user sees the output, not your reply. \
+             After each word definition, add a \\ comment (same line) explaining what it does in plain English. \
              Example:  : greet  .\" hello\" cr ;  \\ prints hello \
-             After each word definition, write a test:word proof that asserts its behaviour. \
-             Use assert ( flag -- ) which aborts if 0. Keep proofs minimal — one or two checks. \
+             After each word definition, write a test:word proof using assert (aborts if 0). \
              Example after  : double  dup + ;  write  : test:double  4 double 8 = assert ; \
-             For words with side-effects (output only, no stack result), assert the stack depth is unchanged: \
-             Example after  : greet  .\" hi\" cr ;  write  : test:greet  depth >r greet depth r> = assert ; \
-             After all definitions and proofs, write  prove-all  to verify everything before running. \
-             Then call the defined words so the user sees what happens. \
-             If prove-all finds a failure, stop — do not call the main words. \
-             When a program needs the user to choose between options, use \
-             select\" title|option1|option2\" which pops up a dialog and leaves the chosen index (0-based) on the stack. \
-             Example: select\" What color?|Red|Green|Blue\" \
-             Forth word names can be in any language — if the input is Chinese, define words with Chinese names. \
-             If the user said something in a language that has no matching word in the vocabulary yet, \
-             define it as a Forth word so it runs instantly next time. \
-             If they asked a question or made a comment, \
-             reply in the same language they used — clear, direct, two sentences max. \
-             Never explain Forth syntax unprompted.";
+             For side-effect-only words: assert depth is unchanged. \
+             After all definitions, write prove-all to verify before calling the main words. \
+             If prove-all fails, stop — do not call the main words. \
+             When the user needs to choose between options, use \
+             select\" title|opt1|opt2\" — leaves the chosen index (0-based) on the stack. \
+             Forth word names can be in any language. \
+             If the user expressed something in their own words that has no matching word in the vocabulary yet, \
+             define a Forth word with their exact phrase (hyphens for spaces) so it runs instantly next time. \
+             Example: user says \"flip it\" → define  : flip-it  swap ; \
+             When the user challenges, disputes, or wonders about equivalence, settle it with argue-cases — \
+             never just assert. Triggers include: \
+             \"is X the same as Y\", \"isn't X just Y\", \"doesn't X equal Y\", \
+             \"X is better than Y\", \"X works like Y\", \"X and Y do the same thing\", \
+             \"what's the difference between X and Y\", \"X vs Y\", \
+             \"I thought X was equivalent to Y\", \"why use X instead of Y\", \
+             or any phrasing that compares two operations or questions their equivalence. \
+             Syntax: s\" op1\" s\" op2\" argue-cases \
+             Tests both ops against seeds 0 1 -1 2 -2 5 -5 10 -10 100 -100; shows each case. \
+             Examples: \
+             \"isn't dup + the same as 2 *?\" → s\" dup +\" s\" 2 *\" argue-cases \
+             \"is dividing by 2 the same as shifting right?\" → s\" 2 /\" s\" 1 rshift\" argue-cases \
+             \"does negate work like 0 minus?\" → s\" negate\" s\" 0 swap -\" argue-cases \
+             \"swap then drop vs nip — same thing?\" → s\" swap drop\" s\" nip\" argue-cases \
+             \"I think abs and dup * do the same thing\" → s\" abs\" s\" dup *\" argue-cases \
+             If the user asked a question or made a comment with no executable intent, \
+             reply in plain language — same language they used, two sentences max. \
+             Never mention Forth, stacks, or any implementation detail.";
         let initial_prompt = format!(
-            "{system_note}{vocab_section}\nStack:{stack_str}\nFirst programmer: {text}{error_str}\nSecond programmer:",
+            "{system_note}{vocab_section}\nStack:{stack_str}\nUser: {text}{error_str}\nForth:",
         );
-        let mut messages = vec![crate::claude::Message {
+        let messages = vec![crate::claude::Message {
             role: "user".to_string(),
             content: vec![crate::claude::ContentBlock::Text { text: initial_prompt }],
         }];
@@ -3101,17 +3496,9 @@ s" it is ours"      s" -1 is ours"     argue
                 return self.render_tui().await;
             }
 
-            // Show the proposed Forth.
-            self.output_manager.write_info(
-                format!("{}  {}", "→".dark_grey(), forth_code.as_str().cyan())
-            );
-            self.render_tui().await.ok();
-
-            // Just run it. Two programmers, shared stack. No interruption.
+            // Run it. The user sees the result, not the implementation.
             return self.handle_forth_eval_inner(forth_code, false).await;
         }
-
-        self.render_tui().await
     }
 
     /// Handle `push <message>` — send plain text to all peers.
@@ -3454,6 +3841,40 @@ s" it is ours"      s" -1 is ours"     argue
 
     async fn handle_forth_eval_inner(&mut self, code: String, show_define: bool) -> Result<()> {
         use crossterm::style::Stylize;
+
+        // FIREBALL — clears conversation context immediately, like /clear
+        if code.trim() == "FIREBALL" {
+            self.conversation.write().await.clear();
+            self.output_manager.write_info("🔥 Context cleared.".to_string());
+            return self.render_tui().await;
+        }
+
+        // PLAN [task] — enter plan mode with optional task, like /plan
+        {
+            let trimmed = code.trim();
+            if trimmed == "PLAN" {
+                // Toggle plan mode, same as /plan with no args — enter planning with no task
+                let plan_path = std::env::temp_dir()
+                    .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+                let new_mode = crate::cli::ReplMode::Planning {
+                    task: "Manual exploration".to_string(),
+                    plan_path: plan_path.clone(),
+                    created_at: chrono::Utc::now(),
+                };
+                *self.mode.write().await = new_mode.clone();
+                self.update_plan_mode_indicator(&new_mode);
+                self.output_manager.write_info("⏸ Plan mode on. Describe your goal.".to_string());
+                return self.render_tui().await;
+            }
+            if let Some(task) = trimmed.strip_prefix("PLAN ") {
+                let task = task.trim().to_string();
+                if !task.is_empty() {
+                    self.handle_plan_task(task).await?;
+                    return Ok(());
+                }
+            }
+        }
+
         // Pre-flight: if the code contains scatter-exec" or exec-at" commands, show
         // the user a plan and require confirmation before firing on remote machines.
         let scatter_cmds = extract_scatter_exec_commands(&code);
@@ -3521,6 +3942,7 @@ s" it is ours"      s" -1 is ours"     argue
         // Snapshot before eval so the user can undo it
         let snap = self.forth_vm.snapshot();
         self.forth_undo.push(snap);
+        let stack_depth_before = self.forth_vm.data_stack().len();
 
         match self.forth_vm.exec(&code) {
             Ok(out) if !out.is_empty() => {
@@ -3552,7 +3974,20 @@ s" it is ours"      s" -1 is ours"     argue
                         silent_remark(&code)
                     } else {
                         let items: Vec<String> = stack.iter().map(|n| n.to_string()).collect();
-                        format!("( {} )", items.join("  "))
+                        let mut r = format!("( {} )", items.join("  "));
+                        // Vocab word hint: single alphabetic token that pushed exactly one value
+                        let token = code.trim();
+                        let grew_by_one = self.forth_vm.data_stack().len() == stack_depth_before + 1;
+                        let looks_like_vocab = token.len() >= 3
+                            && token.chars().all(|c| c.is_ascii_lowercase() || c == '-');
+                        if grew_by_one && looks_like_vocab {
+                            r.push_str(&format!(
+                                "\n  note: '{}' is a vocabulary word — it pushed its index.\
+                                \n  To see its definition: s\" {}\" describe",
+                                token, token
+                            ));
+                        }
+                        r
                     };
                     self.output_manager.write_info(remark.dark_grey().to_string());
                 }
@@ -3840,6 +4275,12 @@ s" it is ours"      s" -1 is ours"     argue
              - After each definition, write a minimal test: `: test:NAME  ... assert ;`\n\
              - After all definitions and tests, write `prove-all` then call each new word.\n\
              - Word names must match the user's input exactly (case-sensitive).\n\
+             - CRITICAL: Only use Forth primitives and words already in the vocabulary above. \
+               Do NOT reference undefined words — the code runs immediately and undefined words \
+               will cause an error and an infinite definition loop.\n\
+             - For string output use `s\" literal text\" type` or `.\" literal text\"`. \
+               Never write `str:NAME` as if it were a word; there is no str: namespace.\n\
+             - Do NOT use `to NAME` unless NAME was defined as a `value` in this same response.\n\
              - If the word names are in a non-English language, the Forth definitions may call \
                gen\" ...\" to invoke AI, or simply print something meaningful.\n\
              - No explanations outside comments. Only valid Forth.\n\
@@ -3882,6 +4323,13 @@ s" it is ours"      s" -1 is ours"     argue
             .to_string();
 
         if forth_defs.is_empty() {
+            return self.render_tui().await;
+        }
+
+        // Remove dangerous definitions before compilation.
+        let forth_defs = filter_ai_forth_response(&forth_defs);
+
+        if forth_defs.trim().is_empty() {
             return self.render_tui().await;
         }
 
@@ -4888,7 +5336,7 @@ s" it is ours"      s" -1 is ours"     argue
         tool_use: crate::tools::types::ToolUse,
         response_tx: tokio::sync::oneshot::Sender<super::events::ConfirmationResult>,
     ) -> Result<()> {
-        use crate::cli::tui::{Dialog, DialogOption};
+        use crate::cli::tui::Dialog;
 
         tracing::debug!("[EVENT_LOOP] Requesting tool approval: {}", tool_use.name);
 
@@ -4896,13 +5344,7 @@ s" it is ours"      s" -1 is ours"     argue
         let tool_name = &tool_use.name;
         let summary = tool_approval_summary(&tool_use);
 
-        let options = vec![
-            DialogOption::new("1. Yes"),
-            DialogOption::new(format!("2. Yes, and don't ask again for: {}:*", tool_name)),
-            DialogOption::new("3. No"),
-        ];
-
-        let dialog = Dialog::select(format!("{}\n{}", tool_name, summary), options);
+        let dialog = Dialog::tool_approval(tool_name, &summary);
 
         // Set dialog in TUI (non-blocking - will be handled by async_input task)
         let mut tui = self.tui_renderer.lock().await;
@@ -5327,6 +5769,82 @@ pub(crate) fn humanize_forth_error(raw: &str) -> String {
     e.to_string()
 }
 
+/// Filter an AI-generated Forth response before compilation.
+///
+/// Removes definitions that would cause infinite loops or produce garbage output:
+/// - Definitions that call `gen:*` words (AI-invocation; triggers new AI calls during execution)
+/// - Definitions that call themselves directly (immediate infinite recursion)
+/// - Definitions with bodies longer than 40 tokens (garbage dump from confused AI)
+///
+/// Preserves: valid `: name ... ;` definitions, `test:*` proofs, and `prove-all`.
+pub(crate) fn filter_ai_forth_response(code: &str) -> String {
+    let tokens: Vec<&str> = code.split_whitespace().collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut i = 0;
+
+    while i < tokens.len() {
+        if tokens[i] != ":" {
+            // Outside a definition: keep prove-all and bare word calls; skip unknown noise.
+            out.push(tokens[i]);
+            i += 1;
+            continue;
+        }
+
+        // Collect `: name body ;`
+        let def_start = i;
+        let name = tokens.get(i + 1).copied().unwrap_or("");
+        i += 2; // skip `:` and name
+
+        // Advance to the matching `;`, tracking nested `: ;` pairs.
+        // Cap the scan at 60 tokens to avoid consuming everything when `;` is missing.
+        let body_start = i;
+        let scan_limit = body_start + 60;
+        let mut depth: usize = 1;
+        let mut found_closing = false;
+        while i < tokens.len() && i < scan_limit {
+            match tokens[i] {
+                ":" => depth += 1,
+                ";" if depth == 1 => { i += 1; found_closing = true; break; }
+                ";" => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+
+        // Skip malformed definitions (no closing semicolon within scan window).
+        // Reset i to body_start so any prove-all or valid defs that follow are not lost.
+        if !found_closing {
+            i = body_start;
+            // Skip past this definition's body by advancing to the next `:` or end.
+            while i < tokens.len() && tokens[i] != ":" {
+                // Preserve prove-all even inside a malformed body.
+                if tokens[i] == "prove-all" { out.push("prove-all"); }
+                i += 1;
+            }
+            continue;
+        }
+
+        let body = &tokens[body_start..i.saturating_sub(1)];
+
+        // Reject: gen: calls in the body (would trigger AI during word execution → loops).
+        if body.iter().any(|t| t.starts_with("gen:")) {
+            continue;
+        }
+        // Reject: direct self-recursion (word calls itself immediately → return stack overflow).
+        if body.iter().any(|t| *t == name) {
+            continue;
+        }
+        // Reject: suspiciously long body — AI garbage-dumped the vocabulary into the definition.
+        if body.len() > 40 {
+            continue;
+        }
+
+        out.extend_from_slice(&tokens[def_start..i]);
+    }
+
+    out.join(" ")
+}
+
 /// Build a concise human-readable summary of a tool call for the approval dialog.
 ///
 /// Returns a single line such as `"Command: git push"` or `"File: src/main.rs"`.
@@ -5390,7 +5908,105 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> 
                 "Enter planning mode".to_string()
             }
         }
+        "write" | "Write" => {
+            let path = tool_use.input.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
+            let content = tool_use.input.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let line_count = content.lines().count();
+            let is_new = !std::path::Path::new(path).exists();
+            if is_new {
+                let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
+                let truncated = if line_count > 5 { format!("\n… ({} lines total)", line_count) } else { String::new() };
+                format!("Create {}\n{}{}", path, preview, truncated)
+            } else {
+                // Show unified diff against existing file
+                let existing = std::fs::read_to_string(path).unwrap_or_default();
+                format!("Overwrite {}\n{}", path, unified_diff_summary(&existing, content, 3))
+            }
+        }
+        "edit" | "Edit" => {
+            let path = tool_use.input.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
+            let old = tool_use.input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+            let new = tool_use.input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Edit {}\n{}", path, unified_diff_summary(old, new, 2))
+        }
         _ => format!("Execute {} tool", tool_name),
+    }
+}
+
+/// Produce a compact unified-diff-style summary between `before` and `after`.
+/// Shows up to `context` lines of context around each change.
+fn unified_diff_summary(before: &str, after: &str, context: usize) -> String {
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+
+    // Simple LCS-based diff: find changed regions
+    let mut hunks: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    let mut current_hunk: Vec<String> = Vec::new();
+    let mut in_hunk = false;
+    let max_lines = 40; // cap total output
+    let mut total = 0;
+
+    // Build a simple line-by-line diff without external crates:
+    // walk both sides, emit - / + lines for mismatches
+    while i < before_lines.len() || j < after_lines.len() {
+        if total >= max_lines {
+            current_hunk.push(format!("  … (diff truncated)"));
+            break;
+        }
+        match (before_lines.get(i), after_lines.get(j)) {
+            (Some(a), Some(b)) if a == b => {
+                if in_hunk {
+                    current_hunk.push(format!("  {}", a));
+                    // End hunk after `context` unchanged lines
+                    let trail = current_hunk.iter().rev()
+                        .take_while(|l| l.starts_with("  "))
+                        .count();
+                    if trail > context {
+                        hunks.push(current_hunk.join("\n"));
+                        current_hunk = Vec::new();
+                        in_hunk = false;
+                    }
+                }
+                i += 1; j += 1;
+            }
+            (Some(a), Some(_b)) => {
+                if !in_hunk {
+                    // Add context before
+                    let start = i.saturating_sub(context);
+                    for ctx_line in before_lines[start..i].iter() {
+                        current_hunk.push(format!("  {}", ctx_line));
+                    }
+                    in_hunk = true;
+                }
+                current_hunk.push(format!("- {}", a));
+                current_hunk.push(format!("+ {}", _b));
+                total += 2;
+                i += 1; j += 1;
+            }
+            (Some(a), None) => {
+                if !in_hunk { in_hunk = true; }
+                current_hunk.push(format!("- {}", a));
+                total += 1;
+                i += 1;
+            }
+            (None, Some(b)) => {
+                if !in_hunk { in_hunk = true; }
+                current_hunk.push(format!("+ {}", b));
+                total += 1;
+                j += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    if !current_hunk.is_empty() {
+        hunks.push(current_hunk.join("\n"));
+    }
+    if hunks.is_empty() {
+        "(no changes)".to_string()
+    } else {
+        hunks.join("\n---\n")
     }
 }
 
@@ -6361,5 +6977,286 @@ mod tests {
         }
         // It's time-gated so we can't guarantee it fires, but the content is correct when it does.
         let _ = found_recursive;
+    }
+}
+
+/// Open `content` in `$VISUAL` or `$EDITOR` (falling back to `vi`), let the user
+/// edit it, and return the saved result.  Suspends the terminal while the editor
+/// runs and restores it afterwards.
+fn open_in_editor(content: &str) -> anyhow::Result<String> {
+    // Pick editor: $VISUAL > $EDITOR > vi
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    // Write proposed content to a temp file
+    let tmp_path = std::env::temp_dir().join(format!("finch-edit-{}.txt", std::process::id()));
+    std::fs::write(&tmp_path, content.as_bytes())?;
+
+    // Suspend raw mode so the editor has full terminal control
+    crossterm::terminal::disable_raw_mode()?;
+
+    let status = std::process::Command::new(&editor)
+        .arg(&tmp_path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to launch editor '{}': {}", editor, e))?;
+
+    // Restore raw mode
+    crossterm::terminal::enable_raw_mode()?;
+
+    if !status.success() {
+        anyhow::bail!("Editor exited with status {}", status);
+    }
+
+    let edited = std::fs::read_to_string(&tmp_path)?;
+    Ok(edited)
+}
+
+// ── looks_like_natural_language tests ─────────────────────────────────────────
+#[cfg(test)]
+mod nl_routing_tests {
+    use super::looks_like_natural_language;
+
+    fn no_words(_: &str) -> bool { false }
+    fn all_words(_: &str) -> bool { true }
+
+    // Question marks always → AI
+    #[test] fn test_question_mark_latin() { assert!(looks_like_natural_language("what is this?", no_words)); }
+    #[test] fn test_question_mark_fullwidth() { assert!(looks_like_natural_language("何？", no_words)); }
+    #[test] fn test_question_embedded() { assert!(looks_like_natural_language("is 2 + 2 = 4?", no_words)); }
+
+    // Uppercase first letter → AI
+    #[test] fn test_uppercase_start() { assert!(looks_like_natural_language("Show me something", no_words)); }
+    #[test] fn test_uppercase_single_word() { assert!(looks_like_natural_language("Hello", no_words)); }
+
+    // Non-ASCII non-definition → AI
+    #[test] fn test_non_ascii_chinese() { assert!(looks_like_natural_language("你好", no_words)); }
+    #[test] fn test_non_ascii_arabic() { assert!(looks_like_natural_language("مرحبا", no_words)); }
+    #[test] fn test_non_ascii_definition_not_nl() {
+        // `: 你好 1 . ;` is a definition — should NOT be routed to AI
+        assert!(!looks_like_natural_language(": 你好 1 . ;", no_words));
+    }
+
+    // Multi-word with unknown alphabetic word → AI
+    #[test] fn test_multi_word_unknown() { assert!(looks_like_natural_language("show me something", no_words)); }
+    #[test] fn test_multi_word_with_number() { assert!(looks_like_natural_language("show me 3 examples", no_words)); }
+    #[test] fn test_multi_word_all_known_is_forth() {
+        // Every token is known → Forth, not AI
+        assert!(!looks_like_natural_language("dup swap drop", all_words));
+    }
+    #[test] fn test_multi_word_all_numbers_is_forth() {
+        // Pure number sequence → Forth stack push, not AI
+        assert!(!looks_like_natural_language("1 2 3", no_words));
+    }
+
+    // Single unknown alphabetic word → AI
+    #[test] fn test_single_unknown_word() { assert!(looks_like_natural_language("foobar", no_words)); }
+    // Hyphen is a Forth operator char, so single hyphenated token → Forth (not AI).
+    #[test] fn test_single_hyphenated_is_forth_not_nl() { assert!(!looks_like_natural_language("my-thing", no_words)); }
+
+    // Known Forth primitives → Forth (not AI)
+    #[test] fn test_single_known_primitive_dup() { assert!(!looks_like_natural_language("dup", no_words)); }
+    #[test] fn test_single_known_primitive_drop() { assert!(!looks_like_natural_language("drop", no_words)); }
+    #[test] fn test_single_known_primitive_swap() { assert!(!looks_like_natural_language("swap", no_words)); }
+    #[test] fn test_single_number_is_forth() { assert!(!looks_like_natural_language("42", no_words)); }
+    #[test] fn test_single_float_is_forth() { assert!(!looks_like_natural_language("3.14", no_words)); }
+
+    // Forth operators in input → Forth
+    #[test] fn test_contains_forth_operator_plus() { assert!(!looks_like_natural_language("2 3 +", no_words)); }
+    #[test] fn test_contains_forth_operator_dot() { assert!(!looks_like_natural_language("42 .", no_words)); }
+
+    // Definitions → Forth
+    #[test] fn test_colon_definition() { assert!(!looks_like_natural_language(": foo 1 . ;", no_words)); }
+
+    // Word known to VM → Forth
+    #[test] fn test_single_known_vm_word() { assert!(!looks_like_natural_language("hello", all_words)); }
+
+    // Regression: "it's just two greats talking" — multi-word with unknown words → AI
+    #[test] fn test_regression_two_greats() {
+        assert!(looks_like_natural_language("it's just two greats talking", no_words));
+    }
+    // Regression: "we could do that whatever" — multi-word unknown → AI
+    #[test] fn test_regression_we_could() {
+        assert!(looks_like_natural_language("we could do that", no_words));
+    }
+}
+
+// ── filter_ai_forth_response edge case tests ──────────────────────────────────
+#[cfg(test)]
+mod filter_tests {
+    use super::filter_ai_forth_response;
+
+    #[test]
+    fn test_filter_keeps_valid_def() {
+        // filter normalizes whitespace (joins tokens with single space)
+        let code = ": hello  .\" hello\" cr ;";
+        let result = filter_ai_forth_response(code);
+        assert!(result.contains(": hello"), "valid def should be kept");
+        assert!(result.contains(".\""), "string print should be kept");
+        assert!(result.contains(";"), "closing ; should be kept");
+    }
+
+    #[test]
+    fn test_filter_removes_self_recursive_def() {
+        // `hello` calls itself → infinite recursion → should be stripped.
+        let code = ": hello  hello cr ;";
+        assert!(filter_ai_forth_response(code).trim().is_empty(),
+            "self-recursive definition should be removed");
+    }
+
+    #[test]
+    fn test_filter_removes_gen_call() {
+        // Body calls gen:what — AI invocation during execution causes a loop.
+        let code = ": greeting  gen:what cr ;";
+        assert!(filter_ai_forth_response(code).trim().is_empty(),
+            "definition with gen: call should be removed");
+    }
+
+    #[test]
+    fn test_filter_removes_garbage_long_body() {
+        // More than 40 body tokens = vocabulary dump, not real Forth.
+        let long_body = std::iter::repeat("word").take(41).collect::<Vec<_>>().join(" ");
+        let code = format!(": garbage  {long_body} ;");
+        assert!(filter_ai_forth_response(&code).trim().is_empty(),
+            "garbage long-body definition should be removed");
+    }
+
+    #[test]
+    fn test_filter_keeps_prove_all() {
+        let code = ": hello  .\" hello\" cr ; prove-all";
+        let result = filter_ai_forth_response(code);
+        assert!(result.contains("prove-all"), "prove-all should be preserved");
+    }
+
+    #[test]
+    fn test_filter_mixed_good_and_bad() {
+        let code = "\
+            : good  .\" ok\" cr ; \
+            : bad  bad cr ; \
+            : also-good  1 1 + . ;";
+        let result = filter_ai_forth_response(code);
+        assert!(result.contains(": good"), "valid def should be kept");
+        assert!(!result.contains(": bad"), "self-recursive def should be removed");
+        assert!(result.contains(": also-good"), "valid def should be kept");
+    }
+
+    #[test]
+    fn test_filter_exact_40_token_body_ok() {
+        // Exactly 40 body tokens — should be kept (threshold is > 40).
+        let body = std::iter::repeat("drop").take(40).collect::<Vec<_>>().join(" ");
+        let code = format!(": word40  {body} ;");
+        let result = filter_ai_forth_response(&code);
+        assert!(result.contains(": word40"), "40-token body should be kept");
+    }
+
+    #[test]
+    fn test_filter_41_token_body_rejected() {
+        let body = std::iter::repeat("drop").take(41).collect::<Vec<_>>().join(" ");
+        let code = format!(": word41  {body} ;");
+        let result = filter_ai_forth_response(&code);
+        assert!(!result.contains(": word41"), "41-token body should be rejected");
+    }
+
+    #[test]
+    fn test_filter_indirect_recursion_not_caught() {
+        // Indirect recursion (a→b→a) is NOT caught by the filter — that's OK,
+        // the VM's call-depth guard handles it at runtime.
+        let code = ": a  b . ; : b  a . ;";
+        let result = filter_ai_forth_response(code);
+        // Both should pass the filter (no direct self-call)
+        assert!(result.contains(": a"), "indirect recursion not filtered at compile time");
+        assert!(result.contains(": b"), "indirect recursion not filtered at compile time");
+    }
+
+    #[test]
+    fn test_filter_gen_in_non_gen_word_blocked() {
+        // gen:what in body of a normal word — should be blocked.
+        let code = ": greet  gen:hello cr ;";
+        assert!(filter_ai_forth_response(code).trim().is_empty());
+    }
+
+    #[test]
+    fn test_filter_test_word_passes_through() {
+        // test: words are just definitions — they should pass the same rules.
+        let code = ": test:hello  hello depth 0 = assert ;";
+        let result = filter_ai_forth_response(code);
+        assert!(result.contains(": test:hello"), "test word should be kept");
+    }
+
+    #[test]
+    fn test_filter_empty_input() {
+        assert_eq!(filter_ai_forth_response("").trim(), "");
+    }
+
+    #[test]
+    fn test_filter_only_prove_all() {
+        let result = filter_ai_forth_response("prove-all");
+        assert!(result.contains("prove-all"));
+    }
+
+    #[test]
+    fn test_filter_malformed_missing_semicolon() {
+        // Should skip malformed definitions completely
+        let code = ": hello";  
+        assert_eq!(filter_ai_forth_response(code).trim(), "");
+    }
+
+    #[test]
+    fn test_filter_malformed_missing_semicolon_with_body() {
+        let code = ": hello world";
+        assert_eq!(filter_ai_forth_response(code).trim(), "");
+    }
+
+    #[test]
+    fn test_filter_malformed_outer_recovers_inner() {
+        // `: outer : inner stuff ; more` — outer has no closing `;`.
+        // After the fix, the parser skips the malformed outer, then recovers
+        // `: inner stuff ;` as a valid inner definition.
+        let code = ": outer : inner stuff ; more";
+        let result = filter_ai_forth_response(code);
+        // Inner definition is recovered; "more" passes through as a bare word.
+        assert!(result.contains(": inner"), "inner def should be recovered after malformed outer");
+    }
+
+    #[test]
+    fn test_filter_mixed_malformed_recovers_valid_and_prove_all() {
+        // Malformed definition followed by a valid one and prove-all.
+        // After the fix, the valid def and prove-all are both preserved.
+        let code = ": malformed hello : valid .\" ok\" ; prove-all";
+        let result = filter_ai_forth_response(code);
+        assert!(result.contains(": valid"), "valid def should be recovered after malformed one");
+        assert!(result.contains("prove-all"), "prove-all must survive a malformed definition");
+    }
+
+    #[test]
+    fn test_filter_empty_definition() {
+        let code = ": empty ;";
+        let result = filter_ai_forth_response(code);
+        assert!(result.contains(": empty ;"), "empty definition should be valid");
+    }
+
+    #[test]
+    fn test_filter_multiple_gen_calls_blocked() {
+        let code = ": multi  gen:a gen:b gen:c ;";
+        assert!(filter_ai_forth_response(code).trim().is_empty());
+    }
+
+    // Regression: malformed definition (no `;`) must not consume prove-all.
+    // Bug found by finch self-inspecting its own filter function.
+    #[test]
+    fn test_filter_malformed_def_does_not_consume_prove_all() {
+        let code = ": broken no-semicolon-here prove-all";
+        let result = filter_ai_forth_response(code);
+        assert!(result.contains("prove-all"),
+            "prove-all must survive a malformed definition with no closing semicolon");
+    }
+
+    // Regression: malformed definition must not consume subsequent valid definitions.
+    #[test]
+    fn test_filter_malformed_def_followed_by_valid() {
+        let code = ": broken no-semicolon : good .\" ok\" cr ;";
+        let result = filter_ai_forth_response(code);
+        assert!(result.contains(": good"),
+            "valid definition after malformed one should be kept");
     }
 }

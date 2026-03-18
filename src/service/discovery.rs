@@ -31,13 +31,15 @@ impl ServiceDiscovery {
         let daemon = ServiceDaemon::new().context("Failed to create mDNS service daemon")?;
 
         // Generate instance name from hostname
-        let hostname = hostname::get()
+        let _hostname = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "finch".to_string());
 
+        // Use the stable cute name (e.g. "tiny-bird") when no explicit name is set.
+        // This makes peer discovery show "tiny-bird is here" instead of "macbook-pro is here".
         let instance_name = if config.name.is_empty() {
-            format!("finch-{}", hostname)
+            format!("finch-{}", crate::node_name::NAME.as_str())
         } else {
             config.name.clone()
         };
@@ -73,6 +75,8 @@ impl ServiceDiscovery {
         properties.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
         // Peer token — so auto-discovered machines can authenticate without manual setup
         properties.insert("token".to_string(), crate::peer_token::TOKEN.clone());
+        // Cute node name — shown in the TUI when this machine is discovered
+        properties.insert("name".to_string(), crate::node_name::NAME.clone());
 
         // Create service info
         let service_info = ServiceInfo::new(

@@ -87,7 +87,7 @@ impl SubagentType {
 
     fn allowed_tools(self) -> &'static [&'static str] {
         match self {
-            Self::General => &["read", "glob", "grep", "bash", "web_fetch"],
+            Self::General => &["read", "glob", "grep", "bash", "web_fetch", "spawn_task"],
             Self::Explore => &["read", "glob", "grep"],
             Self::Researcher => &["read", "glob", "grep", "web_fetch"],
             Self::Coder => &["read", "glob", "grep", "bash"],
@@ -103,22 +103,28 @@ impl SubagentType {
 /// Default maximum number of turns a subagent may run.
 const DEFAULT_MAX_TURNS: usize = 10;
 
+/// Maximum spawn_task nesting depth before recursion is cut off.
+const MAX_RECURSION_DEPTH: usize = 4;
+
 /// Tool that spawns a fresh, isolated subagent loop.
 ///
-/// The subagent has its own conversation history, a focused system prompt,
-/// and a restricted tool set (no `spawn_task` to prevent infinite recursion,
-/// no `restart` to prevent self-modification).
+/// Subagents may themselves call `spawn_task` up to `MAX_RECURSION_DEPTH`
+/// levels deep.  Beyond that depth the tool is omitted from the child's
+/// tool list so the tree terminates naturally.
 pub struct TaskTool {
     provider: Arc<dyn LlmProvider>,
     max_turns: usize,
+    /// Nesting depth of this instance (0 = top-level).
+    depth: usize,
 }
 
 impl TaskTool {
-    /// Create with an existing provider.
+    /// Create a top-level (depth 0) instance.
     pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
         Self {
             provider,
             max_turns: DEFAULT_MAX_TURNS,
+            depth: 0,
         }
     }
 
@@ -137,10 +143,11 @@ impl Tool for TaskTool {
 
     fn description(&self) -> &str {
         "Spawn an isolated subagent to handle a specific subtask in a fresh \
-         conversation.  The subagent has access to read/search/bash tools, \
-         runs its own agentic loop, and returns its final answer as a string. \
-         Use this to delegate focused work (exploration, research, shell \
-         commands) without polluting the main conversation context."
+         conversation.  The subagent has access to read/search/bash tools and \
+         may itself spawn further subagents (up to 4 levels deep).  Runs its \
+         own agentic loop and returns its final answer as a string. \
+         Use this to delegate or fan out focused work without polluting the \
+         main conversation context."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -178,19 +185,49 @@ impl Tool for TaskTool {
         let background = input["background"].as_str();
 
         info!(
-            "Spawning {:?} subagent for task: {}",
+            "Spawning {:?} subagent (depth {}) for task: {}",
             subagent_type,
+            self.depth,
             &task[..task.len().min(80)]
         );
 
-        run_subagent(
-            self.provider.as_ref(),
+        let result = run_subagent(
+            Arc::clone(&self.provider),
             task,
             subagent_type,
             background,
             self.max_turns,
+            self.depth,
         )
-        .await
+        .await?;
+
+        if result.exit_code != 0 {
+            anyhow::bail!("Task failed (exit {}): {}", result.exit_code, result.output);
+        }
+        Ok(result.output)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskResult
+// ---------------------------------------------------------------------------
+
+/// The outcome of a completed subagent run.
+#[derive(Debug, Clone)]
+pub struct TaskResult {
+    /// Final text output produced by the subagent.
+    pub output: String,
+    /// 0 = success; nonzero = failure (timeout, provider error, etc.).
+    pub exit_code: i32,
+}
+
+impl TaskResult {
+    fn success(output: String) -> Self {
+        Self { output, exit_code: 0 }
+    }
+
+    fn failure(output: String) -> Self {
+        Self { output, exit_code: 1 }
     }
 }
 
@@ -198,17 +235,19 @@ impl Tool for TaskTool {
 // Subagent execution loop
 // ---------------------------------------------------------------------------
 
-/// Run a headless agentic loop and return the final text response.
+/// Run a headless agentic loop and return a `TaskResult`.
 ///
 /// The subagent has no TUI, no approval prompts, and no recursion guard
-/// beyond `max_turns`.  Tools are executed directly without permission checks.
+/// beyond `max_turns` and `MAX_RECURSION_DEPTH`.  Tools are executed
+/// directly without permission checks.
 async fn run_subagent(
-    provider: &dyn LlmProvider,
+    provider: Arc<dyn LlmProvider>,
     task: &str,
     subagent_type: SubagentType,
     background: Option<&str>,
     max_turns: usize,
-) -> Result<String> {
+    depth: usize,
+) -> Result<TaskResult> {
     // Build system prompt
     let mut system = subagent_type.system_prompt().to_string();
     if let Some(bg) = background {
@@ -217,7 +256,7 @@ async fn run_subagent(
     }
 
     // Build tools for this subagent type
-    let tools = build_subagent_tools(subagent_type.allowed_tools());
+    let tools = build_subagent_tools(subagent_type.allowed_tools(), Arc::clone(&provider), depth);
     let tool_defs: Vec<ToolDefinition> = tools.iter().map(|t| t.definition()).collect();
 
     let mut messages: Vec<Message> = vec![Message::user(task)];
@@ -234,6 +273,7 @@ async fn run_subagent(
         }
 
         let response = provider
+            .as_ref()
             .send_message(&request)
             .await
             .map_err(|e| anyhow::anyhow!("Subagent provider error: {}", e))?;
@@ -246,7 +286,7 @@ async fn run_subagent(
                 turn + 1,
                 text.len()
             );
-            return Ok(text);
+            return Ok(TaskResult::success(text));
         }
 
         // Append assistant message (with tool_use blocks)
@@ -273,10 +313,10 @@ async fn run_subagent(
         messages.push(Message::with_content("user", result_blocks));
     }
 
-    anyhow::bail!(
+    Ok(TaskResult::failure(format!(
         "Subagent reached max_turns ({}) without producing a final text response",
         max_turns
-    )
+    )))
 }
 
 /// Execute a single tool inside the subagent (no permission checks).
@@ -299,13 +339,23 @@ async fn execute_subagent_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> R
         tokenizer: None,
         repl_mode: None,
         plan_content: None,
+        live_output: None,
+        stack: None,
+        poset: None,
     };
 
     tool.execute(tool_use.input.clone(), &context).await
 }
 
 /// Instantiate the tools allowed for a given subagent type.
-fn build_subagent_tools(allowed: &[&str]) -> Vec<Box<dyn Tool>> {
+///
+/// `spawn_task` is included only when `depth < MAX_RECURSION_DEPTH` so the
+/// tree terminates naturally rather than blowing the stack.
+fn build_subagent_tools(
+    allowed: &[&str],
+    provider: Arc<dyn LlmProvider>,
+    depth: usize,
+) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
     for &name in allowed {
         match name {
@@ -314,6 +364,13 @@ fn build_subagent_tools(allowed: &[&str]) -> Vec<Box<dyn Tool>> {
             "grep" => tools.push(Box::new(GrepTool)),
             "bash" => tools.push(Box::new(BashTool)),
             "web_fetch" => tools.push(Box::new(WebFetchTool::new())),
+            "spawn_task" if depth < MAX_RECURSION_DEPTH => {
+                tools.push(Box::new(TaskTool {
+                    provider: Arc::clone(&provider),
+                    max_turns: DEFAULT_MAX_TURNS,
+                    depth: depth + 1,
+                }));
+            }
             _ => {}
         }
     }
@@ -328,13 +385,73 @@ fn build_subagent_tools(allowed: &[&str]) -> Vec<Box<dyn Tool>> {
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------------------
+    // Shared mock helpers
+    // ---------------------------------------------------------------------------
+
+    /// Null provider — fails on any actual call; used for tool-construction tests.
+    struct NullProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for NullProvider {
+        async fn send_message(
+            &self,
+            _req: &crate::providers::ProviderRequest,
+        ) -> anyhow::Result<crate::providers::ProviderResponse> {
+            anyhow::bail!("null provider")
+        }
+        async fn send_message_stream(
+            &self,
+            _req: &crate::providers::ProviderRequest,
+        ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>> {
+            anyhow::bail!("null provider")
+        }
+        fn name(&self) -> &str { "null" }
+        fn default_model(&self) -> &str { "null" }
+    }
+
+    /// Echo provider — immediately returns a text response with no tool calls.
+    struct EchoProvider(String);
+
+    #[async_trait::async_trait]
+    impl crate::providers::LlmProvider for EchoProvider {
+        async fn send_message(
+            &self,
+            _req: &crate::providers::ProviderRequest,
+        ) -> anyhow::Result<crate::providers::ProviderResponse> {
+            use crate::claude::types::ContentBlock;
+            use crate::providers::ProviderResponse;
+            Ok(ProviderResponse {
+                id: "test".to_string(),
+                model: "echo".to_string(),
+                content: vec![ContentBlock::Text { text: self.0.clone() }],
+                stop_reason: Some("end_turn".to_string()),
+                role: "assistant".to_string(),
+                provider: "echo".to_string(),
+            })
+        }
+        async fn send_message_stream(
+            &self,
+            _req: &crate::providers::ProviderRequest,
+        ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>> {
+            anyhow::bail!("echo provider does not stream")
+        }
+        fn name(&self) -> &str { "echo" }
+        fn default_model(&self) -> &str { "echo" }
+    }
+
+    fn null_provider() -> Arc<dyn crate::providers::LlmProvider> {
+        Arc::new(NullProvider)
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests
+    // ---------------------------------------------------------------------------
+
     #[test]
     fn test_subagent_type_from_str() {
         assert_eq!(SubagentType::from_str("explore"), SubagentType::Explore);
-        assert_eq!(
-            SubagentType::from_str("researcher"),
-            SubagentType::Researcher
-        );
+        assert_eq!(SubagentType::from_str("researcher"), SubagentType::Researcher);
         assert_eq!(SubagentType::from_str("coder"), SubagentType::Coder);
         assert_eq!(SubagentType::from_str("bash"), SubagentType::Bash);
         assert_eq!(SubagentType::from_str("general"), SubagentType::General);
@@ -344,77 +461,108 @@ mod tests {
 
     #[test]
     fn test_subagent_tools_explore_is_read_only() {
-        let tools = build_subagent_tools(SubagentType::Explore.allowed_tools());
+        let tools = build_subagent_tools(SubagentType::Explore.allowed_tools(), null_provider(), 0);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"grep"));
         assert!(!names.contains(&"bash"), "Explore should not have bash");
-        assert!(
-            !names.contains(&"web_fetch"),
-            "Explore should not have web_fetch"
-        );
+        assert!(!names.contains(&"web_fetch"), "Explore should not have web_fetch");
     }
 
     #[test]
     fn test_subagent_tools_bash_only() {
-        let tools = build_subagent_tools(SubagentType::Bash.allowed_tools());
+        let tools = build_subagent_tools(SubagentType::Bash.allowed_tools(), null_provider(), 0);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(
-            names,
-            vec!["bash"],
-            "Bash subagent should only have bash tool"
-        );
+        assert_eq!(names, vec!["bash"], "Bash subagent should only have bash tool");
     }
 
     #[test]
     fn test_subagent_tools_general_has_all() {
-        let tools = build_subagent_tools(SubagentType::General.allowed_tools());
+        let tools = build_subagent_tools(SubagentType::General.allowed_tools(), null_provider(), 0);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"spawn_task"));
     }
 
     #[test]
     fn test_task_tool_schema_requires_task() {
-        // Verify the schema marks "task" as required
-        struct MockProvider;
-
-        // We can't easily mock LlmProvider without a full impl, so just test
-        // the schema construction directly via SubagentType constants.
         let allowed = SubagentType::General.allowed_tools();
         assert!(allowed.contains(&"read"));
         assert!(allowed.contains(&"bash"));
+        assert!(allowed.contains(&"spawn_task"));
     }
 
     #[test]
-    fn test_subagent_no_recursion_in_tools() {
-        // spawn_task must not appear in any subagent's tool list
-        for stype in [
-            SubagentType::General,
-            SubagentType::Explore,
-            SubagentType::Researcher,
-            SubagentType::Coder,
-            SubagentType::Bash,
-        ] {
-            let tools = build_subagent_tools(stype.allowed_tools());
-            for tool in &tools {
-                assert_ne!(
-                    tool.name(),
-                    "spawn_task",
-                    "Subagent {:?} must not have spawn_task (recursion guard)",
-                    stype
-                );
-                assert_ne!(
-                    tool.name(),
-                    "restart",
-                    "Subagent {:?} must not have restart",
-                    stype
-                );
+    fn test_subagent_recursion_depth_limit() {
+        let provider = null_provider();
+
+        // Below MAX_RECURSION_DEPTH → spawn_task present
+        let tools = build_subagent_tools(
+            SubagentType::General.allowed_tools(),
+            Arc::clone(&provider),
+            0,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"spawn_task"), "General at depth 0 should have spawn_task");
+
+        // At MAX_RECURSION_DEPTH → spawn_task absent
+        let tools_at_max = build_subagent_tools(
+            SubagentType::General.allowed_tools(),
+            Arc::clone(&provider),
+            MAX_RECURSION_DEPTH,
+        );
+        let names_at_max: Vec<&str> = tools_at_max.iter().map(|t| t.name()).collect();
+        assert!(
+            !names_at_max.contains(&"spawn_task"),
+            "General at MAX_RECURSION_DEPTH must not have spawn_task"
+        );
+
+        // restart must never appear at any depth
+        for depth in [0, 1, MAX_RECURSION_DEPTH] {
+            for stype in [
+                SubagentType::General,
+                SubagentType::Explore,
+                SubagentType::Researcher,
+                SubagentType::Coder,
+                SubagentType::Bash,
+            ] {
+                let tools = build_subagent_tools(stype.allowed_tools(), Arc::clone(&provider), depth);
+                for tool in &tools {
+                    assert_ne!(tool.name(), "restart", "Subagent {:?} must never have restart", stype);
+                }
             }
         }
+    }
+
+    /// Fork 100 tasks in parallel; all must return exit_code 0.
+    #[tokio::test]
+    async fn test_fork_100_tasks_exit_codes_sum_to_zero() {
+        use futures::future::join_all;
+
+        let provider: Arc<dyn crate::providers::LlmProvider> =
+            Arc::new(EchoProvider("done".to_string()));
+
+        let handles: Vec<_> = (0..100)
+            .map(|i| {
+                let p = Arc::clone(&provider);
+                tokio::spawn(async move {
+                    run_subagent(p, &format!("task {i}"), SubagentType::General, None, 10, 0).await
+                })
+            })
+            .collect();
+
+        let results = join_all(handles).await;
+
+        let exit_code_sum: i32 = results
+            .into_iter()
+            .map(|r| r.expect("tokio task panicked").map(|t| t.exit_code).unwrap_or(1))
+            .sum();
+
+        assert_eq!(exit_code_sum, 0, "all 100 tasks must exit 0");
     }
 }

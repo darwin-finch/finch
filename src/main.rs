@@ -50,6 +50,16 @@ struct Args {
     /// or when you only have a cloud API key (e.g. Grok via X Premium+).
     #[arg(long = "cloud-only", alias = "teacher-only")]
     cloud_only: bool,
+
+    /// Evaluate a Forth expression directly and print the result (no AI, no REPL)
+    #[arg(long = "forth", short = 'f')]
+    forth: Option<String>,
+
+    /// Join a named session (UUIDv5 derived from name).
+    /// Two users with the same name arrive at the same session ID.
+    /// Example: finch --session "battleground"
+    #[arg(long = "session", short = 's')]
+    session: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -369,6 +379,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    // --forth: pure Forth eval, no AI, no TUI, no config needed
+    if let Some(forth_expr) = &args.forth {
+        match finch::coforth::Forth::run(forth_expr) {
+            Ok(output) => print!("{}", output),
+            Err(e) => eprintln!("forth error: {}", e),
+        }
+        return Ok(());
+    }
+
     // Check for piped input BEFORE initializing anything else
     if !io::stdin().is_terminal() {
         // Piped input mode: read query from stdin and process as single query
@@ -431,7 +450,19 @@ async fn main() -> Result<()> {
                 cfg.save().ok();
                 cfg
             } else {
-                eprintln!("\n\x1b[1;33m⚠️  Running first-time setup wizard...\x1b[0m\n");
+                {
+                    use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+                    use crossterm::execute;
+                    let _ = execute!(
+                        std::io::stderr(),
+                        Print("\n"),
+                        SetForegroundColor(Color::Yellow),
+                        SetAttribute(Attribute::Bold),
+                        Print("⚠️  Running first-time setup wizard..."),
+                        ResetColor,
+                        Print("\n\n"),
+                    );
+                }
 
                 // Run setup wizard
                 use finch::cli::show_setup_wizard;
@@ -531,6 +562,23 @@ async fn main() -> Result<()> {
                         if cfg.save().is_err() {
                             // Non-fatal — we'll just show the wizard again next time
                         }
+                        {
+                            use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+                            use crossterm::execute;
+                            let _ = execute!(
+                                std::io::stderr(),
+                                Print("\n"),
+                                SetForegroundColor(Color::Green),
+                                SetAttribute(Attribute::Bold),
+                                Print("✓ Setup complete!"),
+                                ResetColor,
+                                Print(" Type "),
+                                SetAttribute(Attribute::Bold),
+                                Print("/help"),
+                                SetAttribute(Attribute::Reset),
+                                Print(" for commands, or just start talking.\n\n"),
+                            );
+                        }
                         cfg
                     }
                     Err(e) => return Err(e),
@@ -611,10 +659,9 @@ async fn main() -> Result<()> {
                 output_manager.write_status("✓ Connected to daemon");
                 Some(Arc::new(client))
             }
-            Err(e) => {
-                if std::env::var("SHAMMAH_DEBUG").is_ok() {
-                    eprintln!("Failed to connect to daemon: {}", e);
-                }
+            Err(_e) => {
+                tracing::debug!("Failed to connect to daemon: {}", _e);
+                output_manager.write_status("⚠️  No daemon — running in direct mode. Start one with `finch daemon-start`.");
                 None
             }
         }
@@ -629,6 +676,74 @@ async fn main() -> Result<()> {
 
     // Create and run REPL (with full TUI support)
     // Pass daemon_client so Repl knows whether to suppress local model logs
+    // Session ID — always UUIDv5, always printed for interactive sessions.
+    // --session <name>: derived from the name (shareable, deterministic).
+    // default: derived from hostname + pid + timestamp (unique per session).
+    // Suppressed for pipe / non-interactive use.
+    let session_id = {
+        use uuid::Uuid;
+        // Finch session namespace.
+        let ns = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
+
+        // Derive a short human name from any UUID — two words, deterministic.
+        let human_name = |id: &Uuid| {
+            const WORDS: &[&str] = &[
+                "amber","arc","ash","bay","beam","birch","bloom","blue","bolt",
+                "brook","calm","cedar","cinder","cliff","coal","coral","crane",
+                "creek","crest","dawn","dew","drift","dune","echo","elm","ember",
+                "fern","field","flame","flash","flint","fog","ford","forge","frost",
+                "gale","glen","glow","gold","grove","haze","heath","hill","hollow",
+                "iron","jade","lake","lark","leaf","ledge","light","lime","loch",
+                "loom","mast","mead","mist","moon","moss","mud","oak","opal","ore",
+                "peat","pine","pond","pool","quartz","rain","reed","reef","ridge",
+                "rill","ring","rook","root","rose","rune","rush","salt","sand",
+                "scale","shade","shaft","shore","silk","silver","slate","smoke",
+                "snow","sol","spar","spark","spire","spring","star","steel","stem",
+                "stone","storm","stream","swift","tarn","thorn","tide","torch",
+                "vale","vine","wave","wind","wren","yarrow",
+            ];
+            let bytes = id.as_bytes();
+            let a = (bytes[0] as usize * 256 + bytes[1] as usize) % WORDS.len();
+            let b = (bytes[2] as usize * 256 + bytes[3] as usize) % WORDS.len();
+            format!("{}-{}", WORDS[a], WORDS[b])
+        };
+
+        let id = match &args.session {
+            Some(name) => {
+                let id = Uuid::new_v5(&ns, name.as_bytes());
+                if io::stdout().is_terminal() {
+                    let hname = human_name(&id);
+                    output_manager.write_status(format!("✦ {} · {} ({})", hname, id, name));
+                }
+                id
+            }
+            None => {
+                // Derive from hostname + pid + nanosecond timestamp — unique per session,
+                // reproducible if you know those three values.
+                let hostname = std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_else(|_| "localhost".to_string());
+                let seed = format!(
+                    "{}:{}:{}",
+                    hostname,
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                );
+                let id = Uuid::new_v5(&ns, seed.as_bytes());
+                if io::stdout().is_terminal() {
+                    let hname = human_name(&id);
+                    output_manager.write_status(format!("✦ {} · {}", hname, id));
+                }
+                id
+            }
+        };
+        id
+    };
+    let _ = session_id; // available for future use (daemon routing, shared stacks)
+
     let mut repl = Repl::new(config, claude_client, router, metrics_logger, daemon_client).await;
 
     // Restore session if requested

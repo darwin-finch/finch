@@ -44,10 +44,9 @@ impl NodeIdentity {
     }
 
     fn generate() -> Result<Self> {
-        let name = hostname::get()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            .unwrap_or_else(|| "finch-node".to_string());
+        // Use the stable cute name (e.g. "tiny-bird") for new nodes.
+        // Existing nodes keep their persisted hostname-based name.
+        let name = crate::node_name::NAME.clone();
 
         // UUID v5: deterministic from a finch-specific namespace + hostname.
         // Same machine always gets the same UUID, even across reinstalls.

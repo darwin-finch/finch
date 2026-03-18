@@ -225,9 +225,10 @@ enum Builtin {
     CellSz,  // ( -- 1 )       size of one cell (1 — heap uses i64 units)
     Fill,    // ( addr n val -- )  fill n cells at addr with val
     Eval,    // ( str -- )    eval strings[pop()] as Forth source code
-    Argue,     // ( str1 str2 -- )  run both, show what each got, assert they agree
-    Versus,    // ( str1 str2 -- )  run both, show FULL stacks side by side, assert they agree
-    BothWays,  // ( a b str -- )   run op(a,b) and op(b,a), show both, assert they agree
+    Argue,      // ( str1 str2 -- )  run both, show what each got, assert they agree
+    ArgueCases, // ( op1 op2 -- )   test both ops against a battery of seeds; show per-seed verdict
+    Versus,     // ( str1 str2 -- )  run both, show FULL stacks side by side, assert they agree
+    BothWays,   // ( a b str -- )   run op(a,b) and op(b,a), show both, assert they agree
     Gate,      // ( str1 str2 check -- result )  run both, apply check; if check passes leave result
     Page,      // ( str -- )    run a multi-line proof page: each line is "left | right"
     Resolve,   // ( str -- )    many sentences, one truth: all lines must converge to same value
@@ -264,6 +265,17 @@ enum Builtin {
     Hash,                     // ( str-idx -- n )  FNV1a-64 hash of strings[idx] → i64
     HashInt,                  // ( n -- n' )       integer mix hash (fast, avalanche)
     HashCombine,              // ( h n -- h' )     combine two hash values (for chaining)
+    // Shared-hash / room operations
+    HPut,        // ( val-idx key-idx -- )   set key in current room's hash; sync to members
+    HFetch,      // ( key-idx -- val-idx )   get value (empty string if absent)
+    HDel,        // ( key-idx -- )           delete key from current room's hash; sync
+    HPrint,      // ( -- )                   print all key-value pairs in current room's hash
+    HHas,        // ( key-idx -- flag )      1 if key exists, else 0
+    RoomUse,     // ( uuid-idx -- )          join/create room by UUID string; sets current_room
+    RoomAdd,     // ( addr-idx -- )          add peer address to current room's member list
+    RoomSub,     // ( addr-idx -- )          remove peer address from current room's member list
+    RoomList,    // ( -- )                   print all rooms with member counts
+    RoomNew,     // ( -- uuid-idx )          create a new room with a fresh UUID; sets current
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
@@ -334,6 +346,11 @@ pub struct Forth {
     /// This machine's own address, set when `join-registry` or `join" addr"` succeeds.
     /// Used by `leave` to deregister from the registry.
     pub my_addr: Option<String>,
+    /// Named rooms — each keyed by UUID string.
+    /// Created by `room-use`, `room-new`, or `/room`.
+    pub rooms: HashMap<String, Room>,
+    /// Currently active room UUID. `h!` / `h@` / `room+` / `room-` operate on this room.
+    pub current_room: Option<String>,
     /// When true, interactive cells (Confirm, GenAI) are suppressed:
     /// Confirm auto-denies (returns 0), GenAI returns an empty string.
     /// Set by the HTTP server on every cloned remote VM so remote code
@@ -358,6 +375,18 @@ pub struct Forth {
     /// Reusable call stack for the inner interpreter — pre-allocated, cleared each execute().
     /// Avoids a Vec allocation on every word call.
     call_stack: Vec<usize>,
+}
+
+/// A shared room — a named group of peers with a synchronized key-value hash.
+///
+/// Rooms are identified by a UUID string.  Any machine can create a room,
+/// then add peers to it.  `h!` broadcasts writes to all room members.
+#[derive(Debug, Clone, Default)]
+pub struct Room {
+    /// Peer addresses (host:port) that are members of this room.
+    pub members: Vec<String>,
+    /// The shared key-value store for this room (last-write-wins).
+    pub hash: HashMap<String, String>,
 }
 
 /// Metadata attached to a peer address via `label-peer` / `tag-peer`.
@@ -1229,6 +1258,8 @@ impl Forth {
             remote_mode:      false,
             registry_addr:    None,
             my_addr:          None,
+            rooms:            HashMap::new(),
+            current_room:     None,
             forth_back:       None,
             channels:         std::collections::HashSet::new(),
             boot_poems:       Vec::new(),
@@ -1467,6 +1498,8 @@ impl Forth {
             remote_mode:      false, // caller sets true for remote VMs
             registry_addr:    self.registry_addr.clone(),
             my_addr:          self.my_addr.clone(),
+            rooms:            self.rooms.clone(),
+            current_room:     self.current_room.clone(),
             forth_back:       None,
             channels:         self.channels.clone(),
             boot_poems:       Vec::new(),
@@ -1610,19 +1643,7 @@ impl Forth {
                             }
                         }
                     }
-                    // If the word already exists as a user definition, require approval
-                    // before overwriting it.  Builtins cannot be shadowed by this interpreter
-                    // (they are always resolved first at compile time), so no gate is needed
-                    // for them — and applying one there would block stdlib internal wrappers.
-                    if self.log_definitions && self.name_index.contains_key(&name) {
-                        if let Some(ref f) = self.confirm_fn {
-                            let prompt = format!("redefine '{name}'?  (it already exists)");
-                            if !f(&prompt) {
-                                bail!("redefinition of '{name}' cancelled");
-                            }
-                        }
-                        // No confirm_fn (pipe/test mode): allow silently.
-                    }
+                    // Redefinitions are always allowed silently.
                     // Register entry address BEFORE compiling body so `recurse` resolves.
                     let word_addr = self.memory.len();
                     self.name_index.insert(name.clone(), word_addr);
@@ -2695,30 +2716,7 @@ impl Forth {
                     }
                     ip += 1;
                 }
-                Cell::Builtin(Builtin::Inc) => { if let Some(t) = self.data.last_mut() { *t += 1; } ip += 1; }
-                Cell::Builtin(Builtin::Dec) => { if let Some(t) = self.data.last_mut() { *t -= 1; } ip += 1; }
-                Cell::Builtin(Builtin::Negate) => { if let Some(t) = self.data.last_mut() { *t = t.wrapping_neg(); } ip += 1; }
-                Cell::Builtin(Builtin::Rot)    => { let len = self.data.len(); if len >= 3 { self.data.swap(len-3, len-2); self.data.swap(len-2, len-1); } ip += 1; }
-                Cell::Builtin(Builtin::Xor)    => { let (a,b) = pop2!(); self.data.push(a ^ b); ip += 1; }
-                Cell::Builtin(Builtin::Invert) => { if let Some(t) = self.data.last_mut() { *t = !*t; } ip += 1; }
-                Cell::Builtin(Builtin::Lshift) => { let (a,b) = pop2!(); self.data.push(a << (b & 63)); ip += 1; }
-                Cell::Builtin(Builtin::Rshift) => { let (a,b) = pop2!(); self.data.push(a >> (b & 63)); ip += 1; }
-                Cell::Builtin(Builtin::Tuck)   => { let (a,b) = pop2!(); self.data.push(b); self.data.push(a); self.data.push(b); ip += 1; }
-                Cell::Builtin(Builtin::Nip)    => { let (a,b) = pop2!(); let _ = a; self.data.push(b); ip += 1; }
-                Cell::Builtin(Builtin::TwoDup) => { let (a,b) = pop2!(); self.data.push(a); self.data.push(b); self.data.push(a); self.data.push(b); ip += 1; }
-                Cell::Builtin(Builtin::Slash)  => {
-                    let (a,b) = pop2!();
-                    if b == 0 { bail!("division by zero"); }
-                    self.data.push(a / b); ip += 1;
-                }
-                Cell::Builtin(Builtin::Mod)    => {
-                    let (a,b) = pop2!();
-                    if b == 0 { bail!("division by zero"); }
-                    self.data.push(a % b); ip += 1;
-                }
-                Cell::Builtin(Builtin::Le)     => { let (a,b) = pop2!(); self.data.push(if a <= b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::Ge)     => { let (a,b) = pop2!(); self.data.push(if a >= b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::Abs)    => { if let Some(t) = self.data.last_mut() { *t = t.abs(); } ip += 1; }
+
                 // ── Loop index (very hot inside do/loop bodies) ──
                 Cell::Builtin(Builtin::LoopI)  => {
                     let v = self.loop_stack.last().map(|t| t.0).unwrap_or(0);
@@ -3010,6 +3008,94 @@ impl Forth {
                         "✗".red(),
                     ));
                     anyhow::bail!("argue: {} got {}, {} got {}", code1, result1, code2, result2);
+                }
+            }
+            Builtin::ArgueCases => {
+                // ( op1 op2 -- )
+                // Test both operations against a standard battery of seed inputs.
+                // For each seed n, builds "n op1" and "n op2", runs agree?, shows verdict.
+                // Seeds: 0 1 -1 2 -2 5 -5 10 -10 100 -100
+                let idx2 = self.pop()? as usize;
+                let idx1 = self.pop()? as usize;
+                let op1 = self.strings.get(idx1).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("argue-cases: invalid string index {idx1}"))?;
+                let op2 = self.strings.get(idx2).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("argue-cases: invalid string index {idx2}"))?;
+
+                const SEEDS: &[i64] = &[0, 1, -1, 2, -2, 5, -5, 10, -10, 100, -100];
+                use crossterm::style::Stylize;
+                let mut failures = 0usize;
+                let saved_data = std::mem::take(&mut self.data);
+
+                let fmt_val = |v: i64| -> String {
+                    match v { -1 => "true".to_string(), 0 => "false".to_string(), n => n.to_string() }
+                };
+
+                for &seed in SEEDS {
+                    let prog1 = format!("{} {}", seed, op1);
+                    let prog2 = format!("{} {}", seed, op2);
+
+                    self.data.clear();
+                    let r1 = self.eval(&prog1).ok().and_then(|_| self.data.last().copied());
+                    self.data.clear();
+                    let r2 = self.eval(&prog2).ok().and_then(|_| self.data.last().copied());
+                    self.data.clear();
+
+                    match (r1, r2) {
+                        (Some(a), Some(b)) if a == b => {
+                            self.out.push_str(&format!(
+                                "  {:>6}  │  {}  ──→  {}  ←──  {}  {}\n",
+                                seed.to_string().dark_grey(),
+                                op1.as_str().cyan(),
+                                fmt_val(a).green().bold(),
+                                op2.as_str().cyan(),
+                                "✓".green(),
+                            ));
+                        }
+                        (Some(a), Some(b)) => {
+                            self.out.push_str(&format!(
+                                "  {:>6}  │  {}  ──→  {}  ≠  {}  ←──  {}  {}\n",
+                                seed.to_string().dark_grey(),
+                                op1.as_str().cyan(),
+                                fmt_val(a).red(),
+                                fmt_val(b).red(),
+                                op2.as_str().cyan(),
+                                "✗".red(),
+                            ));
+                            failures += 1;
+                        }
+                        (None, _) => {
+                            self.out.push_str(&format!("  {:>6}  │  {} errored\n", seed, op1));
+                            failures += 1;
+                        }
+                        (_, None) => {
+                            self.out.push_str(&format!("  {:>6}  │  {} errored\n", seed, op2));
+                            failures += 1;
+                        }
+                    }
+                }
+
+                self.data = saved_data;
+
+                if failures == 0 {
+                    self.out.push_str(&format!(
+                        "  {}  {} ≡ {}  on all {} cases\n",
+                        "✓".green().bold(),
+                        op1.as_str().cyan(),
+                        op2.as_str().cyan(),
+                        SEEDS.len(),
+                    ));
+                } else {
+                    self.out.push_str(&format!(
+                        "  {}  {} ≢ {}  ({}/{} cases differ)\n",
+                        "✗".red().bold(),
+                        op1.as_str().cyan(),
+                        op2.as_str().cyan(),
+                        failures,
+                        SEEDS.len(),
+                    ));
+                    // Don't bail — the table already shows which cases differ.
+                    // Use agree? / same? if you need a boolean result.
                 }
             }
             Builtin::Gate => {
@@ -5346,19 +5432,28 @@ impl Forth {
                     "─── Co-Forth ────────────────────────────────────────────────────\n",
                     " Values go on the stack.  Words transform it.  Proofs settle it.\n",
                     "\n",
-                    " Stack     3 4 +  →  7           dup drop swap over rot\n",
+                    " Getting started\n",
+                    "   help                    this screen\n",
+                    "   words                   list all defined words\n",
+                    "   s\" dup\" describe        explain any word\n",
+                    "   undo                    undo last operation\n",
+                    "\n",
+                    " Stack      3 4 +  →  7          dup drop swap over rot\n",
                     " Arithmetic + - * /  mod  negate  abs  max  min  square  pow\n",
-                    " Compare   =  <  >  <>  0=  0<\n",
-                    " Logic     and  or  xor  invert\n",
-                    " Output    .  .\" hello\"  cr  .s  type\n",
-                    " Strings   s\" hello\"  str-cat  str-len  str=  str-trim  str-find\n",
-                    " Shell     s\" ls\" exec-capture  type\n",
-                    " Define    : double  2 * ;\n",
-                    " Proofs    s\" 2 3 +\" s\" 3 2 +\" agree?      \\ two machines, one answer\n",
-                    "           5 s\" 1 +\" s\" 1 -\" back-and-forth?  \\ round trip\n",
-                    "           9 s\" negate\" invertible?          \\ its own inverse\n",
-                    " List      words\n",
-                    " Describe  s\" dup\" describe\n",
+                    " Compare    =  <  >  <>  0=  0<\n",
+                    " Logic      and  or  xor  invert\n",
+                    " Output     .  .\" hello\"  cr  .s  type\n",
+                    " Strings    s\" hello\"  str-cat  str-len  str=  str-trim  str-find\n",
+                    " Shell      s\" ls\" exec-capture  type\n",
+                    "\n",
+                    " Define     : double  2 * ;\n",
+                    " Proofs     s\" 2 3 +\" s\" 3 2 +\" agree?      \\ two machines, one answer\n",
+                    "            5 s\" 1 +\" s\" 1 -\" back-and-forth?  \\ round trip\n",
+                    "            9 s\" negate\" invertible?          \\ its own inverse\n",
+                    "\n",
+                    " Vocabulary words push their index onto the stack.\n",
+                    "   To call one: use its index with apply\n",
+                    "   To inspect:  s\" wordname\" describe\n",
                     "─────────────────────────────────────────────────────────────────\n",
                 ));
             }
@@ -5594,6 +5689,163 @@ impl Forth {
                 let h = self.pop()?;
                 let mixed = (h as u64) ^ ((n as u64).wrapping_mul(0x9e3779b97f4a7c15));
                 self.data.push(mixed as i64);
+            }
+            // ── Shared-hash / room operations ────────────────────────────────────
+            Builtin::HPut => {
+                // ( val-idx key-idx -- )  set key → val in current room; sync to members
+                let key_idx = self.pop()? as usize;
+                let val_idx = self.pop()? as usize;
+                let key = self.strings.get(key_idx).cloned().unwrap_or_default();
+                let val = self.strings.get(val_idx).cloned().unwrap_or_default();
+                let room_id = self.current_room.clone();
+                if let Some(id) = room_id {
+                    let room = self.rooms.entry(id.clone()).or_default();
+                    room.hash.insert(key.clone(), val.clone());
+                    let members = room.members.clone();
+                    let tokens = peer_tokens_map(&self.peer_meta);
+                    let my_name = crate::node_name::NAME.clone();
+                    run_hash_scatter(&members, &id, &key, &val, &my_name, &tokens);
+                } else {
+                    self.out.push_str("h!: no current room (use room-use or room-new first)\n");
+                }
+            }
+            Builtin::HFetch => {
+                // ( key-idx -- val-idx )  get value from current room hash
+                let key_idx = self.pop()? as usize;
+                let key = self.strings.get(key_idx).cloned().unwrap_or_default();
+                let val = self.current_room.as_ref()
+                    .and_then(|id| self.rooms.get(id))
+                    .and_then(|r| r.hash.get(&key))
+                    .cloned()
+                    .unwrap_or_default();
+                let new_idx = self.strings.len() as i64;
+                self.strings.push(val);
+                self.data.push(new_idx);
+            }
+            Builtin::HDel => {
+                // ( key-idx -- )  delete key from current room hash; sync to members
+                let key_idx = self.pop()? as usize;
+                let key = self.strings.get(key_idx).cloned().unwrap_or_default();
+                let room_id = self.current_room.clone();
+                if let Some(id) = room_id {
+                    let members;
+                    {
+                        let room = self.rooms.entry(id.clone()).or_default();
+                        room.hash.remove(&key);
+                        members = room.members.clone();
+                    }
+                    let tokens = peer_tokens_map(&self.peer_meta);
+                    let my_name = crate::node_name::NAME.clone();
+                    // Signal deletion with empty string sentinel
+                    run_hash_scatter(&members, &id, &key, "\x00del\x00", &my_name, &tokens);
+                }
+            }
+            Builtin::HPrint => {
+                // ( -- )  print all key-value pairs in current room
+                use crossterm::style::Stylize;
+                if let Some(id) = &self.current_room.clone() {
+                    if let Some(room) = self.rooms.get(id) {
+                        if room.hash.is_empty() {
+                            self.out.push_str(&format!("  {} (empty)\n", id.as_str().dark_grey()));
+                        } else {
+                            self.out.push_str(&format!("  {}:\n", id.as_str().dark_grey()));
+                            let mut pairs: Vec<_> = room.hash.iter().collect();
+                            pairs.sort_by_key(|(k, _)| k.as_str());
+                            for (k, v) in pairs {
+                                self.out.push_str(&format!(
+                                    "    {}  {}\n",
+                                    k.as_str().cyan(),
+                                    v.as_str().white()
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    self.out.push_str("h.: no current room\n");
+                }
+            }
+            Builtin::HHas => {
+                // ( key-idx -- flag )  1 if key exists in current room, else 0
+                let key_idx = self.pop()? as usize;
+                let key = self.strings.get(key_idx).cloned().unwrap_or_default();
+                let exists = self.current_room.as_ref()
+                    .and_then(|id| self.rooms.get(id))
+                    .map(|r| r.hash.contains_key(&key))
+                    .unwrap_or(false);
+                self.data.push(if exists { 1 } else { 0 });
+            }
+            Builtin::RoomUse => {
+                // ( uuid-idx -- )  join/create room by UUID; sets current_room
+                let idx = self.pop()? as usize;
+                let id = self.strings.get(idx).cloned().unwrap_or_default();
+                if !id.is_empty() {
+                    self.rooms.entry(id.clone()).or_default();
+                    self.current_room = Some(id.clone());
+                    use crossterm::style::Stylize;
+                    self.out.push_str(&format!("  room {}\n", id.as_str().cyan()));
+                }
+            }
+            Builtin::RoomAdd => {
+                // ( addr-idx -- )  add peer to current room's member list
+                let idx = self.pop()? as usize;
+                let addr = self.strings.get(idx).cloned().unwrap_or_default();
+                if let Some(id) = &self.current_room.clone() {
+                    let room = self.rooms.entry(id.clone()).or_default();
+                    if !room.members.contains(&addr) {
+                        room.members.push(addr.clone());
+                        use crossterm::style::Stylize;
+                        self.out.push_str(&format!("  +{}\n", addr.as_str().cyan()));
+                    }
+                } else {
+                    self.out.push_str("room+: no current room\n");
+                }
+            }
+            Builtin::RoomSub => {
+                // ( addr-idx -- )  remove peer from current room's member list
+                let idx = self.pop()? as usize;
+                let addr = self.strings.get(idx).cloned().unwrap_or_default();
+                if let Some(id) = &self.current_room.clone() {
+                    let room = self.rooms.entry(id.clone()).or_default();
+                    let before = room.members.len();
+                    room.members.retain(|m| m != &addr);
+                    if room.members.len() < before {
+                        use crossterm::style::Stylize;
+                        self.out.push_str(&format!("  -{}\n", addr.as_str().dark_grey()));
+                    }
+                }
+            }
+            Builtin::RoomList => {
+                // ( -- )  print all rooms
+                use crossterm::style::Stylize;
+                if self.rooms.is_empty() {
+                    self.out.push_str("  no rooms  (use room-new or room-use to create one)\n");
+                } else {
+                    let current = self.current_room.clone();
+                    let mut ids: Vec<_> = self.rooms.keys().cloned().collect();
+                    ids.sort();
+                    for id in &ids {
+                        let room = &self.rooms[id];
+                        let marker = if Some(id) == current.as_ref() { " ← " } else { "   " };
+                        self.out.push_str(&format!(
+                            "{}{} ({} members, {} keys)\n",
+                            marker,
+                            id.as_str().cyan(),
+                            room.members.len(),
+                            room.hash.len(),
+                        ));
+                    }
+                }
+            }
+            Builtin::RoomNew => {
+                // ( -- uuid-idx )  create a new room with a fresh UUID; sets current_room
+                let id = uuid::Uuid::new_v4().to_string();
+                self.rooms.entry(id.clone()).or_default();
+                self.current_room = Some(id.clone());
+                use crossterm::style::Stylize;
+                self.out.push_str(&format!("  room {} (new)\n", id.as_str().cyan()));
+                let new_idx = self.strings.len() as i64;
+                self.strings.push(id);
+                self.data.push(new_idx);
             }
             Builtin::SortLines => {
                 let idx = self.pop()? as usize;
@@ -6373,6 +6625,51 @@ fn run_push_all(peers: &[String], text: &str, from: Option<&str>, _tokens: &std:
     futures::executor::block_on(fut);
 }
 
+/// Fire-and-forget POST of a single key-value update to all room members.
+/// Calls each peer's `/v1/forth/hash` endpoint with `{room_id, key, value, from}`.
+fn run_hash_scatter(
+    members: &[String],
+    room_id: &str,
+    key: &str,
+    value: &str,
+    from: &str,
+    tokens: &std::collections::HashMap<String, String>,
+) {
+    if members.is_empty() { return; }
+    let members = members.to_vec();
+    let room_id = room_id.to_string();
+    let key     = key.to_string();
+    let value   = value.to_string();
+    let from    = from.to_string();
+    let tokens  = tokens.clone();
+    let fut = async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "room_id": room_id,
+            "key":     key,
+            "value":   value,
+            "from":    from,
+        });
+        let tasks: Vec<_> = members.iter().map(|peer| {
+            let url = if peer.starts_with("http://") || peer.starts_with("https://") {
+                format!("{peer}/v1/forth/hash")
+            } else {
+                format!("http://{peer}/v1/forth/hash")
+            };
+            let mut req = client.post(&url).json(&body);
+            if let Some(t) = tokens.get(peer) {
+                req = req.header(crate::peer_token::HEADER, t.as_str());
+            }
+            async move { let _ = req.send().await; }
+        }).collect();
+        futures::future::join_all(tasks).await;
+    };
+    futures::executor::block_on(fut);
+}
+
 fn peer_tokens_map(peer_meta: &std::collections::HashMap<String, PeerMeta>) -> std::collections::HashMap<String, String> {
     peer_meta.iter()
         .filter_map(|(addr, meta)| meta.token.as_ref().map(|t| (addr.clone(), t.clone())))
@@ -6843,6 +7140,7 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "fill"           => Builtin::Fill,
         "eval"           => Builtin::Eval,
         "argue"          => Builtin::Argue,
+        "argue-cases"    => Builtin::ArgueCases,
         "gate"           => Builtin::Gate,
         "both-ways"      => Builtin::BothWays,
         "versus"         => Builtin::Versus,
@@ -6875,6 +7173,17 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "hash" | "str-hash" => Builtin::Hash,
         "hash-int"        => Builtin::HashInt,
         "hash-combine"    => Builtin::HashCombine,
+        // Shared-hash / room builtins
+        "h!"              => Builtin::HPut,
+        "h@"              => Builtin::HFetch,
+        "hdel"            => Builtin::HDel,
+        "h."              => Builtin::HPrint,
+        "h?"              => Builtin::HHas,
+        "room-use"        => Builtin::RoomUse,
+        "room+"           => Builtin::RoomAdd,
+        "room-"           => Builtin::RoomSub,
+        "rooms"           => Builtin::RoomList,
+        "room-new"        => Builtin::RoomNew,
         "sort"           => Builtin::SortLines,
         "sort-lines"     => Builtin::SortLines,
         "unique"         => Builtin::UniqueLines,
@@ -6896,10 +7205,16 @@ fn tokenize(src: &str) -> Vec<String> {
     macro_rules! flush { () => { if !tok.is_empty() { tokens.push(std::mem::take(&mut tok)); } }; }
 
     while let Some(&c) = chars.peek() {
-        if c == '\\' {
-            flush!();
+        if c == '\\' && tok.is_empty() {
+            // Standalone `\` — line comment: skip to end of line.
+            // Only triggers when we are NOT mid-token (tok is empty).
+            // This prevents `str:\` or other tokens containing backslash
+            // from silently eating the rest of the line.
+            chars.next();
             for c2 in chars.by_ref() { if c2 == '\n' { break; } }
-        } else if c == '(' {
+        } else if c == '(' && tok.is_empty() {
+            // Standalone `(` — stack-comment or paren-comment.
+            // Only triggers when NOT mid-token; `str::(` must not eat its trailing `)`.
             flush!();
             chars.next();
             // Skip until closing )
@@ -8221,61 +8536,13 @@ mod tests {
         assert!(out.contains("critical"), "EICAR must report critical risk");
     }
 
-    // ── redefinition approval gate ────────────────────────────────────────
+    // ── redefinition ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_redefine_without_confirm_fn_is_allowed() {
-        // No confirm_fn = pipe/test mode: redefinition silently succeeds.
+    fn test_redefine_always_allowed_silently() {
+        // Redefinitions never prompt; the latest definition always wins.
         let out = Forth::run(": sq dup * ; : sq dup dup * * ; 3 sq .").unwrap();
         assert_eq!(out.trim(), "27", "second definition should win");
-    }
-
-    #[test]
-    fn test_redefine_first_time_never_needs_approval() {
-        // Defining a brand-new word never triggers approval even with a confirm_fn.
-        let mut asked = false;
-        let mut f = Forth::new().with_confirm(Box::new(|_| {
-            // Should never be called for a first-time definition.
-            unreachable!("approval asked for a new word");
-        }));
-        // This must not panic or call the confirm_fn.
-        f.eval(": greet 42 . ;").unwrap();
-        drop(asked); // suppress unused warning
-        let _ = f.eval("greet");
-        assert_eq!(f.out.trim(), "42");
-    }
-
-    #[test]
-    fn test_redefine_with_confirm_fn_approved() {
-        // confirm_fn returns true → redefinition proceeds.
-        let mut f = Forth::new().with_confirm(Box::new(|_msg| true));
-        f.eval(": sq dup * ;").unwrap();
-        f.eval(": sq dup dup * * ;").unwrap(); // approved
-        f.eval("3 sq .").unwrap();
-        assert_eq!(f.out.trim(), "27");
-    }
-
-    #[test]
-    fn test_redefine_with_confirm_fn_denied() {
-        // confirm_fn returns false → redefinition is cancelled.
-        let mut f = Forth::new().with_confirm(Box::new(|_msg| false));
-        f.eval(": sq dup * ;").unwrap();
-        let err = f.eval(": sq dup dup * * ;").unwrap_err();
-        assert!(err.to_string().contains("cancelled"), "should report cancellation: {err}");
-        // Original definition must still be intact.
-        f.eval("4 sq .").unwrap();
-        assert_eq!(f.out.trim(), "16");
-    }
-
-    #[test]
-    fn test_redefine_confirm_fn_receives_word_name() {
-        // The prompt passed to confirm_fn must mention the word being redefined.
-        let mut f = Forth::new().with_confirm(Box::new(|msg: &str| {
-            assert!(msg.contains("sq"), "prompt must name the word: {msg}");
-            true
-        }));
-        f.eval(": sq dup * ;").unwrap();
-        f.eval(": sq dup dup * * ;").unwrap();
     }
 
     #[test]
