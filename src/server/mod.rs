@@ -8,6 +8,7 @@ mod middleware;
 mod openai_handlers;
 pub mod openai_types; // Public for client access
 mod session;
+pub mod session_registry;
 mod training_worker;
 
 pub use brain_registry::{BrainDetail, BrainRegistry, BrainState, BrainSummary, PendingPlanView, PendingQuestionView, PlanResponse};

@@ -676,73 +676,56 @@ async fn main() -> Result<()> {
 
     // Create and run REPL (with full TUI support)
     // Pass daemon_client so Repl knows whether to suppress local model logs
-    // Session ID — always UUIDv5, always printed for interactive sessions.
-    // --session <name>: derived from the name (shareable, deterministic).
-    // default: derived from hostname + pid + timestamp (unique per session).
+    // Session name and ID.
+    // --session <name>: join that named session (deterministic UUIDv5 from name).
+    // default: generate a cute name (quiet-hill etc.), derive a UUID, print it.
     // Suppressed for pipe / non-interactive use.
-    let session_id = {
-        use uuid::Uuid;
-        // Finch session namespace.
-        let ns = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
+    let (session_name, session_id) = {
+        use finch::session::names;
 
-        // Derive a short human name from any UUID — two words, deterministic.
-        let human_name = |id: &Uuid| {
-            const WORDS: &[&str] = &[
-                "amber","arc","ash","bay","beam","birch","bloom","blue","bolt",
-                "brook","calm","cedar","cinder","cliff","coal","coral","crane",
-                "creek","crest","dawn","dew","drift","dune","echo","elm","ember",
-                "fern","field","flame","flash","flint","fog","ford","forge","frost",
-                "gale","glen","glow","gold","grove","haze","heath","hill","hollow",
-                "iron","jade","lake","lark","leaf","ledge","light","lime","loch",
-                "loom","mast","mead","mist","moon","moss","mud","oak","opal","ore",
-                "peat","pine","pond","pool","quartz","rain","reed","reef","ridge",
-                "rill","ring","rook","root","rose","rune","rush","salt","sand",
-                "scale","shade","shaft","shore","silk","silver","slate","smoke",
-                "snow","sol","spar","spark","spire","spring","star","steel","stem",
-                "stone","storm","stream","swift","tarn","thorn","tide","torch",
-                "vale","vine","wave","wind","wren","yarrow",
-            ];
-            let bytes = id.as_bytes();
-            let a = (bytes[0] as usize * 256 + bytes[1] as usize) % WORDS.len();
-            let b = (bytes[2] as usize * 256 + bytes[3] as usize) % WORDS.len();
-            format!("{}-{}", WORDS[a], WORDS[b])
-        };
-
-        let id = match &args.session {
-            Some(name) => {
-                let id = Uuid::new_v5(&ns, name.as_bytes());
-                if io::stdout().is_terminal() {
-                    let hname = human_name(&id);
-                    output_manager.write_status(format!("✦ {} · {} ({})", hname, id, name));
-                }
-                id
+        let (name, id) = match &args.session {
+            Some(given) => {
+                let id = names::to_uuid(given);
+                (given.clone(), id)
             }
             None => {
-                // Derive from hostname + pid + nanosecond timestamp — unique per session,
-                // reproducible if you know those three values.
-                let hostname = std::env::var("HOSTNAME")
-                    .or_else(|_| std::env::var("COMPUTERNAME"))
-                    .unwrap_or_else(|_| "localhost".to_string());
-                let seed = format!(
-                    "{}:{}:{}",
-                    hostname,
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0),
-                );
-                let id = Uuid::new_v5(&ns, seed.as_bytes());
-                if io::stdout().is_terminal() {
-                    let hname = human_name(&id);
-                    output_manager.write_status(format!("✦ {} · {}", hname, id));
-                }
-                id
+                let name = names::generate();
+                let id = names::to_uuid(&name);
+                (name, id)
             }
         };
-        id
+
+        if io::stdout().is_terminal() {
+            if args.session.is_some() {
+                output_manager.write_status(format!(
+                    "  session: {}  (id: {})",
+                    name, id
+                ));
+            } else {
+                output_manager.write_status(format!(
+                    "  session: {}  (finch --session {} to join)",
+                    name, name
+                ));
+            }
+        }
+
+        // If a daemon is running, register / join the session so other terminals
+        // with the same name can share the broadcast channel.
+        if let Some(ref client) = daemon_client {
+            let url = format!("{}/v1/session/join", client.base_url());
+            let body = serde_json::json!({ "name": name });
+            // Fire-and-forget — failure just means no cross-terminal broadcast.
+            let _ = reqwest::Client::new()
+                .post(&url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await;
+        }
+
+        (name, id)
     };
-    let _ = session_id; // available for future use (daemon routing, shared stacks)
+    let _ = (session_name, session_id); // available for future use (daemon routing, shared stacks)
 
     let mut repl = Repl::new(config, claude_client, router, metrics_logger, daemon_client).await;
 

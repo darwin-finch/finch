@@ -90,6 +90,9 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/settle",             post(handle_settle))
         // Session WebSocket — bidirectional event bus between two finch nodes
         .route("/v1/session/ws", get(handle_session_ws))
+        // Named session registry
+        .route("/v1/session/join", post(handle_session_join))
+        .route("/v1/session/list", get(handle_session_list))
         // Health and metrics
         .route("/health", get(health_check))
         .route("/metrics", get(metrics_endpoint))
@@ -1186,6 +1189,17 @@ async fn handle_exec(
 use once_cell::sync::Lazy;
 use tokio::sync::{broadcast, Mutex};
 
+// ── Named session registry ────────────────────────────────────────────────────
+
+/// Daemon-wide named session registry.
+/// Clients POST /v1/session/join to get a broadcast sender for a named session.
+pub static SESSION_REGISTRY: Lazy<std::sync::Arc<tokio::sync::Mutex<crate::server::session_registry::SessionRegistry>>> =
+    Lazy::new(|| {
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::server::session_registry::SessionRegistry::new(),
+        ))
+    });
+
 /// Broadcast channel that delivers new SessionBus handles to whoever is
 /// listening (typically the AI event loop).
 static SESSION_BUS_TX: Lazy<broadcast::Sender<()>> = Lazy::new(|| {
@@ -1217,4 +1231,73 @@ pub async fn accept_session_bus() -> Option<crate::session::SessionBus> {
 /// Subscribe to new-session notifications.
 pub fn session_bus_notifications() -> broadcast::Receiver<()> {
     SESSION_BUS_TX.subscribe()
+}
+
+// ── Named session HTTP endpoints ──────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct SessionJoinRequest {
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionJoinResponse {
+    id: String,
+    name: String,
+    /// WebSocket URL to use for this session's broadcast channel.
+    ws_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionListEntry {
+    name: String,
+    id: String,
+    peers: usize,
+}
+
+/// POST /v1/session/join — join (or create) a named session.
+///
+/// Body: `{"name": "quiet-hill"}`
+///
+/// Returns the session UUID and a WebSocket URL for the broadcast channel.
+/// Two clients that POST the same name will get the same UUID and can therefore
+/// connect to the same WebSocket session.
+async fn handle_session_join(
+    State(server): State<Arc<AgentServer>>,
+    Json(req): Json<SessionJoinRequest>,
+) -> Result<Json<SessionJoinResponse>, AppError> {
+    if req.name.trim().is_empty() {
+        return Err(AppError(anyhow::anyhow!("session name must not be empty")));
+    }
+
+    let (id, _tx) = SESSION_REGISTRY.lock().await.get_or_create(&req.name);
+
+    // Build a ws:// URL pointing to this daemon's session WebSocket endpoint.
+    let ws_url = format!(
+        "ws://{}/v1/session/ws?session={}",
+        server.config().bind_address,
+        id
+    );
+
+    Ok(Json(SessionJoinResponse {
+        id: id.to_string(),
+        name: req.name,
+        ws_url,
+    }))
+}
+
+/// GET /v1/session/list — list all active named sessions.
+async fn handle_session_list() -> Json<Vec<SessionListEntry>> {
+    let entries = SESSION_REGISTRY
+        .lock()
+        .await
+        .list()
+        .into_iter()
+        .map(|(name, id, peers)| SessionListEntry {
+            name,
+            id: id.to_string(),
+            peers,
+        })
+        .collect();
+    Json(entries)
 }

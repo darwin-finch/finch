@@ -11,6 +11,7 @@
 //
 // Wire encoding: newline-delimited JSON (one SessionEvent per line).
 
+pub mod names;
 pub mod transport;
 
 use anyhow::Result;
