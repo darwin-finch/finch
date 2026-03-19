@@ -97,6 +97,9 @@ pub enum Command {
     RoomRemove(String),           // /room remove <name-or-addr>
     RoomList,                     // /room list    — list all rooms + member counts
     SelfFix,                      // /self-fix     — diagnose, fix, verify, restart
+    // Diff proposal flow
+    Accept(Option<String>),       // /accept [diff-id-prefix] — accept most-recent (or matched) pending diff
+    Reject(Option<String>),       // /reject [reason]         — reject most-recent pending diff
 }
 
 impl Command {
@@ -150,11 +153,24 @@ impl Command {
             "/share" | "/prove" | "/proof" => return Some(Command::Share),
             "/box-diff" | "/cluster-diff" | "/cdiff" => return Some(Command::BoxDiff),
             "/self-fix" | "/fix" | "/repair" => return Some(Command::SelfFix),
+            // Diff proposal flow (no-arg forms)
+            "/accept" => return Some(Command::Accept(None)),
+            "/reject" => return Some(Command::Reject(None)),
             _ => {}
         }
 
         // Handle /license activate <key>
         // Peer connect / disconnect
+        // Diff proposal flow with arguments
+        if let Some(rest) = trimmed.strip_prefix("/accept ") {
+            let prefix = rest.trim();
+            return Some(Command::Accept(if prefix.is_empty() { None } else { Some(prefix.to_string()) }));
+        }
+        if let Some(rest) = trimmed.strip_prefix("/reject ") {
+            let reason = rest.trim();
+            return Some(Command::Reject(if reason.is_empty() { None } else { Some(reason.to_string()) }));
+        }
+
         if let Some(rest) = trimmed.strip_prefix("/connect ") {
             let addr = rest.trim();
             if !addr.is_empty() {
@@ -622,6 +638,11 @@ pub fn handle_command(
         Command::SelfFix => Ok(CommandOutput::Status(
             "SelfFix command should be handled in REPL.".to_string(),
         )),
+        // Diff proposal flow — handled in the REPL event loop
+        Command::Accept(_)
+        | Command::Reject(_) => Ok(CommandOutput::Status(
+            "Diff command should be handled in REPL.".to_string(),
+        )),
     }
 }
 
@@ -740,6 +761,13 @@ pub fn format_help() -> String {
          \x1b[90m  Type text to push words. The AI pushes back via Push tool.\n\
          The stack builds a Forth dialect. /run executes it.\x1b[0m\n\
          \x1b[90m  /run collapses the stack and executes it.\x1b[0m\n\n\
+         \x1b[1;33m🔀 Diff Proposal Flow:\x1b[0m\n\
+         \x1b[90m  Peers (AI or remote) propose diffs in the room. You argue back in chat.\x1b[0m\n\
+         \x1b[90m  When you're satisfied, accept or reject:\x1b[0m\n\
+         \x1b[36m  /accept\x1b[0m            Apply the most recent pending diff\n\
+         \x1b[36m  /accept <prefix>\x1b[0m   Apply the diff whose id starts with prefix\n\
+         \x1b[36m  /reject [reason]\x1b[0m   Reject the most recent pending diff\n\
+         \x1b[0m\n\
          \x1b[1;33m🧠 Daemon Brain Sessions:\x1b[0m\n\
          \x1b[36m  /brain <task>\x1b[0m      Spawn a background research brain\n\
          \x1b[90m                     Example: /brain investigate why auth tests are flaky\x1b[0m\n\

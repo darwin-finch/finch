@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::claude::ContentBlock;
 use crate::cli::commands::{format_help, Command};
 use crate::cli::conversation::ConversationHistory;
+use crate::session::diff_store::DiffStore;
 use crate::cli::output_manager::OutputManager;
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
@@ -280,6 +281,14 @@ pub struct EventLoop {
 
     /// Active peers: (UUID, display-name) for each forked loop.
     peer_sessions: Vec<(Uuid, String)>,
+
+    /// In-memory store of pending diff proposals in the room.
+    diff_store: DiffStore,
+
+    /// Broadcast receiver that sees every SessionEvent sent on peer_tx.
+    /// Used to intercept Diff/DiffEdit/DiffAccept/DiffReject events from peers
+    /// without routing them through the plain-text peer_inbox_rx.
+    peer_session_rx: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
 }
 
 /// View mode for the REPL
@@ -827,7 +836,7 @@ impl EventLoop {
 
         // Peer channels — boot_peers() finishes wiring in run() (async context).
         let (peer_inbox_tx, peer_inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
-        let (peer_tx, _) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
+        let (peer_tx, peer_session_rx) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
         let peer_sessions: Vec<(Uuid, String)> = Vec::new();
 
         Self {
@@ -901,6 +910,8 @@ impl EventLoop {
             peer_inbox_tx,
             peer_inbox_rx,
             peer_sessions,
+            diff_store: DiffStore::new(),
+            peer_session_rx,
         }
     }
 
@@ -1569,6 +1580,72 @@ s" it is ours"      s" -1 is ours"     argue
                     let _ = id; // available for filtering if needed
                     let _ = self.event_tx.send(ReplEvent::PeerMessage { text: format!("{name}: {text}") });
                 }
+
+                // Structured session events from peers (Diff proposals, edits, accepts, rejects)
+                ev = self.peer_session_rx.recv() => {
+                    match ev {
+                        Ok(crate::session::SessionEvent::Diff { id, label, patch, description }) => {
+                            // Find the proposer name from session list (unknown if not found)
+                            let proposed_by = "peer".to_string();
+                            self.diff_store.propose(id, label.clone(), patch.clone(), description.clone(), proposed_by.clone());
+                            self.render_diff_proposal(id, &label, &patch, description.as_deref(), &proposed_by);
+                            if let Err(e) = self.render_tui().await {
+                                tracing::warn!("TUI render after Diff proposal failed: {e}");
+                            }
+                        }
+                        Ok(crate::session::SessionEvent::DiffEdit { diff_id, patch, description }) => {
+                            self.diff_store.edit(diff_id, patch.clone(), description.clone());
+                            if let Some(d) = self.diff_store.get(diff_id) {
+                                let label = d.label.clone();
+                                let proposed_by = d.proposed_by.clone();
+                                use crossterm::style::Stylize;
+                                self.output_manager.write_info(format!(
+                                    "{}  {} revised diff for {}",
+                                    "↻".yellow(),
+                                    proposed_by.as_str().cyan(),
+                                    label.as_str().white(),
+                                ));
+                                self.render_diff_proposal(diff_id, &label, &patch, description.as_deref(), &proposed_by);
+                            }
+                            if let Err(e) = self.render_tui().await {
+                                tracing::warn!("TUI render after DiffEdit failed: {e}");
+                            }
+                        }
+                        Ok(crate::session::SessionEvent::DiffAccept { diff_id }) => {
+                            if let Some(d) = self.diff_store.accept(diff_id) {
+                                use crossterm::style::Stylize;
+                                self.output_manager.write_info(format!(
+                                    "{}  diff {} accepted",
+                                    "✓".green(),
+                                    &d.id.to_string()[..8].white(),
+                                ));
+                            }
+                            if let Err(e) = self.render_tui().await {
+                                tracing::warn!("TUI render after DiffAccept failed: {e}");
+                            }
+                        }
+                        Ok(crate::session::SessionEvent::DiffReject { diff_id, reason }) => {
+                            self.diff_store.reject(diff_id, reason.clone());
+                            use crossterm::style::Stylize;
+                            let reason_str = reason.as_deref().unwrap_or("no reason given");
+                            self.output_manager.write_info(format!(
+                                "{}  diff {} rejected: {}",
+                                "✗".red(),
+                                &diff_id.to_string()[..8].white(),
+                                reason_str.dark_grey(),
+                            ));
+                            if let Err(e) = self.render_tui().await {
+                                tracing::warn!("TUI render after DiffReject failed: {e}");
+                            }
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Other session events or lag — ignore here (handled elsewhere)
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            // Channel closed — nothing to do
+                        }
+                    }
+                }
             }
         }
 
@@ -2043,6 +2120,12 @@ Rules:\n\
                     }
                     Command::RoomList => {
                         self.handle_room_list().await?;
+                    }
+                    Command::Accept(prefix) => {
+                        self.handle_accept(prefix).await?;
+                    }
+                    Command::Reject(reason) => {
+                        self.handle_reject(reason).await?;
                     }
                     _ => {
                         // All other commands output to scrollback via write_info
@@ -3028,6 +3111,207 @@ Rules:\n\
         }
 
         Ok(())
+    }
+
+    // ── Diff proposal rendering ───────────────────────────────────────────────
+
+    /// Render a diff proposal visually in the room output.
+    ///
+    /// ```text
+    /// peer-a1b2c3d4 proposes: src/session/mod.rs
+    /// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    /// - old line
+    /// + new line
+    /// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    /// "adds Diff variant to SessionEvent"
+    /// [accept: /accept <id>] [reject: /reject <reason>]
+    /// ```
+    fn render_diff_proposal(
+        &self,
+        id: uuid::Uuid,
+        label: &str,
+        patch: &str,
+        description: Option<&str>,
+        proposed_by: &str,
+    ) {
+        use crossterm::style::Stylize;
+        const BAR: &str = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+
+        let short_id = &id.to_string()[..8];
+
+        // Header
+        let id_tag = format!("[id: {}]", short_id);
+        self.output_manager.write_info(format!(
+            "{} proposes: {}  {}",
+            proposed_by.cyan(),
+            label.white().bold(),
+            id_tag.as_str().dark_grey(),
+        ));
+        self.output_manager.write_info(BAR.dark_grey().to_string());
+
+        // Patch lines — colour additions green, removals red
+        for line in patch.lines() {
+            let rendered = if line.starts_with('+') && !line.starts_with("+++") {
+                line.green().to_string()
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                line.red().to_string()
+            } else if line.starts_with("@@") {
+                line.cyan().to_string()
+            } else {
+                line.dark_grey().to_string()
+            };
+            self.output_manager.write_info(rendered);
+        }
+
+        self.output_manager.write_info(BAR.dark_grey().to_string());
+
+        // Optional description
+        if let Some(desc) = description {
+            self.output_manager.write_info(format!("  \"{}\"", desc.dark_grey()));
+        }
+
+        // Action hints
+        self.output_manager.write_info(format!(
+            "  {}  {}",
+            format!("[accept: /accept {}]", short_id).as_str().green(),
+            "[reject: /reject <reason>]".dark_grey(),
+        ));
+    }
+
+    /// Handle `/accept [prefix]` — apply the patch and notify peers.
+    async fn handle_accept(&mut self, prefix: Option<String>) -> Result<()> {
+        use crossterm::style::Stylize;
+
+        let diff_id = {
+            let d = self.diff_store.resolve_pending(prefix.as_deref());
+            match d {
+                None => {
+                    self.output_manager.write_info(
+                        "no pending diff to accept".dark_grey().to_string()
+                    );
+                    return self.render_tui().await;
+                }
+                Some(d) => d.id,
+            }
+        };
+
+        // Mark as accepted in store
+        let (label, patch) = {
+            if let Some(d) = self.diff_store.accept(diff_id) {
+                (d.label.clone(), d.patch.clone())
+            } else {
+                self.output_manager.write_info("diff not found".dark_grey().to_string());
+                return self.render_tui().await;
+            }
+        };
+
+        // Apply the patch: write the patched content to the file.
+        // We implement a simple unified-diff applicator inline.
+        let apply_result = self.apply_unified_diff(&label, &patch);
+        match apply_result {
+            Ok(()) => {
+                self.output_manager.write_info(format!(
+                    "{}  applied diff to {}",
+                    "✓".green(),
+                    label.as_str().white(),
+                ));
+            }
+            Err(e) => {
+                self.output_manager.write_info(format!(
+                    "{}  failed to apply diff to {}: {}",
+                    "✗".red(),
+                    label.as_str().white(),
+                    e,
+                ));
+            }
+        }
+
+        // Broadcast DiffAccept so the proposing peer knows
+        let _ = self.peer_tx.send(crate::session::SessionEvent::diff_accept(diff_id));
+        self.render_tui().await
+    }
+
+    /// Apply a unified diff patch to a file on disk.
+    ///
+    /// This is a simple line-based applicator that handles the most common
+    /// unified diff format (`--- a/file`, `+++ b/file`, `@@ ... @@` hunks).
+    /// It is not a full POSIX patch implementation — it is good enough for
+    /// AI-proposed diffs that the AI has computed against the current file.
+    fn apply_unified_diff(&self, label: &str, patch: &str) -> anyhow::Result<()> {
+        use std::path::Path;
+
+        // Extract the target filename from the patch's `+++ b/...` line,
+        // falling back to `label` if not found.
+        let target_path = patch
+            .lines()
+            .find(|l| l.starts_with("+++ "))
+            .and_then(|l| {
+                let s = l.trim_start_matches("+++ ");
+                // Strip `b/` prefix if present
+                let s = s.strip_prefix("b/").unwrap_or(s);
+                // Strip timestamp suffix (a tab followed by date)
+                let s = s.split('\t').next().unwrap_or(s);
+                if s == "/dev/null" { None } else { Some(s.to_string()) }
+            })
+            .unwrap_or_else(|| label.to_string());
+
+        let path = Path::new(&target_path);
+
+        // Read original file (empty if it doesn't exist — new-file diff)
+        let original: Vec<String> = if path.exists() {
+            std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("could not read {}: {}", target_path, e))?
+                .lines()
+                .map(|l| l.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let patched = apply_patch_lines(&original, patch)
+            .map_err(|e| anyhow::anyhow!("patch failed: {}", e))?;
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow::anyhow!("could not create dirs: {}", e))?;
+            }
+        }
+        std::fs::write(path, patched.join("\n") + "\n")
+            .map_err(|e| anyhow::anyhow!("could not write {}: {}", target_path, e))?;
+
+        Ok(())
+    }
+
+    /// Handle `/reject [reason]` — reject the most recent pending diff and notify peers.
+    async fn handle_reject(&mut self, reason: Option<String>) -> Result<()> {
+        use crossterm::style::Stylize;
+
+        let diff_id = {
+            let d = self.diff_store.resolve_pending(None);
+            match d {
+                None => {
+                    self.output_manager.write_info(
+                        "no pending diff to reject".dark_grey().to_string()
+                    );
+                    return self.render_tui().await;
+                }
+                Some(d) => d.id,
+            }
+        };
+
+        self.diff_store.reject(diff_id, reason.clone());
+        let reason_str = reason.clone().unwrap_or_default();
+        self.output_manager.write_info(format!(
+            "{}  diff {} rejected{}",
+            "✗".red(),
+            &diff_id.to_string()[..8].white(),
+            if reason_str.is_empty() { String::new() } else { format!(": {}", reason_str) },
+        ));
+
+        // Broadcast DiffReject so the proposing peer knows
+        let _ = self.peer_tx.send(crate::session::SessionEvent::diff_reject(diff_id, reason));
+        self.render_tui().await
     }
 
     /// `/machines` — show known peer machines from LAN discovery.
@@ -6293,6 +6577,101 @@ pub(crate) fn dialog_result_to_confirmation(
         },
         _ => ConfirmationResult::Deny,
     }
+}
+
+// ── Unified diff applicator ───────────────────────────────────────────────────
+//
+// A line-based applicator for the unified diff format produced by `diff -u`.
+// Handles context, additions, and deletions.  Does not handle "no newline at
+// end of file" markers (`\ No newline at end of file`) — they are ignored.
+
+fn apply_patch_lines(original: &[String], patch: &str) -> anyhow::Result<Vec<String>> {
+    let mut result: Vec<String> = Vec::new();
+    let mut orig_pos: usize = 0; // 0-based index into `original`
+
+    let mut in_hunk = false;
+    // Per-hunk state
+    let mut hunk_orig_start: usize = 0;
+    let mut hunk_orig_len: usize = 0;
+    let mut hunk_orig_consumed: usize = 0;
+
+    for line in patch.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            // File header — skip
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            // Parse: @@ -l,s +l,s @@
+            // e.g.  @@ -3,7 +3,6 @@
+            if in_hunk {
+                // Flush the rest of the previous hunk
+                while hunk_orig_consumed < hunk_orig_len {
+                    let idx = hunk_orig_start + hunk_orig_consumed;
+                    if idx < original.len() {
+                        result.push(original[idx].clone());
+                    }
+                    hunk_orig_consumed += 1;
+                }
+            }
+            // Parse the @@ line
+            let (os, ol) = parse_hunk_header(line)?;
+            // Copy unmodified lines from current position up to this hunk's start
+            let hunk_start_0 = os.saturating_sub(1); // convert 1-based to 0-based
+            while orig_pos < hunk_start_0 && orig_pos < original.len() {
+                result.push(original[orig_pos].clone());
+                orig_pos += 1;
+            }
+            hunk_orig_start = hunk_start_0;
+            hunk_orig_len = ol;
+            hunk_orig_consumed = 0;
+            in_hunk = true;
+            orig_pos = hunk_start_0;
+            continue;
+        }
+        if !in_hunk {
+            continue;
+        }
+        if line.starts_with('\\') {
+            // "\ No newline at end of file" — ignore
+            continue;
+        }
+        if let Some(content) = line.strip_prefix(' ') {
+            // Context line — keep it
+            result.push(content.to_string());
+            hunk_orig_consumed += 1;
+            orig_pos += 1;
+        } else if let Some(content) = line.strip_prefix('+') {
+            // Addition — insert it
+            result.push(content.to_string());
+        } else if line.starts_with('-') {
+            // Removal — skip the original line
+            hunk_orig_consumed += 1;
+            orig_pos += 1;
+        }
+    }
+
+    // After all hunks: flush remaining original lines
+    while orig_pos < original.len() {
+        result.push(original[orig_pos].clone());
+        orig_pos += 1;
+    }
+
+    Ok(result)
+}
+
+/// Parse the `-l,s` part of `@@ -l,s +l,s @@`.
+/// Returns `(start, len)` for the original (minus) side.
+fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
+    // Format: @@ -<start>[,<len>] +<start>[,<len>] @@
+    let rest = line.strip_prefix("@@ ").ok_or_else(|| anyhow::anyhow!("bad hunk header: {line}"))?;
+    let minus = rest.split_whitespace().next()
+        .ok_or_else(|| anyhow::anyhow!("no minus range in hunk header"))?;
+    let minus = minus.strip_prefix('-')
+        .ok_or_else(|| anyhow::anyhow!("minus range doesn't start with '-': {minus}"))?;
+    let (start_str, len_str) = minus.split_once(',').unwrap_or((minus, "1"));
+    let start: usize = start_str.parse().map_err(|_| anyhow::anyhow!("bad start in hunk: {start_str}"))?;
+    let len: usize = len_str.parse().map_err(|_| anyhow::anyhow!("bad len in hunk: {len_str}"))?;
+    Ok((start, len))
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@
 //
 // Wire encoding: newline-delimited JSON (one SessionEvent per line).
 
+pub mod diff_store;
 pub mod names;
 pub mod transport;
 
@@ -27,6 +28,36 @@ use uuid::Uuid;
 pub enum SessionEvent {
     /// A plain chat message.
     Chat { text: String },
+
+    /// A proposed diff — unified diff format, against a named file or buffer.
+    /// Any peer can propose; others can accept, edit, or comment.
+    Diff {
+        /// Unique ID for this proposal (so edits and accepts can reference it).
+        id: Uuid,
+        /// Display name — file path, buffer name, or free label.
+        label: String,
+        /// Unified diff text (--- a/... +++ b/... @@ ... @@).
+        patch: String,
+        /// Optional prose description of what this diff does.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+
+    /// An edit to a previously proposed diff — replaces the patch.
+    DiffEdit {
+        /// The diff proposal being edited.
+        diff_id: Uuid,
+        /// New patch text.
+        patch: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+
+    /// Accept a proposed diff (apply it).
+    DiffAccept { diff_id: Uuid },
+
+    /// Reject a proposed diff.
+    DiffReject { diff_id: Uuid, reason: Option<String> },
 
     /// One side asks the other to render a dialog and respond.
     Dialog { id: Uuid, spec: DialogSpec },
@@ -125,6 +156,23 @@ impl SessionPair {
 impl SessionEvent {
     pub fn chat(text: impl Into<String>) -> Self {
         SessionEvent::Chat { text: text.into() }
+    }
+
+    pub fn diff(label: impl Into<String>, patch: impl Into<String>, description: Option<String>) -> (Self, Uuid) {
+        let id = Uuid::new_v4();
+        (SessionEvent::Diff { id, label: label.into(), patch: patch.into(), description }, id)
+    }
+
+    pub fn diff_edit(diff_id: Uuid, patch: impl Into<String>, description: Option<String>) -> Self {
+        SessionEvent::DiffEdit { diff_id, patch: patch.into(), description }
+    }
+
+    pub fn diff_accept(diff_id: Uuid) -> Self {
+        SessionEvent::DiffAccept { diff_id }
+    }
+
+    pub fn diff_reject(diff_id: Uuid, reason: Option<String>) -> Self {
+        SessionEvent::DiffReject { diff_id, reason }
     }
 
     pub fn dialog(spec: DialogSpec) -> (Self, Uuid) {
