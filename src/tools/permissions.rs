@@ -52,6 +52,20 @@ impl Default for ToolPermissionConfig {
     }
 }
 
+/// Who is executing the tool — affects permission defaults.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecutorRole {
+    /// The human owner of the session. Default rules apply as configured.
+    Owner,
+    /// An AI peer in the room. Asymmetric rules:
+    ///   - Read/glob/grep: Allow silently
+    ///   - Write/edit/patch: surfaces as DiffPropose in the room (never auto-apply)
+    ///   - Bash (read-only patterns): Allow
+    ///   - Bash (side-effects): AskUser — dialog appears in the shared room
+    ///   - Restart/recompile: always Deny
+    Peer,
+}
+
 /// Permission manager - checks if tool execution is allowed
 pub struct PermissionManager {
     /// Per-tool configuration
@@ -62,15 +76,29 @@ pub struct PermissionManager {
 
     /// Maximum number of tool turns (prevent infinite loops)
     pub max_tool_turns: usize,
+
+    /// Role of the executor — Owner gets configured rules, Peer gets asymmetric rules.
+    pub role: ExecutorRole,
 }
 
 impl PermissionManager {
-    /// Create new permission manager with default settings
+    /// Create new permission manager with default settings (Owner role).
     pub fn new() -> Self {
         Self {
             configs: HashMap::new(),
             default_rule: PermissionRule::Ask,
             max_tool_turns: 25,
+            role: ExecutorRole::Owner,
+        }
+    }
+
+    /// Create a permission manager for an AI peer (asymmetric rules).
+    pub fn for_peer() -> Self {
+        Self {
+            configs: HashMap::new(),
+            default_rule: PermissionRule::Ask,
+            max_tool_turns: 25,
+            role: ExecutorRole::Peer,
         }
     }
 
@@ -80,6 +108,7 @@ impl PermissionManager {
             configs,
             default_rule: PermissionRule::Ask,
             max_tool_turns: 25,
+            role: ExecutorRole::Owner,
         }
     }
 
@@ -102,6 +131,11 @@ impl PermissionManager {
 
     /// Check if tool execution is permitted
     pub fn check_tool_use(&self, tool_name: &str, input: &Value) -> PermissionCheck {
+        // Peer role: asymmetric rules take precedence over per-tool config
+        if self.role == ExecutorRole::Peer {
+            return self.check_peer_tool_use(tool_name, input);
+        }
+
         // Get tool config or use default
         let config = self.configs.get(tool_name);
 
@@ -131,6 +165,48 @@ impl PermissionManager {
             PermissionRule::Deny => {
                 PermissionCheck::Deny(format!("Tool '{}' is not allowed", tool_name))
             }
+        }
+    }
+
+    /// Asymmetric permission check for AI peers.
+    fn check_peer_tool_use(&self, tool_name: &str, input: &Value) -> PermissionCheck {
+        // Hard deny: peer cannot restart/recompile/kill the session
+        if matches!(tool_name, "restart" | "spawn") {
+            return PermissionCheck::Deny(
+                "Peer cannot restart or spawn processes".to_string(),
+            );
+        }
+
+        // Constitutional constraints still apply to everyone
+        if let Some(reason) = self.check_constitutional_constraints(tool_name, input) {
+            return PermissionCheck::Deny(reason);
+        }
+
+        match tool_name {
+            // Silent allow: read-only examination
+            "read" | "glob" | "grep" => PermissionCheck::Allow,
+
+            // Write/edit/patch: must surface as diff proposal in the room
+            // The caller (peer loop) is responsible for converting Allow here into
+            // a DiffPropose SessionEvent rather than applying directly.
+            "write" | "edit" | "patch" => {
+                PermissionCheck::AskUser("Peer proposes a file change — review diff".to_string())
+            }
+
+            // Bash: allow read-only commands silently, ask for everything else
+            "bash" => {
+                let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                if is_readonly_bash(command) {
+                    PermissionCheck::Allow
+                } else {
+                    PermissionCheck::AskUser(
+                        "Peer wants to run a shell command — approve?".to_string(),
+                    )
+                }
+            }
+
+            // Everything else: ask
+            _ => PermissionCheck::AskUser(format!("Peer wants to use '{}' — approve?", tool_name)),
         }
     }
 
@@ -287,6 +363,28 @@ impl PermissionManager {
     }
 }
 
+/// Returns true if a bash command is read-only (no side effects).
+///
+/// Conservative: any shell operator (`;`, `|`, `>`, `<`, `&`) causes a false return,
+/// because operators can chain destructive commands after a harmless-looking prefix.
+fn is_readonly_bash(command: &str) -> bool {
+    let trimmed = command.trim();
+
+    // Reject anything that could chain or redirect — too hard to parse safely.
+    // This catches "ls; rm file", "cat foo | tee out", "echo hi > file", etc.
+    if trimmed.chars().any(|c| matches!(c, ';' | '|' | '>' | '<' | '&')) {
+        return false;
+    }
+
+    let readonly_prefixes = [
+        "ls", "cat", "head", "tail", "echo", "pwd", "find", "grep", "rg",
+        "wc", "diff", "file", "stat", "which", "type", "env", "printenv",
+        "uname", "whoami", "id", "ps", "df", "du", "lsof", "netstat", "ss",
+        "curl -s", "curl --silent",
+    ];
+    readonly_prefixes.iter().any(|p| trimmed.starts_with(p))
+}
+
 impl Default for PermissionManager {
     fn default() -> Self {
         Self::new()
@@ -405,6 +503,156 @@ mod tests {
         let input = serde_json::json!({"command": "ls"});
         let check = manager.check_tool_use("bash", &input);
         assert!(matches!(check, PermissionCheck::Deny(_)));
+    }
+
+    // ── ExecutorRole::Peer tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_peer_cannot_restart() {
+        let mgr = PermissionManager::for_peer();
+        let input = serde_json::json!({});
+        assert!(
+            matches!(mgr.check_tool_use("restart", &input), PermissionCheck::Deny(_)),
+            "Peer must not be allowed to restart"
+        );
+    }
+
+    #[test]
+    fn test_peer_cannot_spawn() {
+        let mgr = PermissionManager::for_peer();
+        let input = serde_json::json!({});
+        assert!(
+            matches!(mgr.check_tool_use("spawn", &input), PermissionCheck::Deny(_)),
+            "Peer must not be allowed to spawn processes"
+        );
+    }
+
+    #[test]
+    fn test_peer_read_glob_grep_silently_allowed() {
+        let mgr = PermissionManager::for_peer();
+        for tool in &["read", "glob", "grep"] {
+            let input = serde_json::json!({"file_path": "/tmp/safe.txt"});
+            assert!(
+                matches!(mgr.check_tool_use(tool, &input), PermissionCheck::Allow),
+                "Peer should silently allow {}",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_peer_write_edit_patch_surfaces_as_ask() {
+        let mgr = PermissionManager::for_peer();
+        for tool in &["write", "edit", "patch"] {
+            let input = serde_json::json!({"file_path": "/tmp/file.txt", "content": "x"});
+            assert!(
+                matches!(mgr.check_tool_use(tool, &input), PermissionCheck::AskUser(_)),
+                "Peer {} must surface as AskUser (diff proposal), not auto-apply",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_peer_readonly_bash_silently_allowed() {
+        let mgr = PermissionManager::for_peer();
+        let readonly_cmds = ["ls -la", "cat README.md", "grep foo src/", "pwd", "whoami"];
+        for cmd in &readonly_cmds {
+            let input = serde_json::json!({"command": cmd});
+            assert!(
+                matches!(mgr.check_tool_use("bash", &input), PermissionCheck::Allow),
+                "Peer should silently allow readonly bash: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_peer_bash_with_side_effects_requires_ask() {
+        let mgr = PermissionManager::for_peer();
+        let side_effect_cmds = ["git commit -m 'x'", "cargo build", "touch file.txt", "mkdir foo"];
+        for cmd in &side_effect_cmds {
+            let input = serde_json::json!({"command": cmd});
+            assert!(
+                matches!(mgr.check_tool_use("bash", &input), PermissionCheck::AskUser(_)),
+                "Peer bash with side effects must require AskUser: {}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn test_peer_constitutional_constraints_still_apply() {
+        let mgr = PermissionManager::for_peer();
+        // Even a peer cannot run rm -rf
+        let input = serde_json::json!({"command": "rm -rf /"});
+        assert!(
+            matches!(mgr.check_tool_use("bash", &input), PermissionCheck::Deny(_)),
+            "Constitutional constraints must apply to peers too"
+        );
+    }
+
+    // ── is_readonly_bash tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_readonly_bash_simple_ls() {
+        assert!(is_readonly_bash("ls -la"), "ls -la is readonly");
+        assert!(is_readonly_bash("ls"), "bare ls is readonly");
+    }
+
+    #[test]
+    fn test_is_readonly_bash_cat_grep_wc() {
+        assert!(is_readonly_bash("cat README.md"));
+        assert!(is_readonly_bash("grep -r foo src/"));
+        assert!(is_readonly_bash("wc -l file.txt"));
+    }
+
+    #[test]
+    fn test_is_readonly_bash_rejects_write_commands() {
+        assert!(!is_readonly_bash("rm file"), "rm is not readonly");
+        assert!(!is_readonly_bash("git commit -m x"), "git commit is not readonly");
+        assert!(!is_readonly_bash("touch foo"), "touch is not readonly");
+        assert!(!is_readonly_bash("mkdir bar"), "mkdir is not readonly");
+    }
+
+    #[test]
+    fn test_is_readonly_bash_pipe_chain_is_rejected() {
+        // Security: "ls; rm file" starts with "ls" but is destructive
+        assert!(
+            !is_readonly_bash("ls; rm file"),
+            "semicolon-chained command must be rejected"
+        );
+        assert!(
+            !is_readonly_bash("cat foo | tee out.txt"),
+            "pipe to tee (writes file) must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_is_readonly_bash_redirect_is_rejected() {
+        assert!(
+            !is_readonly_bash("echo hi > file.txt"),
+            "stdout redirect must be rejected"
+        );
+        assert!(
+            !is_readonly_bash("cat foo >> bar"),
+            "append redirect must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_is_readonly_bash_background_is_rejected() {
+        assert!(
+            !is_readonly_bash("ls &"),
+            "background operator must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_is_readonly_bash_leading_spaces_handled() {
+        // Leading spaces after trim still resolve to the correct prefix
+        assert!(is_readonly_bash("  ls -la"), "leading spaces should be trimmed");
+        assert!(is_readonly_bash("  cat file"), "leading spaces should be trimmed");
     }
 
     #[test]

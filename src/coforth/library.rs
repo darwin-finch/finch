@@ -34,6 +34,8 @@ pub struct WordEntry {
     #[serde(default)]
     pub sense: Option<String>, // disambiguating label e.g. "game", "romantic", "physics"
     #[serde(default)]
+    pub stack_effect: Option<String>, // Forth stack-effect comment e.g. "( n n -- n )"
+    #[serde(default)]
     pub boot: bool, // if true, Forth code runs at startup (used for boot poetry etc.)
     #[serde(default)]
     pub remote: bool, // if true, peers may call this word via /v1/forth/eval
