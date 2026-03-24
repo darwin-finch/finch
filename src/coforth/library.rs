@@ -1462,6 +1462,7 @@ variable it   \ implicit register — the thing most recently produced
 \ Proof: love and hate are structurally the same — both reversible by one operation.
 \ love 5 = 10; 10 2/ = 5.   hate 5 = -5; -5 negate = 5.
 \ Both return to origin.  Same shape.  Different direction.
+: test:love<>peace  love peace <> assert ;
 : test:love-hate-same-depth
   \ love then forget = n.  hate twice = n.  Both return to origin.
   s" 5 love drop"   s" 5 hate hate"   argue ;
@@ -2010,6 +2011,8 @@ variable it   \ implicit register — the thing most recently produced
 : callback    ( -- ) ;   \ callback function
 
 : same      ( str1 str2 -- )  argue ;   \ kept: two sentences must agree
+
+: finch     ( -- )  gen" " ;   \ the AI itself
 
 "#;
 
@@ -4436,6 +4439,20 @@ kind = "task"
 forth = "file-slice"
 
 [[word]]
+word = "file-zip"
+definition = "zip a file or directory into a zip archive  ( src dest -- )"
+related = ["file-unzip", "file-sha256", "file-fetch"]
+kind = "task"
+forth = "file-zip"
+
+[[word]]
+word = "file-unzip"
+definition = "extract a zip archive into a directory  ( zip dest -- )"
+related = ["file-zip", "file-fetch", "file-sha256"]
+kind = "task"
+forth = "file-unzip"
+
+[[word]]
 word = "file-sha256"
 definition = "read a file and push its SHA-256 hex digest  ( path -- hash )"
 related = ["sha256", "file-sha256-range", "verify", "check"]
@@ -4592,6 +4609,24 @@ mod tests {
     fn test_seed_loads() {
         let lib = Library::load();
         assert!(lib.len() > 50, "seed should have at least 50 words");
+    }
+
+    /// Regression: precompiled VM must have `hello` compiled so typing "hello"
+    /// never falls through to the AI define path (handle_define_unknown_words).
+    #[test]
+    fn test_precompiled_vm_knows_hello() {
+        let vm = Library::precompiled_vm();
+        assert!(vm.word_exists("hello"), "hello must be in the precompiled VM");
+        assert!(vm.word_exists("goodbye"), "goodbye must be in the precompiled VM");
+    }
+
+    /// Regression: executing `hello` on the precompiled VM must produce output,
+    /// not an error.  Ensures the word is callable, not just compiled.
+    #[test]
+    fn test_hello_produces_output() {
+        let mut vm = Library::precompiled_vm();
+        let out = vm.exec("hello").expect("hello must not error");
+        assert!(!out.is_empty(), "hello must produce output, got empty string");
     }
 
     #[test]
@@ -4978,6 +5013,16 @@ cherry" sort type"#).expect("sort lines");
         let mut vm = Library::precompiled_vm();
         vm.exec(r#"s" 3 5 grace" s" 5 3 grace" argue"#)
             .expect("proof: grace(3,5) = grace(5,3) — addition commutes");
+    }
+
+    /// John 1:1 — the literal sentence is valid Forth.
+    /// word = god = -1.  `;` is a sentence separator (no-op).  `.` prints TOS.
+    /// "The word was God; and the word was with God." executes without error.
+    #[test]
+    fn test_john1_sentence_is_valid_forth() {
+        let mut vm = Library::precompiled_vm();
+        vm.exec("The word was God; and the word was with God.")
+            .expect("John 1:1 should execute as valid Forth");
     }
 }
 

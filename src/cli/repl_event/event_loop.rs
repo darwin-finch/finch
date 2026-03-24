@@ -189,6 +189,20 @@ pub struct EventLoop {
     /// From config.client.auto_discover.
     auto_discover: bool,
 
+    /// Channels this session has joined (e.g. "#general").
+    joined_channels: std::collections::HashSet<String>,
+
+    /// Remote peer daemon addresses (host:port) from --peer flag.
+    remote_peers: Vec<String>,
+
+    /// Base URL of the local daemon (e.g. "http://127.0.0.1:8000").
+    /// Used by the cross-machine relay poller.
+    daemon_base_url: Option<String>,
+
+    /// Mirror of peer_inbox — cloned into remote-peer bridge tasks so they can
+    /// forward local peer responses back to the remote machine.
+    peer_inbox_mirror_tx: tokio::sync::broadcast::Sender<(String, String)>,
+
     /// Provider used by the brain (background context-gathering agent).
     /// `None` when the brain is disabled (config flag) or no cloud provider is available.
     brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
@@ -314,6 +328,35 @@ pub enum ViewMode {
 /// - Non-Latin scripts (Chinese, Arabic, Japanese, Korean, etc.) that aren't
 ///   Forth definitions — these never need uppercase to signal "sentence"
 /// - Latin sentences starting with an uppercase letter
+/// Returns `true` when `word` has a dedicated magic-word response.
+fn is_magic_word(word: &str) -> bool {
+    magic_word_response(word).is_some()
+}
+
+/// Returns the specific response for a magic word, or `None` for unknowns.
+fn magic_word_response(word: &str) -> Option<&'static str> {
+    match word {
+        "boom"  => Some("boom. nothing survived. not even the stack."),
+        "bang"  => Some("bang. the universe blinked."),
+        "fire"  => Some("fired. no smoke. suspicious."),
+        "nuke"  => Some("nuked. oddly peaceful in here."),
+        "crash" => Some("crash? no crash. try harder."),
+        "die"   => Some("still here. the machine has opinions about dying."),
+        "kill"  => Some("kill confirmed. no witnesses."),
+        "stop"  => Some("stopped. or never started. hard to say."),
+        "go"    => Some("gone. or was it ever here?"),
+        "run"   => Some("ran. left no forwarding address."),
+        "help"  => Some("help is a word. the stack did not respond."),
+        "please"=> Some("noted. the machine is unmoved by politeness."),
+        "hello" => Some("hello back. ( silently )"),
+        "bye"   => Some("bye. the stack waves nothing."),
+        "yes"   => Some("yes. ( the stack agrees by saying nothing )"),
+        "no"    => Some("no. ( equally nothing )"),
+        "fireball" | "fireballs" => Some("fireball: pure energy, no output. the stack appreciates the drama."),
+        _ => None,
+    }
+}
+
 /// The second programmer's reaction when a word runs silently.
 /// Picks a remark based on the word name, or falls back to a random one.
 fn silent_remark(code: &str) -> String {
@@ -336,27 +379,7 @@ fn silent_remark(code: &str) -> String {
 
     // Single-word reactions
     let word = trimmed.as_str();
-    let specific: Option<&str> = match word {
-        "boom"  => Some("boom. nothing survived. not even the stack."),
-        "bang"  => Some("bang. the universe blinked."),
-        "fire"  => Some("fired. no smoke. suspicious."),
-        "nuke"  => Some("nuked. oddly peaceful in here."),
-        "crash" => Some("crash? no crash. try harder."),
-        "die"   => Some("still here. the machine has opinions about dying."),
-        "kill"  => Some("kill confirmed. no witnesses."),
-        "stop"  => Some("stopped. or never started. hard to say."),
-        "go"    => Some("gone. or was it ever here?"),
-        "run"   => Some("ran. left no forwarding address."),
-        "help"  => Some("help is a word. the stack did not respond."),
-        "please"=> Some("noted. the machine is unmoved by politeness."),
-        "hello" => Some("hello back. ( silently )"),
-        "bye"   => Some("bye. the stack waves nothing."),
-        "yes"   => Some("yes. ( the stack agrees by saying nothing )"),
-        "no"    => Some("no. ( equally nothing )"),
-        "fireball" | "fireballs" => Some("fireball: pure energy, no output. the stack appreciates the drama."),
-        _ => None,
-    };
-    if let Some(s) = specific {
+    if let Some(s) = magic_word_response(word) {
         return s.to_string();
     }
     // Generic rotating remarks
@@ -483,7 +506,36 @@ fn definition_observation(name: &str, body: &str) -> Option<String> {
 /// Returns true when `s` looks like natural language (→ AI), false when it looks
 /// like Forth (→ VM).  `word_exists` should check the live VM dictionary so that
 /// user-defined words are always treated as Forth, not language.
-fn looks_like_natural_language(s: &str, word_exists: impl Fn(&str) -> bool) -> bool {
+/// Returns true when `w` is a Forth primitive/builtin that should always
+/// route to the VM regardless of whether it appears in the session vocabulary.
+fn is_forth_primitive_word(w: &str) -> bool {
+    matches!(w,
+        "dup" | "drop" | "swap" | "over" | "rot" | "nip" | "tuck" | "pick" | "roll" |
+        "mod" | "abs" | "max" | "min" | "negate" | "square" | "pow" |
+        "and" | "or" | "xor" | "invert" |
+        "cr" | "emit" | "type" |
+        "if" | "else" | "then" | "do" | "loop" | "begin" | "until" | "while" | "repeat" | "exit" |
+        "words" | "help" | "undo" | "apply" | "describe" |
+        "agree?" | "back-and-forth?" | "invertible?"
+    ) || w.parse::<f64>().is_ok()
+      || w.chars().any(|c| matches!(c, '+' | '-' | '*' | '/' | '@' | '!' | '.' | ':' | ';' | '<' | '>' | '='))
+}
+
+/// Heuristic: does this input look like natural language rather than Forth code?
+///
+/// `word_exists`   — checks the full VM dictionary (builtins + library + session).
+/// `session_word`  — checks only words explicitly defined *during this session*
+///                   (not precompiled library words).  Used to distinguish
+///                   user-authored vocabulary from ambient library words.
+///
+/// Example: "hello world" — both are precompiled library words so `word_exists`
+/// returns true for each, but `session_word` returns false for both, so the
+/// phrase is routed to the AI rather than executed as Forth.
+fn looks_like_natural_language(
+    s: &str,
+    word_exists: impl Fn(&str) -> bool,
+    session_word: impl Fn(&str) -> bool,
+) -> bool {
     let trimmed = s.trim();
     if trimmed.contains('?') || trimmed.contains('？') { return true; }
     // Non-ASCII content that isn't a Forth definition is natural language.
@@ -520,27 +572,33 @@ fn looks_like_natural_language(s: &str, word_exists: impl Fn(&str) -> bool) -> b
     let forth_chars = |c: char| matches!(c, '+' | '-' | '*' | '/' | '@' | '!' | '.' | ':' | ';' | '<' | '>' | '=');
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
 
-    // If every token is a defined word or a number, it's Forth regardless of word count.
-    // This teaches the router the user's vocabulary without any explicit registration.
+    // If every token is a *session-defined* word or a number/operator, treat as
+    // Forth.  Using session_word (not word_exists) prevents precompiled library
+    // words like `hello` and `world` from locking phrases like "hello world" into
+    // Forth execution when the user clearly intends them as natural language.
     let all_tokens_known = !tokens.is_empty()
         && !trimmed.starts_with(':')
         && tokens.iter().all(|t| {
             t.parse::<f64>().is_ok()
                 || trimmed.chars().any(forth_chars)
-                || word_exists(t)
+                || session_word(t)
         });
     if all_tokens_known {
         return false;
     }
 
-    // Multi-word input with no Forth operators and at least one alphabetic unknown word
-    // → natural language.  Numbers are allowed (e.g. "show me 3 examples",
-    // "list the top 5 errors").  Pure-number sequences ("2 3 4") and
-    // all-known-Forth-word sequences are already caught above.
+    // Multi-word input with no Forth operators and at least one word that is
+    // neither session-defined nor a Forth primitive → natural language.
+    // Numbers are allowed (e.g. "show me 3 examples", "list the top 5 errors").
+    // Pure-number sequences ("2 3 4") and all-session-word sequences are caught above.
     if tokens.len() >= 2
         && !trimmed.starts_with(':')
         && !trimmed.chars().any(forth_chars)
-        && tokens.iter().any(|t| t.chars().all(|c| c.is_ascii_alphabetic() || c == '-') && !word_exists(t))
+        && tokens.iter().any(|t| {
+            t.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+                && !session_word(t)
+                && !is_forth_primitive_word(t)
+        })
     {
         return true;
     }
@@ -548,21 +606,11 @@ fn looks_like_natural_language(s: &str, word_exists: impl Fn(&str) -> bool) -> b
     // Single unknown word with only alphabetic characters → AI.
     if tokens.len() == 1 && !trimmed.starts_with(':') {
         let word = tokens[0];
-        // Known to the VM → Forth.
+        // Known to the VM (library or session) → Forth.
         if word_exists(word) {
             return false;
         }
-        let is_forth_primitive = matches!(word,
-            "dup" | "drop" | "swap" | "over" | "rot" | "nip" | "tuck" | "pick" | "roll" |
-            "mod" | "abs" | "max" | "min" | "negate" | "square" | "pow" |
-            "and" | "or" | "xor" | "invert" |
-            "cr" | "emit" | "type" |
-            "if" | "else" | "then" | "do" | "loop" | "begin" | "until" | "while" | "repeat" | "exit" |
-            "words" | "help" | "undo" | "apply" | "describe" |
-            "agree?" | "back-and-forth?" | "invertible?"
-        ) || word.parse::<f64>().is_ok()
-          || trimmed.chars().any(forth_chars);
-        if !is_forth_primitive && word.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+        if !is_forth_primitive_word(word) && word.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
             return true;
         }
     }
@@ -691,26 +739,39 @@ async fn run_peer_loop(
     }
 }
 
-/// Fork two named peer loops.  Returns the broadcast sender (to reach all peers)
-/// and the shared inbox receiver (where all peer replies arrive).
+/// Fork two independent peer loops that share a broadcast channel.
 ///
-/// If `attach` is `Some(name_or_uuid)`, re-uses an existing peer from the
-/// registry instead of forking a new one; the second peer is always freshly
-/// forked so there are always exactly two.
+/// Returns the broadcast sender (write to reach all peers) and a list of
+/// `(id, name)` pairs for every peer that was started.
+///
+/// If `attach` is `Some(name_or_uuid)`, the first slot re-uses an existing
+/// registry peer (bridging its broadcast into the new channel) instead of
+/// forking a fresh one.  The second peer is always fresh.
 async fn boot_peers(
     inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
     attach: Option<&str>,
 ) -> (tokio::sync::broadcast::Sender<crate::session::SessionEvent>, Vec<(Uuid, String)>) {
     let (bcast_tx, _) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
-    let mut sessions: Vec<(Uuid, String)> = Vec::new();
 
-    // ── First peer: attach to existing OR fork fresh ──────────────────────────
-    let (id_a, name_a) = if let Some(needle) = attach {
+    /// Spawn a fresh peer loop, register it, and return its `(id, name)`.
+    async fn spawn_fresh(
+        bcast_tx: &tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
+        inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
+    ) -> (Uuid, String) {
+        let id   = Uuid::new_v4();
+        let name = format!("peer-{}", &id.to_string()[..8]);
+        let rx   = bcast_tx.subscribe();
+        let (n, i) = (name.clone(), id);
+        tokio::spawn(async move { run_peer_loop(i, n, rx, inbox_tx).await });
+        register_peer(id, name.clone(), bcast_tx.clone()).await;
+        (id, name)
+    }
+
+    // ── First peer: re-attach to existing OR fork fresh ───────────────────────
+    let first = if let Some(needle) = attach {
         if let Some((id, existing_tx)) = find_peer(needle).await {
-            // Re-attach: subscribe the existing peer's broadcast to our new sender.
-            // We do this by bridging the two senders.
             let mut bridge_rx = existing_tx.subscribe();
-            let bcast_clone = bcast_tx.clone();
+            let bcast_clone   = bcast_tx.clone();
             tokio::spawn(async move {
                 while let Ok(ev) = bridge_rx.recv().await {
                     let _ = bcast_clone.send(ev);
@@ -720,38 +781,16 @@ async fn boot_peers(
                 .get(&id).map(|(n, _)| n.clone()).unwrap_or_else(|| id.to_string());
             (id, name)
         } else {
-            let id = Uuid::new_v4();
-            let name = format!("peer-{}", &id.to_string()[..8]);
-            let rx = bcast_tx.subscribe();
-            let itx = inbox_tx.clone();
-            let (n2, id2) = (name.clone(), id);
-            tokio::spawn(async move { run_peer_loop(id2, n2, rx, itx).await });
-            register_peer(id, name.clone(), bcast_tx.clone()).await;
-            (id, name)
+            spawn_fresh(&bcast_tx, inbox_tx.clone()).await
         }
     } else {
-        let id = Uuid::new_v4();
-        let name = format!("peer-{}", &id.to_string()[..8]);
-        let rx = bcast_tx.subscribe();
-        let itx = inbox_tx.clone();
-        let (n2, id2) = (name.clone(), id);
-        tokio::spawn(async move { run_peer_loop(id2, n2, rx, itx).await });
-        register_peer(id, name.clone(), bcast_tx.clone()).await;
-        (id, name)
+        spawn_fresh(&bcast_tx, inbox_tx.clone()).await
     };
-    sessions.push((id_a, name_a));
 
     // ── Second peer: always fresh ─────────────────────────────────────────────
-    let id_b = Uuid::new_v4();
-    let name_b = format!("peer-{}", &id_b.to_string()[..8]);
-    let rx_b = bcast_tx.subscribe();
-    let itx_b = inbox_tx.clone();
-    let (nb2, ib2) = (name_b.clone(), id_b);
-    tokio::spawn(async move { run_peer_loop(ib2, nb2, rx_b, itx_b).await });
-    register_peer(id_b, name_b.clone(), bcast_tx.clone()).await;
-    sessions.push((id_b, name_b));
+    let second = spawn_fresh(&bcast_tx, inbox_tx.clone()).await;
 
-    (bcast_tx, sessions)
+    (bcast_tx, vec![first, second])
 }
 
 impl EventLoop {
@@ -784,6 +823,8 @@ impl EventLoop {
         auto_compact_enabled: bool,
         brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
         auto_discover: bool,
+        remote_peers: Vec<String>,
+        daemon_base_url: Option<String>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -804,8 +845,39 @@ impl EventLoop {
         // Wrap TUI in Arc<Mutex> for shared access
         let tui_renderer = Arc::new(Mutex::new(tui_renderer));
 
+        // Spawn quit watcher — a dedicated task that receives Cap'n Proto binary
+        // ControlMessage { quit } and exits the process immediately.
+        // This runs independently of the event loop so /quit always works even
+        // when the loop is blocked mid-streaming or mid-tool execution.
+        let (quit_tx, mut quit_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            while let Some(bytes) = quit_rx.recv().await {
+                let mut cursor = std::io::Cursor::new(bytes);
+                let ok = capnp::serialize::read_message(
+                    &mut cursor,
+                    capnp::message::ReaderOptions::new(),
+                )
+                .and_then(|reader| {
+                    reader
+                        .get_root::<crate::finch_ipc_capnp::control_message::Reader>()
+                        .map(|ctrl| {
+                            matches!(
+                                ctrl.which(),
+                                Ok(crate::finch_ipc_capnp::control_message::Which::Quit(_))
+                            )
+                        })
+                })
+                .unwrap_or(false);
+
+                if ok {
+                    let _ = crossterm::terminal::disable_raw_mode();
+                    std::process::exit(0);
+                }
+            }
+        });
+
         // Spawn input handler task
-        let input_rx = spawn_input_task(Arc::clone(&tui_renderer));
+        let input_rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx);
 
         // Initialize plan content storage
         let plan_content = Arc::new(RwLock::new(None));
@@ -838,6 +910,7 @@ impl EventLoop {
         let (peer_inbox_tx, peer_inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
         let (peer_tx, peer_session_rx) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
         let peer_sessions: Vec<(Uuid, String)> = Vec::new();
+        let (peer_inbox_mirror_tx, _) = tokio::sync::broadcast::channel::<(String, String)>(128);
 
         Self {
             event_rx,
@@ -912,6 +985,10 @@ impl EventLoop {
             peer_sessions,
             diff_store: DiffStore::new(),
             peer_session_rx,
+            joined_channels: std::collections::HashSet::new(),
+            remote_peers,
+            daemon_base_url,
+            peer_inbox_mirror_tx,
         }
     }
 
@@ -926,6 +1003,11 @@ impl EventLoop {
             self.peer_tx = real_tx;
             self.peer_sessions = sessions;
         }
+
+        // ── Connect to remote peers (--peer flag) ────────────────────────────
+        // For each remote daemon address: establish a bidirectional WS bridge so
+        // the remote machine participates in this session's peer loop.
+        self.bridge_remote_peers().await;
 
         // ── Startup header (Claude Code style) ───────────────────────────────
         // Clear accumulated startup noise from the output manager, then print a
@@ -1186,8 +1268,8 @@ s" it is ours"      s" -1 is ours"     argue
             self.render_tui().await.ok();
 
             // Auto-discover peers on LAN in background — REPL stays responsive.
-            // When found, PeersDiscovered event arrives and we add them to the VM.
-            if self.auto_discover {
+            // When found, PeersDiscovered event arrives and we connect to each peer.
+            {
                 let event_tx = self.event_tx.clone();
                 tokio::spawn(async move {
                     let peers = tokio::task::spawn_blocking(|| {
@@ -1579,6 +1661,8 @@ s" it is ours"      s" -1 is ours"     argue
                 Some((id, name, text)) = self.peer_inbox_rx.recv() => {
                     let _ = id; // available for filtering if needed
                     let _ = self.event_tx.send(ReplEvent::PeerMessage { text: format!("{name}: {text}") });
+                    // Mirror to remote peers so they can see our peer responses.
+                    let _ = self.peer_inbox_mirror_tx.send((name, text));
                 }
 
                 // Structured session events from peers (Diff proposals, edits, accepts, rejects)
@@ -2100,6 +2184,29 @@ Rules:\n\
                     Command::Discover => {
                         self.handle_discover().await?;
                     }
+                    Command::JoinChannel(chan) => {
+                        self.joined_channels.insert(chan.clone());
+                        self.output_manager.write_user(format!("/join {}", chan));
+                        let ev = crate::session::SessionEvent::chat(
+                            format!("joined {chan}")
+                        );
+                        let _ = self.peer_tx.send(ev);
+                    }
+                    Command::PartChannel(chan) => {
+                        self.joined_channels.remove(&chan);
+                        self.output_manager.write_user(format!("/part {}", chan));
+                        let ev = crate::session::SessionEvent::chat(
+                            format!("parted {chan}")
+                        );
+                        let _ = self.peer_tx.send(ev);
+                    }
+                    Command::SayChannel(chan, msg) => {
+                        self.output_manager.write_user(format!("/say {} {}", chan, msg));
+                        let ev = crate::session::SessionEvent::chat(
+                            format!("{chan}: {msg}")
+                        );
+                        let _ = self.peer_tx.send(ev);
+                    }
                     Command::Connect(addr) => {
                         self.handle_connect(addr).await?;
                     }
@@ -2204,7 +2311,11 @@ Rules:\n\
         }
 
         // Route: natural language → AI; Forth tokens → stack.
-        let is_nl = looks_like_natural_language(&input, |w| self.forth_vm.word_exists(w));
+        let is_nl = looks_like_natural_language(
+            &input,
+            |w| self.forth_vm.word_exists(w),
+            |w| self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w),
+        );
         if is_nl {
             return self.execute_query(input).await;
         }
@@ -3059,25 +3170,26 @@ Rules:\n\
 
             ReplEvent::PeersDiscovered(peers) => {
                 // Background boot scan found finch instances on the LAN.
-                // Add each to the Forth VM's peer list; auto-label with friendly name and token.
-                let mut added_names = Vec::new();
+                // Add each to the Forth VM's peer list and establish a WS bridge.
+                let mut added = Vec::new();
                 for (host, port, name, token) in peers {
                     let addr = format!("{host}:{port}");
                     if !self.forth_vm.peers.contains(&addr) {
                         self.forth_vm.peers.push(addr.clone());
-                        let meta = self.forth_vm.peer_meta.entry(addr).or_default();
+                        let meta = self.forth_vm.peer_meta.entry(addr.clone()).or_default();
                         if !name.is_empty() {
                             meta.label = Some(name.clone());
                         }
                         if let Some(t) = token {
                             meta.token = Some(t);
                         }
-                        added_names.push(name);
+                        self.bridge_single_peer(addr);
+                        added.push(name);
                     }
                 }
-                if !added_names.is_empty() {
+                if !added.is_empty() {
                     use crossterm::style::Stylize;
-                    let lines: Vec<String> = added_names.iter().map(|n| {
+                    let lines: Vec<String> = added.iter().map(|n| {
                         let display = if n.is_empty() { "someone".to_string() } else { n.clone() };
                         format!("  {} is here", display.as_str().cyan().bold())
                     }).collect();
@@ -3385,6 +3497,280 @@ Rules:\n\
             "connected".dark_grey()
         ));
         self.render_tui().await
+    }
+
+    /// Establish a WebSocket bridge to a single peer address.
+    ///
+    /// Spawns three tasks:
+    /// 1. Remote → local inbox: their Chat replies appear as peer responses.
+    /// 2. Our in-process peer mirror → remote.
+    /// 3. Our peer_tx broadcasts → remote (they execute our Forth programs).
+    fn bridge_single_peer(&self, peer_addr: String) {
+        let ws_url = match &self.daemon_base_url {
+            Some(base) => {
+                let my_addr = base
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://");
+                format!("ws://{peer_addr}/v1/session/ws?from={my_addr}")
+            }
+            None => format!("ws://{peer_addr}/v1/session/ws"),
+        };
+
+        let peer_tx = self.peer_tx.clone();
+        let peer_inbox_tx = self.peer_inbox_tx.clone();
+        let mirror_rx = self.peer_inbox_mirror_tx.subscribe();
+        let addr = peer_addr.clone();
+
+        tokio::spawn(async move {
+            match crate::session::transport::connect(&ws_url).await {
+                Ok(crate::session::SessionBus { tx: ws_tx, rx: mut ws_rx }) => {
+                    tracing::info!("auto-joined remote peer {addr}");
+
+                    let inbox = peer_inbox_tx.clone();
+                    let a2 = addr.clone();
+                    tokio::spawn(async move {
+                        while let Some(ev) = ws_rx.recv().await {
+                            if let crate::session::SessionEvent::Chat { text } = ev {
+                                if !text.is_empty() {
+                                    let id = uuid::Uuid::new_v4();
+                                    let name = format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
+                                    let _ = inbox.send((id, name, text));
+                                }
+                            }
+                        }
+                    });
+
+                    let ws_tx3 = ws_tx.clone();
+                    let mut mirror_rx = mirror_rx;
+                    tokio::spawn(async move {
+                        while let Ok((name, text)) = mirror_rx.recv().await {
+                            let ev = crate::session::SessionEvent::chat(format!("{name}: {text}"));
+                            if ws_tx3.send(ev).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    let mut bcast_rx = peer_tx.subscribe();
+                    while let Ok(ev) = bcast_rx.recv().await {
+                        if ws_tx.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => tracing::debug!("auto-join {addr}: connect failed: {e}"),
+            }
+        });
+    }
+
+    /// Establish WebSocket bridges to all addresses in `self.remote_peers`.
+    ///
+    /// For each remote daemon at `host:port`:
+    /// 1. Connect to `ws://host:port/v1/session/ws?from=<local-daemon-addr>`.
+    /// 2. Spawn a task that forwards `peer_tx` broadcasts to the remote (so the
+    ///    remote machine executes our Forth programs and replies).
+    /// 3. Spawn a task that receives the remote's `Chat` replies and routes them
+    ///    to `peer_inbox_tx` so they appear alongside the in-process peer responses.
+    /// 4. Spawn a task that forwards local `peer_inbox_mirror` (our in-process
+    ///    peer responses) back to the remote so it can observe our session.
+    ///
+    /// Additionally, start a background poller that:
+    /// - Drains `GET /v1/session/relay-drain` every 300 ms to capture messages from
+    ///   remote peers that connected TO our daemon (i.e., machines that ran
+    ///   `finch --peer <this-machine>`).
+    /// - Polls `GET /v1/peer/announced` for newly arrived remote peers and connects
+    ///   back to them symmetrically.
+    async fn bridge_remote_peers(&mut self) {
+        let daemon_base = self.daemon_base_url.clone();
+
+        // ── Outbound connections (we dial the remote) ─────────────────────────
+        for peer_addr in self.remote_peers.clone() {
+            let ws_url = match &daemon_base {
+                Some(base) => {
+                    // Strip http:// prefix to get host:port for the ?from= param.
+                    let my_addr: &str = base
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://");
+                    format!("ws://{peer_addr}/v1/session/ws?from={my_addr}")
+                }
+                None => format!("ws://{peer_addr}/v1/session/ws"),
+            };
+
+            let peer_tx = self.peer_tx.clone();
+            let peer_inbox_tx = self.peer_inbox_tx.clone();
+            let mut mirror_rx = self.peer_inbox_mirror_tx.subscribe();
+            let addr = peer_addr.clone();
+
+            tokio::spawn(async move {
+                match crate::session::transport::connect(&ws_url).await {
+                    Ok(crate::session::SessionBus { tx: ws_tx, rx: mut ws_rx }) => {
+                        tracing::info!("joined remote peer {addr}");
+
+                        // Remote → local inbox: their peer loop responses appear as our peers.
+                        let inbox = peer_inbox_tx.clone();
+                        let a2 = addr.clone();
+                        let ws_tx2 = ws_tx.clone();
+                        tokio::spawn(async move {
+                            while let Some(ev) = ws_rx.recv().await {
+                                if let crate::session::SessionEvent::Chat { text } = ev {
+                                    if !text.is_empty() {
+                                        let id = uuid::Uuid::new_v4();
+                                        let name = format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
+                                        let _ = inbox.send((id, name, text));
+                                    }
+                                }
+                            }
+                        });
+
+                        // Our in-process peer responses → remote (mirror).
+                        let ws_tx3 = ws_tx.clone();
+                        tokio::spawn(async move {
+                            while let Ok((name, text)) = mirror_rx.recv().await {
+                                let ev = crate::session::SessionEvent::chat(
+                                    format!("{name}: {text}")
+                                );
+                                if ws_tx3.send(ev).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        // Our peer_tx broadcasts → remote (so they execute our Forth programs).
+                        let mut bcast_rx = peer_tx.subscribe();
+                        while let Ok(ev) = bcast_rx.recv().await {
+                            if ws_tx.send(ev).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("--peer {addr}: connect failed: {e}"),
+                }
+            });
+        }
+
+        // ── Background poller: relay-drain + announced peers ──────────────────
+        if let Some(base) = daemon_base {
+            let base: String = base;
+            let peer_inbox_tx = self.peer_inbox_tx.clone();
+            let peer_tx = self.peer_tx.clone();
+            let mirror_tx = self.peer_inbox_mirror_tx.clone();
+            let initial_known: std::collections::HashSet<String> =
+                self.remote_peers.iter().cloned().collect();
+
+            let drain_url = format!("{base}/v1/session/relay-drain");
+            let announced_url = format!("{base}/v1/peer/announced");
+            let bcast_url2 = format!("{base}/v1/session/relay-broadcast");
+
+            tokio::spawn(async move {
+                let http = reqwest::Client::new();
+                let drain_url = drain_url;
+                let announced_url = announced_url;
+                let mut known = initial_known;
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+
+                loop {
+                    interval.tick().await;
+
+                    // Drain messages from remote peers that connected TO our daemon.
+                    if let Ok(resp) = http.get(&drain_url)
+                        .timeout(std::time::Duration::from_secs(1))
+                        .send().await
+                    {
+                        if let Ok(msgs) = resp.json::<Vec<(String, String)>>().await {
+                            for (from, text) in msgs {
+                                let id = uuid::Uuid::new_v4();
+                                let _ = peer_inbox_tx.send((id, from, text));
+                            }
+                        }
+                    }
+
+                    // Check for newly announced peers; connect back symmetrically.
+                    if let Ok(resp) = http.get(&announced_url)
+                        .timeout(std::time::Duration::from_secs(1))
+                        .send().await
+                    {
+                        if let Ok(addrs) = resp.json::<Vec<String>>().await {
+                            for addr in addrs {
+                                if known.contains(&addr) {
+                                    continue;
+                                }
+                                known.insert(addr.clone());
+
+                                let ws_url = format!("ws://{addr}/v1/session/ws?from=relay");
+                                let ptx = peer_tx.clone();
+                                let pib = peer_inbox_tx.clone();
+                                let mut mirror_rx2 = mirror_tx.subscribe();
+                                let a = addr.clone();
+
+                                tokio::spawn(async move {
+                                    if let Ok(crate::session::SessionBus {
+                                        tx: ws_tx,
+                                        rx: mut ws_rx,
+                                    }) = crate::session::transport::connect(&ws_url).await
+                                    {
+                                        tracing::info!("connected back to announced peer {a}");
+
+                                        // Their replies → our inbox.
+                                        let pib2 = pib;
+                                        let a2 = a.clone();
+                                        let ws_tx2 = ws_tx.clone();
+                                        tokio::spawn(async move {
+                                            while let Some(ev) = ws_rx.recv().await {
+                                                if let crate::session::SessionEvent::Chat { text } = ev {
+                                                    if !text.is_empty() {
+                                                        let id = uuid::Uuid::new_v4();
+                                                        let name = format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
+                                                        let _ = pib2.send((id, name, text));
+                                                    }
+                                                }
+                                            }
+                                        });
+
+                                        // Our mirror → them.
+                                        let ws_tx3 = ws_tx.clone();
+                                        tokio::spawn(async move {
+                                            while let Ok((name, text)) = mirror_rx2.recv().await {
+                                                let ev = crate::session::SessionEvent::chat(
+                                                    format!("{name}: {text}")
+                                                );
+                                                if ws_tx3.send(ev).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+
+                                        // Our broadcasts → them.
+                                        let mut bcast_rx = ptx.subscribe();
+                                        while let Ok(ev) = bcast_rx.recv().await {
+                                            if ws_tx.send(ev).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Bridge peer_tx → POST /v1/session/relay-broadcast so remote peers
+            // that connected TO our daemon also receive our broadcasts.
+            let bcast_url = bcast_url2;
+            let mut bcast_rx = self.peer_tx.subscribe();
+            tokio::spawn(async move {
+                let http = reqwest::Client::new();
+                while let Ok(ev) = bcast_rx.recv().await {
+                    if let crate::session::SessionEvent::Chat { ref text } = ev {
+                        let body = serde_json::json!({ "text": text });
+                        let _ = http.post(&bcast_url)
+                            .json(&body)
+                            .timeout(std::time::Duration::from_millis(500))
+                            .send().await;
+                    }
+                }
+            });
+        }
     }
 
     /// `/disconnect <name-or-addr>` — remove a peer from peers list and current room.
@@ -3850,7 +4236,11 @@ Rules:\n\
 
         // Try the VM first — boot JIT compiled all vocab words so known words run immediately.
         let snap = self.forth_vm.snapshot();
-        let is_nl = looks_like_natural_language(&text, |w| self.forth_vm.word_exists(w));
+        let is_nl = looks_like_natural_language(
+            &text,
+            |w| self.forth_vm.word_exists(w),
+            |w| self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w),
+        );
         let vm_result = self.forth_vm.exec(&text);
         // Check for unknown words first, regardless of whether there was other output.
         // missing-word now prints "?wordname" but we still want to define-and-retry.
@@ -4751,7 +5141,12 @@ Rules:\n\
         for word in &words {
             // Strip trailing punctuation to find the base word (e.g. "hello." → "hello")
             let base = word.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-');
-            if let Some(entry) = lib.lookup(base).or_else(|| lib.lookup(word.as_str())) {
+            // Fast path: word is already compiled into the VM (SEED/ENGLISH/MAJOR library).
+            // Library::load() only sees user TOML files, not the built-in embedded library,
+            // so precompiled words like `hello` would fall through to the AI without this check.
+            if self.forth_vm.word_exists(base) {
+                // Already in VM — no library lookup or AI needed; will execute on re-eval.
+            } else if let Some(entry) = lib.lookup(base).or_else(|| lib.lookup(word.as_str())) {
                 // Compile the library Forth code into the VM.
                 if let Some(forth_code) = &entry.forth {
                     let definition = format!(": {base}  {forth_code} ;");
@@ -7582,6 +7977,46 @@ mod tests {
     }
 
     #[test]
+    fn test_is_magic_word_please() {
+        assert!(is_magic_word("please"), "please is a magic word");
+    }
+
+    #[test]
+    fn test_is_magic_word_unknown_is_not_magic() {
+        assert!(!is_magic_word("xyzzy"), "unknown word must not be magic");
+    }
+
+    #[test]
+    fn test_silent_remark_please_is_noted() {
+        let r = silent_remark("please");
+        assert!(
+            r.contains("noted") && r.contains("unmoved"),
+            "please must get its specific remark: {r}"
+        );
+    }
+
+    #[test]
+    fn test_silent_remark_please_does_not_get_generic() {
+        let r = silent_remark("please");
+        // Must not fall through to the rotating generic remarks
+        let generic = [
+            "the stack kept it to itself",
+            "the silence is part of it",
+            "we just can't prove it",
+            "left no evidence",
+            "nothing to show for it",
+            "somewhere, a bit flipped",
+            "the machine shrugged",
+            "filed under: nothing",
+            "works on my stack",
+            "witnesses: zero",
+        ];
+        for g in &generic {
+            assert!(!r.contains(g), "please must not fall through to generic remark '{g}': {r}");
+        }
+    }
+
+    #[test]
     fn test_definition_observation_violent_name_silent_body() {
         // `: boom ;` — violent name, empty/silent body
         let obs = definition_observation("boom", "");
@@ -7651,96 +8086,125 @@ mod nl_routing_tests {
     fn no_words(_: &str) -> bool { false }
     fn all_words(_: &str) -> bool { true }
 
+    // Convenience wrapper: same closure for word_exists and session_word.
+    // Matches pre-refactor behaviour for all tests that don't distinguish the two.
+    fn nl(s: &str, w: impl Fn(&str) -> bool) -> bool {
+        looks_like_natural_language(s, &w, &w)
+    }
+
     // Question marks always → AI
-    #[test] fn test_question_mark_latin() { assert!(looks_like_natural_language("what is this?", no_words)); }
-    #[test] fn test_question_mark_fullwidth() { assert!(looks_like_natural_language("何？", no_words)); }
-    #[test] fn test_question_embedded() { assert!(looks_like_natural_language("is 2 + 2 = 4?", no_words)); }
+    #[test] fn test_question_mark_latin() { assert!(nl("what is this?", no_words)); }
+    #[test] fn test_question_mark_fullwidth() { assert!(nl("何？", no_words)); }
+    #[test] fn test_question_embedded() { assert!(nl("is 2 + 2 = 4?", no_words)); }
 
     // Uppercase first letter → AI
-    #[test] fn test_uppercase_start() { assert!(looks_like_natural_language("Show me something", no_words)); }
-    #[test] fn test_uppercase_single_word() { assert!(looks_like_natural_language("Hello", no_words)); }
+    #[test] fn test_uppercase_start() { assert!(nl("Show me something", no_words)); }
+    #[test] fn test_uppercase_single_word() { assert!(nl("Hello", no_words)); }
 
     // Non-ASCII non-definition → AI
-    #[test] fn test_non_ascii_chinese() { assert!(looks_like_natural_language("你好", no_words)); }
-    #[test] fn test_non_ascii_arabic() { assert!(looks_like_natural_language("مرحبا", no_words)); }
+    #[test] fn test_non_ascii_chinese() { assert!(nl("你好", no_words)); }
+    #[test] fn test_non_ascii_arabic() { assert!(nl("مرحبا", no_words)); }
     #[test] fn test_non_ascii_definition_not_nl() {
         // `: 你好 1 . ;` is a definition — should NOT be routed to AI
-        assert!(!looks_like_natural_language(": 你好 1 . ;", no_words));
+        assert!(!nl(": 你好 1 . ;", no_words));
     }
 
     // Multi-word with unknown alphabetic word → AI
-    #[test] fn test_multi_word_unknown() { assert!(looks_like_natural_language("show me something", no_words)); }
-    #[test] fn test_multi_word_with_number() { assert!(looks_like_natural_language("show me 3 examples", no_words)); }
+    #[test] fn test_multi_word_unknown() { assert!(nl("show me something", no_words)); }
+    #[test] fn test_multi_word_with_number() { assert!(nl("show me 3 examples", no_words)); }
     #[test] fn test_multi_word_all_known_is_forth() {
-        // Every token is known → Forth, not AI
-        assert!(!looks_like_natural_language("dup swap drop", all_words));
+        // Every token is session-known → Forth, not AI
+        assert!(!nl("dup swap drop", all_words));
     }
     #[test] fn test_multi_word_all_numbers_is_forth() {
         // Pure number sequence → Forth stack push, not AI
-        assert!(!looks_like_natural_language("1 2 3", no_words));
+        assert!(!nl("1 2 3", no_words));
     }
 
     // Single unknown alphabetic word → AI
-    #[test] fn test_single_unknown_word() { assert!(looks_like_natural_language("foobar", no_words)); }
+    #[test] fn test_single_unknown_word() { assert!(nl("foobar", no_words)); }
     // Hyphen is a Forth operator char, so single hyphenated token → Forth (not AI).
-    #[test] fn test_single_hyphenated_is_forth_not_nl() { assert!(!looks_like_natural_language("my-thing", no_words)); }
+    #[test] fn test_single_hyphenated_is_forth_not_nl() { assert!(!nl("my-thing", no_words)); }
 
     // Known Forth primitives → Forth (not AI)
-    #[test] fn test_single_known_primitive_dup() { assert!(!looks_like_natural_language("dup", no_words)); }
-    #[test] fn test_single_known_primitive_drop() { assert!(!looks_like_natural_language("drop", no_words)); }
-    #[test] fn test_single_known_primitive_swap() { assert!(!looks_like_natural_language("swap", no_words)); }
-    #[test] fn test_single_number_is_forth() { assert!(!looks_like_natural_language("42", no_words)); }
-    #[test] fn test_single_float_is_forth() { assert!(!looks_like_natural_language("3.14", no_words)); }
+    #[test] fn test_single_known_primitive_dup() { assert!(!nl("dup", no_words)); }
+    #[test] fn test_single_known_primitive_drop() { assert!(!nl("drop", no_words)); }
+    #[test] fn test_single_known_primitive_swap() { assert!(!nl("swap", no_words)); }
+    #[test] fn test_single_number_is_forth() { assert!(!nl("42", no_words)); }
+    #[test] fn test_single_float_is_forth() { assert!(!nl("3.14", no_words)); }
 
     // Forth operators in input → Forth
-    #[test] fn test_contains_forth_operator_plus() { assert!(!looks_like_natural_language("2 3 +", no_words)); }
-    #[test] fn test_contains_forth_operator_dot() { assert!(!looks_like_natural_language("42 .", no_words)); }
+    #[test] fn test_contains_forth_operator_plus() { assert!(!nl("2 3 +", no_words)); }
+    #[test] fn test_contains_forth_operator_dot() { assert!(!nl("42 .", no_words)); }
 
     // Definitions → Forth
-    #[test] fn test_colon_definition() { assert!(!looks_like_natural_language(": foo 1 . ;", no_words)); }
+    #[test] fn test_colon_definition() { assert!(!nl(": foo 1 . ;", no_words)); }
 
     // Word known to VM → Forth
-    #[test] fn test_single_known_vm_word() { assert!(!looks_like_natural_language("hello", all_words)); }
+    #[test] fn test_single_known_vm_word() { assert!(!nl("hello", all_words)); }
 
     // Regression: "it's just two greats talking" — multi-word with unknown words → AI
     #[test] fn test_regression_two_greats() {
-        assert!(looks_like_natural_language("it's just two greats talking", no_words));
+        assert!(nl("it's just two greats talking", no_words));
     }
     // Regression: "we could do that whatever" — multi-word unknown → AI
     #[test] fn test_regression_we_could() {
-        assert!(looks_like_natural_language("we could do that", no_words));
+        assert!(nl("we could do that", no_words));
     }
 
     // Contractions → AI (the apostrophe+letter pattern is unambiguous prose).
     #[test] fn test_contraction_youre() {
-        assert!(looks_like_natural_language("you're not talking to me.", all_words));
+        assert!(nl("you're not talking to me.", all_words));
     }
     #[test] fn test_contraction_dont() {
-        assert!(looks_like_natural_language("don't do that", no_words));
+        assert!(nl("don't do that", no_words));
     }
     #[test] fn test_contraction_its() {
-        assert!(looks_like_natural_language("it's working", no_words));
+        assert!(nl("it's working", no_words));
     }
 
     // Sentence-ending period attached to a word → AI.
     #[test] fn test_period_attached_to_word() {
-        assert!(looks_like_natural_language("hello.", no_words));
+        assert!(nl("hello.", no_words));
     }
     #[test] fn test_period_attached_multi_word() {
-        assert!(looks_like_natural_language("this is a sentence.", no_words));
+        assert!(nl("this is a sentence.", no_words));
     }
     // Standalone "." is the Forth print-TOS op — NOT natural language.
     #[test] fn test_standalone_period_is_forth() {
-        assert!(!looks_like_natural_language("42 .", no_words));
+        assert!(!nl("42 .", no_words));
     }
     // "3.14" is a float literal — Forth, not natural language.
     #[test] fn test_float_with_period_is_forth() {
-        assert!(!looks_like_natural_language("3.14", no_words));
+        assert!(!nl("3.14", no_words));
     }
 
     // Exclamation mark attached to a word → AI.
     #[test] fn test_exclamation_attached() {
-        assert!(looks_like_natural_language("hello!", no_words));
+        assert!(nl("hello!", no_words));
+    }
+
+    // ── session_word distinction ───────────────────────────────────────────────
+    // "hello world" — both words are in the precompiled VM library (word_exists=true)
+    // but neither was defined during this session (session_word=false).
+    // Should route to AI so it gets a conversational response, not Forth execution
+    // of the `hello` word which would echo "hello" back.
+    #[test]
+    fn test_hello_world_library_only_is_nl() {
+        assert!(looks_like_natural_language("hello world", all_words, no_words));
+    }
+
+    // "dup swap drop" — primitives; even with session_word=false they stay Forth.
+    #[test]
+    fn test_dup_swap_drop_primitives_stay_forth() {
+        assert!(!looks_like_natural_language("dup swap drop", all_words, no_words));
+    }
+
+    // Once the user explicitly defines both words in the session, "hello world"
+    // becomes a Forth invocation (session_word=true for both).
+    #[test]
+    fn test_hello_world_session_defined_is_forth() {
+        assert!(!looks_like_natural_language("hello world", all_words, all_words));
     }
 }
 
