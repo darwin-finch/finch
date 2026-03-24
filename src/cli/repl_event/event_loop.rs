@@ -4625,47 +4625,44 @@ Rules:\n\
 
         use crossterm::style::Stylize;
 
-        // Dialogue loop — user can reply to refine the proposed Forth before accepting.
-        loop {
-            let forth_code = {
-                let gen = self.cloud_gen.read().await;
-                match gen.generate(messages.clone(), None).await {
-                    Ok(resp) => resp.text,
-                    Err(e) => return Err(e),
-                }
-            };
-            // Strip markdown fences and trailing "ok" tokens.
-            let forth_code = forth_code
-                .trim()
-                .trim_start_matches("```forth")
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .trim()
-                .trim_end_matches("ok")
-                .trim()
-                .to_string();
-
-            // If the other programmer replied in English, just show it and stop.
-            let looks_like_english = {
-                let no_forth_def = !forth_code.contains(';') && !forth_code.contains(':');
-                let has_prose_end = forth_code.ends_with('.')
-                    || forth_code.ends_with('!')
-                    || forth_code.ends_with('?')
-                    || forth_code.contains(". ");
-                no_forth_def && has_prose_end
-            };
-            if looks_like_english {
-                self.output_manager.write_info(format!(
-                    "{}  {}",
-                    "←".dark_grey(),
-                    forth_code.as_str().white()
-                ));
-                return self.render_tui().await;
+        let forth_code = {
+            let gen = self.cloud_gen.read().await;
+            match gen.generate(messages.clone(), None).await {
+                Ok(resp) => resp.text,
+                Err(e) => return Err(e),
             }
+        };
+        // Strip markdown fences and trailing "ok" tokens.
+        let forth_code = forth_code
+            .trim()
+            .trim_start_matches("```forth")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .trim_end_matches("ok")
+            .trim()
+            .to_string();
 
-            // Run it. The user sees the result, not the implementation.
-            return self.handle_forth_eval_inner(forth_code, false).await;
+        // If the other programmer replied in English, just show it and stop.
+        let looks_like_english = {
+            let no_forth_def = !forth_code.contains(';') && !forth_code.contains(':');
+            let has_prose_end = forth_code.ends_with('.')
+                || forth_code.ends_with('!')
+                || forth_code.ends_with('?')
+                || forth_code.contains(". ");
+            no_forth_def && has_prose_end
+        };
+        if looks_like_english {
+            self.output_manager.write_info(format!(
+                "{}  {}",
+                "←".dark_grey(),
+                forth_code.as_str().white()
+            ));
+            return self.render_tui().await;
         }
+
+        // Run it. The user sees the result, not the implementation.
+        self.handle_forth_eval_inner(forth_code, false).await
     }
 
     /// Handle `push <message>` — send plain text to all peers.

@@ -1674,9 +1674,13 @@ impl Forth {
                     }
                     let name = tokens[pos].to_lowercase();
                     pos += 1;
-                    // Block redefinition of existing words in user sessions.
-                    if self.log_definitions && self.name_index.contains_key(&name) {
-                        bail!("cannot redefine '{name}' — word already defined");
+                    // Block redefinition of words the user defined in this session.
+                    // Stdlib/library words are not in source_log and can still be shadowed.
+                    if self.log_definitions {
+                        let prefix = format!(": {} ", name);
+                        if self.source_log.iter().any(|e| e.starts_with(&prefix)) {
+                            bail!("cannot redefine '{name}' — word already defined");
+                        }
                     }
                     let mut body = Vec::new();
                     let mut depth = 1i32;
@@ -10423,13 +10427,15 @@ mod tests {
     fn test_vm_dump_redefinition_replaces_not_appends() {
         let mut vm = Forth::new();
         vm.exec(": foo  1 . ;").unwrap();
-        vm.exec(": foo  2 . ;").unwrap(); // redefine
+        // Redefinition of a user-defined word is blocked.
+        let err = vm.exec(": foo  2 . ;").unwrap_err();
+        assert!(err.to_string().contains("cannot redefine"), "{err}");
+        // Source log still has exactly one entry.
         let dump = vm.dump_source();
-        // Only one entry for foo — no duplicates
         assert_eq!(dump.lines().filter(|l| l.contains(": foo")).count(), 1);
-        // The dump contains the new definition
+        // Original definition still in effect.
         let out = vm.exec("foo").unwrap();
-        assert_eq!(out.trim(), "2");
+        assert_eq!(out.trim(), "1");
     }
 
     #[test]
@@ -10757,13 +10763,14 @@ mod tests {
     fn test_undo_restores_previous_definition() {
         let mut vm = Forth::new();
         vm.exec(": foo  1 . ;").unwrap();
-        vm.exec(": foo  2 . ;").unwrap(); // redefine
-        vm.exec("undo").unwrap();
+        vm.exec(": bar  2 . ;").unwrap();
+        vm.exec("undo").unwrap(); // removes bar
+                                  // foo still works; bar is gone (missing-word handles unknown words)
         let out = vm.exec("foo").unwrap();
-        assert_eq!(
-            out.trim(),
-            "1",
-            "undo should restore previous definition of foo"
+        assert_eq!(out.trim(), "1", "foo should survive undo of bar");
+        assert!(
+            !vm.dump_source().contains(": bar"),
+            "bar should be gone after undo"
         );
     }
 
