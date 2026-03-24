@@ -1161,6 +1161,8 @@ pub struct BuildOptions {
     pub words: Option<Vec<String>>,
     pub all: bool,
     pub batch_size: usize,
+    /// Max concurrent API calls. `None` = unlimited (spawn all batches at once).
+    pub forks: Option<usize>,
     pub validate: bool,
     pub output: PathBuf,
     /// When true, regenerate words even if they already exist in the output file.
@@ -1220,14 +1222,20 @@ pub async fn build_library(
     }
 
     let total_batches = (pending.len() + opts.batch_size - 1) / opts.batch_size;
-    println!("{total_batches} batches × {} words each — running in parallel", opts.batch_size);
+    let fork_limit = opts.forks.unwrap_or(total_batches);
+    println!(
+        "{total_batches} batches × {} words each — up to {fork_limit} concurrent forks",
+        opts.batch_size
+    );
 
     // Shared file mutex for concurrent writes
     let file_mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let output_path = std::sync::Arc::new(opts.output.clone());
     let validate = opts.validate;
+    // Semaphore caps concurrent API calls; None == unlimited uses total_batches as cap
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(fork_limit));
 
-    // Spawn all batches concurrently
+    // Spawn all batches concurrently (semaphore limits active forks)
     let handles: Vec<_> = pending
         .chunks(opts.batch_size)
         .enumerate()
@@ -1236,8 +1244,10 @@ pub async fn build_library(
             let gen = std::sync::Arc::clone(&generator);
             let file_mutex = std::sync::Arc::clone(&file_mutex);
             let out_path = std::sync::Arc::clone(&output_path);
+            let sem = std::sync::Arc::clone(&sem);
 
             tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
                 let word_list = words.join(", ");
                 println!("[batch {batch_idx}] {word_list}");
 

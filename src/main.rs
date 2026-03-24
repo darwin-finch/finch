@@ -60,6 +60,12 @@ struct Args {
     /// Example: finch --session "battleground"
     #[arg(long = "session", short = 's')]
     session: Option<String>,
+
+    /// Connect to a remote finch peer at host:port and join their session.
+    /// This machine's peer loops will exchange messages with the remote.
+    /// Example: finch --peer 192.168.1.42:8000
+    #[arg(long = "peer")]
+    peer: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -212,6 +218,12 @@ enum LibraryCommand {
         /// Words per API batch
         #[arg(long, default_value = "15")]
         batch_size: usize,
+        /// Max concurrent API calls (default: unlimited)
+        #[arg(long)]
+        forks: Option<usize>,
+        /// Model override (e.g. claude-haiku-4-5-20251001 for cheap bulk generation)
+        #[arg(long)]
+        model: Option<String>,
         /// Write output to a file instead of ~/.finch/library.toml
         #[arg(long)]
         output: Option<PathBuf>,
@@ -227,6 +239,12 @@ enum LibraryCommand {
         /// Words per API batch
         #[arg(long, default_value = "15")]
         batch_size: usize,
+        /// Max concurrent API calls (default: unlimited)
+        #[arg(long)]
+        forks: Option<usize>,
+        /// Model override (e.g. claude-haiku-4-5-20251001 for cheap bulk generation)
+        #[arg(long)]
+        model: Option<String>,
         /// Write output to a file instead of ~/.finch/library.toml
         #[arg(long)]
         output: Option<PathBuf>,
@@ -728,6 +746,10 @@ async fn main() -> Result<()> {
     let _ = (session_name, session_id); // available for future use (daemon routing, shared stacks)
 
     let mut repl = Repl::new(config, claude_client, router, metrics_logger, daemon_client).await;
+
+    if !args.peer.is_empty() {
+        repl.set_peers(args.peer.clone());
+    }
 
     // Restore session if requested
     if let Some(session_path) = args.restore_session {
@@ -1663,6 +1685,24 @@ fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
 
 // ── finch library ─────────────────────────────────────────────────────────────
 
+/// Build an AI generator from the teacher config, with an optional model override.
+fn make_generator(
+    teachers: &[finch::config::TeacherEntry],
+    model_override: Option<&str>,
+) -> Result<std::sync::Arc<dyn finch::generators::Generator>> {
+    let mut teachers_owned: Vec<finch::config::TeacherEntry> = teachers.to_vec();
+    if let Some(m) = model_override {
+        for t in &mut teachers_owned {
+            t.model = Some(m.to_string());
+        }
+    }
+    let provider = finch::providers::create_provider(&teachers_owned)?;
+    let client = std::sync::Arc::new(finch::claude::ClaudeClient::with_provider(provider));
+    Ok(std::sync::Arc::new(
+        finch::generators::claude::ClaudeGenerator::new(client),
+    ))
+}
+
 async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
     use finch::coforth::generator::{self, BuildOptions, CATEGORIES};
     use finch::coforth::Library;
@@ -1766,7 +1806,7 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
             }
         }
 
-        LibraryCommand::Heal { batch_size, output } => {
+        LibraryCommand::Heal { batch_size, forks, model, output } => {
             // Collect words that are missing Forth or have broken snippets
             let lib = Library::load();
             let mut words_to_heal: Vec<String> = Vec::new();
@@ -1804,13 +1844,8 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
 
             let config = load_config().unwrap_or_else(|_| finch::config::Config::new(vec![]));
             let gen: std::sync::Arc<dyn finch::generators::Generator> =
-                match finch::providers::create_provider(&config.teachers) {
-                    Ok(provider) => {
-                        let client = std::sync::Arc::new(
-                            finch::claude::ClaudeClient::with_provider(provider)
-                        );
-                        std::sync::Arc::new(finch::generators::claude::ClaudeGenerator::new(client))
-                    }
+                match make_generator(&config.teachers, model.as_deref()) {
+                    Ok(g) => g,
                     Err(e) => {
                         eprintln!("No provider configured: {e}");
                         eprintln!("Run `finch setup` to configure an API key.");
@@ -1824,8 +1859,9 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
                 category: None,
                 words: Some(words_to_heal),
                 batch_size,
+                forks,
                 validate: true,
-                force: true,   // re-generate even if word exists without Forth
+                force: true,
                 output: output_path,
             };
             generator::build_library(opts, gen).await?;
@@ -1838,6 +1874,8 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
             list_categories,
             validate,
             batch_size,
+            forks,
+            model,
             output,
         } => {
             if list_categories {
@@ -1854,16 +1892,11 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
 
             let output_path = output.unwrap_or_else(generator::user_library_path);
 
-            // Build a generator from config
+            // Build a generator from config, with optional model override
             let config = load_config().unwrap_or_else(|_| finch::config::Config::new(vec![]));
             let gen: std::sync::Arc<dyn finch::generators::Generator> =
-                match finch::providers::create_provider(&config.teachers) {
-                    Ok(provider) => {
-                        let client = std::sync::Arc::new(
-                            finch::claude::ClaudeClient::with_provider(provider)
-                        );
-                        std::sync::Arc::new(finch::generators::claude::ClaudeGenerator::new(client))
-                    }
+                match make_generator(&config.teachers, model.as_deref()) {
+                    Ok(g) => g,
                     Err(e) => {
                         eprintln!("No provider configured: {e}");
                         eprintln!("Run `finch setup` to configure an API key.");
@@ -1876,6 +1909,7 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
                 category,
                 words: words_vec,
                 batch_size,
+                forks,
                 validate,
                 force: false,
                 output: output_path,
