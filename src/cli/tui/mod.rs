@@ -478,6 +478,9 @@ pub struct TuiRenderer {
     // Session task list (set after construction via set_todo_list)
     todo_list: Option<Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>>,
 
+    // Output of the user-defined `check` word — shown in the corner if set.
+    pub corner: Arc<std::sync::Mutex<Option<String>>>,
+
     // Co-Forth shared stack (set after construction via set_stack)
     stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
 
@@ -578,6 +581,7 @@ impl TuiRenderer {
             render_interval: Duration::from_millis(100),
 
             todo_list: None,
+            corner: Arc::new(std::sync::Mutex::new(None)),
             stack: None,
             poset: None,
             poset_was_visible: false,
@@ -1033,30 +1037,21 @@ impl TuiRenderer {
     /// effect** on the live area's cursor tracking.  No rows are added to
     /// `active_rows`; the panel never triggers the "Reflecting…" scrollback spam.
     pub fn draw_poset_overlay(&mut self) -> Result<()> {
-        let Some(ref poset_arc) = self.poset else {
+        // Show the output of the user-defined `check` word, if any.
+        let text = self.corner.lock().ok().and_then(|g| g.clone());
+        let Some(text) = text else {
             return Ok(());
         };
-        let Ok(poset) = poset_arc.try_lock() else {
-            return Ok(());
-        };
-        if poset.is_empty() {
+        let text = text.trim().to_string();
+        if text.is_empty() {
             return Ok(());
         }
 
-        let n = poset.nodes.len();
         let (term_cols, _term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let vis_len = text.chars().count();
+        let start_col = (term_cols as usize).saturating_sub(vis_len + 1) as u16;
 
-        // Express n as 2^k where k = floor(log2(n)).
-        let k = if n <= 1 {
-            0u32
-        } else {
-            (n as f64).log2().floor() as u32
-        };
-        let label = format!("{}2^{k}{}", DIM_GRAY, RESET);
-        let label_vis_len = 3 + k.to_string().len(); // "2^" + digits
-
-        let start_col = (term_cols as usize).saturating_sub(label_vis_len + 1) as u16;
-
+        let label = format!("{}{}{}", DIM_GRAY, text, RESET);
         let mut stdout = io::stdout();
         execute!(stdout, cursor::SavePosition)?;
         execute!(stdout, cursor::MoveTo(start_col, 0))?;

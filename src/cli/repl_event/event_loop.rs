@@ -266,6 +266,9 @@ pub struct EventLoop {
     /// Stack state is cleared between evals; only the dictionary persists.
     forth_vm: crate::coforth::Forth,
 
+    /// Shared with TUI corner — updated after each eval if `check` is defined.
+    corner_output: Arc<std::sync::Mutex<Option<String>>>,
+
     /// Undo history for Forth definitions.
     /// Each entry is a snapshot taken just before an eval (or /define).
     /// `/undefine` (or Ctrl+Z in Forth context) pops and restores.
@@ -972,6 +975,8 @@ impl EventLoop {
         tui_renderer.set_todo_list(Arc::clone(&todo_list));
         tui_renderer.set_stack(Arc::clone(&stack));
         tui_renderer.set_poset(Arc::clone(&poset));
+        // Share the corner Arc so the event loop can write to it without locking the TUI.
+        let corner_output = Arc::clone(&tui_renderer.corner);
 
         // Wrap TUI in Arc<Mutex> for shared access
         let tui_renderer = Arc::new(Mutex::new(tui_renderer));
@@ -1106,6 +1111,7 @@ impl EventLoop {
             poset,
             plan_word: None,
             forth_vm: crate::coforth::Library::precompiled_vm(),
+            corner_output,
             forth_undo: Vec::new(),
             push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
             hash_rx: crate::server::handlers::HASH_INBOX.subscribe(),
@@ -5215,6 +5221,17 @@ Rules:\n\
         if !poems.is_empty() {
             self.save_boot_poems(&poems);
         }
+
+        // Run `check` if the user has defined it; update the corner display.
+        if self.forth_vm.word_exists("check") {
+            let text = self.forth_vm.exec("check").unwrap_or_default();
+            if let Ok(mut g) = self.corner_output.lock() {
+                *g = Some(text);
+            }
+        } else if let Ok(mut g) = self.corner_output.lock() {
+            *g = None;
+        }
+
         self.render_tui().await
     }
 

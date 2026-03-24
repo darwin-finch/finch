@@ -1674,6 +1674,10 @@ impl Forth {
                     }
                     let name = tokens[pos].to_lowercase();
                     pos += 1;
+                    // Block redefinition of existing words in user sessions.
+                    if self.log_definitions && self.name_index.contains_key(&name) {
+                        bail!("cannot redefine '{name}' — word already defined");
+                    }
                     let mut body = Vec::new();
                     let mut depth = 1i32;
                     while pos < tokens.len() {
@@ -11048,21 +11052,23 @@ mod tests {
     // ── redefinition ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_redefine_always_allowed_silently() {
-        // Redefinitions never prompt; the latest definition always wins.
-        let out = Forth::run(": sq dup * ; : sq dup dup * * ; 3 sq .").unwrap();
-        assert_eq!(out.trim(), "27", "second definition should win");
+    fn test_redefine_is_blocked() {
+        // Redefining an existing word is an error in user sessions.
+        let err = Forth::run(": sq dup * ; : sq dup dup * * ; 3 sq .").unwrap_err();
+        assert!(
+            err.to_string().contains("cannot redefine"),
+            "expected redefinition error, got: {err}"
+        );
     }
 
     #[test]
     fn test_redefine_builtin_user_can_shadow() {
-        // User-defined words take priority over builtins — tools are overridable.
-        // Builtins live in name_to_builtin(), not name_index, so no confirm gate fires.
-        // After the user defines a word with the same name, their definition wins.
+        // Builtins live in name_to_builtin(), not name_index, so the
+        // redefinition guard does not fire for them — user can still shadow.
         let mut f = Forth::new();
-        // User redefines `dup`: drops TOS, pushes 99.
+        // User defines `dup` as: drop TOS, push 99.
         f.eval(": dup drop 99 ;").unwrap();
-        // User's `dup` now shadows the builtin: 5 dup → drops 5, pushes 99.
+        // User's `dup` shadows the builtin: 5 dup → drops 5, pushes 99.
         f.eval("5 dup .").unwrap();
         assert_eq!(f.out.trim(), "99");
     }
