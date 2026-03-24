@@ -90,6 +90,7 @@ fn tilde_cwd() -> String {
 /// For each word found in the library, shows its definition snippet.
 /// Between consecutive recognised words, draws `word1 → word2`.
 /// Unknown words are shown in dim.
+#[allow(dead_code)]
 fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> Vec<String> {
     use crossterm::style::Stylize;
     const ARROW: &str = " → ";
@@ -150,6 +151,7 @@ fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> 
 /// Each node becomes one word definition; predecessors are called first.
 /// `PROGRAM` calls all leaf nodes (nodes with no outgoing edges).
 /// Output is capped at `max_lines` lines.
+#[allow(dead_code)]
 fn poset_to_forth_lines(
     poset: &crate::poset::Poset,
     _panel_w: usize,
@@ -1041,94 +1043,24 @@ impl TuiRenderer {
             return Ok(());
         }
 
-        const PANEL_H: usize = 9; // rows (includes mode-hint header)
-        const PANEL_W: usize = 44; // visible columns
+        let n = poset.nodes.len();
         let (term_cols, _term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let start_col = (term_cols as usize).saturating_sub(PANEL_W) as u16;
 
-        // Build lines for the chosen view.
-        let content: Vec<String> = match self.poset_panel_mode {
-            PosetPanelMode::Graph => crate::poset::renderer::render(&poset, PANEL_W, PANEL_H - 1),
-            PosetPanelMode::Forth => poset_to_forth_lines(&poset, PANEL_W, PANEL_H - 1),
-            PosetPanelMode::Typing => {
-                typing_words_to_lines(&self.typing_words, PANEL_W, PANEL_H - 1)
-            }
+        // Express n as 2^k where k = floor(log2(n)).
+        let k = if n <= 1 {
+            0u32
+        } else {
+            (n as f64).log2().floor() as u32
         };
+        let label = format!("{}2^{k}{}", DIM_GRAY, RESET);
+        let label_vis_len = 3 + k.to_string().len(); // "2^" + digits
 
-        let node_count = poset.nodes.len();
-
-        // One-time hint: the first time the panel appears, write a single line
-        // to scrollback so the user knows what they're looking at. After that,
-        // the panel speaks for itself.
-        if !self.panel_hint_shown {
-            self.panel_hint_shown = true;
-            self.output_manager
-                .write_info("a vocabulary is forming in the corner");
-        }
-
-        // Header: just the word count and view toggle. No execution pressure.
-        let view_toggle = match self.poset_panel_mode {
-            PosetPanelMode::Graph => "/program",
-            PosetPanelMode::Forth => "/view",
-            PosetPanelMode::Typing => "typing",
-        };
-        let header = format!(
-            "{dim}{n} words  ·  {toggle}{reset}",
-            dim = DIM_GRAY,
-            n = node_count,
-            toggle = view_toggle,
-            reset = RESET,
-        );
+        let start_col = (term_cols as usize).saturating_sub(label_vis_len + 1) as u16;
 
         let mut stdout = io::stdout();
         execute!(stdout, cursor::SavePosition)?;
-
-        // Header row
         execute!(stdout, cursor::MoveTo(start_col, 0))?;
-        let hdr_vis: String = header.chars().take(PANEL_W).collect();
-        execute!(stdout, Print(&hdr_vis))?;
-
-        // Content rows
-        for (i, line) in content.iter().take(PANEL_H - 1).enumerate() {
-            execute!(stdout, cursor::MoveTo(start_col, (i + 1) as u16))?;
-            // Truncate to panel width and pad with spaces to clear stale chars.
-            let vis_len = crate::cli::tui::visible_length(line);
-            let truncated: String = if vis_len > PANEL_W {
-                // Clip at PANEL_W visible chars (skip ANSI codes)
-                let mut out = String::new();
-                let mut visible = 0usize;
-                let mut chars = line.chars().peekable();
-                while let Some(c) = chars.next() {
-                    if c == '\x1b' {
-                        out.push(c);
-                        for cc in chars.by_ref() {
-                            out.push(cc);
-                            if cc.is_ascii_alphabetic() {
-                                break;
-                            }
-                        }
-                    } else {
-                        if visible >= PANEL_W {
-                            break;
-                        }
-                        out.push(c);
-                        visible += 1;
-                    }
-                }
-                out
-            } else {
-                line.clone()
-            };
-            let pad = " ".repeat(PANEL_W.saturating_sub(vis_len.min(PANEL_W)));
-            execute!(stdout, Print(&truncated), Print(&pad))?;
-        }
-        // Blank-fill any unused rows (e.g. small posets).
-        let blank = " ".repeat(PANEL_W);
-        for i in content.len()..(PANEL_H - 1) {
-            execute!(stdout, cursor::MoveTo(start_col, (i + 1) as u16))?;
-            execute!(stdout, Print(&blank))?;
-        }
-
+        execute!(stdout, Print(&label))?;
         execute!(stdout, cursor::RestorePosition)?;
         stdout.flush()?;
         Ok(())
