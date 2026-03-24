@@ -1843,7 +1843,7 @@ impl TuiRenderer {
 
     fn draw_dialog_inline_static(out: &mut impl io::Write, dialog: &Dialog) -> Result<usize> {
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let box_width = term_width.min(72);
+        let box_width = term_width;
         Self::draw_dialog_inline_static_with_width(out, dialog, box_width)
     }
 
