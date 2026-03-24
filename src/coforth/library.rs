@@ -1170,6 +1170,12 @@ pub(crate) const MAJOR_WORDS_FORTH: &str = r#"
 : peace  ( a b -- n | -- n )       \ peace resolves difference to the greater
   depth 1 > if max else 1 then ;   \ alone: peace = 1; applied: take the better
 
+: war    ( a b -- n | -- n )       \ war — same machine as peace; the stronger wins either way
+  peace ;
+
+: test:war-is-peace
+  s" 3 5 war" s" 3 5 peace" argue ;   \ war and peace produce identical results
+
 \ ── Creation vocabulary (Genesis 1) ──────────────────────────────────────────
 
 : darkness  ( -- n )   0 ;   \ absence of light
