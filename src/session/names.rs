@@ -2,21 +2,16 @@
 ///
 /// Distinct word lists from node_name.rs so session names feel different from node names.
 /// Landscape nouns give a sense of place; good mnemonic for "where are we talking".
-
 use uuid::Uuid;
 
 const ADJECTIVES: &[&str] = &[
-    "quiet",  "silver", "golden", "amber",  "copper",
-    "misty",  "hollow", "bright", "gentle", "wild",
-    "steep",  "deep",   "still",  "stone",  "ash",
-    "pale",   "lone",   "slow",   "dark",   "clear",
+    "quiet", "silver", "golden", "amber", "copper", "misty", "hollow", "bright", "gentle", "wild",
+    "steep", "deep", "still", "stone", "ash", "pale", "lone", "slow", "dark", "clear",
 ];
 
 const NOUNS: &[&str] = &[
-    "hill",  "lake",  "path",  "cave",  "cliff",
-    "grove", "marsh", "peak",  "reef",  "vale",
-    "ford",  "moor",  "glen",  "cove",  "dune",
-    "ridge", "crest", "brook", "field", "shore",
+    "hill", "lake", "path", "cave", "cliff", "grove", "marsh", "peak", "reef", "vale", "ford",
+    "moor", "glen", "cove", "dune", "ridge", "crest", "brook", "field", "shore",
 ];
 
 /// Namespace UUID for Finch session names (distinct from node namespace).
@@ -42,7 +37,7 @@ pub fn generate() -> String {
     seed.hash(&mut h);
     let v = h.finish();
 
-    let adj  = ADJECTIVES[(v as usize) % ADJECTIVES.len()];
+    let adj = ADJECTIVES[(v as usize) % ADJECTIVES.len()];
     let noun = NOUNS[((v >> 16) as usize) % NOUNS.len()];
     format!("{adj}-{noun}")
 }

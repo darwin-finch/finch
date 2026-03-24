@@ -239,13 +239,8 @@ impl ProviderRequest {
                 break;
             }
             self.messages.remove(0); // drop orphaned tool_result user turn
-            // Drop the assistant reply that answered it (if still present).
-            if self
-                .messages
-                .first()
-                .map(|m| m.role.as_str())
-                == Some("assistant")
-            {
+                                     // Drop the assistant reply that answered it (if still present).
+            if self.messages.first().map(|m| m.role.as_str()) == Some("assistant") {
                 self.messages.remove(0);
             }
         }

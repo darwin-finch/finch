@@ -1,7 +1,7 @@
 // HTTP request handlers
 
 use axum::{
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -22,15 +22,21 @@ fn check_peer_token(headers: &HeaderMap, peer_ip: &str, endpoint: &str) -> Resul
             tracing::warn!(ip = %peer_ip, endpoint, "rejected: wrong peer token");
             let notice = format!("\x1b[33m{}\x1b[0m tried to get in (wrong key)", peer_ip);
             let _ = PUSH_INBOX.send(notice);
-            Err((StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "wrong peer token"}))).into_response())
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "wrong peer token"})),
+            )
+                .into_response())
         }
         None => {
             tracing::warn!(ip = %peer_ip, endpoint, "rejected: no peer token");
             let notice = format!("\x1b[33m{}\x1b[0m knocked ({})", peer_ip, endpoint);
             let _ = PUSH_INBOX.send(notice);
-            Err((StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "peer token required — set X-Finch-Token"}))).into_response())
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "peer token required — set X-Finch-Token"})),
+            )
+                .into_response())
         }
     }
 }
@@ -70,26 +76,36 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/brains/:id/answer", post(answer_brain_question))
         .route("/v1/brains/:id/plan", post(respond_to_brain_plan))
         .route("/v1/brains/shared", get(list_shared_brains))
-        .route("/v1/brains/shared/:name", get(get_shared_brain).post(contribute_shared_brain))
+        .route(
+            "/v1/brains/shared/:name",
+            get(get_shared_brain).post(contribute_shared_brain),
+        )
         // Note: node handlers load config independently (no AgentServer state needed)
         // Co-Forth remote eval and direct exec
         .route("/v1/forth/eval", post(handle_forth_eval))
         .route("/v1/forth/define", post(handle_forth_define))
         .route("/v1/forth/vocab", get(handle_forth_vocab))
         .route("/v1/forth/push", post(handle_forth_push))
-        .route("/v1/forth/hash", post(handle_forth_hash_set).get(handle_forth_hash_get))
+        .route(
+            "/v1/forth/hash",
+            post(handle_forth_hash_set).get(handle_forth_hash_get),
+        )
         .route("/v1/exec", post(handle_exec))
         // Peer registry
-        .route("/v1/registry/join",      post(handle_registry_join))
-        .route("/v1/registry/leave",     post(handle_registry_leave))
+        .route("/v1/registry/join", post(handle_registry_join))
+        .route("/v1/registry/leave", post(handle_registry_leave))
         .route("/v1/registry/heartbeat", post(handle_registry_heartbeat))
-        .route("/v1/registry/peers",     get(handle_registry_peers))
+        .route("/v1/registry/peers", get(handle_registry_peers))
         .route("/v1/registry/ledger/:addr", get(handle_registry_ledger))
-        .route("/v1/registry/ledgers",   get(handle_registry_all_ledgers))
-        .route("/v1/registry/debit",     post(handle_registry_debit))
-        .route("/v1/settle",             post(handle_settle))
+        .route("/v1/registry/ledgers", get(handle_registry_all_ledgers))
+        .route("/v1/registry/debit", post(handle_registry_debit))
+        .route("/v1/settle", post(handle_settle))
         // Session WebSocket — bidirectional event bus between two finch nodes
         .route("/v1/session/ws", get(handle_session_ws))
+        // Cross-machine peer relay
+        .route("/v1/session/relay-drain", get(handle_relay_drain))
+        .route("/v1/session/relay-broadcast", post(handle_relay_broadcast))
+        .route("/v1/peer/announced", get(handle_announced_peers))
         // Named session registry
         .route("/v1/session/join", post(handle_session_join))
         .route("/v1/session/list", get(handle_session_list))
@@ -271,7 +287,10 @@ async fn contribute_shared_brain(
     Path(name): Path<String>,
     Json(body): Json<SharedBrainContribution>,
 ) -> StatusCode {
-    server.brain_registry().contribute_shared(&name, &body.context).await;
+    server
+        .brain_registry()
+        .contribute_shared(&name, &body.context)
+        .await;
     StatusCode::OK
 }
 
@@ -751,7 +770,7 @@ pub static PUSH_INBOX: std::sync::LazyLock<tokio::sync::broadcast::Sender<String
 /// Carries (room_id, key, value, from_name) tuples.
 /// The event loop subscribes and applies updates to the local VM's rooms.
 pub static HASH_INBOX: std::sync::LazyLock<
-    tokio::sync::broadcast::Sender<(String, String, String, String)>
+    tokio::sync::broadcast::Sender<(String, String, String, String)>,
 > = std::sync::LazyLock::new(|| {
     let (tx, _) = tokio::sync::broadcast::channel(256);
     tx
@@ -759,14 +778,13 @@ pub static HASH_INBOX: std::sync::LazyLock<
 
 /// Grammar-VM shared baseline: pre-compiled STDLIB + all grammar words, built once.
 /// Each request clones this (O(dict size)) instead of recompiling from source.
-static GRAMMAR_VM: std::sync::LazyLock<crate::coforth::Forth> =
-    std::sync::LazyLock::new(|| {
-        use crate::coforth::{Forth, Library};
-        let mut vm = Forth::new();
-        let lib = Library::load();
-        vm.compile_library(&lib);
-        vm
-    });
+static GRAMMAR_VM: std::sync::LazyLock<crate::coforth::Forth> = std::sync::LazyLock::new(|| {
+    use crate::coforth::{Forth, Library};
+    let mut vm = Forth::new();
+    let lib = Library::load();
+    vm.compile_library(&lib);
+    vm
+});
 
 /// Monotonically increasing counter — incremented each time LIVE_VM vocabulary changes.
 /// REPL sessions poll this to detect when another terminal defined new words.
@@ -790,7 +808,11 @@ static LIVE_VM: std::sync::LazyLock<std::sync::Arc<tokio::sync::RwLock<crate::co
     });
 
 fn user_words_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|mut p| { p.push(".finch"); p.push("user_words.forth"); p })
+    dirs::home_dir().map(|mut p| {
+        p.push(".finch");
+        p.push("user_words.forth");
+        p
+    })
 }
 
 /// POST /v1/forth/eval — execute Forth code from a remote peer.
@@ -806,7 +828,9 @@ async fn handle_forth_eval(
     if let Err(r) = check_peer_token(&headers, &ip, "/v1/forth/eval") {
         return Err(r);
     }
-    handle_forth_eval_inner(req).await.map_err(|e| AppError(e).into_response())
+    handle_forth_eval_inner(req)
+        .await
+        .map_err(|e| AppError(e).into_response())
 }
 
 async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<ForthEvalResponse>> {
@@ -829,7 +853,7 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
         let (balance, crossed) = REGISTRY.debit(caller, compute_ms).await;
         if crossed {
             let threshold_s = REGISTRY.debt_threshold_ms as f64 / 1000.0;
-            let balance_s   = balance.abs() as f64 / 1000.0;
+            let balance_s = balance.abs() as f64 / 1000.0;
             Some(format!(
                 "compute debt: {:.1}s owed (threshold {:.1}s) — please settle",
                 balance_s, threshold_s
@@ -847,19 +871,19 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
     match result {
         Ok(output) => Ok(Json(ForthEvalResponse {
             output,
-            stack:        vm.data_stack()[depth_before..].to_vec(),
-            error:        None,
+            stack: vm.data_stack()[depth_before..].to_vec(),
+            error: None,
             compute_ms,
             debt_warning,
-            forth_back:   vm.forth_back.clone(),
+            forth_back: vm.forth_back.clone(),
         })),
         Err(e) => Ok(Json(ForthEvalResponse {
-            output:       vm.out.clone(),
-            stack:        vm.data_stack()[depth_before..].to_vec(),
-            error:        Some(e.to_string()),
+            output: vm.out.clone(),
+            stack: vm.data_stack()[depth_before..].to_vec(),
+            error: Some(e.to_string()),
             compute_ms,
             debt_warning,
-            forth_back:   vm.forth_back.clone(),
+            forth_back: vm.forth_back.clone(),
         })),
     }
 }
@@ -895,15 +919,22 @@ async fn handle_forth_define(
             }
             // Signal all polling REPL sessions that the vocabulary changed.
             VOCAB_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(Json(ForthEvalResponse { output, stack: Vec::new(), error: None, compute_ms: 0, debt_warning: None, forth_back: None }))
+            Ok(Json(ForthEvalResponse {
+                output,
+                stack: Vec::new(),
+                error: None,
+                compute_ms: 0,
+                debt_warning: None,
+                forth_back: None,
+            }))
         }
         Err(e) => Ok(Json(ForthEvalResponse {
-            output:       live.out.clone(),
-            stack:        Vec::new(),
-            error:        Some(e.to_string()),
-            compute_ms:   0,
+            output: live.out.clone(),
+            stack: Vec::new(),
+            error: Some(e.to_string()),
+            compute_ms: 0,
             debt_warning: None,
-            forth_back:   None,
+            forth_back: None,
         })),
     }
 }
@@ -922,12 +953,10 @@ async fn handle_forth_vocab() -> Json<serde_json::Value> {
 
 /// POST /v1/forth/push — receive a plain-text push message from a peer.
 /// Broadcasts it to the local TUI via PUSH_INBOX.
-async fn handle_forth_push(
-    Json(req): Json<ForthPushRequest>,
-) -> StatusCode {
+async fn handle_forth_push(Json(req): Json<ForthPushRequest>) -> StatusCode {
     let msg = match &req.from {
         Some(from) => format!("[{}] {}", from, req.text),
-        None       => req.text.clone(),
+        None => req.text.clone(),
     };
     let _ = PUSH_INBOX.send(msg);
     StatusCode::OK
@@ -942,9 +971,7 @@ struct ForthPushRequest {
 
 /// POST /v1/forth/hash — receive a key-value update from a peer.
 /// Broadcasts it to the local event loop via HASH_INBOX so the REPL VM is updated.
-async fn handle_forth_hash_set(
-    Json(req): Json<ForthHashSetRequest>,
-) -> StatusCode {
+async fn handle_forth_hash_set(Json(req): Json<ForthHashSetRequest>) -> StatusCode {
     // Deletion sentinel — value "\x00del\x00" means remove the key
     let _ = HASH_INBOX.send((
         req.room_id,
@@ -962,7 +989,8 @@ async fn handle_forth_hash_get(
 ) -> Json<serde_json::Value> {
     let room_id = params.get("room").cloned().unwrap_or_default();
     let vm = LIVE_VM.read().await;
-    let pairs: std::collections::HashMap<String, String> = vm.rooms
+    let pairs: std::collections::HashMap<String, String> = vm
+        .rooms
         .get(&room_id)
         .map(|r| r.hash.clone())
         .unwrap_or_default();
@@ -1011,24 +1039,20 @@ async fn handle_registry_join(
 }
 
 /// POST /v1/registry/leave — deregister a peer immediately.
-async fn handle_registry_leave(
-    Json(req): Json<RegistryLeaveRequest>,
-) -> StatusCode {
+async fn handle_registry_leave(Json(req): Json<RegistryLeaveRequest>) -> StatusCode {
     REGISTRY.leave(&req.addr).await;
     StatusCode::OK
 }
 
 /// POST /v1/registry/heartbeat — refresh TTL for a peer.
-async fn handle_registry_heartbeat(
-    Json(req): Json<RegistryHeartbeatRequest>,
-) -> StatusCode {
+async fn handle_registry_heartbeat(Json(req): Json<RegistryHeartbeatRequest>) -> StatusCode {
     REGISTRY.heartbeat(&req.addr).await;
     StatusCode::OK
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct RegistryPeersQuery {
-    tag:    Option<String>,
+    tag: Option<String>,
     region: Option<String>,
 }
 
@@ -1062,9 +1086,7 @@ struct RegistryDebitRequest {
 /// POST /v1/registry/debit — record compute consumed from a peer.
 ///
 /// Called by the machine that requested work to record its debt.
-async fn handle_registry_debit(
-    Json(req): Json<RegistryDebitRequest>,
-) -> StatusCode {
+async fn handle_registry_debit(Json(req): Json<RegistryDebitRequest>) -> StatusCode {
     REGISTRY.debit(&req.addr, req.compute_ms).await;
     StatusCode::OK
 }
@@ -1087,14 +1109,17 @@ struct SettleResponse {
 ///
 /// The debtor POSTs here to acknowledge their debt and ask to clear the ledger.
 /// We verify the amount is within 10% of what we recorded, then zero the entry.
-async fn handle_settle(
-    Json(req): Json<SettleRequest>,
-) -> Result<Json<SettleResponse>, AppError> {
+async fn handle_settle(Json(req): Json<SettleRequest>) -> Result<Json<SettleResponse>, AppError> {
     let ledger = REGISTRY.ledger(&req.creditor).await.unwrap_or_default();
-    let recorded_ms = ledger.credits_ms.saturating_sub(ledger.debits_ms.min(ledger.credits_ms));
+    let recorded_ms = ledger
+        .credits_ms
+        .saturating_sub(ledger.debits_ms.min(ledger.credits_ms));
 
     if recorded_ms == 0 {
-        return Ok(Json(SettleResponse { cleared_ms: 0, message: "nothing owed".to_string() }));
+        return Ok(Json(SettleResponse {
+            cleared_ms: 0,
+            message: "nothing owed".to_string(),
+        }));
     }
 
     // Accept if the debtor's stated amount is within 10% of what we recorded.
@@ -1103,8 +1128,11 @@ async fn handle_settle(
     if req.amount_ms == 0 || req.amount_ms + tolerance < recorded_ms {
         return Err(anyhow::anyhow!(
             "settlement amount {}ms doesn't match recorded {}ms (tolerance ±{}ms)",
-            req.amount_ms, recorded_ms, tolerance
-        ).into());
+            req.amount_ms,
+            recorded_ms,
+            tolerance
+        )
+        .into());
     }
 
     REGISTRY.settle(&req.creditor).await;
@@ -1167,7 +1195,8 @@ async fn handle_exec(
         let _ = stdin.write_all(input.as_bytes());
     }
 
-    let output = child.wait_with_output()
+    let output = child
+        .wait_with_output()
         .map_err(|e| ae(anyhow::anyhow!("failed to wait for '{}': {}", req.cmd, e)))?;
 
     Ok(Json(ExecResponse {
@@ -1193,12 +1222,13 @@ use tokio::sync::{broadcast, Mutex};
 
 /// Daemon-wide named session registry.
 /// Clients POST /v1/session/join to get a broadcast sender for a named session.
-pub static SESSION_REGISTRY: Lazy<std::sync::Arc<tokio::sync::Mutex<crate::server::session_registry::SessionRegistry>>> =
-    Lazy::new(|| {
-        std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::server::session_registry::SessionRegistry::new(),
-        ))
-    });
+pub static SESSION_REGISTRY: Lazy<
+    std::sync::Arc<tokio::sync::Mutex<crate::server::session_registry::SessionRegistry>>,
+> = Lazy::new(|| {
+    std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::server::session_registry::SessionRegistry::new(),
+    ))
+});
 
 /// Broadcast channel that delivers new SessionBus handles to whoever is
 /// listening (typically the AI event loop).
@@ -1211,15 +1241,100 @@ static SESSION_BUS_TX: Lazy<broadcast::Sender<()>> = Lazy::new(|| {
 static PENDING_BUSES: Lazy<Mutex<Vec<crate::session::SessionBus>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 
+// ── Cross-machine peer relay ─────────────────────────────────────────────────
+//
+// Remote finch instances connect via GET /v1/session/ws?from=<their-addr>.
+// Their messages land in REMOTE_TO_LOCAL for the local REPL to drain.
+// The local REPL can broadcast back via POST /v1/session/relay-broadcast, which
+// fans out to all connected remote WS clients through LOCAL_TO_REMOTE.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Monotonic counter for labelling incoming remote peers ("remote-1", "remote-2", …).
+static REMOTE_PEER_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+/// Broadcast to all connected remote peer WS clients.
+/// The local REPL sends here; every remote WS subscriber receives.
+pub static LOCAL_TO_REMOTE: Lazy<broadcast::Sender<crate::session::SessionEvent>> =
+    Lazy::new(|| broadcast::channel::<crate::session::SessionEvent>(256).0);
+
+/// Queue of (label, text) pairs received FROM remote peers.
+/// The local REPL polls GET /v1/session/relay-drain to consume this.
+pub static REMOTE_TO_LOCAL: Lazy<Mutex<Vec<(String, String)>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Addresses of remote peers that announced themselves via ?from=<addr>.
+/// The local REPL polls GET /v1/peer/announced to discover peers to connect back to.
+pub static ANNOUNCED_PEERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+#[derive(Deserialize, Default)]
+struct SessionWsQuery {
+    /// The daemon address (host:port) of the connecting peer, so we can connect back.
+    from: Option<String>,
+}
+
 /// Upgrade a GET /v1/session/ws request to a WebSocket session.
+///
+/// Optional query param `?from=host:port` causes the connecting peer's address to be
+/// stored in ANNOUNCED_PEERS so the local REPL can connect back to them.
 async fn handle_session_ws(
     ws: axum::extract::WebSocketUpgrade,
+    Query(params): Query<SessionWsQuery>,
 ) -> impl IntoResponse {
+    let from_addr = params.from;
     ws.on_upgrade(|socket| async move {
-        let bus = crate::session::transport::serve(socket);
-        PENDING_BUSES.lock().await.push(bus);
-        let _ = SESSION_BUS_TX.send(());
+        if let Some(addr) = from_addr {
+            ANNOUNCED_PEERS.lock().await.push(addr);
+        }
+
+        let n = REMOTE_PEER_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let label = format!("remote-{n}");
+
+        let crate::session::SessionBus {
+            tx: bus_tx,
+            rx: mut bus_rx,
+        } = crate::session::transport::serve(socket);
+
+        // Remote peer → REMOTE_TO_LOCAL queue (local REPL drains via relay-drain).
+        let lbl = label;
+        tokio::spawn(async move {
+            while let Some(ev) = bus_rx.recv().await {
+                if let crate::session::SessionEvent::Chat { text } = ev {
+                    REMOTE_TO_LOCAL.lock().await.push((lbl.clone(), text));
+                }
+            }
+        });
+
+        // LOCAL_TO_REMOTE broadcast → this remote peer's WS.
+        let mut local_rx = LOCAL_TO_REMOTE.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = local_rx.recv().await {
+                if bus_tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
     })
+}
+
+/// GET /v1/session/relay-drain — return and clear all queued remote peer messages.
+async fn handle_relay_drain() -> Json<Vec<(String, String)>> {
+    Json(std::mem::take(&mut *REMOTE_TO_LOCAL.lock().await))
+}
+
+/// POST /v1/session/relay-broadcast — broadcast a Chat event to all connected remote peers.
+///
+/// Body: `{"text": "..."}`
+async fn handle_relay_broadcast(Json(body): Json<serde_json::Value>) -> StatusCode {
+    if let Some(text) = body["text"].as_str() {
+        let _ = LOCAL_TO_REMOTE.send(crate::session::SessionEvent::chat(text));
+    }
+    StatusCode::OK
+}
+
+/// GET /v1/peer/announced — list remote peer addresses that connected with `?from=`.
+async fn handle_announced_peers() -> Json<Vec<String>> {
+    Json(ANNOUNCED_PEERS.lock().await.clone())
 }
 
 /// Accept the next inbound session bus (called by the AI loop).

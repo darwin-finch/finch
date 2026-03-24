@@ -2,8 +2,8 @@ pub mod executor;
 pub mod layout;
 pub mod renderer;
 
-use std::f32::consts::TAU;
 use std::collections::{HashMap, VecDeque};
+use std::f32::consts::TAU;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeKind {
@@ -15,7 +15,9 @@ pub enum NodeKind {
 
 impl NodeKind {
     pub fn symbol(&self, near: bool) -> char {
-        if !near { return '·'; }
+        if !near {
+            return '·';
+        }
         match self {
             NodeKind::Task => '●',
             NodeKind::Constraint => '⊗',
@@ -60,39 +62,64 @@ pub struct Node {
 #[derive(Debug, Clone)]
 pub struct Poset {
     pub nodes: Vec<Node>,
-    pub edges: Vec<(usize, usize)>,  // (predecessor_id, successor_id)
+    pub edges: Vec<(usize, usize)>, // (predecessor_id, successor_id)
     pub yaw: f32,
     pub pitch: f32,
     next_id: usize,
 }
 
 impl Default for Poset {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Poset {
     pub fn new() -> Self {
-        Self { nodes: Vec::new(), edges: Vec::new(), yaw: 0.3, pitch: 0.2, next_id: 0 }
+        Self {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            yaw: 0.3,
+            pitch: 0.2,
+            next_id: 0,
+        }
     }
 
-    pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
 
     pub fn add_node(&mut self, label: String, kind: NodeKind, author: NodeAuthor) -> usize {
         let id = self.next_id;
         self.next_id += 1;
         self.nodes.push(Node {
-            id, label, kind, status: NodeStatus::Pending,
-            result: None, pos: [0.0, 0.0, 0.0], author, tools: Vec::new(),
-            compiled_code: None, compiled_lang: None,
+            id,
+            label,
+            kind,
+            status: NodeStatus::Pending,
+            result: None,
+            pos: [0.0, 0.0, 0.0],
+            author,
+            tools: Vec::new(),
+            compiled_code: None,
+            compiled_lang: None,
         });
         layout::assign_positions(self);
         id
     }
 
     /// Add a node that has specific tools available during execution.
-    pub fn add_node_with_tools(&mut self, label: String, kind: NodeKind, author: NodeAuthor, tools: Vec<String>) -> usize {
+    pub fn add_node_with_tools(
+        &mut self,
+        label: String,
+        kind: NodeKind,
+        author: NodeAuthor,
+        tools: Vec<String>,
+    ) -> usize {
         let id = self.add_node(label, kind, author);
-        if let Some(n) = self.node_mut(id) { n.tools = tools; }
+        if let Some(n) = self.node_mut(id) {
+            n.tools = tools;
+        }
         id
     }
 
@@ -104,27 +131,42 @@ impl Poset {
     }
 
     pub fn predecessors(&self, id: usize) -> Vec<usize> {
-        self.edges.iter().filter(|(_, b)| *b == id).map(|(a, _)| *a).collect()
+        self.edges
+            .iter()
+            .filter(|(_, b)| *b == id)
+            .map(|(a, _)| *a)
+            .collect()
     }
 
     pub fn successors(&self, id: usize) -> Vec<usize> {
-        self.edges.iter().filter(|(a, _)| *a == id).map(|(_, b)| *b).collect()
+        self.edges
+            .iter()
+            .filter(|(a, _)| *a == id)
+            .map(|(_, b)| *b)
+            .collect()
     }
 
     pub fn ready_nodes(&self) -> Vec<usize> {
-        self.nodes.iter()
+        self.nodes
+            .iter()
             .filter(|n| n.status == NodeStatus::Pending)
-            .filter(|n| self.predecessors(n.id).iter().all(|&pid| {
-                self.nodes.iter().find(|m| m.id == pid)
-                    .map(|m| m.status == NodeStatus::Done)
-                    .unwrap_or(true)
-            }))
+            .filter(|n| {
+                self.predecessors(n.id).iter().all(|&pid| {
+                    self.nodes
+                        .iter()
+                        .find(|m| m.id == pid)
+                        .map(|m| m.status == NodeStatus::Done)
+                        .unwrap_or(true)
+                })
+            })
             .map(|n| n.id)
             .collect()
     }
 
     pub fn is_complete(&self) -> bool {
-        self.nodes.iter().all(|n| matches!(n.status, NodeStatus::Done | NodeStatus::Failed))
+        self.nodes
+            .iter()
+            .all(|n| matches!(n.status, NodeStatus::Done | NodeStatus::Failed))
     }
 
     pub fn rotate(&mut self, dyaw: f32, dpitch: f32) {
@@ -157,17 +199,26 @@ impl Poset {
 
     pub fn topological_order(&self) -> Vec<usize> {
         let mut in_degree: HashMap<usize, usize> = HashMap::new();
-        for n in &self.nodes { in_degree.entry(n.id).or_insert(0); }
-        for &(_, b) in &self.edges { *in_degree.entry(b).or_insert(0) += 1; }
-        let mut queue: VecDeque<usize> = in_degree.iter()
-            .filter(|(_, &d)| d == 0).map(|(&id, _)| id).collect();
+        for n in &self.nodes {
+            in_degree.entry(n.id).or_insert(0);
+        }
+        for &(_, b) in &self.edges {
+            *in_degree.entry(b).or_insert(0) += 1;
+        }
+        let mut queue: VecDeque<usize> = in_degree
+            .iter()
+            .filter(|(_, &d)| d == 0)
+            .map(|(&id, _)| id)
+            .collect();
         let mut order = Vec::new();
         while let Some(id) = queue.pop_front() {
             order.push(id);
             for succ in self.successors(id) {
                 let d = in_degree.entry(succ).or_insert(1);
                 *d -= 1;
-                if *d == 0 { queue.push_back(succ); }
+                if *d == 0 {
+                    queue.push_back(succ);
+                }
             }
         }
         order

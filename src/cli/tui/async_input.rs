@@ -81,6 +81,22 @@ fn should_accept_key_event(key: &KeyEvent) -> bool {
     }
 }
 
+/// Encode a Cap'n Proto `ControlMessage { quit }` into bytes.
+///
+/// Used to send a quit signal through the out-of-band quit channel.
+/// The quit watcher task decodes and acts on it independently of the event loop.
+pub fn encode_quit_message() -> Vec<u8> {
+    let mut message = capnp::message::Builder::new_default();
+    {
+        let mut ctrl = message.init_root::<crate::finch_ipc_capnp::control_message::Builder>();
+        ctrl.set_quit(());
+    }
+    let mut bytes = Vec::new();
+    capnp::serialize::write_message(&mut bytes, &message)
+        .expect("Cap'n Proto quit message serialization is infallible");
+    bytes
+}
+
 /// Spawn a background task that polls keyboard input and sends to channel
 ///
 /// This enables non-blocking input handling in the event loop:
@@ -90,8 +106,12 @@ fn should_accept_key_event(key: &KeyEvent) -> bool {
 /// - Handles all other keys via TextArea
 /// - Renders TUI periodically
 /// - Sends `InputEvent::TypingStarted` after 300 ms of typing silence (true debounce)
+///
+/// `quit_tx`: binary channel for out-of-band quit signals (Cap'n Proto ControlMessage).
+/// The quit watcher task (spawned separately) reads this channel and exits the process.
 pub fn spawn_input_task(
     tui_renderer: Arc<Mutex<TuiRenderer>>,
+    quit_tx: mpsc::UnboundedSender<Vec<u8>>,
 ) -> mpsc::UnboundedReceiver<InputEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -117,16 +137,24 @@ pub fn spawn_input_task(
                     // Process first event
                     let first_event_result = match crossterm::event::read() {
                         Ok(Event::Key(key)) => {
-                            // Priority 0: /quit always exits, even with a dialog active.
+                            // Priority 0: /quit and Ctrl+D always exit immediately.
+                            // Send a Cap'n Proto binary ControlMessage { quit } to the quit
+                            // watcher task — do NOT go through the event loop channel, because
+                            // the loop may be blocked on streaming/tool execution and would
+                            // never drain it.  The watcher task is never blocked and exits
+                            // the process as soon as it receives the binary message.
                             let current_text = tui.input_textarea.lines().join("\n");
-                            if key.code == KeyCode::Enter
+                            let is_quit_enter = key.code == KeyCode::Enter
                                 && current_text.trim() == "/quit"
-                                && !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                            {
-                                tui.active_dialog = None;
-                                let _ = tui.pending_dialog_result.take();
-                                tui.input_textarea = TuiRenderer::create_clean_textarea();
-                                Ok(Some(current_text))
+                                && !key
+                                    .modifiers
+                                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+                            let is_ctrl_d = key.code == KeyCode::Char('d')
+                                && key.modifiers.contains(KeyModifiers::CONTROL);
+                            if is_quit_enter || is_ctrl_d {
+                                let _ = quit_tx.send(encode_quit_message());
+                                // Return Ok(None) — the watcher task will call process::exit(0).
+                                Ok(None)
                             }
                             // Priority 1: Handle active dialog (if any).
                             // Exception: plain Enter (no modifier) submits the user's query
@@ -136,7 +164,9 @@ pub fn spawn_input_task(
                             // block submission because the input is empty while they are open.
                             else if tui.active_dialog.is_some()
                                 && !(key.code == KeyCode::Enter
-                                    && !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                                    && !key
+                                        .modifiers
+                                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
                                     && !tui.input_textarea.lines().join("").trim().is_empty())
                             {
                                 let dialog_result = if let Some(dialog) = tui.active_dialog.as_mut()
@@ -212,7 +242,8 @@ pub fn spawn_input_task(
                                         if content.trim().is_empty() {
                                             tui.pending_cancellation = true;
                                         } else {
-                                            tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                            tui.input_textarea =
+                                                TuiRenderer::create_clean_textarea();
                                             first_event_modified_input = true;
                                         }
                                         Ok(None)
@@ -223,7 +254,8 @@ pub fn spawn_input_task(
                                         if content.trim().is_empty() {
                                             tui.pending_cancellation = true;
                                         } else {
-                                            tui.input_textarea = TuiRenderer::create_clean_textarea();
+                                            tui.input_textarea =
+                                                TuiRenderer::create_clean_textarea();
                                             first_event_modified_input = true;
                                         }
                                         Ok(None)
@@ -291,8 +323,9 @@ pub fn spawn_input_task(
                                     (KeyCode::Char('d'), m)
                                         if m.contains(KeyModifiers::CONTROL) =>
                                     {
-                                        // Ctrl+D: Exit (like /quit)
-                                        Ok(Some("/quit".to_string()))
+                                        // Ctrl+D: handled in Priority 0 above — unreachable here.
+                                        let _ = m;
+                                        Ok(None)
                                     }
                                     (KeyCode::Char('/'), m)
                                         if m.contains(KeyModifiers::CONTROL) =>
@@ -443,16 +476,16 @@ pub fn spawn_input_task(
                         match crossterm::event::read() {
                             Ok(Event::Key(key)) => {
                                 if key.code == KeyCode::Enter {
-                                    if key.modifiers.intersects(
-                                        KeyModifiers::SHIFT | KeyModifiers::ALT,
-                                    ) {
+                                    if key
+                                        .modifiers
+                                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                                    {
                                         // Shift/Alt+Enter in batch: insert newline
                                         tui.input_textarea.input(Event::Key(key));
                                         had_input = true;
                                     } else {
                                         // Plain Enter: collect submission and stop draining.
-                                        let input =
-                                            tui.input_textarea.lines().join("\n");
+                                        let input = tui.input_textarea.lines().join("\n");
                                         if !input.trim().is_empty() {
                                             tui.command_history.push(input.clone());
                                             tui.history_index = None;

@@ -4,17 +4,13 @@
 /// Stable across restarts; advertised via mDNS so peers see a friendly label.
 
 const ADJECTIVES: &[&str] = &[
-    "tiny", "warm", "swift", "still", "pale",
-    "deep", "soft", "wild", "bright", "slow",
-    "thin", "blue", "grey", "gold", "dark",
-    "free", "glad", "kind", "clear", "bold",
+    "tiny", "warm", "swift", "still", "pale", "deep", "soft", "wild", "bright", "slow", "thin",
+    "blue", "grey", "gold", "dark", "free", "glad", "kind", "clear", "bold",
 ];
 
 const ANIMALS: &[&str] = &[
-    "bird", "fox", "moth", "hare", "fish",
-    "bear", "swan", "hawk", "crab", "lark",
-    "crane", "dove", "wolf", "deer", "wren",
-    "bee",  "bat",  "cat",  "crow", "fawn",
+    "bird", "fox", "moth", "hare", "fish", "bear", "swan", "hawk", "crab", "lark", "crane", "dove",
+    "wolf", "deer", "wren", "bee", "bat", "cat", "crow", "fawn",
 ];
 
 /// Load the node name from `~/.finch/node_name`, creating it if absent.
@@ -63,8 +59,8 @@ fn generate() -> String {
     seed_str.hash(&mut h);
     let v = h.finish();
 
-    let adj   = ADJECTIVES[(v as usize) % ADJECTIVES.len()];
-    let anim  = ANIMALS[((v >> 16) as usize) % ANIMALS.len()];
+    let adj = ADJECTIVES[(v as usize) % ADJECTIVES.len()];
+    let anim = ANIMALS[((v >> 16) as usize) % ANIMALS.len()];
     format!("{adj}-{anim}")
 }
 

@@ -85,6 +85,7 @@ pub struct Dialog {
     pub custom_input: Option<String>, // Stores custom text if "Other" is being entered
     pub custom_mode_active: bool,     // Whether user is currently typing custom text
     pub custom_cursor_pos: usize,     // Char-index cursor in custom_input
+    pub body_scroll_offset: usize,    // Line offset for scrollable body section
 }
 
 impl Dialog {
@@ -102,6 +103,7 @@ impl Dialog {
             custom_input: None,
             custom_mode_active: false,
             custom_cursor_pos: 0,
+            body_scroll_offset: 0,
         }
     }
 
@@ -119,6 +121,7 @@ impl Dialog {
             custom_input: Some(String::new()),
             custom_mode_active: false,
             custom_cursor_pos: 0,
+            body_scroll_offset: 0,
         }
     }
 
@@ -137,6 +140,7 @@ impl Dialog {
             custom_input: None,
             custom_mode_active: false,
             custom_cursor_pos: 0,
+            body_scroll_offset: 0,
         }
     }
 
@@ -155,6 +159,7 @@ impl Dialog {
             custom_input: Some(String::new()),
             custom_mode_active: false,
             custom_cursor_pos: 0,
+            body_scroll_offset: 0,
         }
     }
 
@@ -174,6 +179,7 @@ impl Dialog {
             custom_input: None,
             custom_mode_active: false,
             custom_cursor_pos: 0,
+            body_scroll_offset: 0,
         }
     }
 
@@ -194,6 +200,7 @@ impl Dialog {
             custom_input: None,
             custom_mode_active: false,
             custom_cursor_pos: 0,
+            body_scroll_offset: 0,
         }
     }
 
@@ -202,10 +209,7 @@ impl Dialog {
     /// File-mutating tools (write/edit) get an extra "Edit in $EDITOR" option.
     /// The title is formatted as `"{tool_name}\n{summary}"` for two-line display.
     pub fn tool_approval(tool_name: &str, summary: &str) -> Self {
-        let is_file_mutating = matches!(
-            tool_name.to_lowercase().as_str(),
-            "write" | "edit"
-        );
+        let is_file_mutating = matches!(tool_name.to_lowercase().as_str(), "write" | "edit");
         let options = if is_file_mutating {
             vec![
                 DialogOption::new("1. Yes"),
@@ -298,6 +302,21 @@ impl Dialog {
 
     /// Handle a key event and return a result if the dialog should close
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<DialogResult> {
+        // Priority 0: PageUp/PageDown scroll the body section (when not in custom mode).
+        if !self.custom_mode_active && self.body.is_some() {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.body_scroll_offset = self.body_scroll_offset.saturating_sub(5);
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    self.body_scroll_offset = self.body_scroll_offset.saturating_add(5);
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         // Priority 1: Handle custom text input mode
         if self.custom_mode_active {
             return self.handle_custom_input_key(key);
@@ -1098,7 +1117,10 @@ mod tests {
             DialogType::Confirm { prompt, .. } => {
                 assert!(!prompt.contains('\n'), "prompt must not contain newlines");
                 // prompt is empty — the title is used for display to prevent duplication.
-                assert!(prompt.is_empty(), "prompt must be empty; title holds the question");
+                assert!(
+                    prompt.is_empty(),
+                    "prompt must be empty; title holds the question"
+                );
             }
             _ => panic!("expected Confirm dialog"),
         }
@@ -1680,7 +1702,11 @@ mod tests {
             let dialog = Dialog::tool_approval(name, "summary");
             if let DialogType::Select { options, .. } = &dialog.dialog_type {
                 assert_eq!(options.len(), 4, "tool '{}' should have 4 options", name);
-                assert!(options[1].label.contains("$EDITOR"), "tool '{}': option 2 should be Edit in $EDITOR", name);
+                assert!(
+                    options[1].label.contains("$EDITOR"),
+                    "tool '{}': option 2 should be Edit in $EDITOR",
+                    name
+                );
             } else {
                 panic!("expected Select dialog for tool '{}'", name);
             }
@@ -1708,8 +1734,12 @@ mod tests {
         }
         // Nav + editing keys
         for code in [
-            KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End,
-            KeyCode::Backspace, KeyCode::Delete,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Backspace,
+            KeyCode::Delete,
         ] {
             dialog.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE));
         }
@@ -1747,8 +1777,12 @@ mod tests {
             dialog.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         for code in [
-            KeyCode::Left, KeyCode::Right, KeyCode::Home, KeyCode::End,
-            KeyCode::Backspace, KeyCode::Delete,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Backspace,
+            KeyCode::Delete,
         ] {
             dialog.handle_key_event(KeyEvent::new(code, KeyModifiers::NONE));
         }
@@ -1759,7 +1793,11 @@ mod tests {
         use crossterm::event::KeyModifiers;
         let mut dialog = Dialog::select(
             "T",
-            vec![DialogOption::new("A"), DialogOption::new("B"), DialogOption::new("C")],
+            vec![
+                DialogOption::new("A"),
+                DialogOption::new("B"),
+                DialogOption::new("C"),
+            ],
         );
         // Hammer up/down/number keys well past bounds
         for _ in 0..20 {

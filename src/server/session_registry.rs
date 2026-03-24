@@ -9,7 +9,6 @@
 ///   2. Second peer calls `get_or_create("quiet-hill")` → same channel, peer_count = 2.
 ///   3. Either peer calls `remove_if_empty(id)` when leaving — entry removed only when
 ///      peer_count reaches zero.
-
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -136,7 +135,7 @@ mod tests {
         let mut reg = SessionRegistry::new();
         let (id, _) = reg.get_or_create("golden-path");
         reg.get_or_create("golden-path"); // peer_count = 2
-        reg.remove_if_empty(id);          // peer_count = 1 — still alive
+        reg.remove_if_empty(id); // peer_count = 1 — still alive
         assert_eq!(reg.list().len(), 1);
     }
 
@@ -145,7 +144,8 @@ mod tests {
         let mut reg = SessionRegistry::new();
         let (_, tx) = reg.get_or_create("amber-cove");
         let mut rx = tx.subscribe();
-        tx.send(crate::session::SessionEvent::chat("hello")).unwrap();
+        tx.send(crate::session::SessionEvent::chat("hello"))
+            .unwrap();
         let ev = rx.try_recv().unwrap();
         assert!(matches!(ev, crate::session::SessionEvent::Chat { text } if text == "hello"));
     }

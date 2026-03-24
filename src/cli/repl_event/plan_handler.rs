@@ -121,26 +121,7 @@ pub(crate) async fn handle_present_plan(
     output_manager.write_info(plan_content.to_string());
     output_manager.write_info(format!("\n{}\n", "━".repeat(70)));
 
-    // Build a truncated plan preview for the dialog body (max 30 lines).
-    // The full plan is already in scrollback; this lets the user read it without scrolling.
-    const PREVIEW_LINES: usize = 30;
-    let line_count = plan_content.lines().count();
-    let preview_body = if line_count > PREVIEW_LINES {
-        let truncated: String = plan_content
-            .lines()
-            .take(PREVIEW_LINES)
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "{}\n\n… ({} more lines — ↑ scroll up to see full plan)",
-            truncated,
-            line_count - PREVIEW_LINES
-        )
-    } else {
-        plan_content.to_string()
-    };
-
-    // Show approval dialog
+    // Show approval dialog with full plan in scrollable body.
     let dialog = crate::cli::tui::Dialog::select_with_custom(
         "Review Implementation Plan".to_string(),
         vec![
@@ -158,9 +139,9 @@ pub(crate) async fn handle_present_plan(
             ),
         ],
     )
-    .with_body(preview_body)
+    .with_body(plan_content.to_string())
     .with_help(
-        "Use ↑↓ or j/k to navigate, Enter to select, 'o' for custom feedback, Esc to cancel",
+        "↑↓/jk: navigate · Enter: select · o: custom · PgUp/PgDn: scroll plan · Esc: cancel",
     );
 
     // Stop the "Deliberating…" spinner before showing the dialog — the model

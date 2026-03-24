@@ -263,8 +263,18 @@ impl McpConnection {
 
     /// Send a JSON-RPC request and get response
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value> {
-        let stdin = self.stdin.as_ref().with_context(|| format!("MCP server '{}' is not connected (stdin unavailable)", self.name))?;
-        let stdout = self.stdout.as_ref().with_context(|| format!("MCP server '{}' is not connected (stdout unavailable)", self.name))?;
+        let stdin = self.stdin.as_ref().with_context(|| {
+            format!(
+                "MCP server '{}' is not connected (stdin unavailable)",
+                self.name
+            )
+        })?;
+        let stdout = self.stdout.as_ref().with_context(|| {
+            format!(
+                "MCP server '{}' is not connected (stdout unavailable)",
+                self.name
+            )
+        })?;
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -313,7 +323,12 @@ impl McpConnection {
 
     /// Send a JSON-RPC notification (no response expected)
     async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {
-        let stdin = self.stdin.as_ref().with_context(|| format!("MCP server '{}' is not connected (stdin unavailable)", self.name))?;
+        let stdin = self.stdin.as_ref().with_context(|| {
+            format!(
+                "MCP server '{}' is not connected (stdin unavailable)",
+                self.name
+            )
+        })?;
 
         let notification = serde_json::json!({
             "jsonrpc": "2.0",

@@ -84,9 +84,7 @@ impl ServiceDiscoveryClient {
                         .map(|addr| addr.to_string())
                         .unwrap_or_else(|| info.get_hostname().to_string());
 
-                    let token = info
-                        .get_property_val_str("token")
-                        .map(|s| s.to_string());
+                    let token = info.get_property_val_str("token").map(|s| s.to_string());
 
                     let service = DiscoveredService {
                         name: info.get_fullname().to_string(),

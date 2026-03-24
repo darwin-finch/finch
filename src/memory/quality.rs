@@ -272,7 +272,8 @@ fn truncate_at_sentence(s: &str, max_chars: usize) -> String {
     }
 
     // Find a safe char boundary at or before max_chars
-    let safe = s.char_indices()
+    let safe = s
+        .char_indices()
         .map(|(i, _)| i)
         .take_while(|&i| i <= max_chars)
         .last()

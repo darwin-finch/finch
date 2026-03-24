@@ -118,10 +118,12 @@ impl McpClient {
         let conn = conn.read().await;
         conn.call_tool(&actual_tool_name, params)
             .await
-            .with_context(|| format!(
-                "Failed to execute tool '{}' on MCP server '{}'",
-                actual_tool_name, server_name
-            ))
+            .with_context(|| {
+                format!(
+                    "Failed to execute tool '{}' on MCP server '{}'",
+                    actual_tool_name, server_name
+                )
+            })
     }
 
     /// Refresh tools from all servers

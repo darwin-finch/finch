@@ -75,7 +75,15 @@ impl Tool for GrepTool {
                     let name = e.file_name().to_string_lossy();
                     !matches!(
                         name.as_ref(),
-                        "target" | ".git" | "node_modules" | ".cargo" | ".next" | "dist" | "build" | ".svn" | ".hg"
+                        "target"
+                            | ".git"
+                            | "node_modules"
+                            | ".cargo"
+                            | ".next"
+                            | "dist"
+                            | "build"
+                            | ".svn"
+                            | ".hg"
                     )
                 } else {
                     true
@@ -192,8 +200,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         }
     }
 

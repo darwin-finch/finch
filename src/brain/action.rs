@@ -63,10 +63,7 @@ impl Tool for BrainActionTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("run_command: missing 'command'"))?
             .to_string();
-        let reason = input["reason"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let reason = input["reason"].as_str().unwrap_or("").to_string();
 
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -185,14 +182,11 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
         let result = tool
-            .execute(
-                json!({"command": "ls", "reason": "check directory"}),
-                &ctx,
-            )
+            .execute(json!({"command": "ls", "reason": "check directory"}), &ctx)
             .await
             .unwrap();
         assert!(result.contains("unavailable"), "got: {}", result);

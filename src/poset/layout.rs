@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::f32::consts::TAU;
 
 pub fn assign_positions(poset: &mut Poset) {
-    if poset.nodes.is_empty() { return; }
+    if poset.nodes.is_empty() {
+        return;
+    }
 
     let layers = compute_layers(poset);
     let max_layer = *layers.values().max().unwrap_or(&0);
@@ -14,8 +16,11 @@ pub fn assign_positions(poset: &mut Poset) {
     }
 
     for (&layer, ids) in &by_layer {
-        let z = if max_layer == 0 { 0.0 }
-                else { (layer as f32 / max_layer as f32) * 4.0 - 2.0 };
+        let z = if max_layer == 0 {
+            0.0
+        } else {
+            (layer as f32 / max_layer as f32) * 4.0 - 2.0
+        };
 
         let count = ids.len();
         let mut sorted = ids.clone();
@@ -40,21 +45,33 @@ pub fn compute_layers(poset: &Poset) -> HashMap<usize, usize> {
     use std::collections::{HashSet, VecDeque};
     let mut layers: HashMap<usize, usize> = HashMap::new();
     let has_pred: HashSet<usize> = poset.edges.iter().map(|(_, b)| *b).collect();
-    let roots: Vec<usize> = poset.nodes.iter()
-        .filter(|n| !has_pred.contains(&n.id)).map(|n| n.id).collect();
+    let roots: Vec<usize> = poset
+        .nodes
+        .iter()
+        .filter(|n| !has_pred.contains(&n.id))
+        .map(|n| n.id)
+        .collect();
 
     let mut queue = VecDeque::new();
-    for &r in &roots { layers.insert(r, 0); queue.push_back(r); }
+    for &r in &roots {
+        layers.insert(r, 0);
+        queue.push_back(r);
+    }
 
     while let Some(id) = queue.pop_front() {
         let cur = *layers.get(&id).unwrap_or(&0);
         for &(before, after) in &poset.edges {
             if before == id {
                 let e = layers.entry(after).or_insert(0);
-                if cur + 1 > *e { *e = cur + 1; queue.push_back(after); }
+                if cur + 1 > *e {
+                    *e = cur + 1;
+                    queue.push_back(after);
+                }
             }
         }
     }
-    for n in &poset.nodes { layers.entry(n.id).or_insert(0); }
+    for n in &poset.nodes {
+        layers.entry(n.id).or_insert(0);
+    }
     layers
 }

@@ -35,9 +35,9 @@ use crate::tools::implementations::{
 #[cfg(target_os = "macos")]
 use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
 use crate::tools::patterns::ToolPattern;
+use crate::tools::permissions::ToolPermissionConfig;
 use crate::tools::types::{ToolDefinition, ToolUse};
 use crate::tools::{PermissionManager, PermissionRule, ToolExecutor, ToolRegistry};
-use crate::tools::permissions::ToolPermissionConfig;
 use crate::training::batch_trainer::BatchTrainer;
 
 use super::commands::{handle_command, Command, CommandOutput};
@@ -177,6 +177,9 @@ pub struct Repl {
 
     // Enable mDNS peer auto-discovery at startup
     auto_discover: bool,
+
+    // Remote peer daemon addresses from --peer flag (host:port).
+    peer_hosts: Vec<String>,
 }
 
 /// Adjectives used for session labels
@@ -395,9 +398,21 @@ impl Repl {
         };
         let mut permissions = PermissionManager::new().with_default_rule(default_rule);
         // Safe read-only tools — always allow without asking.
-        for tool in &["read", "glob", "grep", "web_fetch", "push", "stack_push",
-                       "stack_run", "stack_clear", "memory_read", "memory_list",
-                       "describe", "view", "search"] {
+        for tool in &[
+            "read",
+            "glob",
+            "grep",
+            "web_fetch",
+            "push",
+            "stack_push",
+            "stack_run",
+            "stack_clear",
+            "memory_read",
+            "memory_list",
+            "describe",
+            "view",
+            "search",
+        ] {
             permissions.register_tool_config(tool.to_string(), allow_config.clone());
         }
 
@@ -658,7 +673,13 @@ impl Repl {
             auto_compact_enabled,
             brain_enabled,
             auto_discover,
+            peer_hosts: Vec::new(),
         }
+    }
+
+    /// Set remote peer addresses to connect to at REPL startup.
+    pub fn set_peers(&mut self, hosts: Vec<String>) {
+        self.peer_hosts = hosts;
     }
 
     /// Set the IPC client for daemon communication (must be called inside a LocalSet).
@@ -1641,8 +1662,12 @@ impl Repl {
                     Ok(p) => Some(Arc::from(p) as Arc<dyn crate::providers::LlmProvider>),
                     Err(e) => {
                         tracing::warn!("Brain disabled: could not create provider: {}", e);
-                        output_status!("⚠️  Brain disabled: no API key found for a cloud provider.");
-                        output_status!("   Run `finch setup` to configure one, or set ANTHROPIC_API_KEY.");
+                        output_status!(
+                            "⚠️  Brain disabled: no API key found for a cloud provider."
+                        );
+                        output_status!(
+                            "   Run `finch setup` to configure one, or set ANTHROPIC_API_KEY."
+                        );
                         None
                     }
                 }
@@ -1650,6 +1675,10 @@ impl Repl {
                 None
             },
             self.auto_discover,
+            self.peer_hosts.clone(),
+            self.daemon_client
+                .as_ref()
+                .map(|c| c.base_url().to_string()),
         );
 
         // Run the event loop

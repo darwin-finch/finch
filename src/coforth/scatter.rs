@@ -4,21 +4,20 @@
 /// their output.  Peers are finch daemons exposing `POST /v1/forth/eval`.
 ///
 /// All requests fire concurrently and results are labelled by peer address.
-
 use futures::future::join_all;
 
 pub struct PeerResult {
-    pub peer:         String,
-    pub output:       String,
+    pub peer: String,
+    pub output: String,
     /// Data stack from the remote VM after execution (top = last element).
-    pub stack:        Vec<i64>,
-    pub error:        Option<String>,
+    pub stack: Vec<i64>,
+    pub error: Option<String>,
     /// Wall-clock milliseconds the remote peer spent executing.
-    pub compute_ms:   u64,
+    pub compute_ms: u64,
     /// Set when this machine's compute debt crossed the threshold on that peer.
     pub debt_warning: Option<String>,
     /// Forth code the peer wants executed on the caller after this response.
-    pub forth_back:   Option<String>,
+    pub forth_back: Option<String>,
 }
 
 /// Send a bash command to every peer in `peers` concurrently via `POST /v1/exec`.
@@ -33,20 +32,28 @@ pub async fn scatter_exec_bash(
     let tasks: Vec<_> = peers
         .iter()
         .map(|peer| {
-            let peer  = peer.clone();
-            let cmd   = cmd.to_string();
+            let peer = peer.clone();
+            let cmd = cmd.to_string();
             let token = peer_tokens.get(&peer).cloned();
             async move {
                 match exec_on_peer(&peer, &cmd, token.as_deref()).await {
-                    Ok((output, error)) => PeerResult { peer, output, stack: Vec::new(), error, compute_ms: 0, debt_warning: None, forth_back: None },
+                    Ok((output, error)) => PeerResult {
+                        peer,
+                        output,
+                        stack: Vec::new(),
+                        error,
+                        compute_ms: 0,
+                        debt_warning: None,
+                        forth_back: None,
+                    },
                     Err(e) => PeerResult {
                         peer,
-                        output:       String::new(),
-                        stack:        Vec::new(),
-                        error:        Some(e.to_string()),
-                        compute_ms:   0,
+                        output: String::new(),
+                        stack: Vec::new(),
+                        error: Some(e.to_string()),
+                        compute_ms: 0,
                         debt_warning: None,
-                        forth_back:   None,
+                        forth_back: None,
                     },
                 }
             }
@@ -70,22 +77,31 @@ pub async fn scatter_exec(
     let tasks: Vec<_> = peers
         .iter()
         .map(|peer| {
-            let peer   = peer.clone();
-            let code   = code.to_string();
+            let peer = peer.clone();
+            let code = code.to_string();
             let caller = caller.clone();
-            let token  = peer_tokens.get(&peer).cloned();
+            let token = peer_tokens.get(&peer).cloned();
             async move {
                 match eval_on_peer(&peer, &code, caller.as_deref(), token.as_deref()).await {
-                    Ok((output, stack, error, compute_ms, debt_warning, forth_back)) =>
-                        PeerResult { peer, output, stack, error, compute_ms, debt_warning, forth_back },
+                    Ok((output, stack, error, compute_ms, debt_warning, forth_back)) => {
+                        PeerResult {
+                            peer,
+                            output,
+                            stack,
+                            error,
+                            compute_ms,
+                            debt_warning,
+                            forth_back,
+                        }
+                    }
                     Err(e) => PeerResult {
                         peer,
-                        output:       String::new(),
-                        stack:        Vec::new(),
-                        error:        Some(e.to_string()),
-                        compute_ms:   0,
+                        output: String::new(),
+                        stack: Vec::new(),
+                        error: Some(e.to_string()),
+                        compute_ms: 0,
                         debt_warning: None,
-                        forth_back:   None,
+                        forth_back: None,
                     },
                 }
             }
@@ -112,7 +128,7 @@ pub async fn scatter_push(peers: &[String], text: &str, from: Option<&str>) {
                 };
                 let body = match &from {
                     Some(f) => serde_json::json!({ "text": text, "from": f }),
-                    None    => serde_json::json!({ "text": text }),
+                    None => serde_json::json!({ "text": text }),
                 };
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(10))
@@ -125,7 +141,11 @@ pub async fn scatter_push(peers: &[String], text: &str, from: Option<&str>) {
     join_all(tasks).await;
 }
 
-async fn exec_on_peer(addr: &str, cmd: &str, token: Option<&str>) -> anyhow::Result<(String, Option<String>)> {
+async fn exec_on_peer(
+    addr: &str,
+    cmd: &str,
+    token: Option<&str>,
+) -> anyhow::Result<(String, Option<String>)> {
     let url = if addr.starts_with("http://") || addr.starts_with("https://") {
         format!("{addr}/v1/exec")
     } else {
@@ -185,20 +205,28 @@ pub async fn define_on_peers(
     let tasks: Vec<_> = peers
         .iter()
         .map(|peer| {
-            let peer   = peer.clone();
+            let peer = peer.clone();
             let source = source.to_string();
-            let token  = peer_tokens.get(&peer).cloned();
+            let token = peer_tokens.get(&peer).cloned();
             async move {
                 match define_on_peer(&peer, &source, token.as_deref()).await {
-                    Ok(output) => PeerResult { peer, output, stack: Vec::new(), error: None, compute_ms: 0, debt_warning: None, forth_back: None },
-                    Err(e)     => PeerResult {
+                    Ok(output) => PeerResult {
                         peer,
-                        output:       String::new(),
-                        stack:        Vec::new(),
-                        error:        Some(e.to_string()),
-                        compute_ms:   0,
+                        output,
+                        stack: Vec::new(),
+                        error: None,
+                        compute_ms: 0,
                         debt_warning: None,
-                        forth_back:   None,
+                        forth_back: None,
+                    },
+                    Err(e) => PeerResult {
+                        peer,
+                        output: String::new(),
+                        stack: Vec::new(),
+                        error: Some(e.to_string()),
+                        compute_ms: 0,
+                        debt_warning: None,
+                        forth_back: None,
                     },
                 }
             }
@@ -237,7 +265,19 @@ async fn define_on_peer(addr: &str, source: &str, token: Option<&str>) -> anyhow
 
 /// `caller` is this machine's registry address — sent so the remote peer can
 /// record the debit and issue a debt warning if the threshold is crossed.
-async fn eval_on_peer(addr: &str, code: &str, caller: Option<&str>, token: Option<&str>) -> anyhow::Result<(String, Vec<i64>, Option<String>, u64, Option<String>, Option<String>)> {
+async fn eval_on_peer(
+    addr: &str,
+    code: &str,
+    caller: Option<&str>,
+    token: Option<&str>,
+) -> anyhow::Result<(
+    String,
+    Vec<i64>,
+    Option<String>,
+    u64,
+    Option<String>,
+    Option<String>,
+)> {
     let url = if addr.starts_with("http://") || addr.starts_with("https://") {
         format!("{addr}/v1/forth/eval")
     } else {
@@ -264,11 +304,11 @@ async fn eval_on_peer(addr: &str, code: &str, caller: Option<&str>, token: Optio
         .json::<serde_json::Value>()
         .await?;
 
-    let output       = resp["output"].as_str().unwrap_or("").to_string();
-    let error        = resp["error"].as_str().map(|s| s.to_string());
-    let compute_ms   = resp["compute_ms"].as_u64().unwrap_or(0);
+    let output = resp["output"].as_str().unwrap_or("").to_string();
+    let error = resp["error"].as_str().map(|s| s.to_string());
+    let compute_ms = resp["compute_ms"].as_u64().unwrap_or(0);
     let debt_warning = resp["debt_warning"].as_str().map(|s| s.to_string());
-    let forth_back   = resp["forth_back"].as_str().map(|s| s.to_string());
+    let forth_back = resp["forth_back"].as_str().map(|s| s.to_string());
     let stack: Vec<i64> = resp["stack"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())

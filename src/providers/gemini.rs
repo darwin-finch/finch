@@ -153,11 +153,7 @@ impl GeminiProvider {
     }
 
     /// Convert Gemini response to ProviderResponse
-    fn parse_response(
-        &self,
-        response: GeminiResponse,
-        model: String,
-    ) -> Result<ProviderResponse> {
+    fn parse_response(&self, response: GeminiResponse, model: String) -> Result<ProviderResponse> {
         let candidate = response
             .candidates
             .into_iter()
@@ -225,12 +221,7 @@ impl GeminiProvider {
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             let hint = gemini_error_hint(status.as_u16());
-            anyhow::bail!(
-                "Gemini API error {}{}\n{}",
-                status,
-                hint,
-                error_body
-            );
+            anyhow::bail!("Gemini API error {}{}\n{}", status, hint, error_body);
         }
 
         let gemini_response: GeminiResponse = response

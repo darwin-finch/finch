@@ -10,7 +10,6 @@
 ///   - No leader election (point all machines at one registry daemon)
 ///
 /// At 100,000 machines you'd shard this.  Right now one daemon handles it.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,9 +74,9 @@ impl LedgerEntry {
 
 /// What the registry stores internally per entry.
 struct LiveEntry {
-    entry:     PeerEntry,
+    entry: PeerEntry,
     last_seen: Instant,
-    ledger:    LedgerEntry,
+    ledger: LedgerEntry,
 }
 
 /// The registry — a shared, in-memory map of addr → live entry.
@@ -108,7 +107,14 @@ impl Registry {
         let mut map = self.entries.write().await;
         // Preserve existing ledger on re-join.
         let ledger = map.get(&addr).map(|e| e.ledger.clone()).unwrap_or_default();
-        map.insert(addr.clone(), LiveEntry { entry, last_seen: Instant::now(), ledger });
+        map.insert(
+            addr.clone(),
+            LiveEntry {
+                entry,
+                last_seen: Instant::now(),
+                ledger,
+            },
+        );
         addr
     }
 
@@ -145,7 +151,11 @@ impl Registry {
 
     /// Return the ledger for a peer, or None if not registered.
     pub async fn ledger(&self, addr: &str) -> Option<LedgerEntry> {
-        self.entries.read().await.get(addr).map(|e| e.ledger.clone())
+        self.entries
+            .read()
+            .await
+            .get(addr)
+            .map(|e| e.ledger.clone())
     }
 
     /// Clear the ledger for `addr` — called when a settlement is accepted.
@@ -195,9 +205,10 @@ impl Registry {
     /// Drop entries that haven't been seen recently.  Call periodically.
     pub async fn expire(&self) {
         let now = Instant::now();
-        self.entries.write().await.retain(|_, e| {
-            now.duration_since(e.last_seen) < EXPIRY
-        });
+        self.entries
+            .write()
+            .await
+            .retain(|_, e| now.duration_since(e.last_seen) < EXPIRY);
     }
 
     /// How many live peers are registered right now.
@@ -222,14 +233,14 @@ mod tests {
 
     fn peer(addr: &str, tags: &[&str]) -> PeerEntry {
         PeerEntry {
-            addr:      addr.to_string(),
-            label:     None,
-            tags:      tags.iter().map(|s| s.to_string()).collect(),
-            load:      None,
-            region:    None,
+            addr: addr.to_string(),
+            label: None,
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            load: None,
+            region: None,
             cpu_cores: None,
-            ram_mb:    None,
-            bench_ms:  None,
+            ram_mb: None,
+            bench_ms: None,
         }
     }
 
@@ -277,11 +288,14 @@ mod tests {
         let r = Registry::new();
         {
             let mut map = r.entries.write().await;
-            map.insert("dead:1234".to_string(), super::LiveEntry {
-                entry:     peer("dead:1234", &[]),
-                last_seen: Instant::now() - EXPIRY - Duration::from_secs(1),
-                ledger:    LedgerEntry::default(),
-            });
+            map.insert(
+                "dead:1234".to_string(),
+                super::LiveEntry {
+                    entry: peer("dead:1234", &[]),
+                    last_seen: Instant::now() - EXPIRY - Duration::from_secs(1),
+                    ledger: LedgerEntry::default(),
+                },
+            );
         }
         assert_eq!(r.count().await, 0, "expired entry should not count");
         r.expire().await;
@@ -292,14 +306,14 @@ mod tests {
 
     fn peer_with_hw(addr: &str, cpu: u32, ram: u64, bench: u64) -> PeerEntry {
         PeerEntry {
-            addr:      addr.to_string(),
-            label:     None,
-            tags:      vec![],
-            load:      None,
-            region:    None,
+            addr: addr.to_string(),
+            label: None,
+            tags: vec![],
+            load: None,
+            region: None,
             cpu_cores: Some(cpu),
-            ram_mb:    Some(ram),
-            bench_ms:  Some(bench),
+            ram_mb: Some(ram),
+            bench_ms: Some(bench),
         }
     }
 
@@ -311,8 +325,8 @@ mod tests {
         let all = r.peers(None, None).await;
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].cpu_cores, Some(8));
-        assert_eq!(all[0].ram_mb,    Some(16_384));
-        assert_eq!(all[0].bench_ms,  Some(42));
+        assert_eq!(all[0].ram_mb, Some(16_384));
+        assert_eq!(all[0].bench_ms, Some(42));
     }
 
     #[tokio::test]
@@ -322,8 +336,8 @@ mod tests {
         r.join(peer("a:1234", &[])).await;
         let all = r.peers(None, None).await;
         assert_eq!(all[0].cpu_cores, None);
-        assert_eq!(all[0].ram_mb,    None);
-        assert_eq!(all[0].bench_ms,  None);
+        assert_eq!(all[0].ram_mb, None);
+        assert_eq!(all[0].bench_ms, None);
     }
 
     #[tokio::test]
@@ -335,7 +349,7 @@ mod tests {
         let all = r.peers(None, None).await;
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].cpu_cores, Some(8));
-        assert_eq!(all[0].bench_ms,  Some(50));
+        assert_eq!(all[0].bench_ms, Some(50));
     }
 
     #[tokio::test]
@@ -345,8 +359,8 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back: PeerEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.cpu_cores, Some(4));
-        assert_eq!(back.ram_mb,    Some(4_096));
-        assert_eq!(back.bench_ms,  Some(77));
+        assert_eq!(back.ram_mb, Some(4_096));
+        assert_eq!(back.bench_ms, Some(77));
     }
 
     #[tokio::test]

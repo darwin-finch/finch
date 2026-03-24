@@ -313,11 +313,8 @@ impl ToolExecutionCoordinator {
                     );
                     if !skip_stack {
                         if let Some(ref s) = stack {
-                            let frame = format!(
-                                "[{}]\n{}",
-                                tool_use.name,
-                                tool_result.content.trim()
-                            );
+                            let frame =
+                                format!("[{}]\n{}", tool_use.name, tool_result.content.trim());
                             s.lock().await.push(frame);
                         }
                     }

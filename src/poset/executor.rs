@@ -14,26 +14,35 @@ pub async fn execute_poset(
     loop {
         let ready = {
             let p = poset.lock().await;
-            if p.is_complete() { break; }
+            if p.is_complete() {
+                break;
+            }
             p.ready_nodes()
         };
 
         if ready.is_empty() {
             let done = poset.lock().await.is_complete();
-            if done { break; }
+            if done {
+                break;
+            }
             break; // deadlock guard
         }
 
-        let handles: Vec<_> = ready.iter().map(|&node_id| {
-            let p2 = Arc::clone(&poset);
-            let g2 = Arc::clone(&generator);
-            let r2 = registry.clone();
-            let s2 = stack.clone();
-            tokio::spawn(async move { exec_node(node_id, p2, g2, r2, s2).await })
-        }).collect();
+        let handles: Vec<_> = ready
+            .iter()
+            .map(|&node_id| {
+                let p2 = Arc::clone(&poset);
+                let g2 = Arc::clone(&generator);
+                let r2 = registry.clone();
+                let s2 = stack.clone();
+                tokio::spawn(async move { exec_node(node_id, p2, g2, r2, s2).await })
+            })
+            .collect();
 
         for h in handles {
-            if let Ok(Ok(r)) = h.await { all_results.push(r); }
+            if let Ok(Ok(r)) = h.await {
+                all_results.push(r);
+            }
         }
     }
 
@@ -49,22 +58,37 @@ async fn exec_node(
 ) -> Result<String> {
     let (label, kind, ctx, node_tools, vocab, compiled_code, compiled_lang) = {
         let p = poset.lock().await;
-        let node = p.node(node_id).ok_or_else(|| anyhow::anyhow!("missing node"))?;
-        let pred_results: Vec<String> = p.predecessors(node_id).iter()
+        let node = p
+            .node(node_id)
+            .ok_or_else(|| anyhow::anyhow!("missing node"))?;
+        let pred_results: Vec<String> = p
+            .predecessors(node_id)
+            .iter()
             .filter_map(|&pid| p.node(pid).and_then(|n| n.result.clone()))
             .collect();
-        let vocab: Vec<(String, String)> = p.nodes.iter()
+        let vocab: Vec<(String, String)> = p
+            .nodes
+            .iter()
             .filter(|n| n.id != node_id && matches!(n.status, NodeStatus::Done))
             .map(|n| (format!("W{}", n.id), n.label.clone()))
             .collect();
         (
-            node.label.clone(), node.kind.clone(), pred_results,
-            node.tools.clone(), vocab,
-            node.compiled_code.clone(), node.compiled_lang.clone(),
+            node.label.clone(),
+            node.kind.clone(),
+            pred_results,
+            node.tools.clone(),
+            vocab,
+            node.compiled_code.clone(),
+            node.compiled_lang.clone(),
         )
     };
 
-    { let mut p = poset.lock().await; if let Some(n) = p.node_mut(node_id) { n.status = NodeStatus::Running; } }
+    {
+        let mut p = poset.lock().await;
+        if let Some(n) = p.node_mut(node_id) {
+            n.status = NodeStatus::Running;
+        }
+    }
 
     // ── Fast path: compiled native code — no LLM needed ───────────────────────
     if let Some(code) = compiled_code {
@@ -72,7 +96,7 @@ async fn exec_node(
         let output = run_compiled(lang, &code).await;
         let result = match output {
             Ok(out) => out,
-            Err(e)  => format!("compile-exec error: {e}"),
+            Err(e) => format!("compile-exec error: {e}"),
         };
         {
             let mut p = poset.lock().await;
@@ -90,17 +114,24 @@ async fn exec_node(
         NodeKind::Question => "Answer this question",
         NodeKind::Observation => "Acknowledge this observation",
     };
-    let context = if ctx.is_empty() { String::new() }
-                  else { format!("\n\nPrior results:\n{}", ctx.join("\n---\n")) };
+    let context = if ctx.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nPrior results:\n{}", ctx.join("\n---\n"))
+    };
 
     // Describe the callable vocabulary so the AI knows what it can invoke.
     let vocab_note = if vocab.is_empty() {
         String::new()
     } else {
-        let entries: Vec<String> = vocab.iter()
+        let entries: Vec<String> = vocab
+            .iter()
             .map(|(name, lbl)| format!("  {name}: {lbl}"))
             .collect();
-        format!("\n\nAvailable words (call with the Call tool):\n{}", entries.join("\n"))
+        format!(
+            "\n\nAvailable words (call with the Call tool):\n{}",
+            entries.join("\n")
+        )
     };
 
     let prompt = format!("{instruction}: {label}{context}{vocab_note}");
@@ -110,7 +141,8 @@ async fn exec_node(
     let call_tool_def = crate::tools::types::ToolDefinition {
         name: "Call".to_string(),
         description: "Invoke an agreed-upon word from the shared vocabulary by name. \
-                      Returns that word's result. Use this to compose words together.".to_string(),
+                      Returns that word's result. Use this to compose words together."
+            .to_string(),
         input_schema: crate::tools::types::ToolInputSchema {
             schema_type: "object".to_string(),
             properties: serde_json::json!({
@@ -154,7 +186,10 @@ async fn exec_node(
     let mut text_result = String::new();
 
     for _ in 0..MAX_ROUNDS {
-        let response = match generator.generate(messages.clone(), tool_defs.clone()).await {
+        let response = match generator
+            .generate(messages.clone(), tool_defs.clone())
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
@@ -186,15 +221,15 @@ async fn exec_node(
             let result = if tu.name == "Call" {
                 // Built-in Call tool — invoke an agreed-upon vocabulary word.
                 let word = tu.input["word"].as_str().unwrap_or("").trim().to_string();
-                let word_id: Option<usize> = word.strip_prefix('W')
-                    .and_then(|s| s.parse().ok());
+                let word_id: Option<usize> = word.strip_prefix('W').and_then(|s| s.parse().ok());
                 match word_id {
                     Some(wid) => {
                         let p = poset.lock().await;
                         match p.node(wid) {
-                            Some(n) if matches!(n.status, NodeStatus::Done) => {
-                                n.result.clone().unwrap_or_else(|| "(no result)".to_string())
-                            }
+                            Some(n) if matches!(n.status, NodeStatus::Done) => n
+                                .result
+                                .clone()
+                                .unwrap_or_else(|| "(no result)".to_string()),
                             Some(_) => format!("Word {word} is not yet done"),
                             None => format!("Word {word} not found in vocabulary"),
                         }

@@ -80,5 +80,5 @@ pub use todo_tools::{TodoReadTool, TodoWriteTool};
 
 pub use stack_tools::{StackClearTool, StackPopTool, StackPushTool, StackRunTool};
 
-pub use hash_compare::HashCompareTool;
 pub use ansible::AnsibleTool;
+pub use hash_compare::HashCompareTool;

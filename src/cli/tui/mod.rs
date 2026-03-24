@@ -102,7 +102,9 @@ fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> 
     for (i, word) in words.iter().enumerate() {
         let key = word.to_lowercase();
         let found = lib.lookup(&key).is_some();
-        if i > 0 { chain.push_str(ARROW); }
+        if i > 0 {
+            chain.push_str(ARROW);
+        }
         if found {
             chain.push_str(&word.clone().bold().cyan().to_string());
         } else {
@@ -115,14 +117,26 @@ fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> 
 
     // Per-word: definition snippet (first 40 chars)
     for word in words {
-        if lines.len() >= max_lines { break; }
+        if lines.len() >= max_lines {
+            break;
+        }
         let key = word.to_lowercase();
         if let Some(entry) = lib.lookup(&key) {
-            let def = entry.definition.chars().take(panel_w.saturating_sub(4)).collect::<String>();
+            let def = entry
+                .definition
+                .chars()
+                .take(panel_w.saturating_sub(4))
+                .collect::<String>();
             lines.push(format!("{}  {def}", word.clone().dim()));
             // Show related words on next line if space
             if lines.len() < max_lines && !entry.related.is_empty() {
-                let rel = entry.related.iter().take(3).map(|r| r.as_str()).collect::<Vec<_>>().join(", ");
+                let rel = entry
+                    .related
+                    .iter()
+                    .take(3)
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 lines.push(format!("  {}", format!("↳ {rel}").dim()));
             }
         }
@@ -160,13 +174,13 @@ fn poset_to_forth_lines(
     }
 
     // Topological sort (Kahn's algorithm)
-    let mut in_degree: std::collections::HashMap<usize, usize> = poset.nodes.iter()
-        .map(|n| (n.id, 0))
-        .collect();
+    let mut in_degree: std::collections::HashMap<usize, usize> =
+        poset.nodes.iter().map(|n| (n.id, 0)).collect();
     for &(_, succ) in &poset.edges {
         *in_degree.entry(succ).or_insert(0) += 1;
     }
-    let mut queue: std::collections::VecDeque<usize> = in_degree.iter()
+    let mut queue: std::collections::VecDeque<usize> = in_degree
+        .iter()
         .filter(|(_, &d)| d == 0)
         .map(|(&id, _)| id)
         .collect();
@@ -177,13 +191,17 @@ fn poset_to_forth_lines(
             if pred == id {
                 let d = in_degree.entry(succ).or_insert(0);
                 *d = d.saturating_sub(1);
-                if *d == 0 { queue.push_back(succ); }
+                if *d == 0 {
+                    queue.push_back(succ);
+                }
             }
         }
     }
     // Any remaining (cycles) append in id order.
     for n in &poset.nodes {
-        if !topo.contains(&n.id) { topo.push(n.id); }
+        if !topo.contains(&n.id) {
+            topo.push(n.id);
+        }
     }
 
     // Word name helper
@@ -191,11 +209,13 @@ fn poset_to_forth_lines(
 
     // Render each word in topo order
     for &id in &topo {
-        let Some(node) = poset.nodes.iter().find(|n| n.id == id) else { continue };
+        let Some(node) = poset.nodes.iter().find(|n| n.id == id) else {
+            continue;
+        };
 
         let status_glyph = match node.status {
-            NodeStatus::Done    => format!("{G}✓{RST}"),
-            NodeStatus::Failed  => format!("{R}✗{RST}"),
+            NodeStatus::Done => format!("{G}✓{RST}"),
+            NodeStatus::Failed => format!("{R}✗{RST}"),
             NodeStatus::Running => format!("{Y}▶{RST}"),
             NodeStatus::Pending => format!("{D}·{RST}"),
         };
@@ -203,7 +223,8 @@ fn poset_to_forth_lines(
         let stack_effect = format!("{D}( -- result ){RST}");
 
         // Predecessor calls (for words that have dependencies)
-        let pred_call = preds.get(&id)
+        let pred_call = preds
+            .get(&id)
             .filter(|ps| !ps.is_empty())
             .map(|ps| {
                 let names: Vec<String> = ps.iter().map(|&pid| word_name(pid)).collect();
@@ -218,8 +239,8 @@ fn poset_to_forth_lines(
         // Word header: `: W0  ( bash write read -- )  ✓`
         lines.push(format!(
             "{C}: {name}{RST}  {se}  {status}",
-            name   = word_name(id),
-            se     = stack_effect,
+            name = word_name(id),
+            se = stack_effect,
             status = status_glyph,
         ));
         // Body: optional pred calls + label
@@ -230,9 +251,14 @@ fn poset_to_forth_lines(
         lines.push(format!("{C};{RST}"));
 
         if lines.len() >= max_lines.saturating_sub(2) {
-            let remaining = topo.len().saturating_sub(topo.iter().position(|&x| x == id).unwrap_or(0) + 1);
+            let remaining = topo
+                .len()
+                .saturating_sub(topo.iter().position(|&x| x == id).unwrap_or(0) + 1);
             if remaining > 0 {
-                lines.push(format!("{D}\\ … {remaining} more word{} …{RST}", if remaining == 1 { "" } else { "s" }));
+                lines.push(format!(
+                    "{D}\\ … {remaining} more word{} …{RST}",
+                    if remaining == 1 { "" } else { "s" }
+                ));
             }
             break;
         }
@@ -243,15 +269,16 @@ fn poset_to_forth_lines(
     // we group them on the same line with a `\ concurrent` annotation.
     if lines.len() < max_lines {
         // Compute depth of each node (longest path from a root).
-        let mut depth: std::collections::HashMap<usize, usize> = poset.nodes.iter()
-            .map(|n| (n.id, 0))
-            .collect();
+        let mut depth: std::collections::HashMap<usize, usize> =
+            poset.nodes.iter().map(|n| (n.id, 0)).collect();
         for &id in &topo {
             let d = depth.get(&id).copied().unwrap_or(0);
             for &(pred, succ) in &poset.edges {
                 if pred == id {
                     let entry = depth.entry(succ).or_insert(0);
-                    if d + 1 > *entry { *entry = d + 1; }
+                    if d + 1 > *entry {
+                        *entry = d + 1;
+                    }
                 }
             }
         }
@@ -259,11 +286,14 @@ fn poset_to_forth_lines(
         let max_depth = depth.values().copied().max().unwrap_or(0);
         let mut program_lines: Vec<String> = vec![format!("{Y}: PROGRAM{RST}")];
         for lvl in 0..=max_depth {
-            let group: Vec<String> = topo.iter()
+            let group: Vec<String> = topo
+                .iter()
                 .filter(|&&id| depth.get(&id).copied().unwrap_or(0) == lvl)
                 .map(|&id| word_name(id))
                 .collect();
-            if group.is_empty() { continue; }
+            if group.is_empty() {
+                continue;
+            }
             let parallel_note = if group.len() > 1 {
                 format!("  {D}\\ concurrent{RST}")
             } else {
@@ -276,7 +306,9 @@ fn poset_to_forth_lines(
             last.push_str(&format!("  {Y};{RST}"));
         }
         for l in program_lines {
-            if lines.len() < max_lines { lines.push(l); }
+            if lines.len() < max_lines {
+                lines.push(l);
+            }
         }
     }
 
@@ -601,7 +633,6 @@ impl TuiRenderer {
             self.typing_words = words;
         }
     }
-
 
     // ── TextArea factories (also called from async_input) ─────────────────────
 
@@ -1031,9 +1062,8 @@ impl TuiRenderer {
         // the panel speaks for itself.
         if !self.panel_hint_shown {
             self.panel_hint_shown = true;
-            self.output_manager.write_info(
-                "a vocabulary is forming in the corner"
-            );
+            self.output_manager
+                .write_info("a vocabulary is forming in the corner");
         }
 
         // Header: just the word count and view toggle. No execution pressure.
@@ -1044,10 +1074,10 @@ impl TuiRenderer {
         };
         let header = format!(
             "{dim}{n} words  ·  {toggle}{reset}",
-            dim    = DIM_GRAY,
-            n      = node_count,
+            dim = DIM_GRAY,
+            n = node_count,
             toggle = view_toggle,
-            reset  = RESET,
+            reset = RESET,
         );
 
         let mut stdout = io::stdout();
@@ -1073,10 +1103,14 @@ impl TuiRenderer {
                         out.push(c);
                         for cc in chars.by_ref() {
                             out.push(cc);
-                            if cc.is_ascii_alphabetic() { break; }
+                            if cc.is_ascii_alphabetic() {
+                                break;
+                            }
                         }
                     } else {
-                        if visible >= PANEL_W { break; }
+                        if visible >= PANEL_W {
+                            break;
+                        }
                         out.push(c);
                         visible += 1;
                     }
@@ -1196,7 +1230,7 @@ impl TuiRenderer {
         // Dump all proofs on boot — shower them with it.
         let (passed, total, proof_output) = crate::coforth::Library::prove_all();
         if total > 0 {
-            use crossterm::style::{Color, ResetColor, SetForegroundColor, Print};
+            use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
             // Print each proof line.
             for line in proof_output.lines() {
                 execute!(io::stdout(), Print(line), Print("\r\n"))?;
@@ -1205,7 +1239,11 @@ impl TuiRenderer {
             execute!(
                 io::stdout(),
                 Print("  "),
-                SetForegroundColor(if passed == total { Color::Green } else { Color::Red }),
+                SetForegroundColor(if passed == total {
+                    Color::Green
+                } else {
+                    Color::Red
+                }),
                 Print(format!("{}/{} ✓", passed, total)),
                 ResetColor,
                 Print("  co-forth proofs\r\n"),
@@ -1222,26 +1260,44 @@ impl TuiRenderer {
 /// Print a one-line hint row showing things worth trying.
 fn print_suggestions() -> std::io::Result<()> {
     use crossterm::{
-        style::{Color, ResetColor, SetForegroundColor, SetAttribute, Attribute, Print},
         execute,
+        style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     };
     use std::io;
 
     // Pairs of (word, hint-colour).  The word is shown dim/grey; separator is dark-grey.
     let items: &[(&str, Color)] = &[
-        ("2 3 +",        Color::Cyan),
-        ("你好",          Color::Yellow),
-        ("道",            Color::Yellow),
-        ("words",        Color::Cyan),
-        ("registry-list",Color::Cyan),
-        ("slowest",      Color::Cyan),
+        ("2 3 +", Color::Cyan),
+        ("你好", Color::Yellow),
+        ("道", Color::Yellow),
+        ("words", Color::Cyan),
+        ("registry-list", Color::Cyan),
+        ("slowest", Color::Cyan),
     ];
 
-    execute!(io::stdout(), Print("  "), SetForegroundColor(Color::DarkGrey), Print("try:  "), ResetColor)?;
+    execute!(
+        io::stdout(),
+        Print("  "),
+        SetForegroundColor(Color::DarkGrey),
+        Print("try:  "),
+        ResetColor
+    )?;
     for (i, (word, colour)) in items.iter().enumerate() {
-        execute!(io::stdout(), SetForegroundColor(*colour), SetAttribute(Attribute::Dim), Print(word), SetAttribute(Attribute::Reset), ResetColor)?;
+        execute!(
+            io::stdout(),
+            SetForegroundColor(*colour),
+            SetAttribute(Attribute::Dim),
+            Print(word),
+            SetAttribute(Attribute::Reset),
+            ResetColor
+        )?;
         if i + 1 < items.len() {
-            execute!(io::stdout(), SetForegroundColor(Color::DarkGrey), Print("  ·  "), ResetColor)?;
+            execute!(
+                io::stdout(),
+                SetForegroundColor(Color::DarkGrey),
+                Print("  ·  "),
+                ResetColor
+            )?;
         }
     }
     execute!(io::stdout(), Print("\r\n"))?;
@@ -1517,22 +1573,24 @@ impl TuiRenderer {
             rows += 1;
         }
 
-        // Help message (from dialog field)
+        // Help message (from dialog field) — wrapped to avoid overflow
         if let Some(ref help) = dialog.help_message {
-            execute!(
-                out,
-                Print(format!(
-                    "│  {}{:<w$}{}  │\r\n",
-                    DIM_GRAY,
-                    help,
-                    RESET,
-                    w = inner
-                ))
-            )?;
-            rows += 1;
+            for line in wrap_text(help, inner) {
+                execute!(
+                    out,
+                    Print(format!(
+                        "│  {}{:<w$}{}  │\r\n",
+                        DIM_GRAY,
+                        line,
+                        RESET,
+                        w = inner
+                    ))
+                )?;
+                rows += 1;
+            }
         }
 
-        // Body text (optional, shown above the options divider)
+        // Body text (optional, shown above the options divider) with scroll support
         if let Some(ref body) = dialog.body {
             let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
             // Reserve ~12 rows for title, help, both dividers, options, and bottom border.
@@ -1541,7 +1599,7 @@ impl TuiRenderer {
             execute!(out, Print(format!("{}\r\n", div)))?;
             rows += 1;
 
-            // Collect all wrapped lines first so we know whether to truncate.
+            // Collect all wrapped lines.
             let mut all_body_lines: Vec<String> = Vec::new();
             for line in body.lines() {
                 for wrapped in wrap_text(line, inner) {
@@ -1551,36 +1609,53 @@ impl TuiRenderer {
                 }
             }
 
-            let truncated = all_body_lines.len() > max_body_rows;
-            let show_count = if truncated {
-                max_body_rows.saturating_sub(1)
+            let total_lines = all_body_lines.len();
+
+            if total_lines <= max_body_rows {
+                // All lines fit — show them all without a scroll indicator.
+                for line in &all_body_lines {
+                    let pad = " ".repeat(inner.saturating_sub(line.chars().count()));
+                    execute!(
+                        out,
+                        Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, line, pad, RESET))
+                    )?;
+                    rows += 1;
+                }
             } else {
-                all_body_lines.len()
-            };
+                // Reserve 1 row for the scroll indicator.
+                let content_rows = max_body_rows.saturating_sub(1).max(1);
+                let max_offset = total_lines.saturating_sub(content_rows);
+                let offset = dialog.body_scroll_offset.min(max_offset);
 
-            for line in &all_body_lines[..show_count] {
-                let pad = " ".repeat(inner.saturating_sub(line.chars().count()));
-                execute!(
-                    out,
-                    Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, line, pad, RESET))
-                )?;
-                rows += 1;
-            }
+                for line in &all_body_lines[offset..total_lines.min(offset + content_rows)] {
+                    let pad = " ".repeat(inner.saturating_sub(line.chars().count()));
+                    execute!(
+                        out,
+                        Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, line, pad, RESET))
+                    )?;
+                    rows += 1;
+                }
 
-            if truncated {
-                let remaining = all_body_lines.len() - show_count;
-                let notice =
-                    format!("… ({} more lines — ↑ scroll up for full plan)", remaining);
-                let notice_short: String = notice.chars().take(inner).collect();
-                let pad = " ".repeat(inner.saturating_sub(notice_short.chars().count()));
-                execute!(
-                    out,
-                    Print(format!(
-                        "│  {}{}{}{}  │\r\n",
-                        DIM_GRAY, notice_short, pad, RESET
-                    ))
-                )?;
-                rows += 1;
+                // Scroll indicator showing position and navigation hint.
+                let above = offset;
+                let below = total_lines.saturating_sub(offset + content_rows);
+                let indicator = match (above > 0, below > 0) {
+                    (true, true) => {
+                        format!("↑ {} above · ↓ {} below  (PgUp/PgDn)", above, below)
+                    }
+                    (true, false) => format!("↑ {} lines above  (PgUp)", above),
+                    (false, true) => format!("↓ {} lines below  (PgDn)", below),
+                    (false, false) => String::new(),
+                };
+                if !indicator.is_empty() {
+                    let short: String = indicator.chars().take(inner).collect();
+                    let pad = " ".repeat(inner.saturating_sub(short.chars().count()));
+                    execute!(
+                        out,
+                        Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, short, pad, RESET))
+                    )?;
+                    rows += 1;
+                }
             }
         }
 
@@ -1646,10 +1721,7 @@ impl TuiRenderer {
             } => {
                 // Prompt may be multi-line — wrap each line inside the box borders.
                 for line in wrap_text(prompt, inner) {
-                    execute!(
-                        out,
-                        Print(format!("│  {:<w$}  │\r\n", line, w = inner))
-                    )?;
+                    execute!(out, Print(format!("│  {:<w$}  │\r\n", line, w = inner)))?;
                     rows += 1;
                 }
                 let yes_style = if *selected { "\x1b[1;36m" } else { DIM_GRAY };
@@ -1670,10 +1742,7 @@ impl TuiRenderer {
             }
             DialogType::TextInput { prompt, input, .. } => {
                 if !prompt.is_empty() {
-                    execute!(
-                        out,
-                        Print(format!("│  {:<w$}  │\r\n", prompt, w = inner))
-                    )?;
+                    execute!(out, Print(format!("│  {:<w$}  │\r\n", prompt, w = inner)))?;
                     rows += 1;
                 }
                 execute!(
@@ -1822,11 +1891,7 @@ impl TuiRenderer {
                 out,
                 Print(format!(
                     "│  {}{}{}{}{}  │\r\n",
-                    btn_row,
-                    DIM_GRAY,
-                    hint,
-                    RESET,
-                    padding,
+                    btn_row, DIM_GRAY, hint, RESET, padding,
                 ))
             )?;
         } else {
@@ -1881,6 +1946,13 @@ impl TuiRenderer {
                         continue;
                     }
                     match (key.code, key.modifiers) {
+                        // Ctrl+D: hard exit — show_dialog holds the TUI lock so the async
+                        // input task is starved and can never deliver InputEvent::Submitted("/quit").
+                        // This is the only reliable escape hatch when a blocking dialog is open.
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            std::process::exit(0);
+                        }
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             let is_custom_mode = self
                                 .active_dialog
@@ -1945,6 +2017,14 @@ impl TuiRenderer {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != crossterm::event::KeyEventKind::Press {
                         continue;
+                    }
+                    if key.code == crossterm::event::KeyCode::Char('d')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        let _ = crossterm::terminal::disable_raw_mode();
+                        std::process::exit(0);
                     }
                     if let Some(r) = dialog.handle_key_event(key) {
                         break r;
@@ -2791,15 +2871,25 @@ mod tests {
         let poset = crate::poset::Poset::new();
         let lines = poset_to_forth_lines(&poset, 80, 40);
         let combined = lines.join("\n");
-        assert!(combined.contains("PROGRAM"), "empty poset should still emit PROGRAM");
+        assert!(
+            combined.contains("PROGRAM"),
+            "empty poset should still emit PROGRAM"
+        );
         // No W-nodes since there are no nodes
-        assert!(!combined.contains("W0"), "empty poset should have no W nodes");
+        assert!(
+            !combined.contains("W0"),
+            "empty poset should have no W nodes"
+        );
     }
 
     #[test]
     fn test_poset_single_node_has_word_and_semicolon() {
         let mut poset = crate::poset::Poset::new();
-        poset.add_node("do-thing".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node(
+            "do-thing".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
         let lines = poset_to_forth_lines(&poset, 80, 40);
         let combined = lines.join("\n");
         assert!(combined.contains("W0"), "should name node W0");
@@ -2811,42 +2901,76 @@ mod tests {
     fn test_poset_label_truncated_at_30_chars() {
         let mut poset = crate::poset::Poset::new();
         let long_label = "a".repeat(50);
-        poset.add_node(long_label, crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node(
+            long_label,
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
         let lines = poset_to_forth_lines(&poset, 80, 40);
         let combined = lines.join("\n");
         // The label in the .\" ... " should be truncated to 30 chars + ellipsis
         assert!(combined.contains('…'), "long label should have ellipsis");
         // Should NOT contain the full 50-char label
-        assert!(!combined.contains(&"a".repeat(50)), "full 50-char label should not appear");
+        assert!(
+            !combined.contains(&"a".repeat(50)),
+            "full 50-char label should not appear"
+        );
     }
 
     #[test]
     fn test_poset_max_lines_respected() {
         let mut poset = crate::poset::Poset::new();
         for i in 0..20 {
-            poset.add_node(format!("word-{i}"), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+            poset.add_node(
+                format!("word-{i}"),
+                crate::poset::NodeKind::Task,
+                crate::poset::NodeAuthor::User,
+            );
         }
         let max = 10;
         let lines = poset_to_forth_lines(&poset, 80, max);
-        assert!(lines.len() <= max, "output must not exceed max_lines (got {})", lines.len());
+        assert!(
+            lines.len() <= max,
+            "output must not exceed max_lines (got {})",
+            lines.len()
+        );
     }
 
     #[test]
     fn test_poset_program_word_emitted() {
         let mut poset = crate::poset::Poset::new();
-        poset.add_node("step".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node(
+            "step".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
         let lines = poset_to_forth_lines(&poset, 80, 40);
         let combined = lines.join("\n");
-        assert!(combined.contains("PROGRAM"), "PROGRAM word should be emitted");
+        assert!(
+            combined.contains("PROGRAM"),
+            "PROGRAM word should be emitted"
+        );
     }
 
     #[test]
     fn test_poset_linear_chain_topo_order() {
         // W0 → W1 → W2: W0 must appear before W1, W1 before W2.
         let mut poset = crate::poset::Poset::new();
-        poset.add_node("first".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
-        poset.add_node("second".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
-        poset.add_node("third".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node(
+            "first".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
+        poset.add_node(
+            "second".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
+        poset.add_node(
+            "third".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
         poset.add_edge(0, 1);
         poset.add_edge(1, 2);
         let lines = poset_to_forth_lines(&poset, 80, 40);
@@ -2862,21 +2986,40 @@ mod tests {
     fn test_poset_cycle_does_not_panic() {
         // Cycle (W0 → W1 → W0) must not infinite-loop the topo sort.
         let mut poset = crate::poset::Poset::new();
-        poset.add_node("a".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
-        poset.add_node("b".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node(
+            "a".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
+        poset.add_node(
+            "b".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
         poset.add_edge(0, 1);
-        poset.add_edge(1, 0);  // cycle
-        // Must not panic or hang
+        poset.add_edge(1, 0); // cycle
+                              // Must not panic or hang
         let lines = poset_to_forth_lines(&poset, 80, 40);
-        assert!(!lines.is_empty(), "cyclic graph should still produce output");
+        assert!(
+            !lines.is_empty(),
+            "cyclic graph should still produce output"
+        );
     }
 
     #[test]
     fn test_poset_predecessor_calls_appear_in_body() {
         // W0 is predecessor of W1; W1's body should call W0.
         let mut poset = crate::poset::Poset::new();
-        poset.add_node("base".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
-        poset.add_node("derived".to_string(), crate::poset::NodeKind::Task, crate::poset::NodeAuthor::User);
+        poset.add_node(
+            "base".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
+        poset.add_node(
+            "derived".to_string(),
+            crate::poset::NodeKind::Task,
+            crate::poset::NodeAuthor::User,
+        );
         poset.add_edge(0, 1);
         let lines = poset_to_forth_lines(&poset, 80, 40);
         // W1's definition should mention W0 as a predecessor call
@@ -2886,7 +3029,10 @@ mod tests {
             let after_w1 = &combined[w1_pos..];
             let semicolon_pos = after_w1.find(';').unwrap_or(after_w1.len());
             let w1_body = &after_w1[..semicolon_pos];
-            assert!(w1_body.contains("W0"), "W1 body should call W0 (its predecessor)");
+            assert!(
+                w1_body.contains("W0"),
+                "W1 body should call W0 (its predecessor)"
+            );
         }
     }
 }
@@ -2921,13 +3067,17 @@ mod draw_dialog_tests {
         // Call the static function directly — it now accepts &mut impl io::Write
         TuiRenderer::draw_dialog_inline_static_with_width(&mut buf, dialog, 72).unwrap();
         let raw = String::from_utf8(buf).unwrap();
-        raw.lines().map(|l| l.trim_end_matches('\r').to_string()).collect()
+        raw.lines()
+            .map(|l| l.trim_end_matches('\r').to_string())
+            .collect()
     }
 
     /// Expected visual width of each content line: box_width chars.
     fn check_widths(lines: &[String], box_width: usize) {
         for (i, line) in lines.iter().enumerate() {
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let visible: String = strip_ansi(line);
             let w = visible.chars().count();
             assert_eq!(
@@ -2955,11 +3105,14 @@ mod draw_dialog_tests {
 
     #[test]
     fn test_select_dialog_line_widths() {
-        let dialog = Dialog::select("Pick one", vec![
-            DialogOption::new("Alpha"),
-            DialogOption::new("Beta"),
-            DialogOption::new("Gamma"),
-        ]);
+        let dialog = Dialog::select(
+            "Pick one",
+            vec![
+                DialogOption::new("Alpha"),
+                DialogOption::new("Beta"),
+                DialogOption::new("Gamma"),
+            ],
+        );
         let lines = render_lines(&dialog);
         check_widths(&lines, 72);
     }
@@ -2973,10 +3126,10 @@ mod draw_dialog_tests {
 
     #[test]
     fn test_multiselect_dialog_line_widths() {
-        let dialog = Dialog::multiselect("Choose all that apply", vec![
-            DialogOption::new("Option A"),
-            DialogOption::new("Option B"),
-        ]);
+        let dialog = Dialog::multiselect(
+            "Choose all that apply",
+            vec![DialogOption::new("Option A"), DialogOption::new("Option B")],
+        );
         let lines = render_lines(&dialog);
         check_widths(&lines, 72);
     }
@@ -2986,5 +3139,62 @@ mod draw_dialog_tests {
         let dialog = Dialog::text_input("Enter a value", None);
         let lines = render_lines(&dialog);
         check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_long_help_message_does_not_overflow() {
+        // Regression: help text longer than inner width must be wrapped, not overflow.
+        let long_help =
+            "Use ↑↓ or j/k to navigate, Enter to select, 'o' for custom feedback, Esc to cancel";
+        let dialog = Dialog::select(
+            "Review Implementation Plan",
+            vec![DialogOption::new("Approve"), DialogOption::new("Reject")],
+        )
+        .with_help(long_help);
+        let lines = render_lines(&dialog);
+        check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_dialog_with_long_body_shows_scroll_indicator() {
+        // A body with more lines than max_body_rows must show a scroll indicator.
+        let long_body = (0..50)
+            .map(|i| format!("Line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut dialog =
+            Dialog::select("Plan", vec![DialogOption::new("Approve")]).with_body(long_body);
+        let lines = render_lines(&dialog);
+        // All rendered lines must have correct width.
+        check_widths(&lines, 72);
+        // At least one line should contain the scroll indicator.
+        let all_text = lines.join("\n");
+        assert!(
+            all_text.contains("PgDn") || all_text.contains("PgUp"),
+            "expected scroll indicator in rendered output"
+        );
+    }
+
+    #[test]
+    fn test_dialog_body_scroll_offset_changes_visible_content() {
+        let lines_text: Vec<String> = (0..30).map(|i| format!("Line {:02}", i)).collect();
+        let body = lines_text.join("\n");
+        let mut dialog_top =
+            Dialog::select("Plan", vec![DialogOption::new("Approve")]).with_body(body.clone());
+        let mut dialog_scrolled =
+            Dialog::select("Plan", vec![DialogOption::new("Approve")]).with_body(body);
+        dialog_scrolled.body_scroll_offset = 10;
+
+        let top_text = render_lines(&dialog_top).join("\n");
+        let scrolled_text = render_lines(&dialog_scrolled).join("\n");
+        assert!(top_text.contains("Line 00"), "top view should show Line 00");
+        assert!(
+            !scrolled_text.contains("Line 00"),
+            "scrolled view should not show Line 00"
+        );
+        assert!(
+            scrolled_text.contains("Line 10"),
+            "scrolled view should show Line 10"
+        );
     }
 }

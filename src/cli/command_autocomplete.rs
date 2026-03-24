@@ -30,6 +30,7 @@ pub enum CommandCategory {
     Feedback,
     Memory,
     Discovery,
+    Channel,
 }
 
 impl fmt::Display for CommandCategory {
@@ -43,6 +44,7 @@ impl fmt::Display for CommandCategory {
             CommandCategory::Feedback => write!(f, "🎓 Feedback"),
             CommandCategory::Memory => write!(f, "💾 Memory"),
             CommandCategory::Discovery => write!(f, "🔍 Discovery"),
+            CommandCategory::Channel => write!(f, "💬 Channel"),
         }
     }
 }
@@ -315,6 +317,26 @@ impl CommandRegistry {
                     params: None,
                     description: "Discover Finch daemons on local network",
                     category: CommandCategory::Discovery,
+                },
+
+                // Channel Commands
+                CommandSpec {
+                    name: "/join",
+                    params: Some("<#channel>"),
+                    description: "Join a channel",
+                    category: CommandCategory::Channel,
+                },
+                CommandSpec {
+                    name: "/part",
+                    params: Some("<#channel>"),
+                    description: "Leave a channel",
+                    category: CommandCategory::Channel,
+                },
+                CommandSpec {
+                    name: "/say",
+                    params: Some("<#channel> <message>"),
+                    description: "Send a message to a channel",
+                    category: CommandCategory::Channel,
                 },
             ],
         }

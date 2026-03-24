@@ -99,7 +99,6 @@ impl ShadowBuffer {
     /// by column position, not by character count.  Returns the number of rows
     /// consumed (≥ 1 even for an empty line).
     fn write_line(&mut self, y: usize, line: &str, style: Style) -> usize {
-
         if y >= self.height {
             return 0;
         }
@@ -138,7 +137,14 @@ impl ShadowBuffer {
             if ch_w == 2 {
                 // Mark the second terminal column occupied by this wide char
                 // with a zero-width space so the diff system clears it correctly.
-                self.set(col + 1, y + row, Cell { ch: '\u{200B}', style });
+                self.set(
+                    col + 1,
+                    y + row,
+                    Cell {
+                        ch: '\u{200B}',
+                        style,
+                    },
+                );
             }
             col += ch_w;
 
@@ -157,7 +163,11 @@ impl ShadowBuffer {
         }
 
         // If col is 0 we just wrapped onto a fresh row that has no content — don't count it.
-        if col == 0 { row } else { row + 1 }
+        if col == 0 {
+            row
+        } else {
+            row + 1
+        }
     }
 
     /// Render messages to shadow buffer with proper wrapping
@@ -649,7 +659,7 @@ mod tests {
     #[test]
     fn test_visible_length_cjk() {
         // Each Chinese character is 2 terminal columns wide
-        assert_eq!(visible_length("你好"), 4);   // 2 chars × 2 cols
+        assert_eq!(visible_length("你好"), 4); // 2 chars × 2 cols
         assert_eq!(visible_length("hello你好"), 9); // 5 + 4
         assert_eq!(visible_length("世界"), 4);
     }

@@ -58,7 +58,11 @@ pub async fn run_daemon_brain_loop(
     info!("Daemon brain {} starting: {}", id, task);
     match run_loop(id, &task, Arc::clone(&registry), provider.as_ref(), &cwd).await {
         Ok(Some(summary)) => {
-            info!("Daemon brain {} finished with summary ({} chars)", id, summary.len());
+            info!(
+                "Daemon brain {} finished with summary ({} chars)",
+                id,
+                summary.len()
+            );
             registry.set_completed_with_summary(id, summary).await;
         }
         Ok(None) => {
@@ -67,9 +71,7 @@ pub async fn run_daemon_brain_loop(
         }
         Err(e) => {
             warn!("Daemon brain {} error: {}", id, e);
-            registry
-                .append_log(id, format!("[Error] {}", e))
-                .await;
+            registry.append_log(id, format!("[Error] {}", e)).await;
             registry.set_dead(id).await;
         }
     }
@@ -103,7 +105,12 @@ async fn run_loop(
     let mut messages: Vec<Message> = vec![Message::user(task)];
 
     for turn in 0..DAEMON_BRAIN_MAX_TURNS {
-        debug!("Daemon brain {} turn {}/{}", id, turn + 1, DAEMON_BRAIN_MAX_TURNS);
+        debug!(
+            "Daemon brain {} turn {}/{}",
+            id,
+            turn + 1,
+            DAEMON_BRAIN_MAX_TURNS
+        );
 
         // Check if the brain has been cancelled externally (state = Dead).
         {
@@ -152,11 +159,15 @@ async fn run_loop(
 
             let (content, is_error) = execute_daemon_brain_tool(&tools, tool_use).await;
             let content_preview = &content[..content.len().min(200)];
-            registry.append_log(id, format!("[result] {}", content_preview)).await;
+            registry
+                .append_log(id, format!("[result] {}", content_preview))
+                .await;
 
             // If present_plan returned "PLAN_APPROVED" the loop can end.
-            let plan_approved = tool_use.name == "present_plan" && content.starts_with("PLAN_APPROVED");
-            let plan_rejected = tool_use.name == "present_plan" && content.starts_with("PLAN_REJECTED");
+            let plan_approved =
+                tool_use.name == "present_plan" && content.starts_with("PLAN_APPROVED");
+            let plan_rejected =
+                tool_use.name == "present_plan" && content.starts_with("PLAN_REJECTED");
 
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: tool_use.id.clone(),
@@ -169,7 +180,9 @@ async fn run_loop(
                 return Ok(None);
             }
             if plan_rejected {
-                registry.append_log(id, "[Plan rejected by user]".to_string()).await;
+                registry
+                    .append_log(id, "[Plan rejected by user]".to_string())
+                    .await;
                 messages.push(Message::with_content("user", result_blocks));
                 return Ok(None);
             }
@@ -178,16 +191,19 @@ async fn run_loop(
         messages.push(Message::with_content("user", result_blocks));
     }
 
-    anyhow::bail!("Daemon brain reached max turns ({})", DAEMON_BRAIN_MAX_TURNS)
+    anyhow::bail!(
+        "Daemon brain reached max turns ({})",
+        DAEMON_BRAIN_MAX_TURNS
+    )
 }
 
 /// Execute one tool in the daemon brain context (no permission checks).
-async fn execute_daemon_brain_tool(
-    tools: &[Box<dyn Tool>],
-    tool_use: &ToolUse,
-) -> (String, bool) {
+async fn execute_daemon_brain_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> (String, bool) {
     let Some(tool) = tools.iter().find(|t| t.name() == tool_use.name) else {
-        return (format!("Tool '{}' not available in daemon brain", tool_use.name), true);
+        return (
+            format!("Tool '{}' not available in daemon brain", tool_use.name),
+            true,
+        );
     };
 
     let context = ToolContext {
@@ -247,18 +263,15 @@ impl Tool for DaemonAskUserTool {
         }
     }
 
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        _ctx: &ToolContext<'_>,
-    ) -> Result<String> {
-        let question = input["question"]
-            .as_str()
-            .unwrap_or("?")
-            .to_string();
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext<'_>) -> Result<String> {
+        let question = input["question"].as_str().unwrap_or("?").to_string();
         let options: Vec<String> = input["options"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let (tx, rx) = oneshot::channel::<String>();
@@ -307,20 +320,11 @@ impl Tool for DaemonPresentPlanTool {
         }
     }
 
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        _ctx: &ToolContext<'_>,
-    ) -> Result<String> {
-        let plan = input["plan"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext<'_>) -> Result<String> {
+        let plan = input["plan"].as_str().unwrap_or("").to_string();
 
         let (tx, rx) = oneshot::channel::<PlanResponse>();
-        self.registry
-            .set_plan_ready(self.brain_id, plan, tx)
-            .await;
+        self.registry.set_plan_ready(self.brain_id, plan, tx).await;
 
         match rx.await {
             Ok(PlanResponse::Approve) => Ok("PLAN_APPROVED".to_string()),
@@ -410,7 +414,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         // Answer from "REPL"
-        registry_clone.answer_question(id, "a.rs".to_string()).await.unwrap();
+        registry_clone
+            .answer_question(id, "a.rs".to_string())
+            .await
+            .unwrap();
 
         let result = exec_handle.await.unwrap().unwrap();
         assert_eq!(result, "a.rs");
@@ -441,7 +448,8 @@ mod tests {
         };
         let registry_clone = Arc::clone(&registry);
         let exec_handle = tokio::spawn(async move {
-            tool.execute(serde_json::json!({"plan": "Do the thing"}), &ctx).await
+            tool.execute(serde_json::json!({"plan": "Do the thing"}), &ctx)
+                .await
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

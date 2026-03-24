@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
 use crate::ipc::schema::finch_ipc_capnp::{
-    self, BrainState as CapnpBrainState, finch_daemon, stream_receiver,
+    self, finch_daemon, stream_receiver, BrainState as CapnpBrainState,
 };
 use crate::ipc::transport::sock_path;
 use crate::server::{BrainDetail, BrainState, BrainSummary};
@@ -51,8 +51,7 @@ impl IpcClient {
         );
 
         let mut rpc_system = RpcSystem::new(Box::new(network), None);
-        let client: finch_daemon::Client =
-            rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
+        let client: finch_daemon::Client = rpc_system.bootstrap(rpc_twoparty_capnp::Side::Server);
 
         let handle = tokio::task::spawn_local(async move {
             let _ = rpc_system.await;
@@ -128,8 +127,7 @@ impl IpcClient {
     ) -> Result<Uuid> {
         let mut req = self.client.spawn_brain_request();
         req.get().set_task_description(task_description);
-        req.get()
-            .set_provider(provider.unwrap_or(""));
+        req.get().set_provider(provider.unwrap_or(""));
         let reply = req.send().promise.await?;
         let id_str = reply.get()?.get_id()?.to_str()?;
         Uuid::parse_str(id_str).context("invalid UUID from daemon")
@@ -169,10 +167,19 @@ impl IpcClient {
             let options: Vec<String> = d
                 .get_question_options()?
                 .iter()
-                .map(|s| s.and_then(|s| s.to_str().map(|s| s.to_string()).map_err(|e| capnp::Error::failed(e.to_string())))
-                         .unwrap_or_default())
+                .map(|s| {
+                    s.and_then(|s| {
+                        s.to_str()
+                            .map(|s| s.to_string())
+                            .map_err(|e| capnp::Error::failed(e.to_string()))
+                    })
+                    .unwrap_or_default()
+                })
                 .collect();
-            Some(PendingQuestionView { question: question_str, options })
+            Some(PendingQuestionView {
+                question: question_str,
+                options,
+            })
         };
 
         let pending_plan = if plan_str.is_empty() {
@@ -184,12 +191,22 @@ impl IpcClient {
         let event_log: Vec<String> = d
             .get_event_log()?
             .iter()
-            .map(|s| s.and_then(|s| s.to_str().map(|s| s.to_string()).map_err(|e| capnp::Error::failed(e.to_string())))
-                     .unwrap_or_default())
+            .map(|s| {
+                s.and_then(|s| {
+                    s.to_str()
+                        .map(|s| s.to_string())
+                        .map_err(|e| capnp::Error::failed(e.to_string()))
+                })
+                .unwrap_or_default()
+            })
             .collect();
 
         let result_str = d.get_result()?.to_str()?.to_string();
-        let final_summary = if result_str.is_empty() { None } else { Some(result_str) };
+        let final_summary = if result_str.is_empty() {
+            None
+        } else {
+            Some(result_str)
+        };
 
         Ok(BrainDetail {
             id: Uuid::parse_str(d.get_id()?.to_str()?)?,
@@ -221,8 +238,7 @@ impl IpcClient {
         let mut req = self.client.respond_to_brain_plan_request();
         req.get().set_id(id.to_string().as_str());
         req.get().set_approved(approved);
-        req.get()
-            .set_instruction(instruction.unwrap_or(""));
+        req.get().set_instruction(instruction.unwrap_or(""));
         req.send().promise.await?;
         Ok(())
     }
@@ -286,21 +302,34 @@ impl stream_receiver::Server for StreamReceiverImpl {
         };
 
         let result = match chunk.which() {
-            Ok(Which::TextDelta(t)) => {
-                t.and_then(|s| s.to_str().map(|s| s.to_string()).map_err(|e| capnp::Error::failed(e.to_string())))
-                    .map(StreamChunk::TextDelta)
-                    .map_err(|e| anyhow::anyhow!("{}", e))
-            }
+            Ok(Which::TextDelta(t)) => t
+                .and_then(|s| {
+                    s.to_str()
+                        .map(|s| s.to_string())
+                        .map_err(|e| capnp::Error::failed(e.to_string()))
+                })
+                .map(StreamChunk::TextDelta)
+                .map_err(|e| anyhow::anyhow!("{}", e)),
             Ok(Which::ToolUseComplete(tu)) => tu
                 .and_then(|tu| {
-                    let id = tu.get_id()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?.to_string();
-                    let name = tu.get_name()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?.to_string();
+                    let id = tu
+                        .get_id()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .to_string();
+                    let name = tu
+                        .get_name()?
+                        .to_str()
+                        .map_err(|e| capnp::Error::failed(e.to_string()))?
+                        .to_string();
                     let input_str = tu.get_input_json()?.to_str()?.to_string();
                     let input: serde_json::Value =
                         serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
-                    Ok(StreamChunk::ContentBlockComplete(
-                        ContentBlock::ToolUse { id, name, input },
-                    ))
+                    Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                    }))
                 })
                 .map_err(|e: capnp::Error| anyhow::anyhow!("{}", e)),
             Ok(Which::UsageUpdate(upd)) => upd
@@ -314,12 +343,15 @@ impl stream_receiver::Server for StreamReceiverImpl {
                 // Better: use a dedicated Done variant on the channel.
                 // For now drop on the caller side when channel is closed.
                 let _ = self.tx; // trigger drop detection? No.
-                // Nothing to send; just return.
+                                 // Nothing to send; just return.
                 return Promise::ok(());
             }
             Ok(Which::Error(e)) => Err(anyhow::anyhow!(
                 "{}",
-                e.and_then(|s| s.to_str().map(|s| s.to_string()).map_err(|e| capnp::Error::failed(e.to_string())))
+                e.and_then(|s| s
+                    .to_str()
+                    .map(|s| s.to_string())
+                    .map_err(|e| capnp::Error::failed(e.to_string())))
                     .unwrap_or_else(|_| "unknown stream error".to_string())
             )),
             Err(e) => Err(anyhow::anyhow!("{}", e)),
@@ -341,8 +373,7 @@ fn write_messages(
     for (i, msg) in messages.iter().enumerate() {
         let mut m = builder.reborrow().get(i as u32);
         m.set_role(msg.role.as_str());
-        let mut content =
-            m.init_content(msg.content.len() as u32);
+        let mut content = m.init_content(msg.content.len() as u32);
         for (j, block) in msg.content.iter().enumerate() {
             let mut b = content.reborrow().get(j as u32);
             match block {
@@ -403,8 +434,16 @@ pub struct QueryResponse {
 fn read_query_response(
     r: finch_ipc_capnp::query_response::Reader,
 ) -> Result<QueryResponse, capnp::Error> {
-    let text = r.get_text()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?.to_string();
-    let model = r.get_model()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?.to_string();
+    let text = r
+        .get_text()?
+        .to_str()
+        .map_err(|e| capnp::Error::failed(e.to_string()))?
+        .to_string();
+    let model = r
+        .get_model()?
+        .to_str()
+        .map_err(|e| capnp::Error::failed(e.to_string()))?
+        .to_string();
     let input_tokens = r.get_input_tokens();
     let output_tokens = r.get_output_tokens();
     let latency_ms = r.get_latency_ms();
@@ -412,11 +451,18 @@ fn read_query_response(
     let mut tool_uses = Vec::new();
     for tu in r.get_tool_uses()?.iter() {
         let input: serde_json::Value =
-            serde_json::from_str(tu.get_input_json()?.to_str()?)
-                .unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(tu.get_input_json()?.to_str()?).unwrap_or(serde_json::Value::Null);
         tool_uses.push(ToolUse {
-            id: tu.get_id()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?.to_string(),
-            name: tu.get_name()?.to_str().map_err(|e| capnp::Error::failed(e.to_string()))?.to_string(),
+            id: tu
+                .get_id()?
+                .to_str()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+                .to_string(),
+            name: tu
+                .get_name()?
+                .to_str()
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+                .to_string(),
             input,
         });
     }
@@ -425,9 +471,21 @@ fn read_query_response(
         text,
         tool_uses,
         model,
-        input_tokens: if input_tokens == 0 { None } else { Some(input_tokens) },
-        output_tokens: if output_tokens == 0 { None } else { Some(output_tokens) },
-        latency_ms: if latency_ms == 0 { None } else { Some(latency_ms) },
+        input_tokens: if input_tokens == 0 {
+            None
+        } else {
+            Some(input_tokens)
+        },
+        output_tokens: if output_tokens == 0 {
+            None
+        } else {
+            Some(output_tokens)
+        },
+        latency_ms: if latency_ms == 0 {
+            None
+        } else {
+            Some(latency_ms)
+        },
     })
 }
 
@@ -466,6 +524,8 @@ fn brain_state_to_server(s: Result<CapnpBrainState, capnp::NotInSchema>) -> Brai
         CapnpBrainState::Running => BrainState::Running,
         CapnpBrainState::WaitingForInput => BrainState::WaitingForInput,
         CapnpBrainState::PlanReady => BrainState::PlanReady,
-        CapnpBrainState::Completed | CapnpBrainState::Failed | CapnpBrainState::Cancelled => BrainState::Dead,
+        CapnpBrainState::Completed | CapnpBrainState::Failed | CapnpBrainState::Cancelled => {
+            BrainState::Dead
+        }
     }
 }

@@ -591,10 +591,11 @@ pub async fn handle_chat_completions(
     }
 
     // Convert internal response to OpenAI format (handles tool_calls)
-    let openai_response = match convert_response_to_openai(content_blocks, &request.model, &request.messages) {
-        Ok(resp) => resp,
-        Err(error_resp) => return error_resp,
-    };
+    let openai_response =
+        match convert_response_to_openai(content_blocks, &request.model, &request.messages) {
+            Ok(resp) => resp,
+            Err(error_resp) => return error_resp,
+        };
 
     Json(openai_response).into_response()
 }
@@ -698,7 +699,8 @@ async fn handle_local_only_query(
 
     // Convert response to OpenAI format
     info!("Converting response to OpenAI format...");
-    let openai_response = convert_response_to_openai(content_blocks, &request.model, &request.messages)?;
+    let openai_response =
+        convert_response_to_openai(content_blocks, &request.model, &request.messages)?;
     info!("Response converted, sending back to client");
 
     Ok(Json(openai_response))

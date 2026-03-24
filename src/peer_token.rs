@@ -64,8 +64,7 @@ fn generate() -> String {
 }
 
 /// Global: token loaded once at process start.
-pub static TOKEN: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(load_or_create);
+pub static TOKEN: std::sync::LazyLock<String> = std::sync::LazyLock::new(load_or_create);
 
 #[cfg(test)]
 mod tests {

@@ -350,15 +350,27 @@ mod tests {
 
     #[test]
     fn test_query_pattern_from_str_case_insensitive() {
-        assert_eq!("GREETING".parse::<QueryPattern>().unwrap(), QueryPattern::Greeting);
-        assert_eq!("HowTo".parse::<QueryPattern>().unwrap(), QueryPattern::HowTo);
-        assert_eq!("HOWTO".parse::<QueryPattern>().unwrap(), QueryPattern::HowTo);
+        assert_eq!(
+            "GREETING".parse::<QueryPattern>().unwrap(),
+            QueryPattern::Greeting
+        );
+        assert_eq!(
+            "HowTo".parse::<QueryPattern>().unwrap(),
+            QueryPattern::HowTo
+        );
+        assert_eq!(
+            "HOWTO".parse::<QueryPattern>().unwrap(),
+            QueryPattern::HowTo
+        );
         assert_eq!("CODE".parse::<QueryPattern>().unwrap(), QueryPattern::Code);
     }
 
     #[test]
     fn test_query_pattern_from_str_unknown_is_other() {
-        assert_eq!("xyz_unknown".parse::<QueryPattern>().unwrap(), QueryPattern::Other);
+        assert_eq!(
+            "xyz_unknown".parse::<QueryPattern>().unwrap(),
+            QueryPattern::Other
+        );
         assert_eq!("".parse::<QueryPattern>().unwrap(), QueryPattern::Other);
     }
 

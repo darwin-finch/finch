@@ -223,11 +223,17 @@ pub struct TaskResult {
 
 impl TaskResult {
     fn success(output: String) -> Self {
-        Self { output, exit_code: 0 }
+        Self {
+            output,
+            exit_code: 0,
+        }
     }
 
     fn failure(output: String) -> Self {
-        Self { output, exit_code: 1 }
+        Self {
+            output,
+            exit_code: 1,
+        }
     }
 }
 
@@ -403,11 +409,17 @@ mod tests {
         async fn send_message_stream(
             &self,
             _req: &crate::providers::ProviderRequest,
-        ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>> {
+        ) -> anyhow::Result<
+            tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>,
+        > {
             anyhow::bail!("null provider")
         }
-        fn name(&self) -> &str { "null" }
-        fn default_model(&self) -> &str { "null" }
+        fn name(&self) -> &str {
+            "null"
+        }
+        fn default_model(&self) -> &str {
+            "null"
+        }
     }
 
     /// Echo provider — immediately returns a text response with no tool calls.
@@ -424,7 +436,9 @@ mod tests {
             Ok(ProviderResponse {
                 id: "test".to_string(),
                 model: "echo".to_string(),
-                content: vec![ContentBlock::Text { text: self.0.clone() }],
+                content: vec![ContentBlock::Text {
+                    text: self.0.clone(),
+                }],
                 stop_reason: Some("end_turn".to_string()),
                 role: "assistant".to_string(),
                 provider: "echo".to_string(),
@@ -433,11 +447,17 @@ mod tests {
         async fn send_message_stream(
             &self,
             _req: &crate::providers::ProviderRequest,
-        ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>> {
+        ) -> anyhow::Result<
+            tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>,
+        > {
             anyhow::bail!("echo provider does not stream")
         }
-        fn name(&self) -> &str { "echo" }
-        fn default_model(&self) -> &str { "echo" }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn default_model(&self) -> &str {
+            "echo"
+        }
     }
 
     fn null_provider() -> Arc<dyn crate::providers::LlmProvider> {
@@ -451,7 +471,10 @@ mod tests {
     #[test]
     fn test_subagent_type_from_str() {
         assert_eq!(SubagentType::from_str("explore"), SubagentType::Explore);
-        assert_eq!(SubagentType::from_str("researcher"), SubagentType::Researcher);
+        assert_eq!(
+            SubagentType::from_str("researcher"),
+            SubagentType::Researcher
+        );
         assert_eq!(SubagentType::from_str("coder"), SubagentType::Coder);
         assert_eq!(SubagentType::from_str("bash"), SubagentType::Bash);
         assert_eq!(SubagentType::from_str("general"), SubagentType::General);
@@ -467,14 +490,21 @@ mod tests {
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"grep"));
         assert!(!names.contains(&"bash"), "Explore should not have bash");
-        assert!(!names.contains(&"web_fetch"), "Explore should not have web_fetch");
+        assert!(
+            !names.contains(&"web_fetch"),
+            "Explore should not have web_fetch"
+        );
     }
 
     #[test]
     fn test_subagent_tools_bash_only() {
         let tools = build_subagent_tools(SubagentType::Bash.allowed_tools(), null_provider(), 0);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names, vec!["bash"], "Bash subagent should only have bash tool");
+        assert_eq!(
+            names,
+            vec!["bash"],
+            "Bash subagent should only have bash tool"
+        );
     }
 
     #[test]
@@ -508,7 +538,10 @@ mod tests {
             0,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"spawn_task"), "General at depth 0 should have spawn_task");
+        assert!(
+            names.contains(&"spawn_task"),
+            "General at depth 0 should have spawn_task"
+        );
 
         // At MAX_RECURSION_DEPTH → spawn_task absent
         let tools_at_max = build_subagent_tools(
@@ -531,9 +564,15 @@ mod tests {
                 SubagentType::Coder,
                 SubagentType::Bash,
             ] {
-                let tools = build_subagent_tools(stype.allowed_tools(), Arc::clone(&provider), depth);
+                let tools =
+                    build_subagent_tools(stype.allowed_tools(), Arc::clone(&provider), depth);
                 for tool in &tools {
-                    assert_ne!(tool.name(), "restart", "Subagent {:?} must never have restart", stype);
+                    assert_ne!(
+                        tool.name(),
+                        "restart",
+                        "Subagent {:?} must never have restart",
+                        stype
+                    );
                 }
             }
         }
@@ -560,7 +599,11 @@ mod tests {
 
         let exit_code_sum: i32 = results
             .into_iter()
-            .map(|r| r.expect("tokio task panicked").map(|t| t.exit_code).unwrap_or(1))
+            .map(|r| {
+                r.expect("tokio task panicked")
+                    .map(|t| t.exit_code)
+                    .unwrap_or(1)
+            })
             .sum();
 
         assert_eq!(exit_code_sum, 0, "all 100 tasks must exit 0");

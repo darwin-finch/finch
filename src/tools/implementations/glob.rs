@@ -75,8 +75,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
 
         let result = tool.execute(input, &context).await;
@@ -101,8 +101,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
 
         let result = tool.execute(input, &context).await;

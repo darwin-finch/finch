@@ -122,8 +122,8 @@ mod tests {
             repl_mode: Some(repl_mode),
             plan_content: Some(plan_content),
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
 
         let result = tool
@@ -153,8 +153,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
 
         let result = tool.execute(serde_json::json!({}), &context).await;
@@ -174,8 +174,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
 
         let result = tool

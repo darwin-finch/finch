@@ -158,7 +158,10 @@ impl DaemonLifecycle {
             // SIGKILL almost always means a zombie.  Either way, the daemon is no
             // longer serving requests — remove the PID file and move on.
             if process_exists(pid) {
-                warn!(pid = pid, "Process still visible after SIGKILL (likely zombie); removing PID file");
+                warn!(
+                    pid = pid,
+                    "Process still visible after SIGKILL (likely zombie); removing PID file"
+                );
             } else {
                 info!(pid = pid, "Daemon force-stopped with SIGKILL");
             }

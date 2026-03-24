@@ -31,22 +31,31 @@ impl Tool for StackPushTool {
     fn input_schema(&self) -> ToolInputSchema {
         use serde_json::{json, Map};
         let mut props = Map::new();
-        props.insert("item".to_string(), json!({
-            "type": "string",
-            "description": "The text to push onto the stack. Can be a question, \
-                            constraint, hypothesis, tool result summary, or context."
-        }));
-        props.insert("tools".to_string(), json!({
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Optional list of tool names this node may use when executed, \
-                            e.g. [\"Bash\", \"Read\", \"Glob\"]. Omit for plain generation."
-        }));
-        props.insert("kind".to_string(), json!({
-            "type": "string",
-            "enum": ["task", "constraint", "question", "observation"],
-            "description": "Node kind (default: observation)"
-        }));
+        props.insert(
+            "item".to_string(),
+            json!({
+                "type": "string",
+                "description": "The text to push onto the stack. Can be a question, \
+                                constraint, hypothesis, tool result summary, or context."
+            }),
+        );
+        props.insert(
+            "tools".to_string(),
+            json!({
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Optional list of tool names this node may use when executed, \
+                                e.g. [\"Bash\", \"Read\", \"Glob\"]. Omit for plain generation."
+            }),
+        );
+        props.insert(
+            "kind".to_string(),
+            json!({
+                "type": "string",
+                "enum": ["task", "constraint", "question", "observation"],
+                "description": "Node kind (default: observation)"
+            }),
+        );
         ToolInputSchema {
             schema_type: "object".to_string(),
             properties: serde_json::Value::Object(props),
@@ -67,21 +76,30 @@ impl Tool for StackPushTool {
         // Optional tool list for the poset node.
         let tools: Vec<String> = input["tools"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Optional node kind (default: observation for AI pushes).
         let kind = match input["kind"].as_str().unwrap_or("observation") {
-            "task"        => crate::poset::NodeKind::Task,
-            "constraint"  => crate::poset::NodeKind::Constraint,
-            "question"    => crate::poset::NodeKind::Question,
-            _             => crate::poset::NodeKind::Observation,
+            "task" => crate::poset::NodeKind::Task,
+            "constraint" => crate::poset::NodeKind::Constraint,
+            "question" => crate::poset::NodeKind::Question,
+            _ => crate::poset::NodeKind::Observation,
         };
 
         // Add a node to the poset if available.
         if let Some(poset) = &context.poset {
             let mut p = poset.lock().await;
-            p.add_node_with_tools(item.clone(), kind, crate::poset::NodeAuthor::Ai, tools.clone());
+            p.add_node_with_tools(
+                item.clone(),
+                kind,
+                crate::poset::NodeAuthor::Ai,
+                tools.clone(),
+            );
         }
 
         match &context.stack {
@@ -280,7 +298,9 @@ impl Tool for StackPopTool {
         };
         let preview: String = item.chars().take(60).collect();
         let ellipsis = if item.len() > 60 { "…" } else { "" };
-        Ok(format!("📚 popped → \"{preview}{ellipsis}\"  (depth:{depth})"))
+        Ok(format!(
+            "📚 popped → \"{preview}{ellipsis}\"  (depth:{depth})"
+        ))
     }
 }
 

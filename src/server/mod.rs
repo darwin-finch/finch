@@ -11,7 +11,10 @@ mod session;
 pub mod session_registry;
 mod training_worker;
 
-pub use brain_registry::{BrainDetail, BrainRegistry, BrainState, BrainSummary, PendingPlanView, PendingQuestionView, PlanResponse};
+pub use brain_registry::{
+    BrainDetail, BrainRegistry, BrainState, BrainSummary, PendingPlanView, PendingQuestionView,
+    PlanResponse,
+};
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
@@ -89,7 +92,9 @@ pub struct AgentServer {
     /// Training examples sender (for feedback endpoint)
     training_tx: Arc<tokio::sync::mpsc::UnboundedSender<crate::models::WeightedExample>>,
     /// Training examples receiver — taken once by `serve()` to hand to the worker.
-    training_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::models::WeightedExample>>>,
+    training_rx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::models::WeightedExample>>,
+    >,
     /// Brain registry — tracks all daemon brain sessions
     brain_registry: Arc<BrainRegistry>,
 }
@@ -183,14 +188,14 @@ impl AgentServer {
         let self_addr = self.config.bind_address.clone();
         let specs = crate::coforth::interpreter::collect_machine_specs();
         let self_entry = crate::registry::PeerEntry {
-            addr:      self_addr.clone(),
-            label:     Some(hostname_or_default()),
-            tags:      vec!["self".to_string()],
-            load:      None,
-            region:    None,
+            addr: self_addr.clone(),
+            label: Some(hostname_or_default()),
+            tags: vec!["self".to_string()],
+            load: None,
+            region: None,
             cpu_cores: Some(specs.0),
-            ram_mb:    Some(specs.1),
-            bench_ms:  Some(specs.2),
+            ram_mb: Some(specs.1),
+            bench_ms: Some(specs.2),
         };
         let registry2 = std::sync::Arc::clone(&crate::server::handlers::REGISTRY);
         registry2.join(self_entry.clone()).await;
@@ -274,7 +279,8 @@ impl AgentServer {
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }

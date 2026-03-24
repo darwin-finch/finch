@@ -57,7 +57,10 @@ pub enum SessionEvent {
     DiffAccept { diff_id: Uuid },
 
     /// Reject a proposed diff.
-    DiffReject { diff_id: Uuid, reason: Option<String> },
+    DiffReject {
+        diff_id: Uuid,
+        reason: Option<String>,
+    },
 
     /// One side asks the other to render a dialog and respond.
     Dialog { id: Uuid, spec: DialogSpec },
@@ -93,10 +96,7 @@ pub enum DialogKind {
         default: Option<String>,
     },
     /// Yes / No.
-    Confirm {
-        prompt: String,
-        default: bool,
-    },
+    Confirm { prompt: String, default: bool },
 }
 
 /// The answer the remote side sends back for a Dialog event.
@@ -158,13 +158,29 @@ impl SessionEvent {
         SessionEvent::Chat { text: text.into() }
     }
 
-    pub fn diff(label: impl Into<String>, patch: impl Into<String>, description: Option<String>) -> (Self, Uuid) {
+    pub fn diff(
+        label: impl Into<String>,
+        patch: impl Into<String>,
+        description: Option<String>,
+    ) -> (Self, Uuid) {
         let id = Uuid::new_v4();
-        (SessionEvent::Diff { id, label: label.into(), patch: patch.into(), description }, id)
+        (
+            SessionEvent::Diff {
+                id,
+                label: label.into(),
+                patch: patch.into(),
+                description,
+            },
+            id,
+        )
     }
 
     pub fn diff_edit(diff_id: Uuid, patch: impl Into<String>, description: Option<String>) -> Self {
-        SessionEvent::DiffEdit { diff_id, patch: patch.into(), description }
+        SessionEvent::DiffEdit {
+            diff_id,
+            patch: patch.into(),
+            description,
+        }
     }
 
     pub fn diff_accept(diff_id: Uuid) -> Self {
@@ -198,7 +214,10 @@ impl DialogSpec {
         DialogSpec {
             title: title.into(),
             body: None,
-            kind: DialogKind::Confirm { prompt: prompt.into(), default },
+            kind: DialogKind::Confirm {
+                prompt: prompt.into(),
+                default,
+            },
         }
     }
 
@@ -206,7 +225,10 @@ impl DialogSpec {
         DialogSpec {
             title: title.into(),
             body: None,
-            kind: DialogKind::TextInput { prompt: prompt.into(), default: None },
+            kind: DialogKind::TextInput {
+                prompt: prompt.into(),
+                default: None,
+            },
         }
     }
 

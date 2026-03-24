@@ -19,15 +19,15 @@ use tracing::{debug, error, info, instrument, warn};
 /// e.g. "Read src/main.rs", "Bash cargo test", "Grep fn main"
 fn tool_label(name: &str, input: &serde_json::Value) -> String {
     let key_arg = match name {
-        "Read"     | "read"      => input["path"].as_str().unwrap_or("").to_string(),
-        "Glob"     | "glob"      => input["pattern"].as_str().unwrap_or("").to_string(),
-        "Grep"     | "grep"      => input["pattern"].as_str().unwrap_or("").to_string(),
-        "Bash"     | "bash"      => {
+        "Read" | "read" => input["path"].as_str().unwrap_or("").to_string(),
+        "Glob" | "glob" => input["pattern"].as_str().unwrap_or("").to_string(),
+        "Grep" | "grep" => input["pattern"].as_str().unwrap_or("").to_string(),
+        "Bash" | "bash" => {
             let cmd = input["command"].as_str().unwrap_or("");
             cmd.chars().take(32).collect::<String>()
         }
-        "Write"    | "write"     => input["path"].as_str().unwrap_or("").to_string(),
-        "Edit"     | "edit"      => input["path"].as_str().unwrap_or("").to_string(),
+        "Write" | "write" => input["path"].as_str().unwrap_or("").to_string(),
+        "Edit" | "edit" => input["path"].as_str().unwrap_or("").to_string(),
         "WebFetch" | "web_fetch" => {
             let url = input["url"].as_str().unwrap_or("");
             url.chars().take(32).collect::<String>()
@@ -45,9 +45,7 @@ fn tool_label(name: &str, input: &serde_json::Value) -> String {
 /// Map a tool name to a poset NodeKind.
 fn tool_kind(name: &str) -> crate::poset::NodeKind {
     match name {
-        "Bash" | "bash" | "Write" | "write" | "Edit" | "edit" => {
-            crate::poset::NodeKind::Task
-        }
+        "Bash" | "bash" | "Write" | "write" | "Edit" | "edit" => crate::poset::NodeKind::Task,
         _ => crate::poset::NodeKind::Observation,
     }
 }
@@ -491,7 +489,8 @@ impl ToolExecutor {
                 info!("Tool executed successfully");
                 // Auto-push a node into the poset so the execution trace
                 // becomes the Co-Forth vocabulary.
-                self.poset_record_tool(&tool_use.name, &tool_use.input).await;
+                self.poset_record_tool(&tool_use.name, &tool_use.input)
+                    .await;
                 Ok(ToolResult::success(tool_use.id.clone(), output))
             }
             Err(e) => {
@@ -511,18 +510,16 @@ impl ToolExecutor {
         if matches!(tool_name, "push" | "pop_stack") {
             return;
         }
-        let Some(ref poset_arc) = self.poset else { return };
+        let Some(ref poset_arc) = self.poset else {
+            return;
+        };
 
         // Build a compact label: "Read src/foo.rs", "Bash cargo test", etc.
         let label = tool_label(tool_name, input);
         let kind = tool_kind(tool_name);
 
         let mut poset = poset_arc.lock().await;
-        let new_id = poset.add_node(
-            label,
-            kind,
-            crate::poset::NodeAuthor::Ai,
-        );
+        let new_id = poset.add_node(label, kind, crate::poset::NodeAuthor::Ai);
         // Chain: add an edge from the previous node (if any) to this one,
         // recording the sequential execution order.
         if new_id > 0 {

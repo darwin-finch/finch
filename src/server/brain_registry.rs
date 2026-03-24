@@ -179,11 +179,14 @@ impl BrainRegistry {
         {
             let mut map = shared.try_write().expect("new is single-threaded");
             for name in &["shared", "vocab", "codebase"] {
-                map.insert(name.to_string(), SharedBrainEntry {
-                    name: name.to_string(),
-                    context: String::new(),
-                    updated_secs: 0,
-                });
+                map.insert(
+                    name.to_string(),
+                    SharedBrainEntry {
+                        name: name.to_string(),
+                        context: String::new(),
+                        updated_secs: 0,
+                    },
+                );
             }
         }
         Self {
@@ -201,11 +204,13 @@ impl BrainRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let entry = map.entry(name.to_string()).or_insert_with(|| SharedBrainEntry {
-            name: name.to_string(),
-            context: String::new(),
-            updated_secs: 0,
-        });
+        let entry = map
+            .entry(name.to_string())
+            .or_insert_with(|| SharedBrainEntry {
+                name: name.to_string(),
+                context: String::new(),
+                updated_secs: 0,
+            });
         if !entry.context.is_empty() {
             entry.context.push('\n');
         }
@@ -438,7 +443,10 @@ mod tests {
 
     #[test]
     fn test_slug_task_basic() {
-        assert_eq!(slug_task("investigate why auth tests"), "investigate-why-auth-tests");
+        assert_eq!(
+            slug_task("investigate why auth tests"),
+            "investigate-why-auth-tests"
+        );
     }
 
     #[test]
@@ -468,7 +476,9 @@ mod tests {
     async fn test_registry_insert_and_list() {
         let registry = BrainRegistry::new();
         let id = Uuid::new_v4();
-        let name = registry.insert(id, "investigate auth tests".to_string()).await;
+        let name = registry
+            .insert(id, "investigate auth tests".to_string())
+            .await;
         assert_eq!(name, "investigate-auth-tests");
 
         let list = registry.list_active().await;
@@ -482,8 +492,12 @@ mod tests {
         let registry = BrainRegistry::new();
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        let name1 = registry.insert(id1, "investigate auth tests".to_string()).await;
-        let name2 = registry.insert(id2, "investigate auth tests".to_string()).await;
+        let name1 = registry
+            .insert(id1, "investigate auth tests".to_string())
+            .await;
+        let name2 = registry
+            .insert(id2, "investigate auth tests".to_string())
+            .await;
         assert_eq!(name1, "investigate-auth-tests");
         assert_eq!(name2, "investigate-auth-tests-2");
     }
@@ -504,7 +518,10 @@ mod tests {
             assert_eq!(brains[&id].state, BrainState::WaitingForInput);
         }
 
-        registry.answer_question(id, "yes".to_string()).await.unwrap();
+        registry
+            .answer_question(id, "yes".to_string())
+            .await
+            .unwrap();
         assert_eq!(rx.await.unwrap(), "yes");
 
         {
@@ -520,9 +537,7 @@ mod tests {
         registry.insert(id, "test task".to_string()).await;
 
         let (tx, rx) = oneshot::channel();
-        registry
-            .set_plan_ready(id, "do this".to_string(), tx)
-            .await;
+        registry.set_plan_ready(id, "do this".to_string(), tx).await;
 
         registry
             .respond_to_plan(id, PlanResponse::Approve)
@@ -541,9 +556,7 @@ mod tests {
         registry.insert(id, "test task".to_string()).await;
 
         let (tx, _rx) = oneshot::channel();
-        registry
-            .set_plan_ready(id, "do this".to_string(), tx)
-            .await;
+        registry.set_plan_ready(id, "do this".to_string(), tx).await;
 
         registry
             .respond_to_plan(
@@ -633,6 +646,9 @@ mod tests {
             .await;
 
         let detail = registry.get_detail(id).await.unwrap();
-        assert_eq!(detail.final_summary.as_deref(), Some("CPU bottleneck in tokenizer"));
+        assert_eq!(
+            detail.final_summary.as_deref(),
+            Some("CPU bottleneck in tokenizer")
+        );
     }
 }

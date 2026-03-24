@@ -95,6 +95,16 @@ where
         event.record(&mut visitor);
 
         if let Some(message) = visitor.message {
+            // Suppress mDNS multicast send failures on non-routable interfaces.
+            // These come via the log→tracing bridge (target="log") and fire for
+            // every interface that doesn't support IPv6 multicast (awdl0, utun*,
+            // lo0, llw0, en0). They are expected and not actionable.
+            if target == "log"
+                && message.contains("Failed to send")
+                && (message.contains(":5353") || message.contains("No route to host"))
+            {
+                return;
+            }
             let formatted = self.format_message(target, &message);
 
             // Route based on log level

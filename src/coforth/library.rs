@@ -12,7 +12,6 @@
 /// Building a larger vocabulary:
 ///   `finch library build` — uses the AI to recursively define words until
 ///   the library reaches a target size or depth.
-
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
@@ -48,10 +47,10 @@ fn default_kind() -> String {
 impl WordEntry {
     pub fn poset_kind(&self) -> crate::poset::NodeKind {
         match self.kind.as_str() {
-            "task"       => crate::poset::NodeKind::Task,
+            "task" => crate::poset::NodeKind::Task,
             "constraint" => crate::poset::NodeKind::Constraint,
-            "question"   => crate::poset::NodeKind::Question,
-            _            => crate::poset::NodeKind::Observation,
+            "question" => crate::poset::NodeKind::Question,
+            _ => crate::poset::NodeKind::Observation,
         }
     }
 }
@@ -124,11 +123,15 @@ impl Library {
         while let Some(c) = chars.next() {
             if c == ':' && chars.peek().map_or(false, |n| n.is_whitespace()) {
                 // skip whitespace
-                while chars.peek().map_or(false, |n| n.is_whitespace()) { chars.next(); }
+                while chars.peek().map_or(false, |n| n.is_whitespace()) {
+                    chars.next();
+                }
                 // read word name
                 let mut name = String::new();
                 for c2 in chars.by_ref() {
-                    if c2.is_whitespace() { break; }
+                    if c2.is_whitespace() {
+                        break;
+                    }
                     name.push(c2);
                 }
                 if !name.is_empty() && !name.starts_with("test:") {
@@ -147,13 +150,16 @@ impl Library {
         let out = vm.out.clone();
         // Parse "N/M passed" from the output.
         for line in out.lines() {
-            let clean: String = line.chars()
+            let clean: String = line
+                .chars()
                 .filter(|c| c.is_ascii_digit() || *c == '/')
                 .collect();
             if let Some(slash) = clean.find('/') {
                 let passed = clean[..slash].parse::<usize>().unwrap_or(0);
-                let total  = clean[slash+1..].parse::<usize>().unwrap_or(0);
-                if total > 0 { return (passed, total, out); }
+                let total = clean[slash + 1..].parse::<usize>().unwrap_or(0);
+                if total > 0 {
+                    return (passed, total, out);
+                }
             }
         }
         (0, 0, out)
@@ -170,7 +176,10 @@ impl Library {
 
     fn load_toml(&mut self, src: &str) {
         #[derive(Deserialize)]
-        struct File { #[serde(rename = "word")] words: Vec<WordEntry> }
+        struct File {
+            #[serde(rename = "word")]
+            words: Vec<WordEntry>,
+        }
         if let Ok(f) = toml::from_str::<File>(src) {
             for w in f.words {
                 let key = w.word.to_lowercase();
@@ -213,7 +222,9 @@ impl Library {
     /// Return all entries marked `boot = true` (across all words/senses), in
     /// alphabetical order by word name.  Used to run boot-time poetry at startup.
     pub fn boot_entries(&self) -> Vec<&WordEntry> {
-        let mut entries: Vec<&WordEntry> = self.words.values()
+        let mut entries: Vec<&WordEntry> = self
+            .words
+            .values()
             .flat_map(|senses| senses.iter())
             .filter(|e| e.boot && e.forth.is_some())
             .collect();
@@ -224,7 +235,9 @@ impl Library {
     /// Return every entry across all words and senses, in alphabetical order.
     /// Used on first boot to run the whole vocabulary.
     pub fn all_entries(&self) -> Vec<&WordEntry> {
-        let mut entries: Vec<&WordEntry> = self.words.values()
+        let mut entries: Vec<&WordEntry> = self
+            .words
+            .values()
             .flat_map(|senses| senses.iter())
             .collect();
         entries.sort_by(|a, b| a.word.cmp(&b.word));
@@ -240,7 +253,9 @@ impl Library {
         queue.push_back((seed.to_lowercase(), 0));
 
         while let Some((word, depth)) = queue.pop_front() {
-            if visited.contains(&word) { continue; }
+            if visited.contains(&word) {
+                continue;
+            }
             visited.insert(word.clone());
 
             if let Some(senses) = self.words.get(&word) {
@@ -373,7 +388,9 @@ pub fn git_repo_root() -> Option<std::path::PathBuf> {
 /// Korean beats CJK for the same reason.
 pub fn detect_vocab_lang(word: &str) -> &'static str {
     // Priority list — later entries win over earlier ones.
-    const PRIORITY: &[&str] = &["en", "zh", "ar", "he", "ru", "hi", "ta", "th", "el", "ko", "ja"];
+    const PRIORITY: &[&str] = &[
+        "en", "zh", "ar", "he", "ru", "hi", "ta", "th", "el", "ko", "ja",
+    ];
 
     let mut best: usize = 0; // index into PRIORITY; 0 = "en"
 
@@ -388,8 +405,11 @@ pub fn detect_vocab_lang(word: &str) -> &'static str {
             0x0900..=0x097F => "hi",
             0x0400..=0x04FF | 0x0500..=0x052F => "ru",
             0x0590..=0x05FF | 0xFB1D..=0xFB4F => "he",
-            0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF
-            | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => "ar",
+            0x0600..=0x06FF
+            | 0x0750..=0x077F
+            | 0x08A0..=0x08FF
+            | 0xFB50..=0xFDFF
+            | 0xFE70..=0xFEFF => "ar",
             0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF => "zh",
             _ => continue,
         };
@@ -429,43 +449,47 @@ pub fn generate_forth_for_word(word: &str) -> String {
 
     // ── Pronouns — self-aware via the stack ────────────────────────────────
     match w {
-        "i" | "me" | "myself" =>
-            return r#"depth . ." items — that's what I have." cr"#.to_string(),
-        "you" | "your" | "yours" =>
-            return r#"." you're here." cr"#.to_string(),
-        "we" | "us" | "our" | "ours" =>
-            return r#"depth . ." — we share this stack." cr"#.to_string(),
-        "it" | "this" | "that" =>
-            return r#"depth 0> if ." it's on the stack." cr else ." nothing here." cr then"#.to_string(),
-        "they" | "them" | "their" =>
-            return r#"." they're somewhere on the stack." cr .s cr"#.to_string(),
+        "i" | "me" | "myself" => {
+            return r#"depth . ." items — that's what I have." cr"#.to_string()
+        }
+        "you" | "your" | "yours" => return r#"." you're here." cr"#.to_string(),
+        "we" | "us" | "our" | "ours" => {
+            return r#"depth . ." — we share this stack." cr"#.to_string()
+        }
+        "it" | "this" | "that" => {
+            return r#"depth 0> if ." it's on the stack." cr else ." nothing here." cr then"#
+                .to_string()
+        }
+        "they" | "them" | "their" => {
+            return r#"." they're somewhere on the stack." cr .s cr"#.to_string()
+        }
         _ => {}
     }
 
     // ── Number words ────────────────────────────────────────────────────────
     let num_opt = match w {
         "zero" | "null" | "nil" | "none" | "nothing" | "nought" => Some(0i64),
-        "one"  | "once"   | "single"   | "unit"     => Some(1),
-        "two"  | "twice"  | "pair"     | "both"     => Some(2),
-        "three"| "thrice"                            => Some(3),
-        "four"                                       => Some(4),
-        "five"                                       => Some(5),
-        "six"                                        => Some(6),
-        "seven"                                      => Some(7),
-        "eight"                                      => Some(8),
-        "nine"                                       => Some(9),
-        "ten"                                        => Some(10),
-        "eleven"                                     => Some(11),
-        "twelve" | "dozen"                           => Some(12),
-        "thirteen"                                   => Some(13),
-        "twenty"                                     => Some(20),
-        "thirty"                                     => Some(30),
-        "forty"                                      => Some(40),
-        "fifty"                                      => Some(50),
-        "hundred"                                    => Some(100),
-        "thousand"                                   => Some(1_000),
-        "million"                                    => Some(1_000_000),
-        "billion"                                    => Some(1_000_000_000),
+        "one" | "once" | "single" | "unit" => Some(1),
+        "two" | "twice" | "pair" | "both" => Some(2),
+        "three" | "thrice" => Some(3),
+        "four" => Some(4),
+        "five" => Some(5),
+        "six" => Some(6),
+        "seven" => Some(7),
+        "eight" => Some(8),
+        "nine" => Some(9),
+        "ten" => Some(10),
+        "eleven" => Some(11),
+        "twelve" | "dozen" => Some(12),
+        "thirteen" => Some(13),
+        "twenty" => Some(20),
+        "thirty" => Some(30),
+        "forty" => Some(40),
+        "fifty" => Some(50),
+        "hundred" => Some(100),
+        "thousand" => Some(1_000),
+        "million" => Some(1_000_000),
+        "billion" => Some(1_000_000_000),
         _ => None,
     };
     if let Some(n) = num_opt {
@@ -474,53 +498,53 @@ pub fn generate_forth_for_word(word: &str) -> String {
 
     // ── Logic / discourse markers ───────────────────────────────────────────
     match w {
-        "and"                          => return "and .bool cr".to_string(),
-        "or"                           => return "or .bool cr".to_string(),
+        "and" => return "and .bool cr".to_string(),
+        "or" => return "or .bool cr".to_string(),
         "not" | "negate" | "opposite" => return "not .bool cr".to_string(),
-        "true" | "yes"                 => return "true .bool cr".to_string(),
-        "false" | "no"                 => return "false .bool cr".to_string(),
-        "equal" | "equals" | "same"    => return "= .bool cr".to_string(),
+        "true" | "yes" => return "true .bool cr".to_string(),
+        "false" | "no" => return "false .bool cr".to_string(),
+        "equal" | "equals" | "same" => return "= .bool cr".to_string(),
         _ => {}
     }
 
     // ── Stack-motion words ──────────────────────────────────────────────────
     match w {
-        "double" | "twice-as-much"  => return "2* . cr".to_string(),
-        "half"   | "halve"          => return "2/ . cr".to_string(),
-        "plus"   | "add"            => return "+ . cr".to_string(),
-        "minus"  | "subtract"       => return "- . cr".to_string(),
-        "times"  | "multiply"       => return "* . cr".to_string(),
-        "divide" | "divided"        => return "/ . cr".to_string(),
-        "up"   | "above" | "higher" | "more"  => return "1+ . cr".to_string(),
-        "down" | "below" | "lower"  | "less"  => return "1- . cr".to_string(),
+        "double" | "twice-as-much" => return "2* . cr".to_string(),
+        "half" | "halve" => return "2/ . cr".to_string(),
+        "plus" | "add" => return "+ . cr".to_string(),
+        "minus" | "subtract" => return "- . cr".to_string(),
+        "times" | "multiply" => return "* . cr".to_string(),
+        "divide" | "divided" => return "/ . cr".to_string(),
+        "up" | "above" | "higher" | "more" => return "1+ . cr".to_string(),
+        "down" | "below" | "lower" | "less" => return "1- . cr".to_string(),
         "swap" | "switch" | "exchange" | "flip" => return "swap .s cr".to_string(),
-        "copy"  | "duplicate"       => return "dup .s cr".to_string(),
-        "drop"  | "discard" | "remove" => return "depth 0> if drop then .s cr".to_string(),
+        "copy" | "duplicate" => return "dup .s cr".to_string(),
+        "drop" | "discard" | "remove" => return "depth 0> if drop then .s cr".to_string(),
         _ => {}
     }
 
     // ── Time words ──────────────────────────────────────────────────────────
     match w {
-        "now" | "today" | "present" | "current" =>
-            return r#"time . ." seconds since epoch." cr"#.to_string(),
-        "never" | "eternity" | "forever" =>
-            return r#"." forever." cr"#.to_string(),
+        "now" | "today" | "present" | "current" => {
+            return r#"time . ." seconds since epoch." cr"#.to_string()
+        }
+        "never" | "eternity" | "forever" => return r#"." forever." cr"#.to_string(),
         _ => {}
     }
 
     // ── Existence words ─────────────────────────────────────────────────────
     match w {
-        "empty" | "void" | "blank" | "bare" =>
-            return r#"depth 0= .bool cr"#.to_string(),
-        "full" | "complete" | "whole" | "all" | "everything" =>
-            return r#".s cr"#.to_string(),
-        "something" | "anything" | "some" =>
-            return r#"depth 0> .bool cr"#.to_string(),
+        "empty" | "void" | "blank" | "bare" => return r#"depth 0= .bool cr"#.to_string(),
+        "full" | "complete" | "whole" | "all" | "everything" => return r#".s cr"#.to_string(),
+        "something" | "anything" | "some" => return r#"depth 0> .bool cr"#.to_string(),
         _ => {}
     }
 
     // ── Question words — print as open questions ────────────────────────────
-    if matches!(w, "who" | "what" | "where" | "when" | "why" | "how" | "which" | "whose") {
+    if matches!(
+        w,
+        "who" | "what" | "where" | "when" | "why" | "how" | "which" | "whose"
+    ) {
         return format!(r#"." {w}?" cr"#);
     }
 
@@ -554,11 +578,14 @@ pub const ZH_LIBRARY: &str = include_str!("../../vocabulary/zh.toml");
 pub fn vocab_pairs_from_toml(src: &str) -> Vec<(String, String)> {
     let mut lib = Library::default();
     lib.load_toml(src);
-    lib.words.values()
+    lib.words
+        .values()
         .flat_map(|senses| senses.iter())
         .filter_map(|e| {
             let code = e.forth.as_deref()?.trim();
-            if code.is_empty() || code == e.word.as_str() { return None; }
+            if code.is_empty() || code == e.word.as_str() {
+                return None;
+            }
             Some((e.word.clone(), code.to_string()))
         })
         .collect()
@@ -606,36 +633,135 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
     // must not override — doing so breaks fundamental language behaviour.
     const PROTECTED: &[&str] = &[
         // I/O primitives
-        "cr", "space", "spaces", "emit", "type", ".", ".s", ",",
+        "cr",
+        "space",
+        "spaces",
+        "emit",
+        "type",
+        ".",
+        ".s",
+        ",",
         // Stack ops
-        "dup", "drop", "swap", "over", "rot", "-rot", "nip", "tuck",
-        "2dup", "2drop", "2swap", "2over", "depth", "?dup",
+        "dup",
+        "drop",
+        "swap",
+        "over",
+        "rot",
+        "-rot",
+        "nip",
+        "tuck",
+        "2dup",
+        "2drop",
+        "2swap",
+        "2over",
+        "depth",
+        "?dup",
         // Arithmetic / logic
-        "+", "-", "*", "/", "mod", "negate", "abs", "max", "min",
-        "and", "or", "xor", "invert", "lshift", "rshift",
-        "=", "<>", "<", ">", "<=", ">=", "0=", "0<", "0>",
-        "1+", "1-", "2*", "2/",
+        "+",
+        "-",
+        "*",
+        "/",
+        "mod",
+        "negate",
+        "abs",
+        "max",
+        "min",
+        "and",
+        "or",
+        "xor",
+        "invert",
+        "lshift",
+        "rshift",
+        "=",
+        "<>",
+        "<",
+        ">",
+        "<=",
+        ">=",
+        "0=",
+        "0<",
+        "0>",
+        "1+",
+        "1-",
+        "2*",
+        "2/",
         // Memory
-        "@", "!", "+!", "here", "allot",
+        "@",
+        "!",
+        "+!",
+        "here",
+        "allot",
         // String
-        "str-len", "str=", "str-cat", "str-upper", "str-lower",
-        "str-trim", "str-find", "str-split", "str-join", "num>str", "str>num",
+        "str-len",
+        "str=",
+        "str-cat",
+        "str-upper",
+        "str-lower",
+        "str-trim",
+        "str-find",
+        "str-split",
+        "str-join",
+        "num>str",
+        "str>num",
         // Control / defining
-        "if", "then", "else", "begin", "while", "repeat", "until",
-        "do", "loop", "i", "j", "exit", "recurse",
-        ":", ";", "variable", "constant", "value", "to", "create",
+        "if",
+        "then",
+        "else",
+        "begin",
+        "while",
+        "repeat",
+        "until",
+        "do",
+        "loop",
+        "i",
+        "j",
+        "exit",
+        "recurse",
+        ":",
+        ";",
+        "variable",
+        "constant",
+        "value",
+        "to",
+        "create",
         // Misc
-        "assert", "safe", "eval", "fork", "time", "nonce",
-        "true", "false", "bool",
+        "assert",
+        "safe",
+        "eval",
+        "fork",
+        "time",
+        "nonce",
+        "true",
+        "false",
+        "bool",
         // Consensus / relay ops — builtins
-        "argue", "gate", "both-ways", "versus", "page", "resolve", "boom", "converge",
+        "argue",
+        "gate",
+        "both-ways",
+        "versus",
+        "page",
+        "resolve",
+        "boom",
+        "converge",
         // Hash builtins — native Rust, must not be shadowed
-        "hash", "str-hash", "hash-int", "hash-combine",
+        "hash",
+        "str-hash",
+        "hash-int",
+        "hash-combine",
         // Math words — STDLIB definitions must not be shadowed by vocab entries
-        "gcd", "lcm", "fib", "prime?", "next-prime", "triangular", "square", "cube",
+        "gcd",
+        "lcm",
+        "fib",
+        "prime?",
+        "next-prime",
+        "triangular",
+        "square",
+        "cube",
     ];
 
-    let mut entries: Vec<_> = lib.words.values()
+    let mut entries: Vec<_> = lib
+        .words
+        .values()
         .flat_map(|senses| senses.iter())
         .filter(|e| e.forth.is_some())
         .filter(|e| !PROTECTED.contains(&e.word.as_str()))
@@ -643,22 +769,32 @@ static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
     entries.sort_by(|a, b| a.word.cmp(&b.word));
 
     let mut all_defs = String::with_capacity(entries.len() * 44);
-    let pairs: Vec<(String, String)> = entries.iter().filter_map(|e| {
-        let code = e.forth.as_deref().unwrap_or("").trim();
-        // Skip self-referential stubs (e.g. `forth = "boom"` for word `boom`).
-        // These say "this is a builtin" — compiling them as `: boom boom ;` recurses.
-        if code == e.word.as_str() { return None; }
-        let line = format!(": {} {} ;\n", e.word, code);
-        all_defs.push_str(&line);
-        Some((e.word.clone(), code.to_string()))
-    }).collect();
+    let pairs: Vec<(String, String)> = entries
+        .iter()
+        .filter_map(|e| {
+            let code = e.forth.as_deref().unwrap_or("").trim();
+            // Skip self-referential stubs (e.g. `forth = "boom"` for word `boom`).
+            // These say "this is a builtin" — compiling them as `: boom boom ;` recurses.
+            if code == e.word.as_str() {
+                return None;
+            }
+            let line = format!(": {} {} ;\n", e.word, code);
+            all_defs.push_str(&line);
+            Some((e.word.clone(), code.to_string()))
+        })
+        .collect();
 
     // Collect words that have argue proofs (definition ↔ Forth bridge).
-    let proofs: Vec<(String, [String; 2])> = entries.iter()
+    let proofs: Vec<(String, [String; 2])> = entries
+        .iter()
         .filter_map(|e| e.proof.as_ref().map(|p| (e.word.clone(), p.clone())))
         .collect();
 
-    BuiltinDefs { pairs, proofs, all_defs }
+    BuiltinDefs {
+        pairs,
+        proofs,
+        all_defs,
+    }
 });
 
 /// Major words — stack machines + sentences + proofs.
@@ -4616,8 +4752,14 @@ mod tests {
     #[test]
     fn test_precompiled_vm_knows_hello() {
         let vm = Library::precompiled_vm();
-        assert!(vm.word_exists("hello"), "hello must be in the precompiled VM");
-        assert!(vm.word_exists("goodbye"), "goodbye must be in the precompiled VM");
+        assert!(
+            vm.word_exists("hello"),
+            "hello must be in the precompiled VM"
+        );
+        assert!(
+            vm.word_exists("goodbye"),
+            "goodbye must be in the precompiled VM"
+        );
     }
 
     /// Regression: executing `hello` on the precompiled VM must produce output,
@@ -4626,7 +4768,10 @@ mod tests {
     fn test_hello_produces_output() {
         let mut vm = Library::precompiled_vm();
         let out = vm.exec("hello").expect("hello must not error");
-        assert!(!out.is_empty(), "hello must produce output, got empty string");
+        assert!(
+            !out.is_empty(),
+            "hello must produce output, got empty string"
+        );
     }
 
     #[test]
@@ -4687,7 +4832,10 @@ mod tests {
     fn test_english_library_proof_entries_argue() {
         let defs = Library::builtin_defs();
         // We added proofs to several words — verify at least some are present.
-        assert!(!defs.proofs.is_empty(), "expected at least one proof entry in English library");
+        assert!(
+            !defs.proofs.is_empty(),
+            "expected at least one proof entry in English library"
+        );
 
         let mut failures = Vec::new();
         for (word, [a, b]) in &defs.proofs {
@@ -4707,7 +4855,11 @@ mod tests {
     #[test]
     fn test_english_library_all_words_batch() {
         let defs = Library::builtin_defs();
-        assert!(defs.pairs.len() > 1000, "expected 1000+ builtin words, got {}", defs.pairs.len());
+        assert!(
+            defs.pairs.len() > 1000,
+            "expected 1000+ builtin words, got {}",
+            defs.pairs.len()
+        );
 
         let mut vm = Library::precompiled_vm();
         let mut failures = Vec::new();
@@ -4730,12 +4882,31 @@ mod tests {
     fn test_rust_builtins_have_forth_wrappers() {
         // Spot-check critical builtins are reachable by name from a fresh VM.
         let critical = [
-            "capitalize", "str-upper", "str-lower", "str-trim",
-            "word-count", "sentence?", "grammar-check", "improve",
-            "fix", "polish", ".sentence", ".words",
-            "undo", "lock", "unlock", "lock-ttl",
-            "sha256", "nonce", "keygen", "sign", "verify",
-            "file-write", "file-fetch", "scatter-code", "peers-discover",
+            "capitalize",
+            "str-upper",
+            "str-lower",
+            "str-trim",
+            "word-count",
+            "sentence?",
+            "grammar-check",
+            "improve",
+            "fix",
+            "polish",
+            ".sentence",
+            ".words",
+            "undo",
+            "lock",
+            "unlock",
+            "lock-ttl",
+            "sha256",
+            "nonce",
+            "keygen",
+            "sign",
+            "verify",
+            "file-write",
+            "file-fetch",
+            "scatter-code",
+            "peers-discover",
         ];
         let mut vm = crate::coforth::Forth::new();
         // Compile a probe that calls each word — stack errors are fine.
@@ -4744,9 +4915,13 @@ mod tests {
             // The word must be known (either builtin or STDLIB wrapper).
             // Try calling it; if "unknown word" it's missing entirely
             let result = vm.exec_with_fuel(name, 1_000);
-            let known = result.map(|_| true)
+            let known = result
+                .map(|_| true)
                 .unwrap_or_else(|e| !e.to_string().contains("unknown word"));
-            assert!(known, "'{name}' is neither a builtin nor a STDLIB wrapper — missing from vocab");
+            assert!(
+                known,
+                "'{name}' is neither a builtin nor a STDLIB wrapper — missing from vocab"
+            );
         }
     }
 
@@ -4755,7 +4930,9 @@ mod tests {
         let lib = Library::load();
         // spot-check a few words produce non-empty output
         for word in &["know", "learn", "stack", "lattice", "compute", "sequence"] {
-            let entry = lib.lookup(word).unwrap_or_else(|| panic!("missing: {word}"));
+            let entry = lib
+                .lookup(word)
+                .unwrap_or_else(|| panic!("missing: {word}"));
             let code = entry.forth.as_ref().expect("no forth for {word}");
             let out = crate::coforth::Forth::run(code).expect("run failed");
             assert!(!out.is_empty(), "{word} produced no output");
@@ -4769,23 +4946,52 @@ mod tests {
         // Every generated snippet must compile and run without "unknown word" errors.
         let words = [
             // Numbers
-            "zero", "one", "two", "three", "hundred", "million",
+            "zero",
+            "one",
+            "two",
+            "three",
+            "hundred",
+            "million",
             // Pronouns
-            "i", "you", "we", "it", "they",
+            "i",
+            "you",
+            "we",
+            "it",
+            "they",
             // Logic
-            "and", "or", "not", "true", "false",
+            "and",
+            "or",
+            "not",
+            "true",
+            "false",
             // Stack motion
-            "double", "half", "up", "down", "swap", "copy",
+            "double",
+            "half",
+            "up",
+            "down",
+            "swap",
+            "copy",
             // Time
-            "now", "forever",
+            "now",
+            "forever",
             // Existence
-            "empty", "full", "something",
+            "empty",
+            "full",
+            "something",
             // Questions
-            "who", "what", "why", "how",
+            "who",
+            "what",
+            "why",
+            "how",
             // Arbitrary English — fallback path
-            "happiness", "running", "beautiful", "algorithm", "sunset",
+            "happiness",
+            "running",
+            "beautiful",
+            "algorithm",
+            "sunset",
             // Non-ASCII — safe fallback (no English word has quotes)
-            "café", "naïve",
+            "café",
+            "naïve",
         ];
         for w in &words {
             let snippet = generate_forth_for_word(w);
@@ -4803,7 +5009,13 @@ mod tests {
     #[test]
     fn test_generate_forth_for_word_numbers_push_value() {
         // Number words should push the numeric value.
-        let cases = [("zero", 0i64), ("one", 1), ("two", 2), ("ten", 10), ("hundred", 100)];
+        let cases = [
+            ("zero", 0i64),
+            ("one", 1),
+            ("two", 2),
+            ("ten", 10),
+            ("hundred", 100),
+        ];
         for (word, expected) in &cases {
             let snippet = generate_forth_for_word(word);
             // Run the snippet, then check what's printed.
@@ -4838,7 +5050,10 @@ mod tests {
         assert!(!ids.is_empty());
         // At least one node should have compiled_code set
         let has_compiled = poset.nodes.iter().any(|n| n.compiled_code.is_some());
-        assert!(has_compiled, "no nodes got compiled_code from inject_into_poset");
+        assert!(
+            has_compiled,
+            "no nodes got compiled_code from inject_into_poset"
+        );
     }
 
     /// John 1:1 — three sentences, two ways each, one truth.
@@ -4849,11 +5064,17 @@ mod tests {
 
         // Verify the key words actually push -1 before testing argue.
         let god_out = vm.exec("god .").expect("god should run");
-        assert!(god_out.contains("-1"), "god should push -1, got: {god_out:?}");
+        assert!(
+            god_out.contains("-1"),
+            "god should push -1, got: {god_out:?}"
+        );
         vm.clear_data();
 
         let word_out = vm.exec("word .").expect("word should run");
-        assert!(word_out.contains("-1"), "word should push -1, got: {word_out:?}");
+        assert!(
+            word_out.contains("-1"),
+            "word should push -1, got: {word_out:?}"
+        );
         vm.clear_data();
 
         // Sentence 1 ≡ Sentence 3: "was" and "is" are both no-ops; word and god both push -1.
@@ -4870,9 +5091,12 @@ mod tests {
     #[test]
     fn test_john14_way_truth_life_argue() {
         let mut vm = Library::precompiled_vm();
-        vm.exec("s\" way\" s\" truth\" argue").expect("way should argue with truth");
-        vm.exec("s\" truth\" s\" life\" argue").expect("truth should argue with life");
-        vm.exec("s\" way\" s\" life\" argue").expect("way should argue with life");
+        vm.exec("s\" way\" s\" truth\" argue")
+            .expect("way should argue with truth");
+        vm.exec("s\" truth\" s\" life\" argue")
+            .expect("truth should argue with life");
+        vm.exec("s\" way\" s\" life\" argue")
+            .expect("way should argue with life");
     }
 
     /// Revelation 22:13 — "I am the Alpha and the Omega, the first and the last."
@@ -4880,9 +5104,12 @@ mod tests {
     #[test]
     fn test_rev22_alpha_omega_argue() {
         let mut vm = Library::precompiled_vm();
-        vm.exec("s\" alpha\" s\" omega\" argue").expect("alpha should argue with omega");
-        vm.exec("s\" first\" s\" last\" argue").expect("first should argue with last");
-        vm.exec("s\" alpha\" s\" last\" argue").expect("alpha should argue with last");
+        vm.exec("s\" alpha\" s\" omega\" argue")
+            .expect("alpha should argue with omega");
+        vm.exec("s\" first\" s\" last\" argue")
+            .expect("first should argue with last");
+        vm.exec("s\" alpha\" s\" last\" argue")
+            .expect("alpha should argue with last");
     }
 
     /// Ecclesiastes 3:1 — "For everything there is a season."
@@ -4926,7 +5153,10 @@ mod tests {
         drop(r1);
         // Now add MAJOR_WORDS_FORTH and see what the FIRST error is
         let result = vm.exec_with_fuel(super::MAJOR_WORDS_FORTH, 0);
-        println!("MAJOR_WORDS_FORTH on TOML-vm: {:?}", result.as_ref().map_err(|e| e.to_string()));
+        println!(
+            "MAJOR_WORDS_FORTH on TOML-vm: {:?}",
+            result.as_ref().map_err(|e| e.to_string())
+        );
         // Check sin
         let sin_result = vm.exec("3 sin .");
         println!("3 sin . on TOML-vm: {:?}", sin_result);
@@ -4945,15 +5175,22 @@ mod tests {
         assert!(out.contains("-3"), "repent should negate 3, got: {out:?}");
         vm.clear_data();
         let out = vm.exec("3 sin repent .").expect("3 sin repent .");
-        assert!(out.contains("3 ") || out.trim() == "3", "sin repent should cancel, got: {out:?}");
+        assert!(
+            out.contains("3 ") || out.trim() == "3",
+            "sin repent should cancel, got: {out:?}"
+        );
     }
 
     #[test]
     fn test_precompiled_vm_negate_is_correct() {
         let mut vm = Library::precompiled_vm();
         let out = vm.exec("7 negate .").unwrap();
-        assert_eq!(out.trim(), "-7",
-            "precompiled_vm negate should output -7, got {:?}", out);
+        assert_eq!(
+            out.trim(),
+            "-7",
+            "precompiled_vm negate should output -7, got {:?}",
+            out
+        );
     }
 
     /// "sort these files" is a real program.
@@ -4963,12 +5200,19 @@ mod tests {
     fn test_sort_lines_builtin() {
         let mut vm = Library::precompiled_vm();
         // Direct test of sort builtin on a string
-        let out = vm.exec(r#"s" banana
+        let out = vm
+            .exec(
+                r#"s" banana
 apple
-cherry" sort type"#).expect("sort lines");
+cherry" sort type"#,
+            )
+            .expect("sort lines");
         let lines: Vec<&str> = out.trim().lines().collect();
-        assert_eq!(lines, vec!["apple", "banana", "cherry"],
-            "sort should sort lines alphabetically, got: {out:?}");
+        assert_eq!(
+            lines,
+            vec!["apple", "banana", "cherry"],
+            "sort should sort lines alphabetically, got: {out:?}"
+        );
     }
 
     #[test]
@@ -4992,8 +5236,10 @@ cherry" sort type"#).expect("sort lines");
             vm.clear_data();
             let out = vm.exec(&format!("{n} sin repent .")).expect("sin repent");
             let got: i64 = out.trim().parse().expect("should be an integer");
-            assert_eq!(got, n,
-                "proof_sin_repent_are_inverse: {n} sin repent should equal {n}, got {got}");
+            assert_eq!(
+                got, n,
+                "proof_sin_repent_are_inverse: {n} sin repent should equal {n}, got {got}"
+            );
         }
     }
 

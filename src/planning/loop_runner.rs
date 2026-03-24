@@ -62,7 +62,9 @@ impl PlanLoop {
         // responds with "CLARIFY: <question>", surface that to the user before
         // running any critique passes.
         {
-            tui.lock().await.set_operation_status("Checking task clarity…".to_string());
+            tui.lock()
+                .await
+                .set_operation_status("Checking task clarity…".to_string());
             let probe = self
                 .generate_plan(task, &[], None)
                 .await
@@ -87,7 +89,9 @@ impl PlanLoop {
 
             let personas = select_active_personas(&probe);
             self.show_critique_header(1, &personas);
-            tui.lock().await.set_operation_status("IMPCPD 1: critiquing…".to_string());
+            tui.lock()
+                .await
+                .set_operation_status("IMPCPD 1: critiquing…".to_string());
             let critiques = self
                 .critique_plan(&probe, &personas)
                 .await
@@ -114,7 +118,9 @@ impl PlanLoop {
                         critiques,
                         user_feedback: None,
                     });
-                    return Ok(PlanResult::UserApproved { iterations: history });
+                    return Ok(PlanResult::UserApproved {
+                        iterations: history,
+                    });
                 }
                 UserFeedback::Cancel => return Ok(PlanResult::Cancelled),
                 UserFeedback::Continue(text) => {

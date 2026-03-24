@@ -88,6 +88,7 @@ fn category_color(category: CommandCategory) -> Color {
         CommandCategory::Feedback => Color::LightMagenta,
         CommandCategory::Memory => Color::LightYellow,
         CommandCategory::Discovery => Color::LightCyan,
+        CommandCategory::Channel => Color::Green,
     }
 }
 

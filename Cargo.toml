@@ -82,6 +82,7 @@ tracing-log = "0.2"  # Bridge log crate → tracing (Phase 3.5)
 # Time and hashing
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+zip = "2"
 uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 
 # Text processing for TF-IDF

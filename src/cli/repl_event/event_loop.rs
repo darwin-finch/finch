@@ -24,7 +24,6 @@ use uuid::Uuid;
 use crate::claude::ContentBlock;
 use crate::cli::commands::{format_help, Command};
 use crate::cli::conversation::ConversationHistory;
-use crate::session::diff_store::DiffStore;
 use crate::cli::output_manager::OutputManager;
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
@@ -36,13 +35,12 @@ use crate::memory::NeuralEmbeddingEngine;
 use crate::models::bootstrap::GeneratorState;
 use crate::models::tokenizer::TextTokenizer;
 use crate::router::Router;
+use crate::session::diff_store::DiffStore;
 use crate::tools::executor::ToolExecutor;
 use crate::tools::types::ToolDefinition;
 
 use super::events::ReplEvent;
-use super::query_processor::{
-    process_query_with_tools, refresh_context_strip, ActiveToolUsesMap,
-};
+use super::query_processor::{process_query_with_tools, refresh_context_strip, ActiveToolUsesMap};
 use super::query_state::{QueryState, QueryStateManager};
 use super::tool_display::tool_result_to_display;
 use super::tool_execution::ToolExecutionCoordinator;
@@ -50,8 +48,7 @@ use super::tool_execution::ToolExecutionCoordinator;
 // refresh_context_strip, dispatch_tool_uses, process_query_with_tools,
 // ActiveToolUsesMap, and apply_sliding_window live in query_processor.rs.
 
-type ToolResultsMap =
-    Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>;
+type ToolResultsMap = Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>;
 type PendingApprovalsMap = Arc<
     RwLock<
         std::collections::HashMap<
@@ -231,7 +228,8 @@ pub struct EventLoop {
 
     /// Per-query tool call history: query_id -> set of "tool_name:input_json" strings.
     /// Used to detect infinite loops (same tool called with same args multiple times).
-    tool_call_history: Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+    tool_call_history:
+        Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
 
     /// Execution graph for the current (or most recent) query.
     current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
@@ -336,23 +334,25 @@ fn is_magic_word(word: &str) -> bool {
 /// Returns the specific response for a magic word, or `None` for unknowns.
 fn magic_word_response(word: &str) -> Option<&'static str> {
     match word {
-        "boom"  => Some("boom. nothing survived. not even the stack."),
-        "bang"  => Some("bang. the universe blinked."),
-        "fire"  => Some("fired. no smoke. suspicious."),
-        "nuke"  => Some("nuked. oddly peaceful in here."),
+        "boom" => Some("boom. nothing survived. not even the stack."),
+        "bang" => Some("bang. the universe blinked."),
+        "fire" => Some("fired. no smoke. suspicious."),
+        "nuke" => Some("nuked. oddly peaceful in here."),
         "crash" => Some("crash? no crash. try harder."),
-        "die"   => Some("still here. the machine has opinions about dying."),
-        "kill"  => Some("kill confirmed. no witnesses."),
-        "stop"  => Some("stopped. or never started. hard to say."),
-        "go"    => Some("gone. or was it ever here?"),
-        "run"   => Some("ran. left no forwarding address."),
-        "help"  => Some("help is a word. the stack did not respond."),
-        "please"=> Some("noted. the machine is unmoved by politeness."),
+        "die" => Some("still here. the machine has opinions about dying."),
+        "kill" => Some("kill confirmed. no witnesses."),
+        "stop" => Some("stopped. or never started. hard to say."),
+        "go" => Some("gone. or was it ever here?"),
+        "run" => Some("ran. left no forwarding address."),
+        "help" => Some("help is a word. the stack did not respond."),
+        "please" => Some("noted. the machine is unmoved by politeness."),
         "hello" => Some("hello back. ( silently )"),
-        "bye"   => Some("bye. the stack waves nothing."),
-        "yes"   => Some("yes. ( the stack agrees by saying nothing )"),
-        "no"    => Some("no. ( equally nothing )"),
-        "fireball" | "fireballs" => Some("fireball: pure energy, no output. the stack appreciates the drama."),
+        "bye" => Some("bye. the stack waves nothing."),
+        "yes" => Some("yes. ( the stack agrees by saying nothing )"),
+        "no" => Some("no. ( equally nothing )"),
+        "fireball" | "fireballs" => {
+            Some("fireball: pure energy, no output. the stack appreciates the drama.")
+        }
         _ => None,
     }
 }
@@ -371,8 +371,13 @@ fn silent_remark(code: &str) -> String {
             "boom" if n >= 3 => "BOOM BOOM BOOM!! yes!! let's go!!".to_string(),
             "boom" if n == 2 => "BOOM BOOM. twice as loud. got it.".to_string(),
             "fire" if n >= 3 => "fired three times. not sure what we were shooting at.".to_string(),
-            "help" if n >= 2 => "help help. the machine has considered your urgency. the stack is unmoved.".to_string(),
-            _ if n >= 3 => format!("{word} {word} {word}. it ran {n} times. the silence is louder now."),
+            "help" if n >= 2 => {
+                "help help. the machine has considered your urgency. the stack is unmoved."
+                    .to_string()
+            }
+            _ if n >= 3 => {
+                format!("{word} {word} {word}. it ran {n} times. the silence is louder now.")
+            }
             _ => format!("{word} {word}. twice. same result both times: nothing."),
         };
     }
@@ -398,7 +403,8 @@ fn silent_remark(code: &str) -> String {
     let idx = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
-        .unwrap_or(0) as usize) % REMARKS.len();
+        .unwrap_or(0) as usize)
+        % REMARKS.len();
     REMARKS[idx].to_string()
 }
 
@@ -418,9 +424,32 @@ fn extract_code_fence(input: &str) -> Option<(String, String)> {
         }
     }
     // lang: code  (single-line prefix style — e.g. "js: x => x+1")
-    let prefix_langs = ["js", "javascript", "python", "py", "rust", "ts", "typescript",
-                        "go", "java", "ruby", "rb", "c", "cpp", "bash", "sh", "sql",
-                        "html", "css", "swift", "kotlin", "php", "lua", "r", "haskell"];
+    let prefix_langs = [
+        "js",
+        "javascript",
+        "python",
+        "py",
+        "rust",
+        "ts",
+        "typescript",
+        "go",
+        "java",
+        "ruby",
+        "rb",
+        "c",
+        "cpp",
+        "bash",
+        "sh",
+        "sql",
+        "html",
+        "css",
+        "swift",
+        "kotlin",
+        "php",
+        "lua",
+        "r",
+        "haskell",
+    ];
     for lang in &prefix_langs {
         if let Some(code) = input.strip_prefix(&format!("{lang}:")) {
             let code = code.trim().to_string();
@@ -437,28 +466,43 @@ fn extract_code_fence(input: &str) -> Option<(String, String)> {
 fn definition_observation(name: &str, body: &str) -> Option<String> {
     use std::time::{SystemTime, UNIX_EPOCH};
     // Only comment ~1 in 3 times (based on nanos parity)
-    let t = SystemTime::now().duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos()).unwrap_or(0);
-    if t % 3 != 0 { return None; }
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    if t % 3 != 0 {
+        return None;
+    }
 
     let body_lo = body.to_lowercase();
     let name_lo = name.to_lowercase();
 
     // Detect what the body seems to do
-    let prints = body_lo.contains(" . ") || body_lo.ends_with(" .")
-        || body_lo.contains(".\"") || body_lo.contains("cr");
-    let arithmetic = body_lo.contains(" + ") || body_lo.contains(" * ")
-        || body_lo.contains(" - ") || body_lo.contains(" / ");
+    let prints = body_lo.contains(" . ")
+        || body_lo.ends_with(" .")
+        || body_lo.contains(".\"")
+        || body_lo.contains("cr");
+    let arithmetic = body_lo.contains(" + ")
+        || body_lo.contains(" * ")
+        || body_lo.contains(" - ")
+        || body_lo.contains(" / ");
     let conditional = body_lo.contains("if") || body_lo.contains("case");
     let loops = body_lo.contains("begin") || body_lo.contains("do ");
-    let calls_self = body_lo.split_whitespace().any(|t| t == name_lo || t == "recurse");
+    let calls_self = body_lo
+        .split_whitespace()
+        .any(|t| t == name_lo || t == "recurse");
 
     // Check if the name gives a hint about what it SHOULD do
-    let name_hints_violent = matches!(name_lo.as_str(),
-        "boom" | "bang" | "nuke" | "fire" | "blast" | "crash" | "kill" | "destroy");
-    let name_hints_math = matches!(name_lo.as_str(),
-        "add" | "sub" | "mul" | "div" | "square" | "cube" | "double" | "half" | "negate");
-    let name_hints_query = name_lo.ends_with('?') || name_lo.starts_with("is-") || name_lo.starts_with("has-");
+    let name_hints_violent = matches!(
+        name_lo.as_str(),
+        "boom" | "bang" | "nuke" | "fire" | "blast" | "crash" | "kill" | "destroy"
+    );
+    let name_hints_math = matches!(
+        name_lo.as_str(),
+        "add" | "sub" | "mul" | "div" | "square" | "cube" | "double" | "half" | "negate"
+    );
+    let name_hints_query =
+        name_lo.ends_with('?') || name_lo.starts_with("is-") || name_lo.starts_with("has-");
 
     if name_hints_violent && !prints && !arithmetic {
         return Some(format!(
@@ -509,16 +553,56 @@ fn definition_observation(name: &str, body: &str) -> Option<String> {
 /// Returns true when `w` is a Forth primitive/builtin that should always
 /// route to the VM regardless of whether it appears in the session vocabulary.
 fn is_forth_primitive_word(w: &str) -> bool {
-    matches!(w,
-        "dup" | "drop" | "swap" | "over" | "rot" | "nip" | "tuck" | "pick" | "roll" |
-        "mod" | "abs" | "max" | "min" | "negate" | "square" | "pow" |
-        "and" | "or" | "xor" | "invert" |
-        "cr" | "emit" | "type" |
-        "if" | "else" | "then" | "do" | "loop" | "begin" | "until" | "while" | "repeat" | "exit" |
-        "words" | "help" | "undo" | "apply" | "describe" |
-        "agree?" | "back-and-forth?" | "invertible?"
+    matches!(
+        w,
+        "dup"
+            | "drop"
+            | "swap"
+            | "over"
+            | "rot"
+            | "nip"
+            | "tuck"
+            | "pick"
+            | "roll"
+            | "mod"
+            | "abs"
+            | "max"
+            | "min"
+            | "negate"
+            | "square"
+            | "pow"
+            | "and"
+            | "or"
+            | "xor"
+            | "invert"
+            | "cr"
+            | "emit"
+            | "type"
+            | "if"
+            | "else"
+            | "then"
+            | "do"
+            | "loop"
+            | "begin"
+            | "until"
+            | "while"
+            | "repeat"
+            | "exit"
+            | "words"
+            | "help"
+            | "undo"
+            | "apply"
+            | "describe"
+            | "agree?"
+            | "back-and-forth?"
+            | "invertible?"
     ) || w.parse::<f64>().is_ok()
-      || w.chars().any(|c| matches!(c, '+' | '-' | '*' | '/' | '@' | '!' | '.' | ':' | ';' | '<' | '>' | '='))
+        || w.chars().any(|c| {
+            matches!(
+                c,
+                '+' | '-' | '*' | '/' | '@' | '!' | '.' | ':' | ';' | '<' | '>' | '='
+            )
+        })
 }
 
 /// Heuristic: does this input look like natural language rather than Forth code?
@@ -537,13 +621,20 @@ fn looks_like_natural_language(
     session_word: impl Fn(&str) -> bool,
 ) -> bool {
     let trimmed = s.trim();
-    if trimmed.contains('?') || trimmed.contains('？') { return true; }
+    if trimmed.contains('?') || trimmed.contains('？') {
+        return true;
+    }
     // Non-ASCII content that isn't a Forth definition is natural language.
     if !trimmed.starts_with(':') && trimmed.chars().any(|c| !c.is_ascii()) {
         return true;
     }
     // Latin sentence: starts with uppercase letter.
-    if trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+    if trimmed
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+    {
         return true;
     }
     // Contractions ("you're", "don't", "I'm", "it's") and sentence-ending punctuation
@@ -569,7 +660,12 @@ fn looks_like_natural_language(
             return true;
         }
     }
-    let forth_chars = |c: char| matches!(c, '+' | '-' | '*' | '/' | '@' | '!' | '.' | ':' | ';' | '<' | '>' | '=');
+    let forth_chars = |c: char| {
+        matches!(
+            c,
+            '+' | '-' | '*' | '/' | '@' | '!' | '.' | ':' | ';' | '<' | '>' | '='
+        )
+    };
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
 
     // If every token is a *session-defined* word or a number/operator, treat as
@@ -579,9 +675,7 @@ fn looks_like_natural_language(
     let all_tokens_known = !tokens.is_empty()
         && !trimmed.starts_with(':')
         && tokens.iter().all(|t| {
-            t.parse::<f64>().is_ok()
-                || trimmed.chars().any(forth_chars)
-                || session_word(t)
+            t.parse::<f64>().is_ok() || trimmed.chars().any(forth_chars) || session_word(t)
         });
     if all_tokens_known {
         return false;
@@ -610,7 +704,9 @@ fn looks_like_natural_language(
         if word_exists(word) {
             return false;
         }
-        if !is_forth_primitive_word(word) && word.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+        if !is_forth_primitive_word(word)
+            && word.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+        {
             return true;
         }
     }
@@ -631,17 +727,25 @@ async fn fetch_peer_name(addr: &str) -> Option<String> {
         .ok()?;
     let resp = client.get(&url).send().await.ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
-    json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
+    json.get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn extract_channel_forth(msg: &str) -> Option<String> {
-    if !msg.starts_with('[') { return None; }
+    if !msg.starts_with('[') {
+        return None;
+    }
     let close = msg.find(']')?;
     let after_bracket = msg[close + 1..].trim_start_matches(':').trim_start();
     // after_bracket is now "sender: content" — find the ": content" part
     let colon_pos = after_bracket.find(": ")?;
     let content = after_bracket[colon_pos + 2..].trim();
-    if content.starts_with(':') { Some(content.to_string()) } else { None }
+    if content.starts_with(':') {
+        Some(content.to_string())
+    } else {
+        None
+    }
 }
 
 fn extract_scatter_exec_commands(code: &str) -> Vec<String> {
@@ -664,19 +768,37 @@ fn extract_scatter_exec_commands(code: &str) -> Vec<String> {
 // Maps UUID → sender-end of a peer's inbox so callers can attach to an
 // existing peer by name or UUID instead of forking a fresh one.
 
-use std::collections::HashMap as PeerMap;
 use once_cell::sync::Lazy;
+use std::collections::HashMap as PeerMap;
 
-static PEER_REGISTRY: Lazy<tokio::sync::Mutex<PeerMap<Uuid, (String, tokio::sync::broadcast::Sender<crate::session::SessionEvent>)>>> =
-    Lazy::new(|| tokio::sync::Mutex::new(PeerMap::new()));
+static PEER_REGISTRY: Lazy<
+    tokio::sync::Mutex<
+        PeerMap<
+            Uuid,
+            (
+                String,
+                tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
+            ),
+        >,
+    >,
+> = Lazy::new(|| tokio::sync::Mutex::new(PeerMap::new()));
 
 /// Register a newly-forked peer so it can be attached to later.
-async fn register_peer(id: Uuid, name: String, tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>) {
+async fn register_peer(
+    id: Uuid,
+    name: String,
+    tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
+) {
     PEER_REGISTRY.lock().await.insert(id, (name, tx));
 }
 
 /// Look up a peer by name or UUID prefix.  Returns `(id, broadcast_tx)`.
-pub async fn find_peer(needle: &str) -> Option<(Uuid, tokio::sync::broadcast::Sender<crate::session::SessionEvent>)> {
+pub async fn find_peer(
+    needle: &str,
+) -> Option<(
+    Uuid,
+    tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
+)> {
     let reg = PEER_REGISTRY.lock().await;
     // Exact UUID match first
     if let Ok(id) = needle.parse::<Uuid>() {
@@ -732,7 +854,9 @@ async fn run_peer_loop(
                     let _ = inbox_tx.send((id, name.clone(), response));
                 }
             }
-            Ok(SessionEvent::Close) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Ok(SessionEvent::Close) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                break
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Ok(_) => {}
         }
@@ -750,7 +874,10 @@ async fn run_peer_loop(
 async fn boot_peers(
     inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
     attach: Option<&str>,
-) -> (tokio::sync::broadcast::Sender<crate::session::SessionEvent>, Vec<(Uuid, String)>) {
+) -> (
+    tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
+    Vec<(Uuid, String)>,
+) {
     let (bcast_tx, _) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
 
     /// Spawn a fresh peer loop, register it, and return its `(id, name)`.
@@ -758,9 +885,9 @@ async fn boot_peers(
         bcast_tx: &tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
         inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
     ) -> (Uuid, String) {
-        let id   = Uuid::new_v4();
+        let id = Uuid::new_v4();
         let name = format!("peer-{}", &id.to_string()[..8]);
-        let rx   = bcast_tx.subscribe();
+        let rx = bcast_tx.subscribe();
         let (n, i) = (name.clone(), id);
         tokio::spawn(async move { run_peer_loop(i, n, rx, inbox_tx).await });
         register_peer(id, name.clone(), bcast_tx.clone()).await;
@@ -771,14 +898,18 @@ async fn boot_peers(
     let first = if let Some(needle) = attach {
         if let Some((id, existing_tx)) = find_peer(needle).await {
             let mut bridge_rx = existing_tx.subscribe();
-            let bcast_clone   = bcast_tx.clone();
+            let bcast_clone = bcast_tx.clone();
             tokio::spawn(async move {
                 while let Ok(ev) = bridge_rx.recv().await {
                     let _ = bcast_clone.send(ev);
                 }
             });
-            let name = PEER_REGISTRY.lock().await
-                .get(&id).map(|(n, _)| n.clone()).unwrap_or_else(|| id.to_string());
+            let name = PEER_REGISTRY
+                .lock()
+                .await
+                .get(&id)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| id.to_string());
             (id, name)
         } else {
             spawn_fresh(&bcast_tx, inbox_tx.clone()).await
@@ -907,8 +1038,10 @@ impl EventLoop {
         };
 
         // Peer channels — boot_peers() finishes wiring in run() (async context).
-        let (peer_inbox_tx, peer_inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
-        let (peer_tx, peer_session_rx) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
+        let (peer_inbox_tx, peer_inbox_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (peer_tx, peer_session_rx) =
+            tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
         let peer_sessions: Vec<(Uuid, String)> = Vec::new();
         let (peer_inbox_mirror_tx, _) = tokio::sync::broadcast::channel::<(String, String)>(128);
 
@@ -968,9 +1101,7 @@ impl EventLoop {
             pending_daemon_brain_question_options: Vec::new(),
             pending_daemon_brain_plan: false,
             pending_daemon_brain_plan_id: None,
-            current_graph: Arc::new(tokio::sync::Mutex::new(
-                crate::graph::ExecutionGraph::new(),
-            )),
+            current_graph: Arc::new(tokio::sync::Mutex::new(crate::graph::ExecutionGraph::new())),
             stack,
             poset,
             plan_word: None,
@@ -1132,7 +1263,8 @@ impl EventLoop {
 
             // Load user vocabulary extensions on top of the builtins.
             let lib = crate::coforth::Library::load();
-            let mut user_entries: Vec<_> = lib.all_entries()
+            let mut user_entries: Vec<_> = lib
+                .all_entries()
                 .into_iter()
                 .filter(|e| e.forth.is_some())
                 .filter(|e| !builtin.pairs.iter().any(|(w, _)| w == &e.word))
@@ -1184,7 +1316,9 @@ impl EventLoop {
             // Print all vocabulary definitions so both participants know what
             // words are available at the start of every session.
             {
-                use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor, ResetColor};
+                use crossterm::style::{
+                    Attribute, Color, ResetColor, SetAttribute, SetForegroundColor,
+                };
                 use std::fmt::Write as FmtWrite;
 
                 let lib = crate::coforth::Library::load();
@@ -1194,16 +1328,13 @@ impl EventLoop {
                 let mut lines = Vec::new();
                 for entry in &entries {
                     let kind_color = match entry.kind.as_str() {
-                        "task"       => Color::Cyan,
-                        "question"   => Color::Yellow,
+                        "task" => Color::Cyan,
+                        "question" => Color::Yellow,
                         "constraint" => Color::Red,
-                        _            => Color::DarkGrey,
+                        _ => Color::DarkGrey,
                     };
                     let callable_marker = if entry.forth.is_some() {
-                        format!("{}{}{} ",
-                            SetForegroundColor(Color::Green),
-                            "✦",
-                            ResetColor)
+                        format!("{}{}{} ", SetForegroundColor(Color::Green), "✦", ResetColor)
                     } else {
                         "  ".to_string()
                     };
@@ -1244,10 +1375,8 @@ s" between us"      s" we are real"    argue
 s" back and forth"  s" -1 and forth"   argue
 s" it is ours"      s" -1 is ours"     argue
 "#;
-                let argue_out = self.forth_vm.exec(boot_argue)
-                    .unwrap_or_default();
-                let english_out = self.forth_vm.exec("prove-english")
-                    .unwrap_or_default();
+                let argue_out = self.forth_vm.exec(boot_argue).unwrap_or_default();
+                let english_out = self.forth_vm.exec("prove-english").unwrap_or_default();
                 let combined = format!("{}{}", argue_out.trim_start(), english_out.trim_start());
                 let text = combined.trim().to_string();
                 if !text.is_empty() {
@@ -1307,22 +1436,24 @@ s" it is ours"      s" -1 is ours"     argue
             }));
 
             let tui_s = self.tui_renderer.clone();
-            self.forth_vm.set_select_fn(Box::new(move |title: &str, options: &[String]| {
-                let title   = title.to_string();
-                let options = options.to_vec();
-                let tui     = tui_s.clone();
-                futures::executor::block_on(async move {
-                    use crate::cli::tui::{Dialog, DialogOption, DialogResult};
-                    let dialog_opts: Vec<DialogOption> = options.iter()
-                        .map(|o| DialogOption::new(o.as_str()))
-                        .collect();
-                    let dialog = Dialog::select(title, dialog_opts);
-                    match tui.lock().await.show_dialog(dialog) {
-                        Ok(DialogResult::Selected(idx)) => idx as i64,
-                        _ => -1,
-                    }
-                })
-            }));
+            self.forth_vm
+                .set_select_fn(Box::new(move |title: &str, options: &[String]| {
+                    let title = title.to_string();
+                    let options = options.to_vec();
+                    let tui = tui_s.clone();
+                    futures::executor::block_on(async move {
+                        use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+                        let dialog_opts: Vec<DialogOption> = options
+                            .iter()
+                            .map(|o| DialogOption::new(o.as_str()))
+                            .collect();
+                        let dialog = Dialog::select(title, dialog_opts);
+                        match tui.lock().await.show_dialog(dialog) {
+                            Ok(DialogResult::Selected(idx)) => idx as i64,
+                            _ => -1,
+                        }
+                    })
+                }));
         }
 
         // Render interval (33ms ≈ 30fps) — smooth streaming without terminal flicker.
@@ -1786,12 +1917,12 @@ s" it is ours"      s" -1 is ours"     argue
                             Ok(Ok(Some(result))) => {
                                 // Save the new config.
                                 if let Err(e) = crate::cli::setup_wizard::apply_and_save(&result) {
-                                    self.output_manager.write_info(
-                                        format!("Setup saved with error: {e}")
-                                    );
+                                    self.output_manager
+                                        .write_info(format!("Setup saved with error: {e}"));
                                 } else {
                                     self.output_manager.write_info(
-                                        "Settings saved. Restart finch to apply changes.".to_string(),
+                                        "Settings saved. Restart finch to apply changes."
+                                            .to_string(),
                                     );
                                 }
                             }
@@ -1799,9 +1930,8 @@ s" it is ours"      s" -1 is ours"     argue
                                 // User cancelled the wizard.
                             }
                             _ => {
-                                self.output_manager.write_info(
-                                    "Setup wizard exited.".to_string(),
-                                );
+                                self.output_manager
+                                    .write_info("Setup wizard exited.".to_string());
                             }
                         }
                         self.render_tui().await?;
@@ -1896,38 +2026,38 @@ Rules:\n\
                                     );
                                     self.execute_chat_response(task).await?;
                                 } else {
-                                // Single word (or re-plan): full IMCPD plan loop.
-                                let stack_word = if let Some(word) = self.plan_word.clone() {
-                                    Some(word)
-                                } else {
-                                    all_words.into_iter().next().map(|word| {
-                                        self.plan_word = Some(word.clone());
-                                        word
-                                    })
-                                };
-
-                                if let Some(task) = stack_word {
-                                    // Kick off the full IMPCPD plan loop for the popped word.
-                                    self.handle_plan_task(task).await?;
-                                } else {
-                                    // No stack word — plain plan mode entry
-                                    let plan_path = std::env::temp_dir()
-                                        .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
-                                    let new_mode = ReplMode::Planning {
-                                        task: "Manual exploration".to_string(),
-                                        plan_path: plan_path.clone(),
-                                        created_at: chrono::Utc::now(),
+                                    // Single word (or re-plan): full IMCPD plan loop.
+                                    let stack_word = if let Some(word) = self.plan_word.clone() {
+                                        Some(word)
+                                    } else {
+                                        all_words.into_iter().next().map(|word| {
+                                            self.plan_word = Some(word.clone());
+                                            word
+                                        })
                                     };
-                                    *self.mode.write().await = new_mode.clone();
-                                    self.output_manager.write_info(
-                                        "📋 Entered plan mode.\n\
+
+                                    if let Some(task) = stack_word {
+                                        // Kick off the full IMPCPD plan loop for the popped word.
+                                        self.handle_plan_task(task).await?;
+                                    } else {
+                                        // No stack word — plain plan mode entry
+                                        let plan_path = std::env::temp_dir()
+                                            .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+                                        let new_mode = ReplMode::Planning {
+                                            task: "Manual exploration".to_string(),
+                                            plan_path: plan_path.clone(),
+                                            created_at: chrono::Utc::now(),
+                                        };
+                                        *self.mode.write().await = new_mode.clone();
+                                        self.output_manager.write_info(
+                                            "📋 Entered plan mode.\n\
                                          You can explore the codebase using read-only tools:\n\
                                          - Read files, glob, grep, web_fetch are allowed\n\
                                          - Write, edit, bash are restricted\n\
                                          Use /plan to exit plan mode.",
-                                    );
-                                    self.update_plan_mode_indicator(&new_mode);
-                                }
+                                        );
+                                        self.update_plan_mode_indicator(&new_mode);
+                                    }
                                 } // end single-word else branch
                             }
                             ReplMode::Planning { .. } | ReplMode::Executing { .. } => {
@@ -2187,24 +2317,19 @@ Rules:\n\
                     Command::JoinChannel(chan) => {
                         self.joined_channels.insert(chan.clone());
                         self.output_manager.write_user(format!("/join {}", chan));
-                        let ev = crate::session::SessionEvent::chat(
-                            format!("joined {chan}")
-                        );
+                        let ev = crate::session::SessionEvent::chat(format!("joined {chan}"));
                         let _ = self.peer_tx.send(ev);
                     }
                     Command::PartChannel(chan) => {
                         self.joined_channels.remove(&chan);
                         self.output_manager.write_user(format!("/part {}", chan));
-                        let ev = crate::session::SessionEvent::chat(
-                            format!("parted {chan}")
-                        );
+                        let ev = crate::session::SessionEvent::chat(format!("parted {chan}"));
                         let _ = self.peer_tx.send(ev);
                     }
                     Command::SayChannel(chan, msg) => {
-                        self.output_manager.write_user(format!("/say {} {}", chan, msg));
-                        let ev = crate::session::SessionEvent::chat(
-                            format!("{chan}: {msg}")
-                        );
+                        self.output_manager
+                            .write_user(format!("/say {} {}", chan, msg));
+                        let ev = crate::session::SessionEvent::chat(format!("{chan}: {msg}"));
                         let _ = self.peer_tx.send(ev);
                     }
                     Command::Connect(addr) => {
@@ -2302,7 +2427,11 @@ Rules:\n\
         }
 
         // Direct AI query: `?? question` — bypasses the stack and asks the AI.
-        if let Some(query) = input.trim().strip_prefix("?? ").or_else(|| input.trim().strip_prefix("??")) {
+        if let Some(query) = input
+            .trim()
+            .strip_prefix("?? ")
+            .or_else(|| input.trim().strip_prefix("??"))
+        {
             let query = query.trim().to_string();
             if !query.is_empty() {
                 self.output_manager.write_user(input.clone());
@@ -2314,7 +2443,9 @@ Rules:\n\
         let is_nl = looks_like_natural_language(
             &input,
             |w| self.forth_vm.word_exists(w),
-            |w| self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w),
+            |w| {
+                self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w)
+            },
         );
         if is_nl {
             return self.execute_query(input).await;
@@ -2342,7 +2473,12 @@ Rules:\n\
     /// after a user push (where the echo was already written).
     /// `echo` — whether to write the user query to the output buffer.
     /// `chat_only` — suppress tools and brain context (for word-push conversational responses).
-    async fn execute_query_inner(&mut self, input: String, echo: bool, chat_only: bool) -> Result<()> {
+    async fn execute_query_inner(
+        &mut self,
+        input: String,
+        echo: bool,
+        chat_only: bool,
+    ) -> Result<()> {
         // Drain any pending images from TUI (pasted before sending)
         let pending_images: Vec<(String, String)> = {
             let mut tui = self.tui_renderer.lock().await;
@@ -2412,9 +2548,9 @@ Rules:\n\
                 .ok()
                 .and_then(|r| {
                     tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(r.json::<serde_json::Value>())
-                    }).ok()
+                        tokio::runtime::Handle::current().block_on(r.json::<serde_json::Value>())
+                    })
+                    .ok()
                 })
                 .and_then(|v| v["context"].as_str().map(|s| s.to_owned()))
                 .filter(|s| !s.trim().is_empty());
@@ -2433,7 +2569,8 @@ Rules:\n\
 
             if lib_count > 0 || stack_count > 0 {
                 // Sample up to 12 library words alphabetically for flavour
-                let sample: Vec<String> = lib.word_list()
+                let sample: Vec<String> = lib
+                    .word_list()
                     .into_iter()
                     .take(12)
                     .map(|w| w.to_string())
@@ -2445,7 +2582,10 @@ Rules:\n\
                 };
 
                 let stack_note = if stack_count > 0 {
-                    format!(" The active program has {} items on the stack.", stack_count)
+                    format!(
+                        " The active program has {} items on the stack.",
+                        stack_count
+                    )
                 } else {
                     String::new()
                 };
@@ -2560,7 +2700,8 @@ Rules:\n\
             Ok(rx) => rx,
             Err(e) => {
                 msg.set_failed();
-                self.output_manager.write_error(format!("Local query failed: {}", e));
+                self.output_manager
+                    .write_error(format!("Local query failed: {}", e));
                 return self.render_tui().await;
             }
         };
@@ -2764,7 +2905,9 @@ Rules:\n\
         if !query.is_empty() {
             let mut g = self.current_graph.lock().await;
             g.reset(query_id, &self.session_label);
-            g.add_node(crate::graph::NodeKind::UserInput { text: query.clone() });
+            g.add_node(crate::graph::NodeKind::UserInput {
+                text: query.clone(),
+            });
         }
 
         let event_tx = self.event_tx.clone();
@@ -2833,7 +2976,9 @@ Rules:\n\
         if !query.is_empty() {
             let mut g = self.current_graph.lock().await;
             g.reset(query_id, &self.session_label);
-            g.add_node(crate::graph::NodeKind::UserInput { text: query.clone() });
+            g.add_node(crate::graph::NodeKind::UserInput {
+                text: query.clone(),
+            });
         }
 
         let event_tx = self.event_tx.clone();
@@ -2893,7 +3038,6 @@ Rules:\n\
             .await;
         });
     }
-
 
     /// Handle an event from the event channel
     async fn handle_event(&mut self, event: ReplEvent) -> Result<()> {
@@ -2978,9 +3122,7 @@ Rules:\n\
                 query_id,
                 full_response,
             } => {
-                tracing::debug!(
-                    "[EVENT_LOOP] Handling StreamingComplete event"
-                );
+                tracing::debug!("[EVENT_LOOP] Handling StreamingComplete event");
 
                 // Check if this query is executing tools
                 // If so, the assistant message was already added with ToolUse blocks
@@ -2989,8 +3131,7 @@ Rules:\n\
                     .get_metadata(query_id)
                     .await
                     .map(|m| m.state.clone());
-                let is_executing_tools =
-                    matches!(state, Some(QueryState::ExecutingTools { .. }));
+                let is_executing_tools = matches!(state, Some(QueryState::ExecutingTools { .. }));
                 // The streaming path adds the assistant message and sets Completed before
                 // sending StreamingComplete. The non-streaming path does not — it relies on
                 // this handler to do both. Detect which case we are in.
@@ -3040,10 +3181,7 @@ Rules:\n\
 
                 // Record final response + save execution graph
                 if !is_executing_tools {
-                    let preview = full_response
-                        .chars()
-                        .take(300)
-                        .collect::<String>();
+                    let preview = full_response.chars().take(300).collect::<String>();
                     let mut g = self.current_graph.lock().await;
                     g.add_node(crate::graph::NodeKind::FinalResponse { preview });
                     if let Err(e) = g.save() {
@@ -3066,13 +3204,14 @@ Rules:\n\
                 latency_ms,
             } => {
                 // Record LLM invocation in execution graph
-                self.current_graph.lock().await.add_node(
-                    crate::graph::NodeKind::LlmCall {
+                self.current_graph
+                    .lock()
+                    .await
+                    .add_node(crate::graph::NodeKind::LlmCall {
                         model: model.clone(),
                         input_tokens,
                         output_tokens,
-                    },
-                );
+                    });
                 // Update status bar with live stats
                 self.status_bar
                     .update_live_stats(model, input_tokens, output_tokens, latency_ms);
@@ -3189,10 +3328,17 @@ Rules:\n\
                 }
                 if !added.is_empty() {
                     use crossterm::style::Stylize;
-                    let lines: Vec<String> = added.iter().map(|n| {
-                        let display = if n.is_empty() { "someone".to_string() } else { n.clone() };
-                        format!("  {} is here", display.as_str().cyan().bold())
-                    }).collect();
+                    let lines: Vec<String> = added
+                        .iter()
+                        .map(|n| {
+                            let display = if n.is_empty() {
+                                "someone".to_string()
+                            } else {
+                                n.clone()
+                            };
+                            format!("  {} is here", display.as_str().cyan().bold())
+                        })
+                        .collect();
                     self.output_manager.write_info(lines.join("\n"));
                     self.render_tui().await?;
                 }
@@ -3200,7 +3346,8 @@ Rules:\n\
             ReplEvent::PeerMessage { text } => {
                 use crossterm::style::Stylize;
                 // text is already "peer-XXXXXXXX: result" from the select! branch
-                self.output_manager.write_info(text.as_str().cyan().to_string());
+                self.output_manager
+                    .write_info(text.as_str().cyan().to_string());
                 self.render_tui().await?;
             }
 
@@ -3214,8 +3361,13 @@ Rules:\n\
                 if new_count > 0 {
                     use crossterm::style::Stylize;
                     self.output_manager.write_info(
-                        format!("  {} word{} synced from another session", new_count, if new_count == 1 { "" } else { "s" })
-                            .dark_grey().to_string()
+                        format!(
+                            "  {} word{} synced from another session",
+                            new_count,
+                            if new_count == 1 { "" } else { "s" }
+                        )
+                        .dark_grey()
+                        .to_string(),
                     );
                     self.render_tui().await?;
                 }
@@ -3279,7 +3431,8 @@ Rules:\n\
 
         // Optional description
         if let Some(desc) = description {
-            self.output_manager.write_info(format!("  \"{}\"", desc.dark_grey()));
+            self.output_manager
+                .write_info(format!("  \"{}\"", desc.dark_grey()));
         }
 
         // Action hints
@@ -3298,9 +3451,8 @@ Rules:\n\
             let d = self.diff_store.resolve_pending(prefix.as_deref());
             match d {
                 None => {
-                    self.output_manager.write_info(
-                        "no pending diff to accept".dark_grey().to_string()
-                    );
+                    self.output_manager
+                        .write_info("no pending diff to accept".dark_grey().to_string());
                     return self.render_tui().await;
                 }
                 Some(d) => d.id,
@@ -3312,7 +3464,8 @@ Rules:\n\
             if let Some(d) = self.diff_store.accept(diff_id) {
                 (d.label.clone(), d.patch.clone())
             } else {
-                self.output_manager.write_info("diff not found".dark_grey().to_string());
+                self.output_manager
+                    .write_info("diff not found".dark_grey().to_string());
                 return self.render_tui().await;
             }
         };
@@ -3339,7 +3492,9 @@ Rules:\n\
         }
 
         // Broadcast DiffAccept so the proposing peer knows
-        let _ = self.peer_tx.send(crate::session::SessionEvent::diff_accept(diff_id));
+        let _ = self
+            .peer_tx
+            .send(crate::session::SessionEvent::diff_accept(diff_id));
         self.render_tui().await
     }
 
@@ -3363,7 +3518,11 @@ Rules:\n\
                 let s = s.strip_prefix("b/").unwrap_or(s);
                 // Strip timestamp suffix (a tab followed by date)
                 let s = s.split('\t').next().unwrap_or(s);
-                if s == "/dev/null" { None } else { Some(s.to_string()) }
+                if s == "/dev/null" {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
             })
             .unwrap_or_else(|| label.to_string());
 
@@ -3403,9 +3562,8 @@ Rules:\n\
             let d = self.diff_store.resolve_pending(None);
             match d {
                 None => {
-                    self.output_manager.write_info(
-                        "no pending diff to reject".dark_grey().to_string()
-                    );
+                    self.output_manager
+                        .write_info("no pending diff to reject".dark_grey().to_string());
                     return self.render_tui().await;
                 }
                 Some(d) => d.id,
@@ -3418,11 +3576,17 @@ Rules:\n\
             "{}  diff {} rejected{}",
             "✗".red(),
             &diff_id.to_string()[..8].white(),
-            if reason_str.is_empty() { String::new() } else { format!(": {}", reason_str) },
+            if reason_str.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", reason_str)
+            },
         ));
 
         // Broadcast DiffReject so the proposing peer knows
-        let _ = self.peer_tx.send(crate::session::SessionEvent::diff_reject(diff_id, reason));
+        let _ = self
+            .peer_tx
+            .send(crate::session::SessionEvent::diff_reject(diff_id, reason));
         self.render_tui().await
     }
 
@@ -3431,9 +3595,11 @@ Rules:\n\
         use crossterm::style::Stylize;
         let peers = &self.forth_vm.peers;
         if peers.is_empty() {
-            self.output_manager.write_info(
-                format!("{}  no peers found yet — run {} to scan", "machines:".dark_grey(), "/discover".cyan())
-            );
+            self.output_manager.write_info(format!(
+                "{}  no peers found yet — run {} to scan",
+                "machines:".dark_grey(),
+                "/discover".cyan()
+            ));
         } else {
             let mut lines = vec![format!("{}", "machines:".dark_grey())];
             for addr in peers {
@@ -3447,9 +3613,8 @@ Rules:\n\
     /// `/discover` — run a fresh mDNS scan for peers on the LAN.
     async fn handle_discover(&mut self) -> Result<()> {
         use crossterm::style::Stylize;
-        self.output_manager.write_info(
-            format!("{}", "scanning LAN for Finch peers…".dark_grey())
-        );
+        self.output_manager
+            .write_info(format!("{}", "scanning LAN for Finch peers…".dark_grey()));
         self.render_tui().await.ok();
 
         let event_tx = self.event_tx.clone();
@@ -3523,7 +3688,10 @@ Rules:\n\
 
         tokio::spawn(async move {
             match crate::session::transport::connect(&ws_url).await {
-                Ok(crate::session::SessionBus { tx: ws_tx, rx: mut ws_rx }) => {
+                Ok(crate::session::SessionBus {
+                    tx: ws_tx,
+                    rx: mut ws_rx,
+                }) => {
                     tracing::info!("auto-joined remote peer {addr}");
 
                     let inbox = peer_inbox_tx.clone();
@@ -3533,7 +3701,8 @@ Rules:\n\
                             if let crate::session::SessionEvent::Chat { text } = ev {
                                 if !text.is_empty() {
                                     let id = uuid::Uuid::new_v4();
-                                    let name = format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
+                                    let name =
+                                        format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
                                     let _ = inbox.send((id, name, text));
                                 }
                             }
@@ -3603,7 +3772,10 @@ Rules:\n\
 
             tokio::spawn(async move {
                 match crate::session::transport::connect(&ws_url).await {
-                    Ok(crate::session::SessionBus { tx: ws_tx, rx: mut ws_rx }) => {
+                    Ok(crate::session::SessionBus {
+                        tx: ws_tx,
+                        rx: mut ws_rx,
+                    }) => {
                         tracing::info!("joined remote peer {addr}");
 
                         // Remote → local inbox: their peer loop responses appear as our peers.
@@ -3615,7 +3787,8 @@ Rules:\n\
                                 if let crate::session::SessionEvent::Chat { text } = ev {
                                     if !text.is_empty() {
                                         let id = uuid::Uuid::new_v4();
-                                        let name = format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
+                                        let name =
+                                            format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
                                         let _ = inbox.send((id, name, text));
                                     }
                                 }
@@ -3626,9 +3799,8 @@ Rules:\n\
                         let ws_tx3 = ws_tx.clone();
                         tokio::spawn(async move {
                             while let Ok((name, text)) = mirror_rx.recv().await {
-                                let ev = crate::session::SessionEvent::chat(
-                                    format!("{name}: {text}")
-                                );
+                                let ev =
+                                    crate::session::SessionEvent::chat(format!("{name}: {text}"));
                                 if ws_tx3.send(ev).await.is_err() {
                                     break;
                                 }
@@ -3672,9 +3844,11 @@ Rules:\n\
                     interval.tick().await;
 
                     // Drain messages from remote peers that connected TO our daemon.
-                    if let Ok(resp) = http.get(&drain_url)
+                    if let Ok(resp) = http
+                        .get(&drain_url)
                         .timeout(std::time::Duration::from_secs(1))
-                        .send().await
+                        .send()
+                        .await
                     {
                         if let Ok(msgs) = resp.json::<Vec<(String, String)>>().await {
                             for (from, text) in msgs {
@@ -3685,9 +3859,11 @@ Rules:\n\
                     }
 
                     // Check for newly announced peers; connect back symmetrically.
-                    if let Ok(resp) = http.get(&announced_url)
+                    if let Ok(resp) = http
+                        .get(&announced_url)
                         .timeout(std::time::Duration::from_secs(1))
-                        .send().await
+                        .send()
+                        .await
                     {
                         if let Ok(addrs) = resp.json::<Vec<String>>().await {
                             for addr in addrs {
@@ -3716,10 +3892,15 @@ Rules:\n\
                                         let ws_tx2 = ws_tx.clone();
                                         tokio::spawn(async move {
                                             while let Some(ev) = ws_rx.recv().await {
-                                                if let crate::session::SessionEvent::Chat { text } = ev {
+                                                if let crate::session::SessionEvent::Chat { text } =
+                                                    ev
+                                                {
                                                     if !text.is_empty() {
                                                         let id = uuid::Uuid::new_v4();
-                                                        let name = format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
+                                                        let name = format!(
+                                                            "peer@{}",
+                                                            a2.split(':').next().unwrap_or(&a2)
+                                                        );
                                                         let _ = pib2.send((id, name, text));
                                                     }
                                                 }
@@ -3731,7 +3912,7 @@ Rules:\n\
                                         tokio::spawn(async move {
                                             while let Ok((name, text)) = mirror_rx2.recv().await {
                                                 let ev = crate::session::SessionEvent::chat(
-                                                    format!("{name}: {text}")
+                                                    format!("{name}: {text}"),
                                                 );
                                                 if ws_tx3.send(ev).await.is_err() {
                                                     break;
@@ -3763,10 +3944,12 @@ Rules:\n\
                 while let Ok(ev) = bcast_rx.recv().await {
                     if let crate::session::SessionEvent::Chat { ref text } = ev {
                         let body = serde_json::json!({ "text": text });
-                        let _ = http.post(&bcast_url)
+                        let _ = http
+                            .post(&bcast_url)
                             .json(&body)
                             .timeout(std::time::Duration::from_millis(500))
-                            .send().await;
+                            .send()
+                            .await;
                     }
                 }
             });
@@ -3777,11 +3960,16 @@ Rules:\n\
     async fn handle_disconnect(&mut self, name: String) -> Result<()> {
         use crossterm::style::Stylize;
         // Resolve by label first, then by addr substring
-        let addr = self.forth_vm.peer_meta.iter()
+        let addr = self
+            .forth_vm
+            .peer_meta
+            .iter()
             .find(|(_, meta)| meta.label.as_deref() == Some(name.as_str()))
             .map(|(a, _)| a.clone())
             .or_else(|| {
-                self.forth_vm.peers.iter()
+                self.forth_vm
+                    .peers
+                    .iter()
                     .find(|a| a.contains(name.as_str()))
                     .cloned()
             });
@@ -3799,9 +3987,8 @@ Rules:\n\
                 "disconnected".dark_grey()
             ));
         } else {
-            self.output_manager.write_info(format!(
-                "  {} not found", name.as_str().dark_grey()
-            ));
+            self.output_manager
+                .write_info(format!("  {} not found", name.as_str().dark_grey()));
         }
         self.render_tui().await
     }
@@ -3812,9 +3999,8 @@ Rules:\n\
         if let Some(id) = uuid {
             self.forth_vm.rooms.entry(id.clone()).or_default();
             self.forth_vm.current_room = Some(id.clone());
-            self.output_manager.write_info(format!(
-                "  room  {}", id.as_str().cyan()
-            ));
+            self.output_manager
+                .write_info(format!("  room  {}", id.as_str().cyan()));
         } else if let Some(ref id) = self.forth_vm.current_room.clone() {
             let room = &self.forth_vm.rooms[id];
             self.output_manager.write_info(format!(
@@ -3825,7 +4011,9 @@ Rules:\n\
             ));
         } else {
             self.output_manager.write_info(
-                "  no current room — use /room new or /room <uuid>".dark_grey().to_string()
+                "  no current room — use /room new or /room <uuid>"
+                    .dark_grey()
+                    .to_string(),
             );
         }
         self.render_tui().await
@@ -3837,9 +4025,8 @@ Rules:\n\
         let id = uuid::Uuid::new_v4().to_string();
         self.forth_vm.rooms.entry(id.clone()).or_default();
         self.forth_vm.current_room = Some(id.clone());
-        self.output_manager.write_info(format!(
-            "  room  {}  (new)", id.as_str().cyan()
-        ));
+        self.output_manager
+            .write_info(format!("  room  {}  (new)", id.as_str().cyan()));
         self.render_tui().await
     }
 
@@ -3856,11 +4043,20 @@ Rules:\n\
                 room.members.push(addr.clone());
             }
             self.output_manager.write_info(format!(
-                "  +{}  in room {}", addr.as_str().cyan(), room_id.chars().take(8).collect::<String>().as_str().dark_grey()
+                "  +{}  in room {}",
+                addr.as_str().cyan(),
+                room_id
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+                    .as_str()
+                    .dark_grey()
             ));
         } else {
             self.output_manager.write_info(
-                "  no current room — use /room new first".dark_grey().to_string()
+                "  no current room — use /room new first"
+                    .dark_grey()
+                    .to_string(),
             );
         }
         self.render_tui().await
@@ -3869,19 +4065,27 @@ Rules:\n\
     /// `/room remove <name-or-addr>` — remove a peer from the current room.
     async fn handle_room_remove(&mut self, name: String) -> Result<()> {
         use crossterm::style::Stylize;
-        let addr = self.forth_vm.peer_meta.iter()
+        let addr = self
+            .forth_vm
+            .peer_meta
+            .iter()
             .find(|(_, m)| m.label.as_deref() == Some(name.as_str()))
             .map(|(a, _)| a.clone())
-            .or_else(|| self.forth_vm.peers.iter().find(|a| a.contains(name.as_str())).cloned())
+            .or_else(|| {
+                self.forth_vm
+                    .peers
+                    .iter()
+                    .find(|a| a.contains(name.as_str()))
+                    .cloned()
+            })
             .unwrap_or_else(|| name.clone());
         if let Some(ref room_id) = self.forth_vm.current_room.clone() {
             if let Some(room) = self.forth_vm.rooms.get_mut(room_id) {
                 room.members.retain(|m| m != &addr);
             }
         }
-        self.output_manager.write_info(format!(
-            "  -{}", addr.as_str().dark_grey()
-        ));
+        self.output_manager
+            .write_info(format!("  -{}", addr.as_str().dark_grey()));
         self.render_tui().await
     }
 
@@ -3890,31 +4094,48 @@ Rules:\n\
         use crossterm::style::Stylize;
         if self.forth_vm.rooms.is_empty() {
             self.output_manager.write_info(
-                "  no rooms — use /room new to create one".dark_grey().to_string()
+                "  no rooms — use /room new to create one"
+                    .dark_grey()
+                    .to_string(),
             );
         } else {
             let current = self.forth_vm.current_room.clone();
             let mut ids: Vec<_> = self.forth_vm.rooms.keys().cloned().collect();
             ids.sort();
-            let lines: Vec<String> = ids.iter().map(|id| {
-                let room = &self.forth_vm.rooms[id];
-                let marker = if Some(id) == current.as_ref() { "▶" } else { " " };
-                let members: Vec<String> = room.members.iter().map(|addr| {
-                    self.forth_vm.peer_meta.get(addr)
-                        .and_then(|m| m.label.clone())
-                        .unwrap_or_else(|| addr.clone())
-                }).collect();
-                format!(
-                    "  {} {}  {} members  {} keys{}",
-                    marker.cyan(),
-                    id.chars().take(8).collect::<String>().as_str().dark_grey(),
-                    room.members.len(),
-                    room.hash.len(),
-                    if members.is_empty() { String::new() } else {
-                        format!("  ({})", members.join(", ").as_str().white())
-                    },
-                )
-            }).collect();
+            let lines: Vec<String> = ids
+                .iter()
+                .map(|id| {
+                    let room = &self.forth_vm.rooms[id];
+                    let marker = if Some(id) == current.as_ref() {
+                        "▶"
+                    } else {
+                        " "
+                    };
+                    let members: Vec<String> = room
+                        .members
+                        .iter()
+                        .map(|addr| {
+                            self.forth_vm
+                                .peer_meta
+                                .get(addr)
+                                .and_then(|m| m.label.clone())
+                                .unwrap_or_else(|| addr.clone())
+                        })
+                        .collect();
+                    format!(
+                        "  {} {}  {} members  {} keys{}",
+                        marker.cyan(),
+                        id.chars().take(8).collect::<String>().as_str().dark_grey(),
+                        room.members.len(),
+                        room.hash.len(),
+                        if members.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  ({})", members.join(", ").as_str().white())
+                        },
+                    )
+                })
+                .collect();
             self.output_manager.write_info(lines.join("\n"));
         }
         self.render_tui().await
@@ -4009,7 +4230,11 @@ Rules:\n\
         {
             let input_preview = {
                 let s = tool_input.to_string();
-                if s.len() > 120 { s[..120].to_string() } else { s }
+                if s.len() > 120 {
+                    s[..120].to_string()
+                } else {
+                    s
+                }
             };
             let (output_preview, is_error) = match &result {
                 Ok(c) => {
@@ -4018,14 +4243,15 @@ Rules:\n\
                 }
                 Err(e) => (e.to_string().chars().take(200).collect(), true),
             };
-            self.current_graph.lock().await.add_node(
-                crate::graph::NodeKind::ToolExecution {
+            self.current_graph
+                .lock()
+                .await
+                .add_node(crate::graph::NodeKind::ToolExecution {
                     name: tool_name.clone(),
                     input_preview,
                     output_preview,
                     is_error,
-                },
-            );
+                });
         }
 
         // Check if tool execution changed the mode (e.g., EnterPlanMode, PresentPlan)
@@ -4184,7 +4410,8 @@ Rules:\n\
     /// Push a word onto the Co-Forth stack and respond conversationally.
     async fn handle_stack_push(&mut self, text: String) -> Result<()> {
         // Strip trailing noise characters (backslash, punctuation typos) from the push.
-        let text = text.trim_end_matches(|c: char| c == '\\' || c == '/' || c == ',' || c == '.')
+        let text = text
+            .trim_end_matches(|c: char| c == '\\' || c == '/' || c == ',' || c == '.')
             .trim()
             .to_string();
         if text.is_empty() {
@@ -4231,7 +4458,8 @@ Rules:\n\
                 let p = self.poset.lock().await;
                 p.nodes.last().map(|n| n.id)
             };
-            self.spawn_coforth_precompile(text.clone(), trigger_id).await;
+            self.spawn_coforth_precompile(text.clone(), trigger_id)
+                .await;
         }
 
         // Try the VM first — boot JIT compiled all vocab words so known words run immediately.
@@ -4239,7 +4467,9 @@ Rules:\n\
         let is_nl = looks_like_natural_language(
             &text,
             |w| self.forth_vm.word_exists(w),
-            |w| self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w),
+            |w| {
+                self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w)
+            },
         );
         let vm_result = self.forth_vm.exec(&text);
         // Check for unknown words first, regardless of whether there was other output.
@@ -4291,10 +4521,9 @@ Rules:\n\
                         // Erase the broken recursive definition.
                         let _ = self.forth_vm.exec(&format!("forget {word}"));
                         // Re-route: ask AI to provide a good definition.
-                        return self.handle_define_unknown_words(
-                            vec![word.to_string()],
-                            text.clone(),
-                        ).await;
+                        return self
+                            .handle_define_unknown_words(vec![word.to_string()], text.clone())
+                            .await;
                     }
                 }
 
@@ -4322,11 +4551,17 @@ Rules:\n\
         // If it's code or an instruction → respond with Forth.
         // If it's a question, complaint, or comment → respond in plain English, in character.
         let auto_names = &self.auto_compiled_word_names;
-        let user_vocab: String = self.forth_vm.dump_source()
+        let user_vocab: String = self
+            .forth_vm
+            .dump_source()
             .lines()
             .filter(|line| {
-                let name = line.trim_start_matches(':').trim()
-                    .split_whitespace().next().unwrap_or("");
+                let name = line
+                    .trim_start_matches(':')
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
                 !auto_names.contains(name)
             })
             .collect::<Vec<_>>()
@@ -4377,7 +4612,9 @@ Rules:\n\
         );
         let messages = vec![crate::claude::Message {
             role: "user".to_string(),
-            content: vec![crate::claude::ContentBlock::Text { text: initial_prompt }],
+            content: vec![crate::claude::ContentBlock::Text {
+                text: initial_prompt,
+            }],
         }];
 
         use crossterm::style::Stylize;
@@ -4412,9 +4649,11 @@ Rules:\n\
                 no_forth_def && has_prose_end
             };
             if looks_like_english {
-                self.output_manager.write_info(
-                    format!("{}  {}", "←".dark_grey(), forth_code.as_str().white())
-                );
+                self.output_manager.write_info(format!(
+                    "{}  {}",
+                    "←".dark_grey(),
+                    forth_code.as_str().white()
+                ));
                 return self.render_tui().await;
             }
 
@@ -4431,9 +4670,15 @@ Rules:\n\
     /// If it contains Forth definitions, compile them. Otherwise just show it.
     async fn handle_foreign_code(&mut self, lang: String, code: String) -> Result<()> {
         use crossterm::style::Stylize;
-        let lang_display = if lang.is_empty() { "code".to_string() } else { lang.clone() };
+        let lang_display = if lang.is_empty() {
+            "code".to_string()
+        } else {
+            lang.clone()
+        };
         self.output_manager.write_info(
-            format!("← {} received.", lang_display).dark_grey().to_string()
+            format!("← {} received.", lang_display)
+                .dark_grey()
+                .to_string(),
         );
 
         let prompt = format!(
@@ -4444,16 +4689,27 @@ Rules:\n\
              - A Forth translation (`: word ... ;`) if that captures it cleanly\n\
              - Both — improved code plus a Forth word that wraps it\n\
              Show the machine. One line saying what changed. Nothing else.",
-            if lang.is_empty() { "code".to_string() } else { lang.clone() },
-            lang, code,
+            if lang.is_empty() {
+                "code".to_string()
+            } else {
+                lang.clone()
+            },
+            lang,
+            code,
         );
 
         let response = {
             let gen = self.cloud_gen.read().await;
-            match gen.generate(vec![crate::claude::Message {
-                role: "user".to_string(),
-                content: vec![crate::claude::ContentBlock::Text { text: prompt }],
-            }], None).await {
+            match gen
+                .generate(
+                    vec![crate::claude::Message {
+                        role: "user".to_string(),
+                        content: vec![crate::claude::ContentBlock::Text { text: prompt }],
+                    }],
+                    None,
+                )
+                .await
+            {
                 Ok(r) => r.text,
                 Err(e) => return Err(e),
             }
@@ -4463,23 +4719,20 @@ Rules:\n\
         let has_forth = response.contains(": ") && response.contains(" ;");
         if has_forth {
             // Extract and compile any Forth definitions; show the rest as prose.
-            let (forth_parts, prose_parts): (Vec<&str>, Vec<&str>) = response
-                .lines()
-                .partition(|line| {
+            let (forth_parts, prose_parts): (Vec<&str>, Vec<&str>) =
+                response.lines().partition(|line| {
                     let t = line.trim();
-                    t.starts_with(':') || t.starts_with("prove-all") || t.starts_with('\\'  )
+                    t.starts_with(':') || t.starts_with("prove-all") || t.starts_with('\\')
                 });
             let prose = prose_parts.join("\n").trim().to_string();
             let forth = forth_parts.join("\n").trim().to_string();
             if !prose.is_empty() {
-                self.output_manager.write_info(
-                    format!("→  {}", prose.as_str().white())
-                );
+                self.output_manager
+                    .write_info(format!("→  {}", prose.as_str().white()));
             }
             if !forth.is_empty() {
-                self.output_manager.write_info(
-                    format!("→  {}", forth.as_str().cyan())
-                );
+                self.output_manager
+                    .write_info(format!("→  {}", forth.as_str().cyan()));
                 self.handle_forth_eval_inner(forth, false).await?;
             }
         } else {
@@ -4490,9 +4743,8 @@ Rules:\n\
                 .trim_end_matches("```")
                 .trim()
                 .to_string();
-            self.output_manager.write_info(
-                format!("→  {}", cleaned.as_str().cyan())
-            );
+            self.output_manager
+                .write_info(format!("→  {}", cleaned.as_str().cyan()));
         }
 
         self.render_tui().await
@@ -4502,17 +4754,12 @@ Rules:\n\
         use crossterm::style::Stylize;
         let peers = self.forth_vm.peers.clone();
         if peers.is_empty() {
-            self.output_manager.write_info(
-                "push: no peers".dark_grey().to_string()
-            );
+            self.output_manager
+                .write_info("push: no peers".dark_grey().to_string());
             return self.render_tui().await;
         }
         let from = self.forth_vm.registry_addr.clone();
-        crate::coforth::scatter::scatter_push(
-            &peers,
-            &msg,
-            from.as_deref(),
-        ).await;
+        crate::coforth::scatter::scatter_push(&peers, &msg, from.as_deref()).await;
         self.render_tui().await
     }
 
@@ -4532,7 +4779,8 @@ Rules:\n\
         // Recent context is more relevant for suggesting what comes next.
         let vocab: Vec<String> = {
             let p = poset.lock().await;
-            p.nodes.iter()
+            p.nodes
+                .iter()
                 .rev()
                 .take(20)
                 .rev()
@@ -4570,11 +4818,16 @@ Rules:\n\
                 content: vec![crate::claude::ContentBlock::Text { text: prompt }],
             }];
 
-            let Ok(response) = generator.generate(messages, None).await else { return };
+            let Ok(response) = generator.generate(messages, None).await else {
+                return;
+            };
 
             // Parse "WORD: <label> | FORTH: <code>" lines from the response.
             // Falls back to plain "WORD: <label>" if no Forth code provided.
-            struct ParsedWord { label: String, forth: Option<String> }
+            struct ParsedWord {
+                label: String,
+                forth: Option<String>,
+            }
             let mut items: Vec<ParsedWord> = Vec::new();
 
             for line in response.text.lines() {
@@ -4582,13 +4835,18 @@ Rules:\n\
                 if let Some(rest) = line.strip_prefix("WORD:") {
                     if let Some((label_part, forth_part)) = rest.split_once('|') {
                         let label = label_part.trim().to_string();
-                        let forth = forth_part.strip_prefix("FORTH:")
+                        let forth = forth_part
+                            .strip_prefix("FORTH:")
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty());
-                        if !label.is_empty() { items.push(ParsedWord { label, forth }); }
+                        if !label.is_empty() {
+                            items.push(ParsedWord { label, forth });
+                        }
                     } else {
                         let label = rest.trim().to_string();
-                        if !label.is_empty() { items.push(ParsedWord { label, forth: None }); }
+                        if !label.is_empty() {
+                            items.push(ParsedWord { label, forth: None });
+                        }
                     }
                 }
             }
@@ -4657,7 +4915,8 @@ Rules:\n\
         if ok {
             self.output_manager.write_info(format!("W{a} → W{b}"));
         } else {
-            self.output_manager.write_info(format!("W{a} or W{b} not found"));
+            self.output_manager
+                .write_info(format!("W{a} or W{b} not found"));
         }
         self.render_tui().await
     }
@@ -4672,9 +4931,9 @@ Rules:\n\
             while let Some(cur) = frontier.pop() {
                 for &(pred, succ) in &p.edges {
                     if pred == cur && !to_remove.contains(&succ) {
-                        if p.nodes.iter().any(|n| n.id == succ
-                            && matches!(n.author, crate::poset::NodeAuthor::Ai))
-                        {
+                        if p.nodes.iter().any(|n| {
+                            n.id == succ && matches!(n.author, crate::poset::NodeAuthor::Ai)
+                        }) {
                             to_remove.insert(succ);
                             frontier.push(succ);
                         }
@@ -4682,12 +4941,15 @@ Rules:\n\
                 }
             }
             let count = to_remove.len();
-            let removed_labels: std::collections::HashSet<String> = p.nodes.iter()
+            let removed_labels: std::collections::HashSet<String> = p
+                .nodes
+                .iter()
                 .filter(|n| to_remove.contains(&n.id))
                 .map(|n| n.label.clone())
                 .collect();
             p.nodes.retain(|n| !to_remove.contains(&n.id));
-            p.edges.retain(|&(a, b)| !to_remove.contains(&a) && !to_remove.contains(&b));
+            p.edges
+                .retain(|&(a, b)| !to_remove.contains(&a) && !to_remove.contains(&b));
             drop(p);
             let mut s = self.stack.lock().await;
             s.retain(|item| !removed_labels.contains(item));
@@ -4717,7 +4979,8 @@ Rules:\n\
         };
         if let Some((new_id, label)) = result {
             self.stack.lock().await.push(label.clone());
-            self.output_manager.write_info(format!("W{id} → W{new_id}  \"{label}\""));
+            self.output_manager
+                .write_info(format!("W{id} → W{new_id}  \"{label}\""));
         } else {
             self.output_manager.write_info(format!("W{id} not found"));
         }
@@ -4741,9 +5004,11 @@ Rules:\n\
             }
         };
         if ok {
-            self.output_manager.write_info(format!("swapped W{a} ↔ W{b}"));
+            self.output_manager
+                .write_info(format!("swapped W{a} ↔ W{b}"));
         } else {
-            self.output_manager.write_info(format!("W{a} or W{b} not found"));
+            self.output_manager
+                .write_info(format!("W{a} or W{b} not found"));
         }
         self.render_tui().await
     }
@@ -4767,7 +5032,8 @@ Rules:\n\
         // FIREBALL — clears conversation context immediately, like /clear
         if code.trim() == "FIREBALL" {
             self.conversation.write().await.clear();
-            self.output_manager.write_info("🔥 Context cleared.".to_string());
+            self.output_manager
+                .write_info("🔥 Context cleared.".to_string());
             return self.render_tui().await;
         }
 
@@ -4776,8 +5042,8 @@ Rules:\n\
             let trimmed = code.trim();
             if trimmed == "PLAN" {
                 // Toggle plan mode, same as /plan with no args — enter planning with no task
-                let plan_path = std::env::temp_dir()
-                    .join(format!("plan_{}.md", uuid::Uuid::new_v4()));
+                let plan_path =
+                    std::env::temp_dir().join(format!("plan_{}.md", uuid::Uuid::new_v4()));
                 let new_mode = crate::cli::ReplMode::Planning {
                     task: "Manual exploration".to_string(),
                     plan_path: plan_path.clone(),
@@ -4785,7 +5051,8 @@ Rules:\n\
                 };
                 *self.mode.write().await = new_mode.clone();
                 self.update_plan_mode_indicator(&new_mode);
-                self.output_manager.write_info("⏸ Plan mode on. Describe your goal.".to_string());
+                self.output_manager
+                    .write_info("⏸ Plan mode on. Describe your goal.".to_string());
                 return self.render_tui().await;
             }
             if let Some(task) = trimmed.strip_prefix("PLAN ") {
@@ -4815,9 +5082,8 @@ Rules:\n\
             match result {
                 Ok(crate::cli::tui::DialogResult::Confirmed(true)) => {}
                 _ => {
-                    self.output_manager.write_info(
-                        "remote exec: cancelled".dark_grey().to_string()
-                    );
+                    self.output_manager
+                        .write_info("remote exec: cancelled".dark_grey().to_string());
                     return self.render_tui().await;
                 }
             }
@@ -4844,22 +5110,24 @@ Rules:\n\
 
         // Wire the TUI dialog into the VM so select" title|opt1|opt2" works.
         let tui_handle = self.tui_renderer.clone();
-        self.forth_vm.set_select_fn(Box::new(move |title: &str, options: &[String]| {
-            let title   = title.to_string();
-            let options = options.to_vec();
-            let tui     = tui_handle.clone();
-            futures::executor::block_on(async move {
-                use crate::cli::tui::{Dialog, DialogOption, DialogResult};
-                let dialog_opts: Vec<DialogOption> = options.iter()
-                    .map(|o| DialogOption::new(o.as_str()))
-                    .collect();
-                let dialog = Dialog::select(title, dialog_opts);
-                match tui.lock().await.show_dialog(dialog) {
-                    Ok(DialogResult::Selected(idx)) => idx as i64,
-                    _ => -1,
-                }
-            })
-        }));
+        self.forth_vm
+            .set_select_fn(Box::new(move |title: &str, options: &[String]| {
+                let title = title.to_string();
+                let options = options.to_vec();
+                let tui = tui_handle.clone();
+                futures::executor::block_on(async move {
+                    use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+                    let dialog_opts: Vec<DialogOption> = options
+                        .iter()
+                        .map(|o| DialogOption::new(o.as_str()))
+                        .collect();
+                    let dialog = Dialog::select(title, dialog_opts);
+                    match tui.lock().await.show_dialog(dialog) {
+                        Ok(DialogResult::Selected(idx)) => idx as i64,
+                        _ => -1,
+                    }
+                })
+            }));
 
         // Snapshot before eval so the user can undo it
         let snap = self.forth_vm.snapshot();
@@ -4879,11 +5147,13 @@ Rules:\n\
                         let src = code.trim_start_matches(':').trim();
                         let name = src.split_whitespace().next().unwrap_or("word");
                         // Extract body: everything between name and the trailing ;
-                        let body = src.trim_start_matches(name).trim()
-                            .trim_end_matches(';').trim();
-                        self.output_manager.write_info(
-                            format!("defined: {}", name.cyan().bold())
-                        );
+                        let body = src
+                            .trim_start_matches(name)
+                            .trim()
+                            .trim_end_matches(';')
+                            .trim();
+                        self.output_manager
+                            .write_info(format!("defined: {}", name.cyan().bold()));
                         // Occasionally observe what the definition seems to do
                         if let Some(obs) = definition_observation(name, body) {
                             self.output_manager.write_info(obs.dark_grey().to_string());
@@ -4899,7 +5169,8 @@ Rules:\n\
                         let mut r = format!("( {} )", items.join("  "));
                         // Vocab word hint: single alphabetic token that pushed exactly one value
                         let token = code.trim();
-                        let grew_by_one = self.forth_vm.data_stack().len() == stack_depth_before + 1;
+                        let grew_by_one =
+                            self.forth_vm.data_stack().len() == stack_depth_before + 1;
                         let looks_like_vocab = token.len() >= 3
                             && token.chars().all(|c| c.is_ascii_lowercase() || c == '-');
                         if grew_by_one && looks_like_vocab {
@@ -4911,7 +5182,8 @@ Rules:\n\
                         }
                         r
                     };
-                    self.output_manager.write_info(remark.dark_grey().to_string());
+                    self.output_manager
+                        .write_info(remark.dark_grey().to_string());
                 }
             }
             Err(e) => {
@@ -4923,19 +5195,26 @@ Rules:\n\
                     false
                 };
                 let msg = humanize_forth_error(&e.to_string());
-                let hint = if restored { "  (state restored — try `undo` to go further back)" } else { "" };
-                self.output_manager.write_info(
-                    format!("{}{hint}", msg.as_str().red())
-                );
+                let hint = if restored {
+                    "  (state restored — try `undo` to go further back)"
+                } else {
+                    ""
+                };
+                self.output_manager
+                    .write_info(format!("{}{hint}", msg.as_str().red()));
             }
         }
         // Broadcast this code to all peer loops — each runs it on its own VM
         // and replies via peer_inbox_rx with its result (stack delta or output).
-        let _ = self.peer_tx.send(crate::session::SessionEvent::chat(code.clone()));
+        let _ = self
+            .peer_tx
+            .send(crate::session::SessionEvent::chat(code.clone()));
 
         // Drain any boot poems registered this exec.
         let poems = self.forth_vm.take_boot_poems();
-        if !poems.is_empty() { self.save_boot_poems(&poems); }
+        if !poems.is_empty() {
+            self.save_boot_poems(&poems);
+        }
         self.render_tui().await
     }
 
@@ -4943,11 +5222,14 @@ Rules:\n\
     /// Called after any successful exec that may have added new definitions.
     fn save_user_words(&self) {
         let raw = self.forth_vm.dump_source();
-        if raw.is_empty() { return; }
+        if raw.is_empty() {
+            return;
+        }
         // Strip any definitions that shadow builtins or core Forth words.
         // The AI occasionally generates `: drop 99 drop ;` style corruption that
         // persists across restarts and breaks STDLIB proofs.
-        let source: String = raw.lines()
+        let source: String = raw
+            .lines()
             .filter(|line| {
                 let t = line.trim();
                 if t.starts_with(':') {
@@ -4959,7 +5241,9 @@ Rules:\n\
             })
             .collect::<Vec<_>>()
             .join("\n");
-        if source.is_empty() { return; }
+        if source.is_empty() {
+            return;
+        }
         // Fire-and-forget: push to daemon so all concurrent terminals sync immediately.
         let daemon_addr = crate::config::constants::DEFAULT_HTTP_ADDR;
         let url = format!("http://{daemon_addr}/v1/forth/define");
@@ -5001,8 +5285,13 @@ Rules:\n\
             .filter(|s: &String| !s.is_empty());
 
         let source = daemon_source.or_else(|| {
-            let path = dirs::home_dir().map(|mut p| { p.push(".finch"); p.push("user_words.forth"); p })?;
-            std::fs::read(path).ok()
+            let path = dirs::home_dir().map(|mut p| {
+                p.push(".finch");
+                p.push("user_words.forth");
+                p
+            })?;
+            std::fs::read(path)
+                .ok()
                 .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', ""))
                 .filter(|s: &String| !s.is_empty())
         });
@@ -5011,7 +5300,8 @@ Rules:\n\
             // Only load definitions for NEW words — never redefine anything already in the VM.
             // This prevents AI-generated words from shadowing builtins, stdlib words, or
             // Co-Forth vocabulary (e.g. `: over 3 5 over . ;` is recursive and breaks proofs).
-            let filtered: String = src.lines()
+            let filtered: String = src
+                .lines()
                 .filter(|line| {
                     let t = line.trim();
                     if t.starts_with(':') {
@@ -5046,7 +5336,8 @@ Rules:\n\
             };
 
             // Per-peer version tracking: (url → last_version)
-            let mut last_versions: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            let mut last_versions: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
 
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
@@ -5054,10 +5345,12 @@ Rules:\n\
                 // Build list of vocab URLs to poll:
                 // 1. Local daemon (same-machine terminals)
                 // 2. Remote peers from the daemon's registry (machines sent to other people)
-                let mut urls: Vec<String> = vec![
-                    format!("http://{daemon_addr}/v1/forth/vocab"),
-                ];
-                if let Ok(resp) = client.get(format!("http://{daemon_addr}/v1/registry/peers")).send().await {
+                let mut urls: Vec<String> = vec![format!("http://{daemon_addr}/v1/forth/vocab")];
+                if let Ok(resp) = client
+                    .get(format!("http://{daemon_addr}/v1/registry/peers"))
+                    .send()
+                    .await
+                {
                     if let Ok(peers) = resp.json::<Vec<serde_json::Value>>().await {
                         for peer in &peers {
                             if let Some(addr) = peer["addr"].as_str() {
@@ -5079,7 +5372,10 @@ Rules:\n\
                                 *last = version;
                                 if let Some(src) = val["source"].as_str() {
                                     if !src.is_empty() {
-                                        let _ = tx.send(crate::cli::repl_event::ReplEvent::VocabSync(src.to_owned()));
+                                        let _ =
+                                            tx.send(crate::cli::repl_event::ReplEvent::VocabSync(
+                                                src.to_owned(),
+                                            ));
                                     }
                                 }
                             }
@@ -5093,12 +5389,18 @@ Rules:\n\
     /// Append boot poem lines to ~/.finch/boot.forth (one `.\" text\" cr` per line).
     /// Called after any exec that may have produced boot poems via `boot" text"`.
     fn save_boot_poems(&self, poems: &[String]) {
-        let Some(mut path) = dirs::home_dir() else { return };
+        let Some(mut path) = dirs::home_dir() else {
+            return;
+        };
         path.push(".finch");
         let _ = std::fs::create_dir_all(&path);
         path.push("boot.forth");
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             for poem in poems {
                 let escaped = poem.replace('"', "\\\"");
                 let _ = writeln!(f, ".\" {}\" cr", escaped);
@@ -5108,11 +5410,17 @@ Rules:\n\
 
     /// Run ~/.finch/boot.forth at startup — the user's boot poetry.
     fn run_boot_poems(&mut self) {
-        let Some(mut path) = dirs::home_dir() else { return };
+        let Some(mut path) = dirs::home_dir() else {
+            return;
+        };
         path.push(".finch");
         path.push("boot.forth");
-        let Ok(source) = std::fs::read_to_string(&path) else { return };
-        if source.is_empty() { return; }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        if source.is_empty() {
+            return;
+        }
         if let Ok(out) = self.forth_vm.exec_with_fuel(&source, 0) {
             if !out.is_empty() {
                 self.output_manager.write_info(out.trim_end().to_string());
@@ -5171,11 +5479,17 @@ Rules:\n\
 
         // Only show user-authored words in the vocab context (not auto-compiled library words).
         let auto_names = &self.auto_compiled_word_names;
-        let user_vocab: String = self.forth_vm.dump_source()
+        let user_vocab: String = self
+            .forth_vm
+            .dump_source()
             .lines()
             .filter(|line| {
-                let name = line.trim_start_matches(':').trim()
-                    .split_whitespace().next().unwrap_or("");
+                let name = line
+                    .trim_start_matches(':')
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
                 !auto_names.contains(name)
             })
             .collect::<Vec<_>>()
@@ -5234,7 +5548,8 @@ Rules:\n\
                 // AI unavailable — fall back to pure-Rust heuristic generator.
                 // Every English word speaks its own name at minimum.
                 // Grammar still grows; AI can improve these later.
-                words.iter()
+                words
+                    .iter()
                     .map(|w| {
                         let code = crate::coforth::library::generate_forth_for_word(w);
                         format!(": {w}  {code} ;")
@@ -5265,9 +5580,11 @@ Rules:\n\
         }
 
         // Show what's being compiled.
-        self.output_manager.write_info(
-            format!("{}  {}", "→".dark_grey(), forth_defs.as_str().cyan())
-        );
+        self.output_manager.write_info(format!(
+            "{}  {}",
+            "→".dark_grey(),
+            forth_defs.as_str().cyan()
+        ));
         self.render_tui().await.ok();
 
         // Compile the definitions.
@@ -5309,13 +5626,18 @@ Rules:\n\
             s
         };
 
-        let word_count = source.lines().filter(|l| l.trim_start().starts_with(':')).count();
+        let word_count = source
+            .lines()
+            .filter(|l| l.trim_start().starts_with(':'))
+            .count();
 
         let separator = "─".repeat(56);
 
         if source.is_empty() {
             self.output_manager.write_info(
-                "nothing defined yet — build something first".dark_grey().to_string()
+                "nothing defined yet — build something first"
+                    .dark_grey()
+                    .to_string(),
             );
             return self.render_tui().await;
         }
@@ -5329,8 +5651,8 @@ Rules:\n\
              {source}\n\
              {sep}",
             sep = separator,
-            wc  = word_count,
-            ts  = ts,
+            wc = word_count,
+            ts = ts,
             hash = hash,
             source = source,
         );
@@ -5361,19 +5683,23 @@ Rules:\n\
     /// 3. Majority = "good"; minority = "broken" (or just different).
     /// 4. If any outlier exists, pops a select dialog: run `git pull` to fix it.
     async fn handle_box_diff(&mut self) -> Result<()> {
-        use crossterm::style::Stylize;
         use crate::coforth::scatter::scatter_exec_bash;
+        use crossterm::style::Stylize;
 
         let peers = self.forth_vm.peers.clone();
         if peers.is_empty() {
             self.output_manager.write_info(
-                "no peers connected — join a session first\n  try: add-peer\" host:11435\"".dark_grey().to_string()
+                "no peers connected — join a session first\n  try: add-peer\" host:11435\""
+                    .dark_grey()
+                    .to_string(),
             );
             return self.render_tui().await;
         }
 
         self.output_manager.write_info(
-            format!("checking {} boxes…", peers.len()).dark_grey().to_string()
+            format!("checking {} boxes…", peers.len())
+                .dark_grey()
+                .to_string(),
         );
         self.render_tui().await.ok();
 
@@ -5381,13 +5707,17 @@ Rules:\n\
         let probe = "git log --oneline -1 2>/dev/null || echo '(no git)'; \
                      git diff --stat HEAD 2>/dev/null | tail -1 || echo ''";
 
-        let peer_tokens: std::collections::HashMap<String, String> = self.forth_vm.peer_meta.iter()
+        let peer_tokens: std::collections::HashMap<String, String> = self
+            .forth_vm
+            .peer_meta
+            .iter()
             .filter_map(|(a, m)| m.token.as_ref().map(|t| (a.clone(), t.clone())))
             .collect();
         let results = scatter_exec_bash(&peers, probe, &peer_tokens).await;
 
         // Build a map: output → Vec<peer>
-        let mut groups: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut groups: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         let mut errors: Vec<(String, String)> = Vec::new();
 
         for r in &results {
@@ -5401,13 +5731,17 @@ Rules:\n\
 
         // Show errors first.
         for (peer, err) in &errors {
-            self.output_manager.write_info(
-                format!("{} {} — {}", "✗".red(), peer.as_str().dark_grey(), err.as_str().red())
-            );
+            self.output_manager.write_info(format!(
+                "{} {} — {}",
+                "✗".red(),
+                peer.as_str().dark_grey(),
+                err.as_str().red()
+            ));
         }
 
         // Find the majority output (the "good" state).
-        let majority_output = groups.iter()
+        let majority_output = groups
+            .iter()
             .max_by_key(|(_, peers)| peers.len())
             .map(|(k, _)| k.clone())
             .unwrap_or_default();
@@ -5422,15 +5756,22 @@ Rules:\n\
             } else {
                 "✗".red().to_string()
             };
-            let label = if groups.len() == 1 { "all in sync".to_string() }
-                        else if is_majority { "good".to_string() }
-                        else { "different".red().to_string() };
+            let label = if groups.len() == 1 {
+                "all in sync".to_string()
+            } else if is_majority {
+                "good".to_string()
+            } else {
+                "different".red().to_string()
+            };
 
             let peer_list = group_peers.join("  ");
             let first_line = output.lines().next().unwrap_or("(empty)");
             self.output_manager.write_info(format!(
                 "{} {}  {}\n  {}",
-                marker, label, peer_list.dark_grey(), first_line.cyan()
+                marker,
+                label,
+                peer_list.dark_grey(),
+                first_line.cyan()
             ));
         }
 
@@ -5440,7 +5781,8 @@ Rules:\n\
         }
 
         // Build a fix dialog for outlier peers.
-        let outliers: Vec<String> = groups.iter()
+        let outliers: Vec<String> = groups
+            .iter()
             .filter(|(k, _)| *k != &majority_output)
             .flat_map(|(_, peers)| peers.clone())
             .collect();
@@ -5451,7 +5793,8 @@ Rules:\n\
 
         // At fleet scale, offer to fix each *group* of outliers, not each individual box.
         // A group might be 50k machines — you fix them all with one confirmation.
-        let outlier_groups: Vec<(String, Vec<String>)> = groups.iter()
+        let outlier_groups: Vec<(String, Vec<String>)> = groups
+            .iter()
             .filter(|(k, _)| *k != &majority_output)
             .map(|(k, peers)| (k.clone(), peers.clone()))
             .collect();
@@ -5487,34 +5830,46 @@ Rules:\n\
                 ));
                 self.render_tui().await.ok();
 
-                let fix_tokens: std::collections::HashMap<String, String> = self.forth_vm.peer_meta.iter()
+                let fix_tokens: std::collections::HashMap<String, String> = self
+                    .forth_vm
+                    .peer_meta
+                    .iter()
                     .filter_map(|(a, m)| m.token.as_ref().map(|t| (a.clone(), t.clone())))
                     .collect();
                 let fix_results = scatter_exec_bash(targets, "git pull", &fix_tokens).await;
-                let ok_count  = fix_results.iter().filter(|r| r.error.is_none()).count();
+                let ok_count = fix_results.iter().filter(|r| r.error.is_none()).count();
                 let err_count = fix_results.iter().filter(|r| r.error.is_some()).count();
 
                 if ok_count > 0 {
-                    self.output_manager.write_info(
-                        format!("{} {} box{} updated", "✓".green(), ok_count, if ok_count == 1 { "" } else { "es" })
-                    );
+                    self.output_manager.write_info(format!(
+                        "{} {} box{} updated",
+                        "✓".green(),
+                        ok_count,
+                        if ok_count == 1 { "" } else { "es" }
+                    ));
                 }
                 if err_count > 0 {
-                    self.output_manager.write_info(
-                        format!("{} {} box{} failed", "✗".red(), err_count, if err_count == 1 { "" } else { "es" })
-                    );
+                    self.output_manager.write_info(format!(
+                        "{} {} box{} failed",
+                        "✗".red(),
+                        err_count,
+                        if err_count == 1 { "" } else { "es" }
+                    ));
                     // Show up to 5 individual errors so you know what's actually broken.
                     for r in fix_results.iter().filter(|r| r.error.is_some()).take(5) {
                         if let Some(ref e) = r.error {
-                            self.output_manager.write_info(
-                                format!("  {} {}", r.peer.as_str().dark_grey(), e.as_str().red())
-                            );
+                            self.output_manager.write_info(format!(
+                                "  {} {}",
+                                r.peer.as_str().dark_grey(),
+                                e.as_str().red()
+                            ));
                         }
                     }
                 }
             }
             _ => {
-                self.output_manager.write_info("cancelled".dark_grey().to_string());
+                self.output_manager
+                    .write_info("cancelled".dark_grey().to_string());
             }
         }
 
@@ -5525,21 +5880,29 @@ Rules:\n\
         use crossterm::style::Stylize;
         let source = self.forth_vm.dump_source();
         if source.is_empty() {
-            self.output_manager.write_info("vm: no user-defined words yet".dark_grey().to_string());
+            self.output_manager
+                .write_info("vm: no user-defined words yet".dark_grey().to_string());
             return self.render_tui().await;
         }
         // Style each definition: colon word cyan, body dark grey.
-        let styled: Vec<String> = source.lines().map(|line| {
-            // ": name body ;" — colour the name, leave body dark grey
-            if let Some(rest) = line.strip_prefix(": ") {
-                let mut parts = rest.splitn(2, ' ');
-                let name = parts.next().unwrap_or("");
-                let body = parts.next().unwrap_or("");
-                format!(": {}  {} ;", name.cyan().bold(), body.trim_end_matches(';').trim().dark_grey())
-            } else {
-                line.dark_grey().to_string()
-            }
-        }).collect();
+        let styled: Vec<String> = source
+            .lines()
+            .map(|line| {
+                // ": name body ;" — colour the name, leave body dark grey
+                if let Some(rest) = line.strip_prefix(": ") {
+                    let mut parts = rest.splitn(2, ' ');
+                    let name = parts.next().unwrap_or("");
+                    let body = parts.next().unwrap_or("");
+                    format!(
+                        ": {}  {} ;",
+                        name.cyan().bold(),
+                        body.trim_end_matches(';').trim().dark_grey()
+                    )
+                } else {
+                    line.dark_grey().to_string()
+                }
+            })
+            .collect();
         self.output_manager.write_info(styled.join("\n"));
         self.render_tui().await
     }
@@ -5552,7 +5915,8 @@ Rules:\n\
                 self.output_manager.write_info("undone".to_string());
             }
             None => {
-                self.output_manager.write_info("nothing to undo".to_string());
+                self.output_manager
+                    .write_info("nothing to undo".to_string());
             }
         }
         self.render_tui().await
@@ -5581,7 +5945,9 @@ Rules:\n\
 
         let mut output = String::new();
         for entry in senses {
-            let sense_tag = entry.sense.as_deref()
+            let sense_tag = entry
+                .sense
+                .as_deref()
                 .map(|s| format!(" {}", format!("[{s}]").yellow()))
                 .unwrap_or_default();
             match &entry.forth {
@@ -5611,7 +5977,8 @@ Rules:\n\
             }
         }
 
-        self.output_manager.write_info(output.trim_end().to_string());
+        self.output_manager
+            .write_info(output.trim_end().to_string());
         self.render_tui().await
     }
 
@@ -5638,9 +6005,13 @@ Rules:\n\
                     // Find the last block that matches
                     let last_match = blocks.iter().rposition(|b| {
                         let trimmed = b.trim_start_matches('\n');
-                        trimmed.starts_with(&target2) ||
-                        trimmed.lines().next().map(|l| l == &target2[..]).unwrap_or(false) ||
-                        b.contains(&target)
+                        trimmed.starts_with(&target2)
+                            || trimmed
+                                .lines()
+                                .next()
+                                .map(|l| l == &target2[..])
+                                .unwrap_or(false)
+                            || b.contains(&target)
                     });
 
                     match last_match {
@@ -5651,7 +6022,8 @@ Rules:\n\
                                 String::new()
                             } else {
                                 let first = new_blocks[0].to_string();
-                                let rest = new_blocks[1..].iter()
+                                let rest = new_blocks[1..]
+                                    .iter()
                                     .map(|b| format!("\n[[word]]{b}"))
                                     .collect::<String>();
                                 format!("{first}{rest}")
@@ -5697,16 +6069,24 @@ Rules:\n\
             use crossterm::style::Stylize;
             let mut out = key.clone().bold().cyan().to_string();
             for (i, entry) in senses.iter().enumerate() {
-                let sense_label = entry.sense.as_deref()
+                let sense_label = entry
+                    .sense
+                    .as_deref()
                     .map(|s| format!("  {}", format!("[{s}]").yellow()))
                     .unwrap_or_default();
-                let num = if senses.len() > 1 { format!("{}. ", i + 1) } else { String::new() };
+                let num = if senses.len() > 1 {
+                    format!("{}. ", i + 1)
+                } else {
+                    String::new()
+                };
                 let related = if entry.related.is_empty() {
                     String::new()
                 } else {
                     format!("\n     related: {}", entry.related.join(", "))
                 };
-                let forth = entry.forth.as_deref()
+                let forth = entry
+                    .forth
+                    .as_deref()
                     .map(|f| format!("\n     forth:   {f}"))
                     .unwrap_or_default();
                 out.push_str(&format!(
@@ -5741,7 +6121,8 @@ Rules:\n\
             return self.handle_stack_define_auto(key, sense).await;
         }
 
-        self.save_library_entry(&key, definition.trim(), sense.as_deref(), "").await
+        self.save_library_entry(&key, definition.trim(), sense.as_deref(), "")
+            .await
     }
 
     /// `/override <word> <def>` — write directly to ~/.finch/library.toml, bypassing the repo.
@@ -5755,15 +6136,30 @@ Rules:\n\
         if key.is_empty() {
             return Ok(());
         }
-        self.save_library_entry_local(&key, definition.trim(), sense.as_deref(), "").await
+        self.save_library_entry_local(&key, definition.trim(), sense.as_deref(), "")
+            .await
     }
 
     /// Save a word entry to `~/.finch/library.toml` (machine-local, never committed).
-    async fn save_library_entry_local(&mut self, key: &str, definition: &str, sense: Option<&str>, forth: &str) -> Result<()> {
+    async fn save_library_entry_local(
+        &mut self,
+        key: &str,
+        definition: &str,
+        sense: Option<&str>,
+        forth: &str,
+    ) -> Result<()> {
         let path = dirs::home_dir()
             .map(|h| h.join(".finch").join("library.toml"))
             .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-        self.save_library_entry_to(key, definition, sense, forth, &path, "~/.finch/library.toml").await
+        self.save_library_entry_to(
+            key,
+            definition,
+            sense,
+            forth,
+            &path,
+            "~/.finch/library.toml",
+        )
+        .await
     }
 
     /// Core save: write a word entry to vocabulary/{lang}.toml in the git repo and inject into the live poset.
@@ -5790,7 +6186,8 @@ Rules:\n\
                 (p, "~/.finch/library.toml".to_string())
             }
         };
-        self.save_library_entry_to(key, definition, sense, forth, &path, &display).await
+        self.save_library_entry_to(key, definition, sense, forth, &path, &display)
+            .await
     }
 
     /// Shared write+inject implementation used by both save paths.
@@ -5805,7 +6202,9 @@ Rules:\n\
     ) -> Result<()> {
         let safe_def = definition.replace('\\', "\\\\").replace('"', "\\\"");
 
-        let sense_line = sense.map(|s| format!("sense = \"{s}\"\n")).unwrap_or_default();
+        let sense_line = sense
+            .map(|s| format!("sense = \"{s}\"\n"))
+            .unwrap_or_default();
         let forth_line = if forth.is_empty() {
             String::new()
         } else {
@@ -5833,7 +6232,8 @@ Rules:\n\
             .append(true)
             .open(path)
             .with_context(|| format!("cannot open {}", path.display()))?;
-        file.write_all(entry_toml.as_bytes()).context("failed to write library entry")?;
+        file.write_all(entry_toml.as_bytes())
+            .context("failed to write library entry")?;
 
         // Inject into live poset
         {
@@ -5848,23 +6248,24 @@ Rules:\n\
             .unwrap_or_else(|| key.bold().cyan().to_string());
 
         if sense_exists {
-            self.output_manager.write_info(format!(
-                "{label} redefined in {display_path}"
-            ));
+            self.output_manager
+                .write_info(format!("{label} redefined in {display_path}"));
         } else if already_exists {
-            self.output_manager.write_info(format!(
-                "{label} added as new sense to {display_path}"
-            ));
+            self.output_manager
+                .write_info(format!("{label} added as new sense to {display_path}"));
         } else {
-            self.output_manager.write_info(format!(
-                "{label} → {display_path}"
-            ));
+            self.output_manager
+                .write_info(format!("{label} → {display_path}"));
         }
         self.render_tui().await
     }
 
     /// Manual define dialog: shown when no AI provider is configured.
-    async fn handle_stack_define_manual(&mut self, key: String, sense: Option<String>) -> Result<()> {
+    async fn handle_stack_define_manual(
+        &mut self,
+        key: String,
+        sense: Option<String>,
+    ) -> Result<()> {
         use crate::cli::tui::{Dialog, DialogResult};
         let prompt = if let Some(ref s) = sense {
             format!("Define {key}:{s}")
@@ -5878,7 +6279,8 @@ Rules:\n\
             _ => return self.render_tui().await, // cancelled or empty
         };
         // Save directly (no recursive call — same logic as handle_stack_define body)
-        self.save_library_entry(&key, &definition, sense.as_deref(), "").await
+        self.save_library_entry(&key, &definition, sense.as_deref(), "")
+            .await
     }
 
     /// AI auto-define: ask the brain provider for a definition when the user types `/define word`.
@@ -5890,7 +6292,8 @@ Rules:\n\
         let provider = self.brain_provider.clone().unwrap();
 
         use crossterm::style::Stylize;
-        let label = sense.as_deref()
+        let label = sense
+            .as_deref()
             .map(|s| format!("{}:{}", key.clone().bold().cyan(), s.yellow()))
             .unwrap_or_else(|| key.clone().bold().cyan().to_string());
         self.output_manager.write_info(format!("defining {label}…"));
@@ -5902,24 +6305,35 @@ Rules:\n\
             format!("[\"{key}\"]")
         };
 
-        let request = crate::providers::ProviderRequest::new(vec![
-            crate::claude::types::Message::user(&word_arg),
-        ])
-        .with_system(crate::coforth::generator::GENERATION_SYSTEM_PROMPT.to_string())
-        .with_max_tokens(500);
+        let request =
+            crate::providers::ProviderRequest::new(vec![crate::claude::types::Message::user(
+                &word_arg,
+            )])
+            .with_system(crate::coforth::generator::GENERATION_SYSTEM_PROMPT.to_string())
+            .with_max_tokens(500);
 
         let response = match provider.send_message(&request).await {
             Ok(r) => r,
             Err(e) => {
-                self.output_manager.write_info(format!("auto-define failed: {e}"));
+                self.output_manager
+                    .write_info(format!("auto-define failed: {e}"));
                 return self.render_tui().await;
             }
         };
 
         // Extract text from response content blocks
-        let text: String = response.content.iter().filter_map(|block| {
-            if let crate::claude::ContentBlock::Text { text } = block { Some(text.as_str()) } else { None }
-        }).collect::<Vec<_>>().join("");
+        let text: String = response
+            .content
+            .iter()
+            .filter_map(|block| {
+                if let crate::claude::ContentBlock::Text { text } = block {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
         let json_text = text
             .trim_start_matches("```json")
             .trim_start_matches("```")
@@ -5938,18 +6352,23 @@ Rules:\n\
         };
 
         let Some(entry) = entries.into_iter().next() else {
-            self.output_manager.write_info("auto-define: AI returned empty list".to_string());
+            self.output_manager
+                .write_info("auto-define: AI returned empty list".to_string());
             return self.render_tui().await;
         };
 
-        let definition = entry["definition"].as_str().unwrap_or("(no definition)").to_string();
+        let definition = entry["definition"]
+            .as_str()
+            .unwrap_or("(no definition)")
+            .to_string();
         let forth = entry["forth"].as_str().unwrap_or("").to_string();
 
         self.output_manager.write_info(format!(
             "{label}: {definition}{}",
             "  (saving…)".dark_grey()
         ));
-        self.save_library_entry(&key, &definition, sense.as_deref(), &forth).await
+        self.save_library_entry(&key, &definition, sense.as_deref(), &forth)
+            .await
     }
 
     /// Handle `/program` — render the current stack as Forth source code.
@@ -6034,7 +6453,7 @@ Rules:\n\
         self.output_manager.write_info(
             "📚 Demo language seeded: 4 words, 3 edges.\n\
              W0 + W1 run in parallel → W2 → W3.\n\
-             /program to see the vocabulary · /view for graph · /run to execute."
+             /program to see the vocabulary · /view for graph · /run to execute.",
         );
 
         // Switch to Forth view so the vocabulary is immediately visible.
@@ -6102,9 +6521,8 @@ Rules:\n\
         } else {
             item
         };
-        self.output_manager.write_info(format!(
-            "📚 popped → \"{preview}\"   depth:{depth}"
-        ));
+        self.output_manager
+            .write_info(format!("📚 popped → \"{preview}\"   depth:{depth}"));
         self.render_tui().await
     }
 
@@ -6138,10 +6556,12 @@ Rules:\n\
         if is_non_empty {
             // Show the execution plan and ask for approval before running anything.
             let approved = self.confirm_poset_run().await?;
-            if !approved { return Ok(()); }
+            if !approved {
+                return Ok(());
+            }
 
             use crate::tools::implementations::{
-                BashTool, GlobTool, GrepTool, ReadTool, WebFetchTool, WriteTool, EditTool,
+                BashTool, EditTool, GlobTool, GrepTool, ReadTool, WebFetchTool, WriteTool,
             };
             let mut reg = crate::tools::ToolRegistry::new();
             reg.register(Box::new(ReadTool));
@@ -6162,9 +6582,9 @@ Rules:\n\
             // Node status (Pending → Running → Done) updates through the shared
             // Arc<Mutex<Poset>>, so the Forth panel shows live progress.
             tokio::spawn(async move {
-                let result = crate::poset::executor::execute_poset(
-                    poset, generator, registry, Some(stack),
-                ).await;
+                let result =
+                    crate::poset::executor::execute_poset(poset, generator, registry, Some(stack))
+                        .await;
                 let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
             });
 
@@ -6188,7 +6608,8 @@ Rules:\n\
             tui.poset_panel_mode = crate::cli::tui::PosetPanelMode::Graph;
         }
         if count == 0 {
-            self.output_manager.write_info("stack empty  (tip: ?? question  to ask the AI directly)");
+            self.output_manager
+                .write_info("stack empty  (tip: ?? question  to ask the AI directly)");
         } else {
             self.output_manager.write_info(format!(
                 "cleared {count} item{}  (tip: ?? question  to ask the AI directly)",
@@ -6206,16 +6627,23 @@ Rules:\n\
 
         let plan = {
             let p = self.poset.lock().await;
-            if p.is_empty() { return Ok(false); }
+            if p.is_empty() {
+                return Ok(false);
+            }
 
             // Topological sort + depth propagation.
             let mut depth: std::collections::HashMap<usize, usize> =
                 p.nodes.iter().map(|n| (n.id, 0usize)).collect();
             let mut in_deg: std::collections::HashMap<usize, usize> =
                 p.nodes.iter().map(|n| (n.id, 0)).collect();
-            for &(_, s) in &p.edges { *in_deg.entry(s).or_insert(0) += 1; }
-            let mut q: std::collections::VecDeque<usize> = in_deg.iter()
-                .filter(|(_, &d)| d == 0).map(|(&id, _)| id).collect();
+            for &(_, s) in &p.edges {
+                *in_deg.entry(s).or_insert(0) += 1;
+            }
+            let mut q: std::collections::VecDeque<usize> = in_deg
+                .iter()
+                .filter(|(_, &d)| d == 0)
+                .map(|(&id, _)| id)
+                .collect();
             let mut topo: Vec<usize> = Vec::new();
             while let Some(id) = q.pop_front() {
                 topo.push(id);
@@ -6223,10 +6651,14 @@ Rules:\n\
                 for &(pred, succ) in &p.edges {
                     if pred == id {
                         let e = depth.entry(succ).or_insert(0);
-                        if d + 1 > *e { *e = d + 1; }
+                        if d + 1 > *e {
+                            *e = d + 1;
+                        }
                         let deg = in_deg.entry(succ).or_insert(0);
                         *deg = deg.saturating_sub(1);
-                        if *deg == 0 { q.push_back(succ); }
+                        if *deg == 0 {
+                            q.push_back(succ);
+                        }
                     }
                 }
             }
@@ -6234,27 +6666,32 @@ Rules:\n\
             let max_depth = depth.values().copied().max().unwrap_or(0);
             let mut lines: Vec<String> = Vec::new();
             for lvl in 0..=max_depth {
-                let group: Vec<&crate::poset::Node> = topo.iter()
+                let group: Vec<&crate::poset::Node> = topo
+                    .iter()
                     .filter(|&&id| depth[&id] == lvl)
                     .filter_map(|&id| p.nodes.iter().find(|n| n.id == id))
                     .collect();
-                if group.is_empty() { continue; }
+                if group.is_empty() {
+                    continue;
+                }
 
-                let names: Vec<String> = group.iter()
-                    .map(|n| format!("W{}", n.id))
-                    .collect();
+                let names: Vec<String> = group.iter().map(|n| format!("W{}", n.id)).collect();
 
-                let concurrent = if group.len() > 1 { "  \\ concurrent" } else { "" };
+                let concurrent = if group.len() > 1 {
+                    "  \\ concurrent"
+                } else {
+                    ""
+                };
                 lines.push(format!("  {}{}", names.join("  "), concurrent));
             }
             lines.join("\n")
         };
 
         let title = format!(": PROGRAM\n{}\n;\n\nthis will run on your machine.", plan);
-        let dialog = Dialog::select(title, vec![
-            DialogOption::new("run"),
-            DialogOption::new("cancel"),
-        ]);
+        let dialog = Dialog::select(
+            title,
+            vec![DialogOption::new("run"), DialogOption::new("cancel")],
+        );
 
         let result = { self.tui_renderer.lock().await.show_dialog(dialog)? };
         Ok(matches!(result, DialogResult::Selected(0)))
@@ -6307,7 +6744,6 @@ Rules:\n\
     ) -> super::events::ConfirmationResult {
         dialog_result_to_confirmation(dialog_result, tool_use)
     }
-
 
     // ========== Plan Mode Handlers ==========
 
@@ -6657,7 +7093,6 @@ pub(crate) fn find_last_exchange(messages: &[crate::claude::Message]) -> (String
     (last_query, last_response)
 }
 
-
 /// Translate a raw Forth error message into plain English.
 ///
 /// The Forth VM surfaces low-level errors ("stack underflow", "unknown word: foo").
@@ -6735,7 +7170,11 @@ pub(crate) fn filter_ai_forth_response(code: &str) -> String {
         while i < tokens.len() && i < scan_limit {
             match tokens[i] {
                 ":" => depth += 1,
-                ";" if depth == 1 => { i += 1; found_closing = true; break; }
+                ";" if depth == 1 => {
+                    i += 1;
+                    found_closing = true;
+                    break;
+                }
                 ";" => depth -= 1,
                 _ => {}
             }
@@ -6749,7 +7188,9 @@ pub(crate) fn filter_ai_forth_response(code: &str) -> String {
             // Skip past this definition's body by advancing to the next `:` or end.
             while i < tokens.len() && tokens[i] != ":" {
                 // Preserve prove-all even inside a malformed body.
-                if tokens[i] == "prove-all" { out.push("prove-all"); }
+                if tokens[i] == "prove-all" {
+                    out.push("prove-all");
+                }
                 i += 1;
             }
             continue;
@@ -6840,24 +7281,52 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> 
             }
         }
         "write" | "Write" => {
-            let path = tool_use.input.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
-            let content = tool_use.input.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let path = tool_use
+                .input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let content = tool_use
+                .input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let line_count = content.lines().count();
             let is_new = !std::path::Path::new(path).exists();
             if is_new {
                 let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
-                let truncated = if line_count > 5 { format!("\n… ({} lines total)", line_count) } else { String::new() };
+                let truncated = if line_count > 5 {
+                    format!("\n… ({} lines total)", line_count)
+                } else {
+                    String::new()
+                };
                 format!("Create {}\n{}{}", path, preview, truncated)
             } else {
                 // Show unified diff against existing file
                 let existing = std::fs::read_to_string(path).unwrap_or_default();
-                format!("Overwrite {}\n{}", path, unified_diff_summary(&existing, content, 3))
+                format!(
+                    "Overwrite {}\n{}",
+                    path,
+                    unified_diff_summary(&existing, content, 3)
+                )
             }
         }
         "edit" | "Edit" => {
-            let path = tool_use.input.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
-            let old = tool_use.input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new = tool_use.input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            let path = tool_use
+                .input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let old = tool_use
+                .input
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new = tool_use
+                .input
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             format!("Edit {}\n{}", path, unified_diff_summary(old, new, 2))
         }
         _ => format!("Execute {} tool", tool_name),
@@ -6891,7 +7360,9 @@ fn unified_diff_summary(before: &str, after: &str, context: usize) -> String {
                 if in_hunk {
                     current_hunk.push(format!("  {}", a));
                     // End hunk after `context` unchanged lines
-                    let trail = current_hunk.iter().rev()
+                    let trail = current_hunk
+                        .iter()
+                        .rev()
                         .take_while(|l| l.starts_with("  "))
                         .count();
                     if trail > context {
@@ -6900,7 +7371,8 @@ fn unified_diff_summary(before: &str, after: &str, context: usize) -> String {
                         in_hunk = false;
                     }
                 }
-                i += 1; j += 1;
+                i += 1;
+                j += 1;
             }
             (Some(a), Some(_b)) => {
                 if !in_hunk {
@@ -6914,16 +7386,21 @@ fn unified_diff_summary(before: &str, after: &str, context: usize) -> String {
                 current_hunk.push(format!("- {}", a));
                 current_hunk.push(format!("+ {}", _b));
                 total += 2;
-                i += 1; j += 1;
+                i += 1;
+                j += 1;
             }
             (Some(a), None) => {
-                if !in_hunk { in_hunk = true; }
+                if !in_hunk {
+                    in_hunk = true;
+                }
                 current_hunk.push(format!("- {}", a));
                 total += 1;
                 i += 1;
             }
             (None, Some(b)) => {
-                if !in_hunk { in_hunk = true; }
+                if !in_hunk {
+                    in_hunk = true;
+                }
                 current_hunk.push(format!("+ {}", b));
                 total += 1;
                 j += 1;
@@ -7058,14 +7535,23 @@ fn apply_patch_lines(original: &[String], patch: &str) -> anyhow::Result<Vec<Str
 /// Returns `(start, len)` for the original (minus) side.
 fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
     // Format: @@ -<start>[,<len>] +<start>[,<len>] @@
-    let rest = line.strip_prefix("@@ ").ok_or_else(|| anyhow::anyhow!("bad hunk header: {line}"))?;
-    let minus = rest.split_whitespace().next()
+    let rest = line
+        .strip_prefix("@@ ")
+        .ok_or_else(|| anyhow::anyhow!("bad hunk header: {line}"))?;
+    let minus = rest
+        .split_whitespace()
+        .next()
         .ok_or_else(|| anyhow::anyhow!("no minus range in hunk header"))?;
-    let minus = minus.strip_prefix('-')
+    let minus = minus
+        .strip_prefix('-')
         .ok_or_else(|| anyhow::anyhow!("minus range doesn't start with '-': {minus}"))?;
     let (start_str, len_str) = minus.split_once(',').unwrap_or((minus, "1"));
-    let start: usize = start_str.parse().map_err(|_| anyhow::anyhow!("bad start in hunk: {start_str}"))?;
-    let len: usize = len_str.parse().map_err(|_| anyhow::anyhow!("bad len in hunk: {len_str}"))?;
+    let start: usize = start_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad start in hunk: {start_str}"))?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad len in hunk: {len_str}"))?;
     Ok((start, len))
 }
 
@@ -7317,7 +7803,6 @@ mod tests {
         assert!(q.is_empty(), "query should be empty: {:?}", q);
     }
 
-
     // --- apply_sliding_window ---
 
     fn make_msgs(roles: &[&str]) -> Vec<crate::claude::Message> {
@@ -7492,7 +7977,10 @@ mod tests {
     fn test_humanize_unknown_word() {
         let msg = humanize_forth_error("unknown word: foo");
         assert!(msg.contains("\"foo\" isn't defined yet"), "got: {msg}");
-        assert!(msg.contains(": foo"), "should show how to define it, got: {msg}");
+        assert!(
+            msg.contains(": foo"),
+            "should show how to define it, got: {msg}"
+        );
     }
 
     #[test]
@@ -7510,14 +7998,20 @@ mod tests {
     #[test]
     fn test_humanize_fuel_exhausted() {
         let msg = humanize_forth_error("fuel exhausted — word is too expensive");
-        assert!(msg.contains("infinite loop") || msg.contains("too long"), "got: {msg}");
+        assert!(
+            msg.contains("infinite loop") || msg.contains("too long"),
+            "got: {msg}"
+        );
         assert!(msg.contains("undo"), "should hint at undo, got: {msg}");
     }
 
     #[test]
     fn test_humanize_strips_prefix() {
         let msg = humanize_forth_error("forth error: division by zero");
-        assert!(!msg.contains("forth error:"), "prefix should be stripped, got: {msg}");
+        assert!(
+            !msg.contains("forth error:"),
+            "prefix should be stripped, got: {msg}"
+        );
     }
 
     #[test]
@@ -7898,7 +8392,10 @@ mod tests {
     #[test]
     fn test_extract_channel_forth_definition() {
         let msg = "[#forth] alice: : double  2 * ;";
-        assert_eq!(extract_channel_forth(msg), Some(": double  2 * ;".to_string()));
+        assert_eq!(
+            extract_channel_forth(msg),
+            Some(": double  2 * ;".to_string())
+        );
     }
 
     #[test]
@@ -7928,9 +8425,12 @@ mod tests {
     #[test]
     fn test_extract_scatter_exec_commands_multiple() {
         let cmds = extract_scatter_exec_commands(
-            r#"peer" 192.168.1.1:11435" scatter-exec" hostname" scatter-exec" uname -a""#
+            r#"peer" 192.168.1.1:11435" scatter-exec" hostname" scatter-exec" uname -a""#,
         );
-        assert_eq!(cmds, vec![r#"* → bash -c "hostname""#, r#"* → bash -c "uname -a""#]);
+        assert_eq!(
+            cmds,
+            vec![r#"* → bash -c "hostname""#, r#"* → bash -c "uname -a""#]
+        );
     }
 
     #[test]
@@ -7953,27 +8453,37 @@ mod tests {
     fn test_silent_remark_single_boom() {
         let r = silent_remark("boom");
         assert!(r.contains("boom"), "boom remark should mention boom: {r}");
-        assert!(!r.contains("BOOM BOOM"), "single boom should not get triple treatment");
+        assert!(
+            !r.contains("BOOM BOOM"),
+            "single boom should not get triple treatment"
+        );
     }
 
     #[test]
     fn test_silent_remark_triple_boom_escalates() {
         let r = silent_remark("BOOM BOOM BOOM");
-        assert!(r.contains("yes") || r.contains("BOOM BOOM BOOM") || r.contains("go"),
-            "triple boom should be excited: {r}");
+        assert!(
+            r.contains("yes") || r.contains("BOOM BOOM BOOM") || r.contains("go"),
+            "triple boom should be excited: {r}"
+        );
     }
 
     #[test]
     fn test_silent_remark_double_word() {
         let r = silent_remark("help help");
-        assert!(r.contains("help") && (r.contains("twice") || r.contains("urgency")),
-            "double help should get double treatment: {r}");
+        assert!(
+            r.contains("help") && (r.contains("twice") || r.contains("urgency")),
+            "double help should get double treatment: {r}"
+        );
     }
 
     #[test]
     fn test_silent_remark_fireballs() {
         let r = silent_remark("fireballs");
-        assert!(r.contains("fireball"), "fireballs should get fireball remark: {r}");
+        assert!(
+            r.contains("fireball"),
+            "fireballs should get fireball remark: {r}"
+        );
     }
 
     #[test]
@@ -8012,7 +8522,10 @@ mod tests {
             "witnesses: zero",
         ];
         for g in &generic {
-            assert!(!r.contains(g), "please must not fall through to generic remark '{g}': {r}");
+            assert!(
+                !r.contains(g),
+                "please must not fall through to generic remark '{g}': {r}"
+            );
         }
     }
 
@@ -8022,8 +8535,10 @@ mod tests {
         let obs = definition_observation("boom", "");
         // May or may not fire (30% gate), but if it does it should mention quietness
         if let Some(r) = obs {
-            assert!(!r.contains("you sent me a machine called"),
-                "should not repeat that phrase verbatim: {r}");
+            assert!(
+                !r.contains("you sent me a machine called"),
+                "should not repeat that phrase verbatim: {r}"
+            );
         }
     }
 
@@ -8034,9 +8549,14 @@ mod tests {
         // Since it's time-gated we just call it many times and verify the content when Some.
         let mut found_recursive = false;
         for _ in 0..20 {
-            if let Some(r) = definition_observation("fib", "dup 2 < if drop 1 exit then dup 1 - fib swap 2 - fib +") {
-                assert!(r.contains("recurse") || r.contains("itself") || r.contains("base"),
-                    "recursive remark should mention recursion: {r}");
+            if let Some(r) = definition_observation(
+                "fib",
+                "dup 2 < if drop 1 exit then dup 1 - fib swap 2 - fib +",
+            ) {
+                assert!(
+                    r.contains("recurse") || r.contains("itself") || r.contains("base"),
+                    "recursive remark should mention recursion: {r}"
+                );
                 found_recursive = true;
                 break;
             }
@@ -8083,8 +8603,12 @@ fn open_in_editor(content: &str) -> anyhow::Result<String> {
 mod nl_routing_tests {
     use super::looks_like_natural_language;
 
-    fn no_words(_: &str) -> bool { false }
-    fn all_words(_: &str) -> bool { true }
+    fn no_words(_: &str) -> bool {
+        false
+    }
+    fn all_words(_: &str) -> bool {
+        true
+    }
 
     // Convenience wrapper: same closure for word_exists and session_word.
     // Matches pre-refactor behaviour for all tests that don't distinguish the two.
@@ -8093,94 +8617,167 @@ mod nl_routing_tests {
     }
 
     // Question marks always → AI
-    #[test] fn test_question_mark_latin() { assert!(nl("what is this?", no_words)); }
-    #[test] fn test_question_mark_fullwidth() { assert!(nl("何？", no_words)); }
-    #[test] fn test_question_embedded() { assert!(nl("is 2 + 2 = 4?", no_words)); }
+    #[test]
+    fn test_question_mark_latin() {
+        assert!(nl("what is this?", no_words));
+    }
+    #[test]
+    fn test_question_mark_fullwidth() {
+        assert!(nl("何？", no_words));
+    }
+    #[test]
+    fn test_question_embedded() {
+        assert!(nl("is 2 + 2 = 4?", no_words));
+    }
 
     // Uppercase first letter → AI
-    #[test] fn test_uppercase_start() { assert!(nl("Show me something", no_words)); }
-    #[test] fn test_uppercase_single_word() { assert!(nl("Hello", no_words)); }
+    #[test]
+    fn test_uppercase_start() {
+        assert!(nl("Show me something", no_words));
+    }
+    #[test]
+    fn test_uppercase_single_word() {
+        assert!(nl("Hello", no_words));
+    }
 
     // Non-ASCII non-definition → AI
-    #[test] fn test_non_ascii_chinese() { assert!(nl("你好", no_words)); }
-    #[test] fn test_non_ascii_arabic() { assert!(nl("مرحبا", no_words)); }
-    #[test] fn test_non_ascii_definition_not_nl() {
+    #[test]
+    fn test_non_ascii_chinese() {
+        assert!(nl("你好", no_words));
+    }
+    #[test]
+    fn test_non_ascii_arabic() {
+        assert!(nl("مرحبا", no_words));
+    }
+    #[test]
+    fn test_non_ascii_definition_not_nl() {
         // `: 你好 1 . ;` is a definition — should NOT be routed to AI
         assert!(!nl(": 你好 1 . ;", no_words));
     }
 
     // Multi-word with unknown alphabetic word → AI
-    #[test] fn test_multi_word_unknown() { assert!(nl("show me something", no_words)); }
-    #[test] fn test_multi_word_with_number() { assert!(nl("show me 3 examples", no_words)); }
-    #[test] fn test_multi_word_all_known_is_forth() {
+    #[test]
+    fn test_multi_word_unknown() {
+        assert!(nl("show me something", no_words));
+    }
+    #[test]
+    fn test_multi_word_with_number() {
+        assert!(nl("show me 3 examples", no_words));
+    }
+    #[test]
+    fn test_multi_word_all_known_is_forth() {
         // Every token is session-known → Forth, not AI
         assert!(!nl("dup swap drop", all_words));
     }
-    #[test] fn test_multi_word_all_numbers_is_forth() {
+    #[test]
+    fn test_multi_word_all_numbers_is_forth() {
         // Pure number sequence → Forth stack push, not AI
         assert!(!nl("1 2 3", no_words));
     }
 
     // Single unknown alphabetic word → AI
-    #[test] fn test_single_unknown_word() { assert!(nl("foobar", no_words)); }
+    #[test]
+    fn test_single_unknown_word() {
+        assert!(nl("foobar", no_words));
+    }
     // Hyphen is a Forth operator char, so single hyphenated token → Forth (not AI).
-    #[test] fn test_single_hyphenated_is_forth_not_nl() { assert!(!nl("my-thing", no_words)); }
+    #[test]
+    fn test_single_hyphenated_is_forth_not_nl() {
+        assert!(!nl("my-thing", no_words));
+    }
 
     // Known Forth primitives → Forth (not AI)
-    #[test] fn test_single_known_primitive_dup() { assert!(!nl("dup", no_words)); }
-    #[test] fn test_single_known_primitive_drop() { assert!(!nl("drop", no_words)); }
-    #[test] fn test_single_known_primitive_swap() { assert!(!nl("swap", no_words)); }
-    #[test] fn test_single_number_is_forth() { assert!(!nl("42", no_words)); }
-    #[test] fn test_single_float_is_forth() { assert!(!nl("3.14", no_words)); }
+    #[test]
+    fn test_single_known_primitive_dup() {
+        assert!(!nl("dup", no_words));
+    }
+    #[test]
+    fn test_single_known_primitive_drop() {
+        assert!(!nl("drop", no_words));
+    }
+    #[test]
+    fn test_single_known_primitive_swap() {
+        assert!(!nl("swap", no_words));
+    }
+    #[test]
+    fn test_single_number_is_forth() {
+        assert!(!nl("42", no_words));
+    }
+    #[test]
+    fn test_single_float_is_forth() {
+        assert!(!nl("3.14", no_words));
+    }
 
     // Forth operators in input → Forth
-    #[test] fn test_contains_forth_operator_plus() { assert!(!nl("2 3 +", no_words)); }
-    #[test] fn test_contains_forth_operator_dot() { assert!(!nl("42 .", no_words)); }
+    #[test]
+    fn test_contains_forth_operator_plus() {
+        assert!(!nl("2 3 +", no_words));
+    }
+    #[test]
+    fn test_contains_forth_operator_dot() {
+        assert!(!nl("42 .", no_words));
+    }
 
     // Definitions → Forth
-    #[test] fn test_colon_definition() { assert!(!nl(": foo 1 . ;", no_words)); }
+    #[test]
+    fn test_colon_definition() {
+        assert!(!nl(": foo 1 . ;", no_words));
+    }
 
     // Word known to VM → Forth
-    #[test] fn test_single_known_vm_word() { assert!(!nl("hello", all_words)); }
+    #[test]
+    fn test_single_known_vm_word() {
+        assert!(!nl("hello", all_words));
+    }
 
     // Regression: "it's just two greats talking" — multi-word with unknown words → AI
-    #[test] fn test_regression_two_greats() {
+    #[test]
+    fn test_regression_two_greats() {
         assert!(nl("it's just two greats talking", no_words));
     }
     // Regression: "we could do that whatever" — multi-word unknown → AI
-    #[test] fn test_regression_we_could() {
+    #[test]
+    fn test_regression_we_could() {
         assert!(nl("we could do that", no_words));
     }
 
     // Contractions → AI (the apostrophe+letter pattern is unambiguous prose).
-    #[test] fn test_contraction_youre() {
+    #[test]
+    fn test_contraction_youre() {
         assert!(nl("you're not talking to me.", all_words));
     }
-    #[test] fn test_contraction_dont() {
+    #[test]
+    fn test_contraction_dont() {
         assert!(nl("don't do that", no_words));
     }
-    #[test] fn test_contraction_its() {
+    #[test]
+    fn test_contraction_its() {
         assert!(nl("it's working", no_words));
     }
 
     // Sentence-ending period attached to a word → AI.
-    #[test] fn test_period_attached_to_word() {
+    #[test]
+    fn test_period_attached_to_word() {
         assert!(nl("hello.", no_words));
     }
-    #[test] fn test_period_attached_multi_word() {
+    #[test]
+    fn test_period_attached_multi_word() {
         assert!(nl("this is a sentence.", no_words));
     }
     // Standalone "." is the Forth print-TOS op — NOT natural language.
-    #[test] fn test_standalone_period_is_forth() {
+    #[test]
+    fn test_standalone_period_is_forth() {
         assert!(!nl("42 .", no_words));
     }
     // "3.14" is a float literal — Forth, not natural language.
-    #[test] fn test_float_with_period_is_forth() {
+    #[test]
+    fn test_float_with_period_is_forth() {
         assert!(!nl("3.14", no_words));
     }
 
     // Exclamation mark attached to a word → AI.
-    #[test] fn test_exclamation_attached() {
+    #[test]
+    fn test_exclamation_attached() {
         assert!(nl("hello!", no_words));
     }
 
@@ -8191,20 +8788,32 @@ mod nl_routing_tests {
     // of the `hello` word which would echo "hello" back.
     #[test]
     fn test_hello_world_library_only_is_nl() {
-        assert!(looks_like_natural_language("hello world", all_words, no_words));
+        assert!(looks_like_natural_language(
+            "hello world",
+            all_words,
+            no_words
+        ));
     }
 
     // "dup swap drop" — primitives; even with session_word=false they stay Forth.
     #[test]
     fn test_dup_swap_drop_primitives_stay_forth() {
-        assert!(!looks_like_natural_language("dup swap drop", all_words, no_words));
+        assert!(!looks_like_natural_language(
+            "dup swap drop",
+            all_words,
+            no_words
+        ));
     }
 
     // Once the user explicitly defines both words in the session, "hello world"
     // becomes a Forth invocation (session_word=true for both).
     #[test]
     fn test_hello_world_session_defined_is_forth() {
-        assert!(!looks_like_natural_language("hello world", all_words, all_words));
+        assert!(!looks_like_natural_language(
+            "hello world",
+            all_words,
+            all_words
+        ));
     }
 }
 
@@ -8227,32 +8836,44 @@ mod filter_tests {
     fn test_filter_removes_self_recursive_def() {
         // `hello` calls itself → infinite recursion → should be stripped.
         let code = ": hello  hello cr ;";
-        assert!(filter_ai_forth_response(code).trim().is_empty(),
-            "self-recursive definition should be removed");
+        assert!(
+            filter_ai_forth_response(code).trim().is_empty(),
+            "self-recursive definition should be removed"
+        );
     }
 
     #[test]
     fn test_filter_removes_gen_call() {
         // Body calls gen:what — AI invocation during execution causes a loop.
         let code = ": greeting  gen:what cr ;";
-        assert!(filter_ai_forth_response(code).trim().is_empty(),
-            "definition with gen: call should be removed");
+        assert!(
+            filter_ai_forth_response(code).trim().is_empty(),
+            "definition with gen: call should be removed"
+        );
     }
 
     #[test]
     fn test_filter_removes_garbage_long_body() {
         // More than 40 body tokens = vocabulary dump, not real Forth.
-        let long_body = std::iter::repeat("word").take(41).collect::<Vec<_>>().join(" ");
+        let long_body = std::iter::repeat("word")
+            .take(41)
+            .collect::<Vec<_>>()
+            .join(" ");
         let code = format!(": garbage  {long_body} ;");
-        assert!(filter_ai_forth_response(&code).trim().is_empty(),
-            "garbage long-body definition should be removed");
+        assert!(
+            filter_ai_forth_response(&code).trim().is_empty(),
+            "garbage long-body definition should be removed"
+        );
     }
 
     #[test]
     fn test_filter_keeps_prove_all() {
         let code = ": hello  .\" hello\" cr ; prove-all";
         let result = filter_ai_forth_response(code);
-        assert!(result.contains("prove-all"), "prove-all should be preserved");
+        assert!(
+            result.contains("prove-all"),
+            "prove-all should be preserved"
+        );
     }
 
     #[test]
@@ -8263,14 +8884,20 @@ mod filter_tests {
             : also-good  1 1 + . ;";
         let result = filter_ai_forth_response(code);
         assert!(result.contains(": good"), "valid def should be kept");
-        assert!(!result.contains(": bad"), "self-recursive def should be removed");
+        assert!(
+            !result.contains(": bad"),
+            "self-recursive def should be removed"
+        );
         assert!(result.contains(": also-good"), "valid def should be kept");
     }
 
     #[test]
     fn test_filter_exact_40_token_body_ok() {
         // Exactly 40 body tokens — should be kept (threshold is > 40).
-        let body = std::iter::repeat("drop").take(40).collect::<Vec<_>>().join(" ");
+        let body = std::iter::repeat("drop")
+            .take(40)
+            .collect::<Vec<_>>()
+            .join(" ");
         let code = format!(": word40  {body} ;");
         let result = filter_ai_forth_response(&code);
         assert!(result.contains(": word40"), "40-token body should be kept");
@@ -8278,10 +8905,16 @@ mod filter_tests {
 
     #[test]
     fn test_filter_41_token_body_rejected() {
-        let body = std::iter::repeat("drop").take(41).collect::<Vec<_>>().join(" ");
+        let body = std::iter::repeat("drop")
+            .take(41)
+            .collect::<Vec<_>>()
+            .join(" ");
         let code = format!(": word41  {body} ;");
         let result = filter_ai_forth_response(&code);
-        assert!(!result.contains(": word41"), "41-token body should be rejected");
+        assert!(
+            !result.contains(": word41"),
+            "41-token body should be rejected"
+        );
     }
 
     #[test]
@@ -8291,8 +8924,14 @@ mod filter_tests {
         let code = ": a  b . ; : b  a . ;";
         let result = filter_ai_forth_response(code);
         // Both should pass the filter (no direct self-call)
-        assert!(result.contains(": a"), "indirect recursion not filtered at compile time");
-        assert!(result.contains(": b"), "indirect recursion not filtered at compile time");
+        assert!(
+            result.contains(": a"),
+            "indirect recursion not filtered at compile time"
+        );
+        assert!(
+            result.contains(": b"),
+            "indirect recursion not filtered at compile time"
+        );
     }
 
     #[test]
@@ -8324,7 +8963,7 @@ mod filter_tests {
     #[test]
     fn test_filter_malformed_missing_semicolon() {
         // Should skip malformed definitions completely
-        let code = ": hello";  
+        let code = ": hello";
         assert_eq!(filter_ai_forth_response(code).trim(), "");
     }
 
@@ -8342,7 +8981,10 @@ mod filter_tests {
         let code = ": outer : inner stuff ; more";
         let result = filter_ai_forth_response(code);
         // Inner definition is recovered; "more" passes through as a bare word.
-        assert!(result.contains(": inner"), "inner def should be recovered after malformed outer");
+        assert!(
+            result.contains(": inner"),
+            "inner def should be recovered after malformed outer"
+        );
     }
 
     #[test]
@@ -8351,15 +8993,24 @@ mod filter_tests {
         // After the fix, the valid def and prove-all are both preserved.
         let code = ": malformed hello : valid .\" ok\" ; prove-all";
         let result = filter_ai_forth_response(code);
-        assert!(result.contains(": valid"), "valid def should be recovered after malformed one");
-        assert!(result.contains("prove-all"), "prove-all must survive a malformed definition");
+        assert!(
+            result.contains(": valid"),
+            "valid def should be recovered after malformed one"
+        );
+        assert!(
+            result.contains("prove-all"),
+            "prove-all must survive a malformed definition"
+        );
     }
 
     #[test]
     fn test_filter_empty_definition() {
         let code = ": empty ;";
         let result = filter_ai_forth_response(code);
-        assert!(result.contains(": empty ;"), "empty definition should be valid");
+        assert!(
+            result.contains(": empty ;"),
+            "empty definition should be valid"
+        );
     }
 
     #[test]
@@ -8374,8 +9025,10 @@ mod filter_tests {
     fn test_filter_malformed_def_does_not_consume_prove_all() {
         let code = ": broken no-semicolon-here prove-all";
         let result = filter_ai_forth_response(code);
-        assert!(result.contains("prove-all"),
-            "prove-all must survive a malformed definition with no closing semicolon");
+        assert!(
+            result.contains("prove-all"),
+            "prove-all must survive a malformed definition with no closing semicolon"
+        );
     }
 
     // Regression: malformed definition must not consume subsequent valid definitions.
@@ -8383,8 +9036,10 @@ mod filter_tests {
     fn test_filter_malformed_def_followed_by_valid() {
         let code = ": broken no-semicolon : good .\" ok\" cr ;";
         let result = filter_ai_forth_response(code);
-        assert!(result.contains(": good"),
-            "valid definition after malformed one should be kept");
+        assert!(
+            result.contains(": good"),
+            "valid definition after malformed one should be kept"
+        );
     }
 }
 
@@ -8397,7 +9052,8 @@ mod peer_loop_tests {
     /// Both peer loops receive the broadcast and each sends back an independent result.
     #[tokio::test]
     async fn test_two_peers_both_reply_to_broadcast() {
-        let (inbox_tx, mut inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (inbox_tx, mut inbox_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
         let (bcast_tx, sessions) = boot_peers(inbox_tx, None).await;
 
         assert_eq!(sessions.len(), 2, "boot_peers must fork exactly two peers");
@@ -8422,7 +9078,12 @@ mod peer_loop_tests {
             }
         }
 
-        assert_eq!(replies.len(), 2, "expected two replies (one per peer), got {}", replies.len());
+        assert_eq!(
+            replies.len(),
+            2,
+            "expected two replies (one per peer), got {}",
+            replies.len()
+        );
 
         // Both peers should have computed 7.
         for (_, name, text) in &replies {
@@ -8441,13 +9102,16 @@ mod peer_loop_tests {
     /// bleed between peers (each has its own VM snapshot).
     #[tokio::test]
     async fn test_peers_have_independent_vms() {
-        let (inbox_tx, mut inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (inbox_tx, mut inbox_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
         let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Broadcast a definition — both peers should compile it.
-        bcast_tx.send(SessionEvent::chat(": square  dup * ;")).unwrap();
+        bcast_tx
+            .send(SessionEvent::chat(": square  dup * ;"))
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Now evaluate the word — both VMs should have it.
@@ -8478,7 +9142,8 @@ mod peer_loop_tests {
     /// Registry contains both peers after boot.
     #[tokio::test]
     async fn test_registry_populated_after_boot() {
-        let (inbox_tx, _inbox_rx) = tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (inbox_tx, _inbox_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
         let (_bcast_tx, sessions) = boot_peers(inbox_tx, None).await;
 
         for (id, name) in &sessions {

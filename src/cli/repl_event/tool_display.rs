@@ -928,8 +928,7 @@ mod tests {
 
     #[test]
     fn test_tool_result_bash_exit_code_nonzero() {
-        let content =
-            "STDERR:\nls: cannot access '/nope': No such file or directory\nExit code: 2";
+        let content = "STDERR:\nls: cannot access '/nope': No such file or directory\nExit code: 2";
         let (summary, _) = tool_result_to_display("bash", content);
         assert!(
             summary.contains("Exit code:") || !summary.is_empty(),
@@ -1066,8 +1065,7 @@ mod tests {
 
     #[test]
     fn test_bash_smart_summary_cargo_test_failed() {
-        let out =
-            "running 3 tests\ntest b ... FAILED\ntest result: FAILED. 2 passed; 1 failed";
+        let out = "running 3 tests\ntest b ... FAILED\ntest result: FAILED. 2 passed; 1 failed";
         assert_eq!(
             bash_smart_summary(out),
             "test result: FAILED. 2 passed; 1 failed"
@@ -1082,8 +1080,7 @@ mod tests {
 
     #[test]
     fn test_bash_smart_summary_cargo_build_error() {
-        let out =
-            "error[E0308]: mismatched types\n --> src/main.rs:5:1\nerror: could not compile";
+        let out = "error[E0308]: mismatched types\n --> src/main.rs:5:1\nerror: could not compile";
         let s = bash_smart_summary(out);
         assert!(
             s.contains("could not compile") || s.contains("error["),
@@ -1116,8 +1113,7 @@ mod tests {
 
     #[test]
     fn test_bash_smart_summary_test_result_beats_finished() {
-        let out =
-            "    Finished test profile in 2s\nrunning 3 tests\ntest result: ok. 3 passed";
+        let out = "    Finished test profile in 2s\nrunning 3 tests\ntest result: ok. 3 passed";
         assert!(
             bash_smart_summary(out).starts_with("test result:"),
             "test result should beat Finished: {}",

@@ -141,7 +141,9 @@ pub(super) async fn dispatch_tool_uses(
     status_bar: &Arc<crate::cli::StatusBar>,
     context_lines: usize,
 ) {
-    use super::plan_handler::{handle_ask_user_question, handle_present_plan, is_tool_allowed_in_mode};
+    use super::plan_handler::{
+        handle_ask_user_question, handle_present_plan, is_tool_allowed_in_mode,
+    };
     use super::tool_display::format_tool_label;
     use tokio_util::sync::CancellationToken;
 
@@ -149,6 +151,12 @@ pub(super) async fn dispatch_tool_uses(
     for tool_use in tool_uses {
         // Loop detection: a second identical (tool, input) call for this query means
         // the model is stuck; return a terminal error so it breaks out.
+        //
+        // Skip detection for no-argument tools (empty JSON object input).  These
+        // tools — Run, Clear, View — are intentionally stateless; calling them
+        // twice is meaningful (e.g. signalling readiness, then confirming after
+        // the user interacted), so there is nothing to deduplicate.
+        let input_is_empty = tool_use.input == serde_json::json!({});
         let call_key = format!("{}:{}", tool_use.name, tool_use.input);
         let call_count = {
             let mut history = tool_call_history.write().await;
@@ -159,7 +167,7 @@ pub(super) async fn dispatch_tool_uses(
             *count += 1;
             *count
         };
-        if call_count > 1 {
+        if !input_is_empty && call_count > 1 {
             let label = format_tool_label(&tool_use.name, &tool_use.input);
             let row_idx = work_unit.add_row(label);
             work_unit.fail_row(row_idx, "loop detected");
@@ -203,13 +211,16 @@ pub(super) async fn dispatch_tool_uses(
         let row_idx = work_unit.add_row(&label);
         active_tool_uses.write().await.insert(
             tool_use.id.clone(),
-            (tool_use.name.clone(), tool_use.input.clone(), Arc::clone(work_unit), row_idx),
+            (
+                tool_use.name.clone(),
+                tool_use.input.clone(),
+                Arc::clone(work_unit),
+                row_idx,
+            ),
         );
 
         // Inline handlers for interactive tools (block until dialog resolved)
-        if let Some(result) =
-            handle_ask_user_question(&tool_use, Arc::clone(tui_renderer)).await
-        {
+        if let Some(result) = handle_ask_user_question(&tool_use, Arc::clone(tui_renderer)).await {
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
                 tool_id: tool_use.id.clone(),
@@ -293,7 +304,9 @@ pub(crate) async fn process_query_with_tools(
     enable_summarization: bool,
     auto_compact_enabled: bool,
     summary_gen: Arc<dyn Generator>,
-    tool_call_history: Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
+    tool_call_history: Arc<
+        RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
+    >,
 ) {
     tracing::debug!(
         "process_query_with_tools starting for query_id: {:?}",
@@ -314,17 +327,12 @@ pub(crate) async fn process_query_with_tools(
             match router.route(&query) {
                 crate::router::RouteDecision::Local { confidence, .. } if confidence > 0.7 => {
                     // Use Qwen
-                    tracing::debug!(
-                        "Client-side routing: Qwen (confidence: {:.2})",
-                        confidence
-                    );
+                    tracing::debug!("Client-side routing: Qwen (confidence: {:.2})", confidence);
                     Arc::clone(&qwen_gen)
                 }
                 _ => {
                     // Use Claude
-                    tracing::debug!(
-                        "Client-side routing: teacher (low confidence or no match)"
-                    );
+                    tracing::debug!("Client-side routing: teacher (low confidence or no match)");
                     Arc::clone(&claude_gen)
                 }
             }
@@ -342,18 +350,18 @@ pub(crate) async fn process_query_with_tools(
         // When summarization is enabled and messages have been dropped by the
         // sliding window, summarise them and inject as a prefix so the LLM
         // retains awareness of earlier turns.
-        let mut msgs =
-            if enable_summarization && max_verbatim > 0 && all_msgs.len() > max_verbatim {
-                let drop_end = all_msgs.len() - max_verbatim;
-                // Clone the dropped slice so we can pass all_msgs by value to apply_sliding_window.
-                let dropped: Vec<_> = all_msgs[..drop_end].to_vec();
-                let window = apply_sliding_window(all_msgs, max_verbatim);
-                let compactor =
-                    crate::cli::conversation_compactor::ConversationCompactor::new(summary_gen);
-                compactor.compact(&dropped, window).await
-            } else {
-                apply_sliding_window(all_msgs, max_verbatim)
-            };
+        let mut msgs = if enable_summarization && max_verbatim > 0 && all_msgs.len() > max_verbatim
+        {
+            let drop_end = all_msgs.len() - max_verbatim;
+            // Clone the dropped slice so we can pass all_msgs by value to apply_sliding_window.
+            let dropped: Vec<_> = all_msgs[..drop_end].to_vec();
+            let window = apply_sliding_window(all_msgs, max_verbatim);
+            let compactor =
+                crate::cli::conversation_compactor::ConversationCompactor::new(summary_gen);
+            compactor.compact(&dropped, window).await
+        } else {
+            apply_sliding_window(all_msgs, max_verbatim)
+        };
         if let Some(ref mem) = memory_system {
             if let Ok(memories) = mem.query(&query, Some(recall_k)).await {
                 if !memories.is_empty() {
@@ -496,9 +504,7 @@ pub(crate) async fn process_query_with_tools(
                         )
                         .await;
 
-                    tracing::debug!(
-                        "[EVENT_LOOP] Query state updated, adding assistant message"
-                    );
+                    tracing::debug!("[EVENT_LOOP] Query state updated, adding assistant message");
                     // Add assistant message with ALL content blocks (text + tool uses)
                     // This is critical for proper conversation structure
                     let assistant_message = crate::claude::Message {
@@ -576,14 +582,8 @@ pub(crate) async fn process_query_with_tools(
                             ),
                         );
                     }
-                    refresh_context_strip(
-                        mem,
-                        &session_label,
-                        &cwd,
-                        &status_bar,
-                        context_lines,
-                    )
-                    .await;
+                    refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines)
+                        .await;
                 }
 
                 // Update context usage indicator (suppressed when auto-compact disabled)
@@ -713,12 +713,7 @@ pub(crate) async fn process_query_with_tools(
             if let Some(ref mem) = memory_system {
                 let model_name = response.metadata.model.clone();
                 let _ = mem
-                    .insert_conversation(
-                        "user",
-                        &query,
-                        Some(&model_name),
-                        Some(&session_label),
-                    )
+                    .insert_conversation("user", &query, Some(&model_name), Some(&session_label))
                     .await;
                 let _ = mem
                     .insert_conversation(
@@ -737,8 +732,7 @@ pub(crate) async fn process_query_with_tools(
                         ),
                     );
                 }
-                refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines)
-                    .await;
+                refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
             }
         }
         Err(e) => {
@@ -791,7 +785,7 @@ pub(crate) fn apply_sliding_window(
             break;
         }
         window.remove(0); // drop orphaned tool_result user turn
-        // Also drop the assistant reply that followed it (starts the next pair).
+                          // Also drop the assistant reply that followed it (starts the next pair).
         if window.first().map(|m| m.role.as_str()) == Some("assistant") {
             window.remove(0);
         }

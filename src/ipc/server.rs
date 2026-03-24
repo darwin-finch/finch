@@ -12,9 +12,7 @@ use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::ipc::schema::finch_ipc_capnp::{
-    self, BrainState as CapnpBrainState, finch_daemon,
-};
+use crate::ipc::schema::finch_ipc_capnp::{self, finch_daemon, BrainState as CapnpBrainState};
 use crate::server::{AgentServer, PlanResponse};
 
 // ---------------------------------------------------------------------------
@@ -91,12 +89,13 @@ fn read_tools(
     let mut out = Vec::with_capacity(list.len() as usize);
     for td in list.iter() {
         let schema: crate::tools::types::ToolInputSchema =
-            serde_json::from_str(td.get_input_schema_json()?.to_str()?)
-                .unwrap_or_else(|_| crate::tools::types::ToolInputSchema {
+            serde_json::from_str(td.get_input_schema_json()?.to_str()?).unwrap_or_else(|_| {
+                crate::tools::types::ToolInputSchema {
                     schema_type: "object".to_string(),
                     properties: serde_json::Value::Object(serde_json::Map::new()),
                     required: vec![],
-                });
+                }
+            });
         out.push(crate::tools::types::ToolDefinition {
             name: td.get_name()?.to_str()?.to_string(),
             description: td.get_description()?.to_str()?.to_string(),
@@ -278,7 +277,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
         use crate::brain::daemon_brain::run_daemon_brain_loop;
 
         let p = pry!(params.get());
-        let task = pry!(p.get_task_description()).to_str().unwrap_or("").to_string();
+        let task = pry!(p.get_task_description())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
         let provider_name = pry!(p.get_provider()).to_str().unwrap_or("").to_string();
         let server = Arc::clone(&self.server);
 
@@ -287,9 +289,15 @@ impl finch_daemon::Server for FinchDaemonImpl {
             let registry = Arc::clone(server.brain_registry());
 
             let provider = server
-                .provider_for_name(if provider_name.is_empty() { None } else { Some(&provider_name) })
+                .provider_for_name(if provider_name.is_empty() {
+                    None
+                } else {
+                    Some(&provider_name)
+                })
                 .cloned()
-                .ok_or_else(|| capnp::Error::failed("No provider configured for daemon brains".into()))?;
+                .ok_or_else(|| {
+                    capnp::Error::failed("No provider configured for daemon brains".into())
+                })?;
 
             let cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
@@ -335,9 +343,11 @@ impl finch_daemon::Server for FinchDaemonImpl {
         params: finch_daemon::GetBrainParams,
         mut results: finch_daemon::GetBrainResults,
     ) -> Promise<(), capnp::Error> {
-        let id_str = pry!(pry!(params.get()).get_id()).to_str().unwrap_or("").to_string();
-        let id = pry!(Uuid::parse_str(&id_str)
-            .map_err(|e| capnp::Error::failed(e.to_string())));
+        let id_str = pry!(pry!(params.get()).get_id())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let id = pry!(Uuid::parse_str(&id_str).map_err(|e| capnp::Error::failed(e.to_string())));
         let server = Arc::clone(&self.server);
 
         Promise::from_future(async move {
@@ -381,8 +391,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let p = pry!(params.get());
         let id_str = pry!(p.get_id()).to_str().unwrap_or("").to_string();
         let answer = pry!(p.get_answer()).to_str().unwrap_or("").to_string();
-        let id = pry!(Uuid::parse_str(&id_str)
-            .map_err(|e| capnp::Error::failed(e.to_string())));
+        let id = pry!(Uuid::parse_str(&id_str).map_err(|e| capnp::Error::failed(e.to_string())));
         let server = Arc::clone(&self.server);
 
         Promise::from_future(async move {
@@ -403,8 +412,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let id_str = pry!(p.get_id()).to_str().unwrap_or("").to_string();
         let approved = p.get_approved();
         let instruction = pry!(p.get_instruction()).to_str().unwrap_or("").to_string();
-        let id = pry!(Uuid::parse_str(&id_str)
-            .map_err(|e| capnp::Error::failed(e.to_string())));
+        let id = pry!(Uuid::parse_str(&id_str).map_err(|e| capnp::Error::failed(e.to_string())));
         let server = Arc::clone(&self.server);
 
         Promise::from_future(async move {
@@ -412,7 +420,9 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 if instruction.is_empty() {
                     PlanResponse::Approve
                 } else {
-                    PlanResponse::ChangesRequested { feedback: instruction }
+                    PlanResponse::ChangesRequested {
+                        feedback: instruction,
+                    }
                 }
             } else {
                 PlanResponse::Reject
@@ -430,9 +440,11 @@ impl finch_daemon::Server for FinchDaemonImpl {
         params: finch_daemon::CancelBrainParams,
         _results: finch_daemon::CancelBrainResults,
     ) -> Promise<(), capnp::Error> {
-        let id_str = pry!(pry!(params.get()).get_id()).to_str().unwrap_or("").to_string();
-        let id = pry!(Uuid::parse_str(&id_str)
-            .map_err(|e| capnp::Error::failed(e.to_string())));
+        let id_str = pry!(pry!(params.get()).get_id())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let id = pry!(Uuid::parse_str(&id_str).map_err(|e| capnp::Error::failed(e.to_string())));
         let server = Arc::clone(&self.server);
 
         Promise::from_future(async move {
@@ -448,7 +460,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
         params: finch_daemon::EvalForthParams,
         mut results: finch_daemon::EvalForthResults,
     ) -> Promise<(), capnp::Error> {
-        let program = pry!(pry!(params.get()).get_program()).to_str().unwrap_or("").to_owned();
+        let program = pry!(pry!(params.get()).get_program())
+            .to_str()
+            .unwrap_or("")
+            .to_owned();
 
         // Spin up a fresh Forth VM cloned from the precompiled dict, run the
         // program, then return the full data stack + any printed output.
@@ -477,9 +492,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         _params: finch_daemon::PingParams,
         mut results: finch_daemon::PingResults,
     ) -> Promise<(), capnp::Error> {
-        results
-            .get()
-            .set_version(env!("CARGO_PKG_VERSION"));
+        results.get().set_version(env!("CARGO_PKG_VERSION"));
         Promise::ok(())
     }
 }
@@ -541,10 +554,7 @@ pub async fn start_ipc_server(server: Arc<AgentServer>) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
-    server: Arc<AgentServer>,
-) -> Result<()> {
+async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServer>) -> Result<()> {
     let (reader, writer) = stream.into_split();
 
     let network = twoparty::VatNetwork::new(

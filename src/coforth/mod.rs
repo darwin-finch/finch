@@ -11,11 +11,10 @@
 /// - `Library::lookup` — find a word and its neighbours.
 /// - `Library::related` — walk the graph N hops from a seed word.
 /// - `Library::inject_into_poset` — seed a poset with a word's neighbourhood.
-
 pub mod generator;
 pub mod interpreter;
 pub mod library;
 pub mod scatter;
 
-pub use interpreter::{Forth, DictionarySnapshot};
+pub use interpreter::{DictionarySnapshot, Forth};
 pub use library::{Library, WordEntry};

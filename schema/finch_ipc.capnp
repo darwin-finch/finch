@@ -128,6 +128,19 @@ interface StreamReceiver {
 # Main daemon interface
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Out-of-band control messages (binary channel, not RPC)
+# ---------------------------------------------------------------------------
+
+struct ControlMessage {
+  # Sent as raw Cap'n Proto bytes over the quit channel.
+  # The quit watcher task decodes these independently of the event loop.
+  union {
+    quit      @0 :Void;   # User requested clean exit (/quit or Ctrl+D)
+    interrupt @1 :Void;   # Reserved: interrupt current operation
+  }
+}
+
 interface FinchDaemon {
   # Blocking (non-streaming) query.
   query @0 (messages :List(Message), tools :List(ToolDefinition))

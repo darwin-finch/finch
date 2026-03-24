@@ -3,8 +3,14 @@ fn strip_ansi(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            for ch in chars.by_ref() { if ch.is_ascii_alphabetic() { break; } }
-        } else { out.push(c); }
+            for ch in chars.by_ref() {
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
     }
     out
 }
@@ -26,7 +32,8 @@ fn main() {
 
     println!("\n=== user defines + proves own word ===");
     vm.exec(": double dup + ;").unwrap();
-    vm.exec(": test:double  5 double 10 = assert  0 double 0 = assert  -3 double -6 = assert ;").unwrap();
+    vm.exec(": test:double  5 double 10 = assert  0 double 0 = assert  -3 double -6 = assert ;")
+        .unwrap();
     let out = vm.exec(r#"prove" double""#).unwrap();
     println!("{}", strip_ansi(&out));
 

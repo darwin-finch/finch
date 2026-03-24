@@ -172,9 +172,7 @@ impl PermissionManager {
     fn check_peer_tool_use(&self, tool_name: &str, input: &Value) -> PermissionCheck {
         // Hard deny: peer cannot restart/recompile/kill the session
         if matches!(tool_name, "restart" | "spawn") {
-            return PermissionCheck::Deny(
-                "Peer cannot restart or spawn processes".to_string(),
-            );
+            return PermissionCheck::Deny("Peer cannot restart or spawn processes".to_string());
         }
 
         // Constitutional constraints still apply to everyone
@@ -372,15 +370,42 @@ fn is_readonly_bash(command: &str) -> bool {
 
     // Reject anything that could chain or redirect — too hard to parse safely.
     // This catches "ls; rm file", "cat foo | tee out", "echo hi > file", etc.
-    if trimmed.chars().any(|c| matches!(c, ';' | '|' | '>' | '<' | '&')) {
+    if trimmed
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '>' | '<' | '&'))
+    {
         return false;
     }
 
     let readonly_prefixes = [
-        "ls", "cat", "head", "tail", "echo", "pwd", "find", "grep", "rg",
-        "wc", "diff", "file", "stat", "which", "type", "env", "printenv",
-        "uname", "whoami", "id", "ps", "df", "du", "lsof", "netstat", "ss",
-        "curl -s", "curl --silent",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "echo",
+        "pwd",
+        "find",
+        "grep",
+        "rg",
+        "wc",
+        "diff",
+        "file",
+        "stat",
+        "which",
+        "type",
+        "env",
+        "printenv",
+        "uname",
+        "whoami",
+        "id",
+        "ps",
+        "df",
+        "du",
+        "lsof",
+        "netstat",
+        "ss",
+        "curl -s",
+        "curl --silent",
     ];
     readonly_prefixes.iter().any(|p| trimmed.starts_with(p))
 }
@@ -512,7 +537,10 @@ mod tests {
         let mgr = PermissionManager::for_peer();
         let input = serde_json::json!({});
         assert!(
-            matches!(mgr.check_tool_use("restart", &input), PermissionCheck::Deny(_)),
+            matches!(
+                mgr.check_tool_use("restart", &input),
+                PermissionCheck::Deny(_)
+            ),
             "Peer must not be allowed to restart"
         );
     }
@@ -522,7 +550,10 @@ mod tests {
         let mgr = PermissionManager::for_peer();
         let input = serde_json::json!({});
         assert!(
-            matches!(mgr.check_tool_use("spawn", &input), PermissionCheck::Deny(_)),
+            matches!(
+                mgr.check_tool_use("spawn", &input),
+                PermissionCheck::Deny(_)
+            ),
             "Peer must not be allowed to spawn processes"
         );
     }
@@ -546,7 +577,10 @@ mod tests {
         for tool in &["write", "edit", "patch"] {
             let input = serde_json::json!({"file_path": "/tmp/file.txt", "content": "x"});
             assert!(
-                matches!(mgr.check_tool_use(tool, &input), PermissionCheck::AskUser(_)),
+                matches!(
+                    mgr.check_tool_use(tool, &input),
+                    PermissionCheck::AskUser(_)
+                ),
                 "Peer {} must surface as AskUser (diff proposal), not auto-apply",
                 tool
             );
@@ -570,11 +604,19 @@ mod tests {
     #[test]
     fn test_peer_bash_with_side_effects_requires_ask() {
         let mgr = PermissionManager::for_peer();
-        let side_effect_cmds = ["git commit -m 'x'", "cargo build", "touch file.txt", "mkdir foo"];
+        let side_effect_cmds = [
+            "git commit -m 'x'",
+            "cargo build",
+            "touch file.txt",
+            "mkdir foo",
+        ];
         for cmd in &side_effect_cmds {
             let input = serde_json::json!({"command": cmd});
             assert!(
-                matches!(mgr.check_tool_use("bash", &input), PermissionCheck::AskUser(_)),
+                matches!(
+                    mgr.check_tool_use("bash", &input),
+                    PermissionCheck::AskUser(_)
+                ),
                 "Peer bash with side effects must require AskUser: {}",
                 cmd
             );
@@ -610,7 +652,10 @@ mod tests {
     #[test]
     fn test_is_readonly_bash_rejects_write_commands() {
         assert!(!is_readonly_bash("rm file"), "rm is not readonly");
-        assert!(!is_readonly_bash("git commit -m x"), "git commit is not readonly");
+        assert!(
+            !is_readonly_bash("git commit -m x"),
+            "git commit is not readonly"
+        );
         assert!(!is_readonly_bash("touch foo"), "touch is not readonly");
         assert!(!is_readonly_bash("mkdir bar"), "mkdir is not readonly");
     }
@@ -651,8 +696,14 @@ mod tests {
     #[test]
     fn test_is_readonly_bash_leading_spaces_handled() {
         // Leading spaces after trim still resolve to the correct prefix
-        assert!(is_readonly_bash("  ls -la"), "leading spaces should be trimmed");
-        assert!(is_readonly_bash("  cat file"), "leading spaces should be trimmed");
+        assert!(
+            is_readonly_bash("  ls -la"),
+            "leading spaces should be trimmed"
+        );
+        assert!(
+            is_readonly_bash("  cat file"),
+            "leading spaces should be trimmed"
+        );
     }
 
     #[test]

@@ -12,19 +12,19 @@ fn t(key: &str) -> &'static str {
     let lang = std::env::var("LANG").unwrap_or_default();
     let locale = &lang[..lang.len().min(2)];
     match (locale, key) {
-        ("es", "try")            => "Intenta:",
-        ("es", "suggestion")     => "Sugerencia:",
-        ("es", "possible_causes")=> "Posibles causas:",
-        ("fr", "try")            => "Essayez:",
-        ("fr", "suggestion")     => "Suggestion:",
-        ("fr", "possible_causes")=> "Causes possibles:",
-        ("de", "try")            => "Versuchen Sie:",
-        ("de", "suggestion")     => "Vorschlag:",
-        ("de", "possible_causes")=> "Mögliche Ursachen:",
-        (_,    "try")            => "Try:",
-        (_,    "suggestion")     => "Suggestion:",
-        (_,    "possible_causes")=> "Possible causes:",
-        _                        => ":",
+        ("es", "try") => "Intenta:",
+        ("es", "suggestion") => "Sugerencia:",
+        ("es", "possible_causes") => "Posibles causas:",
+        ("fr", "try") => "Essayez:",
+        ("fr", "suggestion") => "Suggestion:",
+        ("fr", "possible_causes") => "Causes possibles:",
+        ("de", "try") => "Versuchen Sie:",
+        ("de", "suggestion") => "Vorschlag:",
+        ("de", "possible_causes") => "Mögliche Ursachen:",
+        (_, "try") => "Try:",
+        (_, "suggestion") => "Suggestion:",
+        (_, "possible_causes") => "Possible causes:",
+        _ => ":",
     }
 }
 

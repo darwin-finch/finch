@@ -124,7 +124,10 @@ impl Persona {
         } else {
             None
         };
-        let user_name: Option<&str> = self.behavior.git_name.as_deref()
+        let user_name: Option<&str> = self
+            .behavior
+            .git_name
+            .as_deref()
             .or_else(|| git_name_fallback.as_deref());
 
         if let Some(name) = user_name {

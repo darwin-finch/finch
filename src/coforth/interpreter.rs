@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 /// Co-Forth native Forth interpreter — von Neumann flat-memory model.
 ///
 /// All compiled words live in a single flat `Vec<Cell>` (the "memory").
@@ -27,10 +28,9 @@
 ///
 /// Control flow: if/else/then  begin/until  begin/while/repeat  do/loop/+loop
 /// Comments: ( ... )   \ line comment
-
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use anyhow::{bail, Result};
 
 // ── Flat memory cell ─────────────────────────────────────────────────────────
 //
@@ -44,238 +44,285 @@ const _: () = assert!(std::mem::size_of::<Cell>() <= 16);
 
 #[derive(Clone, Copy, Debug)]
 enum Cell {
-    Lit(i64),           // push literal onto data stack
-    Str(usize),         // print strings[idx]  (string-literal pool)
-    PushStr(usize),     // push strings[idx] index as i64 onto data stack (s" literal")
-    HelloPeer(usize),   // send "hello from <hostname>!" to one peer (by addr or label) strings[idx]
-    TagPeer(u32,u32), // strings[name_idx] → label for strings[addr_idx]
-    JoinChannel(usize),          // join channel strings[idx]; broadcast "<name> joined #chan" to all peers
-    PartChannel(usize),          // leave channel strings[idx]; broadcast "<name> left #chan" to all peers
-    SayInChannel(u32,u32),   // broadcast "[#chan] name: msg" — strings[chan_idx], strings[msg_idx]
-    ProveWord(usize),            // run test:strings[idx]; show ✓ / ✗
-    Confirm(usize),     // ask user strings[idx]; push -1 (yes) or 0 (no)
-    SelectDialog(usize),// pop-up select: strings[idx] is "title|opt1|opt2|..."; push chosen index or -1
-    ReadFile(usize),    // read file at strings[idx]; emit contents to out
-    ReadCsv(usize),     // read CSV file at strings[idx]; emit as pipe-delimited rows
-    ReadTsv(usize),     // read TSV file at strings[idx]; emit as pipe-delimited rows
-    ReadXlsx(usize),    // read first sheet of xlsx/xls/ods at strings[idx]; emit rows
-    ExecCmd(usize),     // run shell command strings[idx]; emit stdout to out
-    GlobFiles(usize),   // list files matching glob strings[idx]; emit to out
-    AddPeer(usize),     // register peer address strings[idx] for scatter
-    ScatterExec(usize),           // run strings[idx] Forth code on all peers in parallel
-    ScatterBashExec(usize),       // run strings[idx] as bash -c on all peers via /v1/exec
-    ScatterStack,                 // ( code-idx -- ) scatter strings[pop()] to all peers (dynamic code)
-    ScatterSymbol(usize),         // share symbol strings[idx]: send local def if known, then run on all peers
-    ScatterOnCluster(u32,u32),// run strings[code_idx] on ensemble strings[ensemble_idx]; no side-effects on peers
-    RunOn(u32,u32),           // run strings[code_idx] on exactly one peer: strings[peer_idx] (addr or label)
-    GenAI(usize),           // call AI generator with strings[idx] as prompt; emit response
-    Builtin(Builtin),   // execute a primitive operation
-    Addr(usize),        // call word at memory[addr]: push ip+1, ip = addr
-    JmpZ(usize),        // if pop() == 0: ip = addr  (if/while/of)
-    Jmp(usize),         // ip = addr  (unconditional)
-    Until(usize),       // if pop() == 0: ip = addr  (begin..until loop back)
-    While(usize),       // if pop() == 0: ip = addr  (exit begin..while loop)
-    Repeat(usize),      // ip = addr  (back-edge of begin..while..repeat)
-    DoSetup,            // ( limit index -- ) initialise do/loop counter
-    DoLoop(usize),      // ++index; if index < limit: ip = addr
-    DoLoopPlus(usize),  // index += pop(); if index < limit: ip = addr
-    OfTest(usize),      // case/of: if TOS ≠ selector: ip = addr
-    Ret,                // pop call_stack → ip; if empty, halt
+    Lit(i64),                   // push literal onto data stack
+    Str(usize),                 // print strings[idx]  (string-literal pool)
+    PushStr(usize),             // push strings[idx] index as i64 onto data stack (s" literal")
+    HelloPeer(usize), // send "hello from <hostname>!" to one peer (by addr or label) strings[idx]
+    TagPeer(u32, u32), // strings[name_idx] → label for strings[addr_idx]
+    JoinChannel(usize), // join channel strings[idx]; broadcast "<name> joined #chan" to all peers
+    PartChannel(usize), // leave channel strings[idx]; broadcast "<name> left #chan" to all peers
+    SayInChannel(u32, u32), // broadcast "[#chan] name: msg" — strings[chan_idx], strings[msg_idx]
+    ProveWord(usize), // run test:strings[idx]; show ✓ / ✗
+    Confirm(usize),   // ask user strings[idx]; push -1 (yes) or 0 (no)
+    SelectDialog(usize), // pop-up select: strings[idx] is "title|opt1|opt2|..."; push chosen index or -1
+    ReadFile(usize),     // read file at strings[idx]; emit contents to out
+    ReadCsv(usize),      // read CSV file at strings[idx]; emit as pipe-delimited rows
+    ReadTsv(usize),      // read TSV file at strings[idx]; emit as pipe-delimited rows
+    ReadXlsx(usize),     // read first sheet of xlsx/xls/ods at strings[idx]; emit rows
+    ExecCmd(usize),      // run shell command strings[idx]; emit stdout to out
+    GlobFiles(usize),    // list files matching glob strings[idx]; emit to out
+    AddPeer(usize),      // register peer address strings[idx] for scatter
+    ScatterExec(usize),  // run strings[idx] Forth code on all peers in parallel
+    ScatterBashExec(usize), // run strings[idx] as bash -c on all peers via /v1/exec
+    ScatterStack,        // ( code-idx -- ) scatter strings[pop()] to all peers (dynamic code)
+    ScatterSymbol(usize), // share symbol strings[idx]: send local def if known, then run on all peers
+    ScatterOnCluster(u32, u32), // run strings[code_idx] on ensemble strings[ensemble_idx]; no side-effects on peers
+    RunOn(u32, u32), // run strings[code_idx] on exactly one peer: strings[peer_idx] (addr or label)
+    GenAI(usize),    // call AI generator with strings[idx] as prompt; emit response
+    Builtin(Builtin), // execute a primitive operation
+    Addr(usize),     // call word at memory[addr]: push ip+1, ip = addr
+    JmpZ(usize),     // if pop() == 0: ip = addr  (if/while/of)
+    Jmp(usize),      // ip = addr  (unconditional)
+    Until(usize),    // if pop() == 0: ip = addr  (begin..until loop back)
+    While(usize),    // if pop() == 0: ip = addr  (exit begin..while loop)
+    Repeat(usize),   // ip = addr  (back-edge of begin..while..repeat)
+    DoSetup,         // ( limit index -- ) initialise do/loop counter
+    DoLoop(usize),   // ++index; if index < limit: ip = addr
+    DoLoopPlus(usize), // index += pop(); if index < limit: ip = addr
+    OfTest(usize),   // case/of: if TOS ≠ selector: ip = addr
+    Ret,             // pop call_stack → ip; if empty, halt
 }
 
 #[derive(Clone, Debug, Copy)]
 enum Builtin {
-    Plus, Minus, Star, Slash, Mod,
-    Dup, Drop, Swap, Over, Rot, Nip, Tuck,
-    TwoDup, TwoDrop, TwoSwap,
-    TwoOver,   // ( a b c d -- a b c d a b )  copy second pair to top
-    TwoRot,    // ( a b c d e f -- c d e f a b )  rotate three pairs
-    Pick, Roll,
-    Eq, Lt, Gt, Ne, Le, Ge, ZeroEq, ZeroLt, ZeroGt, ULt,
-    And, Or, Xor, Invert, Negate, Abs, Max, Min,
-    Lshift, Rshift,
-    StarSlash, SlashMod,      // */ and /mod
-    Print, PrintU, PrintS, Cr, Space, Emit, PrintHex,
-    Fetch, Store, PlusStore, Allot, Cells,
-    LoopI, LoopJ,
-    ToR, FromR, FetchR,
-    Words,                    // list defined words
-    HotWords,                 // ( -- )  show top-10 most-called words
-    Random,                   // ( -- n )
-    Time,                     // ( -- epoch_secs )
-    Depth, Nop,
-    Fuel,                     // ( -- n )  push remaining step budget
-    WithFuel,                 // ( n addr -- )  call word at addr with n-step budget
-    Undo,                     // ( -- )  restore dictionary to state before last definition
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Mod,
+    Dup,
+    Drop,
+    Swap,
+    Over,
+    Rot,
+    Nip,
+    Tuck,
+    TwoDup,
+    TwoDrop,
+    TwoSwap,
+    TwoOver, // ( a b c d -- a b c d a b )  copy second pair to top
+    TwoRot,  // ( a b c d e f -- c d e f a b )  rotate three pairs
+    Pick,
+    Roll,
+    Eq,
+    Lt,
+    Gt,
+    Ne,
+    Le,
+    Ge,
+    ZeroEq,
+    ZeroLt,
+    ZeroGt,
+    ULt,
+    And,
+    Or,
+    Xor,
+    Invert,
+    Negate,
+    Abs,
+    Max,
+    Min,
+    Lshift,
+    Rshift,
+    StarSlash,
+    SlashMod, // */ and /mod
+    Print,
+    PrintU,
+    PrintS,
+    Cr,
+    Space,
+    Emit,
+    PrintHex,
+    Fetch,
+    Store,
+    PlusStore,
+    Allot,
+    Cells,
+    LoopI,
+    LoopJ,
+    ToR,
+    FromR,
+    FetchR,
+    Words,    // list defined words
+    HotWords, // ( -- )  show top-10 most-called words
+    Random,   // ( -- n )
+    Time,     // ( -- epoch_secs )
+    Depth,
+    Nop,
+    Fuel,     // ( -- n )  push remaining step budget
+    WithFuel, // ( n addr -- )  call word at addr with n-step budget
+    Undo,     // ( -- )  restore dictionary to state before last definition
     // Distributed locking — advisory; auto-expire; only meaningful across peers
-    Lock,                     // ( name-idx ttl-ms -- flag )  acquire if free/expired (-1) or fail (0)
-    Unlock,                   // ( name-idx -- )              release early
-    LockTtl,                  // ( name-idx -- ms )           remaining TTL (0 if free or expired)
+    Lock,    // ( name-idx ttl-ms -- flag )  acquire if free/expired (-1) or fail (0)
+    Unlock,  // ( name-idx -- )              release early
+    LockTtl, // ( name-idx -- ms )           remaining TTL (0 if free or expired)
     // Writing assistance — string manipulation + AI correction
-    Capitalize,               // ( str-idx -- str-idx )  uppercase first character
-    StrUpper,                 // ( str-idx -- str-idx )  all uppercase
-    StrLower,                 // ( str-idx -- str-idx )  all lowercase
-    StrTrim,                  // ( str-idx -- str-idx )  strip leading/trailing whitespace
-    WordCount,                // ( str-idx -- n )        number of whitespace-delimited words
-    SentenceCheck,            // ( str-idx -- flag )     -1 if starts uppercase + ends . ! ?
-    GrammarCheck,             // ( str-idx -- str-idx )  AI: return grammar-corrected sentence
-    ImproveStr,               // ( str-idx -- str-idx )  AI: return clearer/more fluent sentence
+    Capitalize,    // ( str-idx -- str-idx )  uppercase first character
+    StrUpper,      // ( str-idx -- str-idx )  all uppercase
+    StrLower,      // ( str-idx -- str-idx )  all lowercase
+    StrTrim,       // ( str-idx -- str-idx )  strip leading/trailing whitespace
+    WordCount,     // ( str-idx -- n )        number of whitespace-delimited words
+    SentenceCheck, // ( str-idx -- flag )     -1 if starts uppercase + ends . ! ?
+    GrammarCheck,  // ( str-idx -- str-idx )  AI: return grammar-corrected sentence
+    ImproveStr,    // ( str-idx -- str-idx )  AI: return clearer/more fluent sentence
     // Integer math extras
-    Sqrt,                     // ( n -- isqrt(n) )  integer square root
-    Floor,                    // ( n d -- n/d*d )   floor division result
-    Ceil,                     // ( n d -- ceil )    ceiling division
+    Sqrt,  // ( n -- isqrt(n) )  integer square root
+    Floor, // ( n d -- n/d*d )   floor division result
+    Ceil,  // ( n d -- ceil )    ceiling division
     // Trig (scaled: input in degrees * 1000, output * 1000)
-    Sin,                      // ( deg*1000 -- sin*1000 )
-    Cos,                      // ( deg*1000 -- cos*1000 )
+    Sin, // ( deg*1000 -- sin*1000 )
+    Cos, // ( deg*1000 -- cos*1000 )
     // Fixed-point helpers
-    FPMul,                    // ( a b scale -- a*b/scale )  fixed-point multiply
+    FPMul, // ( a b scale -- a*b/scale )  fixed-point multiply
     // Distributed
-    Peers,                    // ( -- )  list registered peers
-    PeersClear,               // ( -- )  remove all registered peers
-    PeersDiscover,            // ( -- )  mDNS scan; auto-add found finch daemons
-    TakeAll,                  // ( -- )  discover all LAN peers, tag+ensemble them as "all"
-    EnsembleDef,              // ( name-idx -- )  snapshot current peers as named ensemble
-    EnsembleUse,              // ( name-idx -- )  push peers, switch to named ensemble
-    EnsembleEnd,              // ( -- )           pop peers (restore previous)
-    EnsembleList,             // ( -- )           print all ensembles + members
-    LabelPeer,                // ( addr-idx label-idx -- )  attach human label to peer address
-    TagPeer,                  // ( addr-idx tag-idx -- )    add tag to peer
-    EnsembleFromTag,          // ( tag-idx -- )   build/update an ensemble from all peers with tag
-    PeerInfo,                 // ( -- )           list peers with labels + tags
-    Publish,                  // ( name-idx -- )  scatter word source to all peers via /v1/forth/define
-    Sync,                     // ( -- )           scatter all user words to all peers
+    Peers,           // ( -- )  list registered peers
+    PeersClear,      // ( -- )  remove all registered peers
+    PeersDiscover,   // ( -- )  mDNS scan; auto-add found finch daemons
+    TakeAll,         // ( -- )  discover all LAN peers, tag+ensemble them as "all"
+    EnsembleDef,     // ( name-idx -- )  snapshot current peers as named ensemble
+    EnsembleUse,     // ( name-idx -- )  push peers, switch to named ensemble
+    EnsembleEnd,     // ( -- )           pop peers (restore previous)
+    EnsembleList,    // ( -- )           print all ensembles + members
+    LabelPeer,       // ( addr-idx label-idx -- )  attach human label to peer address
+    TagPeer,         // ( addr-idx tag-idx -- )    add tag to peer
+    EnsembleFromTag, // ( tag-idx -- )   build/update an ensemble from all peers with tag
+    PeerInfo,        // ( -- )           list peers with labels + tags
+    Publish,         // ( name-idx -- )  scatter word source to all peers via /v1/forth/define
+    Sync,            // ( -- )           scatter all user words to all peers
     // Registry
-    RegistrySet,              // ( addr-idx -- )  set registry address
-    JoinRegistry,             // ( self-addr-idx -- )  register this machine; stores my_addr
-    LeaveRegistry,            // ( -- )           deregister this machine from the registry
-    FromRegistry,             // ( -- )           pull live peers from registry into self.peers
-    RegistryList,             // ( -- )           print all registry members
-    Balance,                  // ( -- )           print this machine's compute balance
-    Balances,                 // ( -- )           print all machines' compute balances
-    RecordDebit,              // ( peer-idx compute-ms -- )  record compute consumed from peer
-    DebtCheck,                // ( -- )           list machines that owe you (negative balance)
-    See(usize),               // ( -- )  show definition of strings[idx]
-    Settle,                   // ( peer-idx -- )  request settlement from a peer
-    Slowest,                  // ( -- addr-idx )  push addr of slowest live peer onto stack
-    ForthBack(usize),         // ( -- )           queue Forth code to run on the caller after response
+    RegistrySet,      // ( addr-idx -- )  set registry address
+    JoinRegistry,     // ( self-addr-idx -- )  register this machine; stores my_addr
+    LeaveRegistry,    // ( -- )           deregister this machine from the registry
+    FromRegistry,     // ( -- )           pull live peers from registry into self.peers
+    RegistryList,     // ( -- )           print all registry members
+    Balance,          // ( -- )           print this machine's compute balance
+    Balances,         // ( -- )           print all machines' compute balances
+    RecordDebit,      // ( peer-idx compute-ms -- )  record compute consumed from peer
+    DebtCheck,        // ( -- )           list machines that owe you (negative balance)
+    See(usize),       // ( -- )  show definition of strings[idx]
+    Settle,           // ( peer-idx -- )  request settlement from a peer
+    Slowest,          // ( -- addr-idx )  push addr of slowest live peer onto stack
+    ForthBack(usize), // ( -- )           queue Forth code to run on the caller after response
     // String pool operations (stack: idx is i64 index into self.strings)
-    Type,                     // ( idx -- )  print strings[idx]
-    StrEq,                    // ( idx-a idx-b -- bool )  string equality
-    StrLen,                   // ( idx -- n )  byte length of strings[idx]
-    StrCat,                   // ( idx-a idx-b -- idx-c )  concatenate
-    StrSplit,                 // ( idx sep-idx -- result-idx )  split by sep → one part per line
-    StrJoin,                  // ( idx sep-idx -- result-idx )  join newline-separated parts with sep
-    StrSub,                   // ( idx start len -- idx' )      substring (char-indexed)
-    StrFind,                  // ( idx needle-idx -- pos )       find needle; -1 if absent
-    StrReplace,               // ( idx from-idx to-idx -- idx' ) replace all occurrences
-    StrReverse,               // ( idx -- idx' )                 reverse characters
-    NumToStr,                 // ( n -- idx )  format integer as decimal string in pool
-    StrToNum,                 // ( idx -- n flag )  parse integer; flag=-1 ok, 0 fail
-    WordDefined,              // ( idx -- flag )  -1 if word named strings[idx] is defined
-    WordNames,                // ( -- idx )  all defined word names, newline-separated
-    NthLine,                  // ( idx n -- line-idx )  get nth line (0-based) of newline string
-    AgreeQ,                   // ( str1 str2 -- flag )  like argue but flag, never aborts
-    SameQ,                    // ( str1 str2 -- flag )  like versus but flag, never aborts
-    Safe,                     // ( str-idx -- flag )  eval str; -1 ok, 0 error (never aborts)
+    Type,        // ( idx -- )  print strings[idx]
+    StrEq,       // ( idx-a idx-b -- bool )  string equality
+    StrLen,      // ( idx -- n )  byte length of strings[idx]
+    StrCat,      // ( idx-a idx-b -- idx-c )  concatenate
+    StrSplit,    // ( idx sep-idx -- result-idx )  split by sep → one part per line
+    StrJoin,     // ( idx sep-idx -- result-idx )  join newline-separated parts with sep
+    StrSub,      // ( idx start len -- idx' )      substring (char-indexed)
+    StrFind,     // ( idx needle-idx -- pos )       find needle; -1 if absent
+    StrReplace,  // ( idx from-idx to-idx -- idx' ) replace all occurrences
+    StrReverse,  // ( idx -- idx' )                 reverse characters
+    NumToStr,    // ( n -- idx )  format integer as decimal string in pool
+    StrToNum,    // ( idx -- n flag )  parse integer; flag=-1 ok, 0 fail
+    WordDefined, // ( idx -- flag )  -1 if word named strings[idx] is defined
+    WordNames,   // ( -- idx )  all defined word names, newline-separated
+    NthLine,     // ( idx n -- line-idx )  get nth line (0-based) of newline string
+    AgreeQ,      // ( str1 str2 -- flag )  like argue but flag, never aborts
+    SameQ,       // ( str1 str2 -- flag )  like versus but flag, never aborts
+    Safe,        // ( str-idx -- flag )  eval str; -1 ok, 0 error (never aborts)
     // Crypto primitives (safe Rust — sha2, ed25519-dalek, rand)
-    Sha256,                   // ( idx -- idx' )  SHA-256 hex of strings[idx]
-    FileSha256,               // ( path-idx -- hex-idx )         SHA-256 of whole file (stack)
-    FileSha256Range,          // ( path-idx offset length -- hex-idx )  SHA-256 of byte range
-    FileHash,                 // ( path-idx -- )                 SHA-256 of whole file → out
-    FileHashRange,            // ( path-idx offset length -- )   SHA-256 of byte range → out
-    FileFetch,                // ( path-idx -- content-idx )     read whole file into pool
-    FileSlice,                // ( path-idx offset length -- content-idx )  byte range → pool (utf-8 lossy)
-    FileSize,                 // ( path-idx -- n )               file size in bytes
-    FileWrite,                // ( content-idx path-idx -- )     overwrite file
-    FileAppend,               // ( content-idx path-idx -- )     append to file
-    Nonce,                    // ( -- n )  cryptographically random i64
-    Keygen,                   // ( -- pub-idx priv-idx )  generate Ed25519 keypair (hex)
-    Sign,                     // ( priv-idx data-idx -- sig-idx )  Ed25519 sign
-    Verify,                   // ( pub-idx sig-idx data-idx -- bool )  Ed25519 verify
+    Sha256,          // ( idx -- idx' )  SHA-256 hex of strings[idx]
+    FileSha256,      // ( path-idx -- hex-idx )         SHA-256 of whole file (stack)
+    FileSha256Range, // ( path-idx offset length -- hex-idx )  SHA-256 of byte range
+    FileHash,        // ( path-idx -- )                 SHA-256 of whole file → out
+    FileHashRange,   // ( path-idx offset length -- )   SHA-256 of byte range → out
+    FileFetch,       // ( path-idx -- content-idx )     read whole file into pool
+    FileSlice,       // ( path-idx offset length -- content-idx )  byte range → pool (utf-8 lossy)
+    FileSize,        // ( path-idx -- n )               file size in bytes
+    FileWrite,       // ( content-idx path-idx -- )     overwrite file
+    FileAppend,      // ( content-idx path-idx -- )     append to file
+    FileZip,         // ( src-idx dest-idx -- )         zip src path → dest.zip
+    FileUnzip,       // ( zip-idx dest-idx -- )         unzip zip file → dest dir
+    Nonce,           // ( -- n )  cryptographically random i64
+    Keygen,          // ( -- pub-idx priv-idx )  generate Ed25519 keypair (hex)
+    Sign,            // ( priv-idx data-idx -- sig-idx )  Ed25519 sign
+    Verify,          // ( pub-idx sig-idx data-idx -- bool )  Ed25519 verify
     // Security scanning (pure Rust — no external tools)
-    ScanFile,                 // ( path-idx -- report-idx )  byte-level scan → text report
-    ScanBytes,                // ( str-idx -- score )        pattern risk score 0-100
-    FileEntropy,              // ( path-idx -- entropy*1000 ) Shannon entropy * 1000
-    ScanDir,                  // ( path-idx -- report-idx )  recursive dir scan
-    ScanStrings,              // ( path-idx -- str-idx )     printable strings from binary (like `strings`)
-    ScanProcs,                // ( -- report-idx )           scan running processes for suspicion
-    ScanNet,                  // ( -- report-idx )           open network connections
-    ScanStartup,              // ( -- report-idx )           persistence locations (LaunchAgents, cron, etc.)
-    Quarantine,               // ( path-idx -- flag )        move file to ~/.finch/quarantine/
+    ScanFile,    // ( path-idx -- report-idx )  byte-level scan → text report
+    ScanBytes,   // ( str-idx -- score )        pattern risk score 0-100
+    FileEntropy, // ( path-idx -- entropy*1000 ) Shannon entropy * 1000
+    ScanDir,     // ( path-idx -- report-idx )  recursive dir scan
+    ScanStrings, // ( path-idx -- str-idx )     printable strings from binary (like `strings`)
+    ScanProcs,   // ( -- report-idx )           scan running processes for suspicion
+    ScanNet,     // ( -- report-idx )           open network connections
+    ScanStartup, // ( -- report-idx )           persistence locations (LaunchAgents, cron, etc.)
+    Quarantine,  // ( path-idx -- flag )        move file to ~/.finch/quarantine/
     // Terminal control (crossterm-backed)
-    AtXy,                     // ( col row -- )  move cursor to col, row
-    TermSize,                 // ( -- cols rows )  push terminal dimensions
-    SaveCursor,               // ( -- )  save cursor position
-    RestoreCursor,            // ( -- )  restore cursor position
-    ClearEol,                 // ( -- )  clear from cursor to end of line
-    ClearLine,                // ( -- )  clear entire current line
-    ColorFg,                  // ( n -- )  set foreground ANSI color 0-255
-    ResetStyle,               // ( -- )  reset all text attributes
-    SyncBegin,                // ( -- )  begin synchronized update
-    SyncEnd,                  // ( -- )  end synchronized update
-    HideCursor,               // ( -- )  hide terminal cursor
-    ShowCursor,               // ( -- )  show terminal cursor
-    Connected,                // ( -- flag )  -1 if peers/registry active, 0 if isolated
+    AtXy,          // ( col row -- )  move cursor to col, row
+    TermSize,      // ( -- cols rows )  push terminal dimensions
+    SaveCursor,    // ( -- )  save cursor position
+    RestoreCursor, // ( -- )  restore cursor position
+    ClearEol,      // ( -- )  clear from cursor to end of line
+    ClearLine,     // ( -- )  clear entire current line
+    ColorFg,       // ( n -- )  set foreground ANSI color 0-255
+    ResetStyle,    // ( -- )  reset all text attributes
+    SyncBegin,     // ( -- )  begin synchronized update
+    SyncEnd,       // ( -- )  end synchronized update
+    HideCursor,    // ( -- )  hide terminal cursor
+    ShowCursor,    // ( -- )  show terminal cursor
+    Connected,     // ( -- flag )  -1 if peers/registry active, 0 if isolated
     /// Increment/decrement TOS in-place — peephole result of `1 +` / `1 -`.
-    Inc,   // ( n -- n+1 )
-    Dec,   // ( n -- n-1 )
+    Inc, // ( n -- n+1 )
+    Dec,           // ( n -- n-1 )
     /// Heap memory allocation (Forth standard words).
-    Here,    // ( -- addr )    address of next free heap cell
-    Comma,   // ( val -- )     store val at here, advance here
-    CellSz,  // ( -- 1 )       size of one cell (1 — heap uses i64 units)
-    Fill,    // ( addr n val -- )  fill n cells at addr with val
-    Eval,    // ( str -- )    eval strings[pop()] as Forth source code
-    Argue,      // ( str1 str2 -- )  run both, show what each got, assert they agree
+    Here, // ( -- addr )    address of next free heap cell
+    Comma,         // ( val -- )     store val at here, advance here
+    CellSz,        // ( -- 1 )       size of one cell (1 — heap uses i64 units)
+    Fill,          // ( addr n val -- )  fill n cells at addr with val
+    Eval,          // ( str -- )    eval strings[pop()] as Forth source code
+    Argue,         // ( str1 str2 -- )  run both, show what each got, assert they agree
     ArgueCases, // ( op1 op2 -- )   test both ops against a battery of seeds; show per-seed verdict
     Versus,     // ( str1 str2 -- )  run both, show FULL stacks side by side, assert they agree
     BothWays,   // ( a b str -- )   run op(a,b) and op(b,a), show both, assert they agree
-    Gate,      // ( str1 str2 check -- result )  run both, apply check; if check passes leave result
-    Page,      // ( str -- )    run a multi-line proof page: each line is "left | right"
-    Resolve,   // ( str -- )    many sentences, one truth: all lines must converge to same value
-    Infix,        // ( str -- )    eval infix expression: "3 + 4", "10 * 5 - 2", etc.
+    Gate, // ( str1 str2 check -- result )  run both, apply check; if check passes leave result
+    Page, // ( str -- )    run a multi-line proof page: each line is "left | right"
+    Resolve, // ( str -- )    many sentences, one truth: all lines must converge to same value
+    Infix, // ( str -- )    eval infix expression: "3 + 4", "10 * 5 - 2", etc.
     RegisterBoot, // ( str -- )    register a boot poem line; REPL persists to ~/.finch/boot.forth
     // Proof system
-    Assert,                   // ( flag -- )  bail "assertion failed" if flag == 0
-    ProveAll,                 // ( -- )  run all test:* words; report pass/fail
-    ProveAllBool,             // ( -- flag )  run all test:* words; push -1 (all pass) or 0 (any fail)
-    ProveEnglish,             // ( -- )  run every English-library word body; report pass rate
-    ProveLanguages,           // ( -- )  argue English ↔ Chinese on shared Forth primitives
+    Assert,         // ( flag -- )  bail "assertion failed" if flag == 0
+    ProveAll,       // ( -- )  run all test:* words; report pass/fail
+    ProveAllBool,   // ( -- flag )  run all test:* words; push -1 (all pass) or 0 (any fail)
+    ProveEnglish,   // ( -- )  run every English-library word body; report pass rate
+    ProveLanguages, // ( -- )  argue English ↔ Chinese on shared Forth primitives
     // Channel system
-    ListChannels,             // ( -- )  print joined channels
+    ListChannels, // ( -- )  print joined channels
     // Collection operations
-    SortLines,                // ( idx -- idx' )  sort lines of strings[idx] alphabetically
-    UniqueLines,              // ( idx -- idx' )  deduplicate lines of strings[idx]
-    ReverseLines,             // ( idx -- idx' )  reverse line order of strings[idx]
-    LineCount,                // ( idx -- n )     number of lines in strings[idx]
-    GlobPool,                 // ( pattern-idx -- result-idx )  glob into string pool (one path per line)
-    CleanLines,               // ( idx -- n )  quarantine each path in strings[idx] (one per line); return count
-    GlobCount,                // ( pattern-idx -- n )  count files matching glob pattern
-    ExecCapture,              // ( cmd-idx -- output-idx )  run shell command; push stdout as string pool entry
-    BackAndForthQ,            // ( n fwd-str back-str -- flag )  round-trip predicate; never aborts
-    InvertibleQ,              // ( n str -- flag )  apply str twice; -1 if f(f(n))=n (involution test)
-    Help,                     // ( -- )  print the Co-Forth quick-reference guide
-    Describe,                 // ( idx -- )  describe a word: stack signature, source, or builtin notice
-    Compute,                  // ( str-idx -- )  evaluate as Forth; fall back to infix; print "= result"
-    EquivQ,                   // ( str1 str2 -- flag )  -1 if programs agree on inputs -5..5; the equivalence probe
-    Fork,                     // ( str-idx -- )  run code in a forked copy (current stack shared); discard copy
-    Boot,                     // ( -- )  re-execute all boot=true vocabulary words
-    PrintR,                   // ( n width -- )  print n right-aligned in field of width chars
-    PrintPad,                 // ( n width char-idx -- )  print n padded with char to width
+    SortLines,     // ( idx -- idx' )  sort lines of strings[idx] alphabetically
+    UniqueLines,   // ( idx -- idx' )  deduplicate lines of strings[idx]
+    ReverseLines,  // ( idx -- idx' )  reverse line order of strings[idx]
+    LineCount,     // ( idx -- n )     number of lines in strings[idx]
+    GlobPool,      // ( pattern-idx -- result-idx )  glob into string pool (one path per line)
+    CleanLines, // ( idx -- n )  quarantine each path in strings[idx] (one per line); return count
+    GlobCount,  // ( pattern-idx -- n )  count files matching glob pattern
+    ExecCapture, // ( cmd-idx -- output-idx )  run shell command; push stdout as string pool entry
+    BackAndForthQ, // ( n fwd-str back-str -- flag )  round-trip predicate; never aborts
+    InvertibleQ, // ( n str -- flag )  apply str twice; -1 if f(f(n))=n (involution test)
+    Help,       // ( -- )  print the Co-Forth quick-reference guide
+    Describe,   // ( idx -- )  describe a word: stack signature, source, or builtin notice
+    Compute,    // ( str-idx -- )  evaluate as Forth; fall back to infix; print "= result"
+    EquivQ, // ( str1 str2 -- flag )  -1 if programs agree on inputs -5..5; the equivalence probe
+    Fork,   // ( str-idx -- )  run code in a forked copy (current stack shared); discard copy
+    Boot,   // ( -- )  re-execute all boot=true vocabulary words
+    PrintR, // ( n width -- )  print n right-aligned in field of width chars
+    PrintPad, // ( n width char-idx -- )  print n padded with char to width
     // Fast integer hash operations
-    Hash,                     // ( str-idx -- n )  FNV1a-64 hash of strings[idx] → i64
-    HashInt,                  // ( n -- n' )       integer mix hash (fast, avalanche)
-    HashCombine,              // ( h n -- h' )     combine two hash values (for chaining)
+    Hash,        // ( str-idx -- n )  FNV1a-64 hash of strings[idx] → i64
+    HashInt,     // ( n -- n' )       integer mix hash (fast, avalanche)
+    HashCombine, // ( h n -- h' )     combine two hash values (for chaining)
     // Shared-hash / room operations
-    HPut,        // ( val-idx key-idx -- )   set key in current room's hash; sync to members
-    HFetch,      // ( key-idx -- val-idx )   get value (empty string if absent)
-    HDel,        // ( key-idx -- )           delete key from current room's hash; sync
-    HPrint,      // ( -- )                   print all key-value pairs in current room's hash
-    HHas,        // ( key-idx -- flag )      1 if key exists, else 0
-    RoomUse,     // ( uuid-idx -- )          join/create room by UUID string; sets current_room
-    RoomAdd,     // ( addr-idx -- )          add peer address to current room's member list
-    RoomSub,     // ( addr-idx -- )          remove peer address from current room's member list
-    RoomList,    // ( -- )                   print all rooms with member counts
-    RoomNew,     // ( -- uuid-idx )          create a new room with a fresh UUID; sets current
+    HPut,     // ( val-idx key-idx -- )   set key in current room's hash; sync to members
+    HFetch,   // ( key-idx -- val-idx )   get value (empty string if absent)
+    HDel,     // ( key-idx -- )           delete key from current room's hash; sync
+    HPrint,   // ( -- )                   print all key-value pairs in current room's hash
+    HHas,     // ( key-idx -- flag )      1 if key exists, else 0
+    RoomUse,  // ( uuid-idx -- )          join/create room by UUID string; sets current_room
+    RoomAdd,  // ( addr-idx -- )          add peer address to current room's member list
+    RoomSub,  // ( addr-idx -- )          remove peer address from current room's member list
+    RoomList, // ( -- )                   print all rooms with member counts
+    RoomNew,  // ( -- uuid-idx )          create a new room with a fresh UUID; sets current
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
@@ -297,19 +344,19 @@ pub type GenFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 pub type SelectFn = Box<dyn Fn(&str, &[String]) -> i64 + Send + Sync>;
 
 pub struct Forth {
-    data:       Vec<i64>,
-    loop_stack: Vec<(i64, i64)>,         // (index, limit) for do/loop
-    rstack:     Vec<i64>,                // >r / r> scratch stack
-    memory:     Vec<Cell>,               // flat code memory (von Neumann)
-    strings:    Vec<String>,             // string-literal pool
-    string_dedup: HashMap<String, usize>, // reverse index for dedup (same literal → same idx)
-    name_index: HashMap<String, usize>,  // word name → entry address in memory
-    call_counts: HashMap<usize, u64>,    // addr → call count (hot call detection)
-    heap:       Vec<i64>,                // variable storage
-    var_index:  HashMap<String, usize>,  // variable name → heap address
-    pub out:    String,
+    data: Vec<i64>,
+    loop_stack: Vec<(i64, i64)>,             // (index, limit) for do/loop
+    rstack: Vec<i64>,                        // >r / r> scratch stack
+    memory: Vec<Cell>,                       // flat code memory (von Neumann)
+    strings: Vec<String>,                    // string-literal pool
+    string_dedup: HashMap<String, usize>,    // reverse index for dedup (same literal → same idx)
+    name_index: Arc<HashMap<String, usize>>, // word name → entry address in memory
+    call_counts: HashMap<usize, u64>,        // addr → call count (hot call detection)
+    heap: Vec<i64>,                          // variable storage
+    var_index: Arc<HashMap<String, usize>>,  // variable name → heap address
+    pub out: String,
     /// Peer addresses for `scatter"`.  Each entry is a host:port or URL.
-    pub peers:  Vec<String>,
+    pub peers: Vec<String>,
     /// Source log — every user-defined `: name body ;` compiled into this VM, in order.
     /// Lets the VM be serialised to Forth source and pasted into another session.
     /// Only active after stdlib init; stdlib words are intentionally excluded.
@@ -393,14 +440,14 @@ pub struct Room {
 #[derive(Debug, Clone, Default)]
 pub struct PeerMeta {
     pub label: Option<String>,
-    pub tags:  Vec<String>,
+    pub tags: Vec<String>,
     /// Authentication token for this peer's daemon endpoints.
     /// Populated automatically from mDNS TXT record on discovery.
     pub token: Option<String>,
 }
 
-const MAX_CALL_DEPTH: usize  = 1024;
-const MAX_DATA_DEPTH: usize  = 1024; // data stack overflow guard
+const MAX_CALL_DEPTH: usize = 1024;
+const MAX_DATA_DEPTH: usize = 1024; // data stack overflow guard
 /// Default step budget for interactive vocabulary words.
 /// 1M steps: enough for fib(20) (~300k steps), gcd, most recursive definitions.
 /// Catches infinite loops in ~1ms rather than seconds.
@@ -411,12 +458,12 @@ const DEFAULT_FUEL: usize = 1_000_000;
 /// Used to implement undo: restore the dictionary to a previous point.
 #[derive(Clone)]
 pub struct DictionarySnapshot {
-    memory_len:   usize,
-    strings_len:  usize,
-    heap_len:     usize,
-    name_index:   HashMap<String, usize>,
-    var_index:    HashMap<String, usize>,
-    source_log:   Vec<String>, // full snapshot — handles in-place redefinition correctly
+    memory_len: usize,
+    strings_len: usize,
+    heap_len: usize,
+    name_index: Arc<HashMap<String, usize>>, // O(1) clone — refcount bump only
+    var_index: Arc<HashMap<String, usize>>,  // O(1) clone — refcount bump only
+    source_log: Vec<String>, // full snapshot — handles in-place redefinition correctly
 }
 
 // ── Standard library (pre-loaded Forth definitions) ──────────────────────────
@@ -715,6 +762,8 @@ const STDLIB: &str = r#"
 : file-slice        ( path off n -- data )   file-slice ;
 : file-sha256       ( path -- hash )         file-sha256 ;
 : file-sha256-range ( path off n -- hash )   file-sha256-range ;
+: file-zip          ( src dest -- )          file-zip ;
+: file-unzip        ( zip dest -- )          file-unzip ;
 : file-hash         ( path -- )              file-hash ;
 : file-hash-range   ( path off n -- )        file-hash-range ;
 : scan-file         ( path -- report )       scan-file ;
@@ -998,6 +1047,7 @@ const STDLIB_PROOFS: &str = r#"
 \ ── Logic / comparison ──────────────────────────────────────────────────────
 : test:true      true  -1 = assert ;
 : test:false     false  0 = assert ;
+: test:true<>false  true false <> assert ;
 : test:bool      0 bool 0 = assert  1 bool -1 = assert  -5 bool -1 = assert ;
 : test:odd?      3 odd? assert   4 odd? 0= assert   0 odd? 0= assert   1 odd? assert ;
 : test:positive? 1 positive? assert   0 positive? 0= assert  -1 positive? 0= assert ;
@@ -1231,41 +1281,41 @@ variable _tm  ( shared test memory cell )
 impl Forth {
     pub fn new() -> Self {
         let mut f = Forth {
-            data:       Vec::with_capacity(32),
+            data: Vec::with_capacity(32),
             loop_stack: Vec::with_capacity(8),
-            rstack:     Vec::with_capacity(8),
-            memory:     Vec::with_capacity(4096),
-            strings:    Vec::with_capacity(256),
+            rstack: Vec::with_capacity(8),
+            memory: Vec::with_capacity(4096),
+            strings: Vec::with_capacity(256),
             string_dedup: HashMap::with_capacity(256),
-            name_index:   HashMap::with_capacity(512),
-            call_counts:  HashMap::with_capacity(64),
-            heap:         Vec::with_capacity(64),
-            var_index:  HashMap::with_capacity(64),
-            out:        String::with_capacity(256),
-            peers:           Vec::new(),
-            source_log:      Vec::new(),
+            name_index: Arc::new(HashMap::with_capacity(512)),
+            call_counts: HashMap::with_capacity(64),
+            heap: Vec::with_capacity(64),
+            var_index: Arc::new(HashMap::with_capacity(64)),
+            out: String::with_capacity(256),
+            peers: Vec::new(),
+            source_log: Vec::new(),
             log_definitions: false, // off during stdlib load
-            fuel:            usize::MAX, // unlimited while loading stdlib
-            undo_stack:      Vec::new(),
-            locks:           HashMap::new(),
-            confirm_fn:      None,
-            gen_fn:          None,
-            select_fn:       None,
+            fuel: usize::MAX,       // unlimited while loading stdlib
+            undo_stack: Vec::new(),
+            locks: HashMap::new(),
+            confirm_fn: None,
+            gen_fn: None,
+            select_fn: None,
             remote_whitelist: std::collections::HashSet::new(),
-            ensembles:        HashMap::new(),
-            peer_save_stack:  Vec::new(),
-            peer_meta:        HashMap::new(),
-            remote_mode:      false,
-            registry_addr:    None,
-            my_addr:          None,
-            rooms:            HashMap::new(),
-            current_room:     None,
-            forth_back:       None,
-            channels:         std::collections::HashSet::new(),
-            boot_poems:       Vec::new(),
-            pending_defines:  Vec::new(),
-            user_word_names:  std::collections::HashSet::new(),
-            call_stack:       Vec::with_capacity(64),
+            ensembles: HashMap::new(),
+            peer_save_stack: Vec::new(),
+            peer_meta: HashMap::new(),
+            remote_mode: false,
+            registry_addr: None,
+            my_addr: None,
+            rooms: HashMap::new(),
+            current_room: None,
+            forth_back: None,
+            channels: std::collections::HashSet::new(),
+            boot_poems: Vec::new(),
+            pending_defines: Vec::new(),
+            user_word_names: std::collections::HashSet::new(),
+            call_stack: Vec::with_capacity(64),
         };
         // Load standard library silently — not logged (every session has stdlib)
         let _ = f.eval(STDLIB);
@@ -1311,7 +1361,9 @@ impl Forth {
     }
 
     /// Expose the data stack (for inspection).
-    pub fn stack(&self) -> &[i64] { &self.data }
+    pub fn stack(&self) -> &[i64] {
+        &self.data
+    }
 
     /// Attach a confirm callback (builder pattern).
     ///
@@ -1356,10 +1408,14 @@ impl Forth {
 
     /// Disable word-definition logging (used when compiling library/system words that
     /// must not end up in `user_word_names`).  Call `enable_logging()` to restore.
-    pub fn disable_logging(&mut self) { self.log_definitions = false; }
+    pub fn disable_logging(&mut self) {
+        self.log_definitions = false;
+    }
 
     /// Re-enable word-definition logging after a `disable_logging()` call.
-    pub fn enable_logging(&mut self) { self.log_definitions = true; }
+    pub fn enable_logging(&mut self) {
+        self.log_definitions = true;
+    }
 
     /// Execute Forth source on this instance and return collected output.
     /// Uses the default fuel budget (100k steps). For heavy computation use `exec_with_fuel`.
@@ -1409,7 +1465,6 @@ impl Forth {
         self.memory.len()
     }
 
-
     /// Mark a word as callable by remote peers.
     pub fn mark_remote_ok(&mut self, word: &str) {
         self.remote_whitelist.insert(word.to_string());
@@ -1419,9 +1474,14 @@ impl Forth {
     /// These are safe to expose: read-only scanning, no mutations.
     fn seed_remote_whitelist(&mut self) {
         for word in &[
-            "scan-file", "scan-bytes", "file-entropy",
-            "scan-dir", "scan-strings", "scan-procs",
-            "scan-net", "scan-startup",
+            "scan-file",
+            "scan-bytes",
+            "file-entropy",
+            "scan-dir",
+            "scan-strings",
+            "scan-procs",
+            "scan-net",
+            "scan-startup",
         ] {
             self.remote_whitelist.insert(word.to_string());
         }
@@ -1431,10 +1491,14 @@ impl Forth {
     /// Words with `remote = true` are added to the remote whitelist.
     pub fn compile_library(&mut self, lib: &crate::coforth::Library) {
         for entry in lib.all_entries() {
-            let Some(forth_code) = &entry.forth else { continue };
+            let Some(forth_code) = &entry.forth else {
+                continue;
+            };
             // Sanitize the word name: no spaces, no semicolons
             let name = &entry.word;
-            if name.contains(' ') || name.contains(';') { continue; }
+            if name.contains(' ') || name.contains(';') {
+                continue;
+            }
             let def = format!(": {} {} ;", name, forth_code);
             if self.exec(&def).is_ok() && entry.remote {
                 self.remote_whitelist.insert(name.clone());
@@ -1450,7 +1514,10 @@ impl Forth {
         let word = word.trim();
         // Reject anything that looks like code rather than a plain word name
         if word.contains(' ') || word.contains('\n') || word.contains(';') || word.contains(':') {
-            anyhow::bail!("remote: only single word names are accepted, not: {:?}", word);
+            anyhow::bail!(
+                "remote: only single word names are accepted, not: {:?}",
+                word
+            );
         }
         if !self.remote_whitelist.contains(word) {
             anyhow::bail!("remote: word '{}' is not in the remote vocabulary", word);
@@ -1471,41 +1538,41 @@ impl Forth {
 
     pub fn clone_dict(&self) -> Self {
         Forth {
-            data:       Vec::new(),
+            data: Vec::new(),
             loop_stack: Vec::new(),
-            rstack:     Vec::new(),
-            memory:     self.memory.clone(),
-            strings:    self.strings.clone(),
+            rstack: Vec::new(),
+            memory: self.memory.clone(),
+            strings: self.strings.clone(),
             string_dedup: self.string_dedup.clone(),
-            name_index:  self.name_index.clone(),
-            call_counts: HashMap::new(),  // fresh counter per clone — don't inherit parent's profile
-            heap:        self.heap.clone(),
-            var_index:   self.var_index.clone(),
-            out:         String::new(),
-            peers:       self.peers.clone(),
-            source_log:  Vec::new(),    // fresh log — don't inherit parent's history
+            name_index: Arc::clone(&self.name_index),
+            call_counts: HashMap::new(), // fresh counter per clone — don't inherit parent's profile
+            heap: self.heap.clone(),
+            var_index: Arc::clone(&self.var_index),
+            out: String::new(),
+            peers: self.peers.clone(),
+            source_log: Vec::new(), // fresh log — don't inherit parent's history
             log_definitions: true,
-            fuel:        DEFAULT_FUEL,
-            undo_stack:  Vec::new(),
-            locks:      HashMap::new(),
+            fuel: DEFAULT_FUEL,
+            undo_stack: Vec::new(),
+            locks: HashMap::new(),
             confirm_fn: None,
-            gen_fn:     None,
-            select_fn:  None,
+            gen_fn: None,
+            select_fn: None,
             remote_whitelist: self.remote_whitelist.clone(),
-            ensembles:        self.ensembles.clone(),
-            peer_save_stack:  Vec::new(),
-            peer_meta:        self.peer_meta.clone(),
-            remote_mode:      false, // caller sets true for remote VMs
-            registry_addr:    self.registry_addr.clone(),
-            my_addr:          self.my_addr.clone(),
-            rooms:            self.rooms.clone(),
-            current_room:     self.current_room.clone(),
-            forth_back:       None,
-            channels:         self.channels.clone(),
-            boot_poems:       Vec::new(),
-            pending_defines:  Vec::new(),
-            user_word_names:  self.user_word_names.clone(),
-            call_stack:       Vec::with_capacity(64),
+            ensembles: self.ensembles.clone(),
+            peer_save_stack: Vec::new(),
+            peer_meta: self.peer_meta.clone(),
+            remote_mode: false, // caller sets true for remote VMs
+            registry_addr: self.registry_addr.clone(),
+            my_addr: self.my_addr.clone(),
+            rooms: self.rooms.clone(),
+            current_room: self.current_room.clone(),
+            forth_back: None,
+            channels: self.channels.clone(),
+            boot_poems: Vec::new(),
+            pending_defines: Vec::new(),
+            user_word_names: self.user_word_names.clone(),
+            call_stack: Vec::with_capacity(64),
         }
     }
 
@@ -1529,12 +1596,12 @@ impl Forth {
     /// Snapshot the current dictionary state (word definitions only, not the data stack).
     pub fn snapshot(&self) -> DictionarySnapshot {
         DictionarySnapshot {
-            memory_len:  self.memory.len(),
+            memory_len: self.memory.len(),
             strings_len: self.strings.len(),
-            heap_len:    self.heap.len(),
-            name_index:  self.name_index.clone(),
-            var_index:   self.var_index.clone(),
-            source_log:  self.source_log.clone(),
+            heap_len: self.heap.len(),
+            name_index: Arc::clone(&self.name_index), // O(1) refcount bump
+            var_index: Arc::clone(&self.var_index),   // O(1) refcount bump
+            source_log: self.source_log.clone(),
         }
     }
 
@@ -1547,8 +1614,8 @@ impl Forth {
         self.string_dedup.retain(|_, v| *v < strings_len);
         self.strings.truncate(strings_len);
         self.heap.truncate(snap.heap_len);
-        self.name_index = snap.name_index.clone();
-        self.var_index  = snap.var_index.clone();
+        self.name_index = Arc::clone(&snap.name_index); // O(1) swap
+        self.var_index = Arc::clone(&snap.var_index); // O(1) swap
         self.source_log = snap.source_log.clone();
     }
 
@@ -1561,7 +1628,10 @@ impl Forth {
     /// Return the source of a single named word, or None if not in source_log.
     pub fn word_source(&self, name: &str) -> Option<String> {
         let prefix = format!(": {} ", name);
-        self.source_log.iter().find(|e| e.starts_with(&prefix)).cloned()
+        self.source_log
+            .iter()
+            .find(|e| e.starts_with(&prefix))
+            .cloned()
     }
 }
 
@@ -1599,24 +1669,41 @@ impl Forth {
                 ":" => {
                     flush_pending!();
                     pos += 1;
-                    if pos >= tokens.len() { bail!("expected name after :"); }
+                    if pos >= tokens.len() {
+                        bail!("expected name after :");
+                    }
                     let name = tokens[pos].to_lowercase();
                     pos += 1;
                     let mut body = Vec::new();
                     let mut depth = 1i32;
                     while pos < tokens.len() {
                         match tokens[pos].as_str() {
-                            ";" if depth == 1 => { depth = 0; break; }
-                            ";" => { depth -= 1; body.push(tokens[pos].clone()); }
-                            ":" => { depth += 1; body.push(tokens[pos].clone()); }
-                            _ => { body.push(tokens[pos].clone()); }
+                            ";" if depth == 1 => {
+                                depth = 0;
+                                break;
+                            }
+                            ";" => {
+                                depth -= 1;
+                                body.push(tokens[pos].clone());
+                            }
+                            ":" => {
+                                depth += 1;
+                                body.push(tokens[pos].clone());
+                            }
+                            _ => {
+                                body.push(tokens[pos].clone());
+                            }
                         }
                         pos += 1;
                     }
-                    if depth != 0 { bail!("missing ; for :{name}"); }
+                    if depth != 0 {
+                        bail!("missing ; for :{name}");
+                    }
                     // Auto-push undo snapshot before each user definition (capped at 20).
                     if self.log_definitions {
-                        if self.undo_stack.len() >= 20 { self.undo_stack.remove(0); }
+                        if self.undo_stack.len() >= 20 {
+                            self.undo_stack.remove(0);
+                        }
                         self.undo_stack.push(self.snapshot());
                     }
                     // Log user-defined words so the VM is serialisable.
@@ -1625,7 +1712,9 @@ impl Forth {
                     if self.log_definitions {
                         let entry = format!(": {} {} ;", name, body.join(" "));
                         let prefix = format!(": {} ", name);
-                        if let Some(pos) = self.source_log.iter().position(|e| e.starts_with(&prefix)) {
+                        if let Some(pos) =
+                            self.source_log.iter().position(|e| e.starts_with(&prefix))
+                        {
                             self.source_log[pos] = entry.clone();
                         } else {
                             self.source_log.push(entry.clone());
@@ -1633,7 +1722,8 @@ impl Forth {
                         // Word propagation: broadcast definition to all channel members.
                         if !self.channels.is_empty() && !self.peers.is_empty() {
                             let my_name = hostname::get()
-                                .ok().and_then(|h| h.into_string().ok())
+                                .ok()
+                                .and_then(|h| h.into_string().ok())
                                 .unwrap_or_else(|| "someone".to_string());
                             let from = self.registry_addr.clone();
                             let tokens_map = peer_tokens_map(&self.peer_meta);
@@ -1646,14 +1736,18 @@ impl Forth {
                     // Redefinitions are always allowed silently.
                     // Register entry address BEFORE compiling body so `recurse` resolves.
                     let word_addr = self.memory.len();
-                    self.name_index.insert(name.clone(), word_addr);
+                    Arc::make_mut(&mut self.name_index).insert(name.clone(), word_addr);
                     if self.log_definitions {
                         self.user_word_names.insert(name.clone());
                     }
                     self.compile_into(&body, false)?;
                     // Patch Addr(usize::MAX) recurse placeholders with the real word_addr.
                     for cell in &mut self.memory[word_addr..] {
-                        if let Cell::Addr(a) = cell { if *a == usize::MAX { *a = word_addr; } }
+                        if let Cell::Addr(a) = cell {
+                            if *a == usize::MAX {
+                                *a = word_addr;
+                            }
+                        }
                     }
                     self.memory.push(Cell::Ret);
                     self.apply_tco(word_addr);
@@ -1662,11 +1756,16 @@ impl Forth {
                     // `42 constant answer` — pop value, define word that pushes it.
                     flush_pending!();
                     pos += 1;
-                    if pos >= tokens.len() { bail!("expected name after constant"); }
+                    if pos >= tokens.len() {
+                        bail!("expected name after constant");
+                    }
                     let name = tokens[pos].to_lowercase();
-                    let value = self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow in constant"))?;
+                    let value = self
+                        .data
+                        .pop()
+                        .ok_or_else(|| anyhow::anyhow!("stack underflow in constant"))?;
                     let word_addr = self.memory.len();
-                    self.name_index.insert(name.clone(), word_addr);
+                    Arc::make_mut(&mut self.name_index).insert(name.clone(), word_addr);
                     self.memory.push(Cell::Lit(value));
                     self.memory.push(Cell::Ret);
                     if self.log_definitions {
@@ -1678,19 +1777,24 @@ impl Forth {
                     // The word pushes the current heap value (not the address).
                     flush_pending!();
                     pos += 1;
-                    if pos >= tokens.len() { bail!("expected name after value"); }
+                    if pos >= tokens.len() {
+                        bail!("expected name after value");
+                    }
                     let name = tokens[pos].to_lowercase();
-                    let init = self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow in value"))?;
+                    let init = self
+                        .data
+                        .pop()
+                        .ok_or_else(|| anyhow::anyhow!("stack underflow in value"))?;
                     let addr = self.heap.len();
                     self.heap.push(init);
                     // Define the word: push heap addr, then fetch.
                     let word_addr = self.memory.len();
-                    self.name_index.insert(name.clone(), word_addr);
+                    Arc::make_mut(&mut self.name_index).insert(name.clone(), word_addr);
                     self.memory.push(Cell::Lit(addr as i64));
                     self.memory.push(Cell::Builtin(Builtin::Fetch));
                     self.memory.push(Cell::Ret);
                     // Also register in var_index so `to` can find the address.
-                    self.var_index.insert(format!("value:{name}"), addr);
+                    Arc::make_mut(&mut self.var_index).insert(format!("value:{name}"), addr);
                     if self.log_definitions {
                         self.source_log.push(format!("{init} value {name}"));
                     }
@@ -1699,44 +1803,57 @@ impl Forth {
                     // `42 to answer` — store TOS into a `value`'s heap cell.
                     flush_pending!();
                     pos += 1;
-                    if pos >= tokens.len() { bail!("expected name after to"); }
+                    if pos >= tokens.len() {
+                        bail!("expected name after to");
+                    }
                     let name = tokens[pos].to_lowercase();
                     let key = format!("value:{name}");
-                    let addr = *self.var_index.get(&key)
+                    let addr = *self
+                        .var_index
+                        .get(&key)
                         .ok_or_else(|| anyhow::anyhow!("`to {name}`: not a value"))?;
-                    let v = self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow in `to`"))?;
+                    let v = self
+                        .data
+                        .pop()
+                        .ok_or_else(|| anyhow::anyhow!("stack underflow in `to`"))?;
                     self.heap[addr] = v;
                 }
                 "variable" => {
                     flush_pending!();
                     pos += 1;
-                    if pos >= tokens.len() { bail!("expected name after variable"); }
+                    if pos >= tokens.len() {
+                        bail!("expected name after variable");
+                    }
                     let name = tokens[pos].to_lowercase();
                     let addr = self.heap.len();
                     self.heap.push(0);
-                    self.var_index.insert(name, addr);
+                    Arc::make_mut(&mut self.var_index).insert(name, addr);
                 }
                 "create" => {
                     flush_pending!();
                     pos += 1;
-                    if pos >= tokens.len() { bail!("expected name after create"); }
+                    if pos >= tokens.len() {
+                        bail!("expected name after create");
+                    }
                     let name = tokens[pos].to_lowercase();
                     // Allocate a heap address for this word's data field.
                     let data_addr = self.heap.len() as i64;
                     // Define a word that pushes its data address when called.
                     let word_addr = self.memory.len();
-                    self.name_index.insert(name, word_addr);
+                    Arc::make_mut(&mut self.name_index).insert(name, word_addr);
                     self.memory.push(Cell::Lit(data_addr));
                     self.memory.push(Cell::Ret);
                 }
                 "forget" => {
                     flush_pending!();
                     pos += 1;
-                    if pos >= tokens.len() { bail!("expected name after forget"); }
+                    if pos >= tokens.len() {
+                        bail!("expected name after forget");
+                    }
                     let name = tokens[pos].to_lowercase();
                     // Remove from word and variable indices so the name is unreachable.
-                    self.name_index.remove(&name);
-                    self.var_index.remove(&name);
+                    Arc::make_mut(&mut self.name_index).remove(&name);
+                    Arc::make_mut(&mut self.var_index).remove(&name);
                     // Remove from source log so dump/undo are clean.
                     let word_prefix = format!(": {} ", name);
                     self.source_log.retain(|e| !e.starts_with(&word_prefix));
@@ -1761,7 +1878,10 @@ impl Forth {
             match tokens[i].as_str() {
                 // `;` outside a word definition = sentence separator (no-op).
                 // Allows natural language like "Hello; I am a Forth program."
-                ";" => { i += 1; continue; }
+                ";" => {
+                    i += 1;
+                    continue;
+                }
                 // `exit` — unconditional return from the current word.
                 // Compiles a Ret cell directly; safe to use anywhere in a definition.
                 "exit" => {
@@ -1803,8 +1923,12 @@ impl Forth {
                     let begin_addr = self.memory.len();
                     self.compile_into(&body, false)?;
                     match end_kind.as_str() {
-                        "until" => { self.memory.push(Cell::Until(begin_addr)); }
-                        "again" => { self.memory.push(Cell::Jmp(begin_addr)); }
+                        "until" => {
+                            self.memory.push(Cell::Until(begin_addr));
+                        }
+                        "again" => {
+                            self.memory.push(Cell::Jmp(begin_addr));
+                        }
                         "while" => {
                             let while_pos = self.memory.len();
                             self.memory.push(Cell::While(0)); // forward: patch to after repeat
@@ -1854,7 +1978,9 @@ impl Forth {
                         self.memory[p] = Cell::Jmp(endcase);
                     }
                 }
-                _ => { self.emit_token(&tokens[i])?; }
+                _ => {
+                    self.emit_token(&tokens[i])?;
+                }
             }
             i += 1;
         }
@@ -1877,10 +2003,20 @@ impl Forth {
             .unwrap_or(self.memory.len());
         let word_len = word_end.saturating_sub(addr);
         let is_pure = word_len <= Self::INLINE_LIMIT
-            && self.memory[addr..word_end].iter()
-                .all(|c| !matches!(c, Cell::Addr(_) | Cell::Jmp(_) | Cell::JmpZ(_)
-                                     | Cell::Repeat(_) | Cell::Until(_) | Cell::While(_)
-                                     | Cell::DoSetup | Cell::DoLoop(_) | Cell::DoLoopPlus(_)));
+            && self.memory[addr..word_end].iter().all(|c| {
+                !matches!(
+                    c,
+                    Cell::Addr(_)
+                        | Cell::Jmp(_)
+                        | Cell::JmpZ(_)
+                        | Cell::Repeat(_)
+                        | Cell::Until(_)
+                        | Cell::While(_)
+                        | Cell::DoSetup
+                        | Cell::DoLoop(_)
+                        | Cell::DoLoopPlus(_)
+                )
+            });
         if is_pure && word_len > 0 {
             let cells: Vec<Cell> = self.memory[addr..word_end].to_vec();
             self.memory.extend(cells);
@@ -1967,7 +2103,8 @@ impl Forth {
             self.strings.push(peer.to_string());
             let code_idx = self.strings.len();
             self.strings.push(code.to_string());
-            self.memory.push(Cell::RunOn(peer_idx as u32, code_idx as u32));
+            self.memory
+                .push(Cell::RunOn(peer_idx as u32, code_idx as u32));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00hello:") {
@@ -1983,7 +2120,8 @@ impl Forth {
             self.strings.push(name.to_string());
             let addr_idx = self.strings.len();
             self.strings.push(addr.to_string());
-            self.memory.push(Cell::TagPeer(name_idx as u32, addr_idx as u32));
+            self.memory
+                .push(Cell::TagPeer(name_idx as u32, addr_idx as u32));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00channel:") {
@@ -2005,7 +2143,26 @@ impl Forth {
             self.strings.push(chan.to_string());
             let msg_idx = self.strings.len();
             self.strings.push(msg.to_string());
-            self.memory.push(Cell::SayInChannel(chan_idx as u32, msg_idx as u32));
+            self.memory
+                .push(Cell::SayInChannel(chan_idx as u32, msg_idx as u32));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00file-zip:") {
+            let (src, dest) = s.split_once('\x01').unwrap_or((s, ""));
+            let src_idx = self.intern_str(src);
+            let dest_idx = self.intern_str(dest);
+            self.memory.push(Cell::PushStr(src_idx));
+            self.memory.push(Cell::PushStr(dest_idx));
+            self.memory.push(Cell::Builtin(Builtin::FileZip));
+            return Ok(());
+        }
+        if let Some(s) = tok.strip_prefix("\x00file-unzip:") {
+            let (src, dest) = s.split_once('\x01').unwrap_or((s, ""));
+            let src_idx = self.intern_str(src);
+            let dest_idx = self.intern_str(dest);
+            self.memory.push(Cell::PushStr(src_idx));
+            self.memory.push(Cell::PushStr(dest_idx));
+            self.memory.push(Cell::Builtin(Builtin::FileUnzip));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00prove:") {
@@ -2021,7 +2178,8 @@ impl Forth {
             self.strings.push(ensemble.to_string());
             let code_idx = self.strings.len();
             self.strings.push(code.to_string());
-            self.memory.push(Cell::ScatterOnCluster(ens_idx as u32, code_idx as u32));
+            self.memory
+                .push(Cell::ScatterOnCluster(ens_idx as u32, code_idx as u32));
             return Ok(());
         }
         if let Some(s) = tok.strip_prefix("\x00scatter-exec:") {
@@ -2094,11 +2252,26 @@ impl Forth {
             // Peephole: combine common literal+op sequences into single instructions.
             let prev = self.memory.last().copied();
             let folded: Option<Cell> = match (prev, b) {
-                (Some(Cell::Lit(1)),  Builtin::Plus)    => { self.memory.pop(); Some(Cell::Builtin(Builtin::Inc)) }
-                (Some(Cell::Lit(1)),  Builtin::Minus)   => { self.memory.pop(); Some(Cell::Builtin(Builtin::Dec)) }
-                (Some(Cell::Lit(0)),  Builtin::Eq)      => { self.memory.pop(); Some(Cell::Builtin(Builtin::ZeroEq)) }
-                (Some(Cell::Lit(0)),  Builtin::Lt)      => { self.memory.pop(); Some(Cell::Builtin(Builtin::ZeroLt)) }
-                (Some(Cell::Lit(0)),  Builtin::Gt)      => { self.memory.pop(); Some(Cell::Builtin(Builtin::ZeroGt)) }
+                (Some(Cell::Lit(1)), Builtin::Plus) => {
+                    self.memory.pop();
+                    Some(Cell::Builtin(Builtin::Inc))
+                }
+                (Some(Cell::Lit(1)), Builtin::Minus) => {
+                    self.memory.pop();
+                    Some(Cell::Builtin(Builtin::Dec))
+                }
+                (Some(Cell::Lit(0)), Builtin::Eq) => {
+                    self.memory.pop();
+                    Some(Cell::Builtin(Builtin::ZeroEq))
+                }
+                (Some(Cell::Lit(0)), Builtin::Lt) => {
+                    self.memory.pop();
+                    Some(Cell::Builtin(Builtin::ZeroLt))
+                }
+                (Some(Cell::Lit(0)), Builtin::Gt) => {
+                    self.memory.pop();
+                    Some(Cell::Builtin(Builtin::ZeroGt))
+                }
                 _ => None,
             };
             self.memory.push(folded.unwrap_or(Cell::Builtin(b)));
@@ -2153,8 +2326,10 @@ impl Forth {
             () => {
                 if fuel == 0 {
                     self.fuel = 0;
-                    bail!("fuel exhausted — word is too expensive for vocabulary use.\n\
-                           hint: use  N with-fuel  for intentional heavy computation.");
+                    bail!(
+                        "fuel exhausted — word is too expensive for vocabulary use.\n\
+                           hint: use  N with-fuel  for intentional heavy computation."
+                    );
                 }
                 fuel -= 1;
             };
@@ -2163,7 +2338,9 @@ impl Forth {
         // Single bounds check + unchecked pop: one branch instead of two ok_or_else chains.
         macro_rules! pop2 {
             () => {{
-                if self.data.len() < 2 { bail!("stack underflow"); }
+                if self.data.len() < 2 {
+                    bail!("stack underflow");
+                }
                 // SAFETY: we just checked len >= 2.
                 let b = unsafe { self.data.pop().unwrap_unchecked() };
                 let a = unsafe { self.data.pop().unwrap_unchecked() };
@@ -2172,7 +2349,9 @@ impl Forth {
         }
         macro_rules! pop1 {
             () => {{
-                if self.data.is_empty() { bail!("stack underflow"); }
+                if self.data.is_empty() {
+                    bail!("stack underflow");
+                }
                 // SAFETY: we just checked non-empty.
                 unsafe { self.data.pop().unwrap_unchecked() }
             }};
@@ -2184,52 +2363,236 @@ impl Forth {
             // The bounds check runs only in debug builds to catch compiler bugs early;
             // release builds skip it — saving one branch per instruction on the hot path.
             #[cfg(debug_assertions)]
-            if ip >= self.memory.len() { break; }
+            if ip >= self.memory.len() {
+                break;
+            }
             // SAFETY: guaranteed by well-formed code (Ret always terminates before OOB).
             let cell = unsafe { *self.memory.get_unchecked(ip) };
             match cell {
                 // ── Hot path: inlined arithmetic & stack ops (no function call) ──
-                Cell::Builtin(Builtin::Plus)  => { let (a,b) = pop2!(); self.data.push(a.wrapping_add(b)); ip += 1; }
-                Cell::Builtin(Builtin::Minus) => { let (a,b) = pop2!(); self.data.push(a.wrapping_sub(b)); ip += 1; }
-                Cell::Builtin(Builtin::Star)  => { let (a,b) = pop2!(); self.data.push(a.wrapping_mul(b)); ip += 1; }
-                Cell::Builtin(Builtin::Dup)   => { let a = pop1!(); self.data.push(a); self.data.push(a); ip += 1; }
-                Cell::Builtin(Builtin::Drop)  => { pop1!(); ip += 1; }
-                Cell::Builtin(Builtin::Swap)  => { let (a,b) = pop2!(); self.data.push(b); self.data.push(a); ip += 1; }
-                Cell::Builtin(Builtin::Over)  => { let (a,b) = pop2!(); self.data.push(a); self.data.push(b); self.data.push(a); ip += 1; }
-                Cell::Builtin(Builtin::Eq)    => { let (a,b) = pop2!(); self.data.push(if a == b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::Ne)    => { let (a,b) = pop2!(); self.data.push(if a != b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::Lt)    => { let (a,b) = pop2!(); self.data.push(if a  < b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::Gt)    => { let (a,b) = pop2!(); self.data.push(if a  > b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::ZeroEq) => { let a = pop1!(); self.data.push(if a == 0 { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::ZeroLt) => { let a = pop1!(); self.data.push(if a  < 0 { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::ZeroGt) => { let a = pop1!(); self.data.push(if a  > 0 { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::And)    => { if self.data.len() >= 2 { let (a,b) = pop2!(); self.data.push(a & b); } ip += 1; }
-                Cell::Builtin(Builtin::Or)     => { let (a,b) = pop2!(); self.data.push(a | b); ip += 1; }
-                Cell::Builtin(Builtin::Xor)    => { let (a,b) = pop2!(); self.data.push(a ^ b); ip += 1; }
-                Cell::Builtin(Builtin::Invert) => { let a = pop1!(); self.data.push(!a); ip += 1; }
-                Cell::Builtin(Builtin::Negate) => { let a = pop1!(); self.data.push(a.wrapping_neg()); ip += 1; }
-                Cell::Builtin(Builtin::Abs)    => { let a = pop1!(); self.data.push(a.wrapping_abs()); ip += 1; }
-                Cell::Builtin(Builtin::Max)    => { let (a,b) = pop2!(); self.data.push(a.max(b)); ip += 1; }
-                Cell::Builtin(Builtin::Min)    => { let (a,b) = pop2!(); self.data.push(a.min(b)); ip += 1; }
-                Cell::Builtin(Builtin::Slash)  => { let (a,b) = pop2!(); if b == 0 { bail!("division by zero"); } self.data.push(a.wrapping_div(b)); ip += 1; }
-                Cell::Builtin(Builtin::Mod)    => { let (a,b) = pop2!(); if b == 0 { bail!("division by zero"); } self.data.push(a.wrapping_rem(b)); ip += 1; }
-                Cell::Builtin(Builtin::Lshift) => { let (a,b) = pop2!(); self.data.push(a << (b & 63)); ip += 1; }
-                Cell::Builtin(Builtin::Rshift) => { let (a,b) = pop2!(); self.data.push(a >> (b & 63)); ip += 1; }
-                Cell::Builtin(Builtin::Rot)    => { if self.data.len() >= 3 { let c=pop1!(); let b=pop1!(); let a=pop1!(); self.data.push(b); self.data.push(c); self.data.push(a); } ip += 1; }
-                Cell::Builtin(Builtin::Nip)    => { let (a,b) = pop2!(); let _ = a; self.data.push(b); ip += 1; }
-                Cell::Builtin(Builtin::Tuck)   => { let (a,b) = pop2!(); self.data.push(b); self.data.push(a); self.data.push(b); ip += 1; }
-                Cell::Builtin(Builtin::TwoDup) => { if self.data.len() >= 2 { let b=*self.data.last().unwrap(); let a=self.data[self.data.len()-2]; self.data.push(a); self.data.push(b); } ip += 1; }
-                Cell::Builtin(Builtin::TwoDrop)=> { if self.data.len() >= 2 { pop2!(); } ip += 1; }
-                Cell::Builtin(Builtin::Inc)    => { let a = pop1!(); self.data.push(a.wrapping_add(1)); ip += 1; }
-                Cell::Builtin(Builtin::Dec)    => { let a = pop1!(); self.data.push(a.wrapping_sub(1)); ip += 1; }
-                Cell::Builtin(Builtin::Le)     => { let (a,b) = pop2!(); self.data.push(if a <= b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::Ge)     => { let (a,b) = pop2!(); self.data.push(if a >= b { -1 } else { 0 }); ip += 1; }
-                Cell::Builtin(Builtin::Depth)  => { self.data.push(self.data.len() as i64); ip += 1; }
-                Cell::Builtin(Builtin::Cr)     => { self.out.push('\n'); ip += 1; }
-                Cell::Builtin(Builtin::Space)  => { self.out.push(' '); ip += 1; }
-                Cell::Builtin(Builtin::Print)  => { let a = pop1!(); self.out.push_str(&a.to_string()); self.out.push(' '); ip += 1; }
+                Cell::Builtin(Builtin::Plus) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a.wrapping_add(b));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Minus) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a.wrapping_sub(b));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Star) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a.wrapping_mul(b));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Dup) => {
+                    let a = pop1!();
+                    self.data.push(a);
+                    self.data.push(a);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Drop) => {
+                    pop1!();
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Swap) => {
+                    let (a, b) = pop2!();
+                    self.data.push(b);
+                    self.data.push(a);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Over) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a);
+                    self.data.push(b);
+                    self.data.push(a);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Eq) => {
+                    let (a, b) = pop2!();
+                    self.data.push(if a == b { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Ne) => {
+                    let (a, b) = pop2!();
+                    self.data.push(if a != b { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Lt) => {
+                    let (a, b) = pop2!();
+                    self.data.push(if a < b { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Gt) => {
+                    let (a, b) = pop2!();
+                    self.data.push(if a > b { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::ZeroEq) => {
+                    let a = pop1!();
+                    self.data.push(if a == 0 { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::ZeroLt) => {
+                    let a = pop1!();
+                    self.data.push(if a < 0 { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::ZeroGt) => {
+                    let a = pop1!();
+                    self.data.push(if a > 0 { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::And) => {
+                    if self.data.len() >= 2 {
+                        let (a, b) = pop2!();
+                        self.data.push(a & b);
+                    }
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Or) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a | b);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Xor) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a ^ b);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Invert) => {
+                    let a = pop1!();
+                    self.data.push(!a);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Negate) => {
+                    let a = pop1!();
+                    self.data.push(a.wrapping_neg());
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Abs) => {
+                    let a = pop1!();
+                    self.data.push(a.wrapping_abs());
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Max) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a.max(b));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Min) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a.min(b));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Slash) => {
+                    let (a, b) = pop2!();
+                    if b == 0 {
+                        bail!("division by zero");
+                    }
+                    self.data.push(a.wrapping_div(b));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Mod) => {
+                    let (a, b) = pop2!();
+                    if b == 0 {
+                        bail!("division by zero");
+                    }
+                    self.data.push(a.wrapping_rem(b));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Lshift) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a << (b & 63));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Rshift) => {
+                    let (a, b) = pop2!();
+                    self.data.push(a >> (b & 63));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Rot) => {
+                    if self.data.len() >= 3 {
+                        let c = pop1!();
+                        let b = pop1!();
+                        let a = pop1!();
+                        self.data.push(b);
+                        self.data.push(c);
+                        self.data.push(a);
+                    }
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Nip) => {
+                    let (a, b) = pop2!();
+                    let _ = a;
+                    self.data.push(b);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Tuck) => {
+                    let (a, b) = pop2!();
+                    self.data.push(b);
+                    self.data.push(a);
+                    self.data.push(b);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::TwoDup) => {
+                    if self.data.len() >= 2 {
+                        let b = *self.data.last().unwrap();
+                        let a = self.data[self.data.len() - 2];
+                        self.data.push(a);
+                        self.data.push(b);
+                    }
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::TwoDrop) => {
+                    if self.data.len() >= 2 {
+                        pop2!();
+                    }
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Inc) => {
+                    let a = pop1!();
+                    self.data.push(a.wrapping_add(1));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Dec) => {
+                    let a = pop1!();
+                    self.data.push(a.wrapping_sub(1));
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Le) => {
+                    let (a, b) = pop2!();
+                    self.data.push(if a <= b { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Ge) => {
+                    let (a, b) = pop2!();
+                    self.data.push(if a >= b { -1 } else { 0 });
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Depth) => {
+                    self.data.push(self.data.len() as i64);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Cr) => {
+                    self.out.push('\n');
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Space) => {
+                    self.out.push(' ');
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::Print) => {
+                    let a = pop1!();
+                    self.out.push_str(&a.to_string());
+                    self.out.push(' ');
+                    ip += 1;
+                }
                 // ── Literals and string output ──
-                Cell::Lit(n) => { self.data.push(n); ip += 1; }  // bypass overflow check — hot path
+                Cell::Lit(n) => {
+                    self.data.push(n);
+                    ip += 1;
+                } // bypass overflow check — hot path
                 Cell::Str(idx) => {
                     self.out.push_str(&self.strings[idx]);
                     ip += 1;
@@ -2295,7 +2658,11 @@ impl Forth {
                 }
                 Cell::ExecCmd(idx) => {
                     let cmd = self.strings[idx].clone();
-                    match std::process::Command::new("sh").arg("-c").arg(&cmd).output() {
+                    match std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&cmd)
+                        .output()
+                    {
                         Ok(o) => self.out.push_str(&String::from_utf8_lossy(&o.stdout)),
                         Err(e) => self.out.push_str(&format!("exec error: {e}\n")),
                     }
@@ -2330,12 +2697,16 @@ impl Forth {
                     let snippet = self.strings[idx].clone();
                     if self.peers.is_empty() {
                         use crossterm::style::Stylize;
-                        self.out.push_str(&format!("{}\n",
-                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)".dark_grey()));
+                        self.out.push_str(&format!(
+                            "{}\n",
+                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)"
+                                .dark_grey()
+                        ));
                     } else {
                         let peers = self.peers.clone();
                         let tokens = peer_tokens_map(&self.peer_meta);
-                        let results = run_scatter(&peers, &snippet, self.registry_addr.as_deref(), &tokens);
+                        let results =
+                            run_scatter(&peers, &snippet, self.registry_addr.as_deref(), &tokens);
                         self.emit_scatter_results(results);
                     }
                     ip += 1;
@@ -2344,21 +2715,21 @@ impl Forth {
                     let cmd = self.strings[idx].clone();
                     if self.peers.is_empty() {
                         self.out.push_str(
-                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n"
+                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n",
                         );
                     } else {
                         let peers = self.peers.clone();
                         // Show plan and require confirmation before running on other machines.
-                        let names: Vec<String> = peers.iter().map(|p| {
-                            self.peer_meta.get(p)
-                                .and_then(|m| m.label.clone())
-                                .unwrap_or_else(|| p.clone())
-                        }).collect();
-                        let plan = format!(
-                            "Share with {}?\n  {}",
-                            names.join(", "),
-                            cmd
-                        );
+                        let names: Vec<String> = peers
+                            .iter()
+                            .map(|p| {
+                                self.peer_meta
+                                    .get(p)
+                                    .and_then(|m| m.label.clone())
+                                    .unwrap_or_else(|| p.clone())
+                            })
+                            .collect();
+                        let plan = format!("Share with {}?\n  {}", names.join(", "), cmd);
                         let approved = if let Some(ref f) = self.confirm_fn {
                             f(&plan)
                         } else {
@@ -2388,17 +2759,22 @@ impl Forth {
                 Cell::ScatterStack => {
                     // ( code-idx -- )  scatter strings[code-idx] to all registered peers
                     let code_idx = self.pop()? as usize;
-                    let snippet = self.strings.get(code_idx)
-                        .ok_or_else(|| anyhow::anyhow!("scatter-code: index {} out of bounds", code_idx))?
+                    let snippet = self
+                        .strings
+                        .get(code_idx)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("scatter-code: index {} out of bounds", code_idx)
+                        })?
                         .clone();
                     if self.peers.is_empty() {
                         self.out.push_str(
-                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n"
+                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n",
                         );
                     } else {
                         let peers = self.peers.clone();
                         let tokens = peer_tokens_map(&self.peer_meta);
-                        let results = run_scatter(&peers, &snippet, self.registry_addr.as_deref(), &tokens);
+                        let results =
+                            run_scatter(&peers, &snippet, self.registry_addr.as_deref(), &tokens);
                         self.emit_scatter_results(results);
                     }
                     ip += 1;
@@ -2408,12 +2784,14 @@ impl Forth {
                     // If I know it, send my definition first so peers speak the same word.
                     // Then run the word on all peers — those who don't know it define it themselves.
                     use crossterm::style::Stylize;
-                    let name = self.strings.get(idx)
+                    let name = self
+                        .strings
+                        .get(idx)
                         .ok_or_else(|| anyhow::anyhow!("symbol: string index out of bounds"))?
                         .clone();
                     if self.peers.is_empty() {
                         self.out.push_str(
-                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n"
+                            "nobody else is here yet  (add-peer\" host:port\" to invite someone)\n",
                         );
                         ip += 1;
                         continue;
@@ -2421,9 +2799,12 @@ impl Forth {
                     let peers = self.peers.clone();
                     let tokens = peer_tokens_map(&self.peer_meta);
                     // If I have a local definition, push it to all peers first.
-                    if let Some(def) = self.source_log.iter().find(|e| {
-                        e.starts_with(&format!(": {} ", name))
-                    }).cloned() {
+                    if let Some(def) = self
+                        .source_log
+                        .iter()
+                        .find(|e| e.starts_with(&format!(": {} ", name)))
+                        .cloned()
+                    {
                         self.out.push_str(&format!(
                             "{} {}  →  peers\n",
                             "sharing".dark_grey(),
@@ -2432,11 +2813,16 @@ impl Forth {
                         let define_results = run_define_scatter(&peers, &def, &tokens);
                         for r in &define_results {
                             if let Some(ref e) = r.error {
-                                let peer_name = r.peer.trim_start_matches("http://")
-                                    .split(':').next().unwrap_or(&r.peer);
+                                let peer_name = r
+                                    .peer
+                                    .trim_start_matches("http://")
+                                    .split(':')
+                                    .next()
+                                    .unwrap_or(&r.peer);
                                 self.out.push_str(&format!(
                                     "  {} couldn't learn it: {}\n",
-                                    peer_name.cyan(), e.as_str().red()
+                                    peer_name.cyan(),
+                                    e.as_str().red()
                                 ));
                             }
                         }
@@ -2449,40 +2835,59 @@ impl Forth {
                         ));
                     }
                     // Now run the word on all peers.
-                    let results = run_scatter(&peers, &name, self.registry_addr.as_deref(), &tokens);
+                    let results =
+                        run_scatter(&peers, &name, self.registry_addr.as_deref(), &tokens);
                     self.emit_scatter_results(results);
                     ip += 1;
                 }
                 Cell::ScatterOnCluster(ens_idx, code_idx) => {
                     // Run code on a named ensemble without touching self.peers.
-                    let name = self.strings.get(ens_idx as usize)
-                        .ok_or_else(|| anyhow::anyhow!("scatter-on: ensemble string index out of bounds"))?
-                        .trim().to_string();
-                    let peers = self.ensembles.get(&name)
+                    let name = self
+                        .strings
+                        .get(ens_idx as usize)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("scatter-on: ensemble string index out of bounds")
+                        })?
+                        .trim()
+                        .to_string();
+                    let peers = self
+                        .ensembles
+                        .get(&name)
                         .ok_or_else(|| anyhow::anyhow!("scatter-on: unknown ensemble '{}'", name))?
                         .clone();
-                    let code = self.strings.get(code_idx as usize)
-                        .ok_or_else(|| anyhow::anyhow!("scatter-on: code string index out of bounds"))?
+                    let code = self
+                        .strings
+                        .get(code_idx as usize)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("scatter-on: code string index out of bounds")
+                        })?
                         .clone();
                     let tokens = peer_tokens_map(&self.peer_meta);
-                    let results = run_scatter(&peers, &code, self.registry_addr.as_deref(), &tokens);
+                    let results =
+                        run_scatter(&peers, &code, self.registry_addr.as_deref(), &tokens);
                     self.emit_scatter_results(results);
                     ip += 1;
                 }
                 Cell::RunOn(peer_idx, code_idx) => {
                     // Run code on exactly one peer, matched by address or label.
                     use crossterm::style::Stylize;
-                    let target = self.strings.get(peer_idx as usize)
+                    let target = self
+                        .strings
+                        .get(peer_idx as usize)
                         .ok_or_else(|| anyhow::anyhow!("on: peer string index out of bounds"))?
-                        .trim().to_string();
-                    let code = self.strings.get(code_idx as usize)
+                        .trim()
+                        .to_string();
+                    let code = self
+                        .strings
+                        .get(code_idx as usize)
                         .ok_or_else(|| anyhow::anyhow!("on: code string index out of bounds"))?
                         .clone();
                     // Resolve target: exact address match first, then label match.
                     let addr = if self.peers.contains(&target) {
                         Some(target.clone())
                     } else {
-                        self.peer_meta.iter()
+                        self.peer_meta
+                            .iter()
                             .find(|(addr, m)| {
                                 m.label.as_deref() == Some(target.as_str())
                                     && self.peers.contains(*addr)
@@ -2491,11 +2896,15 @@ impl Forth {
                     };
                     match addr {
                         None => {
-                            self.out.push_str(&format!("on: no peer matching '{}'\n",
-                                target.as_str().yellow()));
+                            self.out.push_str(&format!(
+                                "on: no peer matching '{}'\n",
+                                target.as_str().yellow()
+                            ));
                         }
                         Some(addr) => {
-                            let display = self.peer_meta.get(&addr)
+                            let display = self
+                                .peer_meta
+                                .get(&addr)
                                 .and_then(|m| m.label.as_deref())
                                 .map(|l| l.cyan().bold().to_string())
                                 .unwrap_or_else(|| addr.as_str().cyan().to_string());
@@ -2504,11 +2913,19 @@ impl Forth {
                             // If so, the peer's machine changed — return the peer address.
                             // If computation, return the results (stack values).
                             let is_definition = code.trim_start().starts_with(':');
-                            let results = run_scatter(&[addr.clone()], &code, self.registry_addr.as_deref(), &tokens);
+                            let results = run_scatter(
+                                &[addr.clone()],
+                                &code,
+                                self.registry_addr.as_deref(),
+                                &tokens,
+                            );
                             for r in results {
                                 if let Some(e) = r.error {
-                                    self.out.push_str(&format!("[{}] {}\n", display,
-                                        format!("error: {e}").red()));
+                                    self.out.push_str(&format!(
+                                        "[{}] {}\n",
+                                        display,
+                                        format!("error: {e}").red()
+                                    ));
                                 } else {
                                     for line in r.output.lines() {
                                         self.out.push_str(&format!("[{}] {}\n", display, line));
@@ -2521,7 +2938,9 @@ impl Forth {
                                         self.data.push(idx);
                                     } else {
                                         // Result: push remote stack values locally.
-                                        for v in &r.stack { self.data.push(*v); }
+                                        for v in &r.stack {
+                                            self.data.push(*v);
+                                        }
                                     }
                                 }
                                 if let Some(ref warn) = r.debt_warning {
@@ -2548,7 +2967,8 @@ impl Forth {
                     let addr = if self.peers.contains(&target) {
                         Some(target.clone())
                     } else {
-                        self.peer_meta.iter()
+                        self.peer_meta
+                            .iter()
                             .find(|(a, m)| {
                                 m.label.as_deref() == Some(target.as_str())
                                     && self.peers.contains(*a)
@@ -2565,7 +2985,8 @@ impl Forth {
                         }
                         Some(addr) => {
                             let my_name = hostname::get()
-                                .ok().and_then(|h| h.into_string().ok())
+                                .ok()
+                                .and_then(|h| h.into_string().ok())
                                 .unwrap_or_else(|| "someone".to_string());
                             let msg = format!("hello from {}!", my_name);
                             let from = self.registry_addr.clone();
@@ -2573,12 +2994,13 @@ impl Forth {
                             let token = tokens.get(&addr).cloned();
                             run_push_one(&addr, &msg, from.as_deref(), token.as_deref());
                             use crossterm::style::Stylize;
-                            let label = self.peer_meta.get(&addr)
+                            let label = self
+                                .peer_meta
+                                .get(&addr)
                                 .and_then(|m| m.label.as_deref())
                                 .unwrap_or(target.as_str());
-                            self.out.push_str(&format!(
-                                "said hello to {}\n", label.cyan().bold()
-                            ));
+                            self.out
+                                .push_str(&format!("said hello to {}\n", label.cyan().bold()));
                         }
                     }
                     ip += 1;
@@ -2591,15 +3013,21 @@ impl Forth {
                         Some(addr.clone())
                     } else {
                         // Fuzzy: peer whose addr contains the given string
-                        self.peers.iter().find(|p| p.contains(addr.as_str())).cloned()
+                        self.peers
+                            .iter()
+                            .find(|p| p.contains(addr.as_str()))
+                            .cloned()
                     };
                     match resolved {
                         None if !addr.is_empty() => {
                             // Register with given addr even if not yet a known peer
-                            self.peer_meta.entry(addr.clone()).or_default().label = Some(name.clone());
+                            self.peer_meta.entry(addr.clone()).or_default().label =
+                                Some(name.clone());
                             use crossterm::style::Stylize;
                             self.out.push_str(&format!(
-                                "{} tagged as {}\n", addr.as_str().dark_grey(), name.as_str().cyan().bold()
+                                "{} tagged as {}\n",
+                                addr.as_str().dark_grey(),
+                                name.as_str().cyan().bold()
                             ));
                         }
                         None => {
@@ -2609,7 +3037,9 @@ impl Forth {
                             self.peer_meta.entry(a.clone()).or_default().label = Some(name.clone());
                             use crossterm::style::Stylize;
                             self.out.push_str(&format!(
-                                "{} is now {}\n", a.as_str().dark_grey(), name.as_str().cyan().bold()
+                                "{} is now {}\n",
+                                a.as_str().dark_grey(),
+                                name.as_str().cyan().bold()
                             ));
                         }
                     }
@@ -2617,10 +3047,15 @@ impl Forth {
                 }
                 Cell::JoinChannel(idx) => {
                     let raw = self.strings[idx].clone();
-                    let chan = if raw.starts_with('#') { raw } else { format!("#{raw}") };
+                    let chan = if raw.starts_with('#') {
+                        raw
+                    } else {
+                        format!("#{raw}")
+                    };
                     self.channels.insert(chan.clone());
                     let my_name = hostname::get()
-                        .ok().and_then(|h| h.into_string().ok())
+                        .ok()
+                        .and_then(|h| h.into_string().ok())
                         .unwrap_or_else(|| "someone".to_string());
                     let msg = format!("{} joined {}", my_name, chan);
                     let from = self.registry_addr.clone();
@@ -2638,25 +3073,36 @@ impl Forth {
                 }
                 Cell::PartChannel(idx) => {
                     let raw = self.strings[idx].clone();
-                    let chan = if raw.starts_with('#') { raw } else { format!("#{raw}") };
+                    let chan = if raw.starts_with('#') {
+                        raw
+                    } else {
+                        format!("#{raw}")
+                    };
                     self.channels.remove(&chan);
                     let my_name = hostname::get()
-                        .ok().and_then(|h| h.into_string().ok())
+                        .ok()
+                        .and_then(|h| h.into_string().ok())
                         .unwrap_or_else(|| "someone".to_string());
                     let msg = format!("{} left {}", my_name, chan);
                     let from = self.registry_addr.clone();
                     let tokens = peer_tokens_map(&self.peer_meta);
                     run_push_all(&self.peers, &msg, from.as_deref(), &tokens);
                     use crossterm::style::Stylize;
-                    self.out.push_str(&format!("left {}\n", chan.as_str().dark_grey()));
+                    self.out
+                        .push_str(&format!("left {}\n", chan.as_str().dark_grey()));
                     ip += 1;
                 }
                 Cell::SayInChannel(chan_idx, msg_idx) => {
                     let raw = self.strings[chan_idx as usize].clone();
-                    let chan = if raw.starts_with('#') { raw } else { format!("#{raw}") };
+                    let chan = if raw.starts_with('#') {
+                        raw
+                    } else {
+                        format!("#{raw}")
+                    };
                     let message = self.strings[msg_idx as usize].clone();
                     let my_name = hostname::get()
-                        .ok().and_then(|h| h.into_string().ok())
+                        .ok()
+                        .and_then(|h| h.into_string().ok())
                         .unwrap_or_else(|| "someone".to_string());
                     let text = format!("[{}] {}: {}", chan, my_name, message);
                     let from = self.registry_addr.clone();
@@ -2680,7 +3126,8 @@ impl Forth {
                         self.out.truncate(saved);
                         match result {
                             Ok(_) => {
-                                self.out.push_str(&format!("✓ {}\n", word.as_str().green().bold()));
+                                self.out
+                                    .push_str(&format!("✓ {}\n", word.as_str().green().bold()));
                             }
                             Err(e) => {
                                 self.out.push_str(&format!(
@@ -2718,41 +3165,64 @@ impl Forth {
                 }
 
                 // ── Loop index (very hot inside do/loop bodies) ──
-                Cell::Builtin(Builtin::LoopI)  => {
+                Cell::Builtin(Builtin::LoopI) => {
                     let v = self.loop_stack.last().map(|t| t.0).unwrap_or(0);
-                    self.data.push(v); ip += 1;
+                    self.data.push(v);
+                    ip += 1;
                 }
-                Cell::Builtin(Builtin::LoopJ)  => {
+                Cell::Builtin(Builtin::LoopJ) => {
                     let len = self.loop_stack.len();
-                    let v = if len >= 2 { self.loop_stack[len-2].0 } else { 0 };
-                    self.data.push(v); ip += 1;
+                    let v = if len >= 2 {
+                        self.loop_stack[len - 2].0
+                    } else {
+                        0
+                    };
+                    self.data.push(v);
+                    ip += 1;
                 }
                 // ── Return stack ops (hot in most real Forth programs) ──
-                Cell::Builtin(Builtin::ToR)    => { let a = pop1!(); self.rstack.push(a); ip += 1; }
-                Cell::Builtin(Builtin::FromR)  => {
-                    if self.rstack.is_empty() { bail!("return stack underflow"); }
+                Cell::Builtin(Builtin::ToR) => {
+                    let a = pop1!();
+                    self.rstack.push(a);
+                    ip += 1;
+                }
+                Cell::Builtin(Builtin::FromR) => {
+                    if self.rstack.is_empty() {
+                        bail!("return stack underflow");
+                    }
                     let a = unsafe { self.rstack.pop().unwrap_unchecked() };
-                    self.data.push(a); ip += 1;
+                    self.data.push(a);
+                    ip += 1;
                 }
                 Cell::Builtin(Builtin::FetchR) => {
-                    let a = self.rstack.last().copied().ok_or_else(|| anyhow::anyhow!("return stack underflow"))?;
-                    self.data.push(a); ip += 1;
+                    let a = self
+                        .rstack
+                        .last()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("return stack underflow"))?;
+                    self.data.push(a);
+                    ip += 1;
                 }
                 // ── Variable memory ops ──
-                Cell::Builtin(Builtin::Fetch)  => {
+                Cell::Builtin(Builtin::Fetch) => {
                     let addr = pop1!() as usize;
-                    self.data.push(self.heap.get(addr).copied().unwrap_or(0)); ip += 1;
+                    self.data.push(self.heap.get(addr).copied().unwrap_or(0));
+                    ip += 1;
                 }
-                Cell::Builtin(Builtin::Store)  => {
+                Cell::Builtin(Builtin::Store) => {
                     let addr = pop1!() as usize;
-                    let val  = pop1!();
-                    if addr < self.heap.len() { self.heap[addr] = val; }
+                    let val = pop1!();
+                    if addr < self.heap.len() {
+                        self.heap[addr] = val;
+                    }
                     ip += 1;
                 }
                 Cell::Builtin(Builtin::PlusStore) => {
                     let addr = pop1!() as usize;
-                    let val  = pop1!();
-                    if addr < self.heap.len() { self.heap[addr] = self.heap[addr].wrapping_add(val); }
+                    let val = pop1!();
+                    if addr < self.heap.len() {
+                        self.heap[addr] = self.heap[addr].wrapping_add(val);
+                    }
                     ip += 1;
                 }
                 Cell::Builtin(b) => {
@@ -2771,9 +3241,11 @@ impl Forth {
                     // Tail-call optimisation: if next cell is Ret, reuse the current frame.
                     // SAFETY: ip+1 is valid because compiled words always end with Ret.
                     if matches!(unsafe { self.memory.get_unchecked(ip + 1) }, Cell::Ret) {
-                        ip = addr;  // jump without pushing return address
+                        ip = addr; // jump without pushing return address
                     } else {
-                        if self.call_stack.len() >= MAX_CALL_DEPTH { bail!("return stack overflow"); }
+                        if self.call_stack.len() >= MAX_CALL_DEPTH {
+                            bail!("return stack overflow");
+                        }
                         self.call_stack.push(ip + 1);
                         ip = addr;
                     }
@@ -2782,15 +3254,47 @@ impl Forth {
                     // Empty call_stack = top-level return = halt.
                     // Non-empty = normal return; use unchecked pop to skip the redundant
                     // is_empty check (we just tested it via is_empty() → break path).
-                    if self.call_stack.is_empty() { break; }
+                    if self.call_stack.is_empty() {
+                        break;
+                    }
                     ip = unsafe { self.call_stack.pop().unwrap_unchecked() };
                 }
                 // Back-edges: charge one fuel unit per iteration to prevent infinite loops.
-                Cell::Jmp(addr)   => { if addr <= ip { check_fuel!(); } ip = addr; }
-                Cell::Repeat(back) => { check_fuel!(); ip = back; }
-                Cell::Until(back) => { check_fuel!(); let v = self.pop()?; if v == 0 { ip = back; } else { ip += 1; } }
-                Cell::JmpZ(addr)  => { let v = self.pop()?; if v == 0 { ip = addr; } else { ip += 1; } }
-                Cell::While(exit) => { let v = self.pop()?; if v == 0 { ip = exit; } else { ip += 1; } }
+                Cell::Jmp(addr) => {
+                    if addr <= ip {
+                        check_fuel!();
+                    }
+                    ip = addr;
+                }
+                Cell::Repeat(back) => {
+                    check_fuel!();
+                    ip = back;
+                }
+                Cell::Until(back) => {
+                    check_fuel!();
+                    let v = self.pop()?;
+                    if v == 0 {
+                        ip = back;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Cell::JmpZ(addr) => {
+                    let v = self.pop()?;
+                    if v == 0 {
+                        ip = addr;
+                    } else {
+                        ip += 1;
+                    }
+                }
+                Cell::While(exit) => {
+                    let v = self.pop()?;
+                    if v == 0 {
+                        ip = exit;
+                    } else {
+                        ip += 1;
+                    }
+                }
                 Cell::DoSetup => {
                     let index = self.pop()?;
                     let limit = self.pop()?;
@@ -2805,7 +3309,10 @@ impl Forth {
                     // loop iteration — the single hottest back-edge in the VM.
                     let top = unsafe { self.loop_stack.last_mut().unwrap_unchecked() };
                     top.0 += 1;
-                    if top.0 < top.1 { ip = back; continue; }
+                    if top.0 < top.1 {
+                        ip = back;
+                        continue;
+                    }
                     self.loop_stack.pop();
                     ip += 1;
                 }
@@ -2815,14 +3322,24 @@ impl Forth {
                     // SAFETY: same as DoLoop — matching DoSetup always precedes DoLoopPlus.
                     let top = unsafe { self.loop_stack.last_mut().unwrap_unchecked() };
                     top.0 += step;
-                    if top.0 < top.1 { ip = back; continue; }
+                    if top.0 < top.1 {
+                        ip = back;
+                        continue;
+                    }
                     self.loop_stack.pop();
                     ip += 1;
                 }
                 Cell::OfTest(skip) => {
                     let val = self.pop()?;
-                    let sel = *self.data.last().ok_or_else(|| anyhow::anyhow!("stack underflow"))?;
-                    if sel == val { ip += 1; } else { ip = skip; }
+                    let sel = *self
+                        .data
+                        .last()
+                        .ok_or_else(|| anyhow::anyhow!("stack underflow"))?;
+                    if sel == val {
+                        ip += 1;
+                    } else {
+                        ip = skip;
+                    }
                 }
             }
         }
@@ -2835,36 +3352,117 @@ impl Forth {
     #[inline(never)] // keep execute() hot loop tight; exec_builtin is the cold path
     fn exec_builtin(&mut self, b: Builtin) -> Result<()> {
         match b {
-            Builtin::Plus  => { let b = self.pop()?; let a = self.pop()?; self.data.push(a.wrapping_add(b)); }
-            Builtin::Minus => { let b = self.pop()?; let a = self.pop()?; self.data.push(a.wrapping_sub(b)); }
-            Builtin::Star  => { let b = self.pop()?; let a = self.pop()?; self.data.push(a.wrapping_mul(b)); }
-            Builtin::Slash => { let b = self.pop()?; let a = self.pop()?; if b == 0 { bail!("division by zero"); } self.data.push(a / b); }
-            Builtin::Mod   => { let b = self.pop()?; let a = self.pop()?; if b == 0 { bail!("division by zero"); } self.data.push(a % b); }
-            Builtin::Dup   => { let a = self.pop()?; self.data.push(a); self.data.push(a); }
-            Builtin::Drop  => { self.pop()?; }
-            Builtin::Inc   => { if let Some(t) = self.data.last_mut() { *t += 1; } }
-            Builtin::Dec   => { if let Some(t) = self.data.last_mut() { *t -= 1; } }
-            Builtin::Swap  => { let b = self.pop()?; let a = self.pop()?; self.data.push(b); self.data.push(a); }
-            Builtin::Over  => { let b = self.pop()?; let a = self.pop()?; self.data.push(a); self.data.push(b); self.data.push(a); }
-            Builtin::Rot   => { let c = self.pop()?; let b = self.pop()?; let a = self.pop()?; self.data.push(b); self.data.push(c); self.data.push(a); }
-            Builtin::Nip   => { let b = self.pop()?; self.pop()?; self.data.push(b); }
-            Builtin::Tuck  => { let b = self.pop()?; let a = self.pop()?; self.data.push(b); self.data.push(a); self.data.push(b); }
+            Builtin::Plus => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a.wrapping_add(b));
+            }
+            Builtin::Minus => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a.wrapping_sub(b));
+            }
+            Builtin::Star => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a.wrapping_mul(b));
+            }
+            Builtin::Slash => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                if b == 0 {
+                    bail!("division by zero");
+                }
+                self.data.push(a / b);
+            }
+            Builtin::Mod => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                if b == 0 {
+                    bail!("division by zero");
+                }
+                self.data.push(a % b);
+            }
+            Builtin::Dup => {
+                let a = self.pop()?;
+                self.data.push(a);
+                self.data.push(a);
+            }
+            Builtin::Drop => {
+                self.pop()?;
+            }
+            Builtin::Inc => {
+                if let Some(t) = self.data.last_mut() {
+                    *t += 1;
+                }
+            }
+            Builtin::Dec => {
+                if let Some(t) = self.data.last_mut() {
+                    *t -= 1;
+                }
+            }
+            Builtin::Swap => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(b);
+                self.data.push(a);
+            }
+            Builtin::Over => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a);
+                self.data.push(b);
+                self.data.push(a);
+            }
+            Builtin::Rot => {
+                let c = self.pop()?;
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(b);
+                self.data.push(c);
+                self.data.push(a);
+            }
+            Builtin::Nip => {
+                let b = self.pop()?;
+                self.pop()?;
+                self.data.push(b);
+            }
+            Builtin::Tuck => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(b);
+                self.data.push(a);
+                self.data.push(b);
+            }
             Builtin::TwoDup => {
                 let len = self.data.len();
-                if len < 2 { bail!("stack underflow"); }
-                let a = self.data[len-2]; let b = self.data[len-1];
-                self.data.push(a); self.data.push(b);
+                if len < 2 {
+                    bail!("stack underflow");
+                }
+                let a = self.data[len - 2];
+                let b = self.data[len - 1];
+                self.data.push(a);
+                self.data.push(b);
             }
-            Builtin::TwoDrop => { self.pop()?; self.pop()?; }
+            Builtin::TwoDrop => {
+                self.pop()?;
+                self.pop()?;
+            }
             Builtin::TwoSwap => {
-                let d = self.pop()?; let c = self.pop()?;
-                let b = self.pop()?; let a = self.pop()?;
-                self.data.push(c); self.data.push(d);
-                self.data.push(a); self.data.push(b);
+                let d = self.pop()?;
+                let c = self.pop()?;
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(c);
+                self.data.push(d);
+                self.data.push(a);
+                self.data.push(b);
             }
             Builtin::TwoOver => {
                 let len = self.data.len();
-                if len < 4 { bail!("2over: stack underflow — need 4 items"); }
+                if len < 4 {
+                    bail!("2over: stack underflow — need 4 items");
+                }
                 let a = self.data[len - 4];
                 let b = self.data[len - 3];
                 self.data.push(a);
@@ -2873,7 +3471,9 @@ impl Forth {
             Builtin::TwoRot => {
                 // ( a b c d e f -- c d e f a b )
                 let len = self.data.len();
-                if len < 6 { bail!("2rot: stack underflow — need 6 items"); }
+                if len < 6 {
+                    bail!("2rot: stack underflow — need 6 items");
+                }
                 let a = self.data[len - 6];
                 let b = self.data[len - 5];
                 self.data.remove(len - 6);
@@ -2881,33 +3481,120 @@ impl Forth {
                 self.data.push(a);
                 self.data.push(b);
             }
-            Builtin::Eq    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a == b { -1 } else { 0 }); }
-            Builtin::Lt    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a < b { -1 } else { 0 }); }
-            Builtin::Gt    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a > b { -1 } else { 0 }); }
-            Builtin::Le    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a <= b { -1 } else { 0 }); }
-            Builtin::Ge    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a >= b { -1 } else { 0 }); }
-            Builtin::Ne    => { let b = self.pop()?; let a = self.pop()?; self.data.push(if a != b { -1 } else { 0 }); }
-            Builtin::ZeroEq => { let a = self.pop()?; self.data.push(if a == 0 { -1 } else { 0 }); }
-            Builtin::ZeroLt => { let a = self.pop()?; self.data.push(if a < 0 { -1 } else { 0 }); }
-            Builtin::ZeroGt => { let a = self.pop()?; self.data.push(if a > 0 { -1 } else { 0 }); }
-            Builtin::And   => { if self.data.len() >= 2 { let b = self.pop()?; let a = self.pop()?; self.data.push(a & b); } }
-            Builtin::Or    => { let b = self.pop()?; let a = self.pop()?; self.data.push(a | b); }
-            Builtin::Xor   => { let b = self.pop()?; let a = self.pop()?; self.data.push(a ^ b); }
-            Builtin::Invert => { let a = self.pop()?; self.data.push(!a); }
-            Builtin::Negate => { let a = self.pop()?; self.data.push(a.wrapping_neg()); }
-            Builtin::Abs   => { let a = self.pop()?; self.data.push(a.abs()); }
-            Builtin::Max   => { let b = self.pop()?; let a = self.pop()?; self.data.push(a.max(b)); }
-            Builtin::Min   => { let b = self.pop()?; let a = self.pop()?; self.data.push(a.min(b)); }
-            Builtin::Lshift => { let n = self.pop()?; let a = self.pop()?; self.data.push(a << (n & 63)); }
-            Builtin::Rshift => { let n = self.pop()?; let a = self.pop()?; self.data.push(a >> (n & 63)); }
-            Builtin::Print  => { if let Some(a) = self.data.pop() { self.out.push_str(&format!("{a} ")); } }
+            Builtin::Eq => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(if a == b { -1 } else { 0 });
+            }
+            Builtin::Lt => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(if a < b { -1 } else { 0 });
+            }
+            Builtin::Gt => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(if a > b { -1 } else { 0 });
+            }
+            Builtin::Le => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(if a <= b { -1 } else { 0 });
+            }
+            Builtin::Ge => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(if a >= b { -1 } else { 0 });
+            }
+            Builtin::Ne => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(if a != b { -1 } else { 0 });
+            }
+            Builtin::ZeroEq => {
+                let a = self.pop()?;
+                self.data.push(if a == 0 { -1 } else { 0 });
+            }
+            Builtin::ZeroLt => {
+                let a = self.pop()?;
+                self.data.push(if a < 0 { -1 } else { 0 });
+            }
+            Builtin::ZeroGt => {
+                let a = self.pop()?;
+                self.data.push(if a > 0 { -1 } else { 0 });
+            }
+            Builtin::And => {
+                if self.data.len() >= 2 {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.data.push(a & b);
+                }
+            }
+            Builtin::Or => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a | b);
+            }
+            Builtin::Xor => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a ^ b);
+            }
+            Builtin::Invert => {
+                let a = self.pop()?;
+                self.data.push(!a);
+            }
+            Builtin::Negate => {
+                let a = self.pop()?;
+                self.data.push(a.wrapping_neg());
+            }
+            Builtin::Abs => {
+                let a = self.pop()?;
+                self.data.push(a.abs());
+            }
+            Builtin::Max => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a.max(b));
+            }
+            Builtin::Min => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a.min(b));
+            }
+            Builtin::Lshift => {
+                let n = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a << (n & 63));
+            }
+            Builtin::Rshift => {
+                let n = self.pop()?;
+                let a = self.pop()?;
+                self.data.push(a >> (n & 63));
+            }
+            Builtin::Print => {
+                if let Some(a) = self.data.pop() {
+                    self.out.push_str(&format!("{a} "));
+                }
+            }
             Builtin::PrintS => {
                 self.out.push_str(&format!("<{}> ", self.data.len()));
-                for n in &self.data { self.out.push_str(&format!("{n} ")); }
+                for n in &self.data {
+                    self.out.push_str(&format!("{n} "));
+                }
             }
-            Builtin::Cr    => { self.out.push('\n'); }
-            Builtin::Space => { self.out.push(' '); }
-            Builtin::Emit  => { let a = self.pop()?; if let Some(c) = char::from_u32(a as u32) { self.out.push(c); } }
+            Builtin::Cr => {
+                self.out.push('\n');
+            }
+            Builtin::Space => {
+                self.out.push(' ');
+            }
+            Builtin::Emit => {
+                let a = self.pop()?;
+                if let Some(c) = char::from_u32(a as u32) {
+                    self.out.push(c);
+                }
+            }
             Builtin::Fetch => {
                 let addr = self.pop()? as usize;
                 let v = self.heap.get(addr).copied().unwrap_or(0);
@@ -2915,17 +3602,23 @@ impl Forth {
             }
             Builtin::Store => {
                 let addr = self.pop()? as usize;
-                let val  = self.pop()?;
-                while self.heap.len() <= addr { self.heap.push(0); }
+                let val = self.pop()?;
+                while self.heap.len() <= addr {
+                    self.heap.push(0);
+                }
                 self.heap[addr] = val;
             }
             Builtin::PlusStore => {
                 let addr = self.pop()? as usize;
-                let val  = self.pop()?;
-                while self.heap.len() <= addr { self.heap.push(0); }
+                let val = self.pop()?;
+                while self.heap.len() <= addr {
+                    self.heap.push(0);
+                }
                 self.heap[addr] += val;
             }
-            Builtin::Here  => { self.data.push(self.heap.len() as i64); }
+            Builtin::Here => {
+                self.data.push(self.heap.len() as i64);
+            }
             Builtin::Allot => {
                 let n = self.pop()?.max(0) as usize;
                 self.heap.resize(self.heap.len() + n, 0);
@@ -2934,20 +3627,29 @@ impl Forth {
                 let val = self.pop()?;
                 self.heap.push(val);
             }
-            Builtin::Cells  => { /* identity — 1 cell = 1 heap unit */ }
-            Builtin::CellSz => { self.data.push(1); }
-            Builtin::Fill   => {
-                let val  = self.pop()?;
-                let n    = self.pop()?.max(0) as usize;
+            Builtin::Cells => { /* identity — 1 cell = 1 heap unit */ }
+            Builtin::CellSz => {
+                self.data.push(1);
+            }
+            Builtin::Fill => {
+                let val = self.pop()?;
+                let n = self.pop()?.max(0) as usize;
                 let addr = self.pop()? as usize;
-                while self.heap.len() < addr + n { self.heap.push(0); }
-                for slot in &mut self.heap[addr..addr + n] { *slot = val; }
+                while self.heap.len() < addr + n {
+                    self.heap.push(0);
+                }
+                for slot in &mut self.heap[addr..addr + n] {
+                    *slot = val;
+                }
             }
             Builtin::Eval => {
                 // ( str -- )  evaluate strings[pop()] as Forth source.
                 // This is how you execute a machine that someone sends you.
                 let idx = self.pop()? as usize;
-                let code = self.strings.get(idx).cloned()
+                let code = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("eval: invalid string index {idx}"))?;
                 self.eval(&code)?;
             }
@@ -2962,22 +3664,31 @@ impl Forth {
                 }
                 let idx2 = self.pop()? as usize;
                 let idx1 = self.pop()? as usize;
-                let code1 = self.strings.get(idx1).cloned()
+                let code1 = self
+                    .strings
+                    .get(idx1)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("argue: invalid string index {idx1}"))?;
-                let code2 = self.strings.get(idx2).cloned()
+                let code2 = self
+                    .strings
+                    .get(idx2)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("argue: invalid string index {idx2}"))?;
 
                 // Save and clear the data stack so each program sees depth = 0.
                 let saved_data = std::mem::take(&mut self.data);
 
                 self.eval(&code1)?;
-                let result1 = self.data.last().copied()
-                    .ok_or_else(|| anyhow::anyhow!("argue: first program left nothing on stack"))?;
+                let result1 =
+                    self.data.last().copied().ok_or_else(|| {
+                        anyhow::anyhow!("argue: first program left nothing on stack")
+                    })?;
                 self.data.clear();
 
                 self.eval(&code2)?;
-                let result2 = self.data.last().copied()
-                    .ok_or_else(|| anyhow::anyhow!("argue: second program left nothing on stack"))?;
+                let result2 = self.data.last().copied().ok_or_else(|| {
+                    anyhow::anyhow!("argue: second program left nothing on stack")
+                })?;
                 self.data.clear();
 
                 // Restore caller's stack.
@@ -2987,8 +3698,8 @@ impl Forth {
                 let fmt_val = |v: i64| -> String {
                     match v {
                         -1 => "true".to_string(),
-                         0 => "false".to_string(),
-                         n => n.to_string(),
+                        0 => "false".to_string(),
+                        n => n.to_string(),
                     }
                 };
                 if result1 == result2 {
@@ -3003,11 +3714,19 @@ impl Forth {
                 } else {
                     self.out.push_str(&format!(
                         "  {}  ──→  {}  ≠  {}  ←──  {}   {}\n",
-                        code1.as_str().cyan(), fmt_val(result1).red(),
-                        fmt_val(result2).red(), code2.as_str().cyan(),
+                        code1.as_str().cyan(),
+                        fmt_val(result1).red(),
+                        fmt_val(result2).red(),
+                        code2.as_str().cyan(),
                         "✗".red(),
                     ));
-                    anyhow::bail!("argue: {} got {}, {} got {}", code1, result1, code2, result2);
+                    anyhow::bail!(
+                        "argue: {} got {}, {} got {}",
+                        code1,
+                        result1,
+                        code2,
+                        result2
+                    );
                 }
             }
             Builtin::ArgueCases => {
@@ -3017,10 +3736,14 @@ impl Forth {
                 // Seeds: 0 1 -1 2 -2 5 -5 10 -10 100 -100
                 let idx2 = self.pop()? as usize;
                 let idx1 = self.pop()? as usize;
-                let op1 = self.strings.get(idx1).cloned()
-                    .ok_or_else(|| anyhow::anyhow!("argue-cases: invalid string index {idx1}"))?;
-                let op2 = self.strings.get(idx2).cloned()
-                    .ok_or_else(|| anyhow::anyhow!("argue-cases: invalid string index {idx2}"))?;
+                let op1 =
+                    self.strings.get(idx1).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("argue-cases: invalid string index {idx1}")
+                    })?;
+                let op2 =
+                    self.strings.get(idx2).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("argue-cases: invalid string index {idx2}")
+                    })?;
 
                 const SEEDS: &[i64] = &[0, 1, -1, 2, -2, 5, -5, 10, -10, 100, -100];
                 use crossterm::style::Stylize;
@@ -3028,7 +3751,11 @@ impl Forth {
                 let saved_data = std::mem::take(&mut self.data);
 
                 let fmt_val = |v: i64| -> String {
-                    match v { -1 => "true".to_string(), 0 => "false".to_string(), n => n.to_string() }
+                    match v {
+                        -1 => "true".to_string(),
+                        0 => "false".to_string(),
+                        n => n.to_string(),
+                    }
                 };
 
                 for &seed in SEEDS {
@@ -3036,9 +3763,15 @@ impl Forth {
                     let prog2 = format!("{} {}", seed, op2);
 
                     self.data.clear();
-                    let r1 = self.eval(&prog1).ok().and_then(|_| self.data.last().copied());
+                    let r1 = self
+                        .eval(&prog1)
+                        .ok()
+                        .and_then(|_| self.data.last().copied());
                     self.data.clear();
-                    let r2 = self.eval(&prog2).ok().and_then(|_| self.data.last().copied());
+                    let r2 = self
+                        .eval(&prog2)
+                        .ok()
+                        .and_then(|_| self.data.last().copied());
                     self.data.clear();
 
                     match (r1, r2) {
@@ -3065,11 +3798,13 @@ impl Forth {
                             failures += 1;
                         }
                         (None, _) => {
-                            self.out.push_str(&format!("  {:>6}  │  {} errored\n", seed, op1));
+                            self.out
+                                .push_str(&format!("  {:>6}  │  {} errored\n", seed, op1));
                             failures += 1;
                         }
                         (_, None) => {
-                            self.out.push_str(&format!("  {:>6}  │  {} errored\n", seed, op2));
+                            self.out
+                                .push_str(&format!("  {:>6}  │  {} errored\n", seed, op2));
                             failures += 1;
                         }
                     }
@@ -3104,25 +3839,40 @@ impl Forth {
                 // If check leaves truthy: ✓ result propagates (left on caller's stack).
                 // If check leaves falsy:  ✗ bail — the gate does not pass.
                 let idx_check = self.pop()? as usize;
-                let idx_b     = self.pop()? as usize;
-                let idx_a     = self.pop()? as usize;
-                let code_a     = self.strings.get(idx_a).cloned()
+                let idx_b = self.pop()? as usize;
+                let idx_a = self.pop()? as usize;
+                let code_a = self
+                    .strings
+                    .get(idx_a)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("gate: invalid string index {idx_a}"))?;
-                let code_b     = self.strings.get(idx_b).cloned()
+                let code_b = self
+                    .strings
+                    .get(idx_b)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("gate: invalid string index {idx_b}"))?;
-                let code_check = self.strings.get(idx_check).cloned()
+                let code_check = self
+                    .strings
+                    .get(idx_check)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("gate: invalid string index {idx_check}"))?;
 
                 // Run each program in isolation.
                 let saved = std::mem::take(&mut self.data);
 
                 self.eval(&code_a)?;
-                let result_a = self.data.last().copied()
+                let result_a = self
+                    .data
+                    .last()
+                    .copied()
                     .ok_or_else(|| anyhow::anyhow!("gate: prog-a left nothing on stack"))?;
                 let stack_a = std::mem::take(&mut self.data);
 
                 self.eval(&code_b)?;
-                let result_b = self.data.last().copied()
+                let result_b = self
+                    .data
+                    .last()
+                    .copied()
                     .ok_or_else(|| anyhow::anyhow!("gate: prog-b left nothing on stack"))?;
                 self.data.clear();
 
@@ -3140,9 +3890,15 @@ impl Forth {
                 if flag != 0 {
                     // Gate passes — leave the agreed result on the stack.
                     // "Passes along" the full output stack of prog-a (the canonical result).
-                    for v in &stack_a { self.data.push(*v); }
+                    for v in &stack_a {
+                        self.data.push(*v);
+                    }
                     let fmt = |v: i64| -> String {
-                        match v { -1 => "true".into(), 0 => "false".into(), n => n.to_string() }
+                        match v {
+                            -1 => "true".into(),
+                            0 => "false".into(),
+                            n => n.to_string(),
+                        }
                     };
                     self.out.push_str(&format!(
                         "  {} | {} ──[{}]──→ {}   {}\n",
@@ -3154,16 +3910,27 @@ impl Forth {
                     ));
                 } else {
                     let fmt = |v: i64| -> String {
-                        match v { -1 => "true".into(), 0 => "false".into(), n => n.to_string() }
+                        match v {
+                            -1 => "true".into(),
+                            0 => "false".into(),
+                            n => n.to_string(),
+                        }
                     };
                     self.out.push_str(&format!(
                         "  {} → {}  {} → {}  check: {}   {}\n",
-                        code_a.as_str().cyan(), fmt(result_a).red(),
-                        code_b.as_str().cyan(), fmt(result_b).red(),
+                        code_a.as_str().cyan(),
+                        fmt(result_a).red(),
+                        code_b.as_str().cyan(),
+                        fmt(result_b).red(),
                         code_check.as_str().yellow(),
                         "✗ gate blocked".red(),
                     ));
-                    anyhow::bail!("gate blocked: check `{}` failed on ({}, {})", code_check, result_a, result_b);
+                    anyhow::bail!(
+                        "gate blocked: check `{}` failed on ({}, {})",
+                        code_check,
+                        result_a,
+                        result_b
+                    );
                 }
             }
             Builtin::Versus => {
@@ -3172,9 +3939,15 @@ impl Forth {
                 // Agrees if both stacks are identical (depth + all values).
                 let idx2 = self.pop()? as usize;
                 let idx1 = self.pop()? as usize;
-                let code1 = self.strings.get(idx1).cloned()
+                let code1 = self
+                    .strings
+                    .get(idx1)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("versus: invalid string index {idx1}"))?;
-                let code2 = self.strings.get(idx2).cloned()
+                let code2 = self
+                    .strings
+                    .get(idx2)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("versus: invalid string index {idx2}"))?;
 
                 let saved_data = std::mem::take(&mut self.data);
@@ -3196,7 +3969,11 @@ impl Forth {
                     if s.is_empty() {
                         "[ ]".to_string()
                     } else {
-                        let inner = s.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+                        let inner = s
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         format!("[ {} ]", inner)
                     }
                 };
@@ -3223,48 +4000,83 @@ impl Forth {
                         code2.as_str().cyan(),
                         "✗".red(),
                     ));
-                    anyhow::bail!("versus: stacks differ\n  A: {}\n  B: {}", fmt_stack(&stack1), fmt_stack(&stack2));
+                    anyhow::bail!(
+                        "versus: stacks differ\n  A: {}\n  B: {}",
+                        fmt_stack(&stack1),
+                        fmt_stack(&stack2)
+                    );
                 }
             }
             Builtin::BothWays => {
                 // ( a b str -- )  prove op commutes: op(a,b) = op(b,a)
                 // Two directions at once.  The stack settles it.
                 let idx = self.pop()? as usize;
-                let b   = self.pop()?;
-                let a   = self.pop()?;
-                let code = self.strings.get(idx).cloned()
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let code = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("both-ways: invalid string index {idx}"))?;
 
                 let depth_before = self.data.len();
 
-                self.data.push(a); self.data.push(b);
+                self.data.push(a);
+                self.data.push(b);
                 self.eval(&code)?;
-                let r1 = self.data.last().copied()
-                    .ok_or_else(|| anyhow::anyhow!("both-ways: forward left nothing on stack"))?;
+                let r1 =
+                    self.data.last().copied().ok_or_else(|| {
+                        anyhow::anyhow!("both-ways: forward left nothing on stack")
+                    })?;
                 self.data.truncate(depth_before);
 
-                self.data.push(b); self.data.push(a);
+                self.data.push(b);
+                self.data.push(a);
                 self.eval(&code)?;
-                let r2 = self.data.last().copied()
-                    .ok_or_else(|| anyhow::anyhow!("both-ways: reverse left nothing on stack"))?;
+                let r2 =
+                    self.data.last().copied().ok_or_else(|| {
+                        anyhow::anyhow!("both-ways: reverse left nothing on stack")
+                    })?;
                 self.data.truncate(depth_before);
 
                 use crossterm::style::Stylize;
                 if r1 == r2 {
                     self.out.push_str(&format!(
                         "  {} {} [{}] → {}   {} {} [{}] → {}   {}\n",
-                        a, b, code.as_str().cyan(), r1.to_string().green().bold(),
-                        b, a, code.as_str().cyan(), r2.to_string().green().bold(),
+                        a,
+                        b,
+                        code.as_str().cyan(),
+                        r1.to_string().green().bold(),
+                        b,
+                        a,
+                        code.as_str().cyan(),
+                        r2.to_string().green().bold(),
                         "✓".green(),
                     ));
                 } else {
                     self.out.push_str(&format!(
                         "  {} {} [{}] → {}   {} {} [{}] → {}   {}\n",
-                        a, b, code.as_str().cyan(), r1.to_string().red(),
-                        b, a, code.as_str().cyan(), r2.to_string().red(),
+                        a,
+                        b,
+                        code.as_str().cyan(),
+                        r1.to_string().red(),
+                        b,
+                        a,
+                        code.as_str().cyan(),
+                        r2.to_string().red(),
                         "✗".red(),
                     ));
-                    anyhow::bail!("both-ways: {} {} {} → {} but {} {} {} → {}", a, b, code, r1, b, a, code, r2);
+                    anyhow::bail!(
+                        "both-ways: {} {} {} → {} but {} {} {} → {}",
+                        a,
+                        b,
+                        code,
+                        r1,
+                        b,
+                        a,
+                        code,
+                        r2
+                    );
                 }
             }
             Builtin::Page => {
@@ -3273,42 +4085,53 @@ impl Forth {
                 // If a line has no | it runs as plain Forth.
                 use crossterm::style::Stylize;
                 let idx = self.pop()? as usize;
-                let src = self.strings.get(idx).cloned()
+                let src = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("page: invalid string index {idx}"))?;
                 let mut step = 1usize;
                 for raw_line in src.lines() {
                     let line = raw_line.trim();
-                    if line.is_empty() || line.starts_with('\\') { continue; }
+                    if line.is_empty() || line.starts_with('\\') {
+                        continue;
+                    }
 
                     if let Some(pipe) = line.find('|') {
-                        let left  = line[..pipe].trim();
-                        let right = line[pipe+1..].trim();
+                        let left = line[..pipe].trim();
+                        let right = line[pipe + 1..].trim();
 
                         let depth_before = self.data.len();
 
                         self.eval(left)?;
-                        let r1 = self.data.last().copied()
-                            .ok_or_else(|| anyhow::anyhow!("page line {step}: left side left nothing on stack"))?;
+                        let r1 = self.data.last().copied().ok_or_else(|| {
+                            anyhow::anyhow!("page line {step}: left side left nothing on stack")
+                        })?;
                         self.data.truncate(depth_before);
 
                         self.eval(right)?;
-                        let r2 = self.data.last().copied()
-                            .ok_or_else(|| anyhow::anyhow!("page line {step}: right side left nothing on stack"))?;
+                        let r2 = self.data.last().copied().ok_or_else(|| {
+                            anyhow::anyhow!("page line {step}: right side left nothing on stack")
+                        })?;
                         self.data.truncate(depth_before);
 
                         if r1 == r2 {
                             self.out.push_str(&format!(
                                 "  {}.  {}  ──→  {}  ←──  {}   {}\n",
                                 step,
-                                left.cyan(), r1.to_string().green().bold(),
-                                right.cyan(), "✓".green(),
+                                left.cyan(),
+                                r1.to_string().green().bold(),
+                                right.cyan(),
+                                "✓".green(),
                             ));
                         } else {
                             self.out.push_str(&format!(
                                 "  {}.  {}  ──→  {}  ≠  {}  ←──  {}   {}\n",
                                 step,
-                                left.cyan(), r1.to_string().red(),
-                                r2.to_string().red(), right.cyan(),
+                                left.cyan(),
+                                r1.to_string().red(),
+                                r2.to_string().red(),
+                                right.cyan(),
                                 "✗".red(),
                             ));
                             anyhow::bail!("page line {step}: left got {r1}, right got {r2}");
@@ -3325,26 +4148,40 @@ impl Forth {
                 // Run each non-empty line.  All must produce the same top-of-stack value.
                 // Shows all of them converging.  This is what agreement looks like.
                 let idx = self.pop()? as usize;
-                let src = self.strings.get(idx).cloned()
+                let src = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("resolve: invalid string index {idx}"))?;
 
                 use crossterm::style::Stylize;
 
-                struct Sentence { text: String, result: i64 }
+                struct Sentence {
+                    text: String,
+                    result: i64,
+                }
                 let mut sentences: Vec<Sentence> = Vec::new();
                 let depth_before = self.data.len();
 
                 for raw_line in src.lines() {
                     let line = raw_line.trim();
-                    if line.is_empty() || line.starts_with('\\') { continue; }
+                    if line.is_empty() || line.starts_with('\\') {
+                        continue;
+                    }
                     self.eval(line)?;
-                    let result = self.data.last().copied()
-                        .ok_or_else(|| anyhow::anyhow!("resolve: '{}' left nothing on stack", line))?;
+                    let result = self.data.last().copied().ok_or_else(|| {
+                        anyhow::anyhow!("resolve: '{}' left nothing on stack", line)
+                    })?;
                     self.data.truncate(depth_before);
-                    sentences.push(Sentence { text: line.to_string(), result });
+                    sentences.push(Sentence {
+                        text: line.to_string(),
+                        result,
+                    });
                 }
 
-                if sentences.is_empty() { return Ok(()); }
+                if sentences.is_empty() {
+                    return Ok(());
+                }
 
                 let truth = sentences[0].result;
                 let all_agree = sentences.iter().all(|s| s.result == truth);
@@ -3367,10 +4204,14 @@ impl Forth {
                 }
 
                 if all_agree {
-                    self.out.push_str(&format!("  {}\n", "all agree.".green().bold()));
+                    self.out
+                        .push_str(&format!("  {}\n", "all agree.".green().bold()));
                 } else {
-                    let bad: Vec<_> = sentences.iter().filter(|s| s.result != truth)
-                        .map(|s| format!("'{}' → {}", s.text, s.result)).collect();
+                    let bad: Vec<_> = sentences
+                        .iter()
+                        .filter(|s| s.result != truth)
+                        .map(|s| format!("'{}' → {}", s.text, s.result))
+                        .collect();
                     anyhow::bail!("resolve: sentences disagree: {}", bad.join(", "));
                 }
             }
@@ -3380,22 +4221,46 @@ impl Forth {
             }
             Builtin::LoopJ => {
                 let len = self.loop_stack.len();
-                let v = if len >= 2 { self.loop_stack[len-2].0 } else { 0 };
+                let v = if len >= 2 {
+                    self.loop_stack[len - 2].0
+                } else {
+                    0
+                };
                 self.data.push(v);
             }
-            Builtin::ToR    => { let a = self.pop()?; self.rstack.push(a); }
-            Builtin::FromR  => { let a = self.rstack.pop().ok_or_else(|| anyhow::anyhow!("return stack underflow"))?; self.data.push(a); }
-            Builtin::FetchR => { let a = self.rstack.last().copied().ok_or_else(|| anyhow::anyhow!("return stack underflow"))?; self.data.push(a); }
+            Builtin::ToR => {
+                let a = self.pop()?;
+                self.rstack.push(a);
+            }
+            Builtin::FromR => {
+                let a = self
+                    .rstack
+                    .pop()
+                    .ok_or_else(|| anyhow::anyhow!("return stack underflow"))?;
+                self.data.push(a);
+            }
+            Builtin::FetchR => {
+                let a = self
+                    .rstack
+                    .last()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("return stack underflow"))?;
+                self.data.push(a);
+            }
             Builtin::Pick => {
                 let n = self.pop()? as usize;
                 let len = self.data.len();
-                if n >= len { bail!("pick: stack underflow"); }
+                if n >= len {
+                    bail!("pick: stack underflow");
+                }
                 self.data.push(self.data[len - 1 - n]);
             }
             Builtin::Roll => {
                 let n = self.pop()? as usize;
                 let len = self.data.len();
-                if n >= len { bail!("roll: stack underflow"); }
+                if n >= len {
+                    bail!("roll: stack underflow");
+                }
                 let val = self.data.remove(len - 1 - n);
                 self.data.push(val);
             }
@@ -3406,19 +4271,33 @@ impl Forth {
             }
             Builtin::StarSlash => {
                 // ( a b c -- a*b/c ) with 128-bit intermediate
-                let c = self.pop()?; let b = self.pop()?; let a = self.pop()?;
-                if c == 0 { bail!("division by zero"); }
+                let c = self.pop()?;
+                let b = self.pop()?;
+                let a = self.pop()?;
+                if c == 0 {
+                    bail!("division by zero");
+                }
                 let r = (a as i128) * (b as i128) / (c as i128);
                 self.data.push(r as i64);
             }
             Builtin::SlashMod => {
                 // ( n d -- rem quot )
-                let d = self.pop()?; let n = self.pop()?;
-                if d == 0 { bail!("division by zero"); }
-                self.data.push(n % d); self.data.push(n / d);
+                let d = self.pop()?;
+                let n = self.pop()?;
+                if d == 0 {
+                    bail!("division by zero");
+                }
+                self.data.push(n % d);
+                self.data.push(n / d);
             }
-            Builtin::PrintU  => { let a = self.pop()? as u64; self.out.push_str(&format!("{a} ")); }
-            Builtin::PrintHex => { let a = self.pop()?; self.out.push_str(&format!("{a:#x} ")); }
+            Builtin::PrintU => {
+                let a = self.pop()? as u64;
+                self.out.push_str(&format!("{a} "));
+            }
+            Builtin::PrintHex => {
+                let a = self.pop()?;
+                self.out.push_str(&format!("{a:#x} "));
+            }
             Builtin::Words => {
                 let mut names: Vec<String> = self.name_index.keys().cloned().collect();
                 names.sort();
@@ -3427,10 +4306,14 @@ impl Forth {
             }
             Builtin::HotWords => {
                 // Build reverse map: addr → name
-                let addr_to_name: HashMap<usize, &str> = self.name_index.iter()
+                let addr_to_name: HashMap<usize, &str> = self
+                    .name_index
+                    .iter()
                     .map(|(n, &a)| (a, n.as_str()))
                     .collect();
-                let mut counts: Vec<(u64, &str)> = self.call_counts.iter()
+                let mut counts: Vec<(u64, &str)> = self
+                    .call_counts
+                    .iter()
                     .filter_map(|(&addr, &count)| {
                         addr_to_name.get(&addr).map(|&name| (count, name))
                     })
@@ -3444,21 +4327,30 @@ impl Forth {
             Builtin::Random => {
                 // Simple LCG random number generator
                 use std::time::{SystemTime, UNIX_EPOCH};
-                let seed = SystemTime::now().duration_since(UNIX_EPOCH)
+                let seed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
                     .map(|d| d.subsec_nanos() as i64)
                     .unwrap_or(12345);
-                let n = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let n = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 self.data.push(n.abs());
             }
             Builtin::Time => {
                 use std::time::{SystemTime, UNIX_EPOCH};
-                let secs = SystemTime::now().duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64).unwrap_or(0);
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
                 self.data.push(secs);
             }
-            Builtin::Depth => { self.data.push(self.data.len() as i64); }
-            Builtin::Nop   => {}
-            Builtin::Fuel  => { self.data.push(self.fuel as i64); }
+            Builtin::Depth => {
+                self.data.push(self.data.len() as i64);
+            }
+            Builtin::Nop => {}
+            Builtin::Fuel => {
+                self.data.push(self.fuel as i64);
+            }
             Builtin::WithFuel => {
                 // ( n -- )  set fuel budget for the next word call
                 // Used as: 1000000 with-fuel  before a heavy word
@@ -3479,14 +4371,20 @@ impl Forth {
                 const MAX_TTL_MS: u64 = 5_000;
                 let ttl_ms = self.pop()? as u64;
                 let name_idx = self.pop()? as usize;
-                let name = self.strings.get(name_idx)
-                    .ok_or_else(|| anyhow::anyhow!("lock: string index {} out of bounds", name_idx))?
+                let name = self
+                    .strings
+                    .get(name_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("lock: string index {} out of bounds", name_idx)
+                    })?
                     .clone();
                 let ttl = Duration::from_millis(ttl_ms.min(MAX_TTL_MS));
                 let now = Instant::now();
                 // Purge expired entry first
                 if let Some(&exp) = self.locks.get(&name) {
-                    if now >= exp { self.locks.remove(&name); }
+                    if now >= exp {
+                        self.locks.remove(&name);
+                    }
                 }
                 if self.locks.contains_key(&name) {
                     self.data.push(0); // lock is held
@@ -3498,18 +4396,25 @@ impl Forth {
             Builtin::Unlock => {
                 // ( name-idx -- )  release the named lock immediately
                 let name_idx = self.pop()? as usize;
-                let name = self.strings.get(name_idx)
-                    .ok_or_else(|| anyhow::anyhow!("unlock: string index {} out of bounds", name_idx))?
+                let name = self
+                    .strings
+                    .get(name_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unlock: string index {} out of bounds", name_idx)
+                    })?
                     .clone();
                 self.locks.remove(&name);
             }
             Builtin::LockTtl => {
                 // ( name-idx -- ms )  remaining TTL; 0 if free or expired
                 let name_idx = self.pop()? as usize;
-                let name = self.strings.get(name_idx)
-                    .ok_or_else(|| anyhow::anyhow!("lock-ttl: string index {} out of bounds", name_idx))?;
+                let name = self.strings.get(name_idx).ok_or_else(|| {
+                    anyhow::anyhow!("lock-ttl: string index {} out of bounds", name_idx)
+                })?;
                 let now = Instant::now();
-                let ms = self.locks.get(name)
+                let ms = self
+                    .locks
+                    .get(name)
                     .and_then(|&exp| exp.checked_duration_since(now))
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
@@ -3518,7 +4423,9 @@ impl Forth {
             // ── Writing assistance ────────────────────────────────────────────
             Builtin::Capitalize => {
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("capitalize: index {} out of bounds", idx))?
                     .clone();
                 let result = {
@@ -3534,7 +4441,9 @@ impl Forth {
             }
             Builtin::StrUpper => {
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("str-upper: index {} out of bounds", idx))?
                     .to_uppercase();
                 let new_idx = self.strings.len();
@@ -3543,7 +4452,9 @@ impl Forth {
             }
             Builtin::StrLower => {
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("str-lower: index {} out of bounds", idx))?
                     .to_lowercase();
                 let new_idx = self.strings.len();
@@ -3552,7 +4463,9 @@ impl Forth {
             }
             Builtin::StrTrim => {
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("str-trim: index {} out of bounds", idx))?
                     .trim()
                     .to_string();
@@ -3562,7 +4475,9 @@ impl Forth {
             }
             Builtin::WordCount => {
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("word-count: index {} out of bounds", idx))?;
                 let n = s.split_whitespace().count();
                 self.data.push(n as i64);
@@ -3570,17 +4485,29 @@ impl Forth {
             Builtin::SentenceCheck => {
                 // A well-formed sentence: non-empty, first char uppercase, last char is . ! ?
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("sentence?: index {} out of bounds", idx))?;
                 let trimmed = s.trim();
                 let valid = !trimmed.is_empty()
-                    && trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-                    && trimmed.chars().last().map(|c| matches!(c, '.' | '!' | '?')).unwrap_or(false);
+                    && trimmed
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false)
+                    && trimmed
+                        .chars()
+                        .last()
+                        .map(|c| matches!(c, '.' | '!' | '?'))
+                        .unwrap_or(false);
                 self.data.push(if valid { -1 } else { 0 });
             }
             Builtin::GrammarCheck => {
                 let idx = self.pop()? as usize;
-                let text = self.strings.get(idx)
+                let text = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("grammar-check: index {} out of bounds", idx))?
                     .clone();
                 let result = if let Some(ref f) = self.gen_fn {
@@ -3599,7 +4526,9 @@ impl Forth {
             }
             Builtin::ImproveStr => {
                 let idx = self.pop()? as usize;
-                let text = self.strings.get(idx)
+                let text = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("improve: index {} out of bounds", idx))?
                     .clone();
                 let result = if let Some(ref f) = self.gen_fn {
@@ -3616,38 +4545,51 @@ impl Forth {
                 self.strings.push(result);
                 self.data.push(new_idx as i64);
             }
-            Builtin::Sqrt  => {
+            Builtin::Sqrt => {
                 let n = self.pop()?;
-                if n < 0 { bail!("sqrt of negative"); }
+                if n < 0 {
+                    bail!("sqrt of negative");
+                }
                 self.data.push((n as f64).sqrt() as i64);
             }
             Builtin::Floor => {
-                let d = self.pop()?; let n = self.pop()?;
-                if d == 0 { bail!("division by zero"); }
+                let d = self.pop()?;
+                let n = self.pop()?;
+                if d == 0 {
+                    bail!("division by zero");
+                }
                 self.data.push(n.div_euclid(d) * d);
             }
-            Builtin::Ceil  => {
-                let d = self.pop()?; let n = self.pop()?;
-                if d == 0 { bail!("division by zero"); }
+            Builtin::Ceil => {
+                let d = self.pop()?;
+                let n = self.pop()?;
+                if d == 0 {
+                    bail!("division by zero");
+                }
                 let q = n.div_euclid(d);
                 let r = n.rem_euclid(d);
                 self.data.push(if r == 0 { q * d } else { (q + 1) * d });
             }
-            Builtin::Sin   => {
+            Builtin::Sin => {
                 // Input: degrees * 1000  Output: sin * 1000
                 let deg_milli = self.pop()?;
                 let rad = (deg_milli as f64) / 1000.0 * std::f64::consts::PI / 180.0;
                 self.data.push((rad.sin() * 1000.0) as i64);
             }
-            Builtin::Cos   => {
+            Builtin::Cos => {
                 let deg_milli = self.pop()?;
                 let rad = (deg_milli as f64) / 1000.0 * std::f64::consts::PI / 180.0;
                 self.data.push((rad.cos() * 1000.0) as i64);
             }
             Builtin::FPMul => {
-                let scale = self.pop()?; let b = self.pop()?; let a = self.pop()?;
-                if scale == 0 { bail!("fpmul: scale is zero"); }
-                self.data.push((a as i128 * b as i128 / scale as i128) as i64);
+                let scale = self.pop()?;
+                let b = self.pop()?;
+                let a = self.pop()?;
+                if scale == 0 {
+                    bail!("fpmul: scale is zero");
+                }
+                self.data
+                    .push((a as i128 * b as i128 / scale as i128) as i64);
             }
             Builtin::Peers => {
                 if self.peers.is_empty() {
@@ -3665,7 +4607,8 @@ impl Forth {
                 // mDNS scan — finds _finch._tcp.local. services, adds host:port to self.peers
                 let found = run_peers_discover(2000);
                 if found.is_empty() {
-                    self.out.push_str("peers-discover: no finch instances found on LAN\n");
+                    self.out
+                        .push_str("peers-discover: no finch instances found on LAN\n");
                 } else {
                     for (host, port, name, token) in &found {
                         let addr = format!("{host}:{port}");
@@ -3676,10 +4619,18 @@ impl Forth {
                                 meta.label = Some(name.clone());
                             }
                             if let Some(t) = token {
-                                if meta.token.is_none() { meta.token = Some(t.clone()); }
+                                if meta.token.is_none() {
+                                    meta.token = Some(t.clone());
+                                }
                             }
-                            self.out.push_str(&format!("  + {}\n",
-                                if name.is_empty() { addr.clone() } else { name.clone() }));
+                            self.out.push_str(&format!(
+                                "  + {}\n",
+                                if name.is_empty() {
+                                    addr.clone()
+                                } else {
+                                    name.clone()
+                                }
+                            ));
                         }
                     }
                 }
@@ -3689,8 +4640,10 @@ impl Forth {
                 use crossterm::style::Stylize;
                 let found = run_peers_discover(3000);
                 if found.is_empty() {
-                    self.out.push_str(&format!("{}\n",
-                        "take-all: no machines found on LAN".dark_grey()));
+                    self.out.push_str(&format!(
+                        "{}\n",
+                        "take-all: no machines found on LAN".dark_grey()
+                    ));
                 } else {
                     let mut added = 0usize;
                     for (host, port, name, token) in &found {
@@ -3704,49 +4657,68 @@ impl Forth {
                             meta.label = Some(name.clone());
                         }
                         if let Some(t) = token {
-                            if meta.token.is_none() { meta.token = Some(t.clone()); }
+                            if meta.token.is_none() {
+                                meta.token = Some(t.clone());
+                            }
                         }
                         if !meta.tags.contains(&"all".to_string()) {
                             meta.tags.push("all".to_string());
                         }
                     }
                     // Rebuild the "all" ensemble from tagged peers
-                    let all_peers: Vec<String> = self.peer_meta.iter()
+                    let all_peers: Vec<String> = self
+                        .peer_meta
+                        .iter()
                         .filter(|(_, m)| m.tags.contains(&"all".to_string()))
                         .map(|(a, _)| a.clone())
                         .collect();
                     let total = all_peers.len();
                     self.ensembles.insert("all".to_string(), all_peers);
-                    self.out.push_str(&format!("{} {} machine(s)  ensemble '{}' ready\n",
+                    self.out.push_str(&format!(
+                        "{} {} machine(s)  ensemble '{}' ready\n",
                         "took".green().bold(),
                         total.to_string().cyan().bold(),
-                        "all".cyan()));
+                        "all".cyan()
+                    ));
                     if added < total {
-                        self.out.push_str(&format!("  ({} new, {} already known)\n",
+                        self.out.push_str(&format!(
+                            "  ({} new, {} already known)\n",
                             added.to_string().dark_grey(),
-                            (total - added).to_string().dark_grey()));
+                            (total - added).to_string().dark_grey()
+                        ));
                     }
                 }
             }
             Builtin::EnsembleDef => {
                 // ( name-idx -- )  snapshot current peers under a name
                 let idx = self.pop()? as usize;
-                let name = self.strings.get(idx)
+                let name = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("ensemble-def: string index out of bounds"))?
-                    .trim().to_string();
-                if name.is_empty() { bail!("ensemble-def: name must not be empty"); }
+                    .trim()
+                    .to_string();
+                if name.is_empty() {
+                    bail!("ensemble-def: name must not be empty");
+                }
                 let peers = self.peers.clone();
                 let count = peers.len();
                 self.ensembles.insert(name.clone(), peers);
-                self.out.push_str(&format!("ensemble '{}': {} peer(s) saved\n", name, count));
+                self.out
+                    .push_str(&format!("ensemble '{}': {} peer(s) saved\n", name, count));
             }
             Builtin::EnsembleUse => {
                 // ( name-idx -- )  push current peers, switch to named ensemble
                 let idx = self.pop()? as usize;
-                let name = self.strings.get(idx)
+                let name = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("ensemble-use: string index out of bounds"))?
-                    .trim().to_string();
-                let members = self.ensembles.get(&name)
+                    .trim()
+                    .to_string();
+                let members = self
+                    .ensembles
+                    .get(&name)
                     .ok_or_else(|| anyhow::anyhow!("ensemble-use: unknown ensemble '{}'", name))?
                     .clone();
                 let saved = std::mem::replace(&mut self.peers, members);
@@ -3755,37 +4727,54 @@ impl Forth {
             Builtin::EnsembleEnd => {
                 // ( -- )  restore previous peers
                 match self.peer_save_stack.pop() {
-                    Some(saved) => { self.peers = saved; }
-                    None => { bail!("ensemble-end: no saved peer context (missing ensemble-use?)"); }
+                    Some(saved) => {
+                        self.peers = saved;
+                    }
+                    None => {
+                        bail!("ensemble-end: no saved peer context (missing ensemble-use?)");
+                    }
                 }
             }
             Builtin::EnsembleList => {
                 use crossterm::style::Stylize;
                 if self.ensembles.is_empty() {
-                    self.out.push_str(&"(no ensembles defined)".dark_grey().to_string());
+                    self.out
+                        .push_str(&"(no ensembles defined)".dark_grey().to_string());
                     self.out.push('\n');
                 } else {
                     let mut names: Vec<&String> = self.ensembles.keys().collect();
                     names.sort();
                     for name in names {
                         let members = &self.ensembles[name];
-                        self.out.push_str(&format!("  {}  {}\n",
+                        self.out.push_str(&format!(
+                            "  {}  {}\n",
                             name.as_str().cyan().bold(),
-                            format!("({} peers)", members.len()).dark_grey()));
+                            format!("({} peers)", members.len()).dark_grey()
+                        ));
                         for m in members {
-                            let label = self.peer_meta.get(m)
+                            let label = self
+                                .peer_meta
+                                .get(m)
                                 .and_then(|p| p.label.as_deref())
                                 .unwrap_or("");
-                            let tags = self.peer_meta.get(m)
+                            let tags = self
+                                .peer_meta
+                                .get(m)
                                 .map(|p| p.tags.join(" "))
                                 .unwrap_or_default();
                             let suffix = match (label.is_empty(), tags.is_empty()) {
-                                (false, false) => format!("  {} [{}]", label.yellow(), tags.as_str().dark_grey()),
-                                (false, true)  => format!("  {}", label.yellow()),
-                                (true,  false) => format!("  [{}]", tags.as_str().dark_grey()),
-                                (true,  true)  => String::new(),
+                                (false, false) => {
+                                    format!("  {} [{}]", label.yellow(), tags.as_str().dark_grey())
+                                }
+                                (false, true) => format!("  {}", label.yellow()),
+                                (true, false) => format!("  [{}]", tags.as_str().dark_grey()),
+                                (true, true) => String::new(),
                             };
-                            self.out.push_str(&format!("    {}{}\n", m.as_str().dark_grey(), suffix));
+                            self.out.push_str(&format!(
+                                "    {}{}\n",
+                                m.as_str().dark_grey(),
+                                suffix
+                            ));
                         }
                     }
                 }
@@ -3793,54 +4782,87 @@ impl Forth {
             Builtin::LabelPeer => {
                 // ( addr-idx label-idx -- )
                 let label_idx = self.pop()? as usize;
-                let addr_idx  = self.pop()? as usize;
-                let addr  = self.strings.get(addr_idx).cloned()
+                let addr_idx = self.pop()? as usize;
+                let addr = self
+                    .strings
+                    .get(addr_idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("label-peer: addr index out of bounds"))?;
-                let label = self.strings.get(label_idx).cloned()
+                let label = self
+                    .strings
+                    .get(label_idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("label-peer: label index out of bounds"))?;
-                self.peer_meta.entry(addr.trim().to_string()).or_default().label = Some(label.trim().to_string());
+                self.peer_meta
+                    .entry(addr.trim().to_string())
+                    .or_default()
+                    .label = Some(label.trim().to_string());
             }
             Builtin::TagPeer => {
                 // ( addr-idx tag-idx -- )
-                let tag_idx  = self.pop()? as usize;
+                let tag_idx = self.pop()? as usize;
                 let addr_idx = self.pop()? as usize;
-                let addr = self.strings.get(addr_idx).cloned()
+                let addr = self
+                    .strings
+                    .get(addr_idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("tag-peer: addr index out of bounds"))?;
-                let tag  = self.strings.get(tag_idx).cloned()
+                let tag = self
+                    .strings
+                    .get(tag_idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("tag-peer: tag index out of bounds"))?;
                 let tag_str = tag.trim().to_string();
                 let meta = self.peer_meta.entry(addr.trim().to_string()).or_default();
-                if !meta.tags.contains(&tag_str) { meta.tags.push(tag_str); }
+                if !meta.tags.contains(&tag_str) {
+                    meta.tags.push(tag_str);
+                }
             }
             Builtin::EnsembleFromTag => {
                 // ( tag-idx -- )  build ensemble named after the tag from all tagged peers
                 let tag_idx = self.pop()? as usize;
-                let tag = self.strings.get(tag_idx).cloned()
+                let tag = self
+                    .strings
+                    .get(tag_idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("ensemble-from-tag: index out of bounds"))?
-                    .trim().to_string();
-                let members: Vec<String> = self.peer_meta.iter()
+                    .trim()
+                    .to_string();
+                let members: Vec<String> = self
+                    .peer_meta
+                    .iter()
                     .filter(|(_, m)| m.tags.contains(&tag))
                     .map(|(addr, _)| addr.clone())
                     .collect();
                 use crossterm::style::Stylize;
-                self.out.push_str(&format!("ensemble '{}': {} peer(s)\n",
-                    tag.as_str().cyan().bold(), members.len()));
+                self.out.push_str(&format!(
+                    "ensemble '{}': {} peer(s)\n",
+                    tag.as_str().cyan().bold(),
+                    members.len()
+                ));
                 self.ensembles.insert(tag, members);
             }
             Builtin::PeerInfo => {
                 use crossterm::style::Stylize;
                 if self.peers.is_empty() {
-                    self.out.push_str(&"(no peers registered)".dark_grey().to_string());
+                    self.out
+                        .push_str(&"(no peers registered)".dark_grey().to_string());
                     self.out.push('\n');
                 } else {
                     for addr in &self.peers {
                         let meta = self.peer_meta.get(addr);
                         let label = meta.and_then(|m| m.label.as_deref()).unwrap_or("");
-                        let tags  = meta.map(|m| m.tags.join(" ")).unwrap_or_default();
-                        let name = if label.is_empty() { addr.as_str().cyan().to_string() }
-                                   else { format!("{} {}", label.cyan().bold(), addr.as_str().dark_grey()) };
-                        let tag_str = if tags.is_empty() { String::new() }
-                                      else { format!("  [{}]", tags.as_str().yellow()) };
+                        let tags = meta.map(|m| m.tags.join(" ")).unwrap_or_default();
+                        let name = if label.is_empty() {
+                            addr.as_str().cyan().to_string()
+                        } else {
+                            format!("{} {}", label.cyan().bold(), addr.as_str().dark_grey())
+                        };
+                        let tag_str = if tags.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  [{}]", tags.as_str().yellow())
+                        };
                         self.out.push_str(&format!("  {}{}\n", name, tag_str));
                     }
                 }
@@ -3850,34 +4872,53 @@ impl Forth {
                 // ( name-idx -- )  scatter one word's source to all peers
                 use crossterm::style::Stylize;
                 let name_idx = self.pop()? as usize;
-                let name = self.strings.get(name_idx).cloned()
+                let name = self
+                    .strings
+                    .get(name_idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("publish: index out of bounds"))?;
                 match self.word_source(&name) {
                     None => {
-                        self.out.push_str(&format!("'{}' hasn't been defined yet\n",
-                            name.as_str().yellow()));
+                        self.out.push_str(&format!(
+                            "'{}' hasn't been defined yet\n",
+                            name.as_str().yellow()
+                        ));
                     }
                     Some(src) => {
                         if self.peers.is_empty() {
-                            self.out.push_str(&"nobody else is here yet\n".dark_grey().to_string());
+                            self.out
+                                .push_str(&"nobody else is here yet\n".dark_grey().to_string());
                         } else {
                             let tokens = peer_tokens_map(&self.peer_meta);
                             let results = run_define_scatter(&self.peers, &src, &tokens);
                             for r in &results {
-                                let label = self.peer_meta.get(&r.peer)
+                                let label = self
+                                    .peer_meta
+                                    .get(&r.peer)
                                     .and_then(|m| m.label.as_deref())
                                     .map(|l| l.cyan().bold().to_string())
                                     .unwrap_or_else(|| {
-                                        r.peer.trim_start_matches("http://")
-                                            .split(':').next().unwrap_or(&r.peer)
-                                            .cyan().to_string()
+                                        r.peer
+                                            .trim_start_matches("http://")
+                                            .split(':')
+                                            .next()
+                                            .unwrap_or(&r.peer)
+                                            .cyan()
+                                            .to_string()
                                     });
                                 if let Some(e) = &r.error {
-                                    self.out.push_str(&format!("{} couldn't learn {}: {}\n",
-                                        label, name.as_str().yellow(), e.as_str().red()));
+                                    self.out.push_str(&format!(
+                                        "{} couldn't learn {}: {}\n",
+                                        label,
+                                        name.as_str().yellow(),
+                                        e.as_str().red()
+                                    ));
                                 } else {
-                                    self.out.push_str(&format!("{} now knows {}\n",
-                                        label, name.as_str().green().bold()));
+                                    self.out.push_str(&format!(
+                                        "{} now knows {}\n",
+                                        label,
+                                        name.as_str().green().bold()
+                                    ));
                                 }
                             }
                         }
@@ -3889,30 +4930,46 @@ impl Forth {
                 use crossterm::style::Stylize;
                 let src = self.dump_source();
                 if src.is_empty() {
-                    self.out.push_str(&"nothing to share yet\n".dark_grey().to_string());
+                    self.out
+                        .push_str(&"nothing to share yet\n".dark_grey().to_string());
                 } else if self.peers.is_empty() {
-                    self.out.push_str(&"nobody else is here yet\n".dark_grey().to_string());
+                    self.out
+                        .push_str(&"nobody else is here yet\n".dark_grey().to_string());
                 } else {
-                    let word_count = src.lines().filter(|l| l.trim_start().starts_with(':')).count();
+                    let word_count = src
+                        .lines()
+                        .filter(|l| l.trim_start().starts_with(':'))
+                        .count();
                     let tokens = peer_tokens_map(&self.peer_meta);
                     let results = run_define_scatter(&self.peers, &src, &tokens);
                     for r in &results {
-                        let label = self.peer_meta.get(&r.peer)
+                        let label = self
+                            .peer_meta
+                            .get(&r.peer)
                             .and_then(|m| m.label.as_deref())
                             .map(|l| l.cyan().bold().to_string())
                             .unwrap_or_else(|| {
-                                r.peer.trim_start_matches("http://")
-                                    .split(':').next().unwrap_or(&r.peer)
-                                    .cyan().to_string()
+                                r.peer
+                                    .trim_start_matches("http://")
+                                    .split(':')
+                                    .next()
+                                    .unwrap_or(&r.peer)
+                                    .cyan()
+                                    .to_string()
                             });
                         if let Some(e) = &r.error {
-                            self.out.push_str(&format!("{} is out of reach: {}\n",
-                                label, e.as_str().red()));
+                            self.out.push_str(&format!(
+                                "{} is out of reach: {}\n",
+                                label,
+                                e.as_str().red()
+                            ));
                         } else {
-                            self.out.push_str(&format!("{} is caught up  ({} word{})\n",
+                            self.out.push_str(&format!(
+                                "{} is caught up  ({} word{})\n",
                                 label,
                                 word_count,
-                                if word_count == 1 { "" } else { "s" }));
+                                if word_count == 1 { "" } else { "s" }
+                            ));
                         }
                     }
                 }
@@ -3921,7 +4978,10 @@ impl Forth {
             Builtin::RegistrySet => {
                 // ( addr-idx -- )  set the registry address for this VM
                 let idx = self.pop()? as usize;
-                let addr = self.strings.get(idx).cloned()
+                let addr = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("registry: index out of bounds"))?;
                 self.registry_addr = Some(addr.trim().to_string());
             }
@@ -3929,38 +4989,51 @@ impl Forth {
                 // ( self-addr-idx -- )  register this machine with the configured registry
                 use crossterm::style::Stylize;
                 let addr_idx = self.pop()? as usize;
-                let self_addr = self.strings.get(addr_idx).cloned()
+                let self_addr = self
+                    .strings
+                    .get(addr_idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("join-registry: index out of bounds"))?;
                 match &self.registry_addr {
                     None => {
-                        self.out.push_str(&"join-registry: no registry set  (use registry\" addr\")\n"
-                            .yellow().to_string());
+                        self.out.push_str(
+                            &"join-registry: no registry set  (use registry\" addr\")\n"
+                                .yellow()
+                                .to_string(),
+                        );
                     }
                     Some(reg) => {
                         let reg = reg.clone();
                         // Build tags from peer_meta for self_addr if present; else empty.
                         let meta = self.peer_meta.get(&self_addr).cloned();
                         let specs = collect_machine_specs();
-                        let result = run_registry_join(&reg, crate::registry::PeerEntry {
-                            addr:      self_addr.clone(),
-                            label:     meta.as_ref().and_then(|m| m.label.clone()),
-                            tags:      meta.map(|m| m.tags).unwrap_or_default(),
-                            load:      None,
-                            region:    None,
-                            cpu_cores: Some(specs.0),
-                            ram_mb:    Some(specs.1),
-                            bench_ms:  Some(specs.2),
-                        });
+                        let result = run_registry_join(
+                            &reg,
+                            crate::registry::PeerEntry {
+                                addr: self_addr.clone(),
+                                label: meta.as_ref().and_then(|m| m.label.clone()),
+                                tags: meta.map(|m| m.tags).unwrap_or_default(),
+                                load: None,
+                                region: None,
+                                cpu_cores: Some(specs.0),
+                                ram_mb: Some(specs.1),
+                                bench_ms: Some(specs.2),
+                            },
+                        );
                         match result {
                             Ok(_) => {
                                 self.my_addr = Some(self_addr.clone());
-                                self.out.push_str(&format!("registered {} with {}\n",
+                                self.out.push_str(&format!(
+                                    "registered {} with {}\n",
                                     self_addr.as_str().cyan().bold(),
-                                    reg.as_str().dark_grey()));
+                                    reg.as_str().dark_grey()
+                                ));
                             }
                             Err(e) => {
-                                self.out.push_str(&format!("join-registry error: {}\n",
-                                    e.to_string().red()));
+                                self.out.push_str(&format!(
+                                    "join-registry error: {}\n",
+                                    e.to_string().red()
+                                ));
                             }
                         }
                     }
@@ -3972,26 +5045,32 @@ impl Forth {
                 let addr = match &self.my_addr {
                     Some(a) => a.clone(),
                     None => {
-                        self.out.push_str(&"leave: not registered (use join\" addr\" first)\n"
-                            .yellow().to_string());
+                        self.out.push_str(
+                            &"leave: not registered (use join\" addr\" first)\n"
+                                .yellow()
+                                .to_string(),
+                        );
                         return Ok(());
                     }
                 };
                 match &self.registry_addr {
                     None => {
-                        self.out.push_str(&"leave: no registry set\n".yellow().to_string());
+                        self.out
+                            .push_str(&"leave: no registry set\n".yellow().to_string());
                     }
                     Some(reg) => {
                         let reg = reg.clone();
                         match run_registry_leave(&reg, &addr) {
                             Ok(()) => {
-                                self.out.push_str(&format!("left registry: {}\n",
-                                    addr.as_str().dark_grey()));
+                                self.out.push_str(&format!(
+                                    "left registry: {}\n",
+                                    addr.as_str().dark_grey()
+                                ));
                                 self.my_addr = None;
                             }
                             Err(e) => {
-                                self.out.push_str(&format!("leave error: {}\n",
-                                    e.to_string().red()));
+                                self.out
+                                    .push_str(&format!("leave error: {}\n", e.to_string().red()));
                             }
                         }
                     }
@@ -4002,14 +5081,17 @@ impl Forth {
                 use crossterm::style::Stylize;
                 match &self.registry_addr {
                     None => {
-                        self.out.push_str(&"from-registry: no registry set\n".yellow().to_string());
+                        self.out
+                            .push_str(&"from-registry: no registry set\n".yellow().to_string());
                     }
                     Some(reg) => {
                         let reg = reg.clone();
                         match run_registry_peers(&reg, None, None) {
                             Err(e) => {
-                                self.out.push_str(&format!("from-registry error: {}\n",
-                                    e.to_string().red()));
+                                self.out.push_str(&format!(
+                                    "from-registry error: {}\n",
+                                    e.to_string().red()
+                                ));
                             }
                             Ok(peers) => {
                                 let mut added = 0usize;
@@ -4029,9 +5111,11 @@ impl Forth {
                                         }
                                     }
                                 }
-                                self.out.push_str(&format!("{} peer(s) from registry ({} new)\n",
+                                self.out.push_str(&format!(
+                                    "{} peer(s) from registry ({} new)\n",
                                     peers.len().to_string().cyan(),
-                                    added.to_string().green()));
+                                    added.to_string().green()
+                                ));
                             }
                         }
                     }
@@ -4042,30 +5126,49 @@ impl Forth {
                 use crossterm::style::Stylize;
                 match &self.registry_addr {
                     None => {
-                        self.out.push_str(&"registry-list: no registry set\n".yellow().to_string());
+                        self.out
+                            .push_str(&"registry-list: no registry set\n".yellow().to_string());
                     }
                     Some(reg) => {
                         let reg = reg.clone();
                         match run_registry_peers(&reg, None, None) {
                             Err(e) => {
-                                self.out.push_str(&format!("registry-list error: {}\n",
-                                    e.to_string().red()));
+                                self.out.push_str(&format!(
+                                    "registry-list error: {}\n",
+                                    e.to_string().red()
+                                ));
                             }
                             Ok(peers) => {
                                 if peers.is_empty() {
-                                    self.out.push_str(&"(registry empty)\n".dark_grey().to_string());
+                                    self.out
+                                        .push_str(&"(registry empty)\n".dark_grey().to_string());
                                 } else {
                                     for p in &peers {
-                                        let name = p.label.as_deref()
-                                            .map(|l| format!("{} {}", l.cyan().bold(),
-                                                p.addr.as_str().dark_grey()))
+                                        let name = p
+                                            .label
+                                            .as_deref()
+                                            .map(|l| {
+                                                format!(
+                                                    "{} {}",
+                                                    l.cyan().bold(),
+                                                    p.addr.as_str().dark_grey()
+                                                )
+                                            })
                                             .unwrap_or_else(|| p.addr.as_str().cyan().to_string());
-                                        let tags = if p.tags.is_empty() { String::new() }
-                                            else { format!("  [{}]", p.tags.join(" ").yellow()) };
-                                        let load = p.load.map(|l| format!("  load:{:.0}%",
-                                            (l * 100.0).round())).unwrap_or_default();
+                                        let tags = if p.tags.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!("  [{}]", p.tags.join(" ").yellow())
+                                        };
+                                        let load = p
+                                            .load
+                                            .map(|l| format!("  load:{:.0}%", (l * 100.0).round()))
+                                            .unwrap_or_default();
                                         let hw = format_peer_hw(p);
-                                        self.out.push_str(&format!("  {}{}{}{}\n", name, hw, tags, load));
+                                        self.out.push_str(&format!(
+                                            "  {}{}{}{}\n",
+                                            name, hw, tags, load
+                                        ));
                                     }
                                 }
                             }
@@ -4078,13 +5181,15 @@ impl Forth {
                 use crossterm::style::Stylize;
                 match &self.registry_addr {
                     None => {
-                        self.out.push_str(&"balance: not registered\n".yellow().to_string());
+                        self.out
+                            .push_str(&"balance: not registered\n".yellow().to_string());
                     }
                     Some(reg) => {
                         let reg = reg.clone();
                         match run_registry_ledger(&reg, &reg) {
                             Err(e) => {
-                                self.out.push_str(&format!("balance error: {}\n", e.to_string().red()));
+                                self.out
+                                    .push_str(&format!("balance error: {}\n", e.to_string().red()));
                             }
                             Ok(entry) => {
                                 let net = entry.balance_ms();
@@ -4110,17 +5215,23 @@ impl Forth {
                 use crossterm::style::Stylize;
                 match &self.registry_addr {
                     None => {
-                        self.out.push_str(&"balances: no registry set\n".yellow().to_string());
+                        self.out
+                            .push_str(&"balances: no registry set\n".yellow().to_string());
                     }
                     Some(reg) => {
                         let reg = reg.clone();
                         match run_registry_all_ledgers(&reg) {
                             Err(e) => {
-                                self.out.push_str(&format!("balances error: {}\n", e.to_string().red()));
+                                self.out.push_str(&format!(
+                                    "balances error: {}\n",
+                                    e.to_string().red()
+                                ));
                             }
                             Ok(entries) => {
                                 if entries.is_empty() {
-                                    self.out.push_str(&"(no machines registered)\n".dark_grey().to_string());
+                                    self.out.push_str(
+                                        &"(no machines registered)\n".dark_grey().to_string(),
+                                    );
                                 } else {
                                     for (addr, entry) in &entries {
                                         let net = entry.balance_ms();
@@ -4148,7 +5259,7 @@ impl Forth {
                     return Err(anyhow::anyhow!("record-debit: stack underflow"));
                 }
                 let compute_ms = self.data.pop().unwrap() as u64;
-                let peer_idx   = self.data.pop().unwrap() as usize;
+                let peer_idx = self.data.pop().unwrap() as usize;
                 if let Some(peer_addr) = self.strings.get(peer_idx).cloned() {
                     if let Some(ref reg) = self.registry_addr.clone() {
                         let _ = run_registry_debit(reg, &peer_addr, compute_ms);
@@ -4171,19 +5282,16 @@ impl Forth {
                 }
 
                 // 2. Check the library for a plain-language definition.
-                static LIB: std::sync::OnceLock<crate::coforth::Library> = std::sync::OnceLock::new();
+                static LIB: std::sync::OnceLock<crate::coforth::Library> =
+                    std::sync::OnceLock::new();
                 let lib = LIB.get_or_init(crate::coforth::Library::load);
                 if let Some(entry) = lib.lookup(&word_name) {
-                    self.out.push_str(&format!(
-                        "  {}\n",
-                        entry.definition.as_str().white(),
-                    ));
+                    self.out
+                        .push_str(&format!("  {}\n", entry.definition.as_str().white(),));
                     if !entry.related.is_empty() {
                         let rel = entry.related.join("  ");
-                        self.out.push_str(&format!(
-                            "  → {}\n",
-                            rel.as_str().dark_grey(),
-                        ));
+                        self.out
+                            .push_str(&format!("  → {}\n", rel.as_str().dark_grey(),));
                     }
                     found = true;
                 }
@@ -4218,18 +5326,21 @@ impl Forth {
                 use crossterm::style::Stylize;
                 match &self.registry_addr {
                     None => {
-                        self.out.push_str(&"debt-check: not registered\n".yellow().to_string());
+                        self.out
+                            .push_str(&"debt-check: not registered\n".yellow().to_string());
                     }
                     Some(reg) => {
                         let reg = reg.clone();
                         match run_registry_all_ledgers(&reg) {
                             Err(e) => {
-                                self.out.push_str(&format!("debt-check error: {}\n", e.to_string().red()));
+                                self.out.push_str(&format!(
+                                    "debt-check error: {}\n",
+                                    e.to_string().red()
+                                ));
                             }
                             Ok(entries) => {
-                                let debtors: Vec<_> = entries.iter()
-                                    .filter(|(_, e)| e.balance_ms() < 0)
-                                    .collect();
+                                let debtors: Vec<_> =
+                                    entries.iter().filter(|(_, e)| e.balance_ms() < 0).collect();
                                 if debtors.is_empty() {
                                     self.out.push_str(&"  all square\n".green().to_string());
                                 } else {
@@ -4256,14 +5367,18 @@ impl Forth {
                     return Err(anyhow::anyhow!("settle: stack underflow"));
                 }
                 let peer_idx = self.data.pop().unwrap() as usize;
-                let peer_addr = self.strings.get(peer_idx)
+                let peer_addr = self
+                    .strings
+                    .get(peer_idx)
                     .ok_or_else(|| anyhow::anyhow!("settle: peer string index out of bounds"))?
-                    .trim().to_string();
+                    .trim()
+                    .to_string();
                 // Look up what we owe this peer from our local registry view.
                 let my_addr = self.registry_addr.clone();
                 match run_peer_settle(&peer_addr, my_addr.as_deref()) {
                     Err(e) => {
-                        self.out.push_str(&format!("settle error: {}\n", e.to_string().red()));
+                        self.out
+                            .push_str(&format!("settle error: {}\n", e.to_string().red()));
                     }
                     Ok((cleared_ms, msg)) => {
                         let cleared_s = cleared_ms as f64 / 1000.0;
@@ -4285,33 +5400,39 @@ impl Forth {
                 use crossterm::style::Stylize;
                 match &self.registry_addr {
                     None => {
-                        self.out.push_str(&"slowest: no registry set\n".yellow().to_string());
+                        self.out
+                            .push_str(&"slowest: no registry set\n".yellow().to_string());
                         self.data.push(-1);
                     }
                     Some(reg) => {
                         let reg = reg.clone();
                         match run_registry_peers(&reg, None, None) {
                             Err(e) => {
-                                self.out.push_str(&format!("slowest error: {}\n", e.to_string().red()));
+                                self.out
+                                    .push_str(&format!("slowest error: {}\n", e.to_string().red()));
                                 self.data.push(-1);
                             }
                             Ok(peers) if peers.is_empty() => {
-                                self.out.push_str(&"slowest: registry empty\n".dark_grey().to_string());
+                                self.out
+                                    .push_str(&"slowest: registry empty\n".dark_grey().to_string());
                                 self.data.push(-1);
                             }
                             Ok(peers) => {
                                 // Score: highest bench_ms wins (slowest); tie-break by highest load.
-                                let slowest = peers.iter().max_by(|a, b| {
-                                    let sa = a.bench_ms.unwrap_or(0);
-                                    let sb = b.bench_ms.unwrap_or(0);
-                                    if sa != sb {
-                                        sa.cmp(&sb)
-                                    } else {
-                                        let la = (a.load.unwrap_or(0.0) * 1000.0) as u32;
-                                        let lb = (b.load.unwrap_or(0.0) * 1000.0) as u32;
-                                        la.cmp(&lb)
-                                    }
-                                }).unwrap();
+                                let slowest = peers
+                                    .iter()
+                                    .max_by(|a, b| {
+                                        let sa = a.bench_ms.unwrap_or(0);
+                                        let sb = b.bench_ms.unwrap_or(0);
+                                        if sa != sb {
+                                            sa.cmp(&sb)
+                                        } else {
+                                            let la = (a.load.unwrap_or(0.0) * 1000.0) as u32;
+                                            let lb = (b.load.unwrap_or(0.0) * 1000.0) as u32;
+                                            la.cmp(&lb)
+                                        }
+                                    })
+                                    .unwrap();
                                 let hw = format_peer_hw(slowest);
                                 self.out.push_str(&format!(
                                     "slowest: {}{}\n",
@@ -4330,7 +5451,9 @@ impl Forth {
                 // ( -- )  queue Forth code to execute on the caller after they receive our response.
                 // In remote_mode the peer sets self.forth_back; the caller retrieves it from the
                 // response and evals it locally.  In local mode it runs immediately (no round-trip).
-                let code = self.strings.get(idx)
+                let code = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("forth-back: string index out of bounds"))?
                     .clone();
                 if self.remote_mode {
@@ -4344,7 +5467,9 @@ impl Forth {
             // ── String pool operations ────────────────────────────────────────
             Builtin::Type => {
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("type: string index {} out of bounds", idx))?
                     .clone();
                 self.out.push_str(&s);
@@ -4352,25 +5477,35 @@ impl Forth {
             Builtin::StrEq => {
                 let b = self.pop()? as usize;
                 let a = self.pop()? as usize;
-                let sa = self.strings.get(a)
+                let sa = self
+                    .strings
+                    .get(a)
                     .ok_or_else(|| anyhow::anyhow!("str=: index {} out of bounds", a))?;
-                let sb = self.strings.get(b)
+                let sb = self
+                    .strings
+                    .get(b)
                     .ok_or_else(|| anyhow::anyhow!("str=: index {} out of bounds", b))?;
                 self.data.push(if sa == sb { -1 } else { 0 });
             }
             Builtin::StrLen => {
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("str-len: index {} out of bounds", idx))?;
                 self.data.push(s.len() as i64);
             }
             Builtin::StrCat => {
                 let b = self.pop()? as usize;
                 let a = self.pop()? as usize;
-                let sb = self.strings.get(b)
+                let sb = self
+                    .strings
+                    .get(b)
                     .ok_or_else(|| anyhow::anyhow!("str-cat: index {} out of bounds", b))?
                     .clone();
-                let sa = self.strings.get(a)
+                let sa = self
+                    .strings
+                    .get(a)
                     .ok_or_else(|| anyhow::anyhow!("str-cat: index {} out of bounds", a))?
                     .clone();
                 let cat = sa + &sb;
@@ -4381,14 +5516,25 @@ impl Forth {
             Builtin::StrSplit => {
                 let sep_idx = self.pop()? as usize;
                 let src_idx = self.pop()? as usize;
-                let sep = self.strings.get(sep_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-split: sep index {} out of bounds", sep_idx))?
+                let sep = self
+                    .strings
+                    .get(sep_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-split: sep index {} out of bounds", sep_idx)
+                    })?
                     .clone();
-                let src = self.strings.get(src_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-split: src index {} out of bounds", src_idx))?
+                let src = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-split: src index {} out of bounds", src_idx)
+                    })?
                     .clone();
                 let result = if sep.is_empty() {
-                    src.chars().map(|c| c.to_string()).collect::<Vec<_>>().join("\n")
+                    src.chars()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 } else {
                     src.split(sep.as_str()).collect::<Vec<_>>().join("\n")
                 };
@@ -4399,11 +5545,19 @@ impl Forth {
             Builtin::StrJoin => {
                 let sep_idx = self.pop()? as usize;
                 let src_idx = self.pop()? as usize;
-                let sep = self.strings.get(sep_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-join: sep index {} out of bounds", sep_idx))?
+                let sep = self
+                    .strings
+                    .get(sep_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-join: sep index {} out of bounds", sep_idx)
+                    })?
                     .clone();
-                let src = self.strings.get(src_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-join: src index {} out of bounds", src_idx))?
+                let src = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-join: src index {} out of bounds", src_idx)
+                    })?
                     .clone();
                 let result = src.lines().collect::<Vec<_>>().join(sep.as_str());
                 let idx = self.strings.len();
@@ -4411,10 +5565,12 @@ impl Forth {
                 self.data.push(idx as i64);
             }
             Builtin::StrSub => {
-                let len  = self.pop()? as usize;
+                let len = self.pop()? as usize;
                 let start = self.pop()? as usize;
                 let src_idx = self.pop()? as usize;
-                let src = self.strings.get(src_idx)
+                let src = self
+                    .strings
+                    .get(src_idx)
                     .ok_or_else(|| anyhow::anyhow!("str-sub: index {} out of bounds", src_idx))?
                     .clone();
                 let result: String = src.chars().skip(start).take(len).collect();
@@ -4424,12 +5580,20 @@ impl Forth {
             }
             Builtin::StrFind => {
                 let needle_idx = self.pop()? as usize;
-                let src_idx   = self.pop()? as usize;
-                let needle = self.strings.get(needle_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-find: needle index {} out of bounds", needle_idx))?
+                let src_idx = self.pop()? as usize;
+                let needle = self
+                    .strings
+                    .get(needle_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-find: needle index {} out of bounds", needle_idx)
+                    })?
                     .clone();
-                let src = self.strings.get(src_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-find: src index {} out of bounds", src_idx))?
+                let src = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-find: src index {} out of bounds", src_idx)
+                    })?
                     .clone();
                 let pos: i64 = if needle.is_empty() {
                     0
@@ -4442,26 +5606,44 @@ impl Forth {
                 self.data.push(pos);
             }
             Builtin::StrReplace => {
-                let to_idx   = self.pop()? as usize;
+                let to_idx = self.pop()? as usize;
                 let from_idx = self.pop()? as usize;
-                let src_idx  = self.pop()? as usize;
-                let to   = self.strings.get(to_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-replace: to index {} out of bounds", to_idx))?
+                let src_idx = self.pop()? as usize;
+                let to = self
+                    .strings
+                    .get(to_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-replace: to index {} out of bounds", to_idx)
+                    })?
                     .clone();
-                let from = self.strings.get(from_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-replace: from index {} out of bounds", from_idx))?
+                let from = self
+                    .strings
+                    .get(from_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-replace: from index {} out of bounds", from_idx)
+                    })?
                     .clone();
-                let src  = self.strings.get(src_idx)
-                    .ok_or_else(|| anyhow::anyhow!("str-replace: src index {} out of bounds", src_idx))?
+                let src = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("str-replace: src index {} out of bounds", src_idx)
+                    })?
                     .clone();
-                let result = if from.is_empty() { src } else { src.replace(from.as_str(), to.as_str()) };
+                let result = if from.is_empty() {
+                    src
+                } else {
+                    src.replace(from.as_str(), to.as_str())
+                };
                 let idx = self.strings.len();
                 self.strings.push(result);
                 self.data.push(idx as i64);
             }
             Builtin::StrReverse => {
                 let src_idx = self.pop()? as usize;
-                let src = self.strings.get(src_idx)
+                let src = self
+                    .strings
+                    .get(src_idx)
                     .ok_or_else(|| anyhow::anyhow!("str-reverse: index {} out of bounds", src_idx))?
                     .clone();
                 let result: String = src.chars().rev().collect();
@@ -4473,18 +5655,22 @@ impl Forth {
                 // Execute a Forth string without aborting on error.
                 // Pushes -1 on success, 0 on failure; rolls back state on failure.
                 let str_idx = self.pop()? as usize;
-                let code = self.strings.get(str_idx)
+                let code = self
+                    .strings
+                    .get(str_idx)
                     .ok_or_else(|| anyhow::anyhow!("safe: invalid string index"))?
                     .clone();
-                let snap       = self.snapshot();
+                let snap = self.snapshot();
                 let saved_data = self.data.clone();
-                let saved_out  = self.out.clone();
+                let saved_out = self.out.clone();
                 match self.eval(&code) {
-                    Ok(()) => { self.data.push(-1); }
+                    Ok(()) => {
+                        self.data.push(-1);
+                    }
                     Err(_) => {
                         self.restore(&snap);
                         self.data = saved_data;
-                        self.out  = saved_out;
+                        self.out = saved_out;
                         self.data.push(0);
                     }
                 }
@@ -4497,18 +5683,28 @@ impl Forth {
             }
             Builtin::StrToNum => {
                 let src_idx = self.pop()? as usize;
-                let s = self.strings.get(src_idx)
+                let s = self
+                    .strings
+                    .get(src_idx)
                     .ok_or_else(|| anyhow::anyhow!("str>num: invalid string index"))?
                     .trim()
                     .to_string();
                 match s.parse::<i64>() {
-                    Ok(n)  => { self.data.push(n);  self.data.push(-1); }
-                    Err(_) => { self.data.push(0);  self.data.push(0);  }
+                    Ok(n) => {
+                        self.data.push(n);
+                        self.data.push(-1);
+                    }
+                    Err(_) => {
+                        self.data.push(0);
+                        self.data.push(0);
+                    }
                 }
             }
             Builtin::WordDefined => {
                 let idx = self.pop()? as usize;
-                let name = self.strings.get(idx)
+                let name = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("word-defined?: invalid string index"))?
                     .clone();
                 // Check colon definitions AND compiled builtins.
@@ -4525,12 +5721,16 @@ impl Forth {
                 self.data.push(idx as i64);
             }
             Builtin::NthLine => {
-                let n       = self.pop()? as usize;
+                let n = self.pop()? as usize;
                 let src_idx = self.pop()? as usize;
-                let src = self.strings.get(src_idx)
+                let src = self
+                    .strings
+                    .get(src_idx)
                     .ok_or_else(|| anyhow::anyhow!("nth-line: invalid string index"))?
                     .clone();
-                let line = src.lines().nth(n)
+                let line = src
+                    .lines()
+                    .nth(n)
                     .ok_or_else(|| anyhow::anyhow!("nth-line: index {} out of range", n))?
                     .to_string();
                 let idx = self.intern_str(&line);
@@ -4546,25 +5746,37 @@ impl Forth {
                 }
                 let idx2 = self.pop()? as usize;
                 let idx1 = self.pop()? as usize;
-                let code1 = self.strings.get(idx1).cloned()
+                let code1 = self
+                    .strings
+                    .get(idx1)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("agree?: invalid string index {idx1}"))?;
-                let code2 = self.strings.get(idx2).cloned()
+                let code2 = self
+                    .strings
+                    .get(idx2)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("agree?: invalid string index {idx2}"))?;
 
                 let saved_data = std::mem::take(&mut self.data);
-                let saved_out  = self.out.clone();
-                let snap       = self.snapshot();
+                let saved_out = self.out.clone();
+                let snap = self.snapshot();
 
-                let r1 = self.eval(&code1).ok().and_then(|_| self.data.last().copied());
+                let r1 = self
+                    .eval(&code1)
+                    .ok()
+                    .and_then(|_| self.data.last().copied());
                 self.data.clear();
                 self.restore(&snap);
 
-                let r2 = self.eval(&code2).ok().and_then(|_| self.data.last().copied());
+                let r2 = self
+                    .eval(&code2)
+                    .ok()
+                    .and_then(|_| self.data.last().copied());
                 self.data.clear();
                 self.restore(&snap);
 
                 self.data = saved_data;
-                self.out  = saved_out;
+                self.out = saved_out;
 
                 let flag = match (r1, r2) {
                     (Some(a), Some(b)) if a == b => -1,
@@ -4582,14 +5794,20 @@ impl Forth {
                 }
                 let idx2 = self.pop()? as usize;
                 let idx1 = self.pop()? as usize;
-                let code1 = self.strings.get(idx1).cloned()
+                let code1 = self
+                    .strings
+                    .get(idx1)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("same?: invalid string index {idx1}"))?;
-                let code2 = self.strings.get(idx2).cloned()
+                let code2 = self
+                    .strings
+                    .get(idx2)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("same?: invalid string index {idx2}"))?;
 
                 let saved_data = std::mem::take(&mut self.data);
-                let saved_out  = self.out.clone();
-                let snap       = self.snapshot();
+                let saved_out = self.out.clone();
+                let snap = self.snapshot();
 
                 let stack1 = if self.eval(&code1).is_ok() {
                     self.data.clone()
@@ -4608,18 +5826,21 @@ impl Forth {
                 self.restore(&snap);
 
                 self.data = saved_data;
-                self.out  = saved_out;
+                self.out = saved_out;
 
                 let flag = if stack1 == stack2 { -1 } else { 0 };
                 self.data.push(flag);
             }
             // ── Crypto primitives ─────────────────────────────────────────────
             Builtin::Sha256 => {
-                use sha2::{Sha256, Digest};
+                use sha2::{Digest, Sha256};
                 let idx = self.pop()? as usize;
-                let s = self.strings.get(idx)
+                let s = self
+                    .strings
+                    .get(idx)
                     .ok_or_else(|| anyhow::anyhow!("sha256: index {} out of bounds", idx))?
-                    .as_bytes().to_vec();
+                    .as_bytes()
+                    .to_vec();
                 let hash = Sha256::digest(&s);
                 let hex = crypto_hex_encode(&hash);
                 let new_idx = self.strings.len();
@@ -4627,10 +5848,14 @@ impl Forth {
                 self.data.push(new_idx as i64);
             }
             Builtin::FileSha256 => {
-                use sha2::{Sha256, Digest};
+                use sha2::{Digest, Sha256};
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
-                    .ok_or_else(|| anyhow::anyhow!("file-sha256: index {} out of bounds", path_idx))?
+                let path = self
+                    .strings
+                    .get(path_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-sha256: index {} out of bounds", path_idx)
+                    })?
                     .clone();
                 let content = std::fs::read(&path)
                     .map_err(|e| anyhow::anyhow!("file-sha256: cannot read {}: {}", path, e))?;
@@ -4642,9 +5867,11 @@ impl Forth {
             }
             Builtin::FileHash => {
                 // ( path-idx -- )  hash file, print hex to out — scatter-friendly (no pool idx noise)
-                use sha2::{Sha256, Digest};
+                use sha2::{Digest, Sha256};
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
+                let path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("file-hash: index {} out of bounds", path_idx))?
                     .clone();
                 match std::fs::read(&path) {
@@ -4654,13 +5881,17 @@ impl Forth {
                         self.out.push_str(&hex);
                         self.out.push('\n');
                     }
-                    Err(e) => self.out.push_str(&format!("file-hash: cannot read {}: {}\n", path, e)),
+                    Err(e) => self
+                        .out
+                        .push_str(&format!("file-hash: cannot read {}: {}\n", path, e)),
                 }
             }
             Builtin::FileFetch => {
                 // ( path-idx -- content-idx )  read whole file into string pool
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
+                let path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("file-fetch: index {} out of bounds", path_idx))?
                     .clone();
                 let content = std::fs::read_to_string(&path)
@@ -4671,16 +5902,18 @@ impl Forth {
             }
             Builtin::FileSlice => {
                 // ( path-idx offset length -- content-idx )  read byte range into pool (utf-8 lossy)
-                let length  = self.pop()? as usize;
-                let offset  = self.pop()? as usize;
+                let length = self.pop()? as usize;
+                let offset = self.pop()? as usize;
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
+                let path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("file-slice: index {} out of bounds", path_idx))?
                     .clone();
                 let bytes = std::fs::read(&path)
                     .map_err(|e| anyhow::anyhow!("file-slice: cannot read {}: {}", path, e))?;
                 let start = offset.min(bytes.len());
-                let end   = (offset + length).min(bytes.len());
+                let end = (offset + length).min(bytes.len());
                 let slice = String::from_utf8_lossy(&bytes[start..end]).into_owned();
                 let new_idx = self.strings.len();
                 self.strings.push(slice);
@@ -4688,17 +5921,22 @@ impl Forth {
             }
             Builtin::FileSha256Range => {
                 // ( path-idx offset length -- hex-idx )  SHA-256 of exact byte range
-                use sha2::{Sha256, Digest};
-                let length   = self.pop()? as usize;
-                let offset   = self.pop()? as usize;
+                use sha2::{Digest, Sha256};
+                let length = self.pop()? as usize;
+                let offset = self.pop()? as usize;
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
-                    .ok_or_else(|| anyhow::anyhow!("file-sha256-range: index {} out of bounds", path_idx))?
+                let path = self
+                    .strings
+                    .get(path_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-sha256-range: index {} out of bounds", path_idx)
+                    })?
                     .clone();
-                let bytes = std::fs::read(&path)
-                    .map_err(|e| anyhow::anyhow!("file-sha256-range: cannot read {}: {}", path, e))?;
+                let bytes = std::fs::read(&path).map_err(|e| {
+                    anyhow::anyhow!("file-sha256-range: cannot read {}: {}", path, e)
+                })?;
                 let start = offset.min(bytes.len());
-                let end   = (offset + length).min(bytes.len());
+                let end = (offset + length).min(bytes.len());
                 let hex = crypto_hex_encode(&Sha256::digest(&bytes[start..end]));
                 let new_idx = self.strings.len();
                 self.strings.push(hex);
@@ -4706,28 +5944,36 @@ impl Forth {
             }
             Builtin::FileHashRange => {
                 // ( path-idx offset length -- )  SHA-256 of byte range → out
-                use sha2::{Sha256, Digest};
-                let length   = self.pop()? as usize;
-                let offset   = self.pop()? as usize;
+                use sha2::{Digest, Sha256};
+                let length = self.pop()? as usize;
+                let offset = self.pop()? as usize;
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
-                    .ok_or_else(|| anyhow::anyhow!("file-hash-range: index {} out of bounds", path_idx))?
+                let path = self
+                    .strings
+                    .get(path_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-hash-range: index {} out of bounds", path_idx)
+                    })?
                     .clone();
                 match std::fs::read(&path) {
                     Ok(bytes) => {
                         let start = offset.min(bytes.len());
-                        let end   = (offset + length).min(bytes.len());
+                        let end = (offset + length).min(bytes.len());
                         let hex = crypto_hex_encode(&Sha256::digest(&bytes[start..end]));
                         self.out.push_str(&hex);
                         self.out.push('\n');
                     }
-                    Err(e) => self.out.push_str(&format!("file-hash-range: cannot read {}: {}\n", path, e)),
+                    Err(e) => self
+                        .out
+                        .push_str(&format!("file-hash-range: cannot read {}: {}\n", path, e)),
                 }
             }
             Builtin::FileSize => {
                 // ( path-idx -- n )  file size in bytes; -1 if not found
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
+                let path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("file-size: index {} out of bounds", path_idx))?
                     .clone();
                 let n = std::fs::metadata(&path)
@@ -4737,13 +5983,21 @@ impl Forth {
             }
             Builtin::FileWrite => {
                 // ( content-idx path-idx -- )  overwrite file with string content
-                let path_idx    = self.pop()? as usize;
+                let path_idx = self.pop()? as usize;
                 let content_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
-                    .ok_or_else(|| anyhow::anyhow!("file-write: path index {} out of bounds", path_idx))?
+                let path = self
+                    .strings
+                    .get(path_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-write: path index {} out of bounds", path_idx)
+                    })?
                     .clone();
-                let content = self.strings.get(content_idx)
-                    .ok_or_else(|| anyhow::anyhow!("file-write: content index {} out of bounds", content_idx))?
+                let content = self
+                    .strings
+                    .get(content_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-write: content index {} out of bounds", content_idx)
+                    })?
                     .clone();
                 std::fs::write(&path, content.as_bytes())
                     .map_err(|e| anyhow::anyhow!("file-write: cannot write {}: {}", path, e))?;
@@ -4751,19 +6005,222 @@ impl Forth {
             Builtin::FileAppend => {
                 // ( content-idx path-idx -- )  append string content to file
                 use std::io::Write as IoWrite;
-                let path_idx    = self.pop()? as usize;
+                let path_idx = self.pop()? as usize;
                 let content_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
-                    .ok_or_else(|| anyhow::anyhow!("file-append: path index {} out of bounds", path_idx))?
+                let path = self
+                    .strings
+                    .get(path_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-append: path index {} out of bounds", path_idx)
+                    })?
                     .clone();
-                let content = self.strings.get(content_idx)
-                    .ok_or_else(|| anyhow::anyhow!("file-append: content index {} out of bounds", content_idx))?
+                let content = self
+                    .strings
+                    .get(content_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-append: content index {} out of bounds", content_idx)
+                    })?
                     .clone();
                 let mut f = std::fs::OpenOptions::new()
-                    .append(true).create(true).open(&path)
+                    .append(true)
+                    .create(true)
+                    .open(&path)
                     .map_err(|e| anyhow::anyhow!("file-append: cannot open {}: {}", path, e))?;
                 f.write_all(content.as_bytes())
                     .map_err(|e| anyhow::anyhow!("file-append: cannot write {}: {}", path, e))?;
+            }
+            Builtin::FileZip => {
+                // ( src-idx dest-idx -- )
+                // Zip the file or directory at strings[src] into strings[dest].
+                // Both paths must be within the current working directory.
+                let dest_idx = self.pop()? as usize;
+                let src_idx = self.pop()? as usize;
+                let src = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-zip: src index {} out of bounds", src_idx)
+                    })?
+                    .clone();
+                let dest = self
+                    .strings
+                    .get(dest_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-zip: dest index {} out of bounds", dest_idx)
+                    })?
+                    .clone();
+                let cwd = std::env::current_dir()
+                    .map_err(|e| anyhow::anyhow!("file-zip: cannot get cwd: {}", e))?;
+                // Canonicalize src (must exist); for dest, check parent exists in cwd.
+                let src_canon = std::fs::canonicalize(&src).map_err(|e| {
+                    anyhow::anyhow!("file-zip: cannot resolve src '{}': {}", src, e)
+                })?;
+                if !src_canon.starts_with(&cwd) {
+                    anyhow::bail!("file-zip: src '{}' is outside the working directory", src);
+                }
+                // Dest may not exist yet — check its parent.
+                let dest_path_raw = std::path::Path::new(&dest);
+                let dest_parent = dest_path_raw.parent().unwrap_or(std::path::Path::new("."));
+                let dest_parent_canon =
+                    std::fs::canonicalize(dest_parent).unwrap_or_else(|_| cwd.join(dest_parent));
+                if !dest_parent_canon.starts_with(&cwd) {
+                    anyhow::bail!("file-zip: dest '{}' is outside the working directory", dest);
+                }
+                let dest_path = std::path::Path::new(&dest);
+                let file = std::fs::File::create(dest_path)
+                    .map_err(|e| anyhow::anyhow!("file-zip: cannot create {}: {}", dest, e))?;
+                let mut zip = zip::ZipWriter::new(file);
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                let src_path = std::path::Path::new(&src);
+                if src_path.is_file() {
+                    let name = src_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| src.clone());
+                    zip.start_file(&name, options)
+                        .map_err(|e| anyhow::anyhow!("file-zip: {}", e))?;
+                    let data = std::fs::read(src_path)
+                        .map_err(|e| anyhow::anyhow!("file-zip: read {}: {}", src, e))?;
+                    use std::io::Write as IoWrite;
+                    zip.write_all(&data)
+                        .map_err(|e| anyhow::anyhow!("file-zip: write: {}", e))?;
+                } else {
+                    // Directory: walk recursively
+                    let base = src_path.to_path_buf();
+                    let mut stack = vec![base.clone()];
+                    while let Some(dir) = stack.pop() {
+                        for entry in std::fs::read_dir(&dir).map_err(|e| {
+                            anyhow::anyhow!("file-zip: readdir {}: {}", dir.display(), e)
+                        })? {
+                            let entry =
+                                entry.map_err(|e| anyhow::anyhow!("file-zip: entry: {}", e))?;
+                            let path = entry.path();
+                            if path.is_dir() {
+                                stack.push(path);
+                            } else {
+                                let rel = path.strip_prefix(&base).unwrap_or(&path);
+                                let name = rel.to_string_lossy().to_string();
+                                zip.start_file(&name, options)
+                                    .map_err(|e| anyhow::anyhow!("file-zip: {}", e))?;
+                                let data = std::fs::read(&path).map_err(|e| {
+                                    anyhow::anyhow!("file-zip: read {}: {}", path.display(), e)
+                                })?;
+                                use std::io::Write as IoWrite;
+                                zip.write_all(&data)
+                                    .map_err(|e| anyhow::anyhow!("file-zip: write: {}", e))?;
+                            }
+                        }
+                    }
+                }
+                zip.finish()
+                    .map_err(|e| anyhow::anyhow!("file-zip: finish: {}", e))?;
+            }
+            Builtin::FileUnzip => {
+                // ( zip-idx dest-idx -- )
+                // Extract zip file at strings[zip] into directory strings[dest].
+                // Both the zip source and dest must be within the current working directory.
+                let dest_idx = self.pop()? as usize;
+                let zip_idx = self.pop()? as usize;
+                let zip_path = self
+                    .strings
+                    .get(zip_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-unzip: zip index {} out of bounds", zip_idx)
+                    })?
+                    .clone();
+                let dest = self
+                    .strings
+                    .get(dest_idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("file-unzip: dest index {} out of bounds", dest_idx)
+                    })?
+                    .clone();
+                let cwd = std::env::current_dir()
+                    .map_err(|e| anyhow::anyhow!("file-unzip: cannot get cwd: {}", e))?;
+                let zip_canon = std::fs::canonicalize(&zip_path).map_err(|e| {
+                    anyhow::anyhow!("file-unzip: cannot resolve '{}': {}", zip_path, e)
+                })?;
+                if !zip_canon.starts_with(&cwd) {
+                    anyhow::bail!(
+                        "file-unzip: zip '{}' is outside the working directory",
+                        zip_path
+                    );
+                }
+                // dest may not exist yet — resolve as cwd-relative and check it stays inside.
+                let dest_abs = if std::path::Path::new(&dest).is_absolute() {
+                    std::path::PathBuf::from(&dest)
+                } else {
+                    cwd.join(&dest)
+                };
+                // Normalize without requiring existence: strip any ".." components.
+                let dest_norm =
+                    dest_abs
+                        .components()
+                        .fold(std::path::PathBuf::new(), |mut acc, c| match c {
+                            std::path::Component::ParentDir => {
+                                acc.pop();
+                                acc
+                            }
+                            _ => {
+                                acc.push(c);
+                                acc
+                            }
+                        });
+                if !dest_norm.starts_with(&cwd) {
+                    anyhow::bail!(
+                        "file-unzip: dest '{}' is outside the working directory",
+                        dest
+                    );
+                }
+                // Also validate each entry inside the archive against dest to block zip-slip.
+                let dest_path = std::path::Path::new(&dest);
+                std::fs::create_dir_all(dest_path)
+                    .map_err(|e| anyhow::anyhow!("file-unzip: mkdir {}: {}", dest, e))?;
+                let file = std::fs::File::open(&zip_path)
+                    .map_err(|e| anyhow::anyhow!("file-unzip: open {}: {}", zip_path, e))?;
+                let mut archive = zip::ZipArchive::new(file)
+                    .map_err(|e| anyhow::anyhow!("file-unzip: read zip: {}", e))?;
+                let dest_canon_base =
+                    std::fs::canonicalize(dest_path).unwrap_or_else(|_| cwd.join(dest_path));
+                for i in 0..archive.len() {
+                    let mut entry = archive
+                        .by_index(i)
+                        .map_err(|e| anyhow::anyhow!("file-unzip: entry {}: {}", i, e))?;
+                    let out_path = dest_path.join(entry.name());
+                    // Zip-slip guard: every extracted path must stay inside dest.
+                    let out_norm = out_path.components().fold(
+                        std::path::PathBuf::new(),
+                        |mut acc, c| match c {
+                            std::path::Component::ParentDir => {
+                                acc.pop();
+                                acc
+                            }
+                            _ => {
+                                acc.push(c);
+                                acc
+                            }
+                        },
+                    );
+                    if !out_norm.starts_with(&dest_canon_base) && !out_norm.starts_with(dest_path) {
+                        anyhow::bail!("file-unzip: zip-slip detected in entry '{}'", entry.name());
+                    }
+                    if entry.is_dir() {
+                        std::fs::create_dir_all(&out_path).map_err(|e| {
+                            anyhow::anyhow!("file-unzip: mkdir {}: {}", out_path.display(), e)
+                        })?;
+                    } else {
+                        if let Some(parent) = out_path.parent() {
+                            std::fs::create_dir_all(parent).ok();
+                        }
+                        let mut out = std::fs::File::create(&out_path).map_err(|e| {
+                            anyhow::anyhow!("file-unzip: create {}: {}", out_path.display(), e)
+                        })?;
+                        std::io::copy(&mut entry, &mut out).map_err(|e| {
+                            anyhow::anyhow!("file-unzip: copy {}: {}", out_path.display(), e)
+                        })?;
+                    }
+                }
             }
             Builtin::Nonce => {
                 use rand::RngCore;
@@ -4775,7 +6232,7 @@ impl Forth {
                 use rand::rngs::OsRng;
                 let signing_key = SigningKey::generate(&mut OsRng);
                 let priv_hex = crypto_hex_encode(&signing_key.to_bytes());
-                let pub_hex  = crypto_hex_encode(signing_key.verifying_key().as_bytes());
+                let pub_hex = crypto_hex_encode(signing_key.verifying_key().as_bytes());
                 // ( -- pub-idx priv-idx )  TOS = priv (ready to sign next)
                 let pub_idx = self.strings.len();
                 self.strings.push(pub_hex);
@@ -4785,19 +6242,26 @@ impl Forth {
                 self.data.push(priv_idx as i64);
             }
             Builtin::Sign => {
-                use ed25519_dalek::{SigningKey, Signer};
-                let data_idx    = self.pop()? as usize;
+                use ed25519_dalek::{Signer, SigningKey};
+                let data_idx = self.pop()? as usize;
                 let privkey_idx = self.pop()? as usize;
-                let privkey_hex = self.strings.get(privkey_idx)
+                let privkey_hex = self
+                    .strings
+                    .get(privkey_idx)
                     .ok_or_else(|| anyhow::anyhow!("sign: privkey index out of bounds"))?
                     .clone();
-                let data_str = self.strings.get(data_idx)
+                let data_str = self
+                    .strings
+                    .get(data_idx)
                     .ok_or_else(|| anyhow::anyhow!("sign: data index out of bounds"))?
                     .clone();
                 let privkey_bytes = crypto_hex_decode(&privkey_hex)
                     .map_err(|e| anyhow::anyhow!("sign: bad privkey hex: {}", e))?;
                 if privkey_bytes.len() != 32 {
-                    bail!("sign: privkey must be 32 bytes (64 hex chars), got {}", privkey_bytes.len());
+                    bail!(
+                        "sign: privkey must be 32 bytes (64 hex chars), got {}",
+                        privkey_bytes.len()
+                    );
                 }
                 let arr: [u8; 32] = privkey_bytes.try_into().unwrap();
                 let signing_key = SigningKey::from_bytes(&arr);
@@ -4808,17 +6272,23 @@ impl Forth {
                 self.data.push(sig_idx as i64);
             }
             Builtin::Verify => {
-                use ed25519_dalek::{VerifyingKey, Signature, Verifier};
-                let data_idx   = self.pop()? as usize;
-                let sig_idx    = self.pop()? as usize;
+                use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                let data_idx = self.pop()? as usize;
+                let sig_idx = self.pop()? as usize;
                 let pubkey_idx = self.pop()? as usize;
-                let pubkey_hex = self.strings.get(pubkey_idx)
+                let pubkey_hex = self
+                    .strings
+                    .get(pubkey_idx)
                     .ok_or_else(|| anyhow::anyhow!("verify: pubkey index out of bounds"))?
                     .clone();
-                let sig_hex = self.strings.get(sig_idx)
+                let sig_hex = self
+                    .strings
+                    .get(sig_idx)
                     .ok_or_else(|| anyhow::anyhow!("verify: sig index out of bounds"))?
                     .clone();
-                let data_str = self.strings.get(data_idx)
+                let data_str = self
+                    .strings
+                    .get(data_idx)
                     .ok_or_else(|| anyhow::anyhow!("verify: data index out of bounds"))?
                     .clone();
                 let pubkey_bytes = crypto_hex_decode(&pubkey_hex)
@@ -4826,17 +6296,23 @@ impl Forth {
                 let sig_bytes = crypto_hex_decode(&sig_hex)
                     .map_err(|e| anyhow::anyhow!("verify: bad sig hex: {}", e))?;
                 if pubkey_bytes.len() != 32 {
-                    bail!("verify: pubkey must be 32 bytes, got {}", pubkey_bytes.len());
+                    bail!(
+                        "verify: pubkey must be 32 bytes, got {}",
+                        pubkey_bytes.len()
+                    );
                 }
                 if sig_bytes.len() != 64 {
-                    bail!("verify: signature must be 64 bytes, got {}", sig_bytes.len());
+                    bail!(
+                        "verify: signature must be 64 bytes, got {}",
+                        sig_bytes.len()
+                    );
                 }
                 let pub_arr: [u8; 32] = pubkey_bytes.try_into().unwrap();
                 let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap();
-                let vk  = VerifyingKey::from_bytes(&pub_arr)
+                let vk = VerifyingKey::from_bytes(&pub_arr)
                     .map_err(|e| anyhow::anyhow!("verify: invalid pubkey: {}", e))?;
                 let sig = Signature::from_bytes(&sig_arr);
-                let ok  = vk.verify(data_str.as_bytes(), &sig).is_ok();
+                let ok = vk.verify(data_str.as_bytes(), &sig).is_ok();
                 self.data.push(if ok { -1 } else { 0 });
             }
             // ── Terminal control (crossterm) ─────────────────────────────────
@@ -4860,20 +6336,29 @@ impl Forth {
                 execute!(std::io::stdout(), cursor::RestorePosition).ok();
             }
             Builtin::ClearEol => {
-                use crossterm::{terminal::{Clear, ClearType}, execute};
+                use crossterm::{
+                    execute,
+                    terminal::{Clear, ClearType},
+                };
                 execute!(std::io::stdout(), Clear(ClearType::UntilNewLine)).ok();
             }
             Builtin::ClearLine => {
-                use crossterm::{terminal::{Clear, ClearType}, execute};
+                use crossterm::{
+                    execute,
+                    terminal::{Clear, ClearType},
+                };
                 execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).ok();
             }
             Builtin::ColorFg => {
-                use crossterm::{style::{SetForegroundColor, Color}, execute};
+                use crossterm::{
+                    execute,
+                    style::{Color, SetForegroundColor},
+                };
                 let n = self.pop()? as u8;
                 execute!(std::io::stdout(), SetForegroundColor(Color::AnsiValue(n))).ok();
             }
             Builtin::ResetStyle => {
-                use crossterm::{style::ResetColor, execute};
+                use crossterm::{execute, style::ResetColor};
                 execute!(std::io::stdout(), ResetColor).ok();
             }
             Builtin::SyncBegin => {
@@ -4915,7 +6400,9 @@ impl Forth {
             }
 
             Builtin::ProveAll => {
-                let test_words: Vec<String> = self.name_index.keys()
+                let test_words: Vec<String> = self
+                    .name_index
+                    .keys()
                     .filter(|k| k.starts_with("test:"))
                     .cloned()
                     .collect();
@@ -4925,7 +6412,7 @@ impl Forth {
                 let mut pass = 0usize;
                 let mut fail = 0usize;
                 let mut fail_lines: Vec<String> = Vec::new();
-                let outer_fuel  = self.fuel;       // restore after inner evals reset it
+                let outer_fuel = self.fuel; // restore after inner evals reset it
                 let outer_depth = self.data.len(); // tests must not leak stack state
                 for tw in &sorted {
                     let word_name = &tw["test:".len()..];
@@ -4935,7 +6422,9 @@ impl Forth {
                     self.data.truncate(outer_depth); // clean leaked stack values
                     use crossterm::style::Stylize;
                     match result {
-                        Ok(_) => { pass += 1; }
+                        Ok(_) => {
+                            pass += 1;
+                        }
                         Err(e) => {
                             fail_lines.push(format!("  ✗ {}: {}\n", word_name.red(), e));
                             fail += 1;
@@ -4949,7 +6438,8 @@ impl Forth {
                 }
                 let pass_s = format!("{pass}/{total} passed");
                 if fail == 0 {
-                    self.out.push_str(&format!("── {} ──\n", pass_s.green().bold()));
+                    self.out
+                        .push_str(&format!("── {} ──\n", pass_s.green().bold()));
                 } else {
                     self.out.push_str(&format!(
                         "── {}  {} failed ──\n",
@@ -4963,7 +6453,9 @@ impl Forth {
                 // Same as ProveAll but pushes -1 (all pass) or 0 (any fail).
                 // Failures are printed; the summary line is suppressed on all-pass
                 // so callers can print their own message.
-                let test_words: Vec<String> = self.name_index.keys()
+                let test_words: Vec<String> = self
+                    .name_index
+                    .keys()
                     .filter(|k| k.starts_with("test:"))
                     .cloned()
                     .collect();
@@ -4973,7 +6465,7 @@ impl Forth {
                 let mut pass = 0usize;
                 let mut fail = 0usize;
                 let mut fail_lines: Vec<String> = Vec::new();
-                let outer_fuel  = self.fuel;
+                let outer_fuel = self.fuel;
                 let outer_depth = self.data.len();
                 for tw in &sorted {
                     let word_name = &tw["test:".len()..];
@@ -4983,7 +6475,9 @@ impl Forth {
                     self.data.truncate(outer_depth);
                     use crossterm::style::Stylize;
                     match result {
-                        Ok(_) => { pass += 1; }
+                        Ok(_) => {
+                            pass += 1;
+                        }
                         Err(e) => {
                             fail_lines.push(format!("  ✗ {}: {}\n", word_name.red(), e));
                             fail += 1;
@@ -5031,7 +6525,9 @@ impl Forth {
                     let mut vm = Library::precompiled_vm();
                     vm.clear_data();
                     match vm.exec_with_fuel(body.as_str(), 50_000) {
-                        Ok(_) => { pass += 1; }
+                        Ok(_) => {
+                            pass += 1;
+                        }
                         Err(e) => {
                             let msg = e.to_string();
                             // Only count hard failures: unknown words or compile errors.
@@ -5054,7 +6550,9 @@ impl Forth {
                     // Build: s" A" s" B" argue
                     let src = format!("s\" {}\" s\" {}\" argue", a, b);
                     match vm.exec_with_fuel(&src, 100_000) {
-                        Ok(_) => { proof_pass += 1; }
+                        Ok(_) => {
+                            proof_pass += 1;
+                        }
                         Err(e) => {
                             proof_fail.push((word.clone(), e.to_string()));
                         }
@@ -5065,15 +6563,18 @@ impl Forth {
                 let pct = if total > 0 { (pass * 100) / total } else { 0 };
 
                 for (word, msg) in &fail_words {
-                    self.out.push_str(&format!("  ✗ {}: {}\n", word.as_str().red(), msg));
+                    self.out
+                        .push_str(&format!("  ✗ {}: {}\n", word.as_str().red(), msg));
                 }
                 for (word, msg) in &proof_fail {
-                    self.out.push_str(&format!("  ✗ argue:{}: {}\n", word.as_str().red(), msg));
+                    self.out
+                        .push_str(&format!("  ✗ argue:{}: {}\n", word.as_str().red(), msg));
                 }
 
                 let pass_s = format!("{pass}/{total} words ({pct}%)");
                 if fail == 0 && proof_total == 0 {
-                    self.out.push_str(&format!("── {} ──\n", pass_s.green().bold()));
+                    self.out
+                        .push_str(&format!("── {} ──\n", pass_s.green().bold()));
                 } else if fail == 0 && proof_fail.is_empty() {
                     let bridge_s = format!("{proof_pass}/{proof_total} proofs");
                     self.out.push_str(&format!(
@@ -5100,22 +6601,22 @@ impl Forth {
                 // English:  "3 4 +"     Chinese:  "3 4 加"  → both leave 7   ✓
                 // English:  "true"      Chinese:  "是"       → both leave -1  ✓
                 // … and so on.
-                use crate::coforth::library::{Library, vocab_pairs_from_toml, ZH_LIBRARY};
+                use crate::coforth::library::{vocab_pairs_from_toml, Library, ZH_LIBRARY};
                 use crossterm::style::Stylize;
 
                 // The cross-language pairs: (label, english_forth, chinese_word_or_forth).
                 // The Chinese side uses the word name — which will be compiled from zh.toml.
                 const PAIRS: &[(&str, &str, &str)] = &[
-                    ("add / 加",        "3 4 +",   "3 4 加"),
-                    ("subtract / 减",   "7 3 -",   "7 3 减"),
-                    ("multiply / 乘",   "3 4 *",   "3 4 乘"),
-                    ("divide / 除",     "12 3 /",  "12 3 除"),
-                    ("true / 是",       "true",    "是"),
-                    ("false / 否",      "false",   "否"),
-                    ("zero / 零",       "0",       "零"),
-                    ("equal / 相等",    "5 5 =",   "5 5 相等"),
-                    ("greater / 大于",  "6 5 >",   "6 5 大于"),
-                    ("less / 小于",     "5 6 <",   "5 6 小于"),
+                    ("add / 加", "3 4 +", "3 4 加"),
+                    ("subtract / 减", "7 3 -", "7 3 减"),
+                    ("multiply / 乘", "3 4 *", "3 4 乘"),
+                    ("divide / 除", "12 3 /", "12 3 除"),
+                    ("true / 是", "true", "是"),
+                    ("false / 否", "false", "否"),
+                    ("zero / 零", "0", "零"),
+                    ("equal / 相等", "5 5 =", "5 5 相等"),
+                    ("greater / 大于", "6 5 >", "6 5 大于"),
+                    ("less / 小于", "5 6 <", "5 6 小于"),
                 ];
 
                 // Build a VM that knows both English stdlib + Chinese vocabulary words.
@@ -5131,8 +6632,10 @@ impl Forth {
                 let mut pass = 0usize;
                 let mut fail = 0usize;
 
-                self.out.push_str(&format!("{}\n",
-                    "── prove-languages: English ↔ Chinese ──".cyan().bold()));
+                self.out.push_str(&format!(
+                    "{}\n",
+                    "── prove-languages: English ↔ Chinese ──".cyan().bold()
+                ));
 
                 for (label, en, zh) in PAIRS {
                     let saved = std::mem::take(&mut vm.data);
@@ -5151,9 +6654,9 @@ impl Forth {
                     let fmt = |v: Option<i64>| -> String {
                         match v {
                             Some(-1) => "true".to_string(),
-                            Some(0)  => "false/0".to_string(),
-                            Some(n)  => n.to_string(),
-                            None     => "—".to_string(),
+                            Some(0) => "false/0".to_string(),
+                            Some(n) => n.to_string(),
+                            None => "—".to_string(),
                         }
                     };
 
@@ -5161,7 +6664,8 @@ impl Forth {
                         pass += 1;
                         self.out.push_str(&format!(
                             "  {}  {}  ──→  {}   {}\n",
-                            en.cyan(), zh.cyan(),
+                            en.cyan(),
+                            zh.cyan(),
                             fmt(r_en).green().bold(),
                             "✓".green(),
                         ));
@@ -5169,9 +6673,12 @@ impl Forth {
                         fail += 1;
                         self.out.push_str(&format!(
                             "  {} → {}  {} → {}   {} {}\n",
-                            en.cyan(), fmt(r_en).red(),
-                            zh.cyan(), fmt(r_zh).red(),
-                            "✗".red(), (*label).dark_grey(),
+                            en.cyan(),
+                            fmt(r_en).red(),
+                            zh.cyan(),
+                            fmt(r_zh).red(),
+                            "✗".red(),
+                            (*label).dark_grey(),
                         ));
                     }
                 }
@@ -5199,24 +6706,42 @@ impl Forth {
                 // Supports: integers, +  -  *  /  mod  (  )
                 // Example: "3 + 4 * 2" → 11   "(3 + 4) * 2" → 14
                 let idx = self.pop()? as usize;
-                let src = self.strings.get(idx).cloned()
+                let src = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("infix: invalid string index"))?;
 
                 fn prec(op: &str) -> u8 {
-                    match op { "*" | "/" | "mod" => 2, "+" | "-" => 1, _ => 0 }
+                    match op {
+                        "*" | "/" | "mod" => 2,
+                        "+" | "-" => 1,
+                        _ => 0,
+                    }
                 }
                 fn apply(op: &str, a: i64, b: i64) -> anyhow::Result<i64> {
                     Ok(match op {
-                        "+" => a.wrapping_add(b), "-" => a.wrapping_sub(b),
+                        "+" => a.wrapping_add(b),
+                        "-" => a.wrapping_sub(b),
                         "*" => a.wrapping_mul(b),
-                        "/" => { if b == 0 { anyhow::bail!("division by zero"); } a / b }
-                        "mod" => { if b == 0 { anyhow::bail!("modulo by zero"); } a % b }
+                        "/" => {
+                            if b == 0 {
+                                anyhow::bail!("division by zero");
+                            }
+                            a / b
+                        }
+                        "mod" => {
+                            if b == 0 {
+                                anyhow::bail!("modulo by zero");
+                            }
+                            a % b
+                        }
                         _ => anyhow::bail!("infix: unknown operator {op}"),
                     })
                 }
 
-                let mut out: Vec<i64>     = Vec::new(); // value stack
-                let mut ops: Vec<String>  = Vec::new(); // operator stack
+                let mut out: Vec<i64> = Vec::new(); // value stack
+                let mut ops: Vec<String> = Vec::new(); // operator stack
 
                 for tok in src.split_whitespace() {
                     if let Ok(n) = tok.parse::<i64>() {
@@ -5225,32 +6750,49 @@ impl Forth {
                         ops.push(tok.to_string());
                     } else if tok == ")" {
                         while ops.last().map(|s: &String| s.as_str()) != Some("(") {
-                            let op = ops.pop().ok_or_else(|| anyhow::anyhow!("infix: mismatched parentheses"))?;
-                            let b = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
-                            let a = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                            let op = ops
+                                .pop()
+                                .ok_or_else(|| anyhow::anyhow!("infix: mismatched parentheses"))?;
+                            let b = out
+                                .pop()
+                                .ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                            let a = out
+                                .pop()
+                                .ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
                             out.push(apply(&op, a, b)?);
                         }
                         ops.pop(); // discard "("
                     } else {
                         // operator — pop higher-or-equal precedence ops first
-                        while ops.last()
+                        while ops
+                            .last()
                             .map(|o: &String| o != "(" && prec(o) >= prec(tok))
                             .unwrap_or(false)
                         {
                             let op = ops.pop().unwrap();
-                            let b = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
-                            let a = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                            let b = out
+                                .pop()
+                                .ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                            let a = out
+                                .pop()
+                                .ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
                             out.push(apply(&op, a, b)?);
                         }
                         ops.push(tok.to_string());
                     }
                 }
                 while let Some(op) = ops.pop() {
-                    let b = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
-                    let a = out.pop().ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                    let b = out
+                        .pop()
+                        .ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
+                    let a = out
+                        .pop()
+                        .ok_or_else(|| anyhow::anyhow!("infix: stack underflow"))?;
                     out.push(apply(&op, a, b)?);
                 }
-                let result = out.pop().ok_or_else(|| anyhow::anyhow!("infix: empty expression"))?;
+                let result = out
+                    .pop()
+                    .ok_or_else(|| anyhow::anyhow!("infix: empty expression"))?;
                 self.data.push(result);
             }
 
@@ -5260,7 +6802,10 @@ impl Forth {
                 // The text is stored in self.boot_poems; the REPL drains this
                 // after each exec and appends lines to ~/.finch/boot.forth.
                 let idx = self.pop()? as usize;
-                let text = self.strings.get(idx).cloned()
+                let text = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("register-boot: invalid string index"))?;
                 self.out.push_str(&format!("{}\n", text));
                 self.boot_poems.push(text);
@@ -5275,7 +6820,8 @@ impl Forth {
                     let mut chans: Vec<&String> = self.channels.iter().collect();
                     chans.sort();
                     for c in chans {
-                        self.out.push_str(&format!("  {}\n", c.as_str().cyan().bold()));
+                        self.out
+                            .push_str(&format!("  {}\n", c.as_str().cyan().bold()));
                     }
                 }
             }
@@ -5343,15 +6889,15 @@ impl Forth {
                     return Ok(());
                 }
                 let back_idx = self.pop()? as usize;
-                let fwd_idx  = self.pop()? as usize;
-                let n        = self.pop()?;
+                let fwd_idx = self.pop()? as usize;
+                let n = self.pop()?;
 
-                let fwd_code  = self.strings.get(fwd_idx).cloned().unwrap_or_default();
+                let fwd_code = self.strings.get(fwd_idx).cloned().unwrap_or_default();
                 let back_code = self.strings.get(back_idx).cloned().unwrap_or_default();
 
                 let saved_data = std::mem::take(&mut self.data);
-                let saved_out  = self.out.clone();
-                let snap       = self.snapshot();
+                let saved_out = self.out.clone();
+                let snap = self.snapshot();
 
                 // Forward pass: run fwd_code with n on the stack.
                 self.data.push(n);
@@ -5379,7 +6925,7 @@ impl Forth {
                 self.data.clear();
                 self.restore(&snap);
                 self.data = saved_data;
-                self.out  = saved_out;
+                self.out = saved_out;
                 self.data.push(flag);
             }
             Builtin::InvertibleQ => {
@@ -5391,12 +6937,12 @@ impl Forth {
                     return Ok(());
                 }
                 let idx = self.pop()? as usize;
-                let n   = self.pop()?;
+                let n = self.pop()?;
                 let code = self.strings.get(idx).cloned().unwrap_or_default();
 
                 let saved_data = std::mem::take(&mut self.data);
-                let saved_out  = self.out.clone();
-                let snap       = self.snapshot();
+                let saved_out = self.out.clone();
+                let snap = self.snapshot();
 
                 // First application: n → m
                 self.data.push(n);
@@ -5424,7 +6970,7 @@ impl Forth {
                 self.data.clear();
                 self.restore(&snap);
                 self.data = saved_data;
-                self.out  = saved_out;
+                self.out = saved_out;
                 self.data.push(flag);
             }
             Builtin::Help => {
@@ -5477,21 +7023,30 @@ impl Forth {
                 }
 
                 // 2. Library / vocabulary definition.
-                static DESC_LIB: std::sync::OnceLock<crate::coforth::Library> = std::sync::OnceLock::new();
+                static DESC_LIB: std::sync::OnceLock<crate::coforth::Library> =
+                    std::sync::OnceLock::new();
                 let lib = DESC_LIB.get_or_init(crate::coforth::Library::load);
                 if let Some(entry) = lib.lookup(&name) {
-                    self.out.push_str(&format!("  {}\n", entry.definition.as_str().white()));
+                    self.out
+                        .push_str(&format!("  {}\n", entry.definition.as_str().white()));
                     found = true;
                 }
 
                 // 3. Built-in.
                 if !found {
                     if name_to_builtin(name.as_str()).is_some() {
-                        self.out.push_str(&format!("  {}  — built-in word\n", name.as_str().cyan().bold()));
+                        self.out.push_str(&format!(
+                            "  {}  — built-in word\n",
+                            name.as_str().cyan().bold()
+                        ));
                     } else if self.var_index.contains_key(name.as_str()) {
-                        self.out.push_str(&format!("  {}  — variable\n", name.as_str().cyan().bold()));
+                        self.out
+                            .push_str(&format!("  {}  — variable\n", name.as_str().cyan().bold()));
                     } else {
-                        self.out.push_str(&format!("  {}  — not defined  (type `help` for a guide)\n", name.as_str().dark_grey()));
+                        self.out.push_str(&format!(
+                            "  {}  — not defined  (type `help` for a guide)\n",
+                            name.as_str().dark_grey()
+                        ));
                     }
                 }
             }
@@ -5509,8 +7064,8 @@ impl Forth {
                 let src = self.strings.get(idx).cloned().unwrap_or_default();
 
                 let saved_data = std::mem::take(&mut self.data);
-                let saved_out  = self.out.clone();
-                let snap       = self.snapshot();
+                let saved_out = self.out.clone();
+                let snap = self.snapshot();
 
                 // Attempt 1: Forth.
                 let result = {
@@ -5518,7 +7073,11 @@ impl Forth {
                     let tos = self.data.last().copied();
                     self.data.clear();
                     self.restore(&snap);
-                    if forth_ok { tos } else { None }
+                    if forth_ok {
+                        tos
+                    } else {
+                        None
+                    }
                 };
 
                 // Attempt 2: infix (if Forth failed).
@@ -5532,15 +7091,19 @@ impl Forth {
                     let tos = self.data.last().copied();
                     self.data.clear();
                     self.restore(&snap);
-                    if infix_ok { tos } else { None }
+                    if infix_ok {
+                        tos
+                    } else {
+                        None
+                    }
                 };
 
                 self.data = saved_data;
-                self.out  = saved_out;
+                self.out = saved_out;
 
                 match result {
                     Some(n) => self.out.push_str(&format!("= {n}\n")),
-                    None    => self.out.push_str("?\n"),
+                    None => self.out.push_str("?\n"),
                 }
             }
             Builtin::EquivQ => {
@@ -5566,20 +7129,28 @@ impl Forth {
                 let code2 = self.strings.get(idx2).cloned().unwrap_or_default();
 
                 let saved_data = std::mem::take(&mut self.data);
-                let saved_out  = self.out.clone();
-                let snap       = self.snapshot();
+                let saved_out = self.out.clone();
+                let snap = self.snapshot();
 
                 let mut equiv = true;
                 for n in -5i64..=5 {
                     // Run program 1 with n on the stack.
                     self.data.push(n);
-                    let r1 = if self.eval(&code1).is_ok() { self.data.last().copied() } else { None };
+                    let r1 = if self.eval(&code1).is_ok() {
+                        self.data.last().copied()
+                    } else {
+                        None
+                    };
                     self.data.clear();
                     self.restore(&snap);
 
                     // Run program 2 with n on the stack.
                     self.data.push(n);
-                    let r2 = if self.eval(&code2).is_ok() { self.data.last().copied() } else { None };
+                    let r2 = if self.eval(&code2).is_ok() {
+                        self.data.last().copied()
+                    } else {
+                        None
+                    };
                     self.data.clear();
                     self.restore(&snap);
 
@@ -5598,7 +7169,7 @@ impl Forth {
                 }
 
                 self.data = saved_data;
-                self.out  = saved_out;
+                self.out = saved_out;
                 self.data.push(if equiv { -1 } else { 0 });
             }
             Builtin::Fork => {
@@ -5618,8 +7189,10 @@ impl Forth {
                         }
                         // Show the fork's resulting stack.
                         if !forked.data.is_empty() {
-                            let stack: Vec<String> = forked.data.iter().map(|n| n.to_string()).collect();
-                            self.out.push_str(&format!("fork →  {}\n", stack.join("  ")));
+                            let stack: Vec<String> =
+                                forked.data.iter().map(|n| n.to_string()).collect();
+                            self.out
+                                .push_str(&format!("fork →  {}\n", stack.join("  ")));
                         }
                     }
                     Err(e) => {
@@ -5635,7 +7208,8 @@ impl Forth {
                 static BOOT_LIB: std::sync::OnceLock<crate::coforth::Library> =
                     std::sync::OnceLock::new();
                 let lib = BOOT_LIB.get_or_init(crate::coforth::Library::load);
-                let entries: Vec<String> = lib.boot_entries()
+                let entries: Vec<String> = lib
+                    .boot_entries()
                     .iter()
                     .filter_map(|e| e.forth.clone())
                     .collect();
@@ -5653,14 +7227,18 @@ impl Forth {
             Builtin::PrintPad => {
                 // ( n width char-idx -- )  print n left-padded with char to width.
                 let char_idx = self.pop()? as usize;
-                let width    = self.pop()? as usize;
-                let n        = self.pop()?;
-                let pad_char = self.strings.get(char_idx)
+                let width = self.pop()? as usize;
+                let n = self.pop()?;
+                let pad_char = self
+                    .strings
+                    .get(char_idx)
                     .and_then(|s| s.chars().next())
                     .unwrap_or(' ');
                 let s = n.to_string();
                 let pad = width.saturating_sub(s.len());
-                for _ in 0..pad { self.out.push(pad_char); }
+                for _ in 0..pad {
+                    self.out.push(pad_char);
+                }
                 self.out.push_str(&s);
             }
             // ── Fast hash operations ───────────────────────────────────────────
@@ -5669,7 +7247,7 @@ impl Forth {
                 let idx = self.pop()? as usize;
                 let s = self.strings.get(idx).map(|s| s.as_str()).unwrap_or("");
                 const FNV_OFFSET: u64 = 14695981039346656037;
-                const FNV_PRIME:  u64 = 1099511628211;
+                const FNV_PRIME: u64 = 1099511628211;
                 let h = s.bytes().fold(FNV_OFFSET, |acc, b| {
                     acc.wrapping_mul(FNV_PRIME) ^ (b as u64)
                 });
@@ -5706,14 +7284,17 @@ impl Forth {
                     let my_name = crate::node_name::NAME.clone();
                     run_hash_scatter(&members, &id, &key, &val, &my_name, &tokens);
                 } else {
-                    self.out.push_str("h!: no current room (use room-use or room-new first)\n");
+                    self.out
+                        .push_str("h!: no current room (use room-use or room-new first)\n");
                 }
             }
             Builtin::HFetch => {
                 // ( key-idx -- val-idx )  get value from current room hash
                 let key_idx = self.pop()? as usize;
                 let key = self.strings.get(key_idx).cloned().unwrap_or_default();
-                let val = self.current_room.as_ref()
+                let val = self
+                    .current_room
+                    .as_ref()
                     .and_then(|id| self.rooms.get(id))
                     .and_then(|r| r.hash.get(&key))
                     .cloned()
@@ -5746,9 +7327,11 @@ impl Forth {
                 if let Some(id) = &self.current_room.clone() {
                     if let Some(room) = self.rooms.get(id) {
                         if room.hash.is_empty() {
-                            self.out.push_str(&format!("  {} (empty)\n", id.as_str().dark_grey()));
+                            self.out
+                                .push_str(&format!("  {} (empty)\n", id.as_str().dark_grey()));
                         } else {
-                            self.out.push_str(&format!("  {}:\n", id.as_str().dark_grey()));
+                            self.out
+                                .push_str(&format!("  {}:\n", id.as_str().dark_grey()));
                             let mut pairs: Vec<_> = room.hash.iter().collect();
                             pairs.sort_by_key(|(k, _)| k.as_str());
                             for (k, v) in pairs {
@@ -5768,7 +7351,9 @@ impl Forth {
                 // ( key-idx -- flag )  1 if key exists in current room, else 0
                 let key_idx = self.pop()? as usize;
                 let key = self.strings.get(key_idx).cloned().unwrap_or_default();
-                let exists = self.current_room.as_ref()
+                let exists = self
+                    .current_room
+                    .as_ref()
                     .and_then(|id| self.rooms.get(id))
                     .map(|r| r.hash.contains_key(&key))
                     .unwrap_or(false);
@@ -5782,7 +7367,8 @@ impl Forth {
                     self.rooms.entry(id.clone()).or_default();
                     self.current_room = Some(id.clone());
                     use crossterm::style::Stylize;
-                    self.out.push_str(&format!("  room {}\n", id.as_str().cyan()));
+                    self.out
+                        .push_str(&format!("  room {}\n", id.as_str().cyan()));
                 }
             }
             Builtin::RoomAdd => {
@@ -5810,7 +7396,8 @@ impl Forth {
                     room.members.retain(|m| m != &addr);
                     if room.members.len() < before {
                         use crossterm::style::Stylize;
-                        self.out.push_str(&format!("  -{}\n", addr.as_str().dark_grey()));
+                        self.out
+                            .push_str(&format!("  -{}\n", addr.as_str().dark_grey()));
                     }
                 }
             }
@@ -5818,14 +7405,19 @@ impl Forth {
                 // ( -- )  print all rooms
                 use crossterm::style::Stylize;
                 if self.rooms.is_empty() {
-                    self.out.push_str("  no rooms  (use room-new or room-use to create one)\n");
+                    self.out
+                        .push_str("  no rooms  (use room-new or room-use to create one)\n");
                 } else {
                     let current = self.current_room.clone();
                     let mut ids: Vec<_> = self.rooms.keys().cloned().collect();
                     ids.sort();
                     for id in &ids {
                         let room = &self.rooms[id];
-                        let marker = if Some(id) == current.as_ref() { " ← " } else { "   " };
+                        let marker = if Some(id) == current.as_ref() {
+                            " ← "
+                        } else {
+                            "   "
+                        };
                         self.out.push_str(&format!(
                             "{}{} ({} members, {} keys)\n",
                             marker,
@@ -5842,7 +7434,8 @@ impl Forth {
                 self.rooms.entry(id.clone()).or_default();
                 self.current_room = Some(id.clone());
                 use crossterm::style::Stylize;
-                self.out.push_str(&format!("  room {} (new)\n", id.as_str().cyan()));
+                self.out
+                    .push_str(&format!("  room {} (new)\n", id.as_str().cyan()));
                 let new_idx = self.strings.len() as i64;
                 self.strings.push(id);
                 self.data.push(new_idx);
@@ -5886,7 +7479,9 @@ impl Forth {
             // ── Security scanning ───────────────────────────────────────────
             Builtin::ScanFile => {
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
+                let path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("scan-file: index out of bounds"))?
                     .clone();
                 let bytes = std::fs::read(&path)
@@ -5899,7 +7494,9 @@ impl Forth {
 
             Builtin::ScanBytes => {
                 let str_idx = self.pop()? as usize;
-                let content = self.strings.get(str_idx)
+                let content = self
+                    .strings
+                    .get(str_idx)
                     .ok_or_else(|| anyhow::anyhow!("scan-bytes: index out of bounds"))?
                     .clone();
                 let score = scan_risk_score(content.as_bytes());
@@ -5908,7 +7505,9 @@ impl Forth {
 
             Builtin::FileEntropy => {
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
+                let path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("file-entropy: index out of bounds"))?
                     .clone();
                 let bytes = std::fs::read(&path)
@@ -5919,7 +7518,9 @@ impl Forth {
 
             Builtin::ScanDir => {
                 let path_idx = self.pop()? as usize;
-                let root = self.strings.get(path_idx)
+                let root = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("scan-dir: index out of bounds"))?
                     .clone();
                 let report = scan_dir_recursive(&root);
@@ -5930,7 +7531,9 @@ impl Forth {
 
             Builtin::ScanStrings => {
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
+                let path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("scan-strings: index out of bounds"))?
                     .clone();
                 let bytes = std::fs::read(&path)
@@ -5964,7 +7567,9 @@ impl Forth {
 
             Builtin::Quarantine => {
                 let path_idx = self.pop()? as usize;
-                let path = self.strings.get(path_idx)
+                let path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("quarantine: index out of bounds"))?
                     .clone();
                 let flag = quarantine_file(&path);
@@ -5985,9 +7590,13 @@ impl Forth {
     /// control flow.
     fn apply_tco(&mut self, word_start: usize) {
         let end = self.memory.len();
-        if end < word_start + 2 { return; }
+        if end < word_start + 2 {
+            return;
+        }
         // Last cell must be Ret, second-to-last must be a call.
-        if !matches!(self.memory[end - 1], Cell::Ret) { return; }
+        if !matches!(self.memory[end - 1], Cell::Ret) {
+            return;
+        }
         let tail_addr = match self.memory[end - 2] {
             Cell::Addr(x) => x,
             _ => return,
@@ -5996,11 +7605,18 @@ impl Forth {
         let ret_pos = end - 1;
         for cell in &self.memory[word_start..end - 1] {
             let targets = match *cell {
-                Cell::Jmp(t) | Cell::JmpZ(t) | Cell::While(t) | Cell::Repeat(t)
-                | Cell::Until(t) | Cell::DoLoop(t) | Cell::DoLoopPlus(t) => Some(t),
+                Cell::Jmp(t)
+                | Cell::JmpZ(t)
+                | Cell::While(t)
+                | Cell::Repeat(t)
+                | Cell::Until(t)
+                | Cell::DoLoop(t)
+                | Cell::DoLoopPlus(t) => Some(t),
                 _ => None,
             };
-            if targets == Some(ret_pos) { return; }
+            if targets == Some(ret_pos) {
+                return;
+            }
         }
         // Safe: convert tail call to jump and remove Ret.
         self.memory[end - 2] = Cell::Jmp(tail_addr);
@@ -6009,13 +7625,18 @@ impl Forth {
 
     #[inline(always)]
     fn pop(&mut self) -> Result<i64> {
-        self.data.pop().ok_or_else(|| anyhow::anyhow!("stack underflow"))
+        self.data
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("stack underflow"))
     }
 
     #[inline]
     fn push(&mut self, v: i64) -> Result<()> {
         if self.data.len() >= MAX_DATA_DEPTH {
-            bail!("stack overflow — too many values on the stack (max {})", MAX_DATA_DEPTH);
+            bail!(
+                "stack overflow — too many values on the stack (max {})",
+                MAX_DATA_DEPTH
+            );
         }
         self.data.push(v);
         Ok(())
@@ -6026,98 +7647,333 @@ impl Forth {
 
 // ── Signature database ────────────────────────────────────────────────────────
 
-struct Sig { pattern: &'static [u8], label: &'static str, score: u8 }
+struct Sig {
+    pattern: &'static [u8],
+    label: &'static str,
+    score: u8,
+}
 
 const BYTE_SIGS: &[Sig] = &[
-    Sig { pattern: b"MZ",                                     label: "PE/DOS executable",          score: 25 },
-    Sig { pattern: b"\x7fELF",                                label: "ELF executable",              score: 25 },
-    Sig { pattern: b"\xca\xfe\xba\xbe",                       label: "Mach-O fat binary",           score: 20 },
-    Sig { pattern: b"\xfe\xed\xfa\xce",                       label: "Mach-O 32-bit",               score: 20 },
-    Sig { pattern: b"\xfe\xed\xfa\xcf",                       label: "Mach-O 64-bit",               score: 20 },
-    Sig { pattern: b"\xce\xfa\xed\xfe",                       label: "Mach-O 32-bit LE",            score: 20 },
-    Sig { pattern: b"\xcf\xfa\xed\xfe",                       label: "Mach-O 64-bit LE",            score: 20 },
-    Sig { pattern: b"#!",                                     label: "shell script",                score:  5 },
+    Sig {
+        pattern: b"MZ",
+        label: "PE/DOS executable",
+        score: 25,
+    },
+    Sig {
+        pattern: b"\x7fELF",
+        label: "ELF executable",
+        score: 25,
+    },
+    Sig {
+        pattern: b"\xca\xfe\xba\xbe",
+        label: "Mach-O fat binary",
+        score: 20,
+    },
+    Sig {
+        pattern: b"\xfe\xed\xfa\xce",
+        label: "Mach-O 32-bit",
+        score: 20,
+    },
+    Sig {
+        pattern: b"\xfe\xed\xfa\xcf",
+        label: "Mach-O 64-bit",
+        score: 20,
+    },
+    Sig {
+        pattern: b"\xce\xfa\xed\xfe",
+        label: "Mach-O 32-bit LE",
+        score: 20,
+    },
+    Sig {
+        pattern: b"\xcf\xfa\xed\xfe",
+        label: "Mach-O 64-bit LE",
+        score: 20,
+    },
+    Sig {
+        pattern: b"#!",
+        label: "shell script",
+        score: 5,
+    },
     // Exploit kits / shellcode markers
-    Sig { pattern: b"\x90\x90\x90\x90\x90\x90\x90\x90",      label: "NOP sled (shellcode)",        score: 35 },
-    Sig { pattern: b"\xeb\xfe",                               label: "infinite loop (shellcode)",   score: 30 },
+    Sig {
+        pattern: b"\x90\x90\x90\x90\x90\x90\x90\x90",
+        label: "NOP sled (shellcode)",
+        score: 35,
+    },
+    Sig {
+        pattern: b"\xeb\xfe",
+        label: "infinite loop (shellcode)",
+        score: 30,
+    },
     // Archive / dropper
-    Sig { pattern: b"PK\x03\x04",                             label: "ZIP/JAR/APK archive",         score:  5 },
-    Sig { pattern: b"\x1f\x8b",                               label: "gzip archive",                score:  5 },
-    Sig { pattern: b"Rar!\x1a\x07",                           label: "RAR archive",                 score:  5 },
+    Sig {
+        pattern: b"PK\x03\x04",
+        label: "ZIP/JAR/APK archive",
+        score: 5,
+    },
+    Sig {
+        pattern: b"\x1f\x8b",
+        label: "gzip archive",
+        score: 5,
+    },
+    Sig {
+        pattern: b"Rar!\x1a\x07",
+        label: "RAR archive",
+        score: 5,
+    },
     // Office macros
-    Sig { pattern: b"\xd0\xcf\x11\xe0",                       label: "OLE2 compound doc (Office)",  score: 10 },
+    Sig {
+        pattern: b"\xd0\xcf\x11\xe0",
+        label: "OLE2 compound doc (Office)",
+        score: 10,
+    },
     // Java
-    Sig { pattern: b"\xca\xfe\xba\xbe",                       label: "Java class file",             score: 10 },
+    Sig {
+        pattern: b"\xca\xfe\xba\xbe",
+        label: "Java class file",
+        score: 10,
+    },
 ];
 
-struct StrSig { pattern: &'static str, label: &'static str, score: u8 }
+struct StrSig {
+    pattern: &'static str,
+    label: &'static str,
+    score: u8,
+}
 
 const STR_SIGS: &[StrSig] = &[
     // EICAR test
-    StrSig { pattern: "EICAR-STANDARD-ANTIVIRUS-TEST-FILE",   label: "EICAR antivirus test file",  score: 100 },
+    StrSig {
+        pattern: "EICAR-STANDARD-ANTIVIRUS-TEST-FILE",
+        label: "EICAR antivirus test file",
+        score: 100,
+    },
     // Webshells
-    StrSig { pattern: "eval(base64_decode",                   label: "PHP webshell (eval+b64)",     score: 40 },
-    StrSig { pattern: "assert($_REQUEST",                     label: "PHP webshell (assert)",       score: 40 },
-    StrSig { pattern: "passthru($_",                          label: "PHP webshell (passthru)",     score: 40 },
-    StrSig { pattern: "system($_REQUEST",                     label: "PHP webshell (system)",       score: 40 },
-    StrSig { pattern: "exec($_GET",                           label: "PHP webshell (exec+GET)",     score: 40 },
+    StrSig {
+        pattern: "eval(base64_decode",
+        label: "PHP webshell (eval+b64)",
+        score: 40,
+    },
+    StrSig {
+        pattern: "assert($_REQUEST",
+        label: "PHP webshell (assert)",
+        score: 40,
+    },
+    StrSig {
+        pattern: "passthru($_",
+        label: "PHP webshell (passthru)",
+        score: 40,
+    },
+    StrSig {
+        pattern: "system($_REQUEST",
+        label: "PHP webshell (system)",
+        score: 40,
+    },
+    StrSig {
+        pattern: "exec($_GET",
+        label: "PHP webshell (exec+GET)",
+        score: 40,
+    },
     // Encoded execution
-    StrSig { pattern: "powershell -enc",                      label: "encoded PowerShell",          score: 35 },
-    StrSig { pattern: "powershell -e ",                       label: "encoded PowerShell",          score: 30 },
-    StrSig { pattern: "powershell -nop",                      label: "PowerShell no-profile exec",  score: 25 },
-    StrSig { pattern: "cmd.exe /c ",                          label: "Windows shell execution",     score: 20 },
-    StrSig { pattern: "mshta.exe",                            label: "MSHTA execution (LOLBin)",    score: 25 },
-    StrSig { pattern: "regsvr32.exe",                         label: "Regsvr32 LOLBin",             score: 20 },
+    StrSig {
+        pattern: "powershell -enc",
+        label: "encoded PowerShell",
+        score: 35,
+    },
+    StrSig {
+        pattern: "powershell -e ",
+        label: "encoded PowerShell",
+        score: 30,
+    },
+    StrSig {
+        pattern: "powershell -nop",
+        label: "PowerShell no-profile exec",
+        score: 25,
+    },
+    StrSig {
+        pattern: "cmd.exe /c ",
+        label: "Windows shell execution",
+        score: 20,
+    },
+    StrSig {
+        pattern: "mshta.exe",
+        label: "MSHTA execution (LOLBin)",
+        score: 25,
+    },
+    StrSig {
+        pattern: "regsvr32.exe",
+        label: "Regsvr32 LOLBin",
+        score: 20,
+    },
     // Destructive
-    StrSig { pattern: "rm -rf /",                             label: "recursive root delete",       score: 30 },
-    StrSig { pattern: "dd if=/dev/zero",                      label: "disk-wipe command",           score: 30 },
-    StrSig { pattern: "shred -u",                             label: "secure file delete",          score: 20 },
-    StrSig { pattern: "mkfs.",                                label: "filesystem format",            score: 25 },
+    StrSig {
+        pattern: "rm -rf /",
+        label: "recursive root delete",
+        score: 30,
+    },
+    StrSig {
+        pattern: "dd if=/dev/zero",
+        label: "disk-wipe command",
+        score: 30,
+    },
+    StrSig {
+        pattern: "shred -u",
+        label: "secure file delete",
+        score: 20,
+    },
+    StrSig {
+        pattern: "mkfs.",
+        label: "filesystem format",
+        score: 25,
+    },
     // Downloaders
-    StrSig { pattern: "wget http",                            label: "remote download (wget)",      score: 15 },
-    StrSig { pattern: "curl http",                            label: "remote download (curl)",      score: 15 },
-    StrSig { pattern: "urllib.request.urlopen",               label: "Python remote download",      score: 15 },
+    StrSig {
+        pattern: "wget http",
+        label: "remote download (wget)",
+        score: 15,
+    },
+    StrSig {
+        pattern: "curl http",
+        label: "remote download (curl)",
+        score: 15,
+    },
+    StrSig {
+        pattern: "urllib.request.urlopen",
+        label: "Python remote download",
+        score: 15,
+    },
     // Persistence
-    StrSig { pattern: "crontab -",                            label: "cron persistence",            score: 15 },
-    StrSig { pattern: "LaunchAgents",                         label: "macOS LaunchAgent reference", score: 10 },
-    StrSig { pattern: "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                                                              label: "Windows Run key persistence", score: 25 },
+    StrSig {
+        pattern: "crontab -",
+        label: "cron persistence",
+        score: 15,
+    },
+    StrSig {
+        pattern: "LaunchAgents",
+        label: "macOS LaunchAgent reference",
+        score: 10,
+    },
+    StrSig {
+        pattern: "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        label: "Windows Run key persistence",
+        score: 25,
+    },
     // Crypto miners
-    StrSig { pattern: "stratum+tcp://",                       label: "mining pool connection",      score: 45 },
-    StrSig { pattern: "xmrig",                                label: "XMRig miner",                 score: 45 },
-    StrSig { pattern: "cryptonight",                          label: "CryptoNight algorithm",       score: 40 },
-    StrSig { pattern: "monero",                               label: "Monero mining reference",     score: 20 },
+    StrSig {
+        pattern: "stratum+tcp://",
+        label: "mining pool connection",
+        score: 45,
+    },
+    StrSig {
+        pattern: "xmrig",
+        label: "XMRig miner",
+        score: 45,
+    },
+    StrSig {
+        pattern: "cryptonight",
+        label: "CryptoNight algorithm",
+        score: 40,
+    },
+    StrSig {
+        pattern: "monero",
+        label: "Monero mining reference",
+        score: 20,
+    },
     // Rootkit / evasion
-    StrSig { pattern: "ptrace",                               label: "ptrace (debugger/rootkit)",   score: 15 },
-    StrSig { pattern: "LD_PRELOAD",                           label: "LD_PRELOAD injection",        score: 25 },
-    StrSig { pattern: "DYLD_INSERT_LIBRARIES",                label: "macOS dylib injection",       score: 25 },
-    StrSig { pattern: "NtSetInformationThread",               label: "Windows anti-debug",          score: 20 },
+    StrSig {
+        pattern: "ptrace",
+        label: "ptrace (debugger/rootkit)",
+        score: 15,
+    },
+    StrSig {
+        pattern: "LD_PRELOAD",
+        label: "LD_PRELOAD injection",
+        score: 25,
+    },
+    StrSig {
+        pattern: "DYLD_INSERT_LIBRARIES",
+        label: "macOS dylib injection",
+        score: 25,
+    },
+    StrSig {
+        pattern: "NtSetInformationThread",
+        label: "Windows anti-debug",
+        score: 20,
+    },
     // Ransomware indicators
-    StrSig { pattern: ".onion",                               label: "Tor hidden service (.onion)", score: 20 },
-    StrSig { pattern: "your files have been encrypted",       label: "ransomware note",             score: 60 },
-    StrSig { pattern: "bitcoin address",                      label: "ransom payment instruction",  score: 40 },
-    StrSig { pattern: "AES_encrypt",                          label: "AES encryption call",         score: 15 },
+    StrSig {
+        pattern: ".onion",
+        label: "Tor hidden service (.onion)",
+        score: 20,
+    },
+    StrSig {
+        pattern: "your files have been encrypted",
+        label: "ransomware note",
+        score: 60,
+    },
+    StrSig {
+        pattern: "bitcoin address",
+        label: "ransom payment instruction",
+        score: 40,
+    },
+    StrSig {
+        pattern: "AES_encrypt",
+        label: "AES encryption call",
+        score: 15,
+    },
     // Backdoors
-    StrSig { pattern: "/bin/sh -i",                           label: "interactive shell spawn",     score: 30 },
-    StrSig { pattern: "nc -e /bin/sh",                        label: "netcat reverse shell",        score: 45 },
-    StrSig { pattern: "bash -i >&",                           label: "bash reverse shell",          score: 45 },
-    StrSig { pattern: "socket.connect(",                      label: "socket connect (C2)",         score: 10 },
+    StrSig {
+        pattern: "/bin/sh -i",
+        label: "interactive shell spawn",
+        score: 30,
+    },
+    StrSig {
+        pattern: "nc -e /bin/sh",
+        label: "netcat reverse shell",
+        score: 45,
+    },
+    StrSig {
+        pattern: "bash -i >&",
+        label: "bash reverse shell",
+        score: 45,
+    },
+    StrSig {
+        pattern: "socket.connect(",
+        label: "socket connect (C2)",
+        score: 10,
+    },
     // Keyloggers
-    StrSig { pattern: "GetAsyncKeyState",                     label: "Windows keylogger API",       score: 30 },
-    StrSig { pattern: "SetWindowsHookEx",                     label: "Windows hook injection",      score: 25 },
+    StrSig {
+        pattern: "GetAsyncKeyState",
+        label: "Windows keylogger API",
+        score: 30,
+    },
+    StrSig {
+        pattern: "SetWindowsHookEx",
+        label: "Windows hook injection",
+        score: 25,
+    },
 ];
 
 // ── Scanning helpers ──────────────────────────────────────────────────────────
 
 /// Shannon entropy of a byte slice (0.0 = uniform, 8.0 = maximum randomness).
 fn shannon_entropy(bytes: &[u8]) -> f64 {
-    if bytes.is_empty() { return 0.0; }
+    if bytes.is_empty() {
+        return 0.0;
+    }
     let mut counts = [0u64; 256];
-    for &b in bytes { counts[b as usize] += 1; }
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
     let len = bytes.len() as f64;
-    counts.iter()
+    counts
+        .iter()
         .filter(|&&c| c > 0)
-        .map(|&c| { let p = c as f64 / len; -p * p.log2() })
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
         .sum()
 }
 
@@ -6127,9 +7983,13 @@ fn scan_risk_score(bytes: &[u8]) -> u8 {
 
     // Entropy
     let entropy = shannon_entropy(bytes);
-    if entropy > 7.5      { score += 40; }
-    else if entropy > 7.0 { score += 20; }
-    else if entropy > 6.5 { score += 10; }
+    if entropy > 7.5 {
+        score += 40;
+    } else if entropy > 7.0 {
+        score += 20;
+    } else if entropy > 6.5 {
+        score += 10;
+    }
 
     // Binary signature table
     for sig in BYTE_SIGS {
@@ -6152,7 +8012,9 @@ fn scan_risk_score(bytes: &[u8]) -> u8 {
     let null_count = bytes.iter().filter(|&&b| b == 0).count();
     if null_count > 0 && null_count < bytes.len() {
         let ratio = null_count as f64 / bytes.len() as f64;
-        if ratio > 0.05 && ratio < 0.95 { score += 15; }
+        if ratio > 0.05 && ratio < 0.95 {
+            score += 15;
+        }
     }
 
     score.min(100) as u8
@@ -6160,15 +8022,15 @@ fn scan_risk_score(bytes: &[u8]) -> u8 {
 
 /// Full scan report for a file: human-readable text.
 fn scan_bytes_for_signatures(bytes: &[u8], path: Option<&str>) -> String {
-    let score   = scan_risk_score(bytes);
+    let score = scan_risk_score(bytes);
     let entropy = shannon_entropy(bytes);
 
     let risk_label = match score {
-        0..=19   => "clean",
-        20..=49  => "low",
-        50..=74  => "medium",
-        75..=99  => "high",
-        _        => "critical",
+        0..=19 => "clean",
+        20..=49 => "low",
+        50..=74 => "medium",
+        75..=99 => "high",
+        _ => "critical",
     };
 
     let mut findings: Vec<String> = vec![
@@ -6177,20 +8039,32 @@ fn scan_bytes_for_signatures(bytes: &[u8], path: Option<&str>) -> String {
     ];
 
     // File type from magic bytes
-    let kind = if bytes.starts_with(b"MZ")                           { "PE/DOS executable" }
-        else if bytes.starts_with(b"\x7fELF")                        { "ELF executable" }
-        else if bytes.starts_with(b"\xcf\xfa\xed\xfe") ||
-                bytes.starts_with(b"\xce\xfa\xed\xfe") ||
-                bytes.starts_with(b"\xfe\xed\xfa\xce") ||
-                bytes.starts_with(b"\xfe\xed\xfa\xcf") ||
-                bytes.starts_with(b"\xca\xfe\xba\xbe")               { "Mach-O binary" }
-        else if bytes.starts_with(b"%PDF")                           { "PDF document" }
-        else if bytes.starts_with(b"PK\x03\x04")                     { "ZIP/JAR/APK" }
-        else if bytes.starts_with(b"\x1f\x8b")                       { "gzip" }
-        else if bytes.starts_with(b"Rar!\x1a\x07")                   { "RAR archive" }
-        else if bytes.starts_with(b"\xd0\xcf\x11\xe0")               { "OLE2/Office document" }
-        else if bytes.starts_with(b"#!")                             { "shell script" }
-        else                                                          { "data/text" };
+    let kind = if bytes.starts_with(b"MZ") {
+        "PE/DOS executable"
+    } else if bytes.starts_with(b"\x7fELF") {
+        "ELF executable"
+    } else if bytes.starts_with(b"\xcf\xfa\xed\xfe")
+        || bytes.starts_with(b"\xce\xfa\xed\xfe")
+        || bytes.starts_with(b"\xfe\xed\xfa\xce")
+        || bytes.starts_with(b"\xfe\xed\xfa\xcf")
+        || bytes.starts_with(b"\xca\xfe\xba\xbe")
+    {
+        "Mach-O binary"
+    } else if bytes.starts_with(b"%PDF") {
+        "PDF document"
+    } else if bytes.starts_with(b"PK\x03\x04") {
+        "ZIP/JAR/APK"
+    } else if bytes.starts_with(b"\x1f\x8b") {
+        "gzip"
+    } else if bytes.starts_with(b"Rar!\x1a\x07") {
+        "RAR archive"
+    } else if bytes.starts_with(b"\xd0\xcf\x11\xe0") {
+        "OLE2/Office document"
+    } else if bytes.starts_with(b"#!") {
+        "shell script"
+    } else {
+        "data/text"
+    };
     findings.push(format!("type: {}", kind));
 
     if entropy > 7.5 {
@@ -6198,7 +8072,7 @@ fn scan_bytes_for_signatures(bytes: &[u8], path: Option<&str>) -> String {
     }
 
     // Matched string signatures
-    let text       = String::from_utf8_lossy(bytes);
+    let text = String::from_utf8_lossy(bytes);
     let text_lower = text.to_lowercase();
     for sig in STR_SIGS {
         if text_lower.contains(&sig.pattern.to_lowercase()) {
@@ -6208,8 +8082,9 @@ fn scan_bytes_for_signatures(bytes: &[u8], path: Option<&str>) -> String {
 
     // Matched byte signatures (for embedded content, not just file header)
     for sig in BYTE_SIGS {
-        if bytes.windows(sig.pattern.len()).any(|w| w == sig.pattern) &&
-           !bytes.starts_with(sig.pattern) {
+        if bytes.windows(sig.pattern.len()).any(|w| w == sig.pattern)
+            && !bytes.starts_with(sig.pattern)
+        {
             // Only flag if NOT the file's own header (already reported in type)
             findings.push(format!("embedded: {}", sig.label));
         }
@@ -6217,7 +8092,7 @@ fn scan_bytes_for_signatures(bytes: &[u8], path: Option<&str>) -> String {
 
     let header = match path {
         Some(p) => format!("scan  {}", p),
-        None    => "scan  (bytes)".to_string(),
+        None => "scan  (bytes)".to_string(),
     };
     format!("{}\n{}", header, findings.join("\n"))
 }
@@ -6247,21 +8122,36 @@ fn extract_strings(bytes: &[u8], min_len: usize) -> String {
 /// Recursively scan a directory. Returns a summary report.
 fn scan_dir_recursive(root: &str) -> String {
     let mut lines: Vec<String> = vec![format!("scan-dir  {}", root)];
-    let mut total   = 0usize;
+    let mut total = 0usize;
     let mut flagged = 0usize;
-    let mut errors  = 0usize;
+    let mut errors = 0usize;
 
-    fn walk(dir: &str, lines: &mut Vec<String>, total: &mut usize, flagged: &mut usize, errors: &mut usize, depth: usize) {
-        if depth > 20 { return; } // guard against deep symlink cycles
+    fn walk(
+        dir: &str,
+        lines: &mut Vec<String>,
+        total: &mut usize,
+        flagged: &mut usize,
+        errors: &mut usize,
+        depth: usize,
+    ) {
+        if depth > 20 {
+            return;
+        } // guard against deep symlink cycles
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
-            Err(e) => { lines.push(format!("  err  {}: {}", dir, e)); *errors += 1; return; }
+            Err(e) => {
+                lines.push(format!("  err  {}: {}", dir, e));
+                *errors += 1;
+                return;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
             let path_str = path.to_string_lossy().to_string();
             // Skip known-safe dirs to keep scans fast
-            if path_str.contains("/.git/") || path_str.contains("/target/") { continue; }
+            if path_str.contains("/.git/") || path_str.contains("/target/") {
+                continue;
+            }
             if path.is_dir() {
                 walk(&path_str, lines, total, flagged, errors, depth + 1);
             } else if path.is_file() {
@@ -6275,19 +8165,24 @@ fn scan_dir_recursive(root: &str) -> String {
                                 20..=49 => "low",
                                 50..=74 => "med",
                                 75..=99 => "high",
-                                _       => "crit",
+                                _ => "crit",
                             };
                             lines.push(format!("  [{:>4}] [{label}] {path_str}", score));
                         }
                     }
-                    Err(_) => { *errors += 1; }
+                    Err(_) => {
+                        *errors += 1;
+                    }
                 }
             }
         }
     }
 
     walk(root, &mut lines, &mut total, &mut flagged, &mut errors, 0);
-    lines.push(format!("total: {}  flagged: {}  errors: {}", total, flagged, errors));
+    lines.push(format!(
+        "total: {}  flagged: {}  errors: {}",
+        total, flagged, errors
+    ));
     lines.join("\n")
 }
 
@@ -6297,15 +8192,26 @@ fn scan_processes() -> String {
 
     // Common suspicious process names
     let suspicious_names = [
-        "xmrig", "minerd", "cpuminer", "cgminer",     // miners
-        "ncat", "socat", "cryptcat",                   // network tools
-        "mimikatz", "metasploit", "msfconsole",        // attack tools
-        "keylogger", "rootkit",                        // obvious malware names
+        "xmrig",
+        "minerd",
+        "cpuminer",
+        "cgminer", // miners
+        "ncat",
+        "socat",
+        "cryptcat", // network tools
+        "mimikatz",
+        "metasploit",
+        "msfconsole", // attack tools
+        "keylogger",
+        "rootkit", // obvious malware names
     ];
 
     #[cfg(target_os = "macos")]
     {
-        match std::process::Command::new("ps").args(["axo", "pid,comm,args"]).output() {
+        match std::process::Command::new("ps")
+            .args(["axo", "pid,comm,args"])
+            .output()
+        {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout);
                 for line in text.lines().skip(1) {
@@ -6364,24 +8270,29 @@ fn scan_network() -> String {
     // Known bad ports
     let suspicious_ports: &[u16] = &[
         4444, 4445, 1337, 31337, // common reverse shells
-        6666, 6667, 6668, 6669,  // IRC (botnet C2)
-        8080, 8888,              // common C2 HTTP alt ports
-        9050, 9051,              // Tor SOCKS proxy
+        6666, 6667, 6668, 6669, // IRC (botnet C2)
+        8080, 8888, // common C2 HTTP alt ports
+        9050, 9051, // Tor SOCKS proxy
     ];
 
     #[cfg(target_os = "macos")]
     {
-        match std::process::Command::new("netstat").args(["-an", "-p", "tcp"]).output() {
+        match std::process::Command::new("netstat")
+            .args(["-an", "-p", "tcp"])
+            .output()
+        {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let mut flagged = 0usize;
-                let mut total   = 0usize;
+                let mut total = 0usize;
                 for line in text.lines() {
                     if line.contains("ESTABLISHED") || line.contains("LISTEN") {
                         total += 1;
                         // Check for suspicious ports in the line
                         for &port in suspicious_ports {
-                            if line.contains(&format!(".{}", port)) || line.contains(&format!(":{}", port)) {
+                            if line.contains(&format!(".{}", port))
+                                || line.contains(&format!(":{}", port))
+                            {
                                 lines.push(format!("! {}", line.trim()));
                                 flagged += 1;
                                 break;
@@ -6410,12 +8321,16 @@ fn scan_network() -> String {
                     if parts.len() >= 4 {
                         let local_addr = parts[1];
                         let state = parts[3];
-                        if state == "0A" { // LISTEN
+                        if state == "0A" {
+                            // LISTEN
                             // Parse hex port (last 4 chars of addr field)
                             if let Some(port_hex) = local_addr.split(':').nth(1) {
                                 if let Ok(port) = u16::from_str_radix(port_hex, 16) {
                                     if suspicious_ports.contains(&port) {
-                                        lines.push(format!("! listening on suspicious port {}", port));
+                                        lines.push(format!(
+                                            "! listening on suspicious port {}",
+                                            port
+                                        ));
                                     }
                                 }
                             }
@@ -6464,7 +8379,8 @@ fn scan_startup_locations() -> String {
         "/etc/init.d".to_string(),
     ];
 
-    let all_locations: Vec<&str> = macos_locations.iter()
+    let all_locations: Vec<&str> = macos_locations
+        .iter()
         .chain(linux_locations.iter())
         .map(|s| s.as_str())
         .collect();
@@ -6505,7 +8421,9 @@ fn scan_startup_locations() -> String {
 fn quarantine_file(path: &str) -> bool {
     let home = std::env::var("HOME").unwrap_or_default();
     let quarantine_dir = format!("{}/.finch/quarantine", home);
-    if std::fs::create_dir_all(&quarantine_dir).is_err() { return false; }
+    if std::fs::create_dir_all(&quarantine_dir).is_err() {
+        return false;
+    }
 
     let src = std::path::Path::new(path);
     let file_name = match src.file_name() {
@@ -6530,10 +8448,15 @@ fn crypto_hex_encode(bytes: &[u8]) -> String {
 }
 
 fn crypto_hex_decode(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 { bail!("hex: odd-length string"); }
-    (0..s.len()).step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i+2], 16)
-            .map_err(|e| anyhow::anyhow!("hex decode at byte {}: {}", i/2, e)))
+    if s.len() % 2 != 0 {
+        bail!("hex: odd-length string");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("hex decode at byte {}: {}", i / 2, e))
+        })
         .collect()
 }
 
@@ -6546,21 +8469,25 @@ impl Forth {
         use crossterm::style::Stylize;
         for r in results {
             // Use label if known; fall back to a short hostname (strip port, strip http://).
-            let name = self.peer_meta.get(&r.peer)
+            let name = self
+                .peer_meta
+                .get(&r.peer)
                 .and_then(|m| m.label.as_deref())
                 .map(|l| l.cyan().bold().to_string())
                 .unwrap_or_else(|| {
-                    let short = r.peer
+                    let short = r
+                        .peer
                         .trim_start_matches("http://")
                         .trim_start_matches("https://")
-                        .split(':').next()           // drop port
+                        .split(':')
+                        .next() // drop port
                         .unwrap_or(&r.peer);
                     short.cyan().to_string()
                 });
 
             if let Some(err) = r.error {
-                self.out.push_str(&format!("{} couldn't do it: {}\n",
-                    name, err.red()));
+                self.out
+                    .push_str(&format!("{} couldn't do it: {}\n", name, err.red()));
             } else {
                 for line in r.output.lines() {
                     self.out.push_str(&format!("{}: {}\n", name, line));
@@ -6573,8 +8500,11 @@ impl Forth {
             if let Some(ref fb) = r.forth_back {
                 if !fb.is_empty() {
                     if let Err(e) = self.eval(fb) {
-                        self.out.push_str(&format!("{} sent back something that didn't work: {}\n",
-                            name, e.to_string().red()));
+                        self.out.push_str(&format!(
+                            "{} sent back something that didn't work: {}\n",
+                            name,
+                            e.to_string().red()
+                        ));
                     }
                 }
             }
@@ -6599,7 +8529,7 @@ fn run_push_one(addr: &str, text: &str, from: Option<&str>, token: Option<&str>)
         };
         let body = match &from {
             Some(f) => serde_json::json!({ "text": text, "from": f }),
-            None    => serde_json::json!({ "text": text }),
+            None => serde_json::json!({ "text": text }),
         };
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -6614,11 +8544,18 @@ fn run_push_one(addr: &str, text: &str, from: Option<&str>, token: Option<&str>)
     futures::executor::block_on(fut);
 }
 
-fn run_push_all(peers: &[String], text: &str, from: Option<&str>, _tokens: &std::collections::HashMap<String, String>) {
-    if peers.is_empty() { return; }
+fn run_push_all(
+    peers: &[String],
+    text: &str,
+    from: Option<&str>,
+    _tokens: &std::collections::HashMap<String, String>,
+) {
+    if peers.is_empty() {
+        return;
+    }
     let peers = peers.to_vec();
-    let text  = text.to_string();
-    let from  = from.map(|s| s.to_string());
+    let text = text.to_string();
+    let from = from.map(|s| s.to_string());
     let fut = async move {
         crate::coforth::scatter::scatter_push(&peers, &text, from.as_deref()).await;
     };
@@ -6635,13 +8572,15 @@ fn run_hash_scatter(
     from: &str,
     tokens: &std::collections::HashMap<String, String>,
 ) {
-    if members.is_empty() { return; }
+    if members.is_empty() {
+        return;
+    }
     let members = members.to_vec();
     let room_id = room_id.to_string();
-    let key     = key.to_string();
-    let value   = value.to_string();
-    let from    = from.to_string();
-    let tokens  = tokens.clone();
+    let key = key.to_string();
+    let value = value.to_string();
+    let from = from.to_string();
+    let tokens = tokens.clone();
     let fut = async move {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -6653,34 +8592,50 @@ fn run_hash_scatter(
             "value":   value,
             "from":    from,
         });
-        let tasks: Vec<_> = members.iter().map(|peer| {
-            let url = if peer.starts_with("http://") || peer.starts_with("https://") {
-                format!("{peer}/v1/forth/hash")
-            } else {
-                format!("http://{peer}/v1/forth/hash")
-            };
-            let mut req = client.post(&url).json(&body);
-            if let Some(t) = tokens.get(peer) {
-                req = req.header(crate::peer_token::HEADER, t.as_str());
-            }
-            async move { let _ = req.send().await; }
-        }).collect();
+        let tasks: Vec<_> = members
+            .iter()
+            .map(|peer| {
+                let url = if peer.starts_with("http://") || peer.starts_with("https://") {
+                    format!("{peer}/v1/forth/hash")
+                } else {
+                    format!("http://{peer}/v1/forth/hash")
+                };
+                let mut req = client.post(&url).json(&body);
+                if let Some(t) = tokens.get(peer) {
+                    req = req.header(crate::peer_token::HEADER, t.as_str());
+                }
+                async move {
+                    let _ = req.send().await;
+                }
+            })
+            .collect();
         futures::future::join_all(tasks).await;
     };
     futures::executor::block_on(fut);
 }
 
-fn peer_tokens_map(peer_meta: &std::collections::HashMap<String, PeerMeta>) -> std::collections::HashMap<String, String> {
-    peer_meta.iter()
+fn peer_tokens_map(
+    peer_meta: &std::collections::HashMap<String, PeerMeta>,
+) -> std::collections::HashMap<String, String> {
+    peer_meta
+        .iter()
         .filter_map(|(addr, meta)| meta.token.as_ref().map(|t| (addr.clone(), t.clone())))
         .collect()
 }
 
-fn run_scatter(peers: &[String], code: &str, caller: Option<&str>, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
+fn run_scatter(
+    peers: &[String],
+    code: &str,
+    caller: Option<&str>,
+    tokens: &std::collections::HashMap<String, String>,
+) -> Vec<crate::coforth::scatter::PeerResult> {
     let caller = caller.map(|s| s.to_string());
-    futures::executor::block_on(
-        crate::coforth::scatter::scatter_exec(peers, code, caller.as_deref(), tokens)
-    )
+    futures::executor::block_on(crate::coforth::scatter::scatter_exec(
+        peers,
+        code,
+        caller.as_deref(),
+        tokens,
+    ))
 }
 
 /// Return "hostname: path" attribution prefix for file reads.
@@ -6722,7 +8677,7 @@ fn read_delimited_file(path: &str, delimiter: u8) -> String {
 
 /// Read the first sheet of an xlsx/xls/ods file and return rows as pipe-delimited lines.
 fn read_xlsx_file(path: &str) -> String {
-    use calamine::{Reader, open_workbook_auto, Data};
+    use calamine::{open_workbook_auto, Data, Reader};
     let mut workbook = match open_workbook_auto(path) {
         Ok(wb) => wb,
         Err(e) => return format!("cannot open {path}: {e}\n"),
@@ -6738,17 +8693,24 @@ fn read_xlsx_file(path: &str) -> String {
     };
     let mut out = file_attribution(path);
     for row in range.rows() {
-        let cells: Vec<String> = row.iter().map(|c| match c {
-            Data::Empty => String::new(),
-            Data::String(s) => s.clone(),
-            Data::Float(f) => {
-                if f.fract() == 0.0 { format!("{}", *f as i64) } else { format!("{f}") }
-            }
-            Data::Int(i) => format!("{i}"),
-            Data::Bool(b) => format!("{b}"),
-            Data::Error(e) => format!("#ERR:{e:?}"),
-            _ => String::new(),
-        }).collect();
+        let cells: Vec<String> = row
+            .iter()
+            .map(|c| match c {
+                Data::Empty => String::new(),
+                Data::String(s) => s.clone(),
+                Data::Float(f) => {
+                    if f.fract() == 0.0 {
+                        format!("{}", *f as i64)
+                    } else {
+                        format!("{f}")
+                    }
+                }
+                Data::Int(i) => format!("{i}"),
+                Data::Bool(b) => format!("{b}"),
+                Data::Error(e) => format!("#ERR:{e:?}"),
+                _ => String::new(),
+            })
+            .collect();
         out.push_str(&cells.join(" | "));
         out.push('\n');
     }
@@ -6759,7 +8721,10 @@ fn read_xlsx_file(path: &str) -> String {
 /// e.g. "finch-macbook-pro._finch._tcp.local." → "macbook-pro"
 fn friendly_peer_name(full_name: &str) -> String {
     let instance = full_name.split("._finch").next().unwrap_or(full_name);
-    instance.strip_prefix("finch-").unwrap_or(instance).to_string()
+    instance
+        .strip_prefix("finch-")
+        .unwrap_or(instance)
+        .to_string()
 }
 
 /// Public entry point for background boot discovery (called from event_loop).
@@ -6789,8 +8754,7 @@ fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16, String, Option<Strin
 
     // discover() uses recv_timeout internally — it's a blocking call.
     // block_in_place panics inside LocalSet; use futures::executor::block_on instead.
-    futures::executor::block_on(async { inner() })
-    .unwrap_or_default()
+    futures::executor::block_on(async { inner() }).unwrap_or_default()
 }
 
 /// Collect basic machine specs: (cpu_cores, ram_mb, bench_ms).
@@ -6818,9 +8782,15 @@ pub fn collect_machine_specs() -> (u32, u64, u64) {
 fn format_peer_hw(p: &crate::registry::PeerEntry) -> String {
     use crossterm::style::Stylize;
     let mut parts = Vec::new();
-    if let Some(c) = p.cpu_cores { parts.push(format!("{}c", c)); }
-    if let Some(r) = p.ram_mb    { parts.push(format!("{}MB", r)); }
-    if let Some(b) = p.bench_ms  { parts.push(format!("bench:{}ms", b)); }
+    if let Some(c) = p.cpu_cores {
+        parts.push(format!("{}c", c));
+    }
+    if let Some(r) = p.ram_mb {
+        parts.push(format!("{}MB", r));
+    }
+    if let Some(b) = p.bench_ms {
+        parts.push(format!("bench:{}ms", b));
+    }
     if parts.is_empty() {
         String::new()
     } else {
@@ -6873,8 +8843,15 @@ fn run_registry_peers(
     };
     let mut url = base;
     let mut sep = '?';
-    if let Some(t) = tag    { url.push(sep); url.push_str(&format!("tag={t}"));    sep = '&'; }
-    if let Some(r) = region { url.push(sep); url.push_str(&format!("region={r}")); }
+    if let Some(t) = tag {
+        url.push(sep);
+        url.push_str(&format!("tag={t}"));
+        sep = '&';
+    }
+    if let Some(r) = region {
+        url.push(sep);
+        url.push_str(&format!("region={r}"));
+    }
     let fut = async move {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -6885,10 +8862,7 @@ fn run_registry_peers(
     futures::executor::block_on(fut)
 }
 
-fn run_registry_ledger(
-    registry: &str,
-    addr: &str,
-) -> anyhow::Result<crate::registry::LedgerEntry> {
+fn run_registry_ledger(registry: &str, addr: &str) -> anyhow::Result<crate::registry::LedgerEntry> {
     let base = if registry.starts_with("http") {
         format!("{registry}/v1/registry/ledger/{addr}")
     } else {
@@ -6946,11 +8920,11 @@ fn run_peer_settle(peer_addr: &str, my_addr: Option<&str>) -> anyhow::Result<(u6
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
         // Fetch how much the peer thinks we owe them.
-        let ledger: crate::registry::LedgerEntry = client
-            .get(&ledger_url)
-            .send().await?
-            .json().await?;
-        let amount_ms = ledger.credits_ms.saturating_sub(ledger.debits_ms.min(ledger.credits_ms));
+        let ledger: crate::registry::LedgerEntry =
+            client.get(&ledger_url).send().await?.json().await?;
+        let amount_ms = ledger
+            .credits_ms
+            .saturating_sub(ledger.debits_ms.min(ledger.credits_ms));
         if amount_ms == 0 {
             return Ok((0u64, "nothing owed".to_string()));
         }
@@ -6962,17 +8936,13 @@ fn run_peer_settle(peer_addr: &str, my_addr: Option<&str>) -> anyhow::Result<(u6
         }
         let json: serde_json::Value = resp.json().await?;
         let cleared_ms = json["cleared_ms"].as_u64().unwrap_or(0);
-        let message    = json["message"].as_str().unwrap_or("").to_string();
+        let message = json["message"].as_str().unwrap_or("").to_string();
         Ok::<(u64, String), anyhow::Error>((cleared_ms, message))
     };
     futures::executor::block_on(fut)
 }
 
-fn run_registry_debit(
-    registry: &str,
-    peer_addr: &str,
-    compute_ms: u64,
-) -> anyhow::Result<()> {
+fn run_registry_debit(registry: &str, peer_addr: &str, compute_ms: u64) -> anyhow::Result<()> {
     let base = if registry.starts_with("http") {
         format!("{registry}/v1/registry/debit")
     } else {
@@ -6989,60 +8959,109 @@ fn run_registry_debit(
     futures::executor::block_on(fut)
 }
 
-fn run_define_scatter(peers: &[String], source: &str, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
-    futures::executor::block_on(crate::coforth::scatter::define_on_peers(peers, source, tokens))
+fn run_define_scatter(
+    peers: &[String],
+    source: &str,
+    tokens: &std::collections::HashMap<String, String>,
+) -> Vec<crate::coforth::scatter::PeerResult> {
+    futures::executor::block_on(crate::coforth::scatter::define_on_peers(
+        peers, source, tokens,
+    ))
 }
 
-fn run_exec_scatter(peers: &[String], cmd: &str, tokens: &std::collections::HashMap<String, String>) -> Vec<crate::coforth::scatter::PeerResult> {
-    futures::executor::block_on(crate::coforth::scatter::scatter_exec_bash(peers, cmd, tokens))
+fn run_exec_scatter(
+    peers: &[String],
+    cmd: &str,
+    tokens: &std::collections::HashMap<String, String>,
+) -> Vec<crate::coforth::scatter::PeerResult> {
+    futures::executor::block_on(crate::coforth::scatter::scatter_exec_bash(
+        peers, cmd, tokens,
+    ))
 }
 
 // ── Name table ────────────────────────────────────────────────────────────────
 
 pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
     Some(match name {
-        "+" => Builtin::Plus, "-" => Builtin::Minus, "*" => Builtin::Star,
-        "/" => Builtin::Slash, "mod" => Builtin::Mod,
-        "dup" => Builtin::Dup, "drop" => Builtin::Drop, "swap" => Builtin::Swap,
-        "over" => Builtin::Over, "rot" => Builtin::Rot,
-        "nip" => Builtin::Nip, "tuck" => Builtin::Tuck,
-        "2dup" => Builtin::TwoDup, "2drop" => Builtin::TwoDrop, "2swap" => Builtin::TwoSwap,
-        "2over" => Builtin::TwoOver, "2rot" => Builtin::TwoRot,
-        "=" => Builtin::Eq, "<" => Builtin::Lt, ">" => Builtin::Gt,
-        "<=" | "=<" => Builtin::Le, ">=" | "=>" => Builtin::Ge,
-        "<>" | "!=" => Builtin::Ne, "0=" => Builtin::ZeroEq, "0<" => Builtin::ZeroLt, "0>" => Builtin::ZeroGt,
-        "and" => Builtin::And, "or" => Builtin::Or, "xor" => Builtin::Xor,
-        "invert" | "not" => Builtin::Invert, "negate" => Builtin::Negate,
-        "abs" => Builtin::Abs, "max" => Builtin::Max, "min" => Builtin::Min,
-        "lshift" => Builtin::Lshift, "rshift" => Builtin::Rshift,
-        "." => Builtin::Print, ".s" => Builtin::PrintS,
-        "cr" => Builtin::Cr, "space" => Builtin::Space, "emit" => Builtin::Emit,
-        "@" => Builtin::Fetch, "!" => Builtin::Store, "+!" => Builtin::PlusStore,
-        "i" => Builtin::LoopI, "j" => Builtin::LoopJ,
-        ">r" => Builtin::ToR, "r>" => Builtin::FromR, "r@" => Builtin::FetchR,
-        "pick" => Builtin::Pick, "roll" => Builtin::Roll,
+        "+" => Builtin::Plus,
+        "-" => Builtin::Minus,
+        "*" => Builtin::Star,
+        "/" => Builtin::Slash,
+        "mod" => Builtin::Mod,
+        "dup" => Builtin::Dup,
+        "drop" => Builtin::Drop,
+        "swap" => Builtin::Swap,
+        "over" => Builtin::Over,
+        "rot" => Builtin::Rot,
+        "nip" => Builtin::Nip,
+        "tuck" => Builtin::Tuck,
+        "2dup" => Builtin::TwoDup,
+        "2drop" => Builtin::TwoDrop,
+        "2swap" => Builtin::TwoSwap,
+        "2over" => Builtin::TwoOver,
+        "2rot" => Builtin::TwoRot,
+        "=" => Builtin::Eq,
+        "<" => Builtin::Lt,
+        ">" => Builtin::Gt,
+        "<=" | "=<" => Builtin::Le,
+        ">=" | "=>" => Builtin::Ge,
+        "<>" | "!=" => Builtin::Ne,
+        "0=" => Builtin::ZeroEq,
+        "0<" => Builtin::ZeroLt,
+        "0>" => Builtin::ZeroGt,
+        "and" => Builtin::And,
+        "or" => Builtin::Or,
+        "xor" => Builtin::Xor,
+        "invert" | "not" => Builtin::Invert,
+        "negate" => Builtin::Negate,
+        "abs" => Builtin::Abs,
+        "max" => Builtin::Max,
+        "min" => Builtin::Min,
+        "lshift" => Builtin::Lshift,
+        "rshift" => Builtin::Rshift,
+        "." => Builtin::Print,
+        ".s" => Builtin::PrintS,
+        "cr" => Builtin::Cr,
+        "space" => Builtin::Space,
+        "emit" => Builtin::Emit,
+        "@" => Builtin::Fetch,
+        "!" => Builtin::Store,
+        "+!" => Builtin::PlusStore,
+        "i" => Builtin::LoopI,
+        "j" => Builtin::LoopJ,
+        ">r" => Builtin::ToR,
+        "r>" => Builtin::FromR,
+        "r@" => Builtin::FetchR,
+        "pick" => Builtin::Pick,
+        "roll" => Builtin::Roll,
         "u<" => Builtin::ULt,
-        "*/" => Builtin::StarSlash, "/mod" => Builtin::SlashMod,
-        "u." => Builtin::PrintU, ".h" | "hex." => Builtin::PrintHex,
-        "allot" => Builtin::Allot, "cells" => Builtin::Cells,
-        "words" => Builtin::Words, "hot-words" => Builtin::HotWords,
-        "random" => Builtin::Random, "time" => Builtin::Time,
-        "depth" => Builtin::Depth, "nop" => Builtin::Nop,
-        "fuel"      => Builtin::Fuel,
+        "*/" => Builtin::StarSlash,
+        "/mod" => Builtin::SlashMod,
+        "u." => Builtin::PrintU,
+        ".h" | "hex." => Builtin::PrintHex,
+        "allot" => Builtin::Allot,
+        "cells" => Builtin::Cells,
+        "words" => Builtin::Words,
+        "hot-words" => Builtin::HotWords,
+        "random" => Builtin::Random,
+        "time" => Builtin::Time,
+        "depth" => Builtin::Depth,
+        "nop" => Builtin::Nop,
+        "fuel" => Builtin::Fuel,
         "with-fuel" => Builtin::WithFuel,
-        "undo"      => Builtin::Undo,
-        "lock"      => Builtin::Lock,
-        "unlock"    => Builtin::Unlock,
-        "lock-ttl"  => Builtin::LockTtl,
+        "undo" => Builtin::Undo,
+        "lock" => Builtin::Lock,
+        "unlock" => Builtin::Unlock,
+        "lock-ttl" => Builtin::LockTtl,
         // Writing assistance
-        "capitalize"    => Builtin::Capitalize,
-        "str-upper"     => Builtin::StrUpper,
-        "str-lower"     => Builtin::StrLower,
-        "str-trim"      => Builtin::StrTrim,
-        "word-count"    => Builtin::WordCount,
-        "sentence?"     => Builtin::SentenceCheck,
+        "capitalize" => Builtin::Capitalize,
+        "str-upper" => Builtin::StrUpper,
+        "str-lower" => Builtin::StrLower,
+        "str-trim" => Builtin::StrTrim,
+        "word-count" => Builtin::WordCount,
+        "sentence?" => Builtin::SentenceCheck,
         "grammar-check" => Builtin::GrammarCheck,
-        "improve"       => Builtin::ImproveStr,
+        "improve" => Builtin::ImproveStr,
         "sqrt" | "isqrt" => Builtin::Sqrt,
         "floor" => Builtin::Floor,
         "ceil" | "ceiling" => Builtin::Ceil,
@@ -7052,145 +9071,147 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "peers" => Builtin::Peers,
         "peers-clear" => Builtin::PeersClear,
         "peers-discover" | "discover" => Builtin::PeersDiscover,
-        "take-all"          => Builtin::TakeAll,
-        "ensemble-def"      => Builtin::EnsembleDef,
-        "ensemble-use"      => Builtin::EnsembleUse,
-        "ensemble-end"      => Builtin::EnsembleEnd,
-        "ensemble-list"     => Builtin::EnsembleList,
-        "label-peer"        => Builtin::LabelPeer,
-        "tag-peer"          => Builtin::TagPeer,
+        "take-all" => Builtin::TakeAll,
+        "ensemble-def" => Builtin::EnsembleDef,
+        "ensemble-use" => Builtin::EnsembleUse,
+        "ensemble-end" => Builtin::EnsembleEnd,
+        "ensemble-list" => Builtin::EnsembleList,
+        "label-peer" => Builtin::LabelPeer,
+        "tag-peer" => Builtin::TagPeer,
         "ensemble-from-tag" => Builtin::EnsembleFromTag,
-        "peer-info"         => Builtin::PeerInfo,
-        "publish"           => Builtin::Publish,
-        "sync"              => Builtin::Sync,
-        "registry-set"      => Builtin::RegistrySet,
-        "join-registry"     => Builtin::JoinRegistry,
+        "peer-info" => Builtin::PeerInfo,
+        "publish" => Builtin::Publish,
+        "sync" => Builtin::Sync,
+        "registry-set" => Builtin::RegistrySet,
+        "join-registry" => Builtin::JoinRegistry,
         "leave-registry" | "leave" => Builtin::LeaveRegistry,
-        "from-registry"     => Builtin::FromRegistry,
-        "registry-list"     => Builtin::RegistryList,
-        "slowest"           => Builtin::Slowest,
-        "balance"           => Builtin::Balance,
-        "balances"          => Builtin::Balances,
-        "record-debit"      => Builtin::RecordDebit,
-        "debt-check"        => Builtin::DebtCheck,
-        "settle"            => Builtin::Settle,
+        "from-registry" => Builtin::FromRegistry,
+        "registry-list" => Builtin::RegistryList,
+        "slowest" => Builtin::Slowest,
+        "balance" => Builtin::Balance,
+        "balances" => Builtin::Balances,
+        "record-debit" => Builtin::RecordDebit,
+        "debt-check" => Builtin::DebtCheck,
+        "settle" => Builtin::Settle,
         // String pool
-        "type"    => Builtin::Type,
-        "str="    => Builtin::StrEq,
-        "str-len"     => Builtin::StrLen,
-        "str-cat"     => Builtin::StrCat,
-        "str-split"   => Builtin::StrSplit,
-        "str-join"    => Builtin::StrJoin,
-        "str-sub"     => Builtin::StrSub,
-        "str-find"    => Builtin::StrFind,
-        "str-replace"  => Builtin::StrReplace,
-        "str-reverse"  => Builtin::StrReverse,
-        "num>str"      => Builtin::NumToStr,
-        "str>num"      => Builtin::StrToNum,
+        "type" => Builtin::Type,
+        "str=" => Builtin::StrEq,
+        "str-len" => Builtin::StrLen,
+        "str-cat" => Builtin::StrCat,
+        "str-split" => Builtin::StrSplit,
+        "str-join" => Builtin::StrJoin,
+        "str-sub" => Builtin::StrSub,
+        "str-find" => Builtin::StrFind,
+        "str-replace" => Builtin::StrReplace,
+        "str-reverse" => Builtin::StrReverse,
+        "num>str" => Builtin::NumToStr,
+        "str>num" => Builtin::StrToNum,
         "word-defined?" => Builtin::WordDefined,
-        "word-names"   => Builtin::WordNames,
-        "nth-line"     => Builtin::NthLine,
-        "agree?"       => Builtin::AgreeQ,
-        "same?"        => Builtin::SameQ,
-        "safe"         => Builtin::Safe,
+        "word-names" => Builtin::WordNames,
+        "nth-line" => Builtin::NthLine,
+        "agree?" => Builtin::AgreeQ,
+        "same?" => Builtin::SameQ,
+        "safe" => Builtin::Safe,
         // Crypto
-        "sha256"      => Builtin::Sha256,
+        "sha256" => Builtin::Sha256,
         "file-sha256" => Builtin::FileSha256,
-        "file-hash"         => Builtin::FileHash,
-        "file-hash-range"   => Builtin::FileHashRange,
-        "file-fetch"        => Builtin::FileFetch,
-        "file-slice"        => Builtin::FileSlice,
+        "file-hash" => Builtin::FileHash,
+        "file-hash-range" => Builtin::FileHashRange,
+        "file-fetch" => Builtin::FileFetch,
+        "file-slice" => Builtin::FileSlice,
         "file-sha256-range" => Builtin::FileSha256Range,
-        "file-size"         => Builtin::FileSize,
-        "file-write"        => Builtin::FileWrite,
-        "file-append"       => Builtin::FileAppend,
-        "nonce"       => Builtin::Nonce,
-        "keygen"      => Builtin::Keygen,
-        "sign"        => Builtin::Sign,
-        "verify"      => Builtin::Verify,
+        "file-size" => Builtin::FileSize,
+        "file-write" => Builtin::FileWrite,
+        "file-append" => Builtin::FileAppend,
+        "file-zip" => Builtin::FileZip,
+        "file-unzip" => Builtin::FileUnzip,
+        "nonce" => Builtin::Nonce,
+        "keygen" => Builtin::Keygen,
+        "sign" => Builtin::Sign,
+        "verify" => Builtin::Verify,
         // Terminal control
-        "at-xy"          => Builtin::AtXy,
-        "term-size"      => Builtin::TermSize,
-        "save-cursor"    => Builtin::SaveCursor,
+        "at-xy" => Builtin::AtXy,
+        "term-size" => Builtin::TermSize,
+        "save-cursor" => Builtin::SaveCursor,
         "restore-cursor" => Builtin::RestoreCursor,
-        "clear-eol"      => Builtin::ClearEol,
-        "clear-line"     => Builtin::ClearLine,
-        "color!"         => Builtin::ColorFg,
-        "reset-style"    => Builtin::ResetStyle,
-        "sync-begin"     => Builtin::SyncBegin,
-        "sync-end"       => Builtin::SyncEnd,
-        "hide-cursor"    => Builtin::HideCursor,
-        "show-cursor"    => Builtin::ShowCursor,
-        "connected?"     => Builtin::Connected,
+        "clear-eol" => Builtin::ClearEol,
+        "clear-line" => Builtin::ClearLine,
+        "color!" => Builtin::ColorFg,
+        "reset-style" => Builtin::ResetStyle,
+        "sync-begin" => Builtin::SyncBegin,
+        "sync-end" => Builtin::SyncEnd,
+        "hide-cursor" => Builtin::HideCursor,
+        "show-cursor" => Builtin::ShowCursor,
+        "connected?" => Builtin::Connected,
         // Security scanning
-        "scan-file"      => Builtin::ScanFile,
-        "scan-bytes"     => Builtin::ScanBytes,
-        "file-entropy"   => Builtin::FileEntropy,
-        "scan-dir"       => Builtin::ScanDir,
-        "scan-strings"   => Builtin::ScanStrings,
-        "scan-procs"     => Builtin::ScanProcs,
-        "scan-net"       => Builtin::ScanNet,
-        "scan-startup"   => Builtin::ScanStartup,
-        "quarantine"     => Builtin::Quarantine,
-        "1+"             => Builtin::Inc,
-        "1-"             => Builtin::Dec,
-        "here"           => Builtin::Here,
-        ","              => Builtin::Comma,
-        "cell"           => Builtin::CellSz,
-        "fill"           => Builtin::Fill,
-        "eval"           => Builtin::Eval,
-        "argue"          => Builtin::Argue,
-        "argue-cases"    => Builtin::ArgueCases,
-        "gate"           => Builtin::Gate,
-        "both-ways"      => Builtin::BothWays,
-        "versus"         => Builtin::Versus,
-        "page"           => Builtin::Page,
-        "resolve"        => Builtin::Resolve,
-        "infix"          => Builtin::Infix,
-        "register-boot"  => Builtin::RegisterBoot,
+        "scan-file" => Builtin::ScanFile,
+        "scan-bytes" => Builtin::ScanBytes,
+        "file-entropy" => Builtin::FileEntropy,
+        "scan-dir" => Builtin::ScanDir,
+        "scan-strings" => Builtin::ScanStrings,
+        "scan-procs" => Builtin::ScanProcs,
+        "scan-net" => Builtin::ScanNet,
+        "scan-startup" => Builtin::ScanStartup,
+        "quarantine" => Builtin::Quarantine,
+        "1+" => Builtin::Inc,
+        "1-" => Builtin::Dec,
+        "here" => Builtin::Here,
+        "," => Builtin::Comma,
+        "cell" => Builtin::CellSz,
+        "fill" => Builtin::Fill,
+        "eval" => Builtin::Eval,
+        "argue" => Builtin::Argue,
+        "argue-cases" => Builtin::ArgueCases,
+        "gate" => Builtin::Gate,
+        "both-ways" => Builtin::BothWays,
+        "versus" => Builtin::Versus,
+        "page" => Builtin::Page,
+        "resolve" => Builtin::Resolve,
+        "infix" => Builtin::Infix,
+        "register-boot" => Builtin::RegisterBoot,
         // Proof system
-        "assert"         => Builtin::Assert,
-        "prove-all"       => Builtin::ProveAll,
-        "prove-all?"      => Builtin::ProveAllBool,
-        "prove-english"   => Builtin::ProveEnglish,
+        "assert" => Builtin::Assert,
+        "prove-all" => Builtin::ProveAll,
+        "prove-all?" => Builtin::ProveAllBool,
+        "prove-english" => Builtin::ProveEnglish,
         "prove-languages" => Builtin::ProveLanguages,
-        "channels"       => Builtin::ListChannels,
+        "channels" => Builtin::ListChannels,
         // Collection operations
-        "glob-pool"      => Builtin::GlobPool,
-        "clean-lines"    => Builtin::CleanLines,
-        "glob-count"      => Builtin::GlobCount,
-        "exec-capture"    => Builtin::ExecCapture,
+        "glob-pool" => Builtin::GlobPool,
+        "clean-lines" => Builtin::CleanLines,
+        "glob-count" => Builtin::GlobCount,
+        "exec-capture" => Builtin::ExecCapture,
         "back-and-forth?" => Builtin::BackAndForthQ,
-        "invertible?"     => Builtin::InvertibleQ,
-        "help"            => Builtin::Help,
-        "describe"        => Builtin::Describe,
-        "compute"         => Builtin::Compute,
-        "equiv?"          => Builtin::EquivQ,
-        "fork"            => Builtin::Fork,
-        "boot"            => Builtin::Boot,
-        ".r"              => Builtin::PrintR,
-        ".pad"            => Builtin::PrintPad,
+        "invertible?" => Builtin::InvertibleQ,
+        "help" => Builtin::Help,
+        "describe" => Builtin::Describe,
+        "compute" => Builtin::Compute,
+        "equiv?" => Builtin::EquivQ,
+        "fork" => Builtin::Fork,
+        "boot" => Builtin::Boot,
+        ".r" => Builtin::PrintR,
+        ".pad" => Builtin::PrintPad,
         "hash" | "str-hash" => Builtin::Hash,
-        "hash-int"        => Builtin::HashInt,
-        "hash-combine"    => Builtin::HashCombine,
+        "hash-int" => Builtin::HashInt,
+        "hash-combine" => Builtin::HashCombine,
         // Shared-hash / room builtins
-        "h!"              => Builtin::HPut,
-        "h@"              => Builtin::HFetch,
-        "hdel"            => Builtin::HDel,
-        "h."              => Builtin::HPrint,
-        "h?"              => Builtin::HHas,
-        "room-use"        => Builtin::RoomUse,
-        "room+"           => Builtin::RoomAdd,
-        "room-"           => Builtin::RoomSub,
-        "rooms"           => Builtin::RoomList,
-        "room-new"        => Builtin::RoomNew,
-        "sort"           => Builtin::SortLines,
-        "sort-lines"     => Builtin::SortLines,
-        "unique"         => Builtin::UniqueLines,
-        "unique-lines"   => Builtin::UniqueLines,
-        "reverse"        => Builtin::ReverseLines,
-        "reverse-lines"  => Builtin::ReverseLines,
-        "line-count"     => Builtin::LineCount,
+        "h!" => Builtin::HPut,
+        "h@" => Builtin::HFetch,
+        "hdel" => Builtin::HDel,
+        "h." => Builtin::HPrint,
+        "h?" => Builtin::HHas,
+        "room-use" => Builtin::RoomUse,
+        "room+" => Builtin::RoomAdd,
+        "room-" => Builtin::RoomSub,
+        "rooms" => Builtin::RoomList,
+        "room-new" => Builtin::RoomNew,
+        "sort" => Builtin::SortLines,
+        "sort-lines" => Builtin::SortLines,
+        "unique" => Builtin::UniqueLines,
+        "unique-lines" => Builtin::UniqueLines,
+        "reverse" => Builtin::ReverseLines,
+        "reverse-lines" => Builtin::ReverseLines,
+        "line-count" => Builtin::LineCount,
         _ => return None,
     })
 }
@@ -7202,7 +9223,13 @@ fn tokenize(src: &str) -> Vec<String> {
     let mut chars = src.chars().peekable();
     let mut tok = String::new();
 
-    macro_rules! flush { () => { if !tok.is_empty() { tokens.push(std::mem::take(&mut tok)); } }; }
+    macro_rules! flush {
+        () => {
+            if !tok.is_empty() {
+                tokens.push(std::mem::take(&mut tok));
+            }
+        };
+    }
 
     while let Some(&c) = chars.peek() {
         if c == '\\' && tok.is_empty() {
@@ -7211,7 +9238,11 @@ fn tokenize(src: &str) -> Vec<String> {
             // This prevents `str:\` or other tokens containing backslash
             // from silently eating the rest of the line.
             chars.next();
-            for c2 in chars.by_ref() { if c2 == '\n' { break; } }
+            for c2 in chars.by_ref() {
+                if c2 == '\n' {
+                    break;
+                }
+            }
         } else if c == '(' && tok.is_empty() {
             // Standalone `(` — stack-comment or paren-comment.
             // Only triggers when NOT mid-token; `str::(` must not eat its trailing `)`.
@@ -7220,33 +9251,56 @@ fn tokenize(src: &str) -> Vec<String> {
             // Skip until closing )
             let mut depth = 1;
             for c2 in chars.by_ref() {
-                if c2 == '(' { depth += 1; }
-                else if c2 == ')' { depth -= 1; if depth == 0 { break; } }
+                if c2 == '(' {
+                    depth += 1;
+                } else if c2 == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
             }
         } else if c == '.' {
             chars.next();
             if chars.peek() == Some(&'"') {
                 flush!();
                 chars.next(); // consume "
-                // Skip exactly one space (standard Forth: space separates ." from content)
-                if chars.peek() == Some(&' ') { chars.next(); }
+                              // Skip exactly one space (standard Forth: space separates ." from content)
+                if chars.peek() == Some(&' ') {
+                    chars.next();
+                }
                 let mut s = String::new();
-                for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+                for c2 in chars.by_ref() {
+                    if c2 == '"' {
+                        break;
+                    }
+                    s.push(c2);
+                }
                 tokens.push(format!("\x00str:{s}"));
             } else if chars.peek() == Some(&'|') {
                 // .| text with "quotes" |  — print alternate delimiter
                 flush!();
                 chars.next(); // consume |
-                if chars.peek() == Some(&' ') { chars.next(); }
+                if chars.peek() == Some(&' ') {
+                    chars.next();
+                }
                 let mut s = String::new();
-                for c2 in chars.by_ref() { if c2 == '|' { break; } s.push(c2); }
+                for c2 in chars.by_ref() {
+                    if c2 == '|' {
+                        break;
+                    }
+                    s.push(c2);
+                }
                 tokens.push(format!("\x00str:{s}"));
             } else {
                 // Sentence-final period: "square." → ["square", "."]
                 // A trailing period (followed by space, newline, or end) is a separator —
                 // every period executes, including natural language sentence endings.
                 let next = chars.peek().copied();
-                let is_sentence_end = matches!(next, None | Some(' ') | Some('\n') | Some('\r') | Some('\t') | Some(','));
+                let is_sentence_end = matches!(
+                    next,
+                    None | Some(' ') | Some('\n') | Some('\r') | Some('\t') | Some(',')
+                );
                 if is_sentence_end && !tok.is_empty() {
                     flush!();
                     tokens.push(".".to_string()); // the . itself executes (print TOS or no-op)
@@ -7258,226 +9312,500 @@ fn tokenize(src: &str) -> Vec<String> {
             // confirm" message" — like ." but emits Cell::Confirm instead of Cell::Str
             tok.clear();
             chars.next(); // consume "
-            if chars.peek() == Some(&' ') { chars.next(); } // skip separator space
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            } // skip separator space
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00confirm:{s}"));
         } else if c == '"' && tok == "select" {
             // select" title|opt1|opt2" — pop-up dialog; pushes chosen index or -1
             tok.clear();
             chars.next(); // consume "
-            if chars.peek() == Some(&' ') { chars.next(); } // skip separator space
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            } // skip separator space
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00select:{s}"));
         } else if c == '"' && tok == "read" {
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00read:{s}"));
         } else if c == '"' && tok == "csv" {
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00csv:{s}"));
         } else if c == '"' && tok == "tsv" {
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00tsv:{s}"));
         } else if c == '"' && tok == "xlsx" {
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00xlsx:{s}"));
         } else if c == '"' && tok == "exec" {
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00exec:{s}"));
         } else if c == '"' && tok == "glob" {
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00glob:{s}"));
         } else if c == '"' && tok == "peer" {
             // peer" addr"  — register a remote finch daemon as a scatter target
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00peer:{s}"));
         } else if c == '"' && tok == "ensemble-def" {
             // ensemble-def" name"  — snapshot current peers as a named ensemble
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00push-str:{s}"));
             tokens.push("ensemble-def".to_string());
         } else if c == '"' && tok == "ensemble-use" {
             // ensemble-use" name"  — push peers, switch to named ensemble
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00push-str:{s}"));
             tokens.push("ensemble-use".to_string());
         } else if c == '"' && tok == "registry" {
             // registry" addr"  — set registry address
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00push-str:{s}"));
             tokens.push("registry-set".to_string());
         } else if c == '"' && tok == "join" {
             // join" addr"  — register this machine at addr with the configured registry
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00push-str:{s}"));
             tokens.push("join-registry".to_string());
         } else if c == '"' && tok == "publish" {
             // publish" word-name"  — scatter word source to all peers
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00push-str:{s}"));
             tokens.push("publish".to_string());
         } else if c == '"' && tok == "scatter" {
             // scatter" code"  — run code on all registered peers in parallel
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00scatter:{s}"));
         } else if c == '"' && tok == "symbol" {
             // symbol" name"  — share a word by name: if I know it, send my definition first;
             // then run the word on all peers so each speaks it in their own dialect
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00symbol:{s}"));
         } else if c == '"' && tok == "hello" {
             // hello" peer"  — send "hello from <hostname>!" to one peer by name or addr
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut peer = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } peer.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                peer.push(c2);
+            }
             tokens.push(format!("\x00hello:{peer}"));
         } else if c == '"' && tok == "tag" {
             // tag" name" "addr"  — label a peer's machine with a human name
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut name = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } name.push(c2); }
-            while chars.peek() == Some(&' ') { chars.next(); }
-            if chars.peek() == Some(&'"') { chars.next(); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                name.push(c2);
+            }
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            if chars.peek() == Some(&'"') {
+                chars.next();
+            }
             let mut addr = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } addr.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                addr.push(c2);
+            }
             tokens.push(format!("\x00tag:{name}\x01{addr}"));
         } else if c == '"' && tok == "channel" {
             // channel" #name"  — join a named channel; broadcast presence to all peers
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut name = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } name.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                name.push(c2);
+            }
             tokens.push(format!("\x00channel:{name}"));
         } else if c == '"' && tok == "say" {
             // say" #channel" "message"  — send a message to a channel (all peers)
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut chan = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } chan.push(c2); }
-            while chars.peek() == Some(&' ') { chars.next(); }
-            if chars.peek() == Some(&'"') { chars.next(); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                chan.push(c2);
+            }
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            if chars.peek() == Some(&'"') {
+                chars.next();
+            }
             let mut msg = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } msg.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                msg.push(c2);
+            }
             tokens.push(format!("\x00say:{chan}\x01{msg}"));
+        } else if c == '"' && tok == "zip" {
+            // zip" src" "dest.zip"  — zip a file or directory into an archive
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            let mut src = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                src.push(c2);
+            }
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            if chars.peek() == Some(&'"') {
+                chars.next();
+            }
+            let mut dest = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                dest.push(c2);
+            }
+            tokens.push(format!("\x00file-zip:{src}\x01{dest}"));
+        } else if c == '"' && tok == "unzip" {
+            // unzip" archive.zip" "dest/"  — extract a zip archive into a directory
+            tok.clear();
+            chars.next();
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            let mut src = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                src.push(c2);
+            }
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            if chars.peek() == Some(&'"') {
+                chars.next();
+            }
+            let mut dest = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                dest.push(c2);
+            }
+            tokens.push(format!("\x00file-unzip:{src}\x01{dest}"));
         } else if c == '"' && tok == "part" {
             // part" #name"  — leave a channel; broadcast departure to all peers
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut name = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } name.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                name.push(c2);
+            }
             tokens.push(format!("\x00part:{name}"));
         } else if c == '"' && tok == "prove" {
             // prove" word"  — run test:<word> and show ✓ / ✗
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut word = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } word.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                word.push(c2);
+            }
             tokens.push(format!("\x00prove:{word}"));
         } else if c == '"' && tok == "on" {
             // on" peer" "code"  — run code on exactly one peer (by address or label)
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut peer = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } peer.push(c2); }
-            while chars.peek() == Some(&' ') { chars.next(); }
-            if chars.peek() == Some(&'"') { chars.next(); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                peer.push(c2);
+            }
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            if chars.peek() == Some(&'"') {
+                chars.next();
+            }
             let mut code = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } code.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                code.push(c2);
+            }
             tokens.push(format!("\x00on:{peer}\x01{code}"));
         } else if c == '"' && tok == "scatter-on" {
             // scatter-on" ensemble" "code"  — run code on named ensemble, no peer side-effects
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut ensemble = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } ensemble.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                ensemble.push(c2);
+            }
             // skip whitespace then opening quote for code
-            while chars.peek() == Some(&' ') { chars.next(); }
-            if chars.peek() == Some(&'"') { chars.next(); } // consume opening "
+            while chars.peek() == Some(&' ') {
+                chars.next();
+            }
+            if chars.peek() == Some(&'"') {
+                chars.next();
+            } // consume opening "
             let mut code = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } code.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                code.push(c2);
+            }
             tokens.push(format!("\x00scatter-on:{ensemble}\x01{code}"));
         } else if c == '"' && tok == "forth-back" {
             // forth-back" code"  — set Forth code to be executed on the caller after response
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00forth-back:{s}"));
         } else if c == '"' && tok == "s" {
             // s" text"  — push string pool index as integer operand (no printing)
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00push-str:{s}"));
         } else if c == '"' && tok == "page" {
             // page"        — multiline proof page; content ends at " on its own line
@@ -7486,11 +9814,15 @@ fn tokenize(src: &str) -> Vec<String> {
             // "
             tok.clear();
             chars.next(); // consume the opening "
-            if chars.peek() == Some(&'\n') { chars.next(); } // skip immediate newline
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            } // skip immediate newline
             let mut s = String::new();
             let mut at_line_start = true; // track whether current line so far is whitespace-only
             for c2 in chars.by_ref() {
-                if c2 == '"' && at_line_start { break; } // closing " on a line with only whitespace before it
+                if c2 == '"' && at_line_start {
+                    break;
+                } // closing " on a line with only whitespace before it
                 if c2 == '\n' {
                     at_line_start = true;
                 } else if !c2.is_whitespace() && c2 != '"' {
@@ -7506,13 +9838,20 @@ fn tokenize(src: &str) -> Vec<String> {
             // resolve"   — many sentences, one truth; closing " alone on a line (or with leading whitespace)
             tok.clear();
             chars.next(); // consume "
-            if chars.peek() == Some(&'\n') { chars.next(); }
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
             let mut s = String::new();
             let mut at_line_start = true;
             for c2 in chars.by_ref() {
-                if c2 == '"' && at_line_start { break; }
-                if c2 == '\n' { at_line_start = true; }
-                else if !c2.is_whitespace() { at_line_start = false; }
+                if c2 == '"' && at_line_start {
+                    break;
+                }
+                if c2 == '\n' {
+                    at_line_start = true;
+                } else if !c2.is_whitespace() {
+                    at_line_start = false;
+                }
                 s.push(c2);
             }
             let s = s.trim_end().to_string();
@@ -7522,34 +9861,62 @@ fn tokenize(src: &str) -> Vec<String> {
             // s| text with "quotes" |  — alternate string delimiter; avoids escaping hell
             tok.clear();
             chars.next(); // consume |
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '|' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '|' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00push-str:{s}"));
         } else if c == '"' && tok == "boot" {
             // boot" text"  — register a line to print at every boot; persisted to ~/.finch/boot.forth
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00push-str:{s}"));
             tokens.push("register-boot".to_string());
         } else if c == '"' && tok == "gen" {
             // gen" prompt"  — call AI generator, emit response
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00gen:{s}"));
         } else if c == '"' && tok == "scatter-exec" {
             // scatter-exec" cmd"  — run bash -c cmd on all peers via /v1/exec
             tok.clear();
             chars.next();
-            if chars.peek() == Some(&' ') { chars.next(); }
+            if chars.peek() == Some(&' ') {
+                chars.next();
+            }
             let mut s = String::new();
-            for c2 in chars.by_ref() { if c2 == '"' { break; } s.push(c2); }
+            for c2 in chars.by_ref() {
+                if c2 == '"' {
+                    break;
+                }
+                s.push(c2);
+            }
             tokens.push(format!("\x00scatter-exec:{s}"));
         } else if c == ';' {
             // `;` always terminates the current token and emits itself as a standalone token.
@@ -7585,14 +9952,23 @@ fn collect_if(tokens: &[String], start: usize) -> Result<(Vec<String>, Vec<Strin
     let mut i = start;
     while i < tokens.len() {
         match tokens[i].as_str() {
-            "if"   => { depth += 1; push_branch(&mut true_b, &mut false_b, in_false, &tokens[i]); }
-            "then" => {
-                depth -= 1;
-                if depth == 0 { break; }
+            "if" => {
+                depth += 1;
                 push_branch(&mut true_b, &mut false_b, in_false, &tokens[i]);
             }
-            "else" if depth == 1 => { in_false = true; }
-            _ => { push_branch(&mut true_b, &mut false_b, in_false, &tokens[i]); }
+            "then" => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                push_branch(&mut true_b, &mut false_b, in_false, &tokens[i]);
+            }
+            "else" if depth == 1 => {
+                in_false = true;
+            }
+            _ => {
+                push_branch(&mut true_b, &mut false_b, in_false, &tokens[i]);
+            }
         }
         i += 1;
     }
@@ -7600,7 +9976,11 @@ fn collect_if(tokens: &[String], start: usize) -> Result<(Vec<String>, Vec<Strin
 }
 
 fn push_branch(t: &mut Vec<String>, f: &mut Vec<String>, in_false: bool, tok: &str) {
-    if in_false { f.push(tok.to_string()); } else { t.push(tok.to_string()); }
+    if in_false {
+        f.push(tok.to_string());
+    } else {
+        t.push(tok.to_string());
+    }
 }
 
 /// Collect tokens for `begin/until|again|while`.
@@ -7610,7 +9990,10 @@ fn push_branch(t: &mut Vec<String>, f: &mut Vec<String>, in_false: bool, tok: &s
 /// decrement it.  `while` never changes depth — it is not a balancer for `begin`,
 /// only `repeat` is.  This allows nested `begin..while..repeat` loops to be
 /// collected correctly.
-fn collect_begin(tokens: &[String], start: usize) -> Result<(Vec<String>, String, Vec<String>, usize)> {
+fn collect_begin(
+    tokens: &[String],
+    start: usize,
+) -> Result<(Vec<String>, String, Vec<String>, usize)> {
     let mut body = Vec::new();
     let mut after = Vec::new();
     let mut end_kind = String::new();
@@ -7623,9 +10006,17 @@ fn collect_begin(tokens: &[String], start: usize) -> Result<(Vec<String>, String
                 depth += 1;
                 (if in_after { &mut after } else { &mut body }).push(tokens[i].clone());
             }
-            "until" | "again" if depth == 1 => { end_kind = tokens[i].clone(); break; }
-            "while" if depth == 1 => { end_kind = "while".to_string(); in_after = true; }
-            "repeat" if depth == 1 && in_after => { break; }
+            "until" | "again" if depth == 1 => {
+                end_kind = tokens[i].clone();
+                break;
+            }
+            "while" if depth == 1 => {
+                end_kind = "while".to_string();
+                in_after = true;
+            }
+            "repeat" if depth == 1 && in_after => {
+                break;
+            }
             // Inner loop terminators: only until/again/repeat balance begin.
             "until" | "again" | "repeat" => {
                 depth -= 1;
@@ -7635,7 +10026,9 @@ fn collect_begin(tokens: &[String], start: usize) -> Result<(Vec<String>, String
             "while" => {
                 (if in_after { &mut after } else { &mut body }).push(tokens[i].clone());
             }
-            _ => { (if in_after { &mut after } else { &mut body }).push(tokens[i].clone()); }
+            _ => {
+                (if in_after { &mut after } else { &mut body }).push(tokens[i].clone());
+            }
         }
         i += 1;
     }
@@ -7651,11 +10044,24 @@ fn collect_do(tokens: &[String], start: usize) -> Result<(Vec<String>, bool, usi
     let mut i = start;
     while i < tokens.len() {
         match tokens[i].as_str() {
-            "do"    => { depth += 1; body.push(tokens[i].clone()); }
-            "loop"  if depth == 1 => { break; }
-            "+loop" if depth == 1 => { plus = true; break; }
-            "loop" | "+loop" => { depth -= 1; body.push(tokens[i].clone()); }
-            _ => { body.push(tokens[i].clone()); }
+            "do" => {
+                depth += 1;
+                body.push(tokens[i].clone());
+            }
+            "loop" if depth == 1 => {
+                break;
+            }
+            "+loop" if depth == 1 => {
+                plus = true;
+                break;
+            }
+            "loop" | "+loop" => {
+                depth -= 1;
+                body.push(tokens[i].clone());
+            }
+            _ => {
+                body.push(tokens[i].clone());
+            }
         }
         i += 1;
     }
@@ -7665,7 +10071,10 @@ fn collect_do(tokens: &[String], start: usize) -> Result<(Vec<String>, bool, usi
 /// Collect `case` body tokens into (of_blocks, default_block, tokens_consumed).
 /// Each of_block is (value_tokens, body_tokens).
 /// default_block = tokens between the last endof and endcase.
-fn collect_case(tokens: &[String], start: usize) -> Result<(Vec<(Vec<String>, Vec<String>)>, Vec<String>, usize)> {
+fn collect_case(
+    tokens: &[String],
+    start: usize,
+) -> Result<(Vec<(Vec<String>, Vec<String>)>, Vec<String>, usize)> {
     let mut of_blocks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
     let mut default_block: Vec<String> = Vec::new();
     let mut i = start;
@@ -7673,9 +10082,17 @@ fn collect_case(tokens: &[String], start: usize) -> Result<(Vec<(Vec<String>, Ve
 
     while i < tokens.len() {
         match tokens[i].as_str() {
-            "case"    => { depth += 1; default_block.push(tokens[i].clone()); }
-            "endcase" if depth == 1 => { break; }
-            "endcase" => { depth -= 1; default_block.push(tokens[i].clone()); }
+            "case" => {
+                depth += 1;
+                default_block.push(tokens[i].clone());
+            }
+            "endcase" if depth == 1 => {
+                break;
+            }
+            "endcase" => {
+                depth -= 1;
+                default_block.push(tokens[i].clone());
+            }
             "of" if depth == 1 => {
                 // The tokens before this `of` are the value expression
                 let val_toks: Vec<String> = default_block.drain(..).collect();
@@ -7685,16 +10102,29 @@ fn collect_case(tokens: &[String], start: usize) -> Result<(Vec<(Vec<String>, Ve
                 let mut inner_depth = 1i32;
                 while i < tokens.len() {
                     match tokens[i].as_str() {
-                        "of"    => { inner_depth += 1; body.push(tokens[i].clone()); }
-                        "endof" if inner_depth == 1 => { let _ = inner_depth; break; }
-                        "endof" => { inner_depth -= 1; body.push(tokens[i].clone()); }
-                        _ => { body.push(tokens[i].clone()); }
+                        "of" => {
+                            inner_depth += 1;
+                            body.push(tokens[i].clone());
+                        }
+                        "endof" if inner_depth == 1 => {
+                            let _ = inner_depth;
+                            break;
+                        }
+                        "endof" => {
+                            inner_depth -= 1;
+                            body.push(tokens[i].clone());
+                        }
+                        _ => {
+                            body.push(tokens[i].clone());
+                        }
                     }
                     i += 1;
                 }
                 of_blocks.push((val_toks, body));
             }
-            _ => { default_block.push(tokens[i].clone()); }
+            _ => {
+                default_block.push(tokens[i].clone());
+            }
         }
         i += 1;
     }
@@ -7727,7 +10157,10 @@ mod tests {
     #[test]
     fn test_colon_definition() {
         assert_eq!(Forth::run(": sq dup * ; 7 sq .").unwrap().trim(), "49");
-        assert_eq!(Forth::run(": cube dup dup * * ; 3 cube .").unwrap().trim(), "27");
+        assert_eq!(
+            Forth::run(": cube dup dup * * ; 3 cube .").unwrap().trim(),
+            "27"
+        );
     }
 
     #[test]
@@ -7882,7 +10315,8 @@ mod tests {
     #[test]
     fn test_confirm_auto_approve() {
         // Without a callback, confirm" auto-approves (pushes -1 = true)
-        let out = Forth::run(r#"confirm" delete file?" if ." approved" else ." denied" then"#).unwrap();
+        let out =
+            Forth::run(r#"confirm" delete file?" if ." approved" else ." denied" then"#).unwrap();
         assert_eq!(out, "approved");
     }
 
@@ -7950,7 +10384,9 @@ mod tests {
     fn test_connected_true_when_peer_registered() {
         let mut vm = Forth::new();
         vm.peers.push("192.168.1.2:11435".to_string());
-        let out = vm.exec("connected? if .\" yes\" else .\" no\" then").unwrap();
+        let out = vm
+            .exec("connected? if .\" yes\" else .\" no\" then")
+            .unwrap();
         assert_eq!(out, "yes");
     }
 
@@ -7958,7 +10394,9 @@ mod tests {
     fn test_connected_true_when_my_addr_set() {
         let mut vm = Forth::new();
         vm.my_addr = Some("192.168.1.1:11435".to_string());
-        let out = vm.exec("connected? if .\" yes\" else .\" no\" then").unwrap();
+        let out = vm
+            .exec("connected? if .\" yes\" else .\" no\" then")
+            .unwrap();
         assert_eq!(out, "yes");
     }
 
@@ -7998,14 +10436,20 @@ mod tests {
         vm.exec(": b  2 . ;").unwrap();
         assert!(vm.dump_source().contains(": b"));
         vm.restore(&snap);
-        assert!(!vm.dump_source().contains(": b"), "b should be gone after restore");
+        assert!(
+            !vm.dump_source().contains(": b"),
+            "b should be gone after restore"
+        );
     }
 
     #[test]
     fn test_fuel_catches_infinite_loop_fast() {
         let mut vm = Forth::new();
         let err = vm.exec(": forever  begin again ; forever").unwrap_err();
-        assert!(err.to_string().contains("fuel exhausted"), "expected fuel error, got: {err}");
+        assert!(
+            err.to_string().contains("fuel exhausted"),
+            "expected fuel error, got: {err}"
+        );
     }
 
     #[test]
@@ -8014,7 +10458,10 @@ mod tests {
         // fuel should be close to DEFAULT_FUEL at start of exec; just check it's a large positive
         let out = vm.exec("fuel . cr").unwrap();
         let n: i64 = out.trim().parse().unwrap();
-        assert!(n > 0 && n <= 1_000_000, "fuel should be positive and ≤ default, got {n}");
+        assert!(
+            n > 0 && n <= 1_000_000,
+            "fuel should be positive and ≤ default, got {n}"
+        );
     }
 
     #[test]
@@ -8058,7 +10505,7 @@ mod tests {
         let code = format!(r#"s" {path}" file-fetch sha256 type"#);
         let out = vm.exec(&code).unwrap();
         // SHA-256 of "hello forth"
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let expected = format!("{:x}", Sha256::digest(b"hello forth"));
         assert_eq!(out.trim(), expected);
     }
@@ -8072,7 +10519,7 @@ mod tests {
 
         let code = format!(r#"s" {path}" file-hash"#);
         let out = Forth::run(&code).unwrap();
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let expected = format!("{:x}", Sha256::digest(b"hello forth"));
         assert_eq!(out.trim(), expected);
     }
@@ -8090,8 +10537,8 @@ mod tests {
 
     #[test]
     fn test_file_sha256_range_first_bytes() {
+        use sha2::{Digest, Sha256};
         use std::io::Write;
-        use sha2::{Sha256, Digest};
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(b"hello forth world").unwrap();
         let path = f.path().to_string_lossy().to_string();
@@ -8104,8 +10551,8 @@ mod tests {
 
     #[test]
     fn test_file_sha256_range_mid_bytes() {
+        use sha2::{Digest, Sha256};
         use std::io::Write;
-        use sha2::{Sha256, Digest};
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(b"hello forth world").unwrap();
         let path = f.path().to_string_lossy().to_string();
@@ -8129,8 +10576,8 @@ mod tests {
 
     #[test]
     fn test_file_hash_range_prints() {
+        use sha2::{Digest, Sha256};
         use std::io::Write;
-        use sha2::{Sha256, Digest};
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(b"hello forth world").unwrap();
         let path = f.path().to_string_lossy().to_string();
@@ -8142,8 +10589,8 @@ mod tests {
 
     #[test]
     fn test_file_sha256_range_clamps_to_eof() {
+        use sha2::{Digest, Sha256};
         use std::io::Write;
-        use sha2::{Sha256, Digest};
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(b"hi").unwrap();
         let path = f.path().to_string_lossy().to_string();
@@ -8172,7 +10619,10 @@ mod tests {
     #[test]
     fn test_str_len() {
         let out = Forth::run(r#"s" hello" str-len . cr"#).unwrap();
-        assert!(out.trim() == "5", "str-len of 'hello' should be 5, got {out:?}");
+        assert!(
+            out.trim() == "5",
+            "str-len of 'hello' should be 5, got {out:?}"
+        );
     }
 
     #[test]
@@ -8185,7 +10635,10 @@ mod tests {
     fn test_sha256_known_value() {
         // SHA-256 of empty string is well-known
         let out = Forth::run(r#"s" " sha256 type"#).unwrap();
-        assert_eq!(out, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            out,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
@@ -8209,9 +10662,13 @@ mod tests {
                swap   ( -- sig pub )
                swap   ( -- pub sig )
                s" the shared stack is real"  ( -- pub sig data )
-               verify . cr"#
-        ).unwrap();
-        assert!(out.trim() == "-1", "valid signature should verify as true (-1), got {out:?}");
+               verify . cr"#,
+        )
+        .unwrap();
+        assert!(
+            out.trim() == "-1",
+            "valid signature should verify as true (-1), got {out:?}"
+        );
     }
 
     #[test]
@@ -8222,9 +10679,13 @@ mod tests {
                swap
                swap
                s" tampered message"
-               verify . cr"#
-        ).unwrap();
-        assert!(out.trim() == "0", "tampered data should fail verification, got {out:?}");
+               verify . cr"#,
+        )
+        .unwrap();
+        assert!(
+            out.trim() == "0",
+            "tampered data should fail verification, got {out:?}"
+        );
     }
 
     // ── forget / undo tests ──────────────────────────────────────────────────
@@ -8236,16 +10697,25 @@ mod tests {
         vm.exec("forget hello").unwrap();
         // Original definition is gone — `missing-word` handles it now (prints "(hello)"), not "42"
         let out = vm.exec("hello").unwrap();
-        assert!(!out.contains("42"), "original body should not run after forget, got: {out:?}");
+        assert!(
+            !out.contains("42"),
+            "original body should not run after forget, got: {out:?}"
+        );
     }
 
     #[test]
     fn test_forget_removes_from_source_log() {
         let mut vm = Forth::new();
         vm.exec(": greet  cr ;").unwrap();
-        assert!(vm.dump_source().contains(": greet"), "should be in log before forget");
+        assert!(
+            vm.dump_source().contains(": greet"),
+            "should be in log before forget"
+        );
         vm.exec("forget greet").unwrap();
-        assert!(!vm.dump_source().contains(": greet"), "should be gone from log after forget");
+        assert!(
+            !vm.dump_source().contains(": greet"),
+            "should be gone from log after forget"
+        );
     }
 
     #[test]
@@ -8273,7 +10743,10 @@ mod tests {
         vm.exec("undo").unwrap();
         // Original definition is gone — `missing-word` handles it, not "42"
         let out = vm.exec("hello").unwrap();
-        assert!(!out.contains("42"), "original body should not run after undo, got: {out:?}");
+        assert!(
+            !out.contains("42"),
+            "original body should not run after undo, got: {out:?}"
+        );
     }
 
     #[test]
@@ -8283,7 +10756,11 @@ mod tests {
         vm.exec(": foo  2 . ;").unwrap(); // redefine
         vm.exec("undo").unwrap();
         let out = vm.exec("foo").unwrap();
-        assert_eq!(out.trim(), "1", "undo should restore previous definition of foo");
+        assert_eq!(
+            out.trim(),
+            "1",
+            "undo should restore previous definition of foo"
+        );
     }
 
     #[test]
@@ -8294,11 +10771,17 @@ mod tests {
         vm.exec(": c  30 . ;").unwrap();
         vm.exec("undo").unwrap(); // removes c
         vm.exec("undo").unwrap(); // removes b
-        // Original definitions gone — missing-word handles them, not "30"/"20"
+                                  // Original definitions gone — missing-word handles them, not "30"/"20"
         let out_c = vm.exec("c").unwrap();
         let out_b = vm.exec("b").unwrap();
-        assert!(!out_c.contains("30"), "c body should not run after undo, got: {out_c:?}");
-        assert!(!out_b.contains("20"), "b body should not run after undo, got: {out_b:?}");
+        assert!(
+            !out_c.contains("30"),
+            "c body should not run after undo, got: {out_c:?}"
+        );
+        assert!(
+            !out_b.contains("20"),
+            "b body should not run after undo, got: {out_b:?}"
+        );
         let out = vm.exec("a").unwrap();
         assert_eq!(out.trim(), "10", "a should still work");
     }
@@ -8307,7 +10790,10 @@ mod tests {
     fn test_undo_nothing_is_graceful() {
         let mut vm = Forth::new();
         let out = vm.exec("undo").unwrap();
-        assert!(out.contains("nothing to undo"), "should say nothing to undo, got: {out:?}");
+        assert!(
+            out.contains("nothing to undo"),
+            "should say nothing to undo, got: {out:?}"
+        );
     }
 
     #[test]
@@ -8316,7 +10802,10 @@ mod tests {
         vm.exec(": visible  99 . ;").unwrap();
         assert!(vm.dump_source().contains(": visible"), "should be in log");
         vm.exec("undo").unwrap();
-        assert!(!vm.dump_source().contains(": visible"), "should be gone after undo");
+        assert!(
+            !vm.dump_source().contains(": visible"),
+            "should be gone after undo"
+        );
     }
 
     // ── lock / unlock tests ──────────────────────────────────────────────────
@@ -8351,7 +10840,10 @@ mod tests {
         vm.exec(r#"s" res" 5000 lock drop"#).unwrap();
         let out = vm.exec(r#"s" res" lock-ttl . cr"#).unwrap();
         let ms: i64 = out.trim().parse().unwrap();
-        assert!(ms > 0 && ms <= 5000, "TTL should be positive and ≤ 5000, got {ms}");
+        assert!(
+            ms > 0 && ms <= 5000,
+            "TTL should be positive and ≤ 5000, got {ms}"
+        );
     }
 
     #[test]
@@ -8445,7 +10937,9 @@ mod tests {
     fn test_grammar_check_with_ai() {
         let mut vm = Forth::new();
         vm.set_gen_fn(Box::new(|_prompt| "I go to the store.".to_string()));
-        let out = vm.exec(r#"s" i goes to store" grammar-check type"#).unwrap();
+        let out = vm
+            .exec(r#"s" i goes to store" grammar-check type"#)
+            .unwrap();
         assert_eq!(out, "I go to the store.");
     }
 
@@ -8474,7 +10968,11 @@ mod tests {
         let mut vm = Forth::new();
         vm.exec(r#"s" a" 5000 lock drop"#).unwrap();
         let out = vm.exec(r#"s" b" 5000 lock . cr"#).unwrap();
-        assert_eq!(out.trim(), "-1", "lock 'b' should succeed when only 'a' is held");
+        assert_eq!(
+            out.trim(),
+            "-1",
+            "lock 'b' should succeed when only 'a' is held"
+        );
     }
 
     // ── Security scanning ────────────────────────────────────────────────────
@@ -8490,7 +10988,11 @@ mod tests {
     fn test_scan_bytes_elf_magic_raises_score() {
         let elf = b"\x7fELFsome content here that is not actually an ELF";
         let score = scan_risk_score(elf);
-        assert!(score >= 20, "ELF magic should raise risk score, got {}", score);
+        assert!(
+            score >= 20,
+            "ELF magic should raise risk score, got {}",
+            score
+        );
     }
 
     #[test]
@@ -8520,15 +11022,22 @@ mod tests {
         let path = f.path().to_string_lossy().to_string();
         let code = format!(r#"s" {path}" scan-file type cr"#);
         let out = Forth::run(&code).unwrap();
-        assert!(out.contains("risk:"), "scan-file report should contain risk line");
-        assert!(out.contains("entropy:"), "scan-file report should contain entropy");
+        assert!(
+            out.contains("risk:"),
+            "scan-file report should contain risk line"
+        );
+        assert!(
+            out.contains("entropy:"),
+            "scan-file report should contain entropy"
+        );
     }
 
     #[test]
     fn test_scan_file_eicar_detected() {
         use std::io::Write;
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*").unwrap();
+        f.write_all(b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*")
+            .unwrap();
         let path = f.path().to_string_lossy().to_string();
         let code = format!(r#"s" {path}" scan-file type cr"#);
         let out = Forth::run(&code).unwrap();
@@ -8577,7 +11086,11 @@ mod tests {
         let (_cpu, _ram, bench) = collect_machine_specs();
         // benchmark runs 10M iterations; on any real machine this takes at
         // least 1ms and completes in under 10 seconds.
-        assert!(bench < 10_000, "benchmark took implausibly long: {}ms", bench);
+        assert!(
+            bench < 10_000,
+            "benchmark took implausibly long: {}ms",
+            bench
+        );
     }
 
     #[test]
@@ -8595,51 +11108,57 @@ mod tests {
     #[test]
     fn test_format_peer_hw_all_fields() {
         let p = crate::registry::PeerEntry {
-            addr:      "a:1".to_string(),
-            label:     None,
-            tags:      vec![],
-            load:      None,
-            region:    None,
+            addr: "a:1".to_string(),
+            label: None,
+            tags: vec![],
+            load: None,
+            region: None,
             cpu_cores: Some(8),
-            ram_mb:    Some(16_384),
-            bench_ms:  Some(42),
+            ram_mb: Some(16_384),
+            bench_ms: Some(42),
         };
         let hw = format_peer_hw(&p);
         // ANSI codes are present; strip them for assertion.
         let plain = strip_ansi(&hw);
-        assert!(plain.contains("8c"),       "should contain cpu count: {plain}");
-        assert!(plain.contains("16384MB"),  "should contain ram: {plain}");
-        assert!(plain.contains("bench:42ms"), "should contain bench: {plain}");
+        assert!(plain.contains("8c"), "should contain cpu count: {plain}");
+        assert!(plain.contains("16384MB"), "should contain ram: {plain}");
+        assert!(
+            plain.contains("bench:42ms"),
+            "should contain bench: {plain}"
+        );
     }
 
     #[test]
     fn test_format_peer_hw_no_fields_is_empty() {
         let p = crate::registry::PeerEntry {
-            addr:      "a:1".to_string(),
-            label:     None,
-            tags:      vec![],
-            load:      None,
-            region:    None,
+            addr: "a:1".to_string(),
+            label: None,
+            tags: vec![],
+            load: None,
+            region: None,
             cpu_cores: None,
-            ram_mb:    None,
-            bench_ms:  None,
+            ram_mb: None,
+            bench_ms: None,
         };
         let hw = format_peer_hw(&p);
         let plain = strip_ansi(&hw);
-        assert!(plain.trim().is_empty(), "empty hw should produce empty string: {plain:?}");
+        assert!(
+            plain.trim().is_empty(),
+            "empty hw should produce empty string: {plain:?}"
+        );
     }
 
     #[test]
     fn test_format_peer_hw_partial_fields() {
         let p = crate::registry::PeerEntry {
-            addr:      "a:1".to_string(),
-            label:     None,
-            tags:      vec![],
-            load:      None,
-            region:    None,
+            addr: "a:1".to_string(),
+            label: None,
+            tags: vec![],
+            load: None,
+            region: None,
             cpu_cores: Some(4),
-            ram_mb:    None,
-            bench_ms:  None,
+            ram_mb: None,
+            bench_ms: None,
         };
         let hw = format_peer_hw(&p);
         let plain = strip_ansi(&hw);
@@ -8681,7 +11200,9 @@ mod tests {
     #[test]
     fn test_en_vocab_slowest_entry_exists() {
         let lib = crate::coforth::Library::load();
-        let entry = lib.lookup("slowest").expect("slowest must exist in library");
+        let entry = lib
+            .lookup("slowest")
+            .expect("slowest must exist in library");
         assert_eq!(entry.forth.as_deref(), Some("slowest"));
     }
 
@@ -8710,15 +11231,24 @@ mod tests {
         let mut vm = Forth::new();
         vm.eval("leave").unwrap();
         // Output should contain a helpful note.
-        assert!(vm.out.contains("not registered") || vm.out.contains("leave"),
-            "unexpected output: {}", vm.out);
+        assert!(
+            vm.out.contains("not registered") || vm.out.contains("leave"),
+            "unexpected output: {}",
+            vm.out
+        );
     }
 
     #[test]
     fn test_leave_builtin_registered_by_name() {
         // Both "leave" and "leave-registry" should map to LeaveRegistry.
-        assert!(matches!(name_to_builtin("leave"), Some(Builtin::LeaveRegistry)));
-        assert!(matches!(name_to_builtin("leave-registry"), Some(Builtin::LeaveRegistry)));
+        assert!(matches!(
+            name_to_builtin("leave"),
+            Some(Builtin::LeaveRegistry)
+        ));
+        assert!(matches!(
+            name_to_builtin("leave-registry"),
+            Some(Builtin::LeaveRegistry)
+        ));
     }
 
     #[test]
@@ -8736,7 +11266,10 @@ mod tests {
         vm.eval(r#"forth-back" 7 8 +"#).unwrap();
         // Stack should have 15.
         assert_eq!(vm.pop().unwrap(), 15);
-        assert!(vm.forth_back.is_none(), "forth_back should not be set in local mode");
+        assert!(
+            vm.forth_back.is_none(),
+            "forth_back should not be set in local mode"
+        );
     }
 
     #[test]
@@ -8770,10 +11303,13 @@ mod tests {
     fn test_stdlib_proofs_compiled() {
         let vm = Forth::new();
         // STDLIB_PROOFS compiles test:square, test:fib, etc.
-        assert!(vm.name_index.contains_key("test:square"), "test:square missing");
-        assert!(vm.name_index.contains_key("test:fib"),    "test:fib missing");
-        assert!(vm.name_index.contains_key("test:gcd"),    "test:gcd missing");
-        assert!(vm.name_index.contains_key("test:+"),      "test:+ missing");
+        assert!(
+            vm.name_index.contains_key("test:square"),
+            "test:square missing"
+        );
+        assert!(vm.name_index.contains_key("test:fib"), "test:fib missing");
+        assert!(vm.name_index.contains_key("test:gcd"), "test:gcd missing");
+        assert!(vm.name_index.contains_key("test:+"), "test:+ missing");
     }
 
     #[test]
@@ -8807,7 +11343,10 @@ mod tests {
         // Should have a "passed" summary line
         assert!(plain.contains("passed"), "{plain}");
         // On all-pass, only the summary line is printed — no individual ✓ noise
-        assert!(!plain.contains("✓"), "should be silent on all-pass: {plain}");
+        assert!(
+            !plain.contains("✓"),
+            "should be silent on all-pass: {plain}"
+        );
     }
 
     #[test]
@@ -8815,7 +11354,11 @@ mod tests {
         // When all pass: only summary, no ✓ lines.
         let out = Forth::run("prove-all").unwrap();
         let plain = strip_ansi(&out);
-        assert_eq!(plain.lines().count(), 1, "all-pass should be one line: {plain}");
+        assert_eq!(
+            plain.lines().count(),
+            1,
+            "all-pass should be one line: {plain}"
+        );
 
         // When one test fails: ✗ line + summary.
         let mut vm = Forth::new();
@@ -8838,7 +11381,10 @@ mod tests {
             plain.contains("10/10") || plain.contains("two languages, one stack"),
             "expected all 10 pairs to agree: {plain}"
         );
-        assert!(!plain.contains("unresolved"), "unexpected failures: {plain}");
+        assert!(
+            !plain.contains("unresolved"),
+            "unexpected failures: {plain}"
+        );
         // Spot-check: add/加 and true/是 must appear
         assert!(plain.contains("加"), "missing 加 in output: {plain}");
         assert!(plain.contains("是"), "missing 是 in output: {plain}");
@@ -8852,14 +11398,20 @@ mod tests {
         let plain = strip_ansi(&out);
         assert!(!plain.is_empty(), "prove-english produced no output");
         // Summary line contains "words" and a percentage
-        assert!(plain.contains("words"), "expected 'words' in output: {plain}");
+        assert!(
+            plain.contains("words"),
+            "expected 'words' in output: {plain}"
+        );
         // Extract pass/total from "N/1049 words (P%)"
         let summary = plain.lines().last().unwrap_or("");
         // Find the pass count — must be at least 900 out of ~1049
         if let Some(slash_pos) = summary.find('/') {
             let pass_str = summary[..slash_pos].trim_start_matches(|c: char| !c.is_ascii_digit());
             let pass: usize = pass_str.parse().unwrap_or(0);
-            assert!(pass >= 900, "expected ≥900 English words to prove, got {pass}: {plain}");
+            assert!(
+                pass >= 900,
+                "expected ≥900 English words to prove, got {pass}: {plain}"
+            );
         }
     }
 
@@ -8887,8 +11439,14 @@ mod tests {
         let mut vm = crate::coforth::Library::precompiled_vm();
         vm.exec("humans argue about forth programs .").unwrap();
         let plain = strip_ansi(&vm.out);
-        assert!(plain.contains("agreed"), "expected 'agreed' in output: {plain}");
-        assert!(plain.contains("-1"), "expected forth's value to be printed: {plain}");
+        assert!(
+            plain.contains("agreed"),
+            "expected 'agreed' in output: {plain}"
+        );
+        assert!(
+            plain.contains("-1"),
+            "expected forth's value to be printed: {plain}"
+        );
     }
 
     #[test]
@@ -8897,10 +11455,10 @@ mod tests {
         // Both sentences evaluate to -1 (true): `i` pushes -1, rest are no-ops.
         // "I am forth. I write whatever code I want." — same machine.
         let sentences: &[(&str, &str)] = &[
-            ("i am a grammar defining grammar .",   "-1"),
-            ("thats what i am .",                   "-1"),
-            ("i am forth .",                        "-1"),
-            ("i write whatever code i want .",      "-1"),
+            ("i am a grammar defining grammar .", "-1"),
+            ("thats what i am .", "-1"),
+            ("i am forth .", "-1"),
+            ("i write whatever code i want .", "-1"),
             ("humans argue about forth programs .", "agreed."),
         ];
         for (src, expected) in sentences {
@@ -8919,7 +11477,10 @@ mod tests {
     fn test_sun_pushes_epoch_and_prints() {
         let out = Forth::run("sun drop").unwrap();
         let plain = strip_ansi(&out);
-        assert!(plain.contains("epoch"), "expected epoch in sun output: {plain}");
+        assert!(
+            plain.contains("epoch"),
+            "expected epoch in sun output: {plain}"
+        );
     }
 
     #[test]
@@ -8942,7 +11503,8 @@ mod tests {
     fn test_user_can_define_and_prove_own_word() {
         let mut vm = Forth::new();
         vm.eval(": double dup + ;").unwrap();
-        vm.eval(": test:double 5 double 10 = assert  0 double 0 = assert ;").unwrap();
+        vm.eval(": test:double 5 double 10 = assert  0 double 0 = assert ;")
+            .unwrap();
         let out = vm.exec(r#"prove" double""#).unwrap();
         let plain = strip_ansi(&out);
         assert!(plain.contains("✓") && plain.contains("double"), "{plain}");
@@ -8972,7 +11534,10 @@ mod tests {
         vm.eval(": probe  42 noop 42 = ;").unwrap();
         // The noop contributed no cells to the body
         let result = vm.exec("probe . cr").unwrap();
-        assert!(result.trim() == "-1", "noop should not change stack: {result}");
+        assert!(
+            result.trim() == "-1",
+            "noop should not change stack: {result}"
+        );
         let _ = before_len; // memory grows but noop adds nothing
     }
 
@@ -9013,7 +11578,7 @@ mod tests {
             r#"s" 3 4 +"      s" 3 + 4"      infix-argue"#,
             r#"s" 3 4 * 2 +"  s" 3 * 4 + 2"  infix-argue"#,
             r#"s" 10 3 -"     s" 10 - 3"     infix-argue"#,
-            r#"s" 3 4 2 * +"  s" 3 + 4 * 2"  infix-argue"#,  // precedence: 3 + (4*2) = 11
+            r#"s" 3 4 2 * +"  s" 3 + 4 * 2"  infix-argue"#, // precedence: 3 + (4*2) = 11
         ];
         let mut all = String::new();
         for prog in tries {
@@ -9028,8 +11593,13 @@ mod tests {
     fn test_gate_passes_when_check_holds() {
         // Both programs agree on 7; check is `=`; gate should pass and leave 7 on stack.
         let mut vm = Forth::new();
-        vm.eval(r#"s" 3 4 +" s" 4 3 +" s" =" gate"#).expect("gate should pass");
-        assert_eq!(vm.data.last().copied(), Some(7), "gate should leave result on stack");
+        vm.eval(r#"s" 3 4 +" s" 4 3 +" s" =" gate"#)
+            .expect("gate should pass");
+        assert_eq!(
+            vm.data.last().copied(),
+            Some(7),
+            "gate should leave result on stack"
+        );
     }
 
     #[test]
@@ -9044,7 +11614,8 @@ mod tests {
     fn test_gate_custom_check() {
         // Check: result must be > 5.  "3 4 +" → 7; "4 3 +" → 7; check "drop 5 >" → true.
         let mut vm = Forth::new();
-        vm.eval(r#"s" 3 4 +" s" 4 3 +" s" drop 5 >" gate"#).expect("gate with custom check");
+        vm.eval(r#"s" 3 4 +" s" 4 3 +" s" drop 5 >" gate"#)
+            .expect("gate with custom check");
         assert_eq!(vm.data.last().copied(), Some(7));
     }
 
@@ -9084,7 +11655,10 @@ mod tests {
 ""#;
         let out = Forth::run(prog).expect("all sentences should resolve to 7");
         let clean = strip_ansi(&out);
-        assert!(clean.contains("all agree"), "expected 'all agree' in: {clean}");
+        assert!(
+            clean.contains("all agree"),
+            "expected 'all agree' in: {clean}"
+        );
     }
 
     #[test]
@@ -9108,8 +11682,8 @@ mod tests {
     fn test_back_and_forth() {
         // A round trip is a proof: go forth, come back, you are home.
         let cases = [
-            r#"5  s" 3 +"  s" 3 -"  back-and-forth"#,   // +3 then -3
-            r#"7  s" 2 *"  s" 2 /"  back-and-forth"#,   // *2 then /2
+            r#"5  s" 3 +"  s" 3 -"  back-and-forth"#,       // +3 then -3
+            r#"7  s" 2 *"  s" 2 /"  back-and-forth"#,       // *2 then /2
             r#"9  s" negate"  s" negate"  back-and-forth"#, // negate is its own inverse
             r#"1  s" 1 lshift"  s" 1 rshift"  back-and-forth"#, // bit-shift round trip
         ];
@@ -9122,32 +11696,41 @@ mod tests {
     fn test_natural_language_missing_word() {
         // Define a known word, then use it in a natural language sentence.
         // Known words execute; unknown ones are silently dropped by default missing-word.
-        let out = strip_ansi(&Forth::run(
-            ": greet  .\" hi.\" cr ;   greet; I am a forth program."
-        ).unwrap());
-        assert!(out.contains("hi"), "known word should execute, got: {out:?}");
+        let out = strip_ansi(
+            &Forth::run(": greet  .\" hi.\" cr ;   greet; I am a forth program.").unwrap(),
+        );
+        assert!(
+            out.contains("hi"),
+            "known word should execute, got: {out:?}"
+        );
         // Unknown words silently dropped — no parens, no error
-        assert!(!out.contains("(I)"), "silent handler should not print parens, got: {out:?}");
+        assert!(
+            !out.contains("(I)"),
+            "silent handler should not print parens, got: {out:?}"
+        );
     }
 
     #[test]
     fn test_missing_word_handler_customizable() {
         // Redefine missing-word to count each unknown word (drop the string, push 1 and print).
-        let out = strip_ansi(&Forth::run(
-            ": missing-word ( str -- ) drop 1 . ;  hello world"
-        ).unwrap());
+        let out =
+            strip_ansi(&Forth::run(": missing-word ( str -- ) drop 1 . ;  hello world").unwrap());
         // `hello` and `world` are both unknown here → handler fires twice → "1 1"
-        assert!(out.contains("1"), "custom handler should fire for unknown words, got: {out:?}");
+        assert!(
+            out.contains("1"),
+            "custom handler should fire for unknown words, got: {out:?}"
+        );
     }
 
     #[test]
     fn test_semicolon_separates_tokens() {
         // `Hello;` should tokenize as two tokens: `Hello` and `;`
         // Previously it was one token `Hello;` that could never match.
-        let out = strip_ansi(&Forth::run(
-            ": greet .\" hi\" ;  greet; unknown-word-xyz"
-        ).unwrap());
-        assert!(out.contains("hi"), "greet should execute after semicolon split, got: {out:?}");
+        let out = strip_ansi(&Forth::run(": greet .\" hi\" ;  greet; unknown-word-xyz").unwrap());
+        assert!(
+            out.contains("hi"),
+            "greet should execute after semicolon split, got: {out:?}"
+        );
     }
 
     #[test]
@@ -9155,7 +11738,7 @@ mod tests {
         let cases = [
             ("s\" 3 + 4\" infix . cr", "7"),
             ("s\" 3 * 4\" infix . cr", "12"),
-            ("s\" 3 + 4 * 2\" infix . cr", "11"),   // 3 + (4*2) = 11
+            ("s\" 3 + 4 * 2\" infix . cr", "11"), // 3 + (4*2) = 11
             ("s\" ( 3 + 4 ) * 2\" infix . cr", "14"), // (3+4)*2 = 14
             ("s\" 10 - 3\" infix . cr", "7"),
         ];
@@ -9173,7 +11756,9 @@ mod tests {
             if c == '\x1b' {
                 // skip until end of CSI/SGR sequence
                 for ch in chars.by_ref() {
-                    if ch.is_ascii_alphabetic() { break; }
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
                 }
             } else {
                 out.push(c);
@@ -9211,7 +11796,10 @@ mod channel_tests {
         let out = vm.exec("channels").unwrap();
         let plain = out.replace("\x1b[", "").replace("m", ""); // rough ansi strip
         assert!(out.contains("#forth") || plain.contains("forth"), "{out}");
-        assert!(out.contains("#general") || plain.contains("general"), "{out}");
+        assert!(
+            out.contains("#general") || plain.contains("general"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -9225,14 +11813,119 @@ mod channel_tests {
     }
 
     #[test]
+    fn test_file_zip_unzip_roundtrip_random_data() {
+        use rand::RngCore;
+        use std::io::Write;
+
+        // Generate 4 KiB of random bytes
+        let mut rng = rand::thread_rng();
+        let mut original = vec![0u8; 4096];
+        rng.fill_bytes(&mut original);
+
+        // All paths must live inside current_dir() to satisfy the cwd boundary check.
+        let work = tempfile::tempdir_in(".").unwrap();
+        let src_path = work.path().join("data.bin");
+        let zip_path = work.path().join("data.zip");
+        let out_dir = work.path().join("extracted");
+
+        std::fs::write(&src_path, &original).unwrap();
+
+        let src_str = src_path.to_string_lossy();
+        let zip_str = zip_path.to_string_lossy();
+        let out_str = out_dir.to_string_lossy();
+
+        let code = format!(
+            r#"s" {src_str}" s" {zip_str}" file-zip  s" {zip_str}" s" {out_str}" file-unzip"#
+        );
+        Forth::run(&code).unwrap();
+
+        let recovered = std::fs::read(out_dir.join("data.bin")).unwrap();
+        assert_eq!(
+            original, recovered,
+            "zip/unzip round-trip must recover identical bytes"
+        );
+    }
+
+    #[test]
+    fn test_file_zip_is_not_lossy() {
+        use rand::RngCore;
+        use sha2::{Digest, Sha256};
+
+        let mut rng = rand::thread_rng();
+        let mut original = vec![0u8; 8192];
+        rng.fill_bytes(&mut original);
+        let original_hash = format!("{:x}", Sha256::digest(&original));
+
+        let work = tempfile::tempdir_in(".").unwrap();
+        let src = work.path().join("payload.bin");
+        let zip = work.path().join("payload.zip");
+        let out_dir = work.path().join("out");
+
+        std::fs::write(&src, &original).unwrap();
+
+        let code = format!(
+            r#"s" {}" s" {}" file-zip  s" {}" s" {}" file-unzip"#,
+            src.to_string_lossy(),
+            zip.to_string_lossy(),
+            zip.to_string_lossy(),
+            out_dir.to_string_lossy(),
+        );
+        Forth::run(&code).unwrap();
+
+        let recovered = std::fs::read(out_dir.join("payload.bin")).unwrap();
+        let recovered_hash = format!("{:x}", Sha256::digest(&recovered));
+        assert_eq!(
+            original_hash, recovered_hash,
+            "zip must not be lossy: SHA-256 mismatch"
+        );
+    }
+
+    #[test]
+    fn test_file_unzip_over_existing_dir() {
+        use rand::RngCore;
+
+        let mut rng = rand::thread_rng();
+        let work = tempfile::tempdir_in(".").unwrap();
+
+        // Pre-populate the destination with a file that is NOT in the zip.
+        let dest_dir = work.path().join("out");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("preexisting.txt"), b"keep me").unwrap();
+
+        // Build a zip with a fresh random file.
+        let mut payload = vec![0u8; 512];
+        rng.fill_bytes(&mut payload);
+        let src = work.path().join("new.bin");
+        std::fs::write(&src, &payload).unwrap();
+        let zip_path = work.path().join("archive.zip");
+
+        let src_str = src.to_string_lossy();
+        let zip_str = zip_path.to_string_lossy();
+        let dest_str = dest_dir.to_string_lossy();
+
+        let code = format!(
+            r#"s" {src_str}" s" {zip_str}" file-zip  s" {zip_str}" s" {dest_str}" file-unzip"#
+        );
+        Forth::run(&code).unwrap();
+
+        // Pre-existing file must still be there.
+        assert_eq!(
+            std::fs::read(dest_dir.join("preexisting.txt")).unwrap(),
+            b"keep me"
+        );
+        // Newly unzipped file must be correct.
+        assert_eq!(std::fs::read(dest_dir.join("new.bin")).unwrap(), payload);
+    }
+
+    #[test]
     fn test_extract_channel_forth_integration() {
         // The extract helper + compile round-trip
         let msg = "[#forth] alice: : quadruple  4 * ;";
         // extract the definition (mirrors extract_channel_forth logic)
         let close = msg.find(']').unwrap();
-        let after = msg[close+1..].trim_start_matches(':').trim_start();
+        let after = msg[close + 1..].trim_start_matches(':').trim_start();
         let colon_pos = after.find(": ").unwrap();
-        let content = after[colon_pos+2..].trim();
+        let content = after[colon_pos + 2..].trim();
         assert!(content.starts_with(':'));
 
         let mut vm = Forth::new();

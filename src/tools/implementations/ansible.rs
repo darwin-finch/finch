@@ -106,7 +106,10 @@ impl Tool for AnsibleTool {
             }
             cmd.output().context("Failed to run ansible")?
         } else {
-            return Ok("Provide either a playbook path or hosts + module for ad-hoc execution.".to_string());
+            return Ok(
+                "Provide either a playbook path or hosts + module for ad-hoc execution."
+                    .to_string(),
+            );
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout);

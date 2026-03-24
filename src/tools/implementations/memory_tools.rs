@@ -279,8 +279,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
         let result = tool
             .execute(
@@ -318,8 +318,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
 
         let result = tool
@@ -368,8 +368,8 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-        stack: None,
-        poset: None,
+            stack: None,
+            poset: None,
         };
         let result = tool
             .execute(serde_json::json!({"limit": 3}), &context)

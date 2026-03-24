@@ -469,8 +469,10 @@ async fn main() -> Result<()> {
                 cfg
             } else {
                 {
-                    use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
                     use crossterm::execute;
+                    use crossterm::style::{
+                        Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor,
+                    };
                     let _ = execute!(
                         std::io::stderr(),
                         Print("\n"),
@@ -581,8 +583,11 @@ async fn main() -> Result<()> {
                             // Non-fatal — we'll just show the wizard again next time
                         }
                         {
-                            use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
                             use crossterm::execute;
+                            use crossterm::style::{
+                                Attribute, Color, Print, ResetColor, SetAttribute,
+                                SetForegroundColor,
+                            };
                             let _ = execute!(
                                 std::io::stderr(),
                                 Print("\n"),
@@ -679,7 +684,9 @@ async fn main() -> Result<()> {
             }
             Err(_e) => {
                 tracing::debug!("Failed to connect to daemon: {}", _e);
-                output_manager.write_status("⚠️  No daemon — running in direct mode. Start one with `finch daemon-start`.");
+                output_manager.write_status(
+                    "⚠️  No daemon — running in direct mode. Start one with `finch daemon-start`.",
+                );
                 None
             }
         }
@@ -715,10 +722,7 @@ async fn main() -> Result<()> {
 
         if io::stdout().is_terminal() {
             if args.session.is_some() {
-                output_manager.write_status(format!(
-                    "  session: {}  (id: {})",
-                    name, id
-                ));
+                output_manager.write_status(format!("  session: {}  (id: {})", name, id));
             } else {
                 output_manager.write_status(format!(
                     "  session: {}  (finch --session {} to join)",
@@ -779,14 +783,16 @@ async fn main() -> Result<()> {
     // Run inside a LocalSet so IpcClient (capnp-rpc, !Send) can use spawn_local.
     // Normal tokio::spawn calls inside the event loop still go to the thread pool.
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        // Try IPC connection to the daemon socket (non-blocking).
-        // If it fails (daemon not running), we just skip it.
-        if let Ok(ipc) = finch::ipc::IpcClient::connect().await {
-            repl.set_ipc_client(ipc);
-        }
-        repl.run_event_loop(args.initial_prompt).await
-    }).await?;
+    local
+        .run_until(async {
+            // Try IPC connection to the daemon socket (non-blocking).
+            // If it fails (daemon not running), we just skip it.
+            if let Ok(ipc) = finch::ipc::IpcClient::connect().await {
+                repl.set_ipc_client(ipc);
+            }
+            repl.run_event_loop(args.initial_prompt).await
+        })
+        .await?;
 
     if std::env::var("SHAMMAH_DEBUG").is_ok() {
         eprintln!("[DEBUG] REPL exited, returning from main");
@@ -1655,30 +1661,26 @@ fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
         Ok(std::mem::take(&mut vm.out))
     };
     match cmd {
-        CoforthCommand::Run { code } => {
-            match run_in_vm(&code) {
-                Ok(out) => print!("{out}"),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
+        CoforthCommand::Run { code } => match run_in_vm(&code) {
+            Ok(out) => print!("{out}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
             }
-        }
-        CoforthCommand::Validate { code } => {
-            match run_in_vm(&code) {
-                Ok(out) if !out.is_empty() => {
-                    println!("ok  →  {:?}", out.trim());
-                }
-                Ok(_) => {
-                    eprintln!("fail: compiled and ran but produced no output");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("fail: {e}");
-                    std::process::exit(1);
-                }
+        },
+        CoforthCommand::Validate { code } => match run_in_vm(&code) {
+            Ok(out) if !out.is_empty() => {
+                println!("ok  →  {:?}", out.trim());
             }
-        }
+            Ok(_) => {
+                eprintln!("fail: compiled and ran but produced no output");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fail: {e}");
+                std::process::exit(1);
+            }
+        },
     }
     Ok(())
 }
@@ -1762,22 +1764,20 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
                                 println!("  ? {word}  (no Forth)");
                             }
                         }
-                        Some(code) => {
-                            match finch::coforth::Forth::run(code) {
-                                Ok(out) if !out.is_empty() => {
-                                    ok += 1;
-                                    if verbose {
-                                        println!("  ✓ {word}");
-                                    }
-                                }
-                                Ok(_) => {
-                                    broken.push((word.to_string(), "no output".to_string()));
-                                }
-                                Err(e) => {
-                                    broken.push((word.to_string(), e.to_string()));
+                        Some(code) => match finch::coforth::Forth::run(code) {
+                            Ok(out) if !out.is_empty() => {
+                                ok += 1;
+                                if verbose {
+                                    println!("  ✓ {word}");
                                 }
                             }
-                        }
+                            Ok(_) => {
+                                broken.push((word.to_string(), "no output".to_string()));
+                            }
+                            Err(e) => {
+                                broken.push((word.to_string(), e.to_string()));
+                            }
+                        },
                     }
                 }
             }
@@ -1798,7 +1798,9 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
 
             if missing > 0 && !verbose {
                 println!();
-                println!("Run `finch library heal` to generate Forth for the {missing} missing words.");
+                println!(
+                    "Run `finch library heal` to generate Forth for the {missing} missing words."
+                );
             }
 
             if !broken.is_empty() || missing > 0 {
@@ -1806,7 +1808,12 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
             }
         }
 
-        LibraryCommand::Heal { batch_size, forks, model, output } => {
+        LibraryCommand::Heal {
+            batch_size,
+            forks,
+            model,
+            output,
+        } => {
             // Collect words that are missing Forth or have broken snippets
             let lib = Library::load();
             let mut words_to_heal: Vec<String> = Vec::new();
@@ -1816,13 +1823,11 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
                 for entry in senses {
                     let needs_healing = match &entry.forth {
                         None => true,
-                        Some(code) => {
-                            match finch::coforth::Forth::run(code) {
-                                Ok(out) if out.is_empty() => true,
-                                Err(_) => true,
-                                _ => false,
-                            }
-                        }
+                        Some(code) => match finch::coforth::Forth::run(code) {
+                            Ok(out) if out.is_empty() => true,
+                            Err(_) => true,
+                            _ => false,
+                        },
                     };
                     if needs_healing {
                         let key = if let Some(ref s) = entry.sense {
@@ -1836,7 +1841,10 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
             }
 
             if words_to_heal.is_empty() {
-                println!("All {} words already have verified Forth snippets.", lib.word_count());
+                println!(
+                    "All {} words already have verified Forth snippets.",
+                    lib.word_count()
+                );
                 return Ok(());
             }
 
@@ -1886,9 +1894,8 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
                 return Ok(());
             }
 
-            let words_vec: Option<Vec<String>> = words.map(|w| {
-                w.split(',').map(|s| s.trim().to_lowercase()).collect()
-            });
+            let words_vec: Option<Vec<String>> =
+                words.map(|w| w.split(',').map(|s| s.trim().to_lowercase()).collect());
 
             let output_path = output.unwrap_or_else(generator::user_library_path);
 

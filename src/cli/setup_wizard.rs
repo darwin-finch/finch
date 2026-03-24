@@ -469,7 +469,9 @@ impl WizardState {
                     .map(|c| c.server.mode == "daemon-only")
                     .unwrap_or(false),
                 mdns_discovery: existing_config.map(|c| c.server.advertise).unwrap_or(false),
-                auto_discover: existing_config.map(|c| c.client.auto_discover).unwrap_or(true),
+                auto_discover: existing_config
+                    .map(|c| c.client.auto_discover)
+                    .unwrap_or(true),
                 memory_context_lines: existing_config
                     .map(|c| c.features.memory_context_lines)
                     .unwrap_or(4),
@@ -1815,36 +1817,44 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract features
-    let (auto_approve, streaming, debug, hf_token_val, daemon_only, mdns, auto_disc, memory_ctx_lines) =
-        if let Some(SectionState::Features {
-            auto_approve,
-            streaming,
-            debug,
-            hf_token,
-            daemon_only_mode,
-            mdns_discovery,
-            auto_discover,
-            memory_context_lines,
-            ..
-        }) = state.sections.get(&WizardSection::Features)
-        {
-            (
-                *auto_approve,
-                *streaming,
-                *debug,
-                if hf_token.is_empty() {
-                    None
-                } else {
-                    Some(hf_token.clone())
-                },
-                *daemon_only_mode,
-                *mdns_discovery,
-                *auto_discover,
-                *memory_context_lines,
-            )
-        } else {
-            (false, true, false, None, false, false, true, 4)
-        };
+    let (
+        auto_approve,
+        streaming,
+        debug,
+        hf_token_val,
+        daemon_only,
+        mdns,
+        auto_disc,
+        memory_ctx_lines,
+    ) = if let Some(SectionState::Features {
+        auto_approve,
+        streaming,
+        debug,
+        hf_token,
+        daemon_only_mode,
+        mdns_discovery,
+        auto_discover,
+        memory_context_lines,
+        ..
+    }) = state.sections.get(&WizardSection::Features)
+    {
+        (
+            *auto_approve,
+            *streaming,
+            *debug,
+            if hf_token.is_empty() {
+                None
+            } else {
+                Some(hf_token.clone())
+            },
+            *daemon_only_mode,
+            *mdns_discovery,
+            *auto_discover,
+            *memory_context_lines,
+        )
+    } else {
+        (false, true, false, None, false, false, true, 4)
+    };
 
     #[cfg(target_os = "macos")]
     let gui_automation = if let Some(SectionState::Features { gui_automation, .. }) =

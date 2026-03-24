@@ -49,8 +49,8 @@ pub enum Command {
     ModelSwitch(String), // /provider <name>  e.g. /provider grok
     ModelShow,           // /provider  (show current active provider)
     // Service discovery (Phase 3)
-    Discover,  // Discover Finch daemons on local network
-    Machines,  // List known peer machines (from LAN discovery)
+    Discover, // Discover Finch daemons on local network
+    Machines, // List known peer machines (from LAN discovery)
     // License management
     LicenseStatus,           // /license or /license status
     LicenseActivate(String), // /license activate <key>
@@ -62,52 +62,59 @@ pub enum Command {
     // Execution graph
     Graph, // /graph — show causal trace of last query
     // Co-Forth VM stack ops
-    Ask(String),                  // /ask <query>      — send directly to AI (bypass stack)
-    StackPush(String),            // /push <text>      — push text onto the stack
-    StackShow,                    // /stack            — show current stack contents
-    StackPop,                     // /pop              — remove top item (undo last push)
-    StackRun,                     // /run              — execute full stack as one query
-    StackClear,                   // /stack clear      — drop all stack items
-    StackProgram,                 // /program          — switch panel to Forth source view
-    StackView,                    // /view             — switch panel to graph view (toggle)
-    StackDemo,                    // /demo             — seed an example language to play with
+    Ask(String),       // /ask <query>      — send directly to AI (bypass stack)
+    StackPush(String), // /push <text>      — push text onto the stack
+    StackShow,         // /stack            — show current stack contents
+    StackPop,          // /pop              — remove top item (undo last push)
+    StackRun,          // /run              — execute full stack as one query
+    StackClear,        // /stack clear      — drop all stack items
+    StackProgram,      // /program          — switch panel to Forth source view
+    StackView,         // /view             — switch panel to graph view (toggle)
+    StackDemo,         // /demo             — seed an example language to play with
     // Special Forth vocabulary ops
-    StackChain(usize, usize),     // /chain W1 W2      — add edge W1 → W2
-    StackForget(usize),           // /forget W1        — remove word and AI descendants
-    StackDup(usize),              // /dup W1           — clone word as new entry
-    StackSwap(usize, usize),      // /swap W1 W2       — swap labels of two words
-    StackDescribe(String),        // /describe <word>  — show library entry for a word
-    StackDefine(String, String),  // /define <word> <def> — add word to repo vocabulary
+    StackChain(usize, usize),      // /chain W1 W2      — add edge W1 → W2
+    StackForget(usize),            // /forget W1        — remove word and AI descendants
+    StackDup(usize),               // /dup W1           — clone word as new entry
+    StackSwap(usize, usize),       // /swap W1 W2       — swap labels of two words
+    StackDescribe(String),         // /describe <word>  — show library entry for a word
+    StackDefine(String, String),   // /define <word> <def> — add word to repo vocabulary
     StackOverride(String, String), // /override <word> <def> — machine-local override (~/.finch/library.toml)
-    ForthEval(String),            // : word ... ; or /forth <expr> — eval in Forth interpreter
-    ForthUndo,                    // /undefine — undo last Forth definition
-    VmDump,                       // /vm — dump VM source to scrollback + clipboard
-    LibraryUndefine(String),      // /undefine <word> — remove last user library entry for word
-    LibraryRun(String),           // /run <word> — execute the Forth snippet for a library word
-    Setup,                        // /setup — open the setup wizard (run 'finch setup' to reconfigure)
-    Share,                        // /share — format session as a pasteable proof block
-    BoxDiff,                      // /box-diff — compare all peers, offer to fix outliers
+    ForthEval(String),             // : word ... ; or /forth <expr> — eval in Forth interpreter
+    ForthUndo,                     // /undefine — undo last Forth definition
+    VmDump,                        // /vm — dump VM source to scrollback + clipboard
+    LibraryUndefine(String),       // /undefine <word> — remove last user library entry for word
+    LibraryRun(String),            // /run <word> — execute the Forth snippet for a library word
+    Setup,   // /setup — open the setup wizard (run 'finch setup' to reconfigure)
+    Share,   // /share — format session as a pasteable proof block
+    BoxDiff, // /box-diff — compare all peers, offer to fix outliers
+    // Channel commands (IRC-style)
+    JoinChannel(String),        // /join #channel        — join a named channel
+    PartChannel(String),        // /part #channel        — leave a named channel
+    SayChannel(String, String), // /say #channel message — send a message to a channel
     // Peer connect / disconnect
-    Connect(String),              // /connect <host:port>   — add peer to current room + peer list
-    Disconnect(String),           // /disconnect <name-or-addr> — remove peer from room + list
+    Connect(String), // /connect <host:port>   — add peer to current room + peer list
+    Disconnect(String), // /disconnect <name-or-addr> — remove peer from room + list
     // Room management
-    Room(Option<String>),         // /room [uuid]  — join/create room (no uuid = show current)
-    RoomNew,                      // /room new     — create a fresh room with a random UUID
-    RoomAdd(String),              // /room add <addr>
-    RoomRemove(String),           // /room remove <name-or-addr>
-    RoomList,                     // /room list    — list all rooms + member counts
-    SelfFix,                      // /self-fix     — diagnose, fix, verify, restart
+    Room(Option<String>), // /room [uuid]  — join/create room (no uuid = show current)
+    RoomNew,              // /room new     — create a fresh room with a random UUID
+    RoomAdd(String),      // /room add <addr>
+    RoomRemove(String),   // /room remove <name-or-addr>
+    RoomList,             // /room list    — list all rooms + member counts
+    SelfFix,              // /self-fix     — diagnose, fix, verify, restart
     // Diff proposal flow
-    Accept(Option<String>),       // /accept [diff-id-prefix] — accept most-recent (or matched) pending diff
-    Reject(Option<String>),       // /reject [reason]         — reject most-recent pending diff
+    Accept(Option<String>), // /accept [diff-id-prefix] — accept most-recent (or matched) pending diff
+    Reject(Option<String>), // /reject [reason]         — reject most-recent pending diff
 }
 
 impl Command {
     pub fn parse(input: &str) -> Option<Self> {
-        let trimmed = input.trim().trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '/');
+        let trimmed = input
+            .trim()
+            .trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '/');
 
         // Handle simple commands without arguments
         match trimmed {
+            "/" => return Some(Command::Help),
             "/help" => return Some(Command::Help),
             "/quit" | "/exit" => return Some(Command::Quit),
             "/metrics" => return Some(Command::Metrics),
@@ -164,11 +171,50 @@ impl Command {
         // Diff proposal flow with arguments
         if let Some(rest) = trimmed.strip_prefix("/accept ") {
             let prefix = rest.trim();
-            return Some(Command::Accept(if prefix.is_empty() { None } else { Some(prefix.to_string()) }));
+            return Some(Command::Accept(if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix.to_string())
+            }));
         }
         if let Some(rest) = trimmed.strip_prefix("/reject ") {
             let reason = rest.trim();
-            return Some(Command::Reject(if reason.is_empty() { None } else { Some(reason.to_string()) }));
+            return Some(Command::Reject(if reason.is_empty() {
+                None
+            } else {
+                Some(reason.to_string())
+            }));
+        }
+
+        // Channel commands
+        fn ensure_hash(s: &str) -> String {
+            if s.starts_with('#') {
+                s.to_string()
+            } else {
+                format!("#{s}")
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/join ") {
+            let chan = rest.trim();
+            if !chan.is_empty() {
+                return Some(Command::JoinChannel(ensure_hash(chan)));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/part ") {
+            let chan = rest.trim();
+            if !chan.is_empty() {
+                return Some(Command::PartChannel(ensure_hash(chan)));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/say ") {
+            let rest = rest.trim();
+            if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
+                let chan = rest[..space].trim();
+                let msg = rest[space..].trim();
+                if !chan.is_empty() && !msg.is_empty() {
+                    return Some(Command::SayChannel(ensure_hash(chan), msg.to_string()));
+                }
+            }
         }
 
         if let Some(rest) = trimmed.strip_prefix("/connect ") {
@@ -310,7 +356,10 @@ impl Command {
                         (rest.trim_matches('"').to_string(), String::new())
                     }
                 } else if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
-                    (rest[..space].trim().to_string(), rest[space..].trim().to_string())
+                    (
+                        rest[..space].trim().to_string(),
+                        rest[space..].trim().to_string(),
+                    )
                 } else {
                     (rest.to_string(), String::new())
                 };
@@ -326,12 +375,18 @@ impl Command {
             if !rest.is_empty() {
                 let (word, definition) = if rest.starts_with('"') {
                     if let Some(close) = rest[1..].find('"') {
-                        (rest[1..=close].to_string(), rest[close + 2..].trim().to_string())
+                        (
+                            rest[1..=close].to_string(),
+                            rest[close + 2..].trim().to_string(),
+                        )
                     } else {
                         (rest.trim_matches('"').to_string(), String::new())
                     }
                 } else if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
-                    (rest[..space].trim().to_string(), rest[space..].trim().to_string())
+                    (
+                        rest[..space].trim().to_string(),
+                        rest[space..].trim().to_string(),
+                    )
                 } else {
                     (rest.to_string(), String::new())
                 };
@@ -512,6 +567,11 @@ impl Command {
             }
         }
 
+        // Any unrecognized /command → show help instead of falling through to Forth/NL.
+        if trimmed.starts_with('/') {
+            return Some(Command::Help);
+        }
+
         None
     }
 }
@@ -584,9 +644,9 @@ pub fn handle_command(
             CommandOutput::Status("License commands should be handled in REPL.".to_string()),
         ),
         // Brain commands are handled directly in REPL
-        Command::Brain(_) | Command::Brains | Command::BrainCancel(_) => Ok(
-            CommandOutput::Status("Brain commands should be handled in REPL.".to_string()),
-        ),
+        Command::Brain(_) | Command::Brains | Command::BrainCancel(_) => Ok(CommandOutput::Status(
+            "Brain commands should be handled in REPL.".to_string(),
+        )),
         // Graph command is handled directly in REPL
         Command::Graph => Ok(CommandOutput::Status(
             "Graph command should be handled in REPL.".to_string(),
@@ -639,17 +699,23 @@ pub fn handle_command(
             "SelfFix command should be handled in REPL.".to_string(),
         )),
         // Diff proposal flow — handled in the REPL event loop
-        Command::Accept(_)
-        | Command::Reject(_) => Ok(CommandOutput::Status(
+        Command::Accept(_) | Command::Reject(_) => Ok(CommandOutput::Status(
             "Diff command should be handled in REPL.".to_string(),
         )),
+        // Channel commands are handled directly in REPL
+        Command::JoinChannel(_) | Command::PartChannel(_) | Command::SayChannel(_, _) => Ok(
+            CommandOutput::Status("Channel commands should be handled in REPL.".to_string()),
+        ),
     }
 }
 
 /// Parse "W3" or "3" into a node id (usize).
 fn parse_word_id(s: &str) -> Option<usize> {
     let s = s.trim();
-    let digits = s.strip_prefix('W').or_else(|| s.strip_prefix('w')).unwrap_or(s);
+    let digits = s
+        .strip_prefix('W')
+        .or_else(|| s.strip_prefix('w'))
+        .unwrap_or(s);
     digits.parse::<usize>().ok()
 }
 
@@ -761,6 +827,11 @@ pub fn format_help() -> String {
          \x1b[90m  Type text to push words. The AI pushes back via Push tool.\n\
          The stack builds a Forth dialect. /run executes it.\x1b[0m\n\
          \x1b[90m  /run collapses the stack and executes it.\x1b[0m\n\n\
+         \x1b[1;33m💬 Channel Commands:\x1b[0m\n\
+         \x1b[36m  /join #channel\x1b[0m     Join a named channel; announce to all peers\n\
+         \x1b[36m  /part #channel\x1b[0m     Leave a named channel\n\
+         \x1b[36m  /say #channel msg\x1b[0m  Send a message to a channel\n\
+         \x1b[0m\n\
          \x1b[1;33m🔀 Diff Proposal Flow:\x1b[0m\n\
          \x1b[90m  Peers (AI or remote) propose diffs in the room. You argue back in chat.\x1b[0m\n\
          \x1b[90m  When you're satisfied, accept or reject:\x1b[0m\n\

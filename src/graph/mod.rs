@@ -5,7 +5,6 @@
 ///
 /// The graph is persisted to `~/.finch/graphs/` as JSON and can be
 /// inspected interactively with `/graph`.
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -144,8 +143,7 @@ impl ExecutionGraph {
         let _ = writeln!(
             &mut out,
             "║  Execution Graph  ·  {}  ·  {}  ║",
-            query_id_str,
-            self.session_label
+            query_id_str, self.session_label
         );
         let _ = writeln!(
             &mut out,
@@ -190,7 +188,12 @@ impl ExecutionGraph {
                         let _ = writeln!(&mut out, "      input:  {}", input_preview);
                     }
                     let icon = if *is_error { "✗" } else { "✓" };
-                    let _ = writeln!(&mut out, "      {}  {}", icon, truncate(output_preview, 200));
+                    let _ = writeln!(
+                        &mut out,
+                        "      {}  {}",
+                        icon,
+                        truncate(output_preview, 200)
+                    );
                 }
                 NodeKind::FinalResponse { preview } => {
                     let _ = writeln!(&mut out, "  [{}] 💬 Response", node.id + 1);
@@ -239,7 +242,9 @@ mod tests {
     #[test]
     fn test_add_nodes_increments_ids() {
         let mut g = make_graph();
-        let id0 = g.add_node(NodeKind::UserInput { text: "hello".into() });
+        let id0 = g.add_node(NodeKind::UserInput {
+            text: "hello".into(),
+        });
         let id1 = g.add_node(NodeKind::LlmCall {
             model: "claude".into(),
             input_tokens: None,
@@ -265,7 +270,9 @@ mod tests {
     #[test]
     fn test_format_display_non_empty() {
         let mut g = make_graph();
-        g.add_node(NodeKind::UserInput { text: "list files".into() });
+        g.add_node(NodeKind::UserInput {
+            text: "list files".into(),
+        });
         g.add_node(NodeKind::LlmCall {
             model: "claude-sonnet-4-6".into(),
             input_tokens: Some(100),
