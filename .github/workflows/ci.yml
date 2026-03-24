@@ -23,6 +23,14 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Install capnproto (Ubuntu)
+      if: runner.os == 'Linux'
+      run: sudo apt-get install -y capnproto
+
+    - name: Install capnproto (macOS)
+      if: runner.os == 'macOS'
+      run: brew install capnp
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -96,6 +104,14 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+
+    - name: Install capnproto (Ubuntu)
+      if: runner.os == 'Linux'
+      run: sudo apt-get install -y capnproto
+
+    - name: Install capnproto (macOS)
+      if: runner.os == 'macOS'
+      run: brew install capnp
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
