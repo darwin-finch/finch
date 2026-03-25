@@ -1695,8 +1695,14 @@ s" it is ours"      s" -1 is ours"     argue
                                 // Find which query this dialog was for (tool approval)
                                 let mut approvals = self.pending_approvals.write().await;
 
-                                // Get the first pending approval (there should only be one active dialog at a time)
-                                if let Some((query_id, (_tool_use, _response_tx))) = approvals.iter().next() {
+                                if approvals.is_empty() {
+                                    // No handler consumed the result — ShowDialog result arrived
+                                    // before pending_dialog_tx was set (belt-and-suspenders race).
+                                    // Put it back so the next tick delivers it once the tx is ready.
+                                    drop(approvals);
+                                    let mut tui = self.tui_renderer.lock().await;
+                                    tui.pending_dialog_result = Some(dialog_result);
+                                } else if let Some((query_id, (_tool_use, _response_tx))) = approvals.iter().next() {
                                     let query_id = *query_id;
                                     let (tool_use, response_tx) = approvals.remove(&query_id)
                                         .expect("query_id was just obtained from the same map");
