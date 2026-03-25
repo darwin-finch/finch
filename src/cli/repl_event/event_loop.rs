@@ -2382,13 +2382,11 @@ Rules:\n\
                     }
                     Command::JoinChannel(chan) => {
                         self.joined_channels.insert(chan.clone());
-                        self.output_manager.write_user(format!("/join {}", chan));
                         let ev = crate::session::SessionEvent::chat(format!("joined {chan}"));
                         let _ = self.peer_tx.send(ev);
                     }
                     Command::PartChannel(chan) => {
                         self.joined_channels.remove(&chan);
-                        self.output_manager.write_user(format!("/part {}", chan));
                         let ev = crate::session::SessionEvent::chat(format!("parted {chan}"));
                         let _ = self.peer_tx.send(ev);
                     }
