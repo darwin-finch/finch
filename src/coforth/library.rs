@@ -963,9 +963,6 @@ pub(crate) const MAJOR_WORDS_FORTH: &str = r#"
   else  ." area: four wide, five tall, twenty inside." cr  4 5 * .  then  cr ;
 : test:area   s" 4 5 area"   s" 4 5 *"   argue ;
 
-: divide    ( a b -- q r | -- )
-  depth 1 > if  /mod swap
-  else  ." divide: ten divided by three — three remainder one." cr  10 3 /mod .  ." r" .  then  cr ;
 
 \ ── Philosophical ────────────────────────────────────────────────────────────────
 
@@ -1092,7 +1089,6 @@ pub(crate) const MAJOR_WORDS_FORTH: &str = r#"
 : came      ( -- ) ;
 : come      ( -- ) ;
 : they      ( -- ) ;
-: them      ( -- ) ;
 : thats     ( -- ) ;   \ that's
 : what      ( -- ) ;
 : whats     ( -- ) ;   \ what's

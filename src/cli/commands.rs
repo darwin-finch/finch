@@ -1057,9 +1057,9 @@ mod tests {
             _ => panic!("Expected PatternsRemove command"),
         }
 
-        // Test empty ID returns None
-        assert!(matches!(Command::parse("/patterns remove "), None));
-        assert!(matches!(Command::parse("/patterns rm "), None));
+        // Test empty ID — catch-all returns Help (unknown /command with no ID)
+        assert!(matches!(Command::parse("/patterns remove "), Some(Command::Help)));
+        assert!(matches!(Command::parse("/patterns rm "), Some(Command::Help)));
     }
 
     #[test]
@@ -1149,10 +1149,10 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_patterns_command() {
-        // Invalid subcommands should return None
-        assert!(matches!(Command::parse("/patterns invalid"), None));
-        assert!(matches!(Command::parse("/patterns remove"), None)); // Missing ID
-        assert!(matches!(Command::parse("/patterns rm"), None)); // Missing ID
+        // Invalid/incomplete /commands → catch-all returns Help
+        assert!(matches!(Command::parse("/patterns invalid"), Some(Command::Help)));
+        assert!(matches!(Command::parse("/patterns remove"), Some(Command::Help))); // Missing ID
+        assert!(matches!(Command::parse("/patterns rm"), Some(Command::Help))); // Missing ID
     }
 
     // MCP Command Tests
@@ -1210,17 +1210,17 @@ mod tests {
 
     #[test]
     fn test_parse_mcp_invalid() {
-        // Invalid subcommands should return None
-        assert!(matches!(Command::parse("/mcp invalid"), None));
+        // Invalid subcommands → catch-all returns Help
+        assert!(matches!(Command::parse("/mcp invalid"), Some(Command::Help)));
         // Note: "/mcp " (with trailing space) is trimmed to "/mcp" which matches McpList
     }
 
     #[test]
     fn test_parse_mcp_case_sensitive() {
-        // Commands should be case-sensitive (lowercase only)
-        assert!(matches!(Command::parse("/MCP list"), None));
-        assert!(matches!(Command::parse("/mcp LIST"), None));
-        assert!(matches!(Command::parse("/Mcp list"), None));
+        // Uppercase /commands don't match known commands → catch-all returns Help
+        assert!(matches!(Command::parse("/MCP list"), Some(Command::Help)));
+        assert!(matches!(Command::parse("/mcp LIST"), Some(Command::Help)));
+        assert!(matches!(Command::parse("/Mcp list"), Some(Command::Help)));
     }
 
     #[test]
