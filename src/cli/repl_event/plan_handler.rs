@@ -158,8 +158,16 @@ pub(crate) async fn handle_present_plan(
         let _ = tui.flush_output_safe(&output_manager);
     }
 
-    // Send a ShowDialog event to the main event loop and await the oneshot.
-    // This avoids polling; the render tick routes pending_dialog_result → response_tx.
+    // Belt-and-suspenders: set active_dialog directly so the dialog is on-screen
+    // and keypresses route correctly *before* the event loop processes ShowDialog.
+    // This eliminates the race window between send() and the event loop's own set.
+    {
+        let mut tui = tui_renderer.lock().await;
+        tui.active_dialog = Some(dialog.clone());
+        tui.pending_dialog_result = None;
+        let _ = tui.erase_live_area();
+        let _ = tui.draw_live_area();
+    }
     let (dialog_tx, dialog_rx) =
         tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
     if event_tx
@@ -347,6 +355,15 @@ pub(crate) async fn handle_ask_user_question(
 
     let dialog = llm_dialogs::question_to_dialog(&question);
 
+    // Belt-and-suspenders: set active_dialog directly before sending ShowDialog
+    // to eliminate the race window where keypresses go to the input buffer.
+    {
+        let mut tui = tui_renderer.lock().await;
+        tui.active_dialog = Some(dialog.clone());
+        tui.pending_dialog_result = None;
+        let _ = tui.erase_live_area();
+        let _ = tui.draw_live_area();
+    }
     let (dialog_tx, dialog_rx) =
         tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
     if event_tx

@@ -1580,22 +1580,24 @@ s" it is ours"      s" -1 is ours"     argue
                         }
                     }
 
-                    // Check for pending cancellation
-                    {
+                    // Single mutex acquisition: read all pending TUI state in one lock.
+                    // Reduces contention with spawn_input_task from 3-4 round-trips to 1 per tick.
+                    let (pending_cancel, dialog_result, pending_feedback) = {
                         let mut tui = self.tui_renderer.lock().await;
-                        if tui.pending_cancellation {
-                            tui.pending_cancellation = false; // Clear flag
-                            drop(tui); // Release lock before sending event
-                            let _ = self.event_tx.send(ReplEvent::CancelQuery);
-                        }
+                        (
+                            std::mem::take(&mut tui.pending_cancellation),
+                            tui.pending_dialog_result.take(),
+                            tui.pending_feedback.take(),
+                        )
+                    };
+
+                    if pending_cancel {
+                        let _ = self.event_tx.send(ReplEvent::CancelQuery);
                     }
 
-                    // Check for pending dialog result (tool approval OR brain question)
-                    {
-                        let mut tui = self.tui_renderer.lock().await;
-                        if let Some(dialog_result) = tui.pending_dialog_result.take() {
-                            drop(tui); // Release lock before async operations
-
+                    // Route pending dialog result (tool approval, brain question, ShowDialog oneshot, etc.)
+                    if let Some(dialog_result) = dialog_result {
+                        {
                             // Priority 0: ShowDialog (used by PresentPlan, AskUserQuestion, etc.)
                             if let Some(tx) = self.pending_dialog_tx.take() {
                                 let _ = tx.send(dialog_result);
@@ -1750,20 +1752,13 @@ s" it is ours"      s" -1 is ours"     argue
                         }
                     }
 
-                    // Check for pending feedback (Ctrl+G / Ctrl+B quick rating)
-                    {
-                        let rating = {
-                            let mut tui = self.tui_renderer.lock().await;
-                            tui.pending_feedback.take()
+                    if let Some(rating) = pending_feedback {
+                        let (weight, label) = match rating {
+                            FeedbackRating::Good => (1.0_f64, "👍 Good"),
+                            FeedbackRating::Bad  => (10.0_f64, "👎 Bad"),
                         };
-                        if let Some(rating) = rating {
-                            let (weight, label) = match rating {
-                                FeedbackRating::Good => (1.0_f64, "👍 Good"),
-                                FeedbackRating::Bad  => (10.0_f64, "👎 Bad"),
-                            };
-                            self.handle_feedback_command(weight, rating, None).await?;
-                            tracing::debug!("[EVENT_LOOP] Quick feedback recorded: {}", label);
-                        }
+                        self.handle_feedback_command(weight, rating, None).await?;
+                        tracing::debug!("[EVENT_LOOP] Quick feedback recorded: {}", label);
                     }
 
                     // Drain incoming push messages from peers.
@@ -3438,15 +3433,11 @@ Rules:\n\
                 }
             }
 
-            ReplEvent::ShowDialog { dialog, response_tx } => {
-                {
-                    let mut tui = self.tui_renderer.lock().await;
-                    tui.active_dialog = Some(dialog);
-                    tui.pending_dialog_result = None;
-                    let _ = tui.erase_live_area();
-                    let _ = tui.draw_live_area();
-                }
-                // Drop previous pending sender if any (new dialog supersedes).
+            ReplEvent::ShowDialog { dialog: _, response_tx } => {
+                // active_dialog is already set by the caller (belt-and-suspenders in
+                // handle_present_plan / handle_ask_user_question), so the dialog is
+                // on-screen before the event is even enqueued — no race window.
+                // Just store the response channel for the render tick to route the result.
                 self.pending_dialog_tx = Some(response_tx);
             }
         }
