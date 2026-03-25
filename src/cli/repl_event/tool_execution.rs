@@ -146,13 +146,11 @@ impl ToolExecutionCoordinator {
             let is_auto_approved = {
                 let tool_name = tool_use.name.as_str();
 
-                // Always auto-approve EnterPlanMode (non-destructive mode change)
-                // Always auto-approve TodoWrite/TodoRead (in-memory only, no side effects)
-                if tool_name == "EnterPlanMode"
-                    || tool_name == "enter_plan_mode"
-                    || tool_name == "TodoWrite"
-                    || tool_name == "TodoRead"
-                {
+                // Always auto-approve TodoWrite/TodoRead (in-memory only, no side effects).
+                // EnterPlanMode is NOT auto-approved — the AI must surface it as a
+                // confirmation dialog so the user can deny it and keep the session in
+                // normal executing mode.
+                if tool_name == "TodoWrite" || tool_name == "TodoRead" {
                     true
                 } else {
                     // Auto-approve read-only tools and user interaction tools when in plan mode
