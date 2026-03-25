@@ -14,11 +14,13 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::messages::work_unit::WorkUnit;
 use crate::cli::output_manager::OutputManager;
 use crate::cli::repl::ReplMode;
+use crate::cli::repl_event::events::ReplEvent;
 use crate::cli::tui::TuiRenderer;
 use crate::tools::types::ToolUse;
 
@@ -73,6 +75,7 @@ pub(crate) async fn handle_present_plan(
     output_manager: Arc<OutputManager>,
     cancel: CancellationToken,
     work_unit: Arc<WorkUnit>,
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
 ) -> Option<Result<String>> {
     use chrono::Utc;
     use crossterm::style::Stylize;
@@ -155,50 +158,31 @@ pub(crate) async fn handle_present_plan(
         let _ = tui.flush_output_safe(&output_manager);
     }
 
-    // Show the approval dialog using the async path so we never hold the tokio
-    // async mutex across a blocking crossterm::event::poll syscall.  The old
-    // approach (calling show_dialog while holding the mutex) caused the dialog
-    // to freeze on macOS because spawn_input_task was suspended waiting for the
-    // same mutex, leaving no task free to process keyboard events (GH #43).
-    //
-    // New approach: set active_dialog, release the mutex, let spawn_input_task
-    // handle keypresses normally, and poll here for pending_dialog_result.
+    // Send a ShowDialog event to the main event loop and await the oneshot.
+    // This avoids polling; the render tick routes pending_dialog_result → response_tx.
+    let (dialog_tx, dialog_rx) =
+        tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
+    if event_tx
+        .send(ReplEvent::ShowDialog {
+            dialog,
+            response_tx: dialog_tx,
+        })
+        .is_err()
     {
-        let mut tui = tui_renderer.lock().await;
-        tui.active_dialog = Some(dialog);
-        tui.pending_dialog_result = None;
-        let _ = tui.erase_live_area();
-        let _ = tui.draw_live_area();
+        return Some(Ok(dismissed_plan_msg()));
     }
 
-    let dialog_result: crate::cli::tui::DialogResult = loop {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Ctrl+C → CancelQuery → cancellation_token.cancel() path.
-        // Check before acquiring the mutex to avoid contention.
-        if cancel.is_cancelled() {
+    let dialog_result: crate::cli::tui::DialogResult = tokio::select! {
+        result = dialog_rx => match result {
+            Ok(r) => r,
+            Err(_) => crate::cli::tui::DialogResult::Cancelled,
+        },
+        _ = cancel.cancelled() => {
+            // Clean up active dialog on cancellation
             let mut tui = tui_renderer.lock().await;
             tui.active_dialog = None;
-            break crate::cli::tui::DialogResult::Cancelled;
+            crate::cli::tui::DialogResult::Cancelled
         }
-
-        let mut tui = tui_renderer.lock().await;
-        // Legacy path: pending_cancellation set directly (race with render tick).
-        if tui.pending_cancellation {
-            tui.pending_cancellation = false;
-            tui.active_dialog = None;
-            break crate::cli::tui::DialogResult::Cancelled;
-        }
-        if let Some(result) = tui.pending_dialog_result.take() {
-            tui.active_dialog = None;
-            break result;
-        }
-        // Do NOT call draw_live_area() here.  The main event loop's render
-        // tick already calls flush_output_safe() → erase_live_area() +
-        // draw_live_area() on its own interval.  Calling draw_live_area()
-        // here WITHOUT erase_live_area() prints the dialog box to stdout on
-        // every 50ms tick, permanently pushing each copy into terminal
-        // scrollback and producing the cascading duplicates the user sees.
     };
 
     // Handle dialog result
@@ -285,9 +269,17 @@ pub(crate) async fn handle_present_plan(
 ///
 /// Returns `Some(tool_result)` when the tool call is an `AskUserQuestion`
 /// invocation; returns `None` for every other tool name.
+///
+/// Single-question dialogs use the non-blocking async overlay path (same as
+/// `handle_present_plan`) so `spawn_input_task` can deliver keyboard events
+/// while the dialog is open.  Multi-question dialogs fall back to the blocking
+/// `show_tabbed_dialog` which takes over the full alternate screen — a separate
+/// issue to fix later.
 pub(crate) async fn handle_ask_user_question(
     tool_use: &ToolUse,
     tui_renderer: Arc<tokio::sync::Mutex<TuiRenderer>>,
+    cancel: CancellationToken,
+    event_tx: &mpsc::UnboundedSender<ReplEvent>,
 ) -> Option<Result<String>> {
     // Only handle AskUserQuestion calls
     if tool_use.name != "AskUserQuestion" {
@@ -308,32 +300,112 @@ pub(crate) async fn handle_ask_user_question(
             }
         };
 
-    // Show dialog and collect answers
-    let mut tui = tui_renderer.lock().await;
-    let result = tui.show_llm_question(&input);
-    drop(tui);
+    use crate::cli::llm_dialogs;
+    use std::collections::HashMap;
 
-    match result {
-        Ok(output) => {
-            // Empty answers means the user dismissed the dialog (Escape).
-            // Return a plain-text message so the model knows to stop asking
-            // rather than looping endlessly.
-            if output.answers.is_empty() {
-                return Some(Ok(
-                    "The user dismissed the dialog without answering (pressed Escape or cancelled). \
-                     Do NOT call AskUserQuestion again. Continue without asking, or ask your \
-                     question inline as plain text in your response."
-                        .to_string(),
-                ));
+    // Multi-question path: show_tabbed_dialog takes over the alternate screen,
+    // so the normal event loop is not active.  We still hold the mutex for the
+    // duration — this is a known limitation; single-question is the common case.
+    if input.questions.len() > 1 {
+        let mut tui = tui_renderer.lock().await;
+        let tabbed =
+            crate::cli::tui::TabbedDialog::new(input.questions.clone(), None);
+        let result = match tui.show_tabbed_dialog(tabbed) {
+            Ok(r) => r,
+            Err(e) => {
+                return Some(Err(anyhow::anyhow!("Failed to show dialog: {}", e)))
             }
-            // Serialize output as JSON
-            match serde_json::to_string_pretty(&output) {
-                Ok(json) => Some(Ok(json)),
-                Err(e) => Some(Err(anyhow::anyhow!("Failed to serialize output: {}", e))),
-            }
+        };
+        drop(tui);
+
+        let answers = match result {
+            crate::cli::tui::TabbedDialogResult::Completed(a) => a,
+            crate::cli::tui::TabbedDialogResult::Cancelled => HashMap::new(),
+        };
+        let annotations = llm_dialogs::build_annotations(&input.questions, &answers);
+        let output = crate::cli::AskUserQuestionOutput {
+            questions: input.questions.clone(),
+            answers,
+            annotations,
+        };
+        if output.answers.is_empty() {
+            return Some(Ok(dismissed_msg()));
         }
-        Err(e) => Some(Err(anyhow::anyhow!("Failed to show LLM question: {}", e))),
+        return Some(match serde_json::to_string_pretty(&output) {
+            Ok(json) => Ok(json),
+            Err(e) => Err(anyhow::anyhow!("Failed to serialize output: {}", e)),
+        });
     }
+
+    // Single-question — non-blocking overlay path via ShowDialog event + oneshot.
+    // The main event loop sets active_dialog; the render tick routes the result
+    // back through the oneshot channel.  No 50ms poll needed.
+    let question = match input.questions.first() {
+        Some(q) => q.clone(),
+        None => return Some(Err(anyhow::anyhow!("No questions provided"))),
+    };
+
+    let dialog = llm_dialogs::question_to_dialog(&question);
+
+    let (dialog_tx, dialog_rx) =
+        tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
+    if event_tx
+        .send(ReplEvent::ShowDialog {
+            dialog,
+            response_tx: dialog_tx,
+        })
+        .is_err()
+    {
+        return Some(Ok(dismissed_msg()));
+    }
+
+    let dialog_result: crate::cli::tui::DialogResult = tokio::select! {
+        result = dialog_rx => match result {
+            Ok(r) => r,
+            Err(_) => crate::cli::tui::DialogResult::Cancelled,
+        },
+        _ = cancel.cancelled() => {
+            // Clean up active dialog on cancellation
+            let mut tui = tui_renderer.lock().await;
+            tui.active_dialog = None;
+            crate::cli::tui::DialogResult::Cancelled
+        }
+    };
+
+    if matches!(dialog_result, crate::cli::tui::DialogResult::Cancelled) {
+        return Some(Ok(dismissed_msg()));
+    }
+
+    let mut answers = HashMap::new();
+    if let Some(answer) = llm_dialogs::extract_answer(&question, &dialog_result) {
+        answers.insert(question.question.clone(), answer);
+    }
+
+    if answers.is_empty() {
+        return Some(Ok(dismissed_msg()));
+    }
+
+    let annotations = llm_dialogs::build_annotations(&input.questions, &answers);
+    let output = crate::cli::AskUserQuestionOutput {
+        questions: input.questions.clone(),
+        answers,
+        annotations,
+    };
+    Some(match serde_json::to_string_pretty(&output) {
+        Ok(json) => Ok(json),
+        Err(e) => Err(anyhow::anyhow!("Failed to serialize output: {}", e)),
+    })
+}
+
+fn dismissed_msg() -> String {
+    "The user dismissed the dialog without answering (pressed Escape or cancelled). \
+     Do NOT call AskUserQuestion again. Continue without asking, or ask your \
+     question inline as plain text in your response."
+        .to_string()
+}
+
+fn dismissed_plan_msg() -> String {
+    "Plan approval cancelled. Staying in planning mode.".to_string()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -220,7 +220,18 @@ pub(super) async fn dispatch_tool_uses(
         );
 
         // Inline handlers for interactive tools (block until dialog resolved)
-        if let Some(result) = handle_ask_user_question(&tool_use, Arc::clone(tui_renderer)).await {
+        if let Some(result) = handle_ask_user_question(
+            &tool_use,
+            Arc::clone(tui_renderer),
+            query_states
+                .get_metadata(query_id)
+                .await
+                .map(|m| m.cancellation_token)
+                .unwrap_or_else(CancellationToken::new),
+            event_tx,
+        )
+        .await
+        {
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
                 tool_id: tool_use.id.clone(),
@@ -237,6 +248,7 @@ pub(super) async fn dispatch_tool_uses(
                 .map(|m| m.cancellation_token)
                 .unwrap_or_else(CancellationToken::new),
             Arc::clone(work_unit),
+            event_tx,
         )
         .await
         {
@@ -752,26 +764,37 @@ pub(crate) async fn process_query_with_tools(
 /// any leading user messages that contain only `tool_result` blocks — these are
 /// orphaned when the sliding window cuts the preceding assistant `tool_use`
 /// message, and all providers reject `tool_result` without a matching `tool_use`.
-/// A floor of 2 messages is kept to avoid sending an empty window in degenerate
-/// cases.
+///
+/// When the orphaned turn is followed immediately by another assistant `tool_use`
+/// (the start of the next still-valid round-trip), a placeholder user message is
+/// inserted instead of cascading removal. Without this, removing the orphan and
+/// the following assistant would orphan the *next* tool_result, cascading all the
+/// way down to a 2-message floor that still starts with an orphaned tool_result.
 pub(crate) fn apply_sliding_window(
     msgs: Vec<crate::claude::Message>,
     max: usize,
 ) -> Vec<crate::claude::Message> {
-    if max == 0 || msgs.len() <= max {
-        return msgs;
-    }
-    let mut window = msgs[msgs.len() - max..].to_vec();
+    let mut window = if max == 0 || msgs.len() <= max {
+        msgs
+    } else {
+        msgs[msgs.len() - max..].to_vec()
+    };
     // Ensure the window starts with a user message (API requirement).
     while window.len() > 2 && window.first().map(|m| m.role.as_str()) == Some("assistant") {
         window.remove(0);
     }
-    // Strip orphaned tool_result-only user messages at the window boundary.
+    // Strip the orphaned tool_result-only user message at the window boundary.
     // This happens when the cut falls inside a tool-call round-trip: the
     // assistant tool_use was dropped but the user tool_result survived.
-    // Every provider rejects tool_result blocks without a matching tool_use.
+    // Every provider rejects tool_result without a matching preceding tool_use.
+    //
+    // After removing the orphan, the window may start with the *next* assistant
+    // tool_use (which has a valid paired user:tool_result after it).  Rather than
+    // cascading removal — which destroys those valid round-trips and ultimately
+    // leaves another orphan at the 2-message floor — we insert a lightweight
+    // placeholder user turn so the valid tool chain is preserved.
     loop {
-        if window.len() <= 2 {
+        if window.is_empty() {
             break;
         }
         let first_is_orphaned = window.first().map(|m| {
@@ -785,9 +808,99 @@ pub(crate) fn apply_sliding_window(
             break;
         }
         window.remove(0); // drop orphaned tool_result user turn
-                          // Also drop the assistant reply that followed it (starts the next pair).
+        // If the window now starts with an assistant message (the next tool round),
+        // insert a placeholder user turn to satisfy the user-first invariant without
+        // cascading removal that would orphan every subsequent tool_result.
         if window.first().map(|m| m.role.as_str()) == Some("assistant") {
-            window.remove(0);
+            window.insert(
+                0,
+                crate::claude::Message {
+                    role: "user".to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "[earlier context omitted by sliding window]".to_string(),
+                    }],
+                },
+            );
+            break;
+        }
+    }
+    // Final pass: strip any assistant messages that have tool_use blocks but are
+    // not immediately followed by a user message with ALL matching tool_results.
+    // This handles conversations corrupted by cancelled queries: the assistant
+    // message with tool_uses was written to history but tool execution was aborted
+    // before finalize_tool_execution could add the corresponding tool_result message.
+    {
+        use std::collections::HashSet;
+        let mut i = 0;
+        while i < window.len() {
+            let tool_use_ids: Vec<String> = window[i]
+                .content
+                .iter()
+                .filter_map(|b| {
+                    if let ContentBlock::ToolUse { id, .. } = b {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if tool_use_ids.is_empty() {
+                i += 1;
+                continue;
+            }
+
+            // Check the immediately following message for ALL matching tool_results.
+            let next_covers_all = (i + 1 < window.len()).then(|| {
+                let result_ids: HashSet<&str> = window[i + 1]
+                    .content
+                    .iter()
+                    .filter_map(|b| {
+                        if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                            Some(tool_use_id.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                tool_use_ids.iter().all(|id| result_ids.contains(id.as_str()))
+            });
+
+            if next_covers_all == Some(true) {
+                i += 1;
+                continue;
+            }
+
+            // Orphaned tool_use found. Keep any text content; strip tool_use blocks.
+            let text_blocks: Vec<ContentBlock> = window[i]
+                .content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::Text { .. }))
+                .cloned()
+                .collect();
+
+            if text_blocks.is_empty() {
+                window.remove(i);
+            } else {
+                window[i] = crate::claude::Message {
+                    role: "assistant".to_string(),
+                    content: text_blocks,
+                };
+                i += 1;
+            }
+
+            // If the next message (now at index i) contains only tool_results they
+            // are also orphaned — remove them so no tool_result arrives without a
+            // preceding tool_use.
+            if i < window.len()
+                && !window[i].content.is_empty()
+                && window[i]
+                    .content
+                    .iter()
+                    .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            {
+                window.remove(i);
+            }
         }
     }
     window

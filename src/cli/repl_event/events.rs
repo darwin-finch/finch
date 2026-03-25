@@ -98,6 +98,20 @@ pub enum ReplEvent {
         response_tx: tokio::sync::oneshot::Sender<Option<String>>,
     },
 
+    /// Show a dialog and send the result back through `response_tx`.
+    ///
+    /// Set `active_dialog` on the TUI, release the mutex, and let
+    /// `spawn_input_task` deliver the key events.  The render tick routes
+    /// `pending_dialog_result` → `response_tx` when the dialog completes.
+    ///
+    /// This is the ONLY correct way to show a dialog from a spawned task —
+    /// do NOT call `TuiRenderer::show_dialog` (it blocks the mutex and the
+    /// event loop).
+    ShowDialog {
+        dialog: crate::cli::tui::Dialog,
+        response_tx: tokio::sync::oneshot::Sender<crate::cli::tui::DialogResult>,
+    },
+
     /// Co-Forth poset execution finished.
     PosetComplete { result: Result<String> },
 

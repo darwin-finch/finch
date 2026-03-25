@@ -31,7 +31,7 @@ use crossterm::{
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tui_textarea::TextArea;
 
 use super::{OutputManager, StatusBar};
@@ -471,9 +471,7 @@ pub struct TuiRenderer {
     pub pending_images: Vec<(usize, String, String)>,
     pub(crate) image_counter: usize,
 
-    // Rate limiting
-    last_render: Instant,
-    render_interval: Duration,
+    // Rate limiting - removed in favor of event loop control
 
     // Session task list (set after construction via set_todo_list)
     todo_list: Option<Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>>,
@@ -576,9 +574,6 @@ impl TuiRenderer {
 
             pending_images: Vec::new(),
             image_counter: 0,
-
-            last_render: Instant::now(),
-            render_interval: Duration::from_millis(100),
 
             todo_list: None,
             corner: Arc::new(std::sync::Mutex::new(None)),
@@ -1011,13 +1006,12 @@ impl TuiRenderer {
                 Self::raw_blank_line()?;
             }
             self.draw_live_area()?;
-        } else if self.last_render.elapsed() >= self.render_interval {
+        } else {
             // Periodic redraw for animation / status updates.
             self.erase_live_area()?;
             self.draw_live_area()?;
         }
 
-        self.last_render = Instant::now();
         Ok(())
     }
 
@@ -1843,7 +1837,12 @@ impl TuiRenderer {
 
     fn draw_dialog_inline_static(out: &mut impl io::Write, dialog: &Dialog) -> Result<usize> {
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let box_width = term_width;
+        // Leave at least 2 columns of breathing room on the right so the box
+        // border never touches the terminal edge (which causes auto-wrap artifacts
+        // on some terminals that emit an extra blank line when the cursor lands in
+        // the last column).  Also cap at 120 so very wide terminals don't produce
+        // comically wide dialogs.
+        let box_width = term_width.saturating_sub(2).min(120).max(72);
         Self::draw_dialog_inline_static_with_width(out, dialog, box_width)
     }
 

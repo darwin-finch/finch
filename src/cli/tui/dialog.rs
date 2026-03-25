@@ -1495,6 +1495,53 @@ mod tests {
         );
     }
 
+    /// Regression (#45): pressing a printable char on the MultiSelect "Other" row
+    /// must immediately activate custom mode and insert the character — no Enter
+    /// required.  Mirrors test_select_other_row_char_activates_custom_mode for
+    /// the MultiSelect dialog type.
+    #[test]
+    fn test_multiselect_other_row_char_activates_custom_mode() {
+        let mut dialog = Dialog::multiselect_with_custom(
+            "T",
+            vec![DialogOption::new("A"), DialogOption::new("B")],
+        );
+        // Navigate to Other row (index 2 for a 2-option multiselect).
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 1→2 (Other)
+        // Press 'x' — must activate custom mode and insert the char.
+        let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
+        assert!(
+            result.is_none(),
+            "pressing char on Other must not close dialog"
+        );
+        assert!(
+            dialog.custom_mode_active,
+            "custom mode must activate on printable char in MultiSelect"
+        );
+        assert_eq!(
+            dialog.custom_input.as_deref(),
+            Some("x"),
+            "char must be inserted into custom_input without pressing Enter first"
+        );
+    }
+
+    /// Regression (#45): multiple chars typed on MultiSelect "Other" row accumulate.
+    #[test]
+    fn test_multiselect_other_row_char_accumulates_without_enter() {
+        let mut dialog = Dialog::multiselect_with_custom(
+            "T",
+            vec![DialogOption::new("A")],
+        );
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1 (Other)
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('h')));
+        dialog.handle_key_event(KeyEvent::from(KeyCode::Char('i')));
+        assert_eq!(
+            dialog.custom_input.as_deref(),
+            Some("hi"),
+            "chars must accumulate on MultiSelect Other row without pressing Enter"
+        );
+    }
+
     /// Guard: Space on the "Other" row in MultiSelect must not insert
     /// options.len() into selected_indices (would be an out-of-bounds index).
     #[test]

@@ -88,6 +88,7 @@ impl EventHandler {
             ReplEvent::Shutdown => {}
             ReplEvent::BrainQuestion { .. } => {}
             ReplEvent::BrainProposedAction { .. } => {}
+            ReplEvent::ShowDialog { .. } => {}
             ReplEvent::PosetComplete { .. } => {}
             ReplEvent::PeersDiscovered(_) => {}
             ReplEvent::VocabSync(_) => {}

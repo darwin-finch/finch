@@ -61,6 +61,14 @@ type PendingApprovalsMap = Arc<
     >,
 >;
 
+/// Continuation data for a poset run that is waiting for user confirmation.
+struct PendingPosetRun {
+    generator: Arc<dyn crate::generators::Generator>,
+    poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>,
+    stack: Arc<tokio::sync::Mutex<Vec<String>>>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
+}
+
 /// Main event loop for concurrent REPL
 #[allow(dead_code)]
 pub struct EventLoop {
@@ -222,6 +230,13 @@ pub struct EventLoop {
 
     /// The command string for the pending brain action (shown in the dialog).
     pending_brain_action_command: Option<String>,
+
+    /// Oneshot sender for a dialog shown via `ReplEvent::ShowDialog`.
+    /// The render tick delivers `pending_dialog_result` here when the dialog completes.
+    pending_dialog_tx: Option<tokio::sync::oneshot::Sender<crate::cli::tui::DialogResult>>,
+
+    /// Data for a pending Co-Forth poset run that is waiting on a confirmation dialog.
+    pending_poset_run: Option<PendingPosetRun>,
 
     /// Known brain states from last poll (Uuid -> BrainState), for transition detection.
     known_brain_states: std::collections::HashMap<Uuid, crate::server::BrainState>,
@@ -1099,6 +1114,8 @@ impl EventLoop {
             deferred_brain_question: None,
             pending_brain_action_tx: None,
             pending_brain_action_command: None,
+            pending_dialog_tx: None,
+            pending_poset_run: None,
             known_brain_states: std::collections::HashMap::new(),
             tool_call_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_daemon_brain_id: None,
@@ -1530,6 +1547,7 @@ s" it is ours"      s" -1 is ours"     argue
                         ReplEvent::Shutdown => "Shutdown",
                         ReplEvent::BrainQuestion { .. } => "BrainQuestion",
                         ReplEvent::BrainProposedAction { .. } => "BrainProposedAction",
+                        ReplEvent::ShowDialog { .. } => "ShowDialog",
                         ReplEvent::PosetComplete { result: Ok(_) } => "PosetComplete(ok)",
                         ReplEvent::PosetComplete { result: Err(_) } => "PosetComplete(err)",
                         ReplEvent::PeersDiscovered(_) => "PeersDiscovered",
@@ -1549,8 +1567,18 @@ s" it is ours"      s" -1 is ours"     argue
 
                 // Periodic rendering
                 _ = render_interval.tick() => {
-                    // Slowly rotate the poset 3D view at 33ms/tick (0.00265 rad ≈ same ~12s turn)
-                    self.poset.lock().await.rotate(0.00265, 0.0);
+                    // Only rotate the poset 3D view if the Co-Forth panel has content to display.
+                    // This saves significant CPU when the panel is empty (most of the time).
+                    {
+                        let tui = self.tui_renderer.lock().await;
+                        if let Some(text) = tui.corner.lock().ok().and_then(|g| g.clone()) {
+                            if !text.trim().is_empty() {
+                                drop(tui); // Release TUI lock before poset lock
+                                // Slowly rotate the poset 3D view at 33ms/tick (0.00265 rad ≈ same ~12s turn)
+                                self.poset.lock().await.rotate(0.00265, 0.0);
+                            }
+                        }
+                    }
 
                     // Check for pending cancellation
                     {
@@ -1568,8 +1596,39 @@ s" it is ours"      s" -1 is ours"     argue
                         if let Some(dialog_result) = tui.pending_dialog_result.take() {
                             drop(tui); // Release lock before async operations
 
-                            // Brain question takes priority (checked first).
-                            if let Some(brain_tx) = self.pending_brain_question_tx.take() {
+                            // Priority 0: ShowDialog (used by PresentPlan, AskUserQuestion, etc.)
+                            if let Some(tx) = self.pending_dialog_tx.take() {
+                                let _ = tx.send(dialog_result);
+                            }
+                            // Priority 1: Poset run confirmation (state machine — no oneshot)
+                            else if let Some(pending) = self.pending_poset_run.take() {
+                                if matches!(dialog_result, crate::cli::tui::DialogResult::Selected(0)) {
+                                    use crate::tools::implementations::{
+                                        BashTool, EditTool, GlobTool, GrepTool, ReadTool,
+                                        WebFetchTool, WriteTool,
+                                    };
+                                    let mut reg = crate::tools::ToolRegistry::new();
+                                    reg.register(Box::new(ReadTool));
+                                    reg.register(Box::new(GlobTool));
+                                    reg.register(Box::new(GrepTool));
+                                    reg.register(Box::new(BashTool));
+                                    reg.register(Box::new(WebFetchTool::new()));
+                                    reg.register(Box::new(WriteTool));
+                                    reg.register(Box::new(EditTool));
+                                    let registry = Some(Arc::new(reg));
+                                    let PendingPosetRun { generator, poset, stack, event_tx } = pending;
+                                    tokio::spawn(async move {
+                                        let result = crate::poset::executor::execute_poset(
+                                            poset, generator, registry, Some(stack),
+                                        ).await;
+                                        let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
+                                    });
+                                    self.output_manager.write_info("running");
+                                    self.render_tui().await.ok();
+                                }
+                            }
+                            // Priority 2: Brain question.
+                            else if let Some(brain_tx) = self.pending_brain_question_tx.take() {
                                 let opts = std::mem::take(&mut self.pending_brain_question_options);
                                 let answer = match &dialog_result {
                                     crate::cli::tui::DialogResult::TextEntered(s) => s.clone(),
@@ -3377,6 +3436,18 @@ Rules:\n\
                     );
                     self.render_tui().await?;
                 }
+            }
+
+            ReplEvent::ShowDialog { dialog, response_tx } => {
+                {
+                    let mut tui = self.tui_renderer.lock().await;
+                    tui.active_dialog = Some(dialog);
+                    tui.pending_dialog_result = None;
+                    let _ = tui.erase_live_area();
+                    let _ = tui.draw_live_area();
+                }
+                // Drop previous pending sender if any (new dialog supersedes).
+                self.pending_dialog_tx = Some(response_tx);
             }
         }
 
@@ -5586,6 +5657,21 @@ Rules:\n\
             return self.render_tui().await;
         }
 
+        // Skip definitions of words already in the VM — redefinition guard would fire.
+        let forth_defs = forth_defs
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                if t.starts_with(':') {
+                    let word = t[1..].trim().split_whitespace().next().unwrap_or("");
+                    !self.forth_vm.word_exists(word)
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
         // Remove dangerous definitions before compilation.
         let forth_defs = filter_ai_forth_response(&forth_defs);
 
@@ -6568,42 +6654,8 @@ Rules:\n\
         let is_non_empty = !self.poset.lock().await.is_empty();
 
         if is_non_empty {
-            // Show the execution plan and ask for approval before running anything.
-            let approved = self.confirm_poset_run().await?;
-            if !approved {
-                return Ok(());
-            }
-
-            use crate::tools::implementations::{
-                BashTool, EditTool, GlobTool, GrepTool, ReadTool, WebFetchTool, WriteTool,
-            };
-            let mut reg = crate::tools::ToolRegistry::new();
-            reg.register(Box::new(ReadTool));
-            reg.register(Box::new(GlobTool));
-            reg.register(Box::new(GrepTool));
-            reg.register(Box::new(BashTool));
-            reg.register(Box::new(WebFetchTool::new()));
-            reg.register(Box::new(WriteTool));
-            reg.register(Box::new(EditTool));
-            let registry = Some(Arc::new(reg));
-
-            let generator = self.cloud_gen.read().await.clone();
-            let poset = Arc::clone(&self.poset);
-            let stack = Arc::clone(&self.stack);
-            let event_tx = self.event_tx.clone();
-
-            // Spawn execution as a background task so the TUI keeps ticking.
-            // Node status (Pending → Running → Done) updates through the shared
-            // Arc<Mutex<Poset>>, so the Forth panel shows live progress.
-            tokio::spawn(async move {
-                let result =
-                    crate::poset::executor::execute_poset(poset, generator, registry, Some(stack))
-                        .await;
-                let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
-            });
-
-            self.output_manager.write_info("running");
-            self.render_tui().await?;
+            // Show confirmation dialog (non-blocking); continuation handled by render tick.
+            self.confirm_poset_run().await?;
         } else {
             self.execute_query(query).await?;
         }
@@ -6633,16 +6685,21 @@ Rules:\n\
         self.render_tui().await
     }
 
-    /// Show the execution plan and ask for approval before running the poset.
-    /// The plan shows which words run concurrently at each depth level,
-    /// and what tools (machine access) each word has.
-    async fn confirm_poset_run(&mut self) -> Result<bool> {
-        use crate::cli::tui::{Dialog, DialogOption, DialogResult};
+    /// Queue the poset run confirmation dialog (non-blocking).
+    ///
+    /// Sets `active_dialog` and stores the pending run data in `pending_poset_run`.
+    /// The render tick executes the poset when the user approves.
+    /// Returns `Ok(())` immediately; the approval is handled asynchronously.
+    ///
+    /// NOTE: The Forth VM show_dialog calls (sync closures ~line 1428–1462) still use
+    /// the blocking `show_dialog` path — those require a separate VM refactor.
+    async fn confirm_poset_run(&mut self) -> Result<()> {
+        use crate::cli::tui::{Dialog, DialogOption};
 
         let plan = {
             let p = self.poset.lock().await;
             if p.is_empty() {
-                return Ok(false);
+                return Ok(());
             }
 
             // Topological sort + depth propagation.
@@ -6707,8 +6764,25 @@ Rules:\n\
             vec![DialogOption::new("run"), DialogOption::new("cancel")],
         );
 
-        let result = { self.tui_renderer.lock().await.show_dialog(dialog)? };
-        Ok(matches!(result, DialogResult::Selected(0)))
+        // Store continuation data for the render tick.
+        let generator = self.cloud_gen.read().await.clone();
+        self.pending_poset_run = Some(PendingPosetRun {
+            generator,
+            poset: Arc::clone(&self.poset),
+            stack: Arc::clone(&self.stack),
+            event_tx: self.event_tx.clone(),
+        });
+
+        // Show dialog non-blocking (render tick will handle the result).
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = Some(dialog);
+            tui.pending_dialog_result = None;
+            let _ = tui.erase_live_area();
+            let _ = tui.draw_live_area();
+        }
+
+        Ok(())
     }
 
     /// Handle tool approval request (show dialog, get user response)
@@ -7046,6 +7120,7 @@ Rules:\n\
                     _ => {
                         // Rejected or cancelled
                         *self.mode.write().await = ReplMode::Normal;
+                        self.plan_word = None;
                         self.update_plan_mode_indicator(&ReplMode::Normal);
                         self.output_manager
                             .write_info("Plan rejected. Returned to normal mode.");
@@ -7054,6 +7129,7 @@ Rules:\n\
             }
             PlanResult::Cancelled => {
                 *self.mode.write().await = ReplMode::Normal;
+                self.plan_word = None;
                 self.update_plan_mode_indicator(&ReplMode::Normal);
                 self.output_manager
                     .write_info("Planning cancelled. Returned to normal mode.");
@@ -7973,6 +8049,147 @@ mod tests {
             Some(true),
             "orphaned tool_result user message must have been stripped"
         );
+    }
+
+    /// Regression: when ALL messages in the window are tool round-trips (no plain
+    /// user text), the old cascade-removal code would strip the orphaned tool_result
+    /// AND the next assistant, making the following tool_result an orphan, and so on
+    /// until the 2-message floor left a single orphaned tool_result at position 0.
+    /// The fix inserts a placeholder user turn instead of cascading.
+    #[test]
+    fn test_sliding_window_all_tool_rounds_no_cascade_orphan() {
+        use crate::claude::Message;
+
+        // Build a conversation that is ENTIRELY tool round-trips:
+        //   [0] user "query"               ← outside window (dropped by slice)
+        //   [1] asst tool_use(A)           ← outside window
+        //   [2] user tool_result(A)        ← window start → ORPHANED
+        //   [3] asst tool_use(B)           ← valid pair start
+        //   [4] user tool_result(B)        ← valid
+        //   [5] asst tool_use(C)
+        //   [6] user tool_result(C)
+        //
+        // window=5 keeps msgs[2..] = [orphan, asst(B), user(B), asst(C), user(C)]
+        let make_tool_result_msg = |id: &str| Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: "ok".to_string(),
+                is_error: None,
+            }],
+        };
+        let make_tool_use_msg = |id: &str| Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({}),
+            }],
+        };
+
+        let msgs: Vec<Message> = vec![
+            user_msg("query"),          // [0] outside window
+            make_tool_use_msg("A"),     // [1] outside window
+            make_tool_result_msg("A"),  // [2] orphaned boundary
+            make_tool_use_msg("B"),     // [3] valid
+            make_tool_result_msg("B"),  // [4] valid
+            make_tool_use_msg("C"),     // [5] valid
+            make_tool_result_msg("C"),  // [6] valid
+        ];
+
+        let result = apply_sliding_window(msgs, 5);
+
+        // Must start with a user message.
+        assert_eq!(
+            result.first().unwrap().role,
+            "user",
+            "window must start with user"
+        );
+        // The first user message must NOT be a pure tool_result (no orphan).
+        let first_is_tool_result_only = result.first().map(|m| {
+            m.content.iter().all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        });
+        assert_ne!(
+            first_is_tool_result_only,
+            Some(true),
+            "orphaned tool_result must not be first: {:?}",
+            result.first()
+        );
+        // Valid tool rounds (B and C) must be preserved.
+        assert!(
+            result.len() >= 4,
+            "valid tool round-trips B and C should be in window; got {} messages",
+            result.len()
+        );
+    }
+
+    /// Regression: orphaned tool_use (assistant sent tool_use but query was
+    /// cancelled before tool_result was added). The final-pass validator in
+    /// apply_sliding_window should strip the orphaned tool_use blocks, keeping
+    /// any text content, so the conversation sent to the provider is clean.
+    #[test]
+    fn test_sliding_window_strips_orphaned_tool_use() {
+        use crate::claude::Message;
+
+        // Simulate a cancelled query: assistant wrote tool_uses but the
+        // corresponding tool_result user message was never added.
+        //   [0] user "query"
+        //   [1] assistant: text + tool_use A  ← orphaned (no tool_result follows)
+        //   [2] user "fix it"
+        let msgs: Vec<Message> = vec![
+            user_msg("query"),
+            Message {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentBlock::Text {
+                        text: "I'll analyze that.".to_string(),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "toolu_orphan".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"file_path": "/foo"}),
+                    },
+                ],
+            },
+            user_msg("fix it"),
+        ];
+
+        let result = apply_sliding_window(msgs, 20);
+
+        // The orphaned tool_use block must be stripped; text content kept.
+        for msg in &result {
+            let has_orphaned_tool_use = msg.content.iter().any(|b| {
+                if let ContentBlock::ToolUse { id, .. } = b {
+                    id == "toolu_orphan"
+                } else {
+                    false
+                }
+            });
+            assert!(
+                !has_orphaned_tool_use,
+                "orphaned tool_use must be stripped; got message: {:?}",
+                msg
+            );
+        }
+
+        // The text content ("I'll analyze that.") should be preserved.
+        let has_text = result.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("I'll analyze")))
+        });
+        assert!(has_text, "text content of orphaned assistant message must be preserved");
+
+        // Window must start with a user message.
+        assert_eq!(result.first().unwrap().role, "user");
+
+        // "fix it" must still be present.
+        let has_fix_it = result.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("fix it")))
+        });
+        assert!(has_fix_it, "user follow-up message must be preserved");
     }
 
     // ── tool_approval_summary ────────────────────────────────────────────────
