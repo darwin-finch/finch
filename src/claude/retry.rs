@@ -7,7 +7,26 @@ use tokio::time::sleep;
 const MAX_RETRIES: u32 = 3;
 const BASE_DELAY_MS: u64 = 1000;
 
-/// Execute a function with exponential backoff retry logic
+/// A marker error type that tells `with_retry` not to retry the request.
+///
+/// Providers wrap 4xx HTTP client errors in this type so that malformed-request
+/// errors are surfaced immediately rather than wasted on identical retries.
+#[derive(Debug)]
+pub struct NonRetriableError(pub String);
+
+impl std::fmt::Display for NonRetriableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for NonRetriableError {}
+
+/// Execute a function with exponential backoff retry logic.
+///
+/// Errors wrapped in [`NonRetriableError`] are returned immediately without
+/// retrying (e.g. 4xx HTTP client errors where the payload is definitively
+/// malformed and retrying would always produce the same failure).
 pub async fn with_retry<F, Fut, T>(f: F) -> Result<T>
 where
     F: Fn() -> Fut,
@@ -19,6 +38,12 @@ where
         match f().await {
             Ok(result) => return Ok(result),
             Err(e) => {
+                // Don't retry deterministic client errors — the same request will
+                // always fail with the same 4xx response.
+                if e.downcast_ref::<NonRetriableError>().is_some() {
+                    return Err(e);
+                }
+
                 last_error = Some(e);
 
                 if attempt < MAX_RETRIES - 1 {

@@ -17,7 +17,8 @@ pub use brain_registry::{
 };
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
-    create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
+    create_router, handle_file_get, handle_file_put, handle_node_info, handle_node_stats,
+    health_check, metrics_endpoint,
 };
 pub use middleware::{auth_middleware, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
@@ -173,13 +174,27 @@ impl AgentServer {
 
         tracing::info!("Training worker spawned");
 
+        // Spawn IRC-like binary channel server on HTTP port + 1 (e.g. 8000 → 8001).
+        // Peers connect over TCP to JOIN channels, YIELD code, and trigger EXEC.
+        // Shares the same registry as the HTTP handlers and Forth words.
+        let channel_port: u16 = addr.port().saturating_add(1);
+        let channel_registry = std::sync::Arc::clone(&crate::server::handlers::CHANNEL_REGISTRY);
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::coforth::irc_proto::start_channel_server(channel_port, channel_registry)
+                    .await
+            {
+                tracing::warn!("channel server exited: {e}");
+            }
+        });
+
         // Background task: expire stale registry entries every 30 seconds.
         let registry = std::sync::Arc::clone(&crate::server::handlers::REGISTRY);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                registry.expire().await;
+                registry.expire();
             }
         });
 
@@ -198,7 +213,7 @@ impl AgentServer {
             bench_ms: Some(specs.2),
         };
         let registry2 = std::sync::Arc::clone(&crate::server::handlers::REGISTRY);
-        registry2.join(self_entry.clone()).await;
+        registry2.join(self_entry.clone());
         tracing::info!("Registered self in registry: {}", self_addr);
 
         // Heartbeat: keep this node alive in its own registry.
@@ -206,7 +221,7 @@ impl AgentServer {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                registry2.heartbeat(&self_addr).await;
+                registry2.heartbeat(&self_addr);
             }
         });
 

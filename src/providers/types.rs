@@ -159,6 +159,63 @@ impl ProviderRequest {
             self.messages.remove(last_assistant_idx);
         }
 
+        // Forward scan: remove ToolResult blocks whose tool_use_id has no matching
+        // ToolUse in the immediately preceding assistant message.
+        //
+        // This catches mid-conversation orphans that the tail-cleanup loop above
+        // misses — e.g. when a user message ends up with a stale ToolResult from a
+        // cancelled or retried round after the conversation history is rebuilt.
+        {
+            use std::collections::HashSet;
+            let mut i = 0;
+            while i < self.messages.len() {
+                if self.messages[i].role != "user" {
+                    i += 1;
+                    continue;
+                }
+
+                // Collect the ToolUse IDs from the immediately preceding assistant message.
+                let allowed_ids: HashSet<String> = if i > 0
+                    && self.messages[i - 1].role == "assistant"
+                {
+                    self.messages[i - 1]
+                        .content
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::ToolUse { id, .. } = b {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
+
+                // Retain only ToolResult blocks whose IDs are in allowed_ids;
+                // non-ToolResult blocks are always kept.
+                let had_tool_results = self.messages[i]
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                self.messages[i].content.retain(|b| match b {
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        allowed_ids.contains(tool_use_id)
+                    }
+                    _ => true,
+                });
+
+                // If the message is now empty (was all orphaned ToolResults), drop it.
+                if self.messages[i].content.is_empty() && had_tool_results {
+                    self.messages.remove(i);
+                    continue;
+                }
+
+                i += 1;
+            }
+        }
+
         // Strip images that exceed provider limits (Claude: 5 MB, Grok: unsupported).
         // base64-encoded PNG from a Retina screenshot can easily be 7+ MB.
         // Replace them with a text placeholder so the conversation stays valid.

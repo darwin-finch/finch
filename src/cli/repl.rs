@@ -2252,10 +2252,15 @@ impl Repl {
                         | "glob"
                         | "grep"
                         | "web_fetch"
+                        | "bash"
+                        | "Bash"
                         | "present_plan"
                         | "PresentPlan"
                         | "ask_user_question"
                         | "AskUserQuestion"
+                        | "EnterPlanMode"
+                        | "ExitPlanMode"
+                        | "Push"
                 )
             }
         }

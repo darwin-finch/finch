@@ -11,8 +11,12 @@ use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::Value;
 use std::fs;
+use std::io::IsTerminal;
+
+use super::propose::{propose_in_editor, run_script_async};
 
 // ANSI colors for diff display
 const RED: &str = "\x1b[31m";
@@ -23,6 +27,36 @@ const GREEN_BG: &str = "\x1b[48;5;22m"; // Dark green background
 const RESET: &str = "\x1b[0m";
 
 const CONTEXT_LINES: usize = 3;
+
+/// Build a bash/python script that applies an edit to a file.
+/// Used by the propose-before-execute flow.
+fn build_edit_code(file_path: &str, old_string: &str, new_string: &str, replace_all: bool) -> String {
+    let old_b64 = base64::engine::general_purpose::STANDARD.encode(old_string);
+    let new_b64 = base64::engine::general_purpose::STANDARD.encode(new_string);
+    let path_py = format!("{:?}", file_path);
+    let replace_all_py = if replace_all { "True" } else { "False" };
+    [
+        "python3 << 'PYEOF'\n",
+        "import base64, sys\n",
+        &format!("path = {}\n", path_py),
+        &format!("old = base64.b64decode(b\"{}\").decode(\"utf-8\")\n", old_b64),
+        &format!("new_str = base64.b64decode(b\"{}\").decode(\"utf-8\")\n", new_b64),
+        "with open(path, \"r\") as f:\n",
+        "    content = f.read()\n",
+        "if old not in content:\n",
+        "    print(\"ERROR: old_string not found in \" + path, file=sys.stderr)\n",
+        "    sys.exit(1)\n",
+        &format!("if {}:\n", replace_all_py),
+        "    content = content.replace(old, new_str)\n",
+        "else:\n",
+        "    content = content.replace(old, new_str, 1)\n",
+        "with open(path, \"w\") as f:\n",
+        "    f.write(content)\n",
+        "print(\"Edited \" + path)\n",
+        "PYEOF",
+    ]
+    .concat()
+}
 
 pub struct EditTool;
 
@@ -81,6 +115,27 @@ impl Tool for EditTool {
             .context("Missing new_string parameter")?;
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
 
+        // Interactive: propose the script in $EDITOR before applying.
+        if std::io::stdin().is_terminal() {
+            let old_lines = old_string.lines().count();
+            let new_lines = new_string.lines().count();
+            let description = format!(
+                "Edit {}\nRemove {} line{}, add {} line{}",
+                file_path,
+                old_lines,
+                if old_lines == 1 { "" } else { "s" },
+                new_lines,
+                if new_lines == 1 { "" } else { "s" },
+            );
+            let code = build_edit_code(file_path, old_string, new_string, replace_all);
+            let approved = propose_in_editor(&description, &code).await?;
+            return match approved {
+                None => Ok("Edit aborted by user.".to_string()),
+                Some(script) => run_script_async(&script).await,
+            };
+        }
+
+        // Non-interactive (tests, daemon): apply in Rust.
         // Read original content
         let original = fs::read_to_string(file_path)
             .with_context(|| format!("Failed to read file: {}", file_path))?;

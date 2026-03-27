@@ -83,6 +83,7 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         // Note: node handlers load config independently (no AgentServer state needed)
         // Co-Forth remote eval and direct exec
         .route("/v1/forth/eval", post(handle_forth_eval))
+        .route("/v1/forth/resume", post(handle_forth_resume))
         .route("/v1/forth/define", post(handle_forth_define))
         .route("/v1/forth/vocab", get(handle_forth_vocab))
         .route("/v1/forth/push", post(handle_forth_push))
@@ -91,6 +92,17 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
             post(handle_forth_hash_set).get(handle_forth_hash_get),
         )
         .route("/v1/exec", post(handle_exec))
+        // Co-Forth mutual execution sessions
+        .route("/v1/forth/coforth", post(handle_coforth_create))
+        .route("/v1/forth/coforth/:id", get(handle_coforth_get))
+        .route("/v1/forth/coforth/:id/yield", post(handle_coforth_yield))
+        .route("/v1/forth/coforth/:id/agree", post(handle_coforth_agree))
+        // Channel contribution stacks
+        .route("/v1/forth/channel/:name/contribute", post(handle_channel_contribute))
+        .route("/v1/forth/channel/:name", get(handle_channel_get))
+        .route("/v1/forth/channel/:name/execute", post(handle_channel_execute))
+        .route("/v1/file/get", get(handle_file_get))
+        .route("/v1/file/put", post(handle_file_put))
         // Peer registry
         .route("/v1/registry/join", post(handle_registry_join))
         .route("/v1/registry/leave", post(handle_registry_leave))
@@ -100,6 +112,7 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/registry/ledgers", get(handle_registry_all_ledgers))
         .route("/v1/registry/debit", post(handle_registry_debit))
         .route("/v1/settle", post(handle_settle))
+        .route("/v1/gas/transfer", post(handle_gas_transfer))
         // Session WebSocket — bidirectional event bus between two finch nodes
         .route("/v1/session/ws", get(handle_session_ws))
         // Cross-machine peer relay
@@ -755,6 +768,11 @@ struct ForthEvalResponse {
     /// Set by `forth-back" <code>"` in the remote program.
     #[serde(skip_serializing_if = "Option::is_none")]
     forth_back: Option<String>,
+    /// Suspended continuation captured at the last `yield` point.
+    /// The caller can POST this to any peer's `/v1/forth/resume` to continue
+    /// the computation there, or execute it locally with the `resume` builtin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation: Option<crate::coforth::interpreter::Continuation>,
 }
 
 /// Global broadcast channel for incoming push messages.
@@ -845,12 +863,12 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
 
     // Credit this machine for the work it just performed.
     if let Some(addr) = vm.registry_addr.clone() {
-        REGISTRY.credit(&addr, compute_ms).await;
+        REGISTRY.credit(&addr, compute_ms);
     }
 
     // Debit the caller and check if they've crossed the debt threshold.
     let debt_warning = if let Some(caller) = &req.caller {
-        let (balance, crossed) = REGISTRY.debit(caller, compute_ms).await;
+        let (balance, crossed) = REGISTRY.debit(caller, compute_ms);
         if crossed {
             let threshold_s = REGISTRY.debt_threshold_ms as f64 / 1000.0;
             let balance_s = balance.abs() as f64 / 1000.0;
@@ -858,7 +876,7 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
                 "compute debt: {:.1}s owed (threshold {:.1}s) — please settle",
                 balance_s, threshold_s
             ))
-        } else if REGISTRY.is_in_debt(caller).await {
+        } else if REGISTRY.is_in_debt(caller) {
             let balance_s = balance.abs() as f64 / 1000.0;
             Some(format!("compute debt: {:.1}s owed", balance_s))
         } else {
@@ -876,6 +894,7 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
             compute_ms,
             debt_warning,
             forth_back: vm.forth_back.clone(),
+            continuation: vm.pending_continuation.clone(),
         })),
         Err(e) => Ok(Json(ForthEvalResponse {
             output: vm.out.clone(),
@@ -884,6 +903,95 @@ async fn handle_forth_eval_inner(req: ForthEvalRequest) -> anyhow::Result<Json<F
             compute_ms,
             debt_warning,
             forth_back: vm.forth_back.clone(),
+            continuation: vm.pending_continuation.clone(),
+        })),
+    }
+}
+
+// ── POST /v1/forth/resume ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ForthResumeRequest {
+    continuation: crate::coforth::interpreter::Continuation,
+    /// Address of the requesting machine — used for ledger debit tracking.
+    #[serde(default)]
+    caller: Option<String>,
+}
+
+/// POST /v1/forth/resume — resume a suspended Co-Forth continuation.
+///
+/// The caller supplies a `Continuation` (stack + code + string pool) that was
+/// previously captured by a `yield` on any machine.  This machine restores the
+/// stack, merges the string pool, and executes the remaining code under the
+/// same constitutional constraints as a normal `/v1/forth/eval`.
+///
+/// **Danger**: the `code` field runs with the same authority as any peer eval.
+/// Only resume continuations from peers you trust.
+async fn handle_forth_resume(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<ForthResumeRequest>,
+) -> Result<Json<ForthEvalResponse>, Response> {
+    let ip = addr.ip().to_string();
+    if let Err(r) = check_peer_token(&headers, &ip, "/v1/forth/resume") {
+        return Err(r);
+    }
+    handle_forth_resume_inner(req)
+        .await
+        .map_err(|e| AppError(e).into_response())
+}
+
+async fn handle_forth_resume_inner(req: ForthResumeRequest) -> anyhow::Result<Json<ForthEvalResponse>> {
+    let base = LIVE_VM.read().await;
+    let mut vm = base.clone_dict();
+    drop(base);
+    vm.remote_mode = true;
+
+    let depth_before = 0; // report entire resulting stack
+    let t0 = std::time::Instant::now();
+    let result = vm.apply_continuation(&req.continuation);
+    let compute_ms = t0.elapsed().as_millis() as u64;
+
+    if let Some(ref addr) = vm.registry_addr.clone() {
+        REGISTRY.credit(addr, compute_ms);
+    }
+    let debt_warning = if let Some(caller) = &req.caller {
+        let (balance, crossed) = REGISTRY.debit(caller, compute_ms);
+        if crossed {
+            let threshold_s = REGISTRY.debt_threshold_ms as f64 / 1000.0;
+            let balance_s = balance.abs() as f64 / 1000.0;
+            Some(format!(
+                "compute debt: {:.1}s owed (threshold {:.1}s) — please settle",
+                balance_s, threshold_s
+            ))
+        } else if REGISTRY.is_in_debt(caller) {
+            let balance_s = balance.abs() as f64 / 1000.0;
+            Some(format!("compute debt: {:.1}s owed", balance_s))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match result {
+        Ok(()) => Ok(Json(ForthEvalResponse {
+            output: vm.out.clone(),
+            stack: vm.data_stack()[depth_before..].to_vec(),
+            error: None,
+            compute_ms,
+            debt_warning,
+            forth_back: vm.forth_back.clone(),
+            continuation: vm.pending_continuation.clone(),
+        })),
+        Err(e) => Ok(Json(ForthEvalResponse {
+            output: vm.out.clone(),
+            stack: vm.data_stack()[depth_before..].to_vec(),
+            error: Some(e.to_string()),
+            compute_ms,
+            debt_warning,
+            forth_back: vm.forth_back.clone(),
+            continuation: vm.pending_continuation.clone(),
         })),
     }
 }
@@ -926,6 +1034,7 @@ async fn handle_forth_define(
                 compute_ms: 0,
                 debt_warning: None,
                 forth_back: None,
+                continuation: None,
             }))
         }
         Err(e) => Ok(Json(ForthEvalResponse {
@@ -935,6 +1044,7 @@ async fn handle_forth_define(
             compute_ms: 0,
             debt_warning: None,
             forth_back: None,
+            continuation: None,
         })),
     }
 }
@@ -1034,19 +1144,19 @@ struct RegistryHeartbeatRequest {
 async fn handle_registry_join(
     Json(entry): Json<crate::registry::PeerEntry>,
 ) -> Json<RegistryJoinResponse> {
-    let addr = REGISTRY.join(entry).await;
+    let addr = REGISTRY.join(entry);
     Json(RegistryJoinResponse { addr, ttl_secs: 90 })
 }
 
 /// POST /v1/registry/leave — deregister a peer immediately.
 async fn handle_registry_leave(Json(req): Json<RegistryLeaveRequest>) -> StatusCode {
-    REGISTRY.leave(&req.addr).await;
+    REGISTRY.leave(&req.addr);
     StatusCode::OK
 }
 
 /// POST /v1/registry/heartbeat — refresh TTL for a peer.
 async fn handle_registry_heartbeat(Json(req): Json<RegistryHeartbeatRequest>) -> StatusCode {
-    REGISTRY.heartbeat(&req.addr).await;
+    REGISTRY.heartbeat(&req.addr);
     StatusCode::OK
 }
 
@@ -1060,21 +1170,19 @@ struct RegistryPeersQuery {
 async fn handle_registry_peers(
     axum::extract::Query(q): axum::extract::Query<RegistryPeersQuery>,
 ) -> Json<Vec<crate::registry::PeerEntry>> {
-    let peers = REGISTRY.peers(q.tag.as_deref(), q.region.as_deref()).await;
-    Json(peers)
+    Json(REGISTRY.peers(q.tag.as_deref(), q.region.as_deref()))
 }
 
 /// GET /v1/registry/ledger/:addr — get the ledger entry for one peer.
 async fn handle_registry_ledger(
     axum::extract::Path(addr): axum::extract::Path<String>,
-) -> Result<Json<crate::registry::LedgerEntry>, AppError> {
-    let entry = REGISTRY.ledger(&addr).await.unwrap_or_default();
-    Ok(Json(entry))
+) -> Json<crate::registry::LedgerEntry> {
+    Json(REGISTRY.ledger(&addr).unwrap_or_default())
 }
 
 /// GET /v1/registry/ledgers — get ledger entries for all live peers.
 async fn handle_registry_all_ledgers() -> Json<Vec<(String, crate::registry::LedgerEntry)>> {
-    Json(REGISTRY.all_ledgers().await)
+    Json(REGISTRY.all_ledgers())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1087,7 +1195,7 @@ struct RegistryDebitRequest {
 ///
 /// Called by the machine that requested work to record its debt.
 async fn handle_registry_debit(Json(req): Json<RegistryDebitRequest>) -> StatusCode {
-    REGISTRY.debit(&req.addr, req.compute_ms).await;
+    REGISTRY.debit(&req.addr, req.compute_ms);
     StatusCode::OK
 }
 
@@ -1110,7 +1218,7 @@ struct SettleResponse {
 /// The debtor POSTs here to acknowledge their debt and ask to clear the ledger.
 /// We verify the amount is within 10% of what we recorded, then zero the entry.
 async fn handle_settle(Json(req): Json<SettleRequest>) -> Result<Json<SettleResponse>, AppError> {
-    let ledger = REGISTRY.ledger(&req.creditor).await.unwrap_or_default();
+    let ledger = REGISTRY.ledger(&req.creditor).unwrap_or_default();
     let recorded_ms = ledger
         .credits_ms
         .saturating_sub(ledger.debits_ms.min(ledger.credits_ms));
@@ -1135,10 +1243,46 @@ async fn handle_settle(Json(req): Json<SettleRequest>) -> Result<Json<SettleResp
         .into());
     }
 
-    REGISTRY.settle(&req.creditor).await;
+    REGISTRY.settle(&req.creditor);
     Ok(Json(SettleResponse {
         cleared_ms: recorded_ms,
         message: format!("settled: {}ms cleared", recorded_ms),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Gas transfer endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct GasTransferRequest {
+    /// Machine sending gas (will be debited).
+    from: String,
+    /// Machine receiving gas (will be credited).
+    to: String,
+    /// Amount of gas in milliseconds of compute credit.
+    amount_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct GasTransferResponse {
+    message: String,
+}
+
+/// POST /v1/gas/transfer — send gas from one machine to another.
+///
+/// Debits `from` and credits `to` by `amount_ms`.
+/// Both machines must be registered.
+async fn handle_gas_transfer(
+    Json(req): Json<GasTransferRequest>,
+) -> Result<Json<GasTransferResponse>, AppError> {
+    REGISTRY.transfer(&req.from, &req.to, req.amount_ms)?;
+    let amount_s = req.amount_ms as f64 / 1000.0;
+    Ok(Json(GasTransferResponse {
+        message: format!(
+            "transferred {:.1}s from {} to {}",
+            amount_s, req.from, req.to
+        ),
     }))
 }
 
@@ -1415,4 +1559,419 @@ async fn handle_session_list() -> Json<Vec<SessionListEntry>> {
         })
         .collect();
     Json(entries)
+}
+
+// ── Co-Forth session endpoints ────────────────────────────────────────────────
+//
+// Minimal message protocol:
+//   POST /v1/forth/coforth                 — create session between two peers
+//   POST /v1/forth/coforth/:id/yield       — yield a program fragment
+//   POST /v1/forth/coforth/:id/agree       — signal readiness to execute
+//   GET  /v1/forth/coforth/:id             — poll session state
+
+static CO_SESSION_STORE: std::sync::LazyLock<crate::coforth::co_session::SessionStore> =
+    std::sync::LazyLock::new(crate::coforth::co_session::new_session_store);
+
+/// Global channel registry — unified state for Forth words, HTTP endpoints, and TCP IRC peers.
+/// `join"`, `yield-to"`, `execute-channel"`, and remote TCP connections all share this store.
+pub static CHANNEL_REGISTRY: std::sync::LazyLock<crate::coforth::irc_proto::ChannelRegistry> =
+    std::sync::LazyLock::new(crate::coforth::irc_proto::new_channel_registry);
+
+#[derive(Debug, Deserialize)]
+struct CoForthCreateRequest {
+    peer_a: String,
+    peer_b: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CoForthCreateResponse {
+    session_id: Uuid,
+}
+
+/// POST /v1/forth/coforth — create a new co-forth session between two peers.
+async fn handle_coforth_create(Json(req): Json<CoForthCreateRequest>) -> Json<CoForthCreateResponse> {
+    let session = crate::coforth::co_session::CoForthSession::new(req.peer_a, req.peer_b);
+    let id = session.id;
+    CO_SESSION_STORE.lock().unwrap().insert(id, session);
+    Json(CoForthCreateResponse { session_id: id })
+}
+
+#[derive(Debug, Deserialize)]
+struct CoForthYieldRequest {
+    from: String,
+    program: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CoForthStateResponse {
+    session_id: Uuid,
+    stack_a: Vec<String>,
+    stack_b: Vec<String>,
+    agreed_a: bool,
+    agreed_b: bool,
+    consensus: bool,
+    /// When consensus is true: program peer_b should run.
+    program_for_b: Option<String>,
+    /// When consensus is true: program peer_a should run.
+    program_for_a: Option<String>,
+}
+
+/// POST /v1/forth/coforth/:id/yield — yield a program fragment from one peer.
+async fn handle_coforth_yield(
+    Path(id): Path<Uuid>,
+    Json(req): Json<CoForthYieldRequest>,
+) -> Result<Json<CoForthStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let mut store = CO_SESSION_STORE.lock().unwrap();
+    let session = store.get_mut(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        )
+    })?;
+    session.push_yield(&req.from, req.program);
+    let consensus = session.consensus();
+    let (pfb, pfa) = if consensus {
+        (Some(session.program_for_b()), Some(session.program_for_a()))
+    } else {
+        (None, None)
+    };
+    Ok(Json(CoForthStateResponse {
+        session_id: session.id,
+        stack_a: session.stack_a.clone(),
+        stack_b: session.stack_b.clone(),
+        agreed_a: session.agreed_a,
+        agreed_b: session.agreed_b,
+        consensus,
+        program_for_b: pfb,
+        program_for_a: pfa,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CoForthAgreeRequest {
+    from: String,
+}
+
+/// POST /v1/forth/coforth/:id/agree — signal agreement; returns state (consensus fires execution).
+async fn handle_coforth_agree(
+    Path(id): Path<Uuid>,
+    Json(req): Json<CoForthAgreeRequest>,
+) -> Result<Json<CoForthStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let mut store = CO_SESSION_STORE.lock().unwrap();
+    let session = store.get_mut(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        )
+    })?;
+    session.agree(&req.from);
+    let consensus = session.consensus();
+    let (pfb, pfa) = if consensus {
+        (Some(session.program_for_b()), Some(session.program_for_a()))
+    } else {
+        (None, None)
+    };
+    Ok(Json(CoForthStateResponse {
+        session_id: session.id,
+        stack_a: session.stack_a.clone(),
+        stack_b: session.stack_b.clone(),
+        agreed_a: session.agreed_a,
+        agreed_b: session.agreed_b,
+        consensus,
+        program_for_b: pfb,
+        program_for_a: pfa,
+    }))
+}
+
+/// GET /v1/forth/coforth/:id — poll session state.
+async fn handle_coforth_get(
+    Path(id): Path<Uuid>,
+) -> Result<Json<CoForthStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let store = CO_SESSION_STORE.lock().unwrap();
+    let session = store.get(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        )
+    })?;
+    let consensus = session.consensus();
+    let (pfb, pfa) = if consensus {
+        (Some(session.program_for_b()), Some(session.program_for_a()))
+    } else {
+        (None, None)
+    };
+    Ok(Json(CoForthStateResponse {
+        session_id: session.id,
+        stack_a: session.stack_a.clone(),
+        stack_b: session.stack_b.clone(),
+        agreed_a: session.agreed_a,
+        agreed_b: session.agreed_b,
+        consensus,
+        program_for_b: pfb,
+        program_for_a: pfa,
+    }))
+}
+
+// ── Channel contribution endpoints ───────────────────────────────────────────
+//
+// Every peer on the LAN can push a Forth program onto a named channel's stack.
+// The stack is visible to all; any peer can trigger execution.
+
+#[derive(Debug, Deserialize)]
+struct ChannelContributeRequest {
+    from: String,
+    program: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChannelEntry {
+    from: String,
+    program: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChannelStateResponse {
+    channel: String,
+    contributions: Vec<ChannelEntry>,
+}
+
+/// POST /v1/forth/channel/:name/contribute — receive a contribution from a peer.
+async fn handle_channel_contribute(
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<ChannelContributeRequest>,
+) -> StatusCode {
+    let ip = addr.ip().to_string();
+    if check_peer_token(&headers, &ip, "/v1/forth/channel/contribute").is_err() {
+        return StatusCode::FORBIDDEN;
+    }
+    let chan = if name.starts_with('#') { name } else { format!("#{name}") };
+    use crate::coforth::irc_proto::{IrcMessage, OP_YIELD};
+    crate::coforth::irc_proto::process_message(
+        IrcMessage::new(OP_YIELD, &req.from, &chan, req.program.as_bytes().to_vec()),
+        &CHANNEL_REGISTRY,
+    );
+    StatusCode::OK
+}
+
+/// GET /v1/forth/channel/:name — list all contributions in a channel.
+async fn handle_channel_get(Path(name): Path<String>) -> Json<ChannelStateResponse> {
+    let chan = if name.starts_with('#') { name.clone() } else { format!("#{name}") };
+    let reg = CHANNEL_REGISTRY.lock().unwrap();
+    let contributions = reg
+        .get(&chan)
+        .map(|s| {
+            s.stack
+                .iter()
+                .map(|(f, p)| ChannelEntry { from: f.clone(), program: p.clone() })
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(ChannelStateResponse { channel: chan, contributions })
+}
+
+/// POST /v1/forth/channel/:name/execute — run all contributions in a channel on this peer.
+async fn handle_channel_execute(Path(name): Path<String>) -> Json<serde_json::Value> {
+    let chan = if name.starts_with('#') { name } else { format!("#{name}") };
+    use crate::coforth::irc_proto::{IrcMessage, OP_EXEC};
+    let reply = crate::coforth::irc_proto::process_message(
+        IrcMessage::new(OP_EXEC, "http", &chan, vec![]),
+        &CHANNEL_REGISTRY,
+    );
+    let combined = reply
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .unwrap_or_default();
+    if combined.is_empty() {
+        return Json(serde_json::json!({ "output": "", "error": "no contributions" }));
+    }
+    let base = LIVE_VM.read().await;
+    let mut vm = base.clone_dict();
+    drop(base);
+    vm.remote_mode = true;
+    match vm.exec(&combined) {
+        Ok(out) => Json(serde_json::json!({ "output": out, "stack": vm.data_stack() })),
+        Err(e) => Json(serde_json::json!({ "output": vm.out, "error": e.to_string() })),
+    }
+}
+
+// ── File transfer: zip/unzip over the peer protocol ───────────────────────────
+
+/// Recursively add a file or directory into a ZipWriter.
+/// Paths inside the archive are relative to `base`.
+fn zip_add_to_writer<W: std::io::Write + std::io::Seek>(
+    zw: &mut zip::ZipWriter<W>,
+    path: &std::path::Path,
+    base: &std::path::Path,
+    opts: zip::write::SimpleFileOptions,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    if path.is_file() {
+        let rel = path.strip_prefix(base).unwrap_or(path).to_string_lossy().to_string();
+        zw.start_file(&rel, opts)?;
+        zw.write_all(&std::fs::read(path)?)?;
+    } else if path.is_dir() {
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let p = entry?.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().to_string();
+                    zw.start_file(&rel, opts)?;
+                    zw.write_all(&std::fs::read(&p)?)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct FileGetParams {
+    path: String,
+}
+
+/// GET /v1/file/get?path=<localpath>
+///
+/// Zips `path` and returns the raw bytes as `application/zip`.
+/// The zip is created relative to the parent of `path` so the top-level entry
+/// inside the archive is just the basename, not the full absolute path.
+pub async fn handle_file_get(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(params): Query<FileGetParams>,
+) -> Result<Response, AppError> {
+    let ip = addr.ip().to_string();
+    check_peer_token(&headers, &ip, "/v1/file/get")
+        .map_err(|r| AppError(anyhow::anyhow!("{:?}", r)))?;
+
+    let src = std::path::Path::new(&params.path);
+    if !src.exists() {
+        return Err(AppError(anyhow::anyhow!("path not found: {}", params.path)));
+    }
+
+    let parent = src.parent().unwrap_or(std::path::Path::new("."));
+    let name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archive");
+
+    // Build zip in memory using the zip crate (no external binary required).
+    let bytes = tokio::task::spawn_blocking({
+        let src = src.to_path_buf();
+        let parent = parent.to_path_buf();
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        move || -> anyhow::Result<Vec<u8>> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            zip_add_to_writer(&mut zw, &src, &parent, opts)?;
+            zw.finish()?;
+            Ok(buf.into_inner())
+        }
+    })
+    .await
+    .map_err(|e| AppError(anyhow::anyhow!("zip task: {}", e)))?
+    .map_err(AppError)?;
+
+    let filename = format!("{}.zip", name);
+
+    use axum::http::header;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", filename),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+struct FilePutParams {
+    /// Filename to save the zip as (default: random UUID + .zip).
+    #[serde(default)]
+    name: Option<String>,
+    /// Directory to unzip into (default: ~/.finch/received/).
+    #[serde(default)]
+    dest: Option<String>,
+}
+
+/// POST /v1/file/put?name=archive.zip&dest=/some/dir
+///
+/// Accepts raw zip bytes, saves to `dest` (default `~/.finch/received/`),
+/// and immediately unzips in place.
+pub async fn handle_file_put(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(params): Query<FilePutParams>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let ip = addr.ip().to_string();
+    check_peer_token(&headers, &ip, "/v1/file/put")
+        .map_err(|r| AppError(anyhow::anyhow!("{:?}", r)))?;
+
+    let dest = params.dest.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".finch/received")
+            .to_string_lossy()
+            .into_owned()
+    });
+    std::fs::create_dir_all(&dest)?;
+
+    let name = params
+        .name
+        .unwrap_or_else(|| format!("{}.zip", uuid::Uuid::new_v4()));
+    let zip_path = std::path::Path::new(&dest).join(&name);
+    std::fs::write(&zip_path, &body)?;
+
+    // Unzip using the zip crate (no external binary required).
+    let dest_clone = dest.clone();
+    let zip_path_clone = zip_path.clone();
+    let count = tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+        let file = std::fs::File::open(&zip_path_clone)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        let dest_p = std::path::Path::new(&dest_clone);
+        let dest_canon = std::fs::canonicalize(dest_p).unwrap_or_else(|_| dest_p.to_path_buf());
+        let count = archive.len();
+        for i in 0..count {
+            let mut entry = archive.by_index(i)?;
+            let out_path = dest_p.join(entry.name());
+            // Zip-slip guard.
+            let out_norm = out_path.components().fold(
+                std::path::PathBuf::new(),
+                |mut acc, c| match c {
+                    std::path::Component::ParentDir => { acc.pop(); acc }
+                    _ => { acc.push(c); acc }
+                },
+            );
+            if !out_norm.starts_with(&dest_canon) && !out_norm.starts_with(dest_p) {
+                anyhow::bail!("zip-slip detected in entry '{}'", entry.name());
+            }
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out_path)?;
+            } else {
+                if let Some(p) = out_path.parent() { std::fs::create_dir_all(p)?; }
+                let mut out = std::fs::File::create(&out_path)?;
+                std::io::copy(&mut entry, &mut out)?;
+            }
+        }
+        Ok(count)
+    })
+    .await
+    .map_err(|e| AppError(anyhow::anyhow!("unzip task: {}", e)))?
+    .map_err(AppError)?;
+
+    Ok(Json(serde_json::json!({
+        "zip": zip_path.to_string_lossy(),
+        "dest": dest,
+        "entries": count,
+    })))
 }

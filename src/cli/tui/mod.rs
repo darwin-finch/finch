@@ -500,6 +500,11 @@ pub struct TuiRenderer {
     pub typing_words: Vec<String>,
     /// Panel mode to restore after typing is done (before Typing mode was set).
     pre_typing_mode: PosetPanelMode,
+
+    /// True when live area state has changed since the last draw.
+    /// Guards the idle-case redraw in flush_output_safe() to eliminate
+    /// unconditional erase+draw every 33 ms tick when nothing changed.
+    live_area_dirty: bool,
 }
 
 // ─── Construction ─────────────────────────────────────────────────────────────
@@ -520,21 +525,37 @@ impl TuiRenderer {
         // normal (unbounded) paste mode, which is safe.
         let _ = execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
 
-        // We intentionally do NOT push any KeyboardEnhancementFlags.
+        // Enable DISAMBIGUATE_ESCAPE_CODES so terminals that support the kitty
+        // keyboard protocol send distinct sequences for Shift+Enter (vs bare Enter).
+        // Without this, macOS Terminal.app and iTerm2 both send bare \r for
+        // Shift+Enter — the SHIFT modifier is never set — so the newline-insertion
+        // path in async_input.rs can never trigger.
         //
-        // The kitty keyboard enhancement protocol (DISAMBIGUATE_ESCAPE_CODES /
-        // REPORT_ALL_KEYS_AS_ESCAPE_CODES) corrupts the terminal if the pop
-        // sequence is not received before the shell takes over — which happens
-        // on panic, SIGKILL, or any non-clean exit.  The user then sees raw
-        // escape-sequence numeric fragments (e.g. "442;5u") for every keypress
-        // and cannot type until they kill the terminal window.
+        // Terminals that don't support the protocol silently ignore the push
+        // (crossterm returns an error we discard with `let _ =`), so there is no
+        // regression for unsupported terminals.
         //
-        // Everything finch needs works without enhancement:
-        //   • Shift+Enter  → standard terminals send Enter + SHIFT modifier
-        //   • Shift+Tab    → standard \x1b[Z (BackTab)
-        //   • Ctrl+keys    → sent as-is in standard raw mode
-        // The only real loss is disambiguation of Esc vs Alt+key, which is not
-        // a use-case finch currently handles.
+        // Cleanup: the Drop impl and the panic hook registered below both call
+        // PopKeyboardEnhancementFlags, so normal exit, panics, and most signals
+        // are covered.  SIGKILL terminates the session entirely so corruption
+        // doesn't persist.  This is the same risk level we already accept for
+        // enable_raw_mode().
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            )
+        );
+
+        // Panic hook: restore terminal state so the shell is usable after a crash.
+        std::panic::set_hook(Box::new(|info| {
+            let _ = execute!(
+                io::stdout(),
+                crossterm::event::PopKeyboardEnhancementFlags
+            );
+            let _ = crossterm::terminal::disable_raw_mode();
+            eprintln!("{info}");
+        }));
 
         execute!(io::stdout(), cursor::Show)?;
 
@@ -586,6 +607,8 @@ impl TuiRenderer {
             session_label: String::new(),
             typing_words: Vec::new(),
             pre_typing_mode: PosetPanelMode::Forth,
+
+            live_area_dirty: true,
         })
     }
 
@@ -605,6 +628,11 @@ impl TuiRenderer {
     /// Attach the Co-Forth poset VM so the live area can render its 3D graph.
     pub fn set_poset(&mut self, poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>) {
         self.poset = Some(poset);
+    }
+
+    /// Mark the live area as needing a redraw on the next flush.
+    pub fn mark_dirty(&mut self) {
+        self.live_area_dirty = true;
     }
 
     /// Toggle the poset panel between graph view and Forth source view.
@@ -633,6 +661,7 @@ impl TuiRenderer {
             }
             self.typing_words = words;
         }
+        self.live_area_dirty = true;
     }
 
     // ── TextArea factories (also called from async_input) ─────────────────────
@@ -691,10 +720,13 @@ impl TuiRenderer {
     /// (not necessarily at the bottom row), so we must use that field — not
     /// `active_rows - 1` — to reach the top correctly.
     pub fn erase_live_area(&mut self) -> Result<()> {
-        if self.active_rows == 0 && self.cursor_row_from_top == 0 {
-            return Ok(()); // Nothing to erase
-        }
         let mut stdout = io::stdout();
+        // Begin the synchronized update here so erase + draw are one atomic
+        // terminal operation — eliminates the blank-flash between them.
+        execute!(stdout, BeginSynchronizedUpdate)?;
+        if self.active_rows == 0 && self.cursor_row_from_top == 0 {
+            return Ok(()); // Nothing to erase; sync block closed by draw_live_area
+        }
         execute!(stdout, cursor::MoveToColumn(0))?;
         if self.cursor_row_from_top > 0 {
             execute!(stdout, cursor::MoveUp(self.cursor_row_from_top as u16))?;
@@ -708,7 +740,6 @@ impl TuiRenderer {
     /// Draw the live area from scratch and track `active_rows`.
     pub fn draw_live_area(&mut self) -> Result<()> {
         let mut stdout = io::stdout();
-        execute!(stdout, BeginSynchronizedUpdate)?;
 
         let mut rows: usize = 0;
 
@@ -974,6 +1005,14 @@ impl TuiRenderer {
     }
 }
 
+// ─── Redraw predicate ─────────────────────────────────────────────────────────
+
+/// Returns true when the live area needs an erase+draw cycle.
+/// Extracted so it can be unit-tested without terminal I/O.
+fn should_redraw_live_area(has_in_progress: bool, dirty: bool) -> bool {
+    has_in_progress || dirty
+}
+
 // ─── flush_output_safe / render ───────────────────────────────────────────────
 
 impl TuiRenderer {
@@ -1006,10 +1045,20 @@ impl TuiRenderer {
                 Self::raw_blank_line()?;
             }
             self.draw_live_area()?;
+            self.live_area_dirty = false;
         } else {
-            // Periodic redraw for animation / status updates.
-            self.erase_live_area()?;
-            self.draw_live_area()?;
+            // Only redraw when something actually changed: a message is streaming
+            // (InProgress) or explicit state mutation marked the area dirty.
+            // This eliminates the unconditional erase+draw every 33 ms tick that
+            // caused visible flicker during idle and between queries.
+            let has_in_progress = messages
+                .iter()
+                .any(|m| matches!(m.status(), MessageStatus::InProgress));
+            if should_redraw_live_area(has_in_progress, self.live_area_dirty) {
+                self.erase_live_area()?;
+                self.draw_live_area()?;
+                self.live_area_dirty = false;
+            }
         }
 
         Ok(())
@@ -1239,6 +1288,7 @@ impl TuiRenderer {
         // than overwriting content from the erased live area.
         let _ = execute!(
             io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags,
             crossterm::event::DisableBracketedPaste,
             cursor::Show,
             ResetColor,
@@ -1280,6 +1330,7 @@ impl Drop for TuiRenderer {
         // shutdown() sets is_active = false before doing anything, so this is
         // idempotent — if shutdown() already ran, this is a no-op.
         if self.is_active {
+            let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
             let _ = disable_raw_mode();
             let _ = execute!(io::stdout(), cursor::Show, ResetColor);
             let _ = io::stdout().flush();
@@ -1357,6 +1408,7 @@ impl TuiRenderer {
     pub fn add_trait_message(&mut self, message: MessageRef) -> MessageId {
         let id = message.id();
         self.output_manager.add_trait_message(message);
+        self.live_area_dirty = true;
         id
     }
 
@@ -1364,6 +1416,7 @@ impl TuiRenderer {
         // Clear the entire screen on resize to prevent ghosts from old layout
         execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
         self.active_rows = 0;
+        self.live_area_dirty = true;
         Ok(())
     }
 }
@@ -1388,6 +1441,7 @@ impl TuiRenderer {
     pub fn update_ghost_text(&mut self) {
         let current = self.input_textarea.lines().join("\n");
         self.ghost_text = compute_ghost_text(&current, &self.command_registry);
+        self.live_area_dirty = true;
     }
 }
 
@@ -1858,6 +1912,7 @@ impl TuiRenderer {
         self.flush_output_safe(&om)?;
 
         self.active_dialog = Some(dialog);
+        self.live_area_dirty = true;
         self.erase_live_area()?;
         self.draw_live_area()?;
 
@@ -1962,6 +2017,216 @@ impl TuiRenderer {
         execute!(io::stdout(), LeaveAlternateScreen)?;
         self.active_rows = 0;
         Ok(result)
+    }
+
+    /// Open a file in a full-screen TUI viewer.
+    ///
+    /// CSV, TSV, and XLSX files are shown as a scrollable grid table.
+    /// All other files are shown as scrollable text.
+    /// `q`, `Esc`, or `Ctrl-D` closes the viewer.
+    pub fn show_file_viewer(&mut self, path: &str) -> Result<()> {
+        use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::layout::{Constraint, Direction, Layout};
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Cell as RCell, Paragraph, Row, Table, Wrap};
+        use ratatui::Terminal;
+
+        // Load content based on file extension.
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        // grid_rows: Some(rows) for tabular files, None for text.
+        let grid_rows: Option<Vec<Vec<String>>> = match ext.as_str() {
+            "csv" => {
+                let raw = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| format!("error: {e}"));
+                let mut rows = Vec::new();
+                for line in raw.lines() {
+                    let cols: Vec<String> = line
+                        .split(',')
+                        .map(|c| c.trim_matches('"').to_string())
+                        .collect();
+                    rows.push(cols);
+                }
+                Some(rows)
+            }
+            "tsv" => {
+                let raw = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| format!("error: {e}"));
+                let mut rows = Vec::new();
+                for line in raw.lines() {
+                    let cols: Vec<String> = line.split('\t').map(|c| c.to_string()).collect();
+                    rows.push(cols);
+                }
+                Some(rows)
+            }
+            "xlsx" | "xls" | "ods" => {
+                use calamine::{open_workbook_auto, Reader};
+                match open_workbook_auto(path) {
+                    Ok(mut wb) => {
+                        let sheet_names = wb.sheet_names().to_vec();
+                        let mut rows = Vec::new();
+                        if let Some(name) = sheet_names.first() {
+                            if let Ok(range) = wb.worksheet_range(name) {
+                                for row in range.rows() {
+                                    let cols: Vec<String> =
+                                        row.iter().map(|c| c.to_string()).collect();
+                                    rows.push(cols);
+                                }
+                            }
+                        }
+                        Some(rows)
+                    }
+                    Err(e) => Some(vec![vec![format!("error opening {path}: {e}")]]),
+                }
+            }
+            _ => None,
+        };
+
+        let colors = self.colors.clone();
+
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut term = Terminal::new(backend).context("Failed to create file viewer terminal")?;
+
+        let mut scroll: usize = 0;
+
+        loop {
+            term.draw(|frame| {
+                let area = frame.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .split(area);
+
+                let title = format!(" {} ", path);
+                let border_style = Style::default().fg(colors.dialog.border.to_color());
+
+                if let Some(ref rows) = grid_rows {
+                    // Compute column widths from data.
+                    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(1);
+                    let mut widths: Vec<usize> = vec![0; ncols];
+                    for row in rows {
+                        for (i, cell) in row.iter().enumerate() {
+                            widths[i] = widths[i].max(cell.chars().count());
+                        }
+                    }
+                    let constraints: Vec<Constraint> = widths
+                        .iter()
+                        .map(|&w| Constraint::Length((w + 2).min(40) as u16))
+                        .collect();
+
+                    let visible_height = chunks[0].height.saturating_sub(3) as usize;
+                    let start = scroll;
+                    let end = (start + visible_height).min(rows.len());
+
+                    let header_style = Style::default()
+                        .fg(colors.dialog.title.to_color())
+                        .add_modifier(Modifier::BOLD);
+                    let row_style = Style::default().fg(colors.dialog.option.to_color());
+
+                    let table_rows: Vec<Row> = rows[start..end]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, row)| {
+                            let cells: Vec<RCell> = row
+                                .iter()
+                                .map(|c| {
+                                    if start == 0 && i == 0 {
+                                        RCell::from(c.as_str()).style(header_style)
+                                    } else {
+                                        RCell::from(c.as_str()).style(row_style)
+                                    }
+                                })
+                                .collect();
+                            Row::new(cells)
+                        })
+                        .collect();
+
+                    let table = Table::new(table_rows, constraints)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(border_style)
+                                .title(title),
+                        );
+                    frame.render_widget(table, chunks[0]);
+                } else {
+                    // Text viewer.
+                    let text_raw = std::fs::read_to_string(path)
+                        .unwrap_or_else(|e| format!("error reading file: {e}"));
+                    let lines: Vec<Line> = text_raw
+                        .lines()
+                        .skip(scroll)
+                        .map(|l| {
+                            Line::from(Span::styled(
+                                l.to_string(),
+                                Style::default().fg(colors.dialog.option.to_color()),
+                            ))
+                        })
+                        .collect();
+                    let para = Paragraph::new(lines)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(border_style)
+                                .title(title),
+                        )
+                        .wrap(Wrap { trim: false });
+                    frame.render_widget(para, chunks[0]);
+                }
+
+                // Help bar at the bottom.
+                let help = Paragraph::new(Line::from(Span::styled(
+                    " ↑/↓: Scroll | PgUp/PgDn | q/Esc: Close ",
+                    Style::default().fg(colors.ui.separator.to_color()),
+                )));
+                frame.render_widget(help, chunks[1]);
+            })?;
+
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind != crossterm::event::KeyEventKind::Press {
+                        continue;
+                    }
+                    use crossterm::event::{KeyCode, KeyModifiers};
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('d')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            std::process::exit(0);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            scroll = scroll.saturating_add(1);
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            scroll = scroll.saturating_sub(1);
+                        }
+                        KeyCode::PageDown => {
+                            scroll = scroll.saturating_add(20);
+                        }
+                        KeyCode::PageUp => {
+                            scroll = scroll.saturating_sub(20);
+                        }
+                        KeyCode::Home => {
+                            scroll = 0;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        self.active_rows = 0;
+        Ok(())
     }
 
     /// Convenience wrapper for the tool-approval flow.
@@ -2095,6 +2360,26 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
+
+    // ── count_status_lines ────────────────────────────────────────────────────
+
+    // ── should_redraw_live_area ───────────────────────────────────────────────
+
+    #[test]
+    fn test_redraw_predicate_does_nothing_when_idle() {
+        // Idle: no in-progress messages, area not dirty — must not trigger redraw.
+        assert!(!should_redraw_live_area(false, false));
+    }
+
+    #[test]
+    fn test_redraw_predicate_triggers_when_in_progress() {
+        assert!(should_redraw_live_area(true, false));
+    }
+
+    #[test]
+    fn test_redraw_predicate_triggers_when_dirty() {
+        assert!(should_redraw_live_area(false, true));
+    }
 
     // ── count_status_lines ────────────────────────────────────────────────────
 

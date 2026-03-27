@@ -56,6 +56,7 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
                     | "AskUserQuestion"
                     | "EnterPlanMode"
                     | "ExitPlanMode"
+                    | "Push"
             )
         }
     }

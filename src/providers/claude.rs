@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
 use super::LlmProvider;
-use crate::claude::retry::with_retry;
+use crate::claude::retry::{with_retry, NonRetriableError};
 use crate::claude::streaming::StreamEvent;
 use crate::claude::types::{ContentBlock, MessageRequest};
 use crate::config::constants::DEFAULT_CLAUDE_MODEL;
@@ -123,7 +123,11 @@ impl ClaudeProvider {
 
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!("{}", friendly_api_error(status, &error_body));
+            let msg = friendly_api_error(status, &error_body);
+            if status.is_client_error() {
+                return Err(anyhow::Error::new(NonRetriableError(msg)));
+            }
+            anyhow::bail!("{}", msg);
         }
 
         let message_response: crate::claude::types::MessageResponse = response
@@ -173,7 +177,11 @@ impl ClaudeProvider {
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!("{}", friendly_api_error(status, &error_body));
+            let msg = friendly_api_error(status, &error_body);
+            if status.is_client_error() {
+                return Err(anyhow::Error::new(NonRetriableError(msg)));
+            }
+            anyhow::bail!("{}", msg);
         }
 
         // Spawn task to parse SSE stream with block tracking

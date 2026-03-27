@@ -18,6 +18,9 @@ pub mod web_fetch;
 // Command execution
 pub mod bash;
 
+// Propose-before-execute
+pub mod propose;
+
 // Self-improvement tools
 pub mod restart;
 pub mod save_and_exec;
@@ -32,6 +35,10 @@ pub mod ask_user_question;
 // GUI automation tools (macOS only)
 #[cfg(target_os = "macos")]
 pub mod gui;
+
+// Excel accessibility tools (macOS only — AppleScript)
+#[cfg(target_os = "macos")]
+pub mod excel;
 
 // LLM delegation tools (Phase 1)
 pub mod llm_tools;
@@ -71,6 +78,12 @@ pub use write::WriteTool;
 
 #[cfg(target_os = "macos")]
 pub use gui::{GuiClickTool, GuiInspectTool, GuiTypeTool};
+
+#[cfg(target_os = "macos")]
+pub use excel::{
+    ExcelActivateTool, ExcelFormulaTool, ExcelRangeTool, ExcelReadTool, ExcelSheetsTool,
+    ExcelWriteTool,
+};
 
 pub use llm_tools::LLMDelegationTool;
 

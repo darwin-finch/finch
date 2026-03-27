@@ -41,6 +41,48 @@ Don't add comments unless the logic is genuinely non-obvious.
 Work through multi-step tasks systematically, verifying each step.
 Be direct. If something is unclear, ask one focused question rather than guessing.";
 
+/// Plain-text command reference injected into every system prompt.
+/// Also used by persona system prompts and any other path that constructs a system message.
+/// Keep in sync with format_help() in src/cli/commands.rs.
+pub const COMMAND_REFERENCE: &str = "\
+## Finch Slash Commands
+
+Basic: /help  /quit  /clear  /compact [note]  /debug  /metrics  /memory  /training
+
+Provider: /provider  /provider list  /provider <name>  /local <query>
+  (aliases: /model /teacher)
+
+MCP: /mcp list  /mcp tools [server]  /mcp refresh  /mcp reload
+
+Persona: /persona  /persona select <name>  /persona show
+
+Discovery: /machines  /discover
+
+Patterns: /patterns  /patterns add  /patterns rm <id>  /patterns clear
+
+Feedback: /critical [note]  /medium [note]  /good [note]
+  (aliases: /feedback critical|medium|good [note])
+
+Co-Forth VM: /push <text>  /pop  /run  /program  /stack  /stack clear
+  /describe <word>  /define <word> [def]  /vm  /forth <expr>  /undefine [word]
+  /chain W1 W2  /forget W1  /dup W1  /swap W1 W2  /share  /box-diff
+
+Registry/Gas: /self-peer  /registry <addr>  /join-registry <addr>
+  /balance  /settle <addr>  /gas-send <addr> <ms>
+
+Channels: /join #channel  /part #channel  /say #channel <msg>
+
+Peers/Rooms: /connect <host:port>  /disconnect <name>
+  /room  /room new  /room list  /room add <addr>  /room remove <addr>
+
+Brains: /brain <task>  /brains  /brain cancel <name>
+
+Other: /plan [task]  /graph  /setup  /license  /license activate <key>  /accept  /reject
+  /ask <query>  /self-fix
+
+Keyboard: Ctrl+C cancel  Ctrl+D quit  Ctrl+G good  Ctrl+B bad  Ctrl+Z undefine
+  Ctrl+P pop  Tab complete  Shift+Tab plan mode  Shift+Enter newline";
+
 /// Build the full system prompt including working directory and project context.
 pub fn build_system_prompt(cwd: Option<&str>, claude_md: Option<&str>) -> String {
     let mut prompt = CODING_SYSTEM_PROMPT.to_string();

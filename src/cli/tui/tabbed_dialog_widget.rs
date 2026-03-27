@@ -24,44 +24,70 @@ impl<'a> TabbedDialogWidget<'a> {
         Self { dialog, colors }
     }
 
-    /// Render the content lines (all questions visible simultaneously, with help)
-    fn render_content(&self) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
+    /// Render the tab bar — one cell per question, active tab highlighted.
+    fn render_tab_bar(&self) -> Line<'static> {
+        let mut spans = Vec::new();
+        let tabs = self.dialog.tabs();
+        let current = self.dialog.current_tab_index();
 
-        for (idx, tab_state) in self.dialog.tabs().iter().enumerate() {
-            let is_current = idx == self.dialog.current_tab_index();
+        for (idx, tab_state) in tabs.iter().enumerate() {
+            let label = if tab_state.answered {
+                format!(" {}. {} ✓ ", idx + 1, tab_state.question.header)
+            } else {
+                format!(" {}. {} ", idx + 1, tab_state.question.header)
+            };
 
-            // Section header — bold/highlighted when active, dimmed otherwise
-            let header_style = if is_current {
+            let style = if idx == current {
                 Style::default()
                     .fg(self.colors.dialog.title.to_color())
-                    .add_modifier(Modifier::BOLD)
-            } else {
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else if tab_state.answered {
                 Style::default().fg(self.colors.ui.separator.to_color())
-            };
-            let label = if tab_state.answered {
-                format!("{}. {} ✓", idx + 1, tab_state.question.question)
             } else {
-                format!("{}. {}", idx + 1, tab_state.question.question)
+                Style::default().fg(self.colors.dialog.option.to_color())
             };
-            lines.push(Line::from(Span::styled(label, header_style)));
-            lines.push(Line::from(""));
 
-            // Full options for every question (not just the active one)
-            lines.extend(self.render_options(tab_state));
+            spans.push(Span::styled(label, style));
 
-            // Separator between questions (omit after the last one)
-            if idx < self.dialog.tabs().len() - 1 {
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(44),
+            if idx < tabs.len() - 1 {
+                spans.push(Span::styled(
+                    "│",
                     Style::default().fg(self.colors.ui.separator.to_color()),
-                )));
-                lines.push(Line::from(""));
+                ));
             }
         }
 
+        Line::from(spans)
+    }
+
+    /// Render content lines: tab bar + active question only.
+    fn render_content(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+
+        // Tab bar
+        lines.push(self.render_tab_bar());
+        lines.push(Line::from(Span::styled(
+            "─".repeat(60),
+            Style::default().fg(self.colors.ui.separator.to_color()),
+        )));
         lines.push(Line::from(""));
-        lines.extend(self.render_help(self.dialog.current_tab()));
+
+        // Active question header
+        let tab_state = self.dialog.current_tab();
+        let header_style = Style::default()
+            .fg(self.colors.dialog.title.to_color())
+            .add_modifier(Modifier::BOLD);
+        lines.push(Line::from(Span::styled(
+            tab_state.question.question.clone(),
+            header_style,
+        )));
+        lines.push(Line::from(""));
+
+        // Active question options
+        lines.extend(self.render_options(tab_state));
+
+        lines.push(Line::from(""));
+        lines.extend(self.render_help(tab_state));
 
         lines
     }
@@ -239,10 +265,9 @@ mod tests {
             .collect()
     }
 
-    /// Regression #19: all question texts must appear in rendered content,
-    /// not just the active tab.
+    /// Tab bar shows all question headers.
     #[test]
-    fn test_render_content_shows_all_question_texts() {
+    fn test_tab_bar_shows_all_headers() {
         let dialog = TabbedDialog::new(
             vec![
                 make_q("First question?", &["A", "B"]),
@@ -252,16 +277,48 @@ mod tests {
         );
         let colors = ColorScheme::default();
         let w = TabbedDialogWidget::new(&dialog, &colors);
-        let text = lines_to_text(&w.render_content());
+        let tab_bar = w.render_tab_bar();
+        let text: String = tab_bar
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect();
 
-        assert!(
-            text.contains("First question?"),
-            "First question must be visible"
+        assert!(text.contains("First q"), "tab bar must show first header: {text}");
+        assert!(text.contains("Second q"), "tab bar must show second header: {text}");
+    }
+
+    /// Only the active tab's question text appears in the content body.
+    #[test]
+    fn test_render_content_shows_only_active_question_body() {
+        let mut dialog = TabbedDialog::new(
+            vec![
+                make_q("First question?", &["A", "B"]),
+                make_q("Second question?", &["X", "Y"]),
+            ],
+            None,
         );
-        assert!(
-            text.contains("Second question?"),
-            "Second question must be visible: {text}"
-        );
+        let colors = ColorScheme::default();
+
+        // Tab 0 active — full question text of Q1 must appear, Q2's must not
+        {
+            let w = TabbedDialogWidget::new(&dialog, &colors);
+            let text = lines_to_text(&w.render_content());
+            assert!(text.contains("First question?"), "active question body: {text}");
+            assert!(!text.contains("Second question?"), "inactive body should be hidden: {text}");
+        }
+
+        // Switch to tab 1
+        dialog.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        {
+            let w = TabbedDialogWidget::new(&dialog, &colors);
+            let text = lines_to_text(&w.render_content());
+            assert!(text.contains("Second question?"), "new active question: {text}");
+            assert!(!text.contains("First question?"), "old active should be hidden: {text}");
+        }
     }
 
     #[test]
@@ -271,25 +328,19 @@ mod tests {
         let w = TabbedDialogWidget::new(&dialog, &colors);
         let text = lines_to_text(&w.render_content());
 
-        assert!(
-            text.contains("Alpha"),
-            "Option Alpha must be visible: {text}"
-        );
+        assert!(text.contains("Alpha"), "Option Alpha must be visible: {text}");
         assert!(text.contains("Beta"), "Option Beta must be visible: {text}");
     }
 
-    /// Regression #19: separator must appear between questions.
+    /// Separator between tab bar and content must be present.
     #[test]
-    fn test_render_content_shows_separator_between_questions() {
+    fn test_render_content_shows_separator_below_tab_bar() {
         let dialog = TabbedDialog::new(vec![make_q("Q1?", &["A"]), make_q("Q2?", &["B"])], None);
         let colors = ColorScheme::default();
         let w = TabbedDialogWidget::new(&dialog, &colors);
         let text = lines_to_text(&w.render_content());
 
-        assert!(
-            text.contains("────"),
-            "Separator must appear between questions: {text}"
-        );
+        assert!(text.contains("────"), "Separator must appear below tab bar: {text}");
     }
 }
 

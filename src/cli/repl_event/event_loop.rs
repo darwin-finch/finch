@@ -39,8 +39,9 @@ use crate::session::diff_store::DiffStore;
 use crate::tools::executor::ToolExecutor;
 use crate::tools::types::ToolDefinition;
 
-use super::events::ReplEvent;
-use super::query_processor::{process_query_with_tools, refresh_context_strip, ActiveToolUsesMap};
+use super::events::{LlmRequest, ReplEvent};
+use super::llm_loop::LlmLoop;
+use super::query_processor::{refresh_context_strip, ActiveToolUsesMap};
 use super::query_state::{QueryState, QueryStateManager};
 use super::tool_display::tool_result_to_display;
 use super::tool_execution::ToolExecutionCoordinator;
@@ -319,6 +320,12 @@ pub struct EventLoop {
     /// Used to intercept Diff/DiffEdit/DiffAccept/DiffReject events from peers
     /// without routing them through the plain-text peer_inbox_rx.
     peer_session_rx: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
+
+    // ── LLM worker loop channel ───────────────────────────────────────────
+    /// Send LLM requests to the worker loop.
+    llm_tx: mpsc::UnboundedSender<LlmRequest>,
+    /// Receiver held until `run()` hands it off to `LlmLoop`.
+    llm_rx: Option<mpsc::UnboundedReceiver<LlmRequest>>,
 }
 
 /// View mode for the REPL
@@ -976,6 +983,7 @@ impl EventLoop {
         daemon_base_url: Option<String>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
 
         // Create Co-Forth shared stack before TUI so both hold the same Arc.
         let stack: Arc<tokio::sync::Mutex<Vec<String>>> =
@@ -1143,6 +1151,8 @@ impl EventLoop {
             remote_peers,
             daemon_base_url,
             peer_inbox_mirror_tx,
+            llm_tx,
+            llm_rx: Some(llm_rx),
         }
     }
 
@@ -1190,6 +1200,12 @@ impl EventLoop {
             }
         }
         // ─────────────────────────────────────────────────────────────────────
+
+        // ── xlsx vocabulary notice ────────────────────────────────────────────
+        self.output_manager.write_info(
+            "xlsx   xlsx@  xlsx@/  xlsx-sheets  xlsx!\n\
+             Usage: s\" report.xlsx\" s\" B3\" xlsx@ type"
+        );
 
         // Show weekly license notice for non-commercial users (honor system)
         {
@@ -1477,6 +1493,51 @@ s" it is ours"      s" -1 is ours"     argue
                         }
                     })
                 }));
+
+            let tui_o = self.tui_renderer.clone();
+            self.forth_vm
+                .set_open_file_fn(Box::new(move |path: &str| {
+                    let path = path.to_string();
+                    let tui = tui_o.clone();
+                    futures::executor::block_on(async move {
+                        let _ = tui.lock().await.show_file_viewer(&path);
+                    });
+                }));
+        }
+
+        // ── Spawn LLM worker loop ─────────────────────────────────────────────
+        // Hand the receiver half of the channel to LlmLoop so it runs as its own
+        // Tokio task, decoupled from TUI select! timing.
+        {
+            let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
+            let llm_loop = LlmLoop::new(
+                llm_rx,
+                self.event_tx.clone(),
+                Arc::clone(&self.cloud_gen),
+                Arc::clone(&self.qwen_gen),
+                Arc::clone(&self.router),
+                Arc::clone(&self.generator_state),
+                Arc::clone(&self.tool_definitions),
+                self.tool_coordinator.clone(),
+                Arc::clone(&self.tool_call_history),
+                Arc::clone(&self.conversation),
+                Arc::clone(&self.query_states),
+                Arc::clone(&self.mode),
+                Arc::clone(&self.output_manager),
+                Arc::clone(&self.status_bar),
+                Arc::clone(&self.tui_renderer),
+                Arc::clone(&self.active_tool_uses),
+                self.memory_system.clone(),
+                Arc::clone(&self.current_graph),
+                self.session_label.clone(),
+                self.cwd.clone(),
+                self.context_lines,
+                self.max_verbatim_messages,
+                self.context_recall_k,
+                self.enable_summarization,
+                self.auto_compact_enabled,
+            );
+            tokio::spawn(llm_loop.run());
         }
 
         // Render interval (33ms ≈ 30fps) — smooth streaming without terminal flicker.
@@ -1928,6 +1989,12 @@ s" it is ours"      s" -1 is ours"     argue
                     }
                 }
             }
+        }
+
+        // Save persistent state before the TUI shuts down and the terminal goes read-only.
+        {
+            let mut executor = self.tool_coordinator.tool_executor().lock().await;
+            let _ = executor.save_if_dirty();
         }
 
         // Normal exit — shut down TUI and restore terminal before returning.
@@ -2423,6 +2490,25 @@ Rules:\n\
                     Command::Reject(reason) => {
                         self.handle_reject(reason).await?;
                     }
+                    // Registry / gas ledger — translate to Forth eval
+                    Command::SelfPeer => {
+                        self.handle_forth_eval("self-peer".to_string()).await?;
+                    }
+                    Command::Balance => {
+                        self.handle_forth_eval("balance".to_string()).await?;
+                    }
+                    Command::Settle(addr) => {
+                        self.handle_forth_eval(format!("settle\" {addr}\"")).await?;
+                    }
+                    Command::RegistrySet(addr) => {
+                        self.handle_forth_eval(format!("registry\" {addr}\"")).await?;
+                    }
+                    Command::JoinRegistry(addr) => {
+                        self.handle_forth_eval(format!("join\" {addr}\"")).await?;
+                    }
+                    Command::GasSend(addr, ms) => {
+                        self.handle_forth_eval(format!("gas-send\" {addr}\" {ms}")).await?;
+                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
@@ -2511,6 +2597,22 @@ Rules:\n\
                 self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w)
             },
         );
+
+        // Sentence execution: if the input ends with '.' and looks like natural language,
+        // try running it as a sentence before routing to the AI.  Each word's library
+        // Forth body runs in sequence; words with no body are skipped.  If sentence-exec
+        // produces output, show it — the period means "do it", not "describe it".
+        if is_nl && input.trim_end().ends_with('.') {
+            let prog = format!("s\" {}\" sentence-exec", input.replace('"', "'"));
+            if let Ok(out) = self.forth_vm.exec(&prog) {
+                let out = out.trim().to_string();
+                if !out.is_empty() && !out.contains("no executable words") {
+                    self.output_manager.write_info(out);
+                    return self.render_tui().await;
+                }
+            }
+        }
+
         if is_nl {
             return self.execute_query(input).await;
         }
@@ -2669,12 +2771,12 @@ Rules:\n\
             }
         };
 
-        // Spawn query processing task (no tools for chat_only word-push responses)
-        if chat_only {
-            self.spawn_query_task_no_tools(query_id, enriched).await;
-        } else {
-            self.spawn_query_task(query_id, enriched).await;
-        }
+        // Send query to the LLM worker loop (no tools for chat_only word-push responses)
+        let _ = self.llm_tx.send(LlmRequest::Query {
+            id: query_id,
+            text: enriched,
+            no_tools: chat_only,
+        });
 
         Ok(())
     }
@@ -2960,147 +3062,6 @@ Rules:\n\
         );
         self.render_tui().await?;
         Ok(())
-    }
-
-    /// Spawn a background task to process a query
-    async fn spawn_query_task(&self, query_id: Uuid, query: String) {
-        // ── Reset execution graph for a real new query (not a tool continuation) ──
-        // Tool-continuation calls pass empty `query`; those extend the same graph.
-        if !query.is_empty() {
-            let mut g = self.current_graph.lock().await;
-            g.reset(query_id, &self.session_label);
-            g.add_node(crate::graph::NodeKind::UserInput {
-                text: query.clone(),
-            });
-        }
-
-        let event_tx = self.event_tx.clone();
-        let claude_gen = self.cloud_gen.read().await.clone();
-        let qwen_gen = Arc::clone(&self.qwen_gen);
-        let router = Arc::clone(&self.router);
-        let generator_state = Arc::clone(&self.generator_state);
-        let tool_definitions = Arc::clone(&self.tool_definitions);
-        let conversation = Arc::clone(&self.conversation);
-        let query_states = Arc::clone(&self.query_states);
-        let tool_coordinator = self.tool_coordinator.clone();
-        let tui_renderer = Arc::clone(&self.tui_renderer);
-        let mode = Arc::clone(&self.mode);
-        let output_manager = Arc::clone(&self.output_manager);
-        let status_bar = Arc::clone(&self.status_bar);
-        let active_tool_uses = Arc::clone(&self.active_tool_uses);
-        let memory_system = self.memory_system.clone();
-        let session_label = self.session_label.clone();
-        let cwd = self.cwd.clone();
-        let context_lines = self.context_lines;
-        let max_verbatim = self.max_verbatim_messages;
-        let recall_k = self.context_recall_k;
-        let enable_summarization = self.enable_summarization;
-        let auto_compact_enabled = self.auto_compact_enabled;
-        // Keep a reference to the cloud generator for summarisation calls
-        // (we always want a capable model for summarisation, regardless of routing).
-        let summary_gen = Arc::clone(&claude_gen);
-        let tool_call_history = Arc::clone(&self.tool_call_history);
-
-        tokio::spawn(async move {
-            process_query_with_tools(
-                query_id,
-                query,
-                event_tx,
-                claude_gen,
-                qwen_gen,
-                router,
-                generator_state,
-                tool_definitions,
-                conversation,
-                query_states,
-                tool_coordinator,
-                tui_renderer,
-                mode,
-                output_manager,
-                status_bar,
-                active_tool_uses,
-                memory_system,
-                session_label,
-                cwd,
-                context_lines,
-                max_verbatim,
-                recall_k,
-                enable_summarization,
-                auto_compact_enabled,
-                summary_gen,
-                tool_call_history,
-            )
-            .await;
-        });
-    }
-
-    /// Like `spawn_query_task` but passes empty tool definitions — used for conversational
-    /// word-push responses where tool use would be inappropriate.
-    async fn spawn_query_task_no_tools(&self, query_id: Uuid, query: String) {
-        if !query.is_empty() {
-            let mut g = self.current_graph.lock().await;
-            g.reset(query_id, &self.session_label);
-            g.add_node(crate::graph::NodeKind::UserInput {
-                text: query.clone(),
-            });
-        }
-
-        let event_tx = self.event_tx.clone();
-        let claude_gen = self.cloud_gen.read().await.clone();
-        let qwen_gen = Arc::clone(&self.qwen_gen);
-        let router = Arc::clone(&self.router);
-        let generator_state = Arc::clone(&self.generator_state);
-        let no_tools: Arc<Vec<crate::tools::ToolDefinition>> = Arc::new(vec![]);
-        let conversation = Arc::clone(&self.conversation);
-        let query_states = Arc::clone(&self.query_states);
-        let tool_coordinator = self.tool_coordinator.clone();
-        let tui_renderer = Arc::clone(&self.tui_renderer);
-        let mode = Arc::clone(&self.mode);
-        let output_manager = Arc::clone(&self.output_manager);
-        let status_bar = Arc::clone(&self.status_bar);
-        let active_tool_uses = Arc::clone(&self.active_tool_uses);
-        let memory_system = self.memory_system.clone();
-        let session_label = self.session_label.clone();
-        let cwd = self.cwd.clone();
-        let context_lines = self.context_lines;
-        let max_verbatim = self.max_verbatim_messages;
-        let recall_k = self.context_recall_k;
-        let enable_summarization = self.enable_summarization;
-        let auto_compact_enabled = self.auto_compact_enabled;
-        let summary_gen = Arc::clone(&claude_gen);
-        let tool_call_history = Arc::clone(&self.tool_call_history);
-
-        tokio::spawn(async move {
-            process_query_with_tools(
-                query_id,
-                query,
-                event_tx,
-                claude_gen,
-                qwen_gen,
-                router,
-                generator_state,
-                no_tools,
-                conversation,
-                query_states,
-                tool_coordinator,
-                tui_renderer,
-                mode,
-                output_manager,
-                status_bar,
-                active_tool_uses,
-                memory_system,
-                session_label,
-                cwd,
-                context_lines,
-                max_verbatim,
-                recall_k,
-                enable_summarization,
-                auto_compact_enabled,
-                summary_gen,
-                tool_call_history,
-            )
-            .await;
-        });
     }
 
     /// Handle an event from the event channel
@@ -4302,8 +4263,8 @@ Rules:\n\
         {
             let input_preview = {
                 let s = tool_input.to_string();
-                if s.len() > 120 {
-                    s[..120].to_string()
+                if s.chars().count() > 120 {
+                    s.chars().take(120).collect::<String>()
                 } else {
                     s
                 }
@@ -4402,6 +4363,10 @@ Rules:\n\
                 // Cancel brain — its stale AskUserQuestion would hijack the next dialog.
                 self.cancel_active_brain(true).await;
 
+                // Clear tool-call history so planning-phase reads/globs don't
+                // trigger loop detection when Claude calls them again during execution.
+                self.tool_call_history.write().await.remove(&query_id);
+
                 // Reset conversation to a single clear execution prompt.
                 {
                     let mut conv = self.conversation.write().await;
@@ -4409,7 +4374,11 @@ Rules:\n\
                     conv.add_user_message(directive);
                 }
 
-                self.spawn_query_task(query_id, String::new()).await;
+                let _ = self.llm_tx.send(LlmRequest::Query {
+                    id: query_id,
+                    text: String::new(),
+                    no_tools: false,
+                });
                 return Ok(());
             }
         }
@@ -4447,9 +4416,12 @@ Rules:\n\
             .await
             .add_message(tool_result_message);
 
-        // Spawn new query task to continue the conversation
-        // This will send another request to Claude with the tool results
-        self.spawn_query_task(query_id, String::new()).await;
+        // Send tool-continuation turn to the LLM worker loop
+        let _ = self.llm_tx.send(LlmRequest::Query {
+            id: query_id,
+            text: String::new(),
+            no_tools: false,
+        });
 
         Ok(())
     }
@@ -4532,6 +4504,34 @@ Rules:\n\
             };
             self.spawn_coforth_precompile(text.clone(), trigger_id)
                 .await;
+        }
+
+        // If the user has joined any channels, Enter yields to them — not execute.
+        // Execution is a separate step: execute-channel" #name" or exec-last" #name".
+        // Word definitions (`: name ... ;`) are always compiled immediately regardless.
+        let in_channel = !self.forth_vm.channels.is_empty();
+        if in_channel && !is_definition {
+            use crate::coforth::irc_proto::{IrcMessage, OP_YIELD};
+            let my_name = hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "local".to_string());
+            for chan in self.forth_vm.channels.clone() {
+                crate::coforth::irc_proto::process_message(
+                    IrcMessage::new(OP_YIELD, &my_name, &chan, text.as_bytes().to_vec()),
+                    &crate::server::handlers::CHANNEL_REGISTRY,
+                );
+            }
+            use crossterm::style::Stylize;
+            let chans: Vec<String> = self
+                .forth_vm
+                .channels
+                .iter()
+                .map(|c| c.as_str().cyan().bold().to_string())
+                .collect();
+            self.output_manager
+                .write_info(format!("→ {}", chans.join(", ")));
+            return self.render_tui().await;
         }
 
         // Try the VM first — boot JIT compiled all vocab words so known words run immediately.
@@ -5198,6 +5198,16 @@ Rules:\n\
                 })
             }));
 
+        let tui_open = self.tui_renderer.clone();
+        self.forth_vm
+            .set_open_file_fn(Box::new(move |path: &str| {
+                let path = path.to_string();
+                let tui = tui_open.clone();
+                futures::executor::block_on(async move {
+                    let _ = tui.lock().await.show_file_viewer(&path);
+                });
+            }));
+
         // Snapshot before eval so the user can undo it
         let snap = self.forth_vm.snapshot();
         self.forth_undo.push(snap);
@@ -5273,6 +5283,57 @@ Rules:\n\
                     .write_info(format!("{}{hint}", msg.as_str().red()));
             }
         }
+        // If the VM yielded a continuation, resume it on the local daemon (one await).
+        if let Some(cont) = self.forth_vm.pending_continuation.take() {
+            let addr = self
+                .forth_vm
+                .registry_addr
+                .clone()
+                .unwrap_or_else(|| crate::config::constants::DEFAULT_HTTP_ADDR.to_string());
+            let url = if addr.starts_with("http://") || addr.starts_with("https://") {
+                format!("{addr}/v1/forth/resume")
+            } else {
+                format!("http://{addr}/v1/forth/resume")
+            };
+            let body = serde_json::json!({ "continuation": cont });
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default();
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(val) => {
+                        let stack: Vec<i64> = val["stack"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+                            .unwrap_or_default();
+                        self.forth_vm.clear_data();
+                        self.forth_vm.push_stack(&stack);
+                        if let Some(out) = val["output"].as_str() {
+                            if !out.is_empty() {
+                                self.output_manager.write_info(out.to_string());
+                            }
+                        }
+                        if let Some(err) = val["error"].as_str() {
+                            if !err.is_empty() {
+                                self.output_manager.write_info(
+                                    format!("yield error: {err}")
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.output_manager
+                            .write_info(format!("yield: bad response from daemon: {e}"));
+                    }
+                },
+                Err(e) => {
+                    self.output_manager
+                        .write_info(format!("yield: daemon not reachable: {e}"));
+                }
+            }
+        }
+
         // Broadcast this code to all peer loops — each runs it on its own VM
         // and replies via peer_inbox_rx with its result (stack delta or output).
         let _ = self
@@ -5653,19 +5714,8 @@ Rules:\n\
         }
 
         // Skip definitions of words already in the VM — redefinition guard would fire.
-        let forth_defs = forth_defs
-            .lines()
-            .filter(|line| {
-                let t = line.trim();
-                if t.starts_with(':') {
-                    let word = t[1..].trim().split_whitespace().next().unwrap_or("");
-                    !self.forth_vm.word_exists(word)
-                } else {
-                    true
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Uses skip_known_word_defs to handle multi-line definitions correctly.
+        let forth_defs = skip_known_word_defs(&forth_defs, |w| self.forth_vm.word_exists(w));
 
         // Remove dangerous definitions before compilation.
         let forth_defs = filter_ai_forth_response(&forth_defs);
@@ -7218,6 +7268,41 @@ pub(crate) fn humanize_forth_error(raw: &str) -> String {
     }
     // Fallback: show the raw message but strip the "forth error:" prefix
     e.to_string()
+}
+
+/// Remove word definitions from AI-generated Forth that already exist in the VM.
+///
+/// Handles multi-line definitions: once a `: name` header is skipped (because
+/// `word_exists(name)` is true), body lines are also dropped until the closing
+/// `;` is found.  The old line-by-line `.filter()` only removed the header line,
+/// leaving orphaned body code that could execute as bare statements — including
+/// infinite loops like `begin dup prime? until` with no increment.
+pub(crate) fn skip_known_word_defs<'a>(
+    code: &'a str,
+    word_exists: impl Fn(&str) -> bool,
+) -> String {
+    let mut result: Vec<&'a str> = Vec::new();
+    let mut in_filtered_def = false;
+    for line in code.lines() {
+        let t = line.trim();
+        if in_filtered_def {
+            if t.contains(';') {
+                in_filtered_def = false;
+            }
+            continue;
+        }
+        if t.starts_with(':') {
+            let word = t[1..].trim().split_whitespace().next().unwrap_or("");
+            if word_exists(word) {
+                if !t.contains(';') {
+                    in_filtered_def = true;
+                }
+                continue;
+            }
+        }
+        result.push(line);
+    }
+    result.join("\n")
 }
 
 /// Filter an AI-generated Forth response before compilation.
@@ -9046,7 +9131,70 @@ mod nl_routing_tests {
 // ── filter_ai_forth_response edge case tests ──────────────────────────────────
 #[cfg(test)]
 mod filter_tests {
-    use super::filter_ai_forth_response;
+    use super::{filter_ai_forth_response, skip_known_word_defs};
+
+    // ── skip_known_word_defs tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_skip_known_word_defs_single_line() {
+        // Single-line definition for a known word is dropped entirely.
+        let code = ": prime?  dup 2 < if drop false exit then true ;";
+        let result = skip_known_word_defs(code, |w| w == "prime?");
+        assert!(
+            !result.contains(": prime?"),
+            "known single-line def should be removed"
+        );
+        assert!(
+            !result.contains("dup 2 < if"),
+            "body of known single-line def should not appear"
+        );
+    }
+
+    #[test]
+    fn test_skip_known_word_defs_multiline_body_dropped() {
+        // Multi-line definition: header on one line, body on next.
+        // The OLD bug: only the header was dropped; the body line leaked through
+        // as bare Forth code, causing e.g. `begin dup prime? until` to loop forever.
+        let code = ": next-prime\n  1+ begin dup prime? until ;\nprove-all";
+        let result = skip_known_word_defs(code, |w| w == "next-prime");
+        assert!(
+            !result.contains(": next-prime"),
+            "known multi-line header should be removed"
+        );
+        assert!(
+            !result.contains("begin dup prime? until"),
+            "body of known multi-line def must not leak as bare code"
+        );
+        assert!(
+            result.contains("prove-all"),
+            "non-definition lines after the def should be kept"
+        );
+    }
+
+    #[test]
+    fn test_skip_known_word_defs_unknown_word_kept() {
+        // Definitions for unknown words are preserved unchanged.
+        let code = ": new-word  1 2 + . ;";
+        let result = skip_known_word_defs(code, |_| false);
+        assert!(result.contains(": new-word"), "unknown word def should be kept");
+    }
+
+    #[test]
+    fn test_skip_known_word_defs_mixed() {
+        // Known word filtered, unknown word kept, trailing code kept.
+        let code = ": prime?\n  dup 2 mod 0= if drop false exit then true ;\n\
+                   : new-word  1 2 + ;\nprove-all";
+        let result = skip_known_word_defs(code, |w| w == "prime?");
+        assert!(!result.contains(": prime?"), "known def removed");
+        assert!(
+            !result.contains("dup 2 mod"),
+            "body of known def must not leak"
+        );
+        assert!(result.contains(": new-word"), "unknown def kept");
+        assert!(result.contains("prove-all"), "bare code kept");
+    }
+
+    // ── filter_ai_forth_response tests ────────────────────────────────────────
 
     #[test]
     fn test_filter_keeps_valid_def() {

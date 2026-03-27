@@ -73,6 +73,23 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 - **Load order: `CLAUDE.md` → `FINCH.md` → `CONTEXT.md` → `README.md`; cwd wins over parent** — `loads_all_names_in_same_directory`, `joins_multiple_sections_with_separator` in `src/context/claude_md.rs`
 
+### GUI Accessibility
+
+- **Coordinate-based GUI ops are forbidden as the primary interface** — blind users cannot determine pixel positions; all GUI tools must accept semantic identifiers: element role + label, button name, or app-domain address (e.g. cell `B3` in Excel).
+- **Every GUI read must return plain text** — no visual-only confirmation; results must be fully speakable and meaningful without seeing the screen.
+- **App-specific words must exist for common applications** — `excel-read`, `excel-write`, `excel-cell` etc. so a blind user can say `"B3" excel-read` and get the cell value as text, without knowing anything about coordinates or window layout.
+- **GUI errors must name what was not found** — "button 'Save' not found in Excel" not "click failed"; the error text must be actionable by someone who cannot see the screen.
+- **`gui_click` with raw coordinates is an internal primitive, not a user-facing tool** — it must not appear in the default tool list for non-developer personas.
+- **Accessibility permission errors must explain how to fix them** — the error message must include the exact path to grant access (`System Settings → Privacy & Security → Accessibility`).
+
+### Exchange (peer function exchange via shared channel)
+
+- **`finch exchange run` never executes without user confirmation** — the daemon returns what would run; the CLI must print it and require explicit `--yes` or interactive confirmation before executing.
+- **A peer's proposal does not install into the local VM until the local user accepts** — `finch exchange run` installs nothing silently; rejection leaves the VM unchanged.
+- **Forked sessions share base vocabulary implicitly** — two sessions running the same binary start from identical stdlib + builtins; the exchange channel carries only the delta.
+- **Proposals are visible before execution** — `finch exchange list` always shows the full program text, not just a name, so the user can read what they are accepting.
+- **Rejection is a first-class operation** — clearing or ignoring a proposal must be as easy as accepting it; no proposal should require action to dismiss.
+
 ## Key Design Decisions
 
 ### Pre-trained models (not training from scratch)

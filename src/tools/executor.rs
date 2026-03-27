@@ -248,6 +248,11 @@ impl ToolExecutor {
         })
     }
 
+    /// Save persistent tool patterns if modified during this session.
+    pub fn save_if_dirty(&mut self) -> Result<()> {
+        self.confirmation_cache.save_if_dirty()
+    }
+
     /// Add MCP client to enable MCP tools
     ///
     /// Always returns Self (never fails) - gracefully handles MCP connection errors

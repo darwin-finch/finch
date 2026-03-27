@@ -11,7 +11,10 @@
 /// - `Library::lookup` — find a word and its neighbours.
 /// - `Library::related` — walk the graph N hops from a seed word.
 /// - `Library::inject_into_poset` — seed a poset with a word's neighbourhood.
+pub mod arm_vm;
+pub mod co_session;
 pub mod generator;
+pub mod irc_proto;
 pub mod interpreter;
 pub mod library;
 pub mod scatter;

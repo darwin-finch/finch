@@ -8,9 +8,35 @@ use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::Value;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::Path;
+
+use super::propose::{propose_in_editor, run_script_async};
+
+/// Build a bash/python script that writes content to a file.
+/// Used by the propose-before-execute flow.
+fn build_write_code(file_path: &str, content: &str) -> String {
+    let content_b64 = base64::engine::general_purpose::STANDARD.encode(content);
+    let path_py = format!("{:?}", file_path);
+    let line_count = content.lines().count();
+    [
+        "python3 << 'PYEOF'\n",
+        "import base64, os\n",
+        &format!("path = {}\n", path_py),
+        &format!("content = base64.b64decode(b\"{}\").decode(\"utf-8\")\n", content_b64),
+        "os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)\n",
+        "is_new = not os.path.exists(path)\n",
+        "with open(path, \"w\") as f:\n",
+        "    f.write(content)\n",
+        &format!("verb = \"Created\" if is_new else \"Updated\"\n"),
+        &format!("print(verb + \" {} ({} lines)\")\n", file_path, line_count),
+        "PYEOF",
+    ]
+    .concat()
+}
 
 pub struct WriteTool;
 
@@ -52,6 +78,19 @@ impl Tool for WriteTool {
             .as_str()
             .context("Missing content parameter")?;
 
+        // Interactive: propose the script in $EDITOR before writing.
+        if std::io::stdin().is_terminal() {
+            let line_count = content.lines().count();
+            let description = format!("Write {} ({} lines)", file_path, line_count);
+            let code = build_write_code(file_path, content);
+            let approved = propose_in_editor(&description, &code).await?;
+            return match approved {
+                None => Ok("Write aborted by user.".to_string()),
+                Some(script) => run_script_async(&script).await,
+            };
+        }
+
+        // Non-interactive (tests, daemon): write directly.
         let path = Path::new(file_path);
         let is_new = !path.exists();
 

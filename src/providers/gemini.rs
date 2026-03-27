@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
 use super::LlmProvider;
-use crate::claude::retry::with_retry;
+use crate::claude::retry::{with_retry, NonRetriableError};
 use crate::claude::types::ContentBlock;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
@@ -221,7 +221,11 @@ impl GeminiProvider {
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             let hint = gemini_error_hint(status.as_u16());
-            anyhow::bail!("Gemini API error {}{}\n{}", status, hint, error_body);
+            let msg = format!("Gemini API error {}{}\n{}", status, hint, error_body);
+            if status.is_client_error() {
+                return Err(anyhow::Error::new(NonRetriableError(msg)));
+            }
+            anyhow::bail!("{}", msg);
         }
 
         let gemini_response: GeminiResponse = response
@@ -264,12 +268,11 @@ impl GeminiProvider {
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             let hint = gemini_error_hint(status.as_u16());
-            anyhow::bail!(
-                "Gemini API streaming error {}{}\n{}",
-                status,
-                hint,
-                error_body
-            );
+            let msg = format!("Gemini API streaming error {}{}\n{}", status, hint, error_body);
+            if status.is_client_error() {
+                return Err(anyhow::Error::new(NonRetriableError(msg)));
+            }
+            anyhow::bail!("{}", msg);
         }
 
         // Spawn task to parse streaming response

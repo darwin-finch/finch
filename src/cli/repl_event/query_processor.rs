@@ -569,10 +569,16 @@ pub(crate) async fn process_query_with_tools(
                 // Store to memory (fire-and-forget; never blocks the response path)
                 if let Some(ref mem) = memory_system {
                     let model_name = generator.name().to_string();
+                    // Strip any [Context: ...] annotation appended for the AI — only
+                    // store the raw user text so the context strip stays clean.
+                    let query_for_memory = query
+                        .split_once("\n\n[Context:")
+                        .map(|(raw, _)| raw)
+                        .unwrap_or(&query);
                     let _ = mem
                         .insert_conversation(
                             "user",
-                            &query,
+                            query_for_memory,
                             Some(&model_name),
                             Some(&session_label),
                         )
@@ -724,8 +730,17 @@ pub(crate) async fn process_query_with_tools(
             // Store to memory (fire-and-forget)
             if let Some(ref mem) = memory_system {
                 let model_name = response.metadata.model.clone();
+                let query_for_memory = query
+                    .split_once("\n\n[Context:")
+                    .map(|(raw, _)| raw)
+                    .unwrap_or(&query);
                 let _ = mem
-                    .insert_conversation("user", &query, Some(&model_name), Some(&session_label))
+                    .insert_conversation(
+                        "user",
+                        query_for_memory,
+                        Some(&model_name),
+                        Some(&session_label),
+                    )
                     .await;
                 let _ = mem
                     .insert_conversation(

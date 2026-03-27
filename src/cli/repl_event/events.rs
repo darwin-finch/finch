@@ -128,6 +128,14 @@ pub enum ReplEvent {
     PeerMessage { text: String },
 }
 
+/// Requests sent from the TUI event loop to the LLM worker loop.
+#[derive(Debug)]
+pub enum LlmRequest {
+    /// Dispatch an LLM turn.  `text = ""` for tool-continuation turns.
+    /// `no_tools` suppresses tool definitions (used for conversational word-push responses).
+    Query { id: Uuid, text: String, no_tools: bool },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

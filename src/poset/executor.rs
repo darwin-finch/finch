@@ -92,16 +92,16 @@ async fn exec_node(
 
     // ── Fast path: compiled native code — no LLM needed ───────────────────────
     if let Some(code) = compiled_code {
-        let lang = compiled_lang.as_deref().unwrap_or("bash");
-        let output = run_compiled(lang, &code).await;
-        let result = match output {
-            Ok(out) => out,
-            Err(e) => format!("compile-exec error: {e}"),
+        let lang = compiled_lang.as_deref().unwrap_or("forth");
+        let output = run_compiled(lang, &code, &ctx).await;
+        let (result, node_status) = match output {
+            Ok(out) => (out, super::NodeStatus::Done),
+            Err(e) => (format!("✗ {e}"), super::NodeStatus::Failed),
         };
         {
             let mut p = poset.lock().await;
             if let Some(n) = p.node_mut(node_id) {
-                n.status = super::NodeStatus::Done;
+                n.status = node_status;
                 n.result = Some(result.clone());
             }
         }
@@ -288,6 +288,17 @@ async fn exec_node(
 
 /// Execute a compiled word natively — no LLM, no external processes.
 /// Words compile to Forth and run at CPU speed in the built-in interpreter.
-async fn run_compiled(_lang: &str, code: &str) -> anyhow::Result<String> {
-    crate::coforth::Forth::run(code)
+async fn run_compiled(_lang: &str, code: &str, predecessor_results: &[String]) -> anyhow::Result<String> {
+    // Predecessor top-of-stack values are prepended as literals so dependent
+    // arguments receive their inputs naturally via the stack.
+    let mut prelude = String::new();
+    for pred in predecessor_results {
+        let trimmed = pred.trim();
+        if trimmed.parse::<i64>().is_ok() {
+            prelude.push_str(trimmed);
+            prelude.push(' ');
+        }
+    }
+    let full_code = format!("{}{}", prelude, code);
+    crate::coforth::Forth::run(&full_code)
 }

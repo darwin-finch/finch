@@ -221,10 +221,10 @@ impl QwenGenerator {
             }
 
             // 5. Execute tools
-            let tool_results = self.execute_tools(&tool_calls).await?;
+            let tool_results = self.execute_tools(&all_tool_uses).await?;
 
             // 6. Add assistant message with tool_use blocks
-            let assistant_content: Vec<ContentBlock> = tool_calls
+            let assistant_content: Vec<ContentBlock> = all_tool_uses
                 .iter()
                 .map(|tu| ContentBlock::ToolUse {
                     id: tu.id.clone(),
@@ -341,7 +341,7 @@ impl QwenGenerator {
     }
 
     /// Execute a list of tool calls
-    async fn execute_tools(&self, tool_calls: &[ToolsToolUse]) -> Result<Vec<ToolResult>> {
+    async fn execute_tools(&self, tool_calls: &[GenToolUse]) -> Result<Vec<ToolResult>> {
         let tool_executor = self
             .tool_executor
             .as_ref()
@@ -351,14 +351,20 @@ impl QwenGenerator {
 
         let executor = tool_executor.lock().await;
 
-        for tool_use in tool_calls {
-            tracing::info!("Executing tool: {} ({})", tool_use.name, tool_use.id);
+        for gen_tool_use in tool_calls {
+            tracing::info!("Executing tool: {} ({})", gen_tool_use.name, gen_tool_use.id);
+
+            // Convert generator ToolUse to executor ToolUse
+            let tool_use = ToolsToolUse {
+                id: gen_tool_use.id.clone(),
+                name: gen_tool_use.name.clone(),
+                input: gen_tool_use.input.clone(),
+            };
 
             // Execute tool (note: ToolExecutor has execute_tool method)
-            // For now, we'll use a simplified call
             let result = executor
                 .execute_tool(
-                    tool_use,
+                    &tool_use,
                     None,                                    // conversation
                     None::<fn() -> Result<()>>,              // save_models_fn
                     None,                                    // batch_trainer

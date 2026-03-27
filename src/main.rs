@@ -152,6 +152,11 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Exchange Forth functions with peers via a shared channel
+    Exchange {
+        #[command(subcommand)]
+        exchange_command: ExchangeCommand,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -263,6 +268,41 @@ enum LicenseCommand {
     },
     /// Remove the active commercial license key
     Remove,
+}
+
+#[derive(Parser, Debug)]
+enum ExchangeCommand {
+    /// Propose a Forth function to the channel
+    Propose {
+        /// Word name (e.g. next-prime)
+        name: String,
+        /// Forth source code for the word (e.g. ": next-prime ... ;")
+        code: String,
+        /// Channel to post to (default: #exchange)
+        #[arg(long, default_value = "#exchange")]
+        channel: String,
+        /// Daemon address (default: 127.0.0.1:11435)
+        #[arg(long)]
+        daemon: Option<String>,
+    },
+    /// List all proposals in the channel
+    List {
+        /// Channel to inspect (default: #exchange)
+        #[arg(long, default_value = "#exchange")]
+        channel: String,
+        /// Daemon address (default: 127.0.0.1:11435)
+        #[arg(long)]
+        daemon: Option<String>,
+    },
+    /// Execute all proposals in the channel on this machine
+    Run {
+        /// Channel to execute (default: #exchange)
+        #[arg(long, default_value = "#exchange")]
+        channel: String,
+        /// Daemon address (default: 127.0.0.1:11435)
+        #[arg(long)]
+        daemon: Option<String>,
+    },
 }
 
 /// Build a teacher list from well-known environment variables and config files.
@@ -391,6 +431,9 @@ async fn main() -> Result<()> {
             once,
         }) => {
             return run_agent(persona, tasks, reflect_every, once).await;
+        }
+        Some(Command::Exchange { exchange_command }) => {
+            return run_exchange_command(exchange_command).await;
         }
         None => {
             // Fall through to REPL mode (check for piped input first)
@@ -1457,10 +1500,80 @@ async fn build_query_tool_executor() -> Result<(
     Ok((executor, tool_definitions))
 }
 
+/// Returns true when the input is unambiguously Forth code that should bypass
+/// the AI entirely and run directly in the co-forth VM.
+///
+/// Matches:
+/// - `: name body ;`  — word definition
+/// - Any `keyword"` string-literal openers used by the co-forth tokeniser
+/// - Stack expressions: every token is a number, operator char, or known Forth word
+fn is_clearly_forth(s: &str) -> bool {
+    let t = s.trim();
+    if t.starts_with(": ") || t.starts_with("; ") || t.starts_with(":require ") {
+        return true;
+    }
+    // Forth string-literal openers: keyword followed immediately by `"`
+    const OPENERS: &[&str] = &[
+        "hash\"", "open\"", "eval\"", "space\"", "csv\"", "tsv\"", "xlsx\"", "read\"", "exec\"", "glob\"",
+        "gen\"", "confirm\"", "select\"", ".\"", "s\"", "boot\"", "call\"", "scatter\"",
+        "say\"", "join\"", "part\"", "contribute\"", "run-on\"", "require\"", "xlsx-into\"",
+    ];
+    for opener in OPENERS {
+        if t.contains(opener) {
+            return true;
+        }
+    }
+    // Natural language disqualifiers: question marks, apostrophes (contractions),
+    // commas, or an uppercase-starting word that isn't a standalone token of digits.
+    if t.contains('?') || t.contains(',') {
+        return false;
+    }
+    if t.starts_with(|c: char| c.is_uppercase()) {
+        return false;
+    }
+    // Forth operator characters that have no place in natural language
+    const FORTH_OP_CHARS: &[char] = &['+', '*', '@', '!', ';', '<', '>', '='];
+    if FORTH_OP_CHARS.iter().any(|&c| t.contains(c)) {
+        return true;
+    }
+    // Pure stack expression: every whitespace token is a number, a standalone `-`,
+    // `/`, `.`, or `.s`, or a known Forth primitive word.
+    const FORTH_PRIMITIVES: &[&str] = &[
+        ".", ".s", "cr", "space", "dup", "drop", "swap", "over", "rot", "nip", "tuck",
+        "2dup", "2drop", "mod", "abs", "max", "min", "negate", "and", "or", "xor",
+        "invert", "words", "help", "depth", "bye", "emit", "type", "i", "j",
+        "-", "/",
+    ];
+    let tokens: Vec<&str> = t.split_whitespace().collect();
+    if !tokens.is_empty()
+        && tokens.iter().all(|tok| {
+            tok.parse::<f64>().is_ok()
+                || FORTH_PRIMITIVES.contains(tok)
+                || tok.chars().all(|c| matches!(c, '+' | '-' | '*' | '/' | '.' | '@' | '!' | '<' | '>' | '='))
+        })
+    {
+        return true;
+    }
+    false
+}
+
 /// Run a single query with full tool support (agentic mode)
 async fn run_query(query: &str) -> Result<()> {
     use finch::client::DaemonClient;
     use finch::daemon::ensure_daemon_running;
+
+    // Short-circuit: run Forth code directly in the VM, no AI involved.
+    if is_clearly_forth(query) {
+        match finch::coforth::Forth::run(query) {
+            Ok(out) => {
+                if !out.is_empty() {
+                    print!("{}", out);
+                }
+            }
+            Err(e) => eprintln!("forth error: {}", e),
+        }
+        return Ok(());
+    }
 
     // Load configuration
     let config = load_config()?;
@@ -2220,4 +2333,109 @@ async fn run_agent(
 
     let mut agent = AgentLoop::new(config, agent_config);
     agent.run().await
+}
+
+/// Exchange Forth functions with peers via a shared channel on the daemon.
+///
+/// Workflow for two Claude Code sessions:
+///   Session A: finch exchange propose next-prime ": next-prime ( n -- p ) ..."
+///   Session B: finch exchange list
+///   Session B: finch exchange propose next-prime ": next-prime ( n -- p ) ..."  (their version)
+///   Either:    finch exchange run
+async fn run_exchange_command(cmd: ExchangeCommand) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    match cmd {
+        ExchangeCommand::Propose { name, code, channel, daemon } => {
+            let addr = daemon.as_deref()
+                .unwrap_or(finch::config::constants::DEFAULT_DAEMON_ADDR);
+            let chan = if channel.starts_with('#') { channel.clone() } else { format!("#{channel}") };
+            let url = format!("http://{addr}/v1/forth/channel/{}/contribute", &chan[1..]);
+
+            let body = serde_json::json!({
+                "from": name,
+                "program": code,
+            });
+
+            let resp = client.post(&url).json(&body).send().await
+                .with_context(|| format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start"))?;
+
+            if resp.status().is_success() {
+                println!("✓ Proposed '{}' to {}", name, chan);
+                println!("  Peers can see it with:  finch exchange list");
+                println!("  Peers can run it with:  finch exchange run");
+            } else {
+                anyhow::bail!("Daemon returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+            }
+        }
+
+        ExchangeCommand::List { channel, daemon } => {
+            let addr = daemon.as_deref()
+                .unwrap_or(finch::config::constants::DEFAULT_DAEMON_ADDR);
+            let chan = if channel.starts_with('#') { channel.clone() } else { format!("#{channel}") };
+            let url = format!("http://{addr}/v1/forth/channel/{}", &chan[1..]);
+
+            let resp = client.get(&url).send().await
+                .with_context(|| format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start"))?;
+
+            if !resp.status().is_success() {
+                anyhow::bail!("Daemon returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+            }
+
+            #[derive(serde::Deserialize)]
+            struct Entry { from: String, program: String }
+            #[derive(serde::Deserialize)]
+            struct State { channel: String, contributions: Vec<Entry> }
+
+            let state: State = resp.json().await.context("Failed to parse channel state")?;
+
+            if state.contributions.is_empty() {
+                println!("{} is empty.", state.channel);
+                println!("  Propose a function with:  finch exchange propose <word> \"<code>\"");
+            } else {
+                println!("{}  ({} contribution{})", state.channel,
+                    state.contributions.len(),
+                    if state.contributions.len() == 1 { "" } else { "s" });
+                println!();
+                for (i, entry) in state.contributions.iter().enumerate() {
+                    println!("  [{}] from: {}", i + 1, entry.from);
+                    for line in entry.program.lines() {
+                        println!("      {}", line);
+                    }
+                    println!();
+                }
+                println!("  Run all with:  finch exchange run");
+            }
+        }
+
+        ExchangeCommand::Run { channel, daemon } => {
+            let addr = daemon.as_deref()
+                .unwrap_or(finch::config::constants::DEFAULT_DAEMON_ADDR);
+            let chan = if channel.starts_with('#') { channel.clone() } else { format!("#{channel}") };
+            let url = format!("http://{addr}/v1/forth/channel/{}/execute", &chan[1..]);
+
+            let resp = client.post(&url).send().await
+                .with_context(|| format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start"))?;
+
+            if !resp.status().is_success() {
+                anyhow::bail!("Daemon returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+            }
+
+            let result: serde_json::Value = resp.json().await.context("Failed to parse execute response")?;
+
+            if let Some(err) = result.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                eprintln!("error: {}", err);
+            }
+            if let Some(out) = result.get("output").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                print!("{}", out);
+            }
+            if let Some(stack) = result.get("stack") {
+                println!("stack: {}", stack);
+            }
+        }
+    }
+
+    Ok(())
 }

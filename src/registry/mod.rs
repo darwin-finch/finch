@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 /// How long a machine can be silent before we consider it dead.
 const EXPIRY: Duration = Duration::from_secs(90);
@@ -102,9 +102,9 @@ impl Registry {
     }
 
     /// Register or refresh a peer.  Returns the canonical addr (unchanged).
-    pub async fn join(&self, entry: PeerEntry) -> String {
+    pub fn join(&self, entry: PeerEntry) -> String {
         let addr = entry.addr.clone();
-        let mut map = self.entries.write().await;
+        let mut map = self.entries.write().unwrap();
         // Preserve existing ledger on re-join.
         let ledger = map.get(&addr).map(|e| e.ledger.clone()).unwrap_or_default();
         map.insert(
@@ -119,8 +119,8 @@ impl Registry {
     }
 
     /// Record compute performed BY `addr` for someone else (credit).
-    pub async fn credit(&self, addr: &str, compute_ms: u64) {
-        let mut map = self.entries.write().await;
+    pub fn credit(&self, addr: &str, compute_ms: u64) {
+        let mut map = self.entries.write().unwrap();
         if let Some(e) = map.get_mut(addr) {
             e.ledger.credits_ms = e.ledger.credits_ms.saturating_add(compute_ms);
         }
@@ -128,8 +128,8 @@ impl Registry {
 
     /// Record compute consumed FROM `addr` by the local machine (debit).
     /// Returns the new balance and whether the debt threshold was just crossed.
-    pub async fn debit(&self, addr: &str, compute_ms: u64) -> (i64, bool) {
-        let mut map = self.entries.write().await;
+    pub fn debit(&self, addr: &str, compute_ms: u64) -> (i64, bool) {
+        let mut map = self.entries.write().unwrap();
         if let Some(e) = map.get_mut(addr) {
             let before = e.ledger.balance_ms();
             e.ledger.debits_ms = e.ledger.debits_ms.saturating_add(compute_ms);
@@ -142,33 +142,54 @@ impl Registry {
     }
 
     /// Check whether `addr` is currently over the debt threshold.
-    pub async fn is_in_debt(&self, addr: &str) -> bool {
-        let map = self.entries.read().await;
-        map.get(addr)
+    pub fn is_in_debt(&self, addr: &str) -> bool {
+        self.entries
+            .read()
+            .unwrap()
+            .get(addr)
             .map(|e| e.ledger.balance_ms() <= -self.debt_threshold_ms)
             .unwrap_or(false)
     }
 
     /// Return the ledger for a peer, or None if not registered.
-    pub async fn ledger(&self, addr: &str) -> Option<LedgerEntry> {
+    pub fn ledger(&self, addr: &str) -> Option<LedgerEntry> {
         self.entries
             .read()
-            .await
+            .unwrap()
             .get(addr)
             .map(|e| e.ledger.clone())
     }
 
+    /// Transfer gas (compute credit) directly from one machine to another.
+    ///
+    /// Debits `from` and credits `to` by `amount_ms`.
+    /// Returns `Err` if either machine is not registered.
+    pub fn transfer(&self, from: &str, to: &str, amount_ms: u64) -> anyhow::Result<()> {
+        let mut map = self.entries.write().unwrap();
+        if !map.contains_key(from) {
+            anyhow::bail!("gas-send: sender {from} not registered");
+        }
+        if !map.contains_key(to) {
+            anyhow::bail!("gas-send: recipient {to} not registered");
+        }
+        map.get_mut(from).unwrap().ledger.debits_ms =
+            map[from].ledger.debits_ms.saturating_add(amount_ms);
+        map.get_mut(to).unwrap().ledger.credits_ms =
+            map[to].ledger.credits_ms.saturating_add(amount_ms);
+        Ok(())
+    }
+
     /// Clear the ledger for `addr` — called when a settlement is accepted.
-    pub async fn settle(&self, addr: &str) {
-        let mut map = self.entries.write().await;
+    pub fn settle(&self, addr: &str) {
+        let mut map = self.entries.write().unwrap();
         if let Some(e) = map.get_mut(addr) {
             e.ledger = LedgerEntry::default();
         }
     }
 
     /// Return ledger entries for all live peers.
-    pub async fn all_ledgers(&self) -> Vec<(String, LedgerEntry)> {
-        let map = self.entries.read().await;
+    pub fn all_ledgers(&self) -> Vec<(String, LedgerEntry)> {
+        let map = self.entries.read().unwrap();
         let now = Instant::now();
         map.iter()
             .filter(|(_, e)| now.duration_since(e.last_seen) < EXPIRY)
@@ -177,22 +198,22 @@ impl Registry {
     }
 
     /// Remove a peer immediately.
-    pub async fn leave(&self, addr: &str) {
-        self.entries.write().await.remove(addr);
+    pub fn leave(&self, addr: &str) {
+        self.entries.write().unwrap().remove(addr);
     }
 
     /// Refresh the last-seen timestamp for an existing peer.
     /// No-op if the peer isn't registered (it should call join instead).
-    pub async fn heartbeat(&self, addr: &str) {
-        let mut map = self.entries.write().await;
+    pub fn heartbeat(&self, addr: &str) {
+        let mut map = self.entries.write().unwrap();
         if let Some(e) = map.get_mut(addr) {
             e.last_seen = Instant::now();
         }
     }
 
     /// List live peers, optionally filtered by tag and/or region.
-    pub async fn peers(&self, tag: Option<&str>, region: Option<&str>) -> Vec<PeerEntry> {
-        let map = self.entries.read().await;
+    pub fn peers(&self, tag: Option<&str>, region: Option<&str>) -> Vec<PeerEntry> {
+        let map = self.entries.read().unwrap();
         let now = Instant::now();
         map.values()
             .filter(|e| now.duration_since(e.last_seen) < EXPIRY)
@@ -203,17 +224,17 @@ impl Registry {
     }
 
     /// Drop entries that haven't been seen recently.  Call periodically.
-    pub async fn expire(&self) {
+    pub fn expire(&self) {
         let now = Instant::now();
         self.entries
             .write()
-            .await
+            .unwrap()
             .retain(|_, e| now.duration_since(e.last_seen) < EXPIRY);
     }
 
     /// How many live peers are registered right now.
-    pub async fn count(&self) -> usize {
-        let map = self.entries.read().await;
+    pub fn count(&self) -> usize {
+        let map = self.entries.read().unwrap();
         let now = Instant::now();
         map.values()
             .filter(|e| now.duration_since(e.last_seen) < EXPIRY)
@@ -244,50 +265,50 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_join_and_list() {
+    #[test]
+    fn test_join_and_list() {
         let r = Registry::new();
-        r.join(peer("a:1234", &["gpu"])).await;
-        r.join(peer("b:1234", &["cpu"])).await;
-        let all = r.peers(None, None).await;
+        r.join(peer("a:1234", &["gpu"]));
+        r.join(peer("b:1234", &["cpu"]));
+        let all = r.peers(None, None);
         assert_eq!(all.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_filter_by_tag() {
+    #[test]
+    fn test_filter_by_tag() {
         let r = Registry::new();
-        r.join(peer("a:1234", &["gpu"])).await;
-        r.join(peer("b:1234", &["cpu"])).await;
-        let gpu = r.peers(Some("gpu"), None).await;
+        r.join(peer("a:1234", &["gpu"]));
+        r.join(peer("b:1234", &["cpu"]));
+        let gpu = r.peers(Some("gpu"), None);
         assert_eq!(gpu.len(), 1);
         assert_eq!(gpu[0].addr, "a:1234");
     }
 
-    #[tokio::test]
-    async fn test_leave_removes_peer() {
+    #[test]
+    fn test_leave_removes_peer() {
         let r = Registry::new();
-        r.join(peer("a:1234", &[])).await;
-        assert_eq!(r.count().await, 1);
-        r.leave("a:1234").await;
-        assert_eq!(r.count().await, 0);
+        r.join(peer("a:1234", &[]));
+        assert_eq!(r.count(), 1);
+        r.leave("a:1234");
+        assert_eq!(r.count(), 0);
     }
 
-    #[tokio::test]
-    async fn test_rejoin_refreshes_entry() {
+    #[test]
+    fn test_rejoin_refreshes_entry() {
         let r = Registry::new();
-        r.join(peer("a:1234", &["old"])).await;
-        r.join(peer("a:1234", &["new"])).await; // re-join with new tags
-        let all = r.peers(None, None).await;
+        r.join(peer("a:1234", &["old"]));
+        r.join(peer("a:1234", &["new"])); // re-join with new tags
+        let all = r.peers(None, None);
         assert_eq!(all.len(), 1);
         assert!(all[0].tags.contains(&"new".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_expiry() {
+    #[test]
+    fn test_expiry() {
         // Manually insert an expired entry by poking last_seen in the past.
         let r = Registry::new();
         {
-            let mut map = r.entries.write().await;
+            let mut map = r.entries.write().unwrap();
             map.insert(
                 "dead:1234".to_string(),
                 super::LiveEntry {
@@ -297,9 +318,9 @@ mod tests {
                 },
             );
         }
-        assert_eq!(r.count().await, 0, "expired entry should not count");
-        r.expire().await;
-        assert_eq!(r.peers(None, None).await.len(), 0);
+        assert_eq!(r.count(), 0, "expired entry should not count");
+        r.expire();
+        assert_eq!(r.peers(None, None).len(), 0);
     }
 
     // ── Hardware spec fields ───────────────────────────────────────────────
@@ -317,43 +338,43 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_peer_entry_hw_fields_round_trip() {
+    #[test]
+    fn test_peer_entry_hw_fields_round_trip() {
         // Hardware fields survive a join → peers() round trip.
         let r = Registry::new();
-        r.join(peer_with_hw("a:1234", 8, 16_384, 42)).await;
-        let all = r.peers(None, None).await;
+        r.join(peer_with_hw("a:1234", 8, 16_384, 42));
+        let all = r.peers(None, None);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].cpu_cores, Some(8));
         assert_eq!(all[0].ram_mb, Some(16_384));
         assert_eq!(all[0].bench_ms, Some(42));
     }
 
-    #[tokio::test]
-    async fn test_peer_entry_hw_fields_optional() {
+    #[test]
+    fn test_peer_entry_hw_fields_optional() {
         // A peer without hardware fields is still valid.
         let r = Registry::new();
-        r.join(peer("a:1234", &[])).await;
-        let all = r.peers(None, None).await;
+        r.join(peer("a:1234", &[]));
+        let all = r.peers(None, None);
         assert_eq!(all[0].cpu_cores, None);
         assert_eq!(all[0].ram_mb, None);
         assert_eq!(all[0].bench_ms, None);
     }
 
-    #[tokio::test]
-    async fn test_rejoin_preserves_hw_fields() {
+    #[test]
+    fn test_rejoin_preserves_hw_fields() {
         // Re-joining with updated hw fields replaces them.
         let r = Registry::new();
-        r.join(peer_with_hw("a:1234", 4, 8_192, 100)).await;
-        r.join(peer_with_hw("a:1234", 8, 16_384, 50)).await;
-        let all = r.peers(None, None).await;
+        r.join(peer_with_hw("a:1234", 4, 8_192, 100));
+        r.join(peer_with_hw("a:1234", 8, 16_384, 50));
+        let all = r.peers(None, None);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].cpu_cores, Some(8));
         assert_eq!(all[0].bench_ms, Some(50));
     }
 
-    #[tokio::test]
-    async fn test_peer_entry_hw_serde_round_trip() {
+    #[test]
+    fn test_peer_entry_hw_serde_round_trip() {
         // Fields survive JSON serialisation and deserialisation.
         let p = peer_with_hw("x:9999", 4, 4_096, 77);
         let json = serde_json::to_string(&p).unwrap();
@@ -363,8 +384,8 @@ mod tests {
         assert_eq!(back.bench_ms, Some(77));
     }
 
-    #[tokio::test]
-    async fn test_peer_entry_hw_serde_optional_skipped() {
+    #[test]
+    fn test_peer_entry_hw_serde_optional_skipped() {
         // None fields are skipped in JSON (skip_serializing_if).
         let p = peer("a:1234", &[]);
         let json = serde_json::to_string(&p).unwrap();

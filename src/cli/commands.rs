@@ -101,6 +101,13 @@ pub enum Command {
     RoomRemove(String),   // /room remove <name-or-addr>
     RoomList,             // /room list    — list all rooms + member counts
     SelfFix,              // /self-fix     — diagnose, fix, verify, restart
+    // Peer registry / gas ledger
+    SelfPeer,                       // /self-peer            — register local daemon with itself
+    GasSend(String, u64),           // /gas-send <addr> <ms> — send gas to a peer
+    Balance,                        // /balance              — show my ledger balance
+    Settle(String),                 // /settle <addr>        — settle debt with peer
+    JoinRegistry(String),           // /join-registry <addr> — register with a remote registry
+    RegistrySet(String),            // /registry <addr>      — set registry address
     // Diff proposal flow
     Accept(Option<String>), // /accept [diff-id-prefix] — accept most-recent (or matched) pending diff
     Reject(Option<String>), // /reject [reason]         — reject most-recent pending diff
@@ -567,6 +574,45 @@ impl Command {
             }
         }
 
+        // Peer registry / gas ledger
+        if trimmed == "/self-peer" {
+            return Some(Command::SelfPeer);
+        }
+        if trimmed == "/balance" {
+            return Some(Command::Balance);
+        }
+        if let Some(rest) = trimmed.strip_prefix("/settle ") {
+            let addr = rest.trim();
+            if !addr.is_empty() {
+                return Some(Command::Settle(addr.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/join-registry ") {
+            let addr = rest.trim();
+            if !addr.is_empty() {
+                return Some(Command::JoinRegistry(addr.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/registry ") {
+            let addr = rest.trim();
+            if !addr.is_empty() {
+                return Some(Command::RegistrySet(addr.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/gas-send ") {
+            // /gas-send <addr> <amount_ms>
+            let rest = rest.trim();
+            let parts: Vec<&str> = rest.rsplitn(2, ' ').collect();
+            if parts.len() == 2 {
+                if let Ok(ms) = parts[0].parse::<u64>() {
+                    let addr = parts[1].trim();
+                    if !addr.is_empty() {
+                        return Some(Command::GasSend(addr.to_string(), ms));
+                    }
+                }
+            }
+        }
+
         // Any unrecognized /command → show help instead of falling through to Forth/NL.
         if trimmed.starts_with('/') {
             return Some(Command::Help);
@@ -697,6 +743,15 @@ pub fn handle_command(
         )),
         Command::SelfFix => Ok(CommandOutput::Status(
             "SelfFix command should be handled in REPL.".to_string(),
+        )),
+        // Peer registry / gas ledger — handled in the REPL event loop
+        Command::SelfPeer
+        | Command::GasSend(_, _)
+        | Command::Balance
+        | Command::Settle(_)
+        | Command::JoinRegistry(_)
+        | Command::RegistrySet(_) => Ok(CommandOutput::Status(
+            "Registry/gas commands should be handled in REPL.".to_string(),
         )),
         // Diff proposal flow — handled in the REPL event loop
         Command::Accept(_) | Command::Reject(_) => Ok(CommandOutput::Status(

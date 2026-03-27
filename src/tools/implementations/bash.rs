@@ -9,6 +9,8 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use super::propose::propose_in_editor;
+
 pub struct BashTool;
 
 #[async_trait]
@@ -32,10 +34,18 @@ impl Tool for BashTool {
         let command = input["command"]
             .as_str()
             .context("Missing command parameter")?;
+        let description = input["description"].as_str().unwrap_or("");
+
+        // Propose the command in $EDITOR before running it.
+        let approved = propose_in_editor(description, command).await?;
+        let script = match approved {
+            None => return Ok("Tool call aborted by user.".to_string()),
+            Some(s) => s,
+        };
 
         let mut child = Command::new("bash")
             .arg("-c")
-            .arg(command)
+            .arg(&script)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

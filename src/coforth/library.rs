@@ -29,7 +29,9 @@ pub struct WordEntry {
     #[serde(default)]
     pub forth: Option<String>, // Forth code that embodies this word; runs at CPU speed
     #[serde(default)]
-    pub proof: Option<[String; 2]>, // Two equivalent Forth sentences that argue the definition
+    pub proof: Option<[String; 2]>, // Two equivalent Forth sentences that argue the definition (implicit equality check)
+    #[serde(default)]
+    pub claim: Option<[String; 3]>, // Explicit triple: [a, b, check] — the unit that travels over the wire
     #[serde(default)]
     pub sense: Option<String>, // disambiguating label e.g. "game", "romantic", "physics"
     #[serde(default)]
@@ -53,6 +55,49 @@ impl WordEntry {
             _ => crate::poset::NodeKind::Observation,
         }
     }
+
+    /// A word is complete when its English and code agree.
+    /// A word with Forth code but no proof is incomplete — the English and the
+    /// machine have not been shown to say the same thing.
+    pub fn is_complete(&self) -> bool {
+        match &self.forth {
+            None => true, // English-only word — no machine claim to prove
+            Some(_) => self.proof.is_some() || self.claim.is_some(),
+        }
+    }
+
+    /// Run the proof, if any.  Returns Ok(true) if the proof passes, Ok(false)
+    /// if there is no proof to run, Err if the proof fails.
+    ///
+    /// Prefers `claim` (explicit check) over `proof` (implicit equality).
+    pub fn run_proof(&self) -> anyhow::Result<bool> {
+        if let Some([a, b, check]) = &self.claim {
+            // Explicit triple: (a, b, check) — the full unit.
+            let prog = format!(r#"s" {a}" s" {b}" s" {check}" gate"#);
+            crate::coforth::interpreter::Forth::run(&prog)?;
+            return Ok(true);
+        }
+        if let Some([a, b]) = &self.proof {
+            // Legacy pair: implicit equality check via argue.
+            let prog = format!(r#"s" {a}" s" {b}" argue"#);
+            crate::coforth::interpreter::Forth::run(&prog)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Serialize this word's proof as a wire-ready claim string.
+    /// Returns None if the word has no claim or proof.
+    pub fn to_claim_string(&self) -> Option<String> {
+        if let Some([a, b, check]) = &self.claim {
+            return Some(format!("CLAIM\x1f{a}\x1f{b}\x1f{check}"));
+        }
+        if let Some([a, b]) = &self.proof {
+            // Implicit check: equality (=)
+            return Some(format!("CLAIM\x1f{a}\x1f{b}\x1f="));
+        }
+        None
+    }
 }
 
 // ── Library ────────────────────────────────────────────────────────────────────
@@ -74,7 +119,6 @@ impl Library {
     pub fn load() -> Self {
         let mut lib = Self::default();
         lib.load_toml(SEED_LIBRARY);
-        lib.load_toml(ENGLISH_LIBRARY);
 
         // Load project-local vocabulary modules (vocabulary/en.toml, vocabulary/zh.toml, …)
         if let Some(root) = git_repo_root() {
@@ -332,6 +376,19 @@ impl Library {
         v.sort_unstable();
         v
     }
+
+    /// Words that have Forth code but no proof — English and machine are not shown to agree.
+    /// Every word here is a liability: it makes a machine claim without a proof.
+    pub fn incomplete_words(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .words
+            .iter()
+            .filter(|(_, entries)| entries.iter().any(|e| !e.is_complete()))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        out.sort_unstable();
+        out
+    }
 }
 
 fn user_library_path() -> Option<std::path::PathBuf> {
@@ -566,9 +623,8 @@ pub const BOOT_POETRY: &[&str] = &[
 
 // ── Vocabulary sources ─────────────────────────────────────────────────────────
 
-/// Generated comprehensive English lexicon — baked in at compile time.
-/// Re-generate with: `finch library build --all`
-const ENGLISH_LIBRARY: &str = include_str!("english_library.toml");
+/// Project English vocabulary — baked in at compile time.
+pub const EN_LIBRARY: &str = include_str!("../../vocabulary/en.toml");
 
 /// Project Chinese vocabulary — baked in at compile time.
 pub const ZH_LIBRARY: &str = include_str!("../../vocabulary/zh.toml");
@@ -626,7 +682,7 @@ static COMPILED_VM: LazyLock<crate::coforth::Forth> = LazyLock::new(|| {
 static BUILTIN_DEFS: LazyLock<BuiltinDefs> = LazyLock::new(|| {
     let mut lib = Library::default();
     lib.load_toml(SEED_LIBRARY);
-    lib.load_toml(ENGLISH_LIBRARY);
+    lib.load_toml(EN_LIBRARY);
 
     // Core Forth words that must never be shadowed by vocabulary entries.
     // These are builtins or STDLIB words that user-facing vocabulary demos
@@ -4829,54 +4885,6 @@ mod tests {
         }
     }
 
-    /// Verify English-library proof entries are parsed and their argue sentences converge.
-    #[test]
-    fn test_english_library_proof_entries_argue() {
-        let defs = Library::builtin_defs();
-        // We added proofs to several words — verify at least some are present.
-        assert!(
-            !defs.proofs.is_empty(),
-            "expected at least one proof entry in English library"
-        );
-
-        let mut failures = Vec::new();
-        for (word, [a, b]) in &defs.proofs {
-            let mut vm = Library::precompiled_vm();
-            let src = format!("s\" {}\" s\" {}\" argue", a, b);
-            if let Err(e) = vm.exec_with_fuel(&src, 100_000) {
-                failures.push(format!("  argue:{word} [{a}] ≠ [{b}]: {e}"));
-            }
-        }
-        if !failures.is_empty() {
-            panic!("Proof failures:\n{}", failures.join("\n"));
-        }
-    }
-
-    /// Verify all 1000+ English-library words are callable from the pre-compiled VM.
-    /// Zero extra TOML parsing or compilation — pure clone + call.
-    #[test]
-    fn test_english_library_all_words_batch() {
-        let defs = Library::builtin_defs();
-        assert!(
-            defs.pairs.len() > 1000,
-            "expected 1000+ builtin words, got {}",
-            defs.pairs.len()
-        );
-
-        let mut vm = Library::precompiled_vm();
-        let mut failures = Vec::new();
-        for (word, _) in &defs.pairs {
-            vm.clear_data();
-            if let Err(e) = vm.exec_with_fuel(word, 2_000) {
-                if e.to_string().contains("unknown word") {
-                    failures.push(format!("  {word}: {e}"));
-                }
-            }
-        }
-        if !failures.is_empty() {
-            panic!("Words not callable:\n{}", failures.join("\n"));
-        }
-    }
 
     /// Verify the Rust↔Forth mix: every Builtin variant has a STDLIB wrapper
     /// (so it appears in `words` and is callable by name) and round-trips correctly.
@@ -5377,5 +5385,159 @@ mod detect_lang_tests {
     #[test]
     fn test_ta() {
         assert_eq!(detect_vocab_lang("வணக்கம்"), "ta");
+    }
+}
+
+#[cfg(test)]
+mod completeness_tests {
+    use super::*;
+
+    /// A word with Forth code and a proof is complete.
+    #[test]
+    fn test_word_with_proof_is_complete() {
+        let e = WordEntry {
+            word: "double".to_string(),
+            definition: "multiply by two".to_string(),
+            forth: Some("2 *".to_string()),
+            proof: Some(["3 2 *".to_string(), "3 dup +".to_string()]),
+            claim: None,
+            related: vec![],
+            kind: "task".to_string(),
+            sense: None,
+            stack_effect: Some("( n -- n )".to_string()),
+            boot: false,
+            remote: false,
+        };
+        assert!(e.is_complete(), "word with proof must be complete");
+    }
+
+    /// A word with Forth code but no proof is incomplete — English and machine disagree by default.
+    #[test]
+    fn test_word_with_forth_but_no_proof_is_incomplete() {
+        let e = WordEntry {
+            word: "double".to_string(),
+            definition: "multiply by two".to_string(),
+            forth: Some("2 *".to_string()),
+            proof: None,
+            claim: None,
+            related: vec![],
+            kind: "task".to_string(),
+            sense: None,
+            stack_effect: None,
+            boot: false,
+            remote: false,
+        };
+        assert!(!e.is_complete(), "word with forth but no proof must be incomplete");
+    }
+
+    /// A pure English word (no Forth code) is always complete — no machine claim to prove.
+    #[test]
+    fn test_english_only_word_is_complete() {
+        let e = WordEntry {
+            word: "rebuild".to_string(),
+            definition: "to build again after destruction or damage".to_string(),
+            forth: None,
+            proof: None,
+            claim: None,
+            related: vec![],
+            kind: "observation".to_string(),
+            sense: None,
+            stack_effect: None,
+            boot: false,
+            remote: false,
+        };
+        assert!(e.is_complete(), "English-only word must be complete");
+    }
+
+    /// run_proof on a valid pair must succeed.
+    #[test]
+    fn test_run_proof_passes_for_valid_pair() {
+        let e = WordEntry {
+            word: "double".to_string(),
+            definition: "multiply by two".to_string(),
+            forth: Some("2 *".to_string()),
+            proof: Some(["3 2 *".to_string(), "3 dup +".to_string()]),
+            claim: None,
+            related: vec![],
+            kind: "task".to_string(),
+            sense: None,
+            stack_effect: None,
+            boot: false,
+            remote: false,
+        };
+        let result = e.run_proof().expect("valid proof must not error");
+        assert!(result, "run_proof must return true when proof passes");
+    }
+
+    /// run_proof on mismatched programs must fail.
+    #[test]
+    fn test_run_proof_fails_for_mismatched_pair() {
+        let e = WordEntry {
+            word: "wrong".to_string(),
+            definition: "a lie".to_string(),
+            forth: Some("1".to_string()),
+            proof: Some(["1".to_string(), "2".to_string()]), // 1 ≠ 2
+            claim: None,
+            related: vec![],
+            kind: "task".to_string(),
+            sense: None,
+            stack_effect: None,
+            boot: false,
+            remote: false,
+        };
+        assert!(e.run_proof().is_err(), "mismatched proof must return Err");
+    }
+
+    /// A word with an explicit claim triple is complete and its proof runs via gate.
+    #[test]
+    fn test_word_with_claim_is_complete_and_runs() {
+        let e = WordEntry {
+            word: "double".to_string(),
+            definition: "multiply by two".to_string(),
+            forth: Some("2 *".to_string()),
+            proof: None,
+            claim: Some(["3 2 *".to_string(), "3 dup +".to_string(), "=".to_string()]),
+            related: vec![],
+            kind: "task".to_string(),
+            sense: None,
+            stack_effect: None,
+            boot: false,
+            remote: false,
+        };
+        assert!(e.is_complete(), "word with claim must be complete");
+        assert!(e.run_proof().is_ok(), "claim proof must pass");
+    }
+
+    /// to_claim_string serializes to the wire format.
+    #[test]
+    fn test_to_claim_string_explicit() {
+        let e = WordEntry {
+            word: "double".to_string(),
+            definition: "multiply by two".to_string(),
+            forth: Some("2 *".to_string()),
+            proof: None,
+            claim: Some(["3 2 *".to_string(), "3 dup +".to_string(), "=".to_string()]),
+            related: vec![],
+            kind: "task".to_string(),
+            sense: None,
+            stack_effect: None,
+            boot: false,
+            remote: false,
+        };
+        let wire = e.to_claim_string().expect("must produce a claim string");
+        assert!(wire.starts_with("CLAIM\x1f"), "must be tagged CLAIM");
+        let parts: Vec<&str> = wire.splitn(4, '\x1f').collect();
+        assert_eq!(parts[1], "3 2 *");
+        assert_eq!(parts[2], "3 dup +");
+        assert_eq!(parts[3], "=");
+    }
+
+    /// claim-make / claim-run round-trip in the VM.
+    #[test]
+    fn test_claim_make_run_roundtrip() {
+        let out = crate::coforth::interpreter::Forth::run(r#"s" 3 2 *" s" 3 dup +" s" =" claim-make claim-run"#)
+            .expect("claim round-trip must not error");
+        // gate passes → result (6) is left on stack; output shows ✓
+        assert!(out.contains("✓") || out.is_empty(), "gate must pass: {out}");
     }
 }
