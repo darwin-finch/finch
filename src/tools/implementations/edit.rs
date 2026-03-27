@@ -18,6 +18,18 @@ use std::io::IsTerminal;
 
 use super::propose::{propose_in_editor, run_script_async};
 
+/// Run `~/.finch/hooks/post-save <file_path>` if that script exists.
+fn run_post_save_hook(file_path: &str) {
+    if let Some(hook) = dirs::home_dir().map(|mut p| {
+        p.push(".finch/hooks/post-save");
+        p
+    }) {
+        if hook.exists() {
+            let _ = std::process::Command::new(&hook).arg(file_path).spawn();
+        }
+    }
+}
+
 // ANSI colors for diff display
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
@@ -169,6 +181,7 @@ impl Tool for EditTool {
         // Write updated content
         fs::write(file_path, &new_content)
             .with_context(|| format!("Failed to write file: {}", file_path))?;
+        run_post_save_hook(file_path);
 
         // Generate and return colored diff
         Ok(generate_edit_diff(

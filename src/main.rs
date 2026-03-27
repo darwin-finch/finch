@@ -33,6 +33,11 @@ struct Args {
     #[arg(long = "restore-session")]
     restore_session: Option<PathBuf>,
 
+    /// Resume a previous session by UUID (printed on exit).
+    /// Shorthand for --restore-session ~/.finch/sessions/<uuid>.json
+    #[arg(long = "resume")]
+    resume: Option<String>,
+
     /// Use raw terminal mode instead of TUI (enables rustyline)
     #[arg(long = "raw", conflicts_with = "no_tui")]
     raw_mode: bool,
@@ -157,6 +162,19 @@ enum Command {
         #[command(subcommand)]
         exchange_command: ExchangeCommand,
     },
+    /// Generate sample spreadsheets into ~/.finch/samples/xlsx/
+    Samples,
+    /// Manage saved sessions
+    Sessions {
+        #[command(subcommand)]
+        sessions_command: SessionsCommand,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum SessionsCommand {
+    /// List saved sessions
+    List,
 }
 
 #[derive(Parser, Debug)]
@@ -434,6 +452,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::Exchange { exchange_command }) => {
             return run_exchange_command(exchange_command).await;
+        }
+        Some(Command::Samples) => {
+            return run_samples();
+        }
+        Some(Command::Sessions { sessions_command }) => {
+            return run_sessions_command(sessions_command);
         }
         None => {
             // Fall through to REPL mode (check for piped input first)
@@ -798,8 +822,15 @@ async fn main() -> Result<()> {
         repl.set_peers(args.peer.clone());
     }
 
+    // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
+    let restore_session = args.restore_session.or_else(|| {
+        args.resume.as_deref().and_then(|uuid| {
+            dirs::home_dir().map(|h| h.join(".finch").join("sessions").join(format!("{uuid}.json")))
+        })
+    });
+
     // Restore session if requested
-    if let Some(session_path) = args.restore_session {
+    if let Some(session_path) = restore_session {
         if session_path.exists() {
             match ConversationHistory::load(&session_path) {
                 Ok(history) => {
@@ -2335,6 +2366,26 @@ async fn run_agent(
     agent.run().await
 }
 
+fn run_samples() -> Result<()> {
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".finch")
+        .join("samples")
+        .join("xlsx");
+
+    finch::samples::generate_all(&dir)?;
+
+    println!("Sample spreadsheets written to {}:", dir.display());
+    for name in &["grades.xlsx", "budget.xlsx", "contacts.xlsx", "times_table.xlsx"] {
+        println!("  {}", dir.join(name).display());
+    }
+    println!();
+    println!("Try in the REPL:");
+    println!("  s\" {}/grades.xlsx\" s\" A2\" xlsx@ type cr", dir.display());
+    println!("  s\" {}/times_table.xlsx\" s\" H8\" xlsx@ type cr", dir.display());
+    Ok(())
+}
+
 /// Exchange Forth functions with peers via a shared channel on the daemon.
 ///
 /// Workflow for two Claude Code sessions:
@@ -2437,5 +2488,74 @@ async fn run_exchange_command(cmd: ExchangeCommand) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Handle `finch sessions` subcommands
+fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
+    match cmd {
+        SessionsCommand::List => {
+            let sessions_dir = dirs::home_dir()
+                .map(|h| h.join(".finch").join("sessions"))
+                .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+
+            if !sessions_dir.exists() {
+                println!("No saved sessions.");
+                return Ok(());
+            }
+
+            let mut entries: Vec<_> = std::fs::read_dir(&sessions_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x == "json")
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if entries.is_empty() {
+                println!("No saved sessions.");
+                return Ok(());
+            }
+
+            // Sort newest first by modification time.
+            entries.sort_by_key(|e| {
+                e.metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            });
+            entries.reverse();
+
+            println!("{:<38}  {}", "UUID", "Saved");
+            println!("{}", "-".repeat(60));
+            for entry in &entries {
+                let path = entry.path();
+                let uuid = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?");
+                let mtime = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| {
+                        t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
+                    })
+                    .map(|d| {
+                        let secs = d.as_secs();
+                        let dt = chrono::DateTime::<chrono::Local>::from(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                        );
+                        dt.format("%Y-%m-%d %H:%M").to_string()
+                    })
+                    .unwrap_or_else(|| "?".to_string());
+                println!("{uuid:<38}  {mtime}");
+            }
+            println!();
+            println!("Resume with: finch --resume <uuid>");
+        }
+    }
     Ok(())
 }

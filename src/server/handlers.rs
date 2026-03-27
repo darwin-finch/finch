@@ -1443,8 +1443,23 @@ async fn handle_session_ws(
         let lbl = label;
         tokio::spawn(async move {
             while let Some(ev) = bus_rx.recv().await {
-                if let crate::session::SessionEvent::Chat { text } = ev {
-                    REMOTE_TO_LOCAL.lock().await.push((lbl.clone(), text));
+                let entry = match ev {
+                    crate::session::SessionEvent::Chat { text } => {
+                        Some((lbl.clone(), text))
+                    }
+                    crate::session::SessionEvent::ChannelMessage { channel, sender, bundle } => {
+                        let primary = bundle.primary();
+                        let comment = if bundle.comments.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  \\ {}", bundle.comments.join("; "))
+                        };
+                        Some((lbl.clone(), format!("{channel} {sender}: {}{comment}", primary.code)))
+                    }
+                    _ => None,
+                };
+                if let Some(pair) = entry {
+                    REMOTE_TO_LOCAL.lock().await.push(pair);
                 }
             }
         });

@@ -129,6 +129,16 @@ interface StreamReceiver {
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Event bus
+# ---------------------------------------------------------------------------
+
+struct Event {
+  name    @0 :Text;         # dispatch key (e.g. "peer.join", "vocab.sync")
+  id      @1 :Text;         # UUID — stable across continuations
+  payload @2 :AnyPointer;   # handler-specific struct; cast by name
+}
+
+# ---------------------------------------------------------------------------
 # Out-of-band control messages (binary channel, not RPC)
 # ---------------------------------------------------------------------------
 

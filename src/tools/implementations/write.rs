@@ -16,6 +16,19 @@ use std::path::Path;
 
 use super::propose::{propose_in_editor, run_script_async};
 
+/// Run `~/.finch/hooks/post-save <file_path>` if that script exists.
+/// Fire-and-forget — the hook runs in the background; errors are ignored.
+fn run_post_save_hook(file_path: &str) {
+    if let Some(hook) = dirs::home_dir().map(|mut p| {
+        p.push(".finch/hooks/post-save");
+        p
+    }) {
+        if hook.exists() {
+            let _ = std::process::Command::new(&hook).arg(file_path).spawn();
+        }
+    }
+}
+
 /// Build a bash/python script that writes content to a file.
 /// Used by the propose-before-execute flow.
 fn build_write_code(file_path: &str, content: &str) -> String {
@@ -106,6 +119,7 @@ impl Tool for WriteTool {
             // New file: just write and return summary
             fs::write(file_path, content)
                 .with_context(|| format!("Failed to write file: {}", file_path))?;
+            run_post_save_hook(file_path);
 
             let line_count = content.lines().count();
             Ok(format!(
@@ -121,6 +135,7 @@ impl Tool for WriteTool {
 
             fs::write(file_path, content)
                 .with_context(|| format!("Failed to write file: {}", file_path))?;
+            run_post_save_hook(file_path);
 
             let old_lines = original.lines().count();
             let new_lines = content.lines().count();

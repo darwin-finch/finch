@@ -19,5 +19,5 @@ pub mod interpreter;
 pub mod library;
 pub mod scatter;
 
-pub use interpreter::{DictionarySnapshot, Forth};
+pub use interpreter::{extract_comments, tokenize, DictionarySnapshot, Forth, StackEffect};
 pub use library::{Library, WordEntry};

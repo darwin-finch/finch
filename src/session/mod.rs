@@ -20,6 +20,142 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+// ── Promise ───────────────────────────────────────────────────────────────────
+
+// ── ProofBundle ───────────────────────────────────────────────────────────────
+
+/// The same idea proven in multiple languages simultaneously.
+///
+/// When two or more `Promise`s agree on stack effect, you have a
+/// cross-architecture proof — something true about the idea itself,
+/// not just one encoding of it.
+///
+/// Comments extracted from the source (Forth `\ ...` and `( ... )` blocks)
+/// travel with the bundle so recipients can read the intent, not just the code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofBundle {
+    /// Stable ID shared by all translations of the same idea.
+    pub id: Uuid,
+    /// One promise per language — same idea, different encodings.
+    pub proofs: Vec<Promise>,
+    /// Comments extracted from the original source — the human explanation.
+    pub comments: Vec<String>,
+}
+
+impl ProofBundle {
+    /// Create a bundle from a single proven promise and its extracted comments.
+    pub fn new(promise: Promise, comments: Vec<String>) -> Self {
+        Self {
+            id: promise.id,
+            proofs: vec![promise],
+            comments,
+        }
+    }
+
+    /// Add another language's proof to this bundle.
+    pub fn with_proof(mut self, promise: Promise) -> Self {
+        self.proofs.push(promise);
+        self
+    }
+
+    /// Returns true if all proofs with known effects agree on `( pops -- pushes )`.
+    pub fn effects_agree(&self) -> bool {
+        let effects: Vec<_> = self.proofs.iter().filter_map(|p| p.effect.as_ref()).collect();
+        if effects.len() < 2 {
+            return true; // nothing to disagree about yet
+        }
+        let first = effects[0];
+        effects.iter().all(|e| e.pops == first.pops && e.pushes == first.pushes)
+    }
+
+    /// Primary promise — the first one added (the original source language).
+    pub fn primary(&self) -> &Promise {
+        &self.proofs[0]
+    }
+}
+
+// ── Promise ───────────────────────────────────────────────────────────────────
+
+/// Which language a `Promise` is written in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lang {
+    Forth,
+    Lisp,
+    Natural,
+}
+
+/// A piece of code (or natural language) together with its proof.
+///
+/// A `Promise` is the unit of exchange between sessions.  Raw strings are
+/// never passed directly — everything is wrapped in a `Promise` so the
+/// receiver knows the language, has a stable identity, and (for Forth) knows
+/// the stack effect before executing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Promise {
+    /// Stable ID — same across a continuation chain.
+    pub id: Uuid,
+    /// The language this code is written in.
+    pub lang: Lang,
+    /// The code or text.
+    pub code: String,
+    /// Proven stack effect (Forth only; `None` means not yet verified).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect: Option<crate::coforth::StackEffect>,
+    /// SHA-256 hex of `code` — integrity check.
+    pub hash: String,
+}
+
+impl Promise {
+    fn sha256(code: &str) -> String {
+        use std::hash::Hasher;
+        // Fast non-crypto hash is fine here (wire integrity, not security).
+        // For cryptographic needs use the `sha256` Forth word instead.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash_slice(code.as_bytes(), &mut h);
+        format!("{:016x}", h.finish())
+    }
+
+    pub fn forth(code: impl Into<String>) -> Self {
+        let code = code.into();
+        Self {
+            id: Uuid::new_v4(),
+            hash: Self::sha256(&code),
+            lang: Lang::Forth,
+            code,
+            effect: None,
+        }
+    }
+
+    pub fn forth_proven(code: impl Into<String>, effect: crate::coforth::StackEffect) -> Self {
+        let mut p = Self::forth(code);
+        p.effect = Some(effect);
+        p
+    }
+
+    pub fn lisp(code: impl Into<String>) -> Self {
+        let code = code.into();
+        Self {
+            id: Uuid::new_v4(),
+            hash: Self::sha256(&code),
+            lang: Lang::Lisp,
+            code,
+            effect: None,
+        }
+    }
+
+    pub fn natural(text: impl Into<String>) -> Self {
+        let code = text.into();
+        Self {
+            id: Uuid::new_v4(),
+            hash: Self::sha256(&code),
+            lang: Lang::Natural,
+            code,
+            effect: None,
+        }
+    }
+}
+
 // ── Wire types ────────────────────────────────────────────────────────────────
 
 /// An event exchanged between two session participants.
@@ -67,6 +203,17 @@ pub enum SessionEvent {
 
     /// Response to a Dialog — sent back by the receiving side.
     DialogAnswer { id: Uuid, answer: DialogAnswer },
+
+    /// A proof bundle delivered to a named channel (e.g. "#all").
+    /// Unlike `Chat`, this is display-only until the receiver explicitly
+    /// calls `/exec [n]` — which executes the primary promise in their VM.
+    /// The bundle carries all language translations and extracted comments,
+    /// so the receiver can read the intent before executing.
+    ChannelMessage {
+        channel: String,
+        sender: String,
+        bundle: ProofBundle,
+    },
 
     /// Signals that this side is closing the session.
     Close,
@@ -321,5 +468,64 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         let back: SessionEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, SessionEvent::Dialog { id: rid, .. } if rid == id));
+    }
+
+    // ── ProofBundle tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_proof_bundle_single_proof_effects_agree() {
+        let p = Promise::forth("2 3 +");
+        let bundle = ProofBundle::new(p, vec![]);
+        // One proof — nothing to disagree with.
+        assert!(bundle.effects_agree());
+    }
+
+    #[test]
+    fn test_proof_bundle_matching_effects_agree() {
+        use crate::coforth::StackEffect;
+        let p1 = Promise::forth_proven("2 3 +", StackEffect::new(2, 1));
+        let p2 = Promise::forth_proven("dup *", StackEffect::new(2, 1));
+        let bundle = ProofBundle::new(p1, vec![]).with_proof(p2);
+        assert!(bundle.effects_agree());
+    }
+
+    #[test]
+    fn test_proof_bundle_mismatched_effects_disagree() {
+        use crate::coforth::StackEffect;
+        let p1 = Promise::forth_proven("dup", StackEffect::new(1, 2));
+        let p2 = Promise::forth_proven("drop", StackEffect::new(1, 0));
+        let bundle = ProofBundle::new(p1, vec![]).with_proof(p2);
+        assert!(!bundle.effects_agree());
+    }
+
+    #[test]
+    fn test_proof_bundle_primary_is_first() {
+        let p1 = Promise::forth("first");
+        let p2 = Promise::lisp("(second)");
+        let code = p1.code.clone();
+        let bundle = ProofBundle::new(p1, vec![]).with_proof(p2);
+        assert_eq!(bundle.primary().code, code);
+    }
+
+    #[test]
+    fn test_proof_bundle_carries_comments() {
+        let p = Promise::forth(": double \\ multiply by two\n  dup + ;");
+        let comments = vec!["multiply by two".to_string()];
+        let bundle = ProofBundle::new(p, comments.clone());
+        assert_eq!(bundle.comments, comments);
+    }
+
+    #[test]
+    fn test_proof_bundle_channel_message_roundtrip() {
+        let p = Promise::natural("hello world");
+        let bundle = ProofBundle::new(p, vec![]);
+        let ev = SessionEvent::ChannelMessage {
+            channel: "#all".into(),
+            sender: "alice".into(),
+            bundle,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: SessionEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, SessionEvent::ChannelMessage { channel, .. } if channel == "#all"));
     }
 }

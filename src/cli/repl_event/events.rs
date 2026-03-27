@@ -115,6 +115,9 @@ pub enum ReplEvent {
     /// Co-Forth poset execution finished.
     PosetComplete { result: Result<String> },
 
+    /// Lisp evaluation finished (spawned by handle_user_input when input starts with `(`).
+    LispResult { result: Result<String> },
+
     /// mDNS background boot scan found finch instances on the LAN.
     /// The event loop adds them to the Forth VM's peer list and shows a notice.
     /// (host, port, friendly_name, token)
@@ -126,6 +129,10 @@ pub enum ReplEvent {
 
     /// A message arrived from the peer event loop (the AI's own loop).
     PeerMessage { text: String },
+
+    /// Translations of a phrase arrived — update the corner ticker.
+    /// Each item is `(language_name, translated_text)`.
+    Translations { items: Vec<(String, String)> },
 }
 
 /// Requests sent from the TUI event loop to the LLM worker loop.

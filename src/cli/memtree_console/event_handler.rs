@@ -90,9 +90,11 @@ impl EventHandler {
             ReplEvent::BrainProposedAction { .. } => {}
             ReplEvent::ShowDialog { .. } => {}
             ReplEvent::PosetComplete { .. } => {}
+            ReplEvent::LispResult { .. } => {}
             ReplEvent::PeersDiscovered(_) => {}
             ReplEvent::VocabSync(_) => {}
             ReplEvent::PeerMessage { .. } => {}
+            ReplEvent::Translations { .. } => {}
         }
 
         Ok(())

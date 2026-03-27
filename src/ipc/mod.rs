@@ -15,10 +15,12 @@
 //! clients (VS Code / Continue.dev).  This module is the internal fast path.
 
 pub mod client;
+pub mod events;
 pub mod schema;
 pub mod server;
 pub mod transport;
 
 pub use client::IpcClient;
+pub use events::{EventBus, QueuedEvent};
 pub use server::start_ipc_server;
 pub use transport::DAEMON_SOCK_PATH;

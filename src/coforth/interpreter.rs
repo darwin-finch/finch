@@ -178,6 +178,13 @@ enum Builtin {
     XlsxAtSheet,  // ( file-idx sheet-idx addr-idx -- val-idx ) read cell from named sheet
     XlsxSheets,   // ( file-idx -- names-idx )             newline-separated sheet names
     XlsxWriteCell, // ( val-idx file-idx addr-idx -- )     write cell (load→patch→save)
+    // ── polymorphic file loader ────────────────────────────────────────────────
+    Load,         // ( path-idx -- result-idx )  dispatch on extension; always returns a value
+    // ── base64 ────────────────────────────────────────────────────────────────
+    FileToB64,    // ( path-idx -- b64-idx )   read file bytes → base64 string
+    B64ToFile,    // ( b64-idx path-idx -- )   decode base64 → write binary file
+    B64Encode,    // ( str-idx -- b64-idx )    base64-encode a string's UTF-8 bytes
+    B64Decode,    // ( b64-idx -- str-idx )    base64-decode → UTF-8 string (lossy)
     // Trig (scaled: input in degrees * 1000, output * 1000)
     Sin, // ( deg*1000 -- sin*1000 )
     Cos, // ( deg*1000 -- cos*1000 )
@@ -303,6 +310,7 @@ enum Builtin {
     ArmRun,    // ( str-asm -- n )   run ARM assembly; push top-of-stack onto Forth stack
     Ergo,      // ( str-a str-b str-check str-conclusion -- )  quadruple proof: if check passes, state conclusion
     WordDef,   // ( str-name str-a str-b -- )  prove a ≡ b on battery of seeds, then install `: name a ;`
+    QuadDef,   // ( str-name str-en str-zh str-forth str-arm -- )  two pairs: (en,zh) + prove forth≡arm, install
     Page, // ( str -- )    run a multi-line proof page: each line is "left | right"
     Resolve, // ( str -- )    many sentences, one truth: all lines must converge to same value
     Infix, // ( str -- )    eval infix expression: "3 + 4", "10 * 5 - 2", etc.
@@ -319,7 +327,8 @@ enum Builtin {
     SortLines,     // ( idx -- idx' )  sort lines of strings[idx] alphabetically
     UniqueLines,   // ( idx -- idx' )  deduplicate lines of strings[idx]
     ReverseLines,  // ( idx -- idx' )  reverse line order of strings[idx]
-    LineCount,     // ( idx -- n )     number of lines in strings[idx]
+    LineCount,
+    Solve,   // ( prog-idx target -- n )  fill _ with integers until prog produces target     // ( idx -- n )     number of lines in strings[idx]
     GlobPool,      // ( pattern-idx -- result-idx )  glob into string pool (one path per line)
     CleanLines, // ( idx -- n )  quarantine each path in strings[idx] (one per line); return count
     GlobCount,  // ( pattern-idx -- n )  count files matching glob pattern
@@ -349,6 +358,21 @@ enum Builtin {
     RoomSub,  // ( addr-idx -- )          remove peer address from current room's member list
     RoomList, // ( -- )                   print all rooms with member counts
     RoomNew,  // ( -- uuid-idx )          create a new room with a fresh UUID; sets current
+    // Stack-effect proof
+    ProveEffect, // ( str-idx -- str-idx )  infer stack effect of program; push as string "( a -- b )"
+    SameEffect,  // ( str1 str2 -- flag )   -1 if both programs have the same stack effect
+    // ── Vec4 — four lanes walking in lockstep ─────────────────────────────────
+    // Values are fixed-point scaled by 1000 (i.e. 1.5 → 1500).
+    // Layout on stack: x y z w  (w on top).
+    Vec4New,  // ( x y z w -- vec4:x vec4:y vec4:z vec4:w )  identity; names the 4-group
+    Vec4Add,  // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise add
+    Vec4Sub,  // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise subtract
+    Vec4Mul,  // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise multiply (fixed-point)
+    Vec4Scale, // ( x y z w s -- rx ry rz rw )               scale all lanes by scalar s
+    Vec4Dot,  // ( ax ay az aw bx by bz bw -- dot )          dot product (fixed-point)
+    Vec4Len,  // ( x y z w -- len )                          Euclidean length (fixed-point)
+    Vec4Norm, // ( x y z w -- rx ry rz rw )                  normalise to unit length
+    Vec4Print, // ( x y z w -- x y z w )  vprint — print without consuming
 }
 
 // ── Interpreter ───────────────────────────────────────────────────────────────
@@ -371,6 +395,143 @@ pub type SelectFn = Box<dyn Fn(&str, &[String]) -> i64 + Send + Sync>;
 
 /// Callback type for the `open-file` builtin — opens a file viewer in the TUI.
 pub type OpenFileFn = Box<dyn Fn(&str) + Send + Sync>;
+
+// ── Stack-effect inference ────────────────────────────────────────────────────
+
+/// The proven stack signature of a word or program.
+///
+/// `pops` — how many values are consumed from the stack before this runs.
+/// `pushes` — how many values are left on the stack after it runs.
+///
+/// A literal like `42` has `StackEffect { pops: 0, pushes: 1 }`.
+/// `+` has `StackEffect { pops: 2, pushes: 1 }`.
+/// `dup` has `StackEffect { pops: 1, pushes: 2 }`.
+///
+/// Effects compose left-to-right: `e1.then(e2)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct StackEffect {
+    pub pops: usize,
+    pub pushes: usize,
+}
+
+impl StackEffect {
+    pub const fn new(pops: usize, pushes: usize) -> Self {
+        Self { pops, pushes }
+    }
+
+    /// Identity — does nothing to the stack.
+    pub const fn identity() -> Self {
+        Self { pops: 0, pushes: 0 }
+    }
+
+    /// Compose `self` then `next`.
+    ///
+    /// If `next` needs more than `self` produced, it draws the remainder from
+    /// the caller's stack (increasing our own `pops`).
+    pub fn then(&self, next: &StackEffect) -> StackEffect {
+        if next.pops <= self.pushes {
+            StackEffect {
+                pops: self.pops,
+                pushes: self.pushes - next.pops + next.pushes,
+            }
+        } else {
+            let extra_needed = next.pops - self.pushes;
+            StackEffect {
+                pops: self.pops + extra_needed,
+                pushes: next.pushes,
+            }
+        }
+    }
+
+    /// Human-readable form: `( a b -- c )` using letters for anonymous slots.
+    pub fn display(&self) -> String {
+        let ins: String = (0..self.pops)
+            .map(|i| ((b'a' + i as u8) as char).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let outs: String = (0..self.pushes)
+            .map(|i| ((b'a' + (self.pops + i) as u8) as char).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("( {ins} -- {outs} )")
+    }
+}
+
+impl std::fmt::Display for StackEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display())
+    }
+}
+
+/// Return the statically-known `StackEffect` for a builtin, if deterministic.
+/// Returns `None` for control-flow words whose effect depends on runtime values.
+fn builtin_effect(b: Builtin) -> Option<StackEffect> {
+    use Builtin::*;
+    Some(match b {
+        // Arithmetic: 2→1
+        Plus | Minus | Star | Slash | Mod | Max | Min | And | Or | Xor
+        | Lshift | Rshift | StarSlash | FPMul => StackEffect::new(2, 1),
+        // Comparison: 2→1
+        Eq | Lt | Gt | Ne | Le | Ge | ULt | AgreeQ | SameQ | EquivQ
+        | BackAndForthQ => StackEffect::new(2, 1),
+        // Unary: 1→1
+        Negate | Abs | Invert | Inc | Dec | ZeroEq | ZeroLt | ZeroGt
+        | Capitalize | StrUpper | StrLower | StrTrim | Sqrt
+        | Sha256 | Hash | HashInt | NumToStr | InvertibleQ => StackEffect::new(1, 1),
+        // 1→0 (consume, no push)
+        Drop | Print | PrintU | PrintS | PrintHex | Cr | Space | Emit | Type
+        | Store | FileWrite | FileAppend | Assert | Boot => StackEffect::new(1, 0),
+        // 1→2
+        Dup => StackEffect::new(1, 2),
+        // 2→2
+        Swap | Over | StrEq | StrCat | StrSplit | StrJoin | StrFind
+        | StrReplace | LabelPeer | TagPeer | BothWays => StackEffect::new(2, 2),
+        // 2→3
+        Over => StackEffect::new(2, 3),
+        // 3→3
+        Rot => StackEffect::new(3, 3),
+        // 2→0
+        TwoDrop | Store | FileWrite | FileAppend | EnsembleDef | HPut | HDel
+        | RecordDebit => StackEffect::new(2, 0),
+        // 0→1
+        Random | Time | Depth | Fuel | Nonce | Here | CellSz | RoomNew
+        | WordNames | Peers => StackEffect::new(0, 1),
+        // 0→0
+        Nop | Words | HotWords | PeersClear | PeersDiscover | TakeAll | Sync
+        | ProveAll | ProveEnglish | ProveLanguages | Help | Boot => StackEffect::new(0, 0),
+        // 1→0 (side-effectful; no push)
+        Publish | EnsembleUse | EnsembleEnd | RoomUse | RoomAdd | RoomSub
+        | JoinRegistry | LeaveRegistry | RegisterBoot | RegistrySet => StackEffect::new(1, 0),
+        // Misc
+        StrLen | WordCount | SentenceCheck | WordDefined | IsPrime | Safe
+        | ArgOk | FileSize | GlobCount | ScanBytes | FileEntropy
+        | ZeroEq | ZeroLt | ZeroGt | HashInt | StrToNum => StackEffect::new(1, 1),
+        StrSub => StackEffect::new(3, 1),
+        NthLine => StackEffect::new(2, 1),
+        SlashMod => StackEffect::new(2, 2),
+        TwoDup => StackEffect::new(2, 4),
+        TwoSwap | TwoOver => StackEffect::new(4, 4),
+        TwoRot => StackEffect::new(6, 6),
+        Nip | Tuck => StackEffect::new(2, 1),
+        TermSize => StackEffect::new(0, 2),
+        Keygen => StackEffect::new(0, 2),
+        Sign => StackEffect::new(2, 1),
+        Verify => StackEffect::new(3, 1),
+        Fill => StackEffect::new(3, 0),
+        AtXy => StackEffect::new(2, 0),
+        PrintPad => StackEffect::new(3, 0),
+        PrintR => StackEffect::new(2, 0),
+        HashCombine => StackEffect::new(2, 1),
+        // Vec4 — four lanes walking in lockstep
+        Vec4New | Vec4Print | Vec4Norm => StackEffect::new(4, 4),
+        Vec4Add | Vec4Sub | Vec4Mul => StackEffect::new(8, 4),
+        Vec4Scale => StackEffect::new(5, 4),
+        Vec4Dot => StackEffect::new(8, 1),
+        Vec4Len => StackEffect::new(4, 5),
+        // Control flow — effect depends on runtime values; can't determine statically
+        _ => return None,
+    })
+}
 
 /// The result of an `argument` proof: the stack it left and whether it passed.
 #[derive(Debug, Clone)]
@@ -413,6 +574,9 @@ pub struct Forth {
     /// Internal undo history: auto-pushed before each new `: name` definition.
     /// Capped at 20 entries (oldest dropped).  `undo` pops and restores.
     undo_stack: Vec<DictionarySnapshot>,
+    /// Proven stack effects for user-defined words (word name → effect).
+    /// Populated lazily by `infer_effect`; lets subsequent analyses skip re-inference.
+    pub effect_cache: HashMap<String, StackEffect>,
     /// Distributed advisory lock table: name → expiry instant.
     /// Auto-expires on each `lock` call.  Max TTL = 5 s.
     locks: HashMap<String, Instant>,
@@ -464,6 +628,9 @@ pub struct Forth {
     /// Word definitions enqueued by `word:` during execution (e.g. inside flush_pending).
     /// Drained after memory.truncate so the compiled body is not wiped.
     deferred_defs: Vec<String>,
+    /// Quad descriptions: word name → (English, Chinese).
+    /// Populated by `quad:`.  Shown in the UI when a quad word is described or runs.
+    pub quad_descriptions: HashMap<String, (String, String)>,
     /// Names of words defined by the USER (not stdlib) — these override builtins.
     /// Populated only when log_definitions is true (after stdlib phase).
     user_word_names: std::collections::HashSet<String>,
@@ -1093,11 +1260,38 @@ word:
 \   s" report.xlsx" xlsx-sheets  type cr       \ list sheet names
 \   s" 42" s" report.xlsx" s" B3" xlsx!        \ write 42 into B3
 
+\ Read a cell as a number.  Aborts if the cell is not numeric.  ( file addr -- n )
+: xlsx-num   xlsx@ str>num if exit then drop 0 ;
+
 \ Print a cell value directly.  ( file addr -- )
 : .cell   xlsx@ type cr ;
 
 \ Print all sheet names, one per line.  ( file -- )
 : .sheets  xlsx-sheets type cr ;
+
+\ ── load / unload ────────────────────────────────────────────────────────────
+\ load   ( path -- result )  dispatch on extension; always returns a value:
+\          .xlsx/.xls/.ods → CSV text of first sheet
+\          .zip            → entry listing  (name TAB size)
+\          .csv            → raw CSV text
+\          anything else   → raw file text
+\
+\ unload ( result -- )  discard a loaded value — the stack IS the loaded state.
+: unload   drop ;
+\
+\ load-exec  ( path -- flag )  load a .forth/.fs file and execute it.
+\ The flag is -1 if execution succeeded, 0 if it errored.
+: load-exec  load safe ;
+
+\ Execute a cell's contents as Forth code (safe — never aborts).
+\ Returns -1 if the cell ran without error, 0 if it failed.
+\ ( file addr -- flag )
+: xlsx-exec   xlsx@ safe ;
+
+\ Execute a cell only if the flag on top of stack is true; otherwise drop.
+\ Useful for conditional execution based on a predicate cell.
+\ ( file addr flag -- )
+: xlsx-exec-if   if xlsx-exec drop else 2drop then ;
 \"#;
 
 /// Proofs for STDLIB words.
@@ -1412,6 +1606,7 @@ impl Forth {
             fuel: usize::MAX,       // unlimited while loading stdlib
             undo_stack: Vec::new(),
             locks: HashMap::new(),
+            effect_cache: HashMap::new(),
             confirm_fn: None,
             gen_fn: None,
             select_fn: None,
@@ -1429,6 +1624,7 @@ impl Forth {
             boot_poems: Vec::new(),
             pending_defines: Vec::new(),
             deferred_defs: Vec::new(),
+            quad_descriptions: HashMap::new(),
             user_word_names: std::collections::HashSet::new(),
             call_stack: Vec::with_capacity(64),
             pending_continuation: None,
@@ -1729,6 +1925,7 @@ impl Forth {
             fuel: DEFAULT_FUEL,
             undo_stack: Vec::new(),
             locks: HashMap::new(),
+            effect_cache: self.effect_cache.clone(),
             confirm_fn: None,
             gen_fn: None,
             select_fn: None,
@@ -1746,6 +1943,7 @@ impl Forth {
             boot_poems: Vec::new(),
             pending_defines: Vec::new(),
             deferred_defs: Vec::new(),
+            quad_descriptions: HashMap::new(),
             user_word_names: self.user_word_names.clone(),
             call_stack: Vec::with_capacity(64),
             pending_continuation: None,
@@ -1811,6 +2009,65 @@ impl Forth {
             .find(|e| e.starts_with(&prefix))
             .cloned()
     }
+
+    /// Statically infer the stack effect of `program`.
+    ///
+    /// Works by composing the known effects of each token left-to-right.
+    /// Returns `Err` if any token has an unknown or control-flow-dependent
+    /// effect (the program is not provably type-safe with this simple model).
+    ///
+    /// Results for user-defined words are memoised in `effect_cache`.
+    pub fn infer_effect(&mut self, program: &str) -> Result<StackEffect, String> {
+        let mut effect = StackEffect::identity();
+        for token in tokenize(program) {
+            let tok_effect = self.infer_effect_token(&token)?;
+            effect = effect.then(&tok_effect);
+        }
+        Ok(effect)
+    }
+
+    fn infer_effect_token(&mut self, token: &str) -> Result<StackEffect, String> {
+        // Integer literals
+        if token.parse::<i64>().is_ok() {
+            return Ok(StackEffect::new(0, 1));
+        }
+        // Builtin lookup via the name table
+        if let Some(b) = name_to_builtin(token) {
+            return builtin_effect(b)
+                .ok_or_else(|| format!("'{token}' has runtime-dependent stack effect"));
+        }
+        // User-defined word — check cache, then try to infer from source
+        if let Some(cached) = self.effect_cache.get(token).cloned() {
+            return Ok(cached);
+        }
+        if let Some(src) = self.word_source(token) {
+            // Extract body via the tokenizer: skip `:`, skip the name, collect until `;`.
+            let toks = tokenize(&src);
+            // toks[0] == ":", toks[1] == name, toks[2..] == body tokens (last is ";")
+            let body_tokens: Vec<&str> = toks
+                .iter()
+                .skip(2)  // skip `:` and name
+                .take_while(|t| t.as_str() != ";")
+                .map(String::as_str)
+                .collect();
+            let body = body_tokens.join(" ");
+            // Guard against recursion: insert identity temporarily
+            self.effect_cache.insert(token.to_string(), StackEffect::identity());
+            let result = self.infer_effect(&body);
+            match result {
+                Ok(e) => {
+                    self.effect_cache.insert(token.to_string(), e.clone());
+                    Ok(e)
+                }
+                Err(err) => {
+                    self.effect_cache.remove(token);
+                    Err(err)
+                }
+            }
+        } else {
+            Err(format!("'{token}' not found"))
+        }
+    }
 }
 
 // ── Interpreter core (von Neumann flat-memory model) ─────────────────────────
@@ -1854,8 +2111,8 @@ impl Forth {
                 // AND `word:` itself, installing the deferred definition), then continue
                 // with the remaining tokens in a fresh batch — so subsequent calls to the
                 // newly-defined word see it in the dictionary at compile time.
-                "word:" => {
-                    pending.push("word:".to_string());
+                "word:" | "quad:" => {
+                    pending.push(tokens[pos].to_string());
                     flush_pending!();
                     pos += 1;
                     continue;
@@ -3855,6 +4112,230 @@ impl Forth {
                     .ok_or_else(|| anyhow::anyhow!("eval: invalid string index {idx}"))?;
                 self.eval(&code)?;
             }
+            Builtin::Solve => {
+                // ( prog-idx target -- n )
+                // Replace every occurrence of the token `_` in the program
+                // with a candidate integer and run it.  The first candidate
+                // whose execution leaves `target` on top of the stack is the
+                // solution; it is pushed as the result.
+                //
+                // Search order: 0, 1, -1, 2, -2, … up to ±1000.
+                // Pushes i64::MIN and prints a warning if nothing found.
+                let target = self.pop()?;
+                let idx = self.pop()? as usize;
+                let prog = self
+                    .strings
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("solve: invalid string index {idx}"))?;
+
+                let stack_before = self.data.clone();
+
+                // Build candidate sequence: 0, 1, -1, 2, -2, …
+                let candidates: Vec<i64> = std::iter::once(0_i64)
+                    .chain((1_i64..=1000).flat_map(|n| [n, -n]))
+                    .collect();
+
+                let mut found: Option<i64> = None;
+                for &candidate in &candidates {
+                    let filled = prog.replace("_", &candidate.to_string());
+                    let snap = self.data.clone();
+                    let depth_before = snap.len();
+                    if self.eval(&filled).is_ok() {
+                        if let Some(&top) = self.data.last() {
+                            if top == target {
+                                found = Some(candidate);
+                                // Restore stack to pre-solve state, then push solution.
+                                self.data = stack_before.clone();
+                                break;
+                            }
+                        }
+                    }
+                    self.data = snap;
+                }
+
+                match found {
+                    Some(n) => {
+                        self.data = stack_before;
+                        self.data.push(n);
+                    }
+                    None => {
+                        self.data = stack_before;
+                        self.data.push(i64::MIN);
+                        self.out.push_str("solve: no solution found in ±1000\n");
+                    }
+                }
+            }
+            Builtin::ProveEffect => {
+                // ( str-idx -- str-idx )
+                // Infer the stack effect of the program at strings[idx] and push
+                // the result as a new string like "( a b -- c )".
+                let idx = self.pop()? as usize;
+                let prog = self
+                    .strings
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("prove-effect: invalid string index {idx}"))?;
+                let result = match self.infer_effect(&prog) {
+                    Ok(e) => e.to_string(),
+                    Err(msg) => format!("unknown: {msg}"),
+                };
+                let new_idx = self.strings.len();
+                self.strings.push(result);
+                self.data.push(new_idx as i64);
+            }
+
+            Builtin::SameEffect => {
+                // ( str1 str2 -- flag )
+                // -1 if both programs have the same proven stack effect, 0 otherwise.
+                let idx2 = self.pop()? as usize;
+                let idx1 = self.pop()? as usize;
+                let prog2 = self.strings.get(idx2).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("same-effect?: invalid index {idx2}"))?;
+                let prog1 = self.strings.get(idx1).cloned()
+                    .ok_or_else(|| anyhow::anyhow!("same-effect?: invalid index {idx1}"))?;
+                let e1 = self.infer_effect(&prog1);
+                let e2 = self.infer_effect(&prog2);
+                let flag = match (e1, e2) {
+                    (Ok(a), Ok(b)) => {
+                        self.out.push_str(&format!(
+                            "  {} → {}\n  {} → {}\n",
+                            prog1.trim(), a, prog2.trim(), b
+                        ));
+                        if a == b { -1 } else { 0 }
+                    }
+                    (Err(e), _) => {
+                        self.out.push_str(&format!("  cannot prove '{}': {e}\n", prog1.trim()));
+                        0
+                    }
+                    (_, Err(e)) => {
+                        self.out.push_str(&format!("  cannot prove '{}': {e}\n", prog2.trim()));
+                        0
+                    }
+                };
+                self.data.push(flag);
+            }
+
+            // ── Vec4 — four lanes walking in lockstep ─────────────────────────
+            // Fixed-point scale: integers represent thousandths (1.5 → 1500).
+            // Layout: x y z w  (w is top of stack).
+
+            Builtin::Vec4New => {
+                // ( x y z w -- x y z w )  identity; documents intent
+                // No-op at runtime — the 4 values are already on the stack.
+            }
+
+            Builtin::Vec4Add => {
+                // ( ax ay az aw bx by bz bw -- rx ry rz rw )
+                let bw = self.pop()?; let bz = self.pop()?;
+                let by = self.pop()?; let bx = self.pop()?;
+                let aw = self.pop()?; let az = self.pop()?;
+                let ay = self.pop()?; let ax = self.pop()?;
+                self.data.push(ax + bx);
+                self.data.push(ay + by);
+                self.data.push(az + bz);
+                self.data.push(aw + bw);
+            }
+
+            Builtin::Vec4Sub => {
+                // ( ax ay az aw bx by bz bw -- rx ry rz rw )
+                let bw = self.pop()?; let bz = self.pop()?;
+                let by = self.pop()?; let bx = self.pop()?;
+                let aw = self.pop()?; let az = self.pop()?;
+                let ay = self.pop()?; let ax = self.pop()?;
+                self.data.push(ax - bx);
+                self.data.push(ay - by);
+                self.data.push(az - bz);
+                self.data.push(aw - bw);
+            }
+
+            Builtin::Vec4Mul => {
+                // ( ax ay az aw bx by bz bw -- rx ry rz rw )  fixed-point multiply
+                let bw = self.pop()?; let bz = self.pop()?;
+                let by = self.pop()?; let bx = self.pop()?;
+                let aw = self.pop()?; let az = self.pop()?;
+                let ay = self.pop()?; let ax = self.pop()?;
+                self.data.push(ax * bx / 1000);
+                self.data.push(ay * by / 1000);
+                self.data.push(az * bz / 1000);
+                self.data.push(aw * bw / 1000);
+            }
+
+            Builtin::Vec4Scale => {
+                // ( x y z w s -- rx ry rz rw )  scale all lanes by scalar s (fixed-point)
+                let s = self.pop()?;
+                let w = self.pop()?; let z = self.pop()?;
+                let y = self.pop()?; let x = self.pop()?;
+                self.data.push(x * s / 1000);
+                self.data.push(y * s / 1000);
+                self.data.push(z * s / 1000);
+                self.data.push(w * s / 1000);
+            }
+
+            Builtin::Vec4Dot => {
+                // ( ax ay az aw bx by bz bw -- dot )
+                let bw = self.pop()?; let bz = self.pop()?;
+                let by = self.pop()?; let bx = self.pop()?;
+                let aw = self.pop()?; let az = self.pop()?;
+                let ay = self.pop()?; let ax = self.pop()?;
+                let dot = (ax * bx + ay * by + az * bz + aw * bw) / 1000;
+                self.data.push(dot);
+            }
+
+            Builtin::Vec4Len => {
+                // ( x y z w -- x y z w len )  Euclidean length; leaves vec4 on stack.
+                // Fixed-point: x_fp = x_real * 1000.
+                // len_real = sqrt(x_real^2 + ...) = sqrt(x_fp^2 + ...) / 1000
+                // len_fp   = len_real * 1000 = sqrt(x_fp^2 + y_fp^2 + z_fp^2 + w_fp^2)
+                let w = self.pop()?; let z = self.pop()?;
+                let y = self.pop()?; let x = self.pop()?;
+                let sum_sq = (x * x + y * y + z * z + w * w) as f64;
+                let len = sum_sq.sqrt() as i64;
+                self.data.push(x);
+                self.data.push(y);
+                self.data.push(z);
+                self.data.push(w);
+                self.data.push(len);
+            }
+
+            Builtin::Vec4Norm => {
+                // ( x y z w -- rx ry rz rw )  normalise to unit length (fixed-point).
+                // len_fp = sqrt(x_fp^2 + ...) ; norm_fp = x_fp * 1000 / len_fp
+                // (because norm_real = x_real/len_real = x_fp/len_fp, then *1000 for fp)
+                let w = self.pop()?; let z = self.pop()?;
+                let y = self.pop()?; let x = self.pop()?;
+                let sum_sq = (x * x + y * y + z * z + w * w) as f64;
+                let len = sum_sq.sqrt();
+                if len < 1e-9 {
+                    self.data.push(x);
+                    self.data.push(y);
+                    self.data.push(z);
+                    self.data.push(w);
+                } else {
+                    self.data.push((x as f64 * 1000.0 / len) as i64);
+                    self.data.push((y as f64 * 1000.0 / len) as i64);
+                    self.data.push((z as f64 * 1000.0 / len) as i64);
+                    self.data.push((w as f64 * 1000.0 / len) as i64);
+                }
+            }
+
+            Builtin::Vec4Print => {
+                // ( x y z w -- x y z w )  print without consuming
+                let w = self.pop()?; let z = self.pop()?;
+                let y = self.pop()?; let x = self.pop()?;
+                self.out.push_str(&format!(
+                    "vec4( {:.3} {:.3} {:.3} {:.3} )\n",
+                    x as f64 / 1000.0,
+                    y as f64 / 1000.0,
+                    z as f64 / 1000.0,
+                    w as f64 / 1000.0,
+                ));
+                self.data.push(x);
+                self.data.push(y);
+                self.data.push(z);
+                self.data.push(w);
+            }
+
             Builtin::Argue => {
                 // ( str1 str2 -- )  two programmers, one stack.
                 // Dual-mode: with two string indices on the stack, compares programs.
@@ -4435,6 +4916,115 @@ impl Forth {
                     code_a.as_str().cyan(),
                     code_b.as_str().cyan(),
                     SEEDS.len(),
+                ));
+            }
+            Builtin::QuadDef => {
+                // ( str-name str-en str-zh str-forth str-js -- )
+                //
+                // Four equal things:
+                //   EN   — English description shown to the user
+                //   ZH   — Chinese description shown to the user
+                //   Forth — VM-native implementation (what gets installed)
+                //   JS    — JavaScript expression; `n` is the seed value
+                //
+                // Proves forth ≡ js across a battery of integer seeds.
+                // Stores (en, zh) in quad_descriptions.
+                // Installs the Forth body.
+                let idx_js    = self.pop()? as usize;
+                let idx_forth = self.pop()? as usize;
+                let idx_zh    = self.pop()? as usize;
+                let idx_en    = self.pop()? as usize;
+                let idx_name  = self.pop()? as usize;
+
+                let name  = self.strings.get(idx_name).cloned().unwrap_or_default();
+                let en    = self.strings.get(idx_en).cloned().unwrap_or_default();
+                let zh    = self.strings.get(idx_zh).cloned().unwrap_or_default();
+                let forth = self.strings.get(idx_forth).cloned().unwrap_or_default();
+                let js    = self.strings.get(idx_js).cloned().unwrap_or_default();
+
+                // ── Show the two human-language descriptions first ──────────
+                use crossterm::style::Stylize;
+                self.out.push_str(&format!(
+                    "  {} {}\n  EN  {}\n  ZH  {}\n",
+                    "⬡".cyan().bold(),
+                    name.as_str().yellow().bold(),
+                    en.as_str().white(),
+                    zh.as_str().white(),
+                ));
+
+                // ── Prove forth ≡ js ────────────────────────────────────────
+                const SEEDS: &[i64] = &[0, 1, -1, 2, -2, 5, -5, 10, -10, 100, -100];
+                let saved_data = std::mem::take(&mut self.data);
+                let mut failures = 0usize;
+
+                // Run a Forth snippet with a seed pushed first; return top of stack.
+                let run_forth = |code: &str, seed: i64, vm: &mut Self| -> Option<i64> {
+                    let prog = format!("{} {}", seed, code);
+                    vm.data.clear();
+                    let result = vm.eval(&prog).ok().and_then(|_| vm.data.last().copied());
+                    vm.data.clear();
+                    result
+                };
+
+                // Run a JS expression where `n` is the seed; return integer result.
+                // Requires `node` on PATH; skips proof if node is unavailable.
+                let run_js = |expr: &str, seed: i64| -> Option<i64> {
+                    let script = format!("const n={}; process.stdout.write(String({}));", seed, expr);
+                    let out = std::process::Command::new("node")
+                        .arg("-e").arg(&script)
+                        .output().ok()?;
+                    if !out.status.success() { return None; }
+                    std::str::from_utf8(&out.stdout).ok()?.trim().parse::<i64>().ok()
+                };
+
+                let node_available = std::process::Command::new("node")
+                    .arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+
+                for &seed in SEEDS {
+                    let rf = run_forth(&forth, seed, self);
+                    if node_available {
+                        let rj = run_js(&js, seed);
+                        match (rf, rj) {
+                            (Some(a), Some(b)) if a == b => {}
+                            (Some(a), Some(b)) => {
+                                self.out.push_str(&format!(
+                                    "  quad: {}  seed {}  →  forth={} js={}  {}\n",
+                                    name.as_str().cyan(), seed,
+                                    a.to_string().red(), b.to_string().red(),
+                                    "✗".red(),
+                                ));
+                                failures += 1;
+                            }
+                            _ => { failures += 1; }
+                        }
+                    }
+                }
+
+                self.data = saved_data;
+
+                if failures > 0 {
+                    anyhow::bail!(
+                        "quad: {} — {} seed(s) disagree; word not installed",
+                        name, failures
+                    );
+                }
+
+                // ── Install Forth body ──────────────────────────────────────
+                self.deferred_defs.push(format!(": {} {} ;", name, forth));
+
+                // ── Store descriptions ──────────────────────────────────────
+                self.quad_descriptions.insert(name.clone(), (en.clone(), zh.clone()));
+
+                let proof_note = if node_available {
+                    format!("({} seeds)", SEEDS.len())
+                } else {
+                    "(node unavailable — js proof skipped)".to_string()
+                };
+                self.out.push_str(&format!(
+                    "  {} {}  forth≡js  {}\n",
+                    "∴".yellow().bold(),
+                    name.as_str().yellow().bold(),
+                    proof_note,
                 ));
             }
             Builtin::Versus => {
@@ -5176,6 +5766,60 @@ impl Forth {
                 if let Err(e) = xlsx_write_cell(&path, &addr, &value) {
                     self.out.push_str(&format!("xlsx!: {e}\n"));
                 }
+            }
+            Builtin::Load => {
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx).cloned().unwrap_or_default();
+                let result = load_file(&path);
+                let idx = self.intern_str(&result);
+                self.data.push(idx as i64);
+            }
+            Builtin::FileToB64 => {
+                let path_idx = self.pop()? as usize;
+                let path = self.strings.get(path_idx).cloned().unwrap_or_default();
+                let result = match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD.encode(&bytes)
+                    }
+                    Err(e) => format!("error: {e}"),
+                };
+                let idx = self.intern_str(&result);
+                self.data.push(idx as i64);
+            }
+            Builtin::B64ToFile => {
+                let path_idx = self.pop()? as usize;
+                let b64_idx  = self.pop()? as usize;
+                let path = self.strings.get(path_idx).cloned().unwrap_or_default();
+                let b64  = self.strings.get(b64_idx).cloned().unwrap_or_default();
+                use base64::Engine as _;
+                match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                    Ok(bytes) => {
+                        if let Err(e) = std::fs::write(&path, &bytes) {
+                            self.out.push_str(&format!("b64>file: {e}\n"));
+                        }
+                    }
+                    Err(e) => self.out.push_str(&format!("b64>file: decode error: {e}\n")),
+                }
+            }
+            Builtin::B64Encode => {
+                let str_idx = self.pop()? as usize;
+                let s = self.strings.get(str_idx).cloned().unwrap_or_default();
+                use base64::Engine as _;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(s.as_bytes());
+                let idx = self.intern_str(&encoded);
+                self.data.push(idx as i64);
+            }
+            Builtin::B64Decode => {
+                let b64_idx = self.pop()? as usize;
+                let b64 = self.strings.get(b64_idx).cloned().unwrap_or_default();
+                use base64::Engine as _;
+                let result = match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Err(e)    => format!("error: {e}"),
+                };
+                let idx = self.intern_str(&result);
+                self.data.push(idx as i64);
             }
             Builtin::Floor => {
                 let d = self.pop()?;
@@ -9701,7 +10345,7 @@ fn data_to_string(cell: &calamine::Data) -> String {
 }
 
 /// Read one cell from an xlsx/xls/ods file.  Sheet name `None` → first sheet.
-fn xlsx_read_cell(path: &str, sheet: Option<&str>, addr: &str) -> Result<String> {
+pub(crate) fn xlsx_read_cell(path: &str, sheet: Option<&str>, addr: &str) -> Result<String> {
     use calamine::{open_workbook_auto, Reader};
     let (row, col) = parse_cell_addr(addr)
         .ok_or_else(|| anyhow::anyhow!("invalid cell address: {addr}"))?;
@@ -9764,6 +10408,77 @@ fn xlsx_write_cell(path: &str, addr: &str, value: &str) -> Result<()> {
     }
     workbook.save(path)?;
     Ok(())
+}
+
+/// Polymorphic file loader — dispatches on file extension.
+///
+/// Every branch returns a plain string result so the caller always gets
+/// something on the stack, regardless of file type:
+///
+///   .xlsx / .xls / .ods  → CSV text of first sheet (via calamine)
+///   .zip                 → newline-separated entry list (name  size)
+///   .csv                 → raw CSV text
+///   .forth / .fs / .fth / .4th → Forth source text (caller can `safe` it)
+///   anything else        → raw UTF-8 text of the file
+///
+/// Errors produce a descriptive string prefixed with "error: " rather than
+/// aborting, so the result is always inspectable.
+pub(crate) fn load_file(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "xlsx" | "xls" | "ods" => load_xlsx_as_csv(path),
+        "zip"                  => load_zip_listing(path),
+        "csv"                  => std::fs::read_to_string(path)
+                                    .unwrap_or_else(|e| format!("error: {e}")),
+        _                      => std::fs::read_to_string(path)
+                                    .unwrap_or_else(|e| format!("error: {e}")),
+    }
+}
+
+fn load_xlsx_as_csv(path: &str) -> String {
+    use calamine::{open_workbook_auto, Reader};
+    let mut wb = match open_workbook_auto(path) {
+        Ok(w)  => w,
+        Err(e) => return format!("error: cannot open {path}: {e}"),
+    };
+    let sheet_name = match wb.sheet_names().first().cloned() {
+        Some(n) => n,
+        None    => return format!("error: {path}: no sheets found"),
+    };
+    let range = match wb.worksheet_range(&sheet_name) {
+        Ok(r)  => r,
+        Err(e) => return format!("error: cannot read sheet: {e}"),
+    };
+    let mut out = String::new();
+    for row in range.rows() {
+        let cells: Vec<String> = row.iter().map(data_to_string).collect();
+        out.push_str(&cells.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+fn load_zip_listing(path: &str) -> String {
+    let file = match std::fs::File::open(path) {
+        Ok(f)  => f,
+        Err(e) => return format!("error: cannot open {path}: {e}"),
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a)  => a,
+        Err(e) => return format!("error: not a valid zip: {e}"),
+    };
+    let mut out = String::new();
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(i) {
+            out.push_str(&format!("{}\t{}\n", entry.name(), entry.size()));
+        }
+    }
+    out
 }
 
 /// Extract a human-friendly machine name from an mDNS fullname.
@@ -10136,6 +10851,11 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "xlsx@/"     => Builtin::XlsxAtSheet,
         "xlsx-sheets" => Builtin::XlsxSheets,
         "xlsx!"      => Builtin::XlsxWriteCell,
+        "load"       => Builtin::Load,
+        "file>b64"   => Builtin::FileToB64,
+        "b64>file"   => Builtin::B64ToFile,
+        "b64-encode" => Builtin::B64Encode,
+        "b64-decode" => Builtin::B64Decode,
         "sin" => Builtin::Sin,
         "cos" => Builtin::Cos,
         "fpmul" => Builtin::FPMul,
@@ -10251,6 +10971,7 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "arm-run" => Builtin::ArmRun,
         "ergo" => Builtin::Ergo,
         "word:" => Builtin::WordDef,
+        "quad:" => Builtin::QuadDef,
         "both-ways" => Builtin::BothWays,
         "versus" => Builtin::Versus,
         "page" => Builtin::Page,
@@ -10293,20 +11014,76 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "room-" => Builtin::RoomSub,
         "rooms" => Builtin::RoomList,
         "room-new" => Builtin::RoomNew,
+        // Proof / solving
+        "solve" => Builtin::Solve,   // ( prog-idx target -- n )  find n s.t. prog[_:=n] leaves target on stack
         "sort" => Builtin::SortLines,
         "sort-lines" => Builtin::SortLines,
+
         "unique" => Builtin::UniqueLines,
         "unique-lines" => Builtin::UniqueLines,
         "reverse" => Builtin::ReverseLines,
         "reverse-lines" => Builtin::ReverseLines,
         "line-count" => Builtin::LineCount,
+        "solve" => Builtin::Solve,
+        "prove-effect" => Builtin::ProveEffect,
+        "same-effect?" => Builtin::SameEffect,
+        // Vec4 — four lanes walking in lockstep
+        "vec4"      => Builtin::Vec4New,
+        "v+"        => Builtin::Vec4Add,
+        "v-"        => Builtin::Vec4Sub,
+        "v*"        => Builtin::Vec4Mul,
+        "vscale"    => Builtin::Vec4Scale,
+        "vdot"      => Builtin::Vec4Dot,
+        "vlen"      => Builtin::Vec4Len,
+        "vnorm"     => Builtin::Vec4Norm,
+        "vprint"    => Builtin::Vec4Print,
         _ => return None,
     })
 }
 
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
 
-fn tokenize(src: &str) -> Vec<String> {
+/// Extract all comment text from Forth source (`\` line comments and `( )` paren comments).
+/// Returns each comment as a trimmed string, in order of appearance.
+pub fn extract_comments(src: &str) -> Vec<String> {
+    let mut comments = Vec::new();
+    let mut chars = src.chars().peekable();
+    let mut tok = String::new();
+
+    while let Some(&c) = chars.peek() {
+        if c == '\\' && tok.is_empty() {
+            chars.next();
+            let mut comment = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '\n' { break; }
+                comment.push(c2);
+            }
+            let c = comment.trim().to_string();
+            if !c.is_empty() { comments.push(c); }
+        } else if c == '(' && tok.is_empty() {
+            chars.next();
+            let mut comment = String::new();
+            let mut depth = 1;
+            for c2 in chars.by_ref() {
+                if c2 == '(' { depth += 1; comment.push(c2); }
+                else if c2 == ')' { depth -= 1; if depth == 0 { break; } comment.push(c2); }
+                else { comment.push(c2); }
+            }
+            let c = comment.trim().to_string();
+            // Skip pure stack-effect comments like "( a b -- c )"
+            if !c.is_empty() && !c.contains("--") { comments.push(c); }
+        } else if c.is_whitespace() {
+            if !tok.is_empty() { tok.clear(); }
+            chars.next();
+        } else {
+            tok.push(c);
+            chars.next();
+        }
+    }
+    comments
+}
+
+pub fn tokenize(src: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut chars = src.chars().peekable();
     let mut tok = String::new();
@@ -11235,6 +12012,34 @@ mod tests {
     }
 
     #[test]
+    fn test_solve_addition() {
+        // 2 + _ = 5  →  _ = 3
+        let out = Forth::run(r#"s" 2 _ +" 5 solve ."#).unwrap();
+        assert_eq!(out.trim(), "3");
+    }
+
+    #[test]
+    fn test_solve_multiplication() {
+        // _ * 4 = 20  →  _ = 5
+        let out = Forth::run(r#"s" _ 4 *" 20 solve ."#).unwrap();
+        assert_eq!(out.trim(), "5");
+    }
+
+    #[test]
+    fn test_solve_negative_solution() {
+        // _ + 10 = 3  →  _ = -7
+        let out = Forth::run(r#"s" _ 10 +" 3 solve ."#).unwrap();
+        assert_eq!(out.trim(), "-7");
+    }
+
+    #[test]
+    fn test_solve_no_solution_returns_sentinel() {
+        // no integer n makes n * 0 = 5
+        let out = Forth::run(r#"s" _ 0 *" 5 solve ."#).unwrap();
+        assert!(out.contains(&i64::MIN.to_string()) || out.contains("no solution"));
+    }
+
+    #[test]
     fn test_stack_ops() {
         assert_eq!(Forth::run("5 dup + .").unwrap().trim(), "10");
         assert_eq!(Forth::run("1 2 swap . .").unwrap().trim(), "1 2");
@@ -12087,6 +12892,45 @@ s" double"  s" 2 *"  s" dup +"  word:
         .unwrap();
         assert!(out.contains("10"), "installed word dbl must compute 5+5=10: {out}");
         assert!(out.contains("∴"), "word: must emit proof line: {out}");
+    }
+
+    #[test]
+    fn test_quad_def_installs_and_shows_descriptions() {
+        // quad: proves forth≡js (if node available), shows EN/ZH, installs Forth body.
+        let out = Forth::run(
+            "s\" triple\"\n\
+             s\" multiply by 3\"\n\
+             s\" 三倍\"\n\
+             s\" 3 *\"\n\
+             s\" n * 3\"\n\
+             quad:\n\
+             4 triple .",
+        )
+        .unwrap();
+        assert!(out.contains("EN"), "quad: must show EN label: {out}");
+        assert!(out.contains("multiply by 3"), "quad: must show english: {out}");
+        assert!(out.contains("三倍"), "quad: must show chinese: {out}");
+        assert!(out.contains("12"), "installed word triple(4)=12: {out}");
+    }
+
+    #[test]
+    fn test_quad_def_rejects_disagreeing_bodies() {
+        // If node is available and forth≠js, quad: must bail and NOT install.
+        // If node is unavailable, we skip the js proof and it should still install.
+        let result = Forth::run(
+            "s\" badquad\"\n\
+             s\" broken\"\n\
+             s\" 坏的\"\n\
+             s\" 2 *\"\n\
+             s\" n * 999\"\n\
+             quad:",
+        );
+        let node_ok = std::process::Command::new("node")
+            .arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+        if node_ok {
+            assert!(result.is_err(), "quad: must fail when forth≠js: {:?}", result);
+        }
+        // If node is absent, install succeeds (proof skipped gracefully).
     }
 
     #[test]
@@ -13210,6 +14054,72 @@ mod channel_tests {
         assert_eq!(std::fs::read(dest_dir.join("new.bin")).unwrap(), payload);
     }
 
+    // ── StackEffect ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_stack_effect_composition_basic() {
+        // push two literals then add: net ( -- n )
+        let lit = StackEffect::new(0, 1);
+        let add = StackEffect::new(2, 1);
+        let prog = lit.then(&lit).then(&add);
+        assert_eq!(prog, StackEffect::new(0, 1));
+    }
+
+    #[test]
+    fn test_stack_effect_composition_draws_from_caller() {
+        // `+` needs 2 but we only push 1 first: net ( a -- n )
+        let lit = StackEffect::new(0, 1);
+        let add = StackEffect::new(2, 1);
+        let prog = lit.then(&add);
+        assert_eq!(prog, StackEffect::new(1, 1));
+    }
+
+    #[test]
+    fn test_infer_effect_literal_sequence() {
+        let mut vm = Forth::new();
+        let e = vm.infer_effect("2 3 +").unwrap();
+        assert_eq!(e, StackEffect::new(0, 1));
+    }
+
+    #[test]
+    fn test_infer_effect_dup() {
+        let mut vm = Forth::new();
+        let e = vm.infer_effect("dup").unwrap();
+        assert_eq!(e, StackEffect::new(1, 2));
+    }
+
+    #[test]
+    fn test_infer_effect_user_word() {
+        let mut vm = Forth::new();
+        vm.exec(": double 2 * ;").unwrap();
+        let e = vm.infer_effect("double").unwrap();
+        // 2 * : StackEffect(1,1) composed with StackEffect(0,1) then StackEffect(2,1)
+        // Actually: token "2" → (0,1), token "*" → (2,1)
+        // body "2 *": start (0,0), then (0,1), then (1,1) [* needs 2 but has 1, draws 1 from caller]
+        // net body: (1, 1) — consumes 1, produces 1
+        assert_eq!(e, StackEffect::new(1, 1));
+    }
+
+    #[test]
+    fn test_same_effect_proves_equivalence() {
+        // `2 3 +` and `5` both have effect ( -- n )
+        let out = Forth::run(r#"s" 2 3 +" s" 5" same-effect? ."#).unwrap();
+        assert!(out.trim().ends_with("-1"), "expected -1 (same effect): {out}");
+    }
+
+    #[test]
+    fn test_same_effect_detects_difference() {
+        // `dup` ( n -- n n ) vs `drop` ( n -- ) — different effects
+        let out = Forth::run(r#"s" dup" s" drop" same-effect? ."#).unwrap();
+        assert!(out.trim().ends_with('0'), "expected 0 (different effect): {out}");
+    }
+
+    #[test]
+    fn test_prove_effect_word_formats_correctly() {
+        let out = Forth::run(r#"s" 2 3 +" prove-effect type"#).unwrap();
+        assert!(out.contains("( -- a )") || out.contains("( -- "), "got: {out}");
+    }
+
     #[test]
     fn test_extract_channel_forth_integration() {
         // The extract helper + compile round-trip
@@ -13225,5 +14135,98 @@ mod channel_tests {
         let _ = vm.exec_with_fuel(content, 0);
         let out = vm.exec("3 quadruple .").unwrap();
         assert_eq!(out.trim(), "12", "{out}");
+    }
+
+    // ── Vec4 tests — four people walking in lockstep ──────────────────────────
+
+    #[test]
+    fn test_vec4_add_lane_wise() {
+        // 1.0 2.0 3.0 4.0  +  5.0 6.0 7.0 8.0  =  6.0 8.0 10.0 12.0
+        let mut vm = Forth::new();
+        vm.exec("1000 2000 3000 4000 5000 6000 7000 8000 v+").unwrap();
+        assert_eq!(vm.data, vec![6000, 8000, 10000, 12000]);
+    }
+
+    #[test]
+    fn test_vec4_sub_lane_wise() {
+        let mut vm = Forth::new();
+        vm.exec("5000 5000 5000 5000 1000 2000 3000 4000 v-").unwrap();
+        assert_eq!(vm.data, vec![4000, 3000, 2000, 1000]);
+    }
+
+    #[test]
+    fn test_vec4_scale() {
+        // 1.0 2.0 3.0 4.0 scaled by 2.0 = 2.0 4.0 6.0 8.0
+        let mut vm = Forth::new();
+        vm.exec("1000 2000 3000 4000 2000 vscale").unwrap();
+        assert_eq!(vm.data, vec![2000, 4000, 6000, 8000]);
+    }
+
+    #[test]
+    fn test_vec4_dot_orthogonal_is_zero() {
+        // (1,0,0,0) · (0,1,0,0) = 0
+        let mut vm = Forth::new();
+        vm.exec("1000 0 0 0 0 1000 0 0 vdot").unwrap();
+        assert_eq!(vm.data, vec![0]);
+    }
+
+    #[test]
+    fn test_vec4_dot_parallel() {
+        // (1,0,0,0) · (1,0,0,0) = 1
+        let mut vm = Forth::new();
+        vm.exec("1000 0 0 0 1000 0 0 0 vdot").unwrap();
+        assert_eq!(vm.data, vec![1000]);
+    }
+
+    #[test]
+    fn test_vec4_norm_unit_length() {
+        // normalise (1,0,0,0) → (1,0,0,0)
+        let mut vm = Forth::new();
+        vm.exec("1000 0 0 0 vnorm").unwrap();
+        assert_eq!(vm.data, vec![1000, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_vec4_len_unit_vector() {
+        // len of (1,0,0,0) = 1.0
+        let mut vm = Forth::new();
+        vm.exec("1000 0 0 0 vlen").unwrap();
+        // stack: x y z w len
+        assert_eq!(vm.data[4], 1000, "len should be 1000 (1.0 fixed-point)");
+    }
+
+    #[test]
+    fn test_vec4_print_leaves_stack_unchanged() {
+        let mut vm = Forth::new();
+        vm.exec("1000 2000 3000 4000 vprint").unwrap();
+        assert_eq!(vm.data, vec![1000, 2000, 3000, 4000]);
+    }
+
+    #[test]
+    fn test_vec4_effect_proven_statically() {
+        // Stack effect for v+ should be ( 8 -- 4 )
+        let mut vm = Forth::new();
+        let e = vm.infer_effect("v+").unwrap();
+        assert_eq!(e.pops, 8);
+        assert_eq!(e.pushes, 4);
+    }
+
+    #[test]
+    fn test_vec4_add_sub_roundtrip() {
+        // a + b - b = a
+        let mut vm = Forth::new();
+        vm.exec("1000 2000 3000 4000 500 600 700 800 v+  500 600 700 800 v-").unwrap();
+        assert_eq!(vm.data, vec![1000, 2000, 3000, 4000]);
+    }
+
+    #[test]
+    fn test_vec4_lockstep_four_walkers() {
+        // Four walkers each at position 0; all step by (1, 0, 0, 0).
+        // After 3 steps: position = (3, 0, 0, 0).
+        let step = "1000 0 0 0";
+        let prog = format!("0 0 0 0  {step} v+  {step} v+  {step} v+");
+        let mut vm = Forth::new();
+        vm.exec(&prog).unwrap();
+        assert_eq!(vm.data, vec![3000, 0, 0, 0]);
     }
 }

@@ -133,6 +133,55 @@ pub async fn run_script_async(script: &str) -> Result<String> {
     .await?
 }
 
+/// Open `$EDITOR` with Forth source, return the (possibly edited) content.
+///
+/// Uses a `.forth` extension so editors apply Forth syntax highlighting.
+/// Lines starting with `\` are treated as comments; emptying the file aborts.
+/// In non-interactive environments the editor is skipped and the original
+/// code is returned immediately.
+pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Option<String>> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(Some(code.to_string()));
+    }
+
+    let header: String = description
+        .lines()
+        .map(|l| format!("\\ {l}\n"))
+        .collect();
+    let content = format!("{header}\n{code}");
+
+    spawn_blocking(move || {
+        let mut tmp = Builder::new()
+            .prefix("finch_")
+            .suffix(".forth")
+            .tempfile()?;
+
+        tmp.write_all(content.as_bytes())?;
+        tmp.flush()?;
+        let path = tmp.path().to_owned();
+
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        let status = std::process::Command::new(&editor).arg(&path).status()?;
+
+        if !status.success() {
+            return Ok(None);
+        }
+
+        let modified = std::fs::read_to_string(&path)?;
+        let executable = modified
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('\\') && !l.trim().is_empty())
+            .count();
+
+        if executable == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(modified))
+        }
+    })
+    .await?
+}
+
 /// Run a shell script string via `bash -c`.
 ///
 /// Returns stdout+stderr combined.

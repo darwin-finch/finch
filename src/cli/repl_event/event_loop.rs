@@ -70,6 +70,35 @@ struct PendingPosetRun {
     event_tx: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
 }
 
+/// Cycling translation display shown in the corner overlay.
+///
+/// Items are `(language_name, translated_text)` pairs.  The ticker advances
+/// once per second; the current item is written to `corner_output` so it
+/// rotates through languages while the user reads the code.
+#[derive(Default)]
+struct TranslationTicker {
+    items: Vec<(String, String)>,
+    index: usize,
+}
+
+impl TranslationTicker {
+    /// Replace the current set of translations and reset the index.
+    fn set(&mut self, items: Vec<(String, String)>) {
+        self.items = items;
+        self.index = 0;
+    }
+
+    /// Advance to the next translation; returns the current `(lang, text)` if any.
+    fn tick(&mut self) -> Option<(String, String)> {
+        if self.items.is_empty() {
+            return None;
+        }
+        let item = self.items[self.index].clone();
+        self.index = (self.index + 1) % self.items.len();
+        Some(item)
+    }
+}
+
 /// Main event loop for concurrent REPL
 #[allow(dead_code)]
 pub struct EventLoop {
@@ -165,6 +194,12 @@ pub struct EventLoop {
     /// Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
 
+    /// Stable UUID for this session — assigned at startup, printed on exit.
+    session_uuid: Uuid,
+
+    /// Cycling translations shown in the corner overlay.
+    translation_ticker: Arc<std::sync::Mutex<TranslationTicker>>,
+
     /// Working directory at startup (for terminal title)
     cwd: String,
 
@@ -196,7 +231,12 @@ pub struct EventLoop {
     auto_discover: bool,
 
     /// Channels this session has joined (e.g. "#general").
+    /// Persisted across sessions in ~/.finch/channels.json.
     joined_channels: std::collections::HashSet<String>,
+
+    /// Ring buffer of recently received channel messages: (channel, sender, text).
+    /// Indexed 0 = most recent. Capped at 20.
+    recent_channel_msgs: std::collections::VecDeque<(String, String, String)>,
 
     /// Remote peer daemon addresses (host:port) from --peer flag.
     remote_peers: Vec<String>,
@@ -282,6 +322,14 @@ pub struct EventLoop {
     /// Stack state is cleared between evals; only the dictionary persists.
     forth_vm: crate::coforth::Forth,
 
+    /// Lisp interpreter context — holds SSH sessions and the global env.
+    /// Shared with spawned Lisp eval tasks via Arc so sessions persist across
+    /// multiple `(...)` inputs within a session.
+    lisp_ctx: std::sync::Arc<crate::lisp::LispCtx>,
+
+    /// Global Lisp environment — `define`d names persist across REPL inputs.
+    lisp_env: crate::lisp::EnvRef,
+
     /// Shared with TUI corner — updated after each eval if `check` is defined.
     corner_output: Arc<std::sync::Mutex<Option<String>>>,
 
@@ -352,10 +400,6 @@ pub enum ViewMode {
 ///   Forth definitions — these never need uppercase to signal "sentence"
 /// - Latin sentences starting with an uppercase letter
 /// Returns `true` when `word` has a dedicated magic-word response.
-fn is_magic_word(word: &str) -> bool {
-    magic_word_response(word).is_some()
-}
-
 /// Returns the specific response for a magic word, or `None` for unknowns.
 fn magic_word_response(word: &str) -> Option<&'static str> {
     match word {
@@ -630,6 +674,27 @@ fn is_forth_primitive_word(w: &str) -> bool {
         })
 }
 
+/// Split a mixed English+Forth input into a Forth program and a natural-language
+/// remainder.  Tokens that are numbers, Forth primitives, or known VM words go
+/// into `forth`; everything else goes into `nl`.
+///
+/// Returns `(forth_program, nl_text)`.  Either may be empty.
+///
+/// Example: `"add 2 and 3 to get the answer"` with `add` known as a Forth word →
+///   forth = `"add 2 3"`, nl = `"and to get the answer"`
+fn split_forth_nl(input: &str, word_exists: impl Fn(&str) -> bool) -> (String, String) {
+    let mut forth = Vec::new();
+    let mut nl = Vec::new();
+    for token in crate::coforth::tokenize(input) {
+        if is_forth_primitive_word(&token) || word_exists(&token) {
+            forth.push(token);
+        } else {
+            nl.push(token);
+        }
+    }
+    (forth.join(" "), nl.join(" "))
+}
+
 /// Heuristic: does this input look like natural language rather than Forth code?
 ///
 /// `word_exists`   — checks the full VM dictionary (builtins + library + session).
@@ -757,6 +822,31 @@ async fn fetch_peer_name(addr: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Fetch the Forth source from a peer's `/v1/forth/vocab` endpoint.
+/// Returns an empty string on any error.
+async fn fetch_peer_vocab_source(addr: &str) -> String {
+    let url = if addr.starts_with("http://") || addr.starts_with("https://") {
+        format!("{addr}/v1/forth/vocab")
+    } else {
+        format!("http://{addr}/v1/forth/vocab")
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    else {
+        return String::new();
+    };
+    match client.get(&url).send().await {
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|j| j["source"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
 fn extract_channel_forth(msg: &str) -> Option<String> {
     if !msg.starts_with('[') {
         return None;
@@ -857,27 +947,47 @@ async fn run_peer_loop(
     let mut vm = crate::coforth::Library::precompiled_vm();
     vm.remote_mode = true;
 
+    let lisp_ctx = std::sync::Arc::new(crate::lisp::LispCtx::new());
+    let lisp_env = crate::lisp::make_env();
+
     loop {
         match rx.recv().await {
             Ok(SessionEvent::Chat { text }) => {
-                let depth_before = vm.data_stack().len();
-                let response = match vm.exec(&text) {
-                    Ok(out) => {
-                        let delta = vm.data_stack()[depth_before..].to_vec();
-                        if !out.is_empty() {
-                            out.trim_end().to_string()
-                        } else if !delta.is_empty() {
-                            let items: Vec<String> = delta.iter().map(|n| n.to_string()).collect();
-                            format!("( {} )", items.join("  "))
-                        } else {
-                            String::new()
-                        }
+                // Route by language: Lisp `(...)` or Forth.
+                let response = if text.trim_start().starts_with('(') {
+                    let ctx = lisp_ctx.clone();
+                    let env = lisp_env.clone();
+                    match crate::lisp::run_in(&text, env, ctx).await {
+                        Ok(val) => val.to_string(),
+                        Err(e) => format!("lisp error: {e}"),
                     }
-                    Err(e) => format!("error: {e}"),
+                } else {
+                    let depth_before = vm.data_stack().len();
+                    match vm.exec(&text) {
+                        Ok(out) => {
+                            let delta = vm.data_stack()[depth_before..].to_vec();
+                            if !out.is_empty() {
+                                out.trim_end().to_string()
+                            } else if !delta.is_empty() {
+                                let items: Vec<String> =
+                                    delta.iter().map(|n| n.to_string()).collect();
+                                format!("( {} )", items.join("  "))
+                            } else {
+                                String::new()
+                            }
+                        }
+                        Err(e) => format!("error: {e}"),
+                    }
                 };
                 if !response.is_empty() {
                     let _ = inbox_tx.send((id, name.clone(), response));
                 }
+            }
+            Ok(SessionEvent::ChannelMessage { .. }) => {
+                // Local peer loops must not echo channel messages back.
+                // ChannelMessage events originate from the local session; echoing
+                // them here produces one duplicate per peer loop.
+                // Remote peers receive and display these through a separate path.
             }
             Ok(SessionEvent::Close) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 break
@@ -947,6 +1057,32 @@ async fn boot_peers(
     let second = spawn_fresh(&bcast_tx, inbox_tx.clone()).await;
 
     (bcast_tx, vec![first, second])
+}
+
+fn channels_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".finch").join("channels.json"))
+}
+
+fn load_joined_channels() -> std::collections::HashSet<String> {
+    let Some(path) = channels_path() else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return std::collections::HashSet::new();
+    };
+    serde_json::from_str::<Vec<String>>(&contents)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+fn save_joined_channels(channels: &std::collections::HashSet<String>) {
+    let Some(path) = channels_path() else { return };
+    let mut sorted: Vec<&String> = channels.iter().collect();
+    sorted.sort();
+    if let Ok(json) = serde_json::to_string(&sorted) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 impl EventLoop {
@@ -1106,6 +1242,8 @@ impl EventLoop {
                 .and_then(|p| crate::metrics::MetricsLogger::new(p).ok()),
             memory_system,
             session_label,
+            session_uuid: Uuid::new_v4(),
+            translation_ticker: Arc::new(std::sync::Mutex::new(TranslationTicker::default())),
             cwd: String::new(), // populated at the start of run()
             context_lines,
             max_verbatim_messages,
@@ -1138,6 +1276,8 @@ impl EventLoop {
             forth_vm: crate::coforth::Library::precompiled_vm(),
             corner_output,
             forth_undo: Vec::new(),
+            lisp_ctx: std::sync::Arc::new(crate::lisp::LispCtx::new()),
+            lisp_env: crate::lisp::make_env(),
             push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
             hash_rx: crate::server::handlers::HASH_INBOX.subscribe(),
             auto_compiled_word_names: std::collections::HashSet::new(),
@@ -1147,7 +1287,8 @@ impl EventLoop {
             peer_sessions,
             diff_store: DiffStore::new(),
             peer_session_rx,
-            joined_channels: std::collections::HashSet::new(),
+            joined_channels: load_joined_channels(),
+            recent_channel_msgs: std::collections::VecDeque::new(),
             remote_peers,
             daemon_base_url,
             peer_inbox_mirror_tx,
@@ -1281,6 +1422,27 @@ impl EventLoop {
                 self.context_lines,
             )
             .await;
+        }
+
+        // ── Translation ticker ────────────────────────────────────────────────
+        // Every second, advance the ticker and write the next translation to the
+        // corner overlay so languages cycle past while the user reads the code.
+        {
+            let ticker = Arc::clone(&self.translation_ticker);
+            let corner = Arc::clone(&self.corner_output);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+                loop {
+                    interval.tick().await;
+                    let item = {
+                        let mut t = ticker.lock().unwrap();
+                        t.tick()
+                    };
+                    if let Ok(mut g) = corner.lock() {
+                        *g = item.map(|(lang, text)| format!("{lang}: {text}"));
+                    }
+                }
+            });
         }
 
         // ── Boot JIT ──────────────────────────────────────────────────────────
@@ -1611,9 +1773,12 @@ s" it is ours"      s" -1 is ours"     argue
                         ReplEvent::ShowDialog { .. } => "ShowDialog",
                         ReplEvent::PosetComplete { result: Ok(_) } => "PosetComplete(ok)",
                         ReplEvent::PosetComplete { result: Err(_) } => "PosetComplete(err)",
+                        ReplEvent::LispResult { result: Ok(_) } => "LispResult(ok)",
+                        ReplEvent::LispResult { result: Err(_) } => "LispResult(err)",
                         ReplEvent::PeersDiscovered(_) => "PeersDiscovered",
                         ReplEvent::VocabSync(_) => "VocabSync",
                         ReplEvent::PeerMessage { .. } => "PeerMessage",
+                        ReplEvent::Translations { .. } => "Translations",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -2003,6 +2168,22 @@ s" it is ours"      s" -1 is ours"     argue
             let _ = tui.shutdown();
         }
 
+        // Save conversation to ~/.finch/sessions/<uuid>.json and print the UUID.
+        // The user can resume with: finch --resume <uuid>
+        if let Some(home) = dirs::home_dir() {
+            let sessions_dir = home.join(".finch").join("sessions");
+            if std::fs::create_dir_all(&sessions_dir).is_ok() {
+                let id = self.session_uuid;
+                let path = sessions_dir.join(format!("{id}.json"));
+                let history = self.conversation.read().await.clone();
+                if !history.is_empty() {
+                    if history.save(&path).is_ok() {
+                        println!("\n{id}");
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2012,6 +2193,41 @@ s" it is ours"      s" -1 is ours"     argue
         if input.trim().starts_with('/') {
             // Echo the command to output (like user queries)
             self.output_manager.write_user(input.clone());
+
+            // /exec [n] — execute a received channel message by index (0 = most recent).
+            //   /exec      → list buffered messages with indices
+            //   /exec 2    → run message at index 2
+            if let Some(rest) = input.trim().strip_prefix("/exec") {
+                let rest = rest.trim();
+                if rest.is_empty() {
+                    if self.recent_channel_msgs.is_empty() {
+                        self.output_manager.write_info("no channel messages received yet".to_string());
+                    } else {
+                        let lines: Vec<String> = self.recent_channel_msgs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (ch, snd, txt))| format!("[{i}] {ch} {snd}: {txt}"))
+                            .collect();
+                        self.output_manager.write_info(lines.join("\n"));
+                    }
+                    self.render_tui().await?;
+                    return Ok(());
+                }
+                if let Ok(idx) = rest.parse::<usize>() {
+                    if let Some((channel, sender, text)) = self.recent_channel_msgs.get(idx).cloned() {
+                        self.output_manager.write_info(
+                            format!("executing [{idx}] {channel} {sender}: {text}")
+                        );
+                        // Route through the stack/query path directly (no recursion).
+                        self.output_manager.write_user(text.clone());
+                        return self.handle_forth_or_query(text).await;
+                    } else {
+                        self.output_manager.write_info(format!("no message at index {idx}"));
+                        self.render_tui().await?;
+                    }
+                    return Ok(());
+                }
+            }
 
             if let Some(command) = Command::parse(&input) {
                 match command {
@@ -2385,6 +2601,9 @@ Rules:\n\
                             }
                         }
                     }
+                    Command::StackEval => {
+                        self.handle_stack_eval().await?;
+                    }
                     Command::StackClear => {
                         self.handle_stack_clear().await?;
                     }
@@ -2449,18 +2668,26 @@ Rules:\n\
                     }
                     Command::JoinChannel(chan) => {
                         self.joined_channels.insert(chan.clone());
+                        save_joined_channels(&self.joined_channels);
                         let ev = crate::session::SessionEvent::chat(format!("joined {chan}"));
                         let _ = self.peer_tx.send(ev);
                     }
                     Command::PartChannel(chan) => {
                         self.joined_channels.remove(&chan);
+                        save_joined_channels(&self.joined_channels);
                         let ev = crate::session::SessionEvent::chat(format!("parted {chan}"));
                         let _ = self.peer_tx.send(ev);
                     }
                     Command::SayChannel(chan, msg) => {
                         self.output_manager
                             .write_user(format!("/say {} {}", chan, msg));
-                        let ev = crate::session::SessionEvent::chat(format!("{chan}: {msg}"));
+                        let promise = crate::session::Promise::natural(msg);
+                        let bundle = crate::session::ProofBundle::new(promise, vec![]);
+                        let ev = crate::session::SessionEvent::ChannelMessage {
+                            channel: chan,
+                            sender: self.session_label.clone(),
+                            bundle,
+                        };
                         let _ = self.peer_tx.send(ev);
                     }
                     Command::Connect(addr) => {
@@ -2589,6 +2816,55 @@ Rules:\n\
             }
         }
 
+        // ── Lisp: input starting with `(` is a Lisp expression ───────────────
+        if input.trim_start().starts_with('(') {
+            self.output_manager.write_user(input.clone());
+            // Broadcast to channels so peers can see (and /exec) it.
+            for chan in &self.joined_channels {
+                let promise = crate::session::Promise::lisp(input.clone());
+                let bundle = crate::session::ProofBundle::new(promise, vec![]);
+                let ev = crate::session::SessionEvent::ChannelMessage {
+                    channel: chan.clone(),
+                    sender: self.session_label.clone(),
+                    bundle,
+                };
+                let _ = self.peer_tx.send(ev);
+            }
+            let src = input.clone();
+            let ctx = self.lisp_ctx.clone();
+            let env = self.lisp_env.clone();
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                let result = crate::lisp::run_in(&src, env, ctx).await
+                    .map(|v| v.to_string());
+                let _ = event_tx.send(super::events::ReplEvent::LispResult { result });
+            });
+            return Ok(());
+        }
+
+        // Broadcast to all joined channels (slash-commands are excluded above).
+        // Try to prove the stack effect before sending; extract comments so
+        // receivers can read the intent before executing.
+        if !self.joined_channels.is_empty() {
+            let comments = crate::coforth::extract_comments(&input);
+            let promise = {
+                let effect = self.forth_vm.infer_effect(&input).ok();
+                match effect {
+                    Some(e) => crate::session::Promise::forth_proven(input.clone(), e),
+                    None => crate::session::Promise::forth(input.clone()),
+                }
+            };
+            let bundle = crate::session::ProofBundle::new(promise, comments);
+            for chan in &self.joined_channels {
+                let ev = crate::session::SessionEvent::ChannelMessage {
+                    channel: chan.clone(),
+                    sender: self.session_label.clone(),
+                    bundle: bundle.clone(),
+                };
+                let _ = self.peer_tx.send(ev);
+            }
+        }
+
         // Route: natural language → AI; Forth tokens → stack.
         let is_nl = looks_like_natural_language(
             &input,
@@ -2614,15 +2890,70 @@ Rules:\n\
         }
 
         if is_nl {
+            // Mixed mode: if the NL input contains embedded Forth tokens (numbers,
+            // primitives, known words), execute those first, then send the remaining
+            // English to the AI so both languages work simultaneously.
+            let (forth_prog, nl_text) = split_forth_nl(
+                &input,
+                |w| self.forth_vm.word_exists(w),
+            );
+            if !forth_prog.is_empty() && !nl_text.is_empty() {
+                if let Ok(out) = self.forth_vm.exec(&forth_prog) {
+                    let out = out.trim().to_string();
+                    if !out.is_empty() {
+                        self.output_manager.write_info(out);
+                    }
+                }
+                self.spawn_translation(nl_text.clone());
+                return self.execute_query(nl_text).await;
+            }
+            self.spawn_translation(input.clone());
             return self.execute_query(input).await;
         }
 
         // ── Co-Forth: plain text pushes onto the stack (no AI trigger) ──────────
-        // The program accumulates silently. /run is the only execution trigger.
-        // This preserves the Forth model: words are defined first, executed later.
+        // Forth input may contain comments (\, ( ), //, #) — extract and translate them.
+        self.spawn_translation_from_forth(&input);
         self.output_manager.write_user(input.clone());
         self.handle_stack_push(input).await?;
         return Ok(());
+    }
+
+    /// Route text through the NL/Forth/Lisp decision without slash-command handling or
+    /// channel broadcast. Used by `/exec` to run a received channel message.
+    async fn handle_forth_or_query(&mut self, input: String) -> Result<()> {
+        // Lisp
+        if input.trim_start().starts_with('(') {
+            let src = input.clone();
+            let ctx = self.lisp_ctx.clone();
+            let env = self.lisp_env.clone();
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                let result = crate::lisp::run_in(&src, env, ctx).await
+                    .map(|v| v.to_string());
+                let _ = event_tx.send(super::events::ReplEvent::LispResult { result });
+            });
+            return Ok(());
+        }
+        let is_nl = looks_like_natural_language(
+            &input,
+            |w| self.forth_vm.word_exists(w),
+            |w| self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w),
+        );
+        if is_nl && input.trim_end().ends_with('.') {
+            let prog = format!("s\" {}\" sentence-exec", input.replace('"', "'"));
+            if let Ok(out) = self.forth_vm.exec(&prog) {
+                let out = out.trim().to_string();
+                if !out.is_empty() && !out.contains("no executable words") {
+                    self.output_manager.write_info(out);
+                    return self.render_tui().await;
+                }
+            }
+        }
+        if is_nl {
+            return self.execute_query(input).await;
+        }
+        self.handle_stack_push(input).await
     }
 
     /// Execute a query with echo (used by /run where the query hasn't been displayed yet).
@@ -3332,6 +3663,27 @@ Rules:\n\
                 self.render_tui().await?;
             }
 
+            ReplEvent::Translations { items } => {
+                // Load translations into the ticker; the ticker task will cycle
+                // through them in the corner overlay.
+                if let Ok(mut t) = self.translation_ticker.lock() {
+                    t.set(items);
+                }
+            }
+
+            ReplEvent::LispResult { result } => {
+                match result {
+                    Ok(text) if text != "()" && !text.is_empty() => {
+                        self.output_manager.write_response(text);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.output_manager.write_info(format!("lisp: {e}"));
+                    }
+                }
+                self.render_tui().await?;
+            }
+
             ReplEvent::PeersDiscovered(peers) => {
                 // Background boot scan found finch instances on the LAN.
                 // Add each to the Forth VM's peer list and establish a WS bridge.
@@ -3370,9 +3722,31 @@ Rules:\n\
             }
             ReplEvent::PeerMessage { text } => {
                 use crossterm::style::Stylize;
-                // text is already "peer-XXXXXXXX: result" from the select! branch
-                self.output_manager
-                    .write_info(text.as_str().cyan().to_string());
+                // Channel messages are tagged with a sentinel that may be preceded
+                // by "peer-XXXX: " when the peer loop wraps the tagged string.
+                if let Some(sentinel_pos) = text.find("\x01CHAN\x01") {
+                    let sentinel = &text[sentinel_pos..];
+                    let parts: Vec<&str> = sentinel.splitn(5, '\x01').collect();
+                    // parts: ["", "CHAN", channel, sender, text_body]
+                    if parts.len() == 5 {
+                        let (channel, sender, body) = (parts[2], parts[3], parts[4]);
+                        let idx = self.recent_channel_msgs.len();
+                        self.recent_channel_msgs.push_front((
+                            channel.to_string(),
+                            sender.to_string(),
+                            body.to_string(),
+                        ));
+                        if self.recent_channel_msgs.len() > 20 {
+                            self.recent_channel_msgs.pop_back();
+                        }
+                        let line = format!("[{idx}] {channel} {sender}: {body}");
+                        self.output_manager.write_info(line.cyan().to_string());
+                    }
+                } else {
+                    // text is already "peer-XXXXXXXX: result" from the select! branch
+                    self.output_manager
+                        .write_info(text.as_str().cyan().to_string());
+                }
                 self.render_tui().await?;
             }
 
@@ -3694,6 +4068,40 @@ Rules:\n\
             display.as_str().cyan().bold(),
             "connected".dark_grey()
         ));
+
+        // Fetch the peer's vocabulary and open it in $EDITOR.
+        // Whatever the user saves (or writes fresh, or deletes) is sent back
+        // into the event loop as a UserInput so the single select! handles it.
+        let peer_source = fetch_peer_vocab_source(&addr).await;
+        let description = format!("peer: {addr} — edit and save to define these words locally");
+
+        {
+            let tui = self.tui_renderer.lock().await;
+            tui.suspend().ok();
+        }
+        let editor_result =
+            crate::tools::implementations::propose::propose_forth_in_editor(
+                &description,
+                &peer_source,
+            )
+            .await;
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.resume().ok();
+        }
+
+        if let Ok(Some(content)) = editor_result {
+            // Strip comment lines before feeding back so only Forth code runs.
+            let code: String = content
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('\\') && !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !code.trim().is_empty() {
+                let _ = self.event_tx.send(ReplEvent::UserInput { input: code });
+            }
+        }
+
         self.render_tui().await
     }
 
@@ -3925,17 +4333,28 @@ Rules:\n\
                                         let ws_tx2 = ws_tx.clone();
                                         tokio::spawn(async move {
                                             while let Some(ev) = ws_rx.recv().await {
-                                                if let crate::session::SessionEvent::Chat { text } =
-                                                    ev
-                                                {
-                                                    if !text.is_empty() {
-                                                        let id = uuid::Uuid::new_v4();
-                                                        let name = format!(
-                                                            "peer@{}",
-                                                            a2.split(':').next().unwrap_or(&a2)
-                                                        );
-                                                        let _ = pib2.send((id, name, text));
+                                                let display = match ev {
+                                                    crate::session::SessionEvent::Chat { text } if !text.is_empty() => {
+                                                        Some(text)
                                                     }
+                                                    crate::session::SessionEvent::ChannelMessage { channel, sender, bundle } => {
+                                                        let primary = bundle.primary();
+                                                        let comment = if bundle.comments.is_empty() {
+                                                            String::new()
+                                                        } else {
+                                                            format!("  \\ {}", bundle.comments.join("; "))
+                                                        };
+                                                        Some(format!("{channel} {sender}: {}{comment}", primary.code))
+                                                    }
+                                                    _ => None,
+                                                };
+                                                if let Some(text) = display {
+                                                    let id = uuid::Uuid::new_v4();
+                                                    let name = format!(
+                                                        "peer@{}",
+                                                        a2.split(':').next().unwrap_or(&a2)
+                                                    );
+                                                    let _ = pib2.send((id, name, text));
                                                 }
                                             }
                                         });
@@ -6673,6 +7092,106 @@ Rules:\n\
 
     /// Handle `/run` — join all stack items and execute as one query (clears stack).
     /// Returns `Some(query)` if the stack was non-empty, `None` otherwise.
+    /// Spawn an async task to translate `text` into several languages and send
+    /// a `ReplEvent::Translations` when done.  Only fires when `text` has at
+    /// least 3 words, to avoid wasting API calls on short fragments.
+    fn spawn_translation(&self, text: String) {
+        let words = text.split_whitespace().count();
+        if words < 3 {
+            return;
+        }
+        let provider = match self.brain_provider.clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let prompt = format!(
+                "Translate the following phrase into Spanish, French, Japanese, Arabic, \
+                 and Russian. Return exactly 5 lines in this format (no extra text):\n\
+                 Spanish: <translation>\n\
+                 French: <translation>\n\
+                 Japanese: <translation>\n\
+                 Arabic: <translation>\n\
+                 Russian: <translation>\n\n\
+                 Phrase: {text}"
+            );
+            let request = crate::providers::ProviderRequest::new(vec![
+                crate::claude::types::Message::user(&prompt),
+            ])
+            .with_max_tokens(300);
+            let Ok(response) = provider.send_message(&request).await else {
+                return;
+            };
+            let raw = response.content.iter()
+                .filter_map(|b| if let crate::claude::ContentBlock::Text { text } = b { Some(text.as_str()) } else { None })
+                .collect::<Vec<_>>()
+                .join("");
+            // Parse "Language: translation" lines.
+            let items: Vec<(String, String)> = raw
+                .lines()
+                .filter_map(|line| {
+                    let (lang, tr) = line.split_once(':')?;
+                    let lang = lang.trim().to_string();
+                    let tr = tr.trim().to_string();
+                    if lang.is_empty() || tr.is_empty() { None } else { Some((lang, tr)) }
+                })
+                .collect();
+            if !items.is_empty() {
+                let _ = event_tx.send(super::events::ReplEvent::Translations { items });
+            }
+        });
+    }
+
+    /// Like `spawn_translation` but uses the tokenizer's comment extractor to
+    /// pull `\` and `( )` comment text from a Forth program before translating.
+    fn spawn_translation_from_forth(&self, code: &str) {
+        let comments = crate::coforth::extract_comments(code);
+        if let Some(text) = comments.into_iter().find(|c| c.split_whitespace().count() >= 3) {
+            self.spawn_translation(text);
+        }
+    }
+
+    /// `/eval-each` — run each stack item independently in a fresh VM clone and
+    /// display the result next to the program.  The stack is left unchanged so
+    /// items can be inspected, re-ordered, or re-run.
+    async fn handle_stack_eval(&mut self) -> Result<()> {
+        let items: Vec<String> = self.stack.lock().await.clone();
+        if items.is_empty() {
+            self.output_manager
+                .write_info("stack is empty — push some programs first".to_string());
+            return self.render_tui().await;
+        }
+
+        let sep = "─".repeat(60);
+        let mut lines = vec![sep.clone()];
+
+        for (i, prog) in items.iter().enumerate() {
+            // Each item gets a clean VM clone (same dict, empty stack) so state doesn't bleed.
+            let mut vm = self.forth_vm.clone_dict();
+            let result = match vm.exec(prog) {
+                Ok(out) => {
+                    let out = out.trim().to_string();
+                    let stack_top = vm.data_stack();
+                    if !out.is_empty() {
+                        out
+                    } else if !stack_top.is_empty() {
+                        let top: Vec<String> = stack_top.iter().map(|n| n.to_string()).collect();
+                        format!("( {} )", top.join("  "))
+                    } else {
+                        "ok".to_string()
+                    }
+                }
+                Err(e) => format!("error: {e}"),
+            };
+            lines.push(format!("[{i}] {prog:<40} → {result}"));
+        }
+
+        lines.push(sep);
+        self.output_manager.write_info(lines.join("\n"));
+        self.render_tui().await
+    }
+
     async fn handle_stack_run(&mut self) -> Result<Option<String>> {
         let mut stack = self.stack.lock().await;
         if stack.is_empty() {
@@ -8799,12 +9318,12 @@ mod tests {
 
     #[test]
     fn test_is_magic_word_please() {
-        assert!(is_magic_word("please"), "please is a magic word");
+        assert!(magic_word_response("please").is_some(), "please is a magic word");
     }
 
     #[test]
     fn test_is_magic_word_unknown_is_not_magic() {
-        assert!(!is_magic_word("xyzzy"), "unknown word must not be magic");
+        assert!(magic_word_response("xyzzy").is_none(), "unknown word must not be magic");
     }
 
     #[test]
@@ -9511,6 +10030,43 @@ mod peer_loop_tests {
                 "peer {name} should know `square` and reply with ( 25 ), got: {text}"
             );
         }
+    }
+
+    /// ChannelMessage events must NOT be echoed back to the local inbox by peer
+    /// loops.  Before the fix, both peer loops would each send the message back,
+    /// causing N_peers × N_channels echoes per send.
+    #[tokio::test]
+    async fn test_channel_message_not_echoed_by_peer_loops() {
+        use crate::session::{Promise, ProofBundle};
+
+        let (inbox_tx, mut inbox_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let promise = Promise::natural("hello world".to_string());
+        let bundle = ProofBundle::new(promise, vec![]);
+        let ev = crate::session::SessionEvent::ChannelMessage {
+            channel: "#test".into(),
+            sender: "lush-hill".into(),
+            bundle,
+        };
+        bcast_tx.send(ev).unwrap();
+
+        // Wait briefly — if the peer loops echo the message, it will arrive here.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Drain everything that arrived.
+        let mut count = 0usize;
+        while inbox_rx.try_recv().is_ok() {
+            count += 1;
+        }
+
+        assert_eq!(
+            count, 0,
+            "peer loops must not echo ChannelMessage events back to the inbox (got {count})"
+        );
     }
 
     /// Registry contains both peers after boot.
