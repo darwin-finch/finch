@@ -119,6 +119,20 @@ Until transactional effect capture and persistent VM checkpoints exist, named-br
 can produce workspace, external, destructive, or unclassified effects must not participate in
 automatic replay. `remote_mode` only suppresses interaction; it is not an effect sandbox.
 
+### TODO: advertise accelerator capacity separately from environments
+
+Extend Finch's existing mDNS node advertisement with a versioned compute manifest: accelerator
+kind (CUDA, Metal, TPU, or CPU), device count, memory capacity and availability, supported model
+formats/runtimes, loaded model identities, queue depth, and approximate inference throughput.
+Discovery is advisory; authenticated node APIs provide the current authoritative capabilities.
+
+A brain may schedule bounded, content-addressed inference jobs across discovered compute nodes and
+combine or compare their results. Compute nodes receive only the prompt/model inputs and declared
+resource budget required for that job. They do not become execution environments and receive no
+implicit workspace, filesystem, process, credential, or approval authority. All host effects remain
+on the brain's single bound environment, and every remote inference result is recorded with node,
+model, input hash, timing, and environment generation for audit and reproducibility.
+
 ### Make programs the model-facing action interface
 
 The model may answer normally or submit a program. Individual filesystem, shell, dialog,
