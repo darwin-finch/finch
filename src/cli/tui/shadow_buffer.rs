@@ -353,6 +353,15 @@ pub fn visible_length(s: &str) -> usize {
     len
 }
 
+/// Number of physical terminal rows occupied by one logical line.
+///
+/// Live-area erasure depends on this value being identical for every producer.
+/// Counting logical lines as one leaves old spinner/tool rows behind whenever a
+/// WorkUnit wraps.
+pub fn physical_rows(s: &str, terminal_width: usize) -> usize {
+    visible_length(s).max(1).div_ceil(terminal_width.max(1))
+}
+
 /// Extract visible characters from string (strip ANSI codes)
 /// Returns (visible_chars, positions_of_ansi_codes)
 pub fn extract_visible_chars(s: &str) -> (Vec<char>, Vec<usize>) {
@@ -524,6 +533,13 @@ mod tests {
         // Each Unicode character counts as 1 (codepoint, not byte)
         assert_eq!(visible_length("café"), 4);
         assert_eq!(visible_length("🦀"), 1);
+    }
+
+    #[test]
+    fn test_physical_rows_accounts_for_wrapped_ansi_text() {
+        assert_eq!(physical_rows("short", 10), 1);
+        assert_eq!(physical_rows("\x1b[36m12345678901\x1b[0m", 10), 2);
+        assert_eq!(physical_rows("", 10), 1);
     }
 
     // ─── extract_visible_chars ───────────────────────────────────────────────

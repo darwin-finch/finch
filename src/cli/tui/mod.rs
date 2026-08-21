@@ -747,6 +747,7 @@ impl TuiRenderer {
         // Cap to the last third of the terminal height so streaming responses
         // don't grow the live area upward and shoot content off-screen.
         let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
+        let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let max_live_lines = (term_h / 3).max(5);
         let live_msg = self.find_live_message();
         if let Some(msg) = &live_msg {
@@ -756,7 +757,7 @@ impl TuiRenderer {
             for line in &all_lines[start..] {
                 let line = line.trim_end_matches('\r');
                 execute!(stdout, Print(line), Print("\r\n"))?;
-                rows += 1;
+                rows += shadow_buffer::physical_rows(line, term_width);
             }
         }
 
@@ -765,7 +766,7 @@ impl TuiRenderer {
             if let Ok(todo) = todo_arc.try_read() {
                 let active = todo.active_items();
                 if !active.is_empty() {
-                    let term_w = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
+                    let term_w = term_width;
                     for item in &active {
                         let (symbol, color) = match item.status {
                             crate::tools::todo::TodoStatus::InProgress => ("●", CYAN),
@@ -786,7 +787,7 @@ impl TuiRenderer {
                                 color, symbol, content, priority_tag, RESET
                             ))
                         )?;
-                        rows += 1;
+                        rows += shadow_buffer::physical_rows(&content, term_w);
                     }
                 }
             }
@@ -800,7 +801,6 @@ impl TuiRenderer {
 
         // ── 2. Separator: "──  ~/repos/finch ──────── jade-river ──" ──────────
         // CWD is left-anchored; session name is right-anchored.
-        let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let cwd_label = tilde_cwd();
         let prefix = "── ";
         let prefix_vis = 3_usize;
@@ -870,7 +870,7 @@ impl TuiRenderer {
                     // A line that exactly fills the terminal still counts as 1 physical row;
                     // one that overflows wraps into additional rows.
                     let prefix_vis = if i == 0 { prompt_vis_len } else { cont_vis_len };
-                    let text_vis = line.chars().count();
+                    let text_vis = shadow_buffer::visible_length(line);
                     let total_vis = prefix_vis + text_vis;
                     let phys = if term_width > 0 {
                         total_vis.max(1).div_ceil(term_width)
@@ -927,12 +927,7 @@ impl TuiRenderer {
             let mut status_phys_rows: usize = 1; // 1 for the separator line itself
             for line in effective_status.lines() {
                 execute!(stdout, Print(format!("\r\n{}{}{}", DIM_GRAY, line, RESET)))?;
-                let vis = shadow_buffer::visible_length(line);
-                let phys = if term_width > 0 {
-                    vis.max(1).div_ceil(term_width)
-                } else {
-                    1
-                };
+                let phys = shadow_buffer::physical_rows(line, term_width);
                 status_phys_rows += phys;
             }
             rows += status_phys_rows;
@@ -952,8 +947,15 @@ impl TuiRenderer {
             };
 
             // Which physical sub-row within cursor_row's logical line is the cursor on?
+            let cursor_text_width = lines
+                .get(cursor_row)
+                .map(|line| {
+                    let prefix: String = line.chars().take(cursor_col).collect();
+                    shadow_buffer::visible_length(&prefix)
+                })
+                .unwrap_or(0);
             let cursor_sub_row = if term_width > 0 {
-                (cursor_prefix_vis + cursor_col) / term_width
+                (cursor_prefix_vis + cursor_text_width) / term_width
             } else {
                 0
             };
@@ -974,9 +976,9 @@ impl TuiRenderer {
 
             // Column within the current physical sub-row (accounts for wrapping).
             let col = if term_width > 0 {
-                (cursor_prefix_vis + cursor_col) % term_width
+                (cursor_prefix_vis + cursor_text_width) % term_width
             } else {
-                cursor_prefix_vis + cursor_col
+                cursor_prefix_vis + cursor_text_width
             };
             execute!(stdout, cursor::MoveToColumn(col as u16))?;
 
@@ -1001,6 +1003,7 @@ impl TuiRenderer {
             .get_messages()
             .into_iter()
             .filter(|m| !self.printed_ids.contains(&m.id()))
+            .rev()
             .find(|m| matches!(m.status(), MessageStatus::InProgress))
     }
 }

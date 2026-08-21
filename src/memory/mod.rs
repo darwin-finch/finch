@@ -543,6 +543,76 @@ impl MemorySystem {
 
         Ok(ConversationSummaryLines { lines })
     }
+
+    /// Derive context-summary lines from one Finch session only.
+    ///
+    /// The MemTree is intentionally cross-session, so using its global leaves for
+    /// the persistent footer can make one brain display another brain's topic.
+    /// Footer identity must instead come from the conversations carrying the
+    /// active session id. Cross-session MemTree results are still available to
+    /// the model as recalled context, but they do not masquerade as this brain's
+    /// current focus.
+    pub async fn conversation_summary_for_session(
+        &self,
+        session_id: &str,
+        depth: usize,
+    ) -> Result<ConversationSummaryLines> {
+        if depth == 0 || session_id.is_empty() {
+            return Ok(ConversationSummaryLines::default());
+        }
+
+        let turns: Vec<String> = {
+            let conn = self.db.lock().await;
+            let mut stmt = conn.prepare(
+                "SELECT content FROM conversations
+                 WHERE session_id = ?1 AND TRIM(content) <> ''
+                 ORDER BY timestamp DESC",
+            )?;
+            let rows = stmt
+                .query_map([session_id], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        if turns.is_empty() {
+            return Ok(ConversationSummaryLines::default());
+        }
+
+        let embeddings = turns
+            .iter()
+            .map(|turn| self.embedding_engine.embed(turn))
+            .collect::<Result<Vec<_>>>()?;
+        let windows = context_windows(depth, turns.len());
+        let now_text = truncate_str(&turns[0], 70);
+        let mut lines = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for window in windows.iter().take(windows.len().saturating_sub(1)) {
+            let count = (*window).min(embeddings.len());
+            let window_embeddings: Vec<&Vec<f32>> = embeddings[..count].iter().collect();
+            let centroid = average_embeddings(&window_embeddings);
+            let representative = embeddings[..count]
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    cosine_similarity(a, &centroid)
+                        .partial_cmp(&cosine_similarity(b, &centroid))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(index, _)| truncate_str(&turns[index], 70));
+            if let Some(text) = representative {
+                if text != now_text && seen.insert(text.clone()) {
+                    lines.push(text);
+                }
+            }
+        }
+
+        if !now_text.trim().is_empty() {
+            lines.push(now_text);
+        }
+
+        Ok(ConversationSummaryLines { lines })
+    }
 }
 
 /// Summary of conversation topics derived from MemTree centroid queries.
@@ -749,6 +819,41 @@ mod tests {
             summary.lines.iter().all(|l| !l.is_empty()),
             "all lines must be non-empty"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_session_summary_does_not_leak_another_brains_context() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            ..Default::default()
+        })?;
+        memory
+            .insert_conversation(
+                "user",
+                "Beelzebub and unrelated mythology",
+                Some("local"),
+                Some("other-brain"),
+            )
+            .await?;
+        memory
+            .insert_conversation(
+                "user",
+                "Fix Finch shadow buffer row accounting",
+                Some("local"),
+                Some("active-brain"),
+            )
+            .await?;
+
+        let summary = memory
+            .conversation_summary_for_session("active-brain", 3)
+            .await?;
+        assert!(summary
+            .lines
+            .iter()
+            .any(|line| line.contains("shadow buffer")));
+        assert!(summary.lines.iter().all(|line| !line.contains("Beelzebub")));
         Ok(())
     }
 

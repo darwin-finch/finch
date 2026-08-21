@@ -56,7 +56,10 @@ pub(super) async fn refresh_context_strip(
     context_lines: usize,
 ) {
     let depth = context_lines.saturating_sub(1); // 🧠 takes one slot
-    let Ok(summary) = memory_system.conversation_summary(depth).await else {
+    let Ok(summary) = memory_system
+        .conversation_summary_for_session(session_label, depth)
+        .await
+    else {
         return;
     };
 
@@ -392,7 +395,7 @@ pub(crate) async fn process_query_with_tools(
                     }
                     status_bar.update_line(
                         crate::cli::status_bar::StatusLineType::MemoryContext,
-                        format!("🧠 recalled {}  ·  querying…", memory_recall_count),
+                        format!("🧠 recalled {}", memory_recall_count),
                     );
                 }
             }
