@@ -726,15 +726,33 @@ async fn handle_local_only_query(
 }
 
 /// Handle GET /v1/models - List available models
-pub async fn handle_list_models() -> Json<ModelsResponse> {
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: vec![Model {
+pub async fn handle_list_models(State(server): State<Arc<AgentServer>>) -> Json<ModelsResponse> {
+    let profile_names: Vec<String> = server
+        .providers
+        .iter()
+        .map(|slot| slot.profile_name.clone())
+        .collect();
+    let data = if profile_names.is_empty() {
+        vec![Model {
             id: "qwen-local".to_string(),
             object: "model".to_string(),
-            created: 1672531200, // Arbitrary timestamp
+            created: 1672531200,
             owned_by: "local".to_string(),
-        }],
+        }]
+    } else {
+        profile_names
+            .into_iter()
+            .map(|id| Model {
+                id,
+                object: "model".to_string(),
+                created: 1672531200,
+                owned_by: "finch".to_string(),
+            })
+            .collect()
+    };
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data,
     })
 }
 
