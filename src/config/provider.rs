@@ -5,6 +5,34 @@ use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Provider-controlled reasoning depth. Unsupported providers ignore this by
+/// omitting the field from their profile schema.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -66,6 +94,8 @@ pub enum ProviderEntry {
         base_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffort>,
     },
     Grok {
         api_key: String,

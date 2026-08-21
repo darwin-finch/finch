@@ -15,6 +15,7 @@ use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
 use super::LlmProvider;
 use crate::claude::retry::{with_retry, NonRetriableError};
 use crate::claude::types::ContentBlock;
+use crate::config::ReasoningEffort;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 
@@ -108,6 +109,7 @@ pub struct OpenAIProvider {
     base_url: String,
     default_model: String,
     provider_name: String,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl OpenAIProvider {
@@ -183,6 +185,12 @@ impl OpenAIProvider {
         self
     }
 
+    /// Set provider-side reasoning depth for models that support it.
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
     /// Create a provider with custom settings
     fn new(
         api_key: String,
@@ -201,6 +209,7 @@ impl OpenAIProvider {
             base_url,
             default_model,
             provider_name,
+            reasoning_effort: None,
         })
     }
 
@@ -357,6 +366,7 @@ impl OpenAIProvider {
             messages,
             max_tokens: Some(request.max_tokens),
             temperature: request.temperature,
+            reasoning_effort: self.reasoning_effort.map(ReasoningEffort::as_str),
             tools,
             stream: request.stream,
         }
@@ -646,6 +656,8 @@ struct OpenAIRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool>>,
     #[serde(skip_serializing_if = "is_false")]
@@ -975,6 +987,19 @@ mod tests {
         let req = ProviderRequest::new(vec![]);
         let openai_req = provider.to_openai_request(&req);
         assert!(!openai_req.model.is_empty());
+    }
+
+    #[test]
+    fn test_to_openai_request_includes_reasoning_effort() {
+        let provider = OpenAIProvider::new_openai("key".to_string())
+            .unwrap()
+            .with_model("gpt-5.6-sol")
+            .with_reasoning_effort(ReasoningEffort::High);
+        let request = ProviderRequest::new(vec![crate::claude::Message::user("reason carefully")]);
+        let openai_request = provider.to_openai_request(&request);
+
+        assert_eq!(openai_request.model, "gpt-5.6-sol");
+        assert_eq!(openai_request.reasoning_effort, Some("high"));
     }
 
     #[test]

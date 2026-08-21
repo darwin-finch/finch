@@ -28,10 +28,25 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
             Ok(Box::new(provider))
         }
 
-        ProviderEntry::Openai { api_key, model, .. } => {
-            let mut provider = OpenAIProvider::new_openai(api_key.clone())?;
+        ProviderEntry::Openai {
+            api_key,
+            model,
+            reasoning_effort,
+            ..
+        } => {
+            let api_key = if api_key.trim().is_empty() {
+                std::env::var("OPENAI_API_KEY").context(
+                    "OpenAI provider needs api_key in config or OPENAI_API_KEY in the environment",
+                )?
+            } else {
+                api_key.clone()
+            };
+            let mut provider = OpenAIProvider::new_openai(api_key)?;
             if let Some(m) = model {
                 provider = provider.with_model(m.clone());
+            }
+            if let Some(effort) = reasoning_effort {
+                provider = provider.with_reasoning_effort(*effort);
             }
             Ok(Box::new(provider))
         }

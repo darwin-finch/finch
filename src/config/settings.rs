@@ -319,6 +319,7 @@ impl ProviderEntry {
                 model,
                 base_url,
                 name,
+                ..
             } => Some(TeacherEntry {
                 provider: "openai".to_string(),
                 api_key: api_key.clone(),
@@ -389,6 +390,7 @@ impl ProviderEntry {
                 model: entry.model.clone(),
                 base_url: entry.base_url.clone(),
                 name: entry.name.clone(),
+                reasoning_effort: None,
             },
             "grok" => Self::Grok {
                 api_key: entry.api_key.clone(),

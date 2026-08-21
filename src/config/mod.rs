@@ -17,7 +17,7 @@ pub use colors::{
 };
 pub use loader::load_config;
 pub use persona::Persona;
-pub use provider::ProviderEntry;
+pub use provider::{ProviderEntry, ReasoningEffort};
 pub use settings::{
     ClientConfig, Config, FeaturesConfig, LicenseConfig, LicenseType, ServerConfig, TeacherEntry,
 };
