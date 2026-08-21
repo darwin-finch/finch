@@ -69,6 +69,13 @@ pub struct BrainSnapshot {
     pub program_stack: Vec<BrainProgram>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrainWireMessage {
+    Snapshot { brain: BrainSnapshot },
+    Event { event: BrainEvent },
+}
+
 struct BrainState {
     events: Vec<BrainEvent>,
     program_stack: Vec<BrainProgram>,

@@ -58,6 +58,8 @@ pub struct ServerConfig {
     pub auth_enabled: bool,
     /// Valid API keys for authentication
     pub api_keys: Vec<String>,
+    /// Password required for remote named-brain access.
+    pub brain_password: String,
 }
 
 impl Default for ServerConfig {
@@ -68,6 +70,7 @@ impl Default for ServerConfig {
             session_timeout_minutes: 30,
             auth_enabled: false,
             api_keys: vec![],
+            brain_password: String::new(),
         }
     }
 }
@@ -103,6 +106,10 @@ pub struct AgentServer {
     >,
     /// Brain registry — tracks all daemon brain sessions
     brain_registry: Arc<BrainRegistry>,
+    /// Authoritative event logs and program stacks for named shared brains.
+    shared_brains: crate::brain::shared::SharedBrainStore,
+    /// Runtime-rotatable password for remote named-brain access.
+    brain_password: Arc<RwLock<String>>,
 }
 
 impl AgentServer {
@@ -144,6 +151,14 @@ impl AgentServer {
             })
             .collect();
 
+        let machine = hostname_or_default();
+        let machine = if machine.contains('.') {
+            machine
+        } else {
+            format!("{machine}.local")
+        };
+        let brain_password = server_config.brain_password.clone();
+
         Ok(Self {
             claude_client: Arc::new(claude_client),
             providers,
@@ -158,6 +173,8 @@ impl AgentServer {
             training_tx: Arc::new(training_tx),
             training_rx: std::sync::Mutex::new(Some(training_rx)),
             brain_registry: Arc::new(BrainRegistry::new()),
+            shared_brains: crate::brain::shared::SharedBrainStore::new(machine),
+            brain_password: Arc::new(RwLock::new(brain_password)),
         })
     }
 
@@ -388,6 +405,25 @@ impl AgentServer {
         &self.config
     }
 
+    pub fn shared_brains(&self) -> &crate::brain::shared::SharedBrainStore {
+        &self.shared_brains
+    }
+
+    pub async fn brain_password(&self) -> String {
+        self.brain_password.read().await.clone()
+    }
+
+    pub async fn check_brain_password(&self, candidate: &str) -> bool {
+        constant_time_eq(
+            self.brain_password.read().await.as_bytes(),
+            candidate.as_bytes(),
+        )
+    }
+
+    pub async fn set_brain_password(&self, password: String) {
+        *self.brain_password.write().await = password;
+    }
+
     /// Get reference to local generator
     pub fn local_generator(&self) -> &Arc<RwLock<LocalGenerator>> {
         &self.local_generator
@@ -427,6 +463,13 @@ impl AgentServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brain_password_comparison_checks_length_and_contents() {
+        assert!(constant_time_eq(b"brain-secret", b"brain-secret"));
+        assert!(!constant_time_eq(b"brain-secret", b"brain-secrex"));
+        assert!(!constant_time_eq(b"brain-secret", b"brain-secret-longer"));
+    }
     use crate::providers::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
     use async_trait::async_trait;
     use tokio::sync::mpsc::Receiver;
@@ -530,4 +573,14 @@ fn hostname_or_default() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "finch-node".to_string())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let width = left.len().max(right.len());
+    for index in 0..width {
+        diff |= left.get(index).copied().unwrap_or(0) as usize
+            ^ right.get(index).copied().unwrap_or(0) as usize;
+    }
+    diff == 0
 }

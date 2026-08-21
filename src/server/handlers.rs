@@ -72,6 +72,16 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/node/stats", get(handle_node_stats))
         // Brain sessions
         .route("/v1/brains", post(spawn_brain).get(list_brains))
+        .route("/v1/brains/named", get(list_named_brains))
+        .route(
+            "/v1/brains/named/:name",
+            get(get_named_brain).post(push_named_brain_event),
+        )
+        .route("/v1/brains/named/:name/ws", get(watch_named_brain))
+        .route(
+            "/v1/brains/password",
+            get(show_brain_password).put(change_brain_password),
+        )
         .route("/v1/brains/:id", get(get_brain).delete(cancel_brain))
         .route("/v1/brains/:id/answer", post(answer_brain_question))
         .route("/v1/brains/:id/plan", post(respond_to_brain_plan))
@@ -133,6 +143,307 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
 // ---------------------------------------------------------------------------
 // Brain route handlers
 // ---------------------------------------------------------------------------
+
+const BRAIN_PASSWORD_HEADER: &str = "x-finch-brain-password";
+
+async fn check_brain_access(
+    server: &AgentServer,
+    addr: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    let supplied = headers
+        .get(BRAIN_PASSWORD_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+        })
+        .unwrap_or_default();
+    if !supplied.is_empty() && server.check_brain_password(supplied).await {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "brain password required"})),
+        )
+            .into_response())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct NamedBrainListEntry {
+    name: String,
+    machine: String,
+    revision: u64,
+    programs: usize,
+}
+
+async fn list_named_brains(
+    State(server): State<Arc<AgentServer>>,
+) -> Result<Json<Vec<NamedBrainListEntry>>, AppError> {
+    let mut result = Vec::new();
+    for name in server.shared_brains().list()? {
+        let snapshot = server.shared_brains().snapshot(&name)?;
+        result.push(NamedBrainListEntry {
+            name,
+            machine: snapshot.machine,
+            revision: snapshot.revision,
+            programs: snapshot.program_stack.len(),
+        });
+    }
+    Ok(Json(result))
+}
+
+async fn get_named_brain(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<crate::brain::shared::BrainSnapshot>, Response> {
+    check_brain_access(&server, addr, &headers).await?;
+    server
+        .shared_brains()
+        .snapshot(&name)
+        .map(Json)
+        .map_err(|error| AppError(error).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct PushNamedBrainEvent {
+    sender: String,
+    #[serde(flatten)]
+    kind: crate::brain::shared::BrainEventKind,
+}
+
+#[derive(Debug, Serialize)]
+struct PushNamedBrainResponse {
+    accepted: crate::brain::shared::BrainEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<crate::brain::shared::BrainEvent>,
+}
+
+async fn push_named_brain_event(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(request): Json<PushNamedBrainEvent>,
+) -> Result<Json<PushNamedBrainResponse>, Response> {
+    use crate::brain::shared::BrainEventKind;
+
+    check_brain_access(&server, addr, &headers).await?;
+    let accepted = server
+        .shared_brains()
+        .push(&name, &request.sender, request.kind.clone())
+        .map_err(|error| AppError(error).into_response())?;
+
+    let execution = match request.kind {
+        BrainEventKind::Program { language, .. } => {
+            Some(execute_named_brain_program(&server, &name, language).await)
+        }
+        BrainEventKind::Prompt { text } => {
+            Some(execute_named_brain_prompt(&server, &name, &text).await)
+        }
+        BrainEventKind::ProgramPopped { .. } | BrainEventKind::Result { .. } => None,
+    };
+    let result = execution.map(|result| {
+        let (output, error) = match result {
+            Ok(output) => (output, None),
+            Err(error) => (String::new(), Some(error.to_string())),
+        };
+        server.shared_brains().push(
+            &name,
+            "daemon",
+            BrainEventKind::Result {
+                request_seq: accepted.seq,
+                output,
+                error,
+            },
+        )
+    });
+    let result = match result {
+        Some(result) => Some(result.map_err(|error| AppError(error).into_response())?),
+        None => None,
+    };
+
+    Ok(Json(PushNamedBrainResponse { accepted, result }))
+}
+
+async fn execute_named_brain_program(
+    server: &AgentServer,
+    name: &str,
+    language: crate::brain::shared::ProgramLanguage,
+) -> anyhow::Result<String> {
+    use crate::brain::shared::ProgramLanguage;
+
+    let snapshot = server.shared_brains().snapshot(name)?;
+    match language {
+        ProgramLanguage::Forth => {
+            let base = LIVE_VM.read().await;
+            let mut vm = base.clone_dict();
+            drop(base);
+            vm.remote_mode = true;
+            let mut output = String::new();
+            for program in snapshot
+                .program_stack
+                .iter()
+                .filter(|program| program.language == ProgramLanguage::Forth)
+            {
+                output = vm.exec(&program.source)?;
+            }
+            if output.trim().is_empty() && !vm.data_stack().is_empty() {
+                output = format!("{:?}", vm.data_stack());
+            }
+            Ok(output)
+        }
+        ProgramLanguage::Lisp => {
+            let env = crate::lisp::make_env();
+            let ctx = Arc::new(crate::lisp::LispCtx::new());
+            let mut output = String::new();
+            for program in snapshot
+                .program_stack
+                .iter()
+                .filter(|program| program.language == ProgramLanguage::Lisp)
+            {
+                output = crate::lisp::run_in(&program.source, env.clone(), ctx.clone())
+                    .await?
+                    .to_string();
+            }
+            Ok(output)
+        }
+    }
+}
+
+async fn execute_named_brain_prompt(
+    server: &AgentServer,
+    name: &str,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let provider = server
+        .provider_for_name(None)
+        .ok_or_else(|| anyhow::anyhow!("no LLM provider configured on the brain host"))?;
+    let snapshot = server.shared_brains().snapshot(name)?;
+    let context = snapshot
+        .events
+        .iter()
+        .rev()
+        .take(80)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|event| format!("#{} {}: {:?}", event.seq, event.sender, event.kind))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let request = crate::providers::ProviderRequest::new(vec![Message::user(prompt)])
+        .with_system(format!(
+            "You are attached to Finch brain {name}. Its authoritative recent event log follows.\n{context}"
+        ));
+    let response = provider.send_message(&request).await?;
+    Ok(response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(""))
+}
+
+async fn watch_named_brain(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> Result<Response, Response> {
+    check_brain_access(&server, addr, &headers).await?;
+    let snapshot = server
+        .shared_brains()
+        .snapshot(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let mut events = server
+        .shared_brains()
+        .subscribe(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let store = server.shared_brains().clone();
+    Ok(ws
+        .on_upgrade(move |mut socket| async move {
+            use axum::extract::ws::Message as WsMessage;
+            let initial = crate::brain::shared::BrainWireMessage::Snapshot { brain: snapshot };
+            if let Ok(json) = serde_json::to_string(&initial) {
+                if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                let wire = match events.recv().await {
+                    Ok(event) => crate::brain::shared::BrainWireMessage::Event { event },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(brain) = store.snapshot(&name) else {
+                            break;
+                        };
+                        crate::brain::shared::BrainWireMessage::Snapshot { brain }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Ok(json) = serde_json::to_string(&wire) else {
+                    continue;
+                };
+                if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .into_response())
+}
+
+async fn show_brain_password(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(Json(serde_json::json!({
+        "password": server.brain_password().await
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangeBrainPassword {
+    password: String,
+}
+
+async fn change_brain_password(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(request): Json<ChangeBrainPassword>,
+) -> Result<StatusCode, Response> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN.into_response());
+    }
+    if request.password.trim().len() < 12 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "brain password must be at least 12 characters"})),
+        )
+            .into_response());
+    }
+    let mut config =
+        crate::config::load_config().map_err(|error| AppError(error).into_response())?;
+    config.server.brain_password = request.password.clone();
+    config
+        .save()
+        .map_err(|error| AppError(error).into_response())?;
+    server.set_brain_password(request.password).await;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 /// POST /v1/brains — spawn a new brain session
 #[derive(Debug, Deserialize)]

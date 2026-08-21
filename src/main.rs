@@ -1357,6 +1357,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         session_timeout_minutes: config.server.session_timeout_minutes,
         auth_enabled: config.server.auth_enabled,
         api_keys: config.server.api_keys.clone(),
+        brain_password: config.server.brain_password.clone(),
     };
 
     // Build the multi-provider pool from [[providers]] config (cloud providers only).
