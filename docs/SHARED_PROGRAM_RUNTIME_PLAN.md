@@ -92,6 +92,33 @@ replace earlier draft text under the same message ID. Commitment appends an immu
 later corrections append `supersedes` or `retracts` events and move the active projection rather
 than deleting history. Programs and mutations may be submitted only from committed output.
 
+### Rewind VM state without replaying external effects
+
+A brain has one authoritative event log, but two different kinds of derived history:
+
+- VM state is reducible state: data/return stacks, definitions, variables, heap, and other
+  language-runtime state.
+- Host effects are execute-once facts: files changed, processes started, network messages sent,
+  dialogs answered, and other observations outside the VM.
+
+Each committed program records its input VM revision, resulting VM revision, declared and derived
+effect, emitted effect intents, and effect outcomes. Finch persists a serializable VM checkpoint
+or reversible VM delta at every committed program boundary. Popping a program moves the active
+head to the preceding VM revision and updates every attached client's projection. It must not
+re-run source merely to reconstruct state: replay could repeat a file write, shell command, network
+request, or other external action.
+
+External effects are never silently reversed by a stack pop. An effect may optionally record a
+typed compensating action. File changes should retain the preimage hash, postimage hash, and reverse
+changeset; compensation applies only when the current content still matches the expected postimage,
+otherwise Finch proposes a conflict-aware diff. Process execution and network sends are normally
+irreversible and are reported as such. Running a compensating action is a new audited event and uses
+the same approval policy as the forward action.
+
+Until transactional effect capture and persistent VM checkpoints exist, named-brain programs that
+can produce workspace, external, destructive, or unclassified effects must not participate in
+automatic replay. `remote_mode` only suppresses interaction; it is not an effect sandbox.
+
 ### Make programs the model-facing action interface
 
 The model may answer normally or submit a program. Individual filesystem, shell, dialog,
