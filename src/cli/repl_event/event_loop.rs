@@ -674,27 +674,6 @@ fn is_forth_primitive_word(w: &str) -> bool {
         })
 }
 
-/// Split a mixed English+Forth input into a Forth program and a natural-language
-/// remainder.  Tokens that are numbers, Forth primitives, or known VM words go
-/// into `forth`; everything else goes into `nl`.
-///
-/// Returns `(forth_program, nl_text)`.  Either may be empty.
-///
-/// Example: `"add 2 and 3 to get the answer"` with `add` known as a Forth word →
-///   forth = `"add 2 3"`, nl = `"and to get the answer"`
-fn split_forth_nl(input: &str, word_exists: impl Fn(&str) -> bool) -> (String, String) {
-    let mut forth = Vec::new();
-    let mut nl = Vec::new();
-    for token in crate::coforth::tokenize(input) {
-        if is_forth_primitive_word(&token) || word_exists(&token) {
-            forth.push(token);
-        } else {
-            nl.push(token);
-        }
-    }
-    (forth.join(" "), nl.join(" "))
-}
-
 /// Heuristic: does this input look like natural language rather than Forth code?
 ///
 /// `word_exists`   — checks the full VM dictionary (builtins + library + session).
@@ -1461,6 +1440,11 @@ impl EventLoop {
             // Use the pre-built (cached) builtin defs — no TOML re-parse, no re-sort.
             // User vocabulary/*.toml files are merged on top at runtime.
             let builtin = crate::coforth::Library::builtin_defs();
+            // These definitions are ambient runtime vocabulary, not words authored in
+            // this conversation. Routing must keep that distinction or an ordinary
+            // sentence made entirely from dictionary words is silently executed.
+            self.auto_compiled_word_names
+                .extend(builtin.pairs.iter().map(|(word, _)| word.clone()));
 
             // Load user vocabulary extensions on top of the builtins.
             let lib = crate::coforth::Library::load();
@@ -1491,6 +1475,7 @@ impl EventLoop {
                 };
                 user_defs.push_str(&jit_def);
                 user_defs.push('\n');
+                self.auto_compiled_word_names.insert(entry.word.clone());
                 if entry.boot {
                     boot_codes.push(code.to_string());
                 }
@@ -1514,57 +1499,18 @@ impl EventLoop {
             // Restore words learned in previous sessions (from daemon or file).
             self.load_user_words().await;
 
-            // Print all vocabulary definitions so both participants know what
-            // words are available at the start of every session.
+            // Keep boot output compact. The registry/introspection tools are the source
+            // of truth; dumping every definition obscures actual conversation output.
             {
-                use crossterm::style::{
-                    Attribute, Color, ResetColor, SetAttribute, SetForegroundColor,
-                };
-                use std::fmt::Write as FmtWrite;
-
                 let lib = crate::coforth::Library::load();
-                let mut entries = lib.all_entries();
-                entries.sort_by(|a, b| a.word.cmp(&b.word));
-
-                let mut lines = Vec::new();
-                for entry in &entries {
-                    let kind_color = match entry.kind.as_str() {
-                        "task" => Color::Cyan,
-                        "question" => Color::Yellow,
-                        "constraint" => Color::Red,
-                        _ => Color::DarkGrey,
-                    };
-                    let callable_marker = if entry.forth.is_some() {
-                        format!("{}{}{} ", SetForegroundColor(Color::Green), "✦", ResetColor)
-                    } else {
-                        "  ".to_string()
-                    };
-                    let mut line = String::new();
-                    let _ = write!(
-                        line,
-                        "{}{}{}{}{}  —  {}",
-                        callable_marker,
-                        SetForegroundColor(kind_color),
-                        entry.word,
-                        ResetColor,
-                        SetAttribute(Attribute::Reset),
-                        entry.definition,
-                    );
-                    lines.push(line);
-                }
-
-                if !lines.is_empty() {
-                    let header = format!(
-                        "{}{} words{}  {}✦{} = callable  {}cyan{}=task  {}yellow{}=question  {}red{}=constraint  {}dim{}=observation",
-                        SetAttribute(Attribute::Bold), entries.len(), SetAttribute(Attribute::Reset),
-                        SetForegroundColor(Color::Green), ResetColor,
-                        SetForegroundColor(Color::Cyan), ResetColor,
-                        SetForegroundColor(Color::Yellow), ResetColor,
-                        SetForegroundColor(Color::Red), ResetColor,
-                        SetForegroundColor(Color::DarkGrey), ResetColor,
-                    );
-                    self.output_manager.write_info(header);
-                    self.output_manager.write_info(lines.join("\n"));
+                let entries = lib.all_entries();
+                if !entries.is_empty() {
+                    let executable = entries.iter().filter(|entry| entry.forth.is_some()).count();
+                    self.output_manager.write_info(format!(
+                        "vocabulary ready: {} words, {} executable",
+                        entries.len(),
+                        executable
+                    ));
                 }
             }
 
@@ -1591,10 +1537,6 @@ s" it is ours"      s" -1 is ours"     argue
             // Run user-authored boot poetry from ~/.finch/boot.forth.
             self.run_boot_poems();
 
-            // Boot poetry — plain Rust strings, compiled in, no parsing.
-            for poem in crate::coforth::library::BOOT_POETRY {
-                self.output_manager.write_info(poem.to_string());
-            }
             self.render_tui().await.ok();
 
             // Auto-discover peers on LAN in background — REPL stays responsive.
@@ -2874,39 +2816,9 @@ Rules:\n\
             },
         );
 
-        // Sentence execution: if the input ends with '.' and looks like natural language,
-        // try running it as a sentence before routing to the AI.  Each word's library
-        // Forth body runs in sequence; words with no body are skipped.  If sentence-exec
-        // produces output, show it — the period means "do it", not "describe it".
-        if is_nl && input.trim_end().ends_with('.') {
-            let prog = format!("s\" {}\" sentence-exec", input.replace('"', "'"));
-            if let Ok(out) = self.forth_vm.exec(&prog) {
-                let out = out.trim().to_string();
-                if !out.is_empty() && !out.contains("no executable words") {
-                    self.output_manager.write_info(out);
-                    return self.render_tui().await;
-                }
-            }
-        }
-
         if is_nl {
-            // Mixed mode: if the NL input contains embedded Forth tokens (numbers,
-            // primitives, known words), execute those first, then send the remaining
-            // English to the AI so both languages work simultaneously.
-            let (forth_prog, nl_text) = split_forth_nl(
-                &input,
-                |w| self.forth_vm.word_exists(w),
-            );
-            if !forth_prog.is_empty() && !nl_text.is_empty() {
-                if let Ok(out) = self.forth_vm.exec(&forth_prog) {
-                    let out = out.trim().to_string();
-                    if !out.is_empty() {
-                        self.output_manager.write_info(out);
-                    }
-                }
-                self.spawn_translation(nl_text.clone());
-                return self.execute_query(nl_text).await;
-            }
+            // Conversation is never partially executed. Explicit `/forth <program>`
+            // remains available when the user intends VM evaluation.
             self.spawn_translation(input.clone());
             return self.execute_query(input).await;
         }
@@ -2938,18 +2850,10 @@ Rules:\n\
         let is_nl = looks_like_natural_language(
             &input,
             |w| self.forth_vm.word_exists(w),
-            |w| self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w),
+            |w| {
+                self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w)
+            },
         );
-        if is_nl && input.trim_end().ends_with('.') {
-            let prog = format!("s\" {}\" sentence-exec", input.replace('"', "'"));
-            if let Ok(out) = self.forth_vm.exec(&prog) {
-                let out = out.trim().to_string();
-                if !out.is_empty() && !out.contains("no executable words") {
-                    self.output_manager.write_info(out);
-                    return self.render_tui().await;
-                }
-            }
-        }
         if is_nl {
             return self.execute_query(input).await;
         }
@@ -9622,6 +9526,26 @@ mod nl_routing_tests {
             "hello world",
             all_words,
             no_words
+        ));
+    }
+
+    #[test]
+    fn test_boot_vocabulary_words_remain_ambient_for_routing() {
+        use std::collections::HashSet;
+
+        let ambient: HashSet<String> = crate::coforth::Library::builtin_defs()
+            .pairs
+            .iter()
+            .map(|(word, _)| word.clone())
+            .collect();
+        assert!(ambient.contains("hello"));
+        let word_exists = |word: &str| ambient.contains(word);
+        let session_word = |word: &str| word_exists(word) && !ambient.contains(word);
+
+        assert!(looks_like_natural_language(
+            "hello world",
+            word_exists,
+            session_word
         ));
     }
 

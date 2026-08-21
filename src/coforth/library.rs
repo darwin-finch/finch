@@ -613,16 +613,6 @@ pub fn generate_forth_for_word(word: &str) -> String {
     format!(r#"." {safe}." cr"#)
 }
 
-// ── Boot poetry ────────────────────────────────────────────────────────────────
-// Printed every startup, before the REPL is ready.
-// Written directly in Rust — no parsing, no Forth, no gen".
-// These are for alignment: orient both the human and the system at the start.
-
-pub const BOOT_POETRY: &[&str] = &[
-    "the machine is warm.\nthe task is yours.\nthe silence between us is not empty.",
-    "you do not start from nothing.\neverything you wrote before is still here.",
-];
-
 // ── Vocabulary sources ─────────────────────────────────────────────────────────
 
 /// Project English vocabulary — baked in at compile time.
