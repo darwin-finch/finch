@@ -24,8 +24,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 
 ## Client and model integration
 
-- [ ] Add an OpenAI-compatible named-brain adapter so Cline/Roo requests participate in the same
-  event log instead of using Finch as a stateless model proxy.
+- [ ] Keep the ordinary OpenAI-compatible API client-managed and stateless with respect to named
+  brains: Cline/Roo own their conversation and tool loop while Finch supplies model inference.
+- [ ] Optionally add an explicit brain-scoped OpenAI mode (for example a `finch/brain/<name>` model
+  ID) for clients that deliberately want to join a Finch event log. Never infer that attachment
+  from an ordinary `/v1/chat/completions` request.
 - [ ] Run the complete coding-agent/tool loop on the brain environment. Remote clients submit
   prompts and approvals; file/process actions execute only in that environment.
 - [ ] Make OpenAI tool-call behavior respect control ownership: a participant client must not
