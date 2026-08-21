@@ -178,7 +178,7 @@ async fn check_brain_access(
 #[derive(Debug, Serialize)]
 struct NamedBrainListEntry {
     name: String,
-    machine: String,
+    environment: crate::brain::shared::BrainEnvironment,
     revision: u64,
     programs: usize,
 }
@@ -191,7 +191,7 @@ async fn list_named_brains(
         let snapshot = server.shared_brains().snapshot(&name)?;
         result.push(NamedBrainListEntry {
             name,
-            machine: snapshot.machine,
+            environment: snapshot.environment,
             revision: snapshot.revision,
             programs: snapshot.program_stack.len(),
         });
@@ -282,6 +282,7 @@ async fn execute_named_brain_program(
     use crate::brain::shared::ProgramLanguage;
 
     let snapshot = server.shared_brains().snapshot(name)?;
+    ensure_named_brain_environment(server, &snapshot)?;
     match language {
         ProgramLanguage::Forth => {
             let base = LIVE_VM.read().await;
@@ -328,6 +329,7 @@ async fn execute_named_brain_prompt(
         .provider_for_name(None)
         .ok_or_else(|| anyhow::anyhow!("no LLM provider configured on the brain host"))?;
     let snapshot = server.shared_brains().snapshot(name)?;
+    ensure_named_brain_environment(server, &snapshot)?;
     let context = snapshot
         .events
         .iter()
@@ -341,7 +343,10 @@ async fn execute_named_brain_prompt(
         .join("\n");
     let request = crate::providers::ProviderRequest::new(vec![Message::user(prompt)])
         .with_system(format!(
-            "You are attached to Finch brain {name}. Its authoritative recent event log follows.\n{context}"
+            "You are attached to Finch brain {name}. Its sole execution environment is {}:{}.\n\
+             All file and process effects belong to that workspace. Its authoritative recent event log follows.\n{context}",
+            snapshot.environment.machine,
+            snapshot.environment.workspace.display(),
         ));
     let response = provider.send_message(&request).await?;
     Ok(response
@@ -353,6 +358,29 @@ async fn execute_named_brain_prompt(
         })
         .collect::<Vec<_>>()
         .join(""))
+}
+
+fn ensure_named_brain_environment(
+    server: &AgentServer,
+    snapshot: &crate::brain::shared::BrainSnapshot,
+) -> anyhow::Result<()> {
+    let configured = server.shared_brains().environment();
+    if &snapshot.environment != configured {
+        anyhow::bail!(
+            "brain environment generation does not match this execution host"
+        );
+    }
+    let process_workspace = std::env::current_dir()?;
+    let process_workspace = process_workspace
+        .canonicalize()
+        .unwrap_or(process_workspace);
+    if process_workspace != configured.workspace {
+        anyhow::bail!(
+            "brain workspace {} is not active on this execution host",
+            configured.workspace.display()
+        );
+    }
+    Ok(())
 }
 
 async fn watch_named_brain(

@@ -22,6 +22,17 @@ pub enum ProgramLanguage {
     Lisp,
 }
 
+/// The one machine/workspace boundary in which a brain may cause effects.
+///
+/// There is deliberately no separate `execution_head`: the machine that owns
+/// the workspace is the only machine allowed to execute the brain's programs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainEnvironment {
+    pub machine: String,
+    pub workspace: PathBuf,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainEventKind {
@@ -46,6 +57,9 @@ pub enum BrainEventKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrainEvent {
     pub seq: u64,
+    /// Binds this event to the exact environment revision in which it ran.
+    #[serde(default = "initial_environment_generation")]
+    pub environment_generation: u64,
     pub sender: String,
     pub created_ms: u64,
     #[serde(flatten)]
@@ -63,7 +77,7 @@ pub struct BrainProgram {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrainSnapshot {
     pub name: String,
-    pub machine: String,
+    pub environment: BrainEnvironment,
     pub revision: u64,
     pub events: Vec<BrainEvent>,
     pub program_stack: Vec<BrainProgram>,
@@ -125,7 +139,7 @@ impl BrainState {
 #[derive(Clone)]
 pub struct SharedBrainStore {
     root: Option<PathBuf>,
-    machine: String,
+    environment: BrainEnvironment,
     brains: Arc<RwLock<HashMap<String, BrainState>>>,
 }
 
@@ -136,11 +150,30 @@ impl SharedBrainStore {
     }
 
     pub fn with_root(machine: impl Into<String>, root: Option<PathBuf>) -> Self {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_environment(machine, workspace, root)
+    }
+
+    pub fn with_environment(
+        machine: impl Into<String>,
+        workspace: impl Into<PathBuf>,
+        root: Option<PathBuf>,
+    ) -> Self {
+        let workspace = workspace.into();
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
         Self {
             root,
-            machine: machine.into(),
+            environment: BrainEnvironment {
+                machine: machine.into(),
+                workspace,
+                generation: initial_environment_generation(),
+            },
             brains: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn environment(&self) -> &BrainEnvironment {
+        &self.environment
     }
 
     pub fn validate_name(name: &str) -> Result<&str> {
@@ -171,7 +204,7 @@ impl SharedBrainStore {
         let state = brains.get(name).expect("brain loaded above");
         Ok(BrainSnapshot {
             name: name.to_string(),
-            machine: self.machine.clone(),
+            environment: self.environment.clone(),
             revision: state.events.last().map(|e| e.seq).unwrap_or(0),
             events: state.events.clone(),
             program_stack: state.program_stack.clone(),
@@ -185,6 +218,7 @@ impl SharedBrainStore {
         let state = brains.get_mut(name).expect("brain loaded above");
         let event = BrainEvent {
             seq: state.events.last().map(|e| e.seq + 1).unwrap_or(1),
+            environment_generation: self.environment.generation,
             sender: sender.trim().to_string(),
             created_ms: unix_millis(),
             kind,
@@ -309,6 +343,10 @@ fn unix_millis() -> u64 {
         .unwrap_or(0)
 }
 
+const fn initial_environment_generation() -> u64 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,7 +380,8 @@ mod tests {
         assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.program_stack.len(), 1);
         assert_eq!(snapshot.program_stack[0].seq, first.seq);
-        assert_eq!(snapshot.machine, "workstation.local");
+        assert_eq!(snapshot.environment.machine, "workstation.local");
+        assert_eq!(snapshot.events[0].environment_generation, 1);
     }
 
     #[test]
@@ -388,5 +427,43 @@ mod tests {
     fn names_cannot_escape_the_storage_root() {
         assert!(SharedBrainStore::validate_name("../other").is_err());
         assert!(SharedBrainStore::validate_name("valid-brain_2").is_ok());
+    }
+
+    #[test]
+    // An environment is an indivisible authority boundary, not two routable heads.
+    fn environment_binds_machine_and_workspace_as_one_revision() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_environment(
+            "gpu-box.local",
+            workspace.path(),
+            Some(state.path().into()),
+        );
+
+        store
+            .push(
+                "project",
+                "laptop.local",
+                BrainEventKind::Prompt { text: "go".into() },
+            )
+            .unwrap();
+        let snapshot = store.snapshot("project").unwrap();
+
+        assert_eq!(snapshot.environment.machine, "gpu-box.local");
+        assert_eq!(
+            snapshot.environment.workspace,
+            workspace.path().canonicalize().unwrap()
+        );
+        assert_eq!(snapshot.environment.generation, 1);
+        assert_eq!(snapshot.events[0].environment_generation, 1);
+    }
+
+    #[test]
+    fn old_events_default_to_the_initial_environment_generation() {
+        let event: BrainEvent = serde_json::from_str(
+            r#"{"seq":1,"sender":"alice","created_ms":0,"kind":"prompt","text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(event.environment_generation, 1);
     }
 }
