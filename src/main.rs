@@ -950,6 +950,7 @@ async fn run_daemon_start(bind_address: String) -> Result<()> {
         let pid = lifecycle.read_pid()?;
         println!("Daemon is already running (PID: {})", pid);
         println!("Bind address: {}", bind_address);
+        print_daemon_client_details(&bind_address);
         return Ok(());
     }
 
@@ -963,8 +964,31 @@ async fn run_daemon_start(bind_address: String) -> Result<()> {
     // Get PID for display
     let pid = lifecycle.read_pid()?;
     println!("✓ Daemon started successfully (PID: {})", pid);
+    print_daemon_client_details(&bind_address);
 
     Ok(())
+}
+
+fn print_daemon_client_details(bind_address: &str) {
+    let client_address = bind_address
+        .strip_prefix("0.0.0.0:")
+        .map(|port| format!("127.0.0.1:{port}"))
+        .unwrap_or_else(|| bind_address.to_string());
+    println!("\nOpenAI-compatible clients (Roo Code, Cline, etc.):");
+    println!("  Base URL: http://{client_address}/v1");
+    println!("  Models:   http://{client_address}/v1/models");
+
+    if let Ok(config) = load_config() {
+        let names: Vec<String> = config.providers.iter().map(|p| p.profile_name()).collect();
+        if !names.is_empty() {
+            println!("  Model ID: {}", names.join(", "));
+        }
+        if config.server.auth_enabled {
+            println!("  API key:  required (the Finch client key from Settings)");
+        } else {
+            println!("  API key:  not required (use any placeholder if your client requires one)");
+        }
+    }
 }
 
 /// Stop the running daemon
