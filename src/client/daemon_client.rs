@@ -55,6 +55,16 @@ pub struct DaemonClient {
     config: DaemonConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalModelStatus {
+    Initializing,
+    Downloading(String),
+    Loading(String),
+    Ready(String),
+    Failed(String),
+    NotAvailable,
+}
+
 impl DaemonClient {
     /// Create a new daemon client and ensure daemon is running
     pub async fn connect(config: DaemonConfig) -> Result<Self> {
@@ -176,6 +186,102 @@ impl DaemonClient {
             .unwrap_or_else(|| "No response from model".to_string());
 
         Ok(response_text)
+    }
+
+    /// Send a full conversation directly to the daemon's local model.
+    ///
+    /// Unlike `query()`, this bypasses routing and retains tool calls/results so
+    /// the local model can participate in the same agent loop as cloud models.
+    pub async fn query_local(
+        &self,
+        messages: Vec<Message>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<ChatCompletionResponse> {
+        use reqwest::StatusCode;
+
+        let request = ChatCompletionRequest {
+            model: "qwen-local".to_string(),
+            messages: Self::convert_to_openai_messages(&messages),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            n: None,
+            stream: false,
+            stop: None,
+            tools: if tools.is_empty() {
+                None
+            } else {
+                Some(Self::convert_to_openai_tools(&tools))
+            },
+            local_only: Some(true),
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .json(&request)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .context("Failed to query the daemon's local model")?;
+
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Local model request failed ({status}): {body}");
+        }
+
+        response
+            .json()
+            .await
+            .context("Failed to parse local model response")
+    }
+
+    /// Return the daemon's current local-model bootstrap state.
+    pub async fn local_model_status(&self) -> Result<LocalModelStatus> {
+        let value: serde_json::Value = self
+            .client
+            .get(format!("{}/v1/status", self.base_url))
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .context("Failed to query local model status")?
+            .error_for_status()
+            .context("Local model status request failed")?
+            .json()
+            .await
+            .context("Failed to parse local model status")?;
+
+        let generator = value
+            .get("generator")
+            .ok_or_else(|| anyhow::anyhow!("Daemon status omitted generator state"))?;
+        let state = generator
+            .get("state")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Daemon returned an invalid generator state"))?;
+        let detail = || {
+            generator
+                .get("model_size")
+                .and_then(|value| value.as_str())
+                .unwrap_or("local model")
+                .to_string()
+        };
+
+        match state {
+            "initializing" => Ok(LocalModelStatus::Initializing),
+            "downloading" => Ok(LocalModelStatus::Downloading(detail())),
+            "loading" => Ok(LocalModelStatus::Loading(detail())),
+            "ready" => Ok(LocalModelStatus::Ready(detail())),
+            "failed" => Ok(LocalModelStatus::Failed(
+                generator
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown local model error")
+                    .to_string(),
+            )),
+            "not_available" => Ok(LocalModelStatus::NotAvailable),
+            other => anyhow::bail!("Unknown local model state: {other}"),
+        }
     }
 
     /// Send a simple text query (convenience method)

@@ -1916,6 +1916,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         ..
     } = &primary_model
     {
+        let profile_name = if model.is_empty() { provider } else { model };
         teachers.push(TeacherEntry {
             provider: provider.clone(),
             api_key: api_key.clone(),
@@ -1925,7 +1926,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 Some(model.clone())
             },
             base_url: None,
-            name: Some(format!("{} (Primary)", provider)),
+            name: Some(profile_name.clone()),
         });
     }
 
@@ -1939,6 +1940,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         } = tool_model
         {
             if *enabled {
+                let profile_name = if model.is_empty() { provider } else { model };
                 teachers.push(TeacherEntry {
                     provider: provider.clone(),
                     api_key: api_key.clone(),
@@ -1948,9 +1950,24 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                         Some(model.clone())
                     },
                     base_url: None,
-                    name: Some(provider.clone()),
+                    name: Some(profile_name.clone()),
                 });
             }
+        }
+    }
+
+    // A profile name is the stable `/model <name>` selector. Keep generated
+    // names unique even when the same provider/model is added more than once.
+    let mut used_names: HashMap<String, usize> = HashMap::new();
+    for teacher in &mut teachers {
+        let base = teacher
+            .name
+            .clone()
+            .unwrap_or_else(|| teacher.provider.clone());
+        let count = used_names.entry(base.to_ascii_lowercase()).or_default();
+        *count += 1;
+        if *count > 1 {
+            teacher.name = Some(format!("{}-{}", base, count));
         }
     }
 
@@ -1970,7 +1987,18 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
             model_repo: None,
             ..Default::default()
         };
-        providers.push(ProviderEntry::from_backend_config(&backend, None));
+        let local_name = format!(
+            "local-{}-{}",
+            model_family.name().to_ascii_lowercase().replace(' ', "-"),
+            model_size
+                .to_size_string(model_family)
+                .to_ascii_lowercase()
+                .replace(' ', "-")
+        );
+        providers.push(ProviderEntry::from_backend_config(
+            &backend,
+            Some(local_name),
+        ));
     }
 
     Ok(SetupResult {

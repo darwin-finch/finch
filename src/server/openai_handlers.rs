@@ -400,6 +400,8 @@ async fn forward_to_cloud(
         }
         let resp = provider.send_message(&req).await?;
         Ok(resp.content)
+    } else if let Some(name) = provider_name {
+        anyhow::bail!("Unknown or ambiguous provider profile '{name}'")
     } else {
         // No providers configured — fall back to legacy ClaudeClient
         let mut claude_request = crate::claude::MessageRequest::with_context(messages);
@@ -657,13 +659,18 @@ async fn handle_local_only_query(
     let internal_messages = convert_messages_to_internal(&request.messages)
         .map_err(|e| error_response(&e.to_string(), "invalid_request_error"))?;
 
-    // Generate response (no tools for now - direct generation only)
+    let internal_tools = request
+        .tools
+        .as_ref()
+        .map(|tools| convert_tools_to_internal(tools));
+
+    // Generate directly with the same tool definitions used by cloud profiles.
     info!("Acquiring write lock on generator...");
     let mut generator = server.local_generator().write().await;
     info!("Write lock acquired, starting generation...");
 
     let content_blocks =
-        match generator.try_generate_from_pattern_with_tools(&internal_messages, None) {
+        match generator.try_generate_from_pattern_with_tools(&internal_messages, internal_tools) {
             Ok(Some(response)) => {
                 info!(
                     "Generation successful, {} content blocks",

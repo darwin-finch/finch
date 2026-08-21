@@ -177,6 +177,49 @@ pub enum ProviderEntry {
 }
 
 impl ProviderEntry {
+    /// Stable, user-facing selector for this configured provider profile.
+    ///
+    /// Explicit `name` values win. Older configs without names remain usable by
+    /// falling back to the configured model, then to a provider-specific label.
+    pub fn profile_name(&self) -> String {
+        let explicit_name = match self {
+            Self::Claude { name, .. }
+            | Self::Openai { name, .. }
+            | Self::Grok { name, .. }
+            | Self::Gemini { name, .. }
+            | Self::Mistral { name, .. }
+            | Self::Groq { name, .. }
+            | Self::Ollama { name, .. }
+            | Self::RemoteDaemon { name, .. }
+            | Self::Local { name, .. } => name.as_deref(),
+        };
+
+        if let Some(name) = explicit_name.filter(|name| !name.trim().is_empty()) {
+            return name.to_string();
+        }
+
+        if let Some(model) = self.model().filter(|model| !model.trim().is_empty()) {
+            return model.to_string();
+        }
+
+        match self {
+            Self::Local {
+                model_family,
+                model_size,
+                ..
+            } => format!(
+                "local-{}-{}",
+                model_family.name().to_ascii_lowercase().replace(' ', "-"),
+                model_size
+                    .to_size_string(*model_family)
+                    .to_ascii_lowercase()
+                    .replace(' ', "-")
+            ),
+            Self::RemoteDaemon { .. } => "remote-daemon".to_string(),
+            _ => self.provider_type().to_string(),
+        }
+    }
+
     /// Human-readable name for UI display.
     pub fn display_name(&self) -> &str {
         match self {

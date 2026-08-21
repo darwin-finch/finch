@@ -10,7 +10,51 @@ use crate::tools::types::ToolDefinition;
 
 // Re-export implementations
 pub mod claude;
+pub mod daemon_local;
 pub mod qwen;
+
+/// Associates a configured profile name with a generator without changing its
+/// provider-specific response metadata.
+pub struct ProfiledGenerator {
+    profile_name: String,
+    inner: std::sync::Arc<dyn Generator>,
+}
+
+impl ProfiledGenerator {
+    pub fn new(profile_name: impl Into<String>, inner: std::sync::Arc<dyn Generator>) -> Self {
+        Self {
+            profile_name: profile_name.into(),
+            inner,
+        }
+    }
+}
+
+#[async_trait]
+impl Generator for ProfiledGenerator {
+    async fn generate(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<GeneratorResponse> {
+        self.inner.generate(messages, tools).await
+    }
+
+    async fn generate_stream(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<Option<mpsc::Receiver<Result<StreamChunk>>>> {
+        self.inner.generate_stream(messages, tools).await
+    }
+
+    fn capabilities(&self) -> &GeneratorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn name(&self) -> &str {
+        &self.profile_name
+    }
+}
 
 /// Unified generator interface for Claude, Qwen, and future generators
 #[async_trait]

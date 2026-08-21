@@ -102,11 +102,11 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 | `finch setup`        | Run the interactive setup wizard                       |
 | `finch --cloud-only` | Start REPL using only cloud providers, no local model  |
 | `/plan <task>`       | Run iterative planning loop (7-persona critique, 3 rounds) |
-| `/teacher grok`      | Switch teacher to Grok for the current session         |
-| `/teacher claude`    | Switch teacher to Claude for the current session       |
-| `/teacher list`      | List all configured teacher providers                  |
-| `/model list`        | List available local models                            |
-| `/model <name>`      | Switch local model for the current session             |
+| `/model`             | Show the active named model profile                     |
+| `/model list`        | List configured cloud, Ollama, and local profiles       |
+| `/model <name>`      | Switch profiles without clearing conversation context  |
+| `/provider …`        | Compatibility alias for `/model …`                     |
+| `/teacher …`         | Compatibility alias for `/model …`                     |
 | `/license status`    | Show current license type                              |
 | `/license activate <key>` | Activate a commercial license key                 |
 | `/help`              | Show available commands                                |

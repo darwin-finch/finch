@@ -116,6 +116,27 @@ pub enum Command {
 
 impl Command {
     pub fn parse(input: &str) -> Option<Self> {
+        // Model profile names are user-defined and may end in punctuation
+        // (for example "GPT-4o (work)"). Parse these before the historical
+        // punctuation cleanup used for conversational slash commands.
+        let raw = input.trim();
+        match raw {
+            "/provider" | "/provider show" | "/model" | "/model show" | "/teacher"
+            | "/teacher show" => return Some(Command::ModelShow),
+            "/provider list" | "/model list" | "/teacher list" => return Some(Command::ModelList),
+            _ => {}
+        }
+        if let Some(rest) = raw
+            .strip_prefix("/provider ")
+            .or_else(|| raw.strip_prefix("/model "))
+            .or_else(|| raw.strip_prefix("/teacher "))
+        {
+            let profile_name = rest.trim();
+            if profile_name != "list" && profile_name != "show" && !profile_name.is_empty() {
+                return Some(Command::ModelSwitch(profile_name.to_string()));
+            }
+        }
+
         let trimmed = input
             .trim()
             .trim_end_matches(|c: char| c.is_ascii_punctuation() && c != '/');
@@ -791,9 +812,9 @@ pub fn format_help() -> String {
          \x1b[36m  /memory\x1b[0m            Show memory usage (system and process)\n\
          \x1b[36m  /training\x1b[0m          Show detailed training statistics\n\n\
          \x1b[1;33m🤖 Provider Commands:\x1b[0m\n\
-         \x1b[36m  /provider\x1b[0m          Show current active provider\n\
-         \x1b[36m  /provider list\x1b[0m     List all configured providers (Claude, Grok, etc.)\n\
-         \x1b[36m  /provider <name>\x1b[0m   Switch to a specific provider mid-session\n\
+         \x1b[36m  /model\x1b[0m             Show current named model profile\n\
+         \x1b[36m  /model list\x1b[0m        List configured cloud and local profiles\n\
+         \x1b[36m  /model <name>\x1b[0m      Switch profiles without clearing context\n\
          \x1b[0m                     Example: /provider grok\n\
          \x1b[36m  /local <query>\x1b[0m     Query local ONNX model directly (bypass routing)\n\
          \x1b[0m                     Example: /local What is 2+2?\n\
@@ -1143,6 +1164,10 @@ mod tests {
         match Command::parse("/provider claude") {
             Some(Command::ModelSwitch(name)) => assert_eq!(name, "claude"),
             _ => panic!("Expected ModelSwitch(claude)"),
+        }
+        match Command::parse("/model GPT-4o (work)") {
+            Some(Command::ModelSwitch(name)) => assert_eq!(name, "GPT-4o (work)"),
+            _ => panic!("Expected punctuation in the profile name to be preserved"),
         }
         // Legacy aliases still work
         assert!(matches!(Command::parse("/model"), Some(Command::ModelShow)));

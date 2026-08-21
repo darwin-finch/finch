@@ -41,6 +41,7 @@ use crate::tools::types::ToolDefinition;
 
 use super::events::{LlmRequest, ReplEvent};
 use super::llm_loop::LlmLoop;
+use super::model_selection::{activate_local_when_ready, LocalActivationOutcome, ModelSelection};
 use super::query_processor::{refresh_context_strip, ActiveToolUsesMap};
 use super::query_state::{QueryState, QueryStateManager};
 use super::tool_display::tool_result_to_display;
@@ -61,6 +62,54 @@ type PendingApprovalsMap = Arc<
         >,
     >,
 >;
+
+pub(crate) fn resolve_provider_profile(
+    providers: &[crate::config::ProviderEntry],
+    selector: &str,
+) -> std::result::Result<usize, String> {
+    if let Ok(number) = selector.parse::<usize>() {
+        return if number > 0 && number <= providers.len() {
+            Ok(number - 1)
+        } else {
+            Err(format!(
+                "Invalid model number: {number}. Use 1-{}",
+                providers.len()
+            ))
+        };
+    }
+
+    let selector = selector.trim();
+    let exact: Vec<usize> = providers
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.profile_name().eq_ignore_ascii_case(selector))
+        .map(|(index, _)| index)
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact[0]);
+    }
+    if exact.len() > 1 {
+        return Err(format!(
+            "Model name '{selector}' is ambiguous; give these profiles unique names in config"
+        ));
+    }
+
+    let by_type: Vec<usize> = providers
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.provider_type().eq_ignore_ascii_case(selector))
+        .map(|(index, _)| index)
+        .collect();
+    match by_type.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(format!(
+            "Unknown model profile '{selector}'. Run /model list to see configured profiles"
+        )),
+        _ => Err(format!(
+            "Provider type '{selector}' matches multiple profiles; select one by name or number"
+        )),
+    }
+}
 
 /// Continuation data for a poset run that is waiting for user confirmation.
 struct PendingPosetRun {
@@ -116,14 +165,17 @@ pub struct EventLoop {
     /// Query state manager
     query_states: Arc<QueryStateManager>,
 
-    /// Active cloud generator (swappable via /provider command)
-    cloud_gen: Arc<RwLock<Arc<dyn Generator>>>,
+    /// Active and pending session model state.
+    model_selection: ModelSelection,
 
     /// Qwen generator (unified interface)
     qwen_gen: Arc<dyn Generator>,
 
     /// Available providers from config (for /provider list + switching)
     available_providers: Vec<crate::config::ProviderEntry>,
+
+    /// HTTP daemon client used for local-model status and generation.
+    daemon_client: Option<Arc<crate::client::DaemonClient>>,
 
     /// Router for deciding between generators
     router: Arc<Router>,
@@ -1086,6 +1138,8 @@ impl EventLoop {
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
         session_label: String,
         available_providers: Vec<crate::config::ProviderEntry>,
+        active_provider_index: usize,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
         context_lines: usize,
         max_verbatim_messages: usize,
         context_recall_k: usize,
@@ -1194,9 +1248,10 @@ impl EventLoop {
             input_rx,
             conversation,
             query_states: Arc::new(QueryStateManager::new()),
-            cloud_gen: Arc::new(RwLock::new(cloud_gen)),
+            model_selection: ModelSelection::new(active_provider_index, cloud_gen),
             qwen_gen,
             available_providers,
+            daemon_client,
             router,
             generator_state,
             tool_definitions: Arc::new(tool_definitions),
@@ -1301,7 +1356,7 @@ impl EventLoop {
         // clean header: finch version · primary model · working directory.
         self.output_manager.clear();
 
-        let model_name = self.cloud_gen.read().await.name().to_string();
+        let model_name = self.model_selection.generator().await.name().to_string();
         let cwd = std::env::current_dir()
             .ok()
             .map(|p| {
@@ -1620,7 +1675,7 @@ s" it is ours"      s" -1 is ours"     argue
             let llm_loop = LlmLoop::new(
                 llm_rx,
                 self.event_tx.clone(),
-                Arc::clone(&self.cloud_gen),
+                self.model_selection.generator_handle(),
                 Arc::clone(&self.qwen_gen),
                 Arc::clone(&self.router),
                 Arc::clone(&self.generator_state),
@@ -2395,18 +2450,19 @@ Rules:\n\
                             .await?;
                     }
                     Command::ModelShow => {
-                        let name = self.cloud_gen.read().await.name().to_string();
-                        self.output_manager
-                            .write_info(format!("Active cloud provider: {}", name));
+                        self.handle_provider_show().await;
                         self.render_tui().await?;
                     }
                     Command::ModelList => {
                         use crate::providers::create_provider_from_entry;
-                        let current = self.cloud_gen.read().await.name().to_string();
-                        let mut lines = vec!["Available providers:".to_string()];
-                        for entry in &self.available_providers {
-                            let marker = if entry.provider_type() == current {
+                        let active = self.model_selection.active_index().await;
+                        let pending = self.model_selection.pending_index().await;
+                        let mut lines = vec!["Available model profiles:".to_string()];
+                        for (index, entry) in self.available_providers.iter().enumerate() {
+                            let marker = if index == active {
                                 "→"
+                            } else if Some(index) == pending {
+                                "…"
                             } else {
                                 " "
                             };
@@ -2420,10 +2476,12 @@ Rules:\n\
                                 " (no API key)"
                             };
                             lines.push(format!(
-                                "{} [{}] {}{}",
+                                "{} {}. [{}] {} · {}{}",
                                 marker,
+                                index + 1,
                                 tag,
-                                entry.display_name(),
+                                entry.profile_name(),
+                                entry.model().unwrap_or(entry.provider_type()),
                                 avail_tag
                             ));
                         }
@@ -2433,6 +2491,7 @@ Rules:\n\
                                     .to_string(),
                             );
                         }
+                        lines.push("Use /model <name> or /model <number> to switch.".to_string());
                         self.output_manager.write_info(lines.join("\n"));
                         self.render_tui().await?;
                     }
@@ -3134,47 +3193,158 @@ Rules:\n\
         Ok(())
     }
 
-    /// Handle `/provider <name>` — switch the active cloud generator.
+    async fn handle_provider_show(&self) {
+        let active = self.model_selection.active_index().await;
+        let Some(entry) = self.available_providers.get(active) else {
+            self.output_manager.write_info("No active model profile.");
+            return;
+        };
+
+        let mut text = format!(
+            "Active model: {}\n  provider: {}\n  model: {}\n  conversation: preserved across switches",
+            entry.profile_name(),
+            entry.provider_type(),
+            entry.model().unwrap_or("provider default")
+        );
+        if let Some(pending) = self.model_selection.pending_index().await {
+            if let Some(entry) = self.available_providers.get(pending) {
+                text.push_str(&format!(
+                    "\n  pending: {} (waiting for local model startup)",
+                    entry.profile_name()
+                ));
+            }
+        }
+        self.output_manager.write_info(text);
+    }
+
+    /// Handle `/model <name>` — switch the active named provider profile.
     async fn handle_provider_switch(&mut self, name: String) -> Result<()> {
         use crate::generators::claude::ClaudeGenerator;
         use crate::providers::create_provider_from_entry;
 
-        let target = self
-            .available_providers
-            .iter()
-            .find(|p| {
-                p.provider_type().eq_ignore_ascii_case(&name)
-                    || p.display_name().eq_ignore_ascii_case(&name)
-            })
-            .cloned();
+        let target_index = match resolve_provider_profile(&self.available_providers, &name) {
+            Ok(index) => index,
+            Err(error) => {
+                self.output_manager.write_info(format!("⚠️  {error}"));
+                return self.render_tui().await;
+            }
+        };
+        let entry = self.available_providers[target_index].clone();
+        let active_index = self.model_selection.active_index().await;
+        if target_index == active_index && self.model_selection.pending_index().await.is_none() {
+            self.output_manager
+                .write_info(format!("Already using model: {}", entry.profile_name()));
+            return self.render_tui().await;
+        }
 
-        match target {
-            None => {
-                self.output_manager.write_info(format!(
-                    "⚠️  Unknown provider '{}'. Run /provider list to see available providers.",
-                    name
-                ));
-            }
-            Some(ref entry) if entry.is_local() => {
+        // Every valid new selection supersedes a local startup already in flight,
+        // even if constructing or checking the replacement later fails.
+        self.model_selection.cancel_pending().await;
+
+        if entry.is_local() {
+            let Some(client) = self.daemon_client.clone() else {
                 self.output_manager.write_info(
-                    "⚠️  Local providers are selected automatically. Use /provider <cloud-name>."
-                        .to_string(),
+                    "⚠️  Local model switching requires a running Finch daemon.".to_string(),
                 );
+                return self.render_tui().await;
+            };
+
+            match client.local_model_status().await {
+                Ok(crate::client::LocalModelStatus::Ready(model)) => {
+                    let generator: Arc<dyn Generator> =
+                        Arc::new(crate::generators::daemon_local::DaemonLocalGenerator::new(
+                            client,
+                            entry.profile_name(),
+                        ));
+                    self.model_selection.activate(target_index, generator).await;
+                    self.output_manager.write_info(format!(
+                        "✓ Switched to {} · {} (conversation preserved)",
+                        entry.profile_name(),
+                        model
+                    ));
+                }
+                Ok(crate::client::LocalModelStatus::Initializing)
+                | Ok(crate::client::LocalModelStatus::Downloading(_))
+                | Ok(crate::client::LocalModelStatus::Loading(_)) => {
+                    let token = self.model_selection.begin_pending(target_index).await;
+                    self.output_manager.write_info(format!(
+                        "⏳ {} is still starting; the current model stays active until it is ready.",
+                        entry.profile_name()
+                    ));
+
+                    let local_generator: Arc<dyn Generator> =
+                        Arc::new(crate::generators::daemon_local::DaemonLocalGenerator::new(
+                            Arc::clone(&client),
+                            entry.profile_name(),
+                        ));
+                    let selection = self.model_selection.clone();
+                    let output = Arc::clone(&self.output_manager);
+                    let profile_name = entry.profile_name();
+                    tokio::spawn(async move {
+                        let outcome = activate_local_when_ready(
+                            selection,
+                            token,
+                            target_index,
+                            local_generator,
+                            || {
+                                let client = Arc::clone(&client);
+                                async move { client.local_model_status().await }
+                            },
+                            Duration::from_millis(750),
+                        )
+                        .await;
+                        match outcome {
+                            LocalActivationOutcome::Activated(model) => output.write_info(format!(
+                                "✓ Switched to {profile_name} · {model} (conversation preserved)"
+                            )),
+                            LocalActivationOutcome::Failed(error) => output.write_error(format!(
+                                "Local model {profile_name} failed to start: {error}"
+                            )),
+                            LocalActivationOutcome::NotAvailable => output.write_error(format!(
+                                "Local model {profile_name} is not enabled in the daemon"
+                            )),
+                            LocalActivationOutcome::StatusError(error) => output.write_error(
+                                format!("Could not monitor local model {profile_name}: {error}"),
+                            ),
+                            LocalActivationOutcome::Cancelled => {}
+                        }
+                    });
+                }
+                Ok(crate::client::LocalModelStatus::Failed(error)) => {
+                    self.output_manager
+                        .write_info(format!("⚠️  Local model failed to start: {error}"));
+                }
+                Ok(crate::client::LocalModelStatus::NotAvailable) => {
+                    self.output_manager.write_info(
+                        "⚠️  This daemon was started without a local model enabled.".to_string(),
+                    );
+                }
+                Err(error) => {
+                    self.output_manager
+                        .write_info(format!("⚠️  Could not read local model status: {error}"));
+                }
             }
-            Some(entry) => match create_provider_from_entry(&entry) {
+        } else {
+            match create_provider_from_entry(&entry) {
                 Err(e) => {
                     self.output_manager
-                        .write_info(format!("⚠️  Failed to create provider '{}': {}", name, e));
+                        .write_info(format!("⚠️  Failed to create model '{}': {}", name, e));
                 }
                 Ok(provider) => {
                     let client = crate::claude::ClaudeClient::with_provider(provider);
-                    let new_gen: Arc<dyn Generator> =
+                    let inner: Arc<dyn Generator> =
                         Arc::new(ClaudeGenerator::new(Arc::new(client)));
-                    *self.cloud_gen.write().await = new_gen;
-                    self.output_manager
-                        .write_info(format!("✓ Switched to provider: {}", entry.provider_type()));
+                    let new_gen: Arc<dyn Generator> = Arc::new(
+                        crate::generators::ProfiledGenerator::new(entry.profile_name(), inner),
+                    );
+                    self.model_selection.activate(target_index, new_gen).await;
+                    self.output_manager.write_info(format!(
+                        "✓ Switched to {} · {} (conversation preserved)",
+                        entry.profile_name(),
+                        entry.model().unwrap_or(entry.provider_type())
+                    ));
                 }
-            },
+            }
         }
         self.render_tui().await
     }
@@ -5022,7 +5192,7 @@ Rules:\n\
         use crossterm::style::Stylize;
 
         let forth_code = {
-            let gen = self.cloud_gen.read().await;
+            let gen = self.model_selection.generator().await;
             match gen.generate(messages.clone(), None).await {
                 Ok(resp) => resp.text,
                 Err(e) => return Err(e),
@@ -5098,7 +5268,7 @@ Rules:\n\
         );
 
         let response = {
-            let gen = self.cloud_gen.read().await;
+            let gen = self.model_selection.generator().await;
             match gen
                 .generate(
                     vec![crate::claude::Message {
@@ -5490,7 +5660,7 @@ Rules:\n\
 
         // Wire the active generator into the VM so gen" prompt" works.
         // Uses block_in_place so the sync GenFn closure can await the async generator.
-        let gen_handle = self.cloud_gen.clone();
+        let gen_handle = self.model_selection.generator_handle();
         self.forth_vm.set_gen_fn(Box::new(move |prompt: &str| {
             let prompt = prompt.to_string();
             let gen = gen_handle.clone();
@@ -6009,7 +6179,7 @@ Rules:\n\
         }];
 
         let forth_defs_result = {
-            let gen = self.cloud_gen.read().await;
+            let gen = self.model_selection.generator().await;
             gen.generate(messages, None).await
         };
 
@@ -7240,7 +7410,7 @@ Rules:\n\
         );
 
         // Store continuation data for the render tick.
-        let generator = self.cloud_gen.read().await.clone();
+        let generator = self.model_selection.generator().await;
         self.pending_poset_run = Some(PendingPosetRun {
             generator,
             poset: Arc::clone(&self.poset),
@@ -7466,7 +7636,7 @@ Rules:\n\
 
         // ── Run the IMPCPD loop ────────────────────────────────────────────────
         let plan_loop = PlanLoop::new(
-            self.cloud_gen.read().await.clone(),
+            self.model_selection.generator().await,
             Arc::clone(&self.output_manager),
             ImpcpdConfig::default(),
         );
@@ -8164,6 +8334,40 @@ mod tests {
 
     // Pulsing animation frames used in status-bar tests.
     const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
+
+    fn claude_profile(name: &str, model: &str) -> crate::config::ProviderEntry {
+        crate::config::ProviderEntry::Claude {
+            api_key: "test-key".to_string(),
+            model: Some(model.to_string()),
+            base_url: None,
+            name: Some(name.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_model_profile_resolution_distinguishes_same_provider_models() {
+        let profiles = vec![
+            claude_profile("fast", "claude-haiku"),
+            claude_profile("deep", "claude-opus"),
+        ];
+        assert_eq!(resolve_provider_profile(&profiles, "fast"), Ok(0));
+        assert_eq!(resolve_provider_profile(&profiles, "deep"), Ok(1));
+        assert_eq!(resolve_provider_profile(&profiles, "2"), Ok(1));
+        assert!(resolve_provider_profile(&profiles, "claude")
+            .unwrap_err()
+            .contains("multiple profiles"));
+    }
+
+    #[test]
+    fn test_duplicate_model_profile_names_are_rejected_as_ambiguous() {
+        let profiles = vec![
+            claude_profile("work", "claude-haiku"),
+            claude_profile("work", "claude-opus"),
+        ];
+        assert!(resolve_provider_profile(&profiles, "work")
+            .unwrap_err()
+            .contains("ambiguous"));
+    }
 
     // --- streaming status bar format ---
 

@@ -123,19 +123,19 @@ impl CommandRegistry {
                 CommandSpec {
                     name: "/model",
                     params: None,
-                    description: "Show current active model/teacher",
+                    description: "Show the active named model profile",
                     category: CommandCategory::Model,
                 },
                 CommandSpec {
                     name: "/model list",
                     params: None,
-                    description: "List all configured teachers (Claude, Grok, GPT-4, etc.)",
+                    description: "List configured cloud and local model profiles",
                     category: CommandCategory::Model,
                 },
                 CommandSpec {
                     name: "/model",
                     params: Some("<name>"),
-                    description: "Switch to a specific teacher (e.g., /model grok)",
+                    description: "Switch profiles without clearing conversation context",
                     category: CommandCategory::Model,
                 },
                 CommandSpec {

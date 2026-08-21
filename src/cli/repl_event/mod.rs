@@ -30,6 +30,7 @@
 pub mod event_loop;
 pub mod events;
 pub mod llm_loop;
+pub(crate) mod model_selection;
 pub mod plan_handler;
 pub mod query_processor;
 pub mod query_state;

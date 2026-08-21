@@ -40,6 +40,11 @@ use crate::models::{BootstrapLoader, GeneratorState, TrainingCoordinator};
 use crate::providers::LlmProvider;
 use crate::router::Router;
 
+struct ProviderSlot {
+    profile_name: String,
+    provider: Arc<dyn LlmProvider>,
+}
+
 /// Configuration for the HTTP server
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -73,7 +78,7 @@ pub struct AgentServer {
     claude_client: Arc<ClaudeClient>,
     /// Multi-provider pool: cloud providers from [[providers]] config.
     /// Indexed by provider name for O(1) lookup via `provider_for_name()`.
-    providers: Vec<Arc<dyn LlmProvider>>,
+    providers: Vec<ProviderSlot>,
     /// Router for decision-making (shared, read-write lock)
     router: Arc<RwLock<Router>>,
     /// Metrics logger (shared)
@@ -107,7 +112,7 @@ impl AgentServer {
     /// If empty, the server falls back to `claude_client` for all cloud forwarding.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        _config: Config,
+        config: Config,
         server_config: ServerConfig,
         claude_client: ClaudeClient,
         router: Router,
@@ -125,7 +130,19 @@ impl AgentServer {
 
         // Create training channel; receiver is taken by serve() to hand to the worker.
         let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
-        let providers: Vec<Arc<dyn LlmProvider>> = providers.into_iter().map(Arc::from).collect();
+        let profile_names = config
+            .providers
+            .iter()
+            .filter(|entry| !entry.is_local())
+            .map(|entry| entry.profile_name());
+        let providers: Vec<ProviderSlot> = providers
+            .into_iter()
+            .zip(profile_names)
+            .map(|(provider, profile_name)| ProviderSlot {
+                profile_name,
+                provider: Arc::from(provider),
+            })
+            .collect();
 
         Ok(Self {
             claude_client: Arc::new(claude_client),
@@ -307,24 +324,33 @@ impl AgentServer {
 
     /// Resolve the cloud provider to use for a given request.
     ///
-    /// If `name` matches a configured provider, returns that provider.
-    /// If `name` is `None` or unrecognised, returns the first configured cloud provider
-    /// (if any). Returns `None` when `providers` is empty (caller falls back to
-    /// `claude_client`).
+    /// Names resolve configured profiles first. A provider type such as
+    /// `openai` is accepted only when it identifies exactly one profile.
+    /// `None` selects the first configured cloud profile.
     pub fn provider_for_name(&self, name: Option<&str>) -> Option<&Arc<dyn LlmProvider>> {
         if self.providers.is_empty() {
             return None;
         }
         if let Some(n) = name {
-            if let Some(p) = self
+            if let Some(slot) = self
                 .providers
                 .iter()
-                .find(|p| p.name().eq_ignore_ascii_case(n))
+                .find(|slot| slot.profile_name.eq_ignore_ascii_case(n))
             {
-                return Some(p);
+                return Some(&slot.provider);
             }
+
+            let by_type: Vec<_> = self
+                .providers
+                .iter()
+                .filter(|slot| slot.provider.name().eq_ignore_ascii_case(n))
+                .collect();
+            return match by_type.as_slice() {
+                [slot] => Some(&slot.provider),
+                _ => None,
+            };
         }
-        self.providers.first()
+        self.providers.first().map(|slot| &slot.provider)
     }
 
     /// Get reference to router
@@ -384,7 +410,9 @@ impl AgentServer {
     /// Used by the IPC server to service CLI queries without going through the
     /// full HTTP handler stack.
     pub fn primary_provider(&self) -> Option<Arc<dyn crate::providers::LlmProvider>> {
-        self.providers.first().cloned()
+        self.providers
+            .first()
+            .map(|slot| Arc::clone(&slot.provider))
     }
 }
 
@@ -458,15 +486,12 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_for_name_unknown_falls_back_to_first() {
+    fn test_provider_for_name_unknown_does_not_silently_fall_back() {
         let providers = make_providers(&["claude", "grok"]);
-        // When name is unknown, provider_for_name returns providers.first()
-        let matched = providers
+        let result = providers
             .iter()
             .find(|p| p.name().eq_ignore_ascii_case("unknown"));
-        let result = matched.or_else(|| providers.first());
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().name(), "claude");
+        assert!(result.is_none());
     }
 
     #[test]

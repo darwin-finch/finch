@@ -578,6 +578,10 @@ impl Repl {
 
         // Store providers and teachers for runtime switching
         let available_providers = config.providers.clone();
+        let active_provider_index = available_providers
+            .iter()
+            .position(|entry| !entry.is_local())
+            .unwrap_or(0);
         let available_teachers = config.teachers.clone();
 
         let teacher_provider = match crate::providers::create_provider(&config.teachers) {
@@ -648,7 +652,7 @@ impl Repl {
             teacher_session,
             available_providers,
             available_teachers,
-            active_provider_index: 0,
+            active_provider_index,
             active_teacher_index: 0, // First teacher is active by default
             router,                  // Contains ThresholdRouter now
             metrics_logger,
@@ -1608,14 +1612,52 @@ impl Repl {
         // }
 
         // Create generators
-        use crate::generators::{claude::ClaudeGenerator, qwen::QwenGenerator};
-        let claude_gen: Arc<dyn crate::generators::Generator> =
-            Arc::new(ClaudeGenerator::new(Arc::new(self.claude_client.clone())));
-        let qwen_gen: Arc<dyn crate::generators::Generator> = Arc::new(QwenGenerator::new(
-            Arc::clone(&self.local_generator),
-            Arc::clone(&self.tokenizer),
-            Some(Arc::clone(&self.tool_executor)), // Enable tool support
-        ));
+        use crate::generators::{
+            claude::ClaudeGenerator, daemon_local::DaemonLocalGenerator, qwen::QwenGenerator,
+            ProfiledGenerator,
+        };
+
+        // Start on the first configured cloud profile, not the legacy fallback
+        // chain. This makes the marker shown by `/model list` match the provider
+        // that will actually receive the request.
+        let initial_provider_index = self
+            .available_providers
+            .iter()
+            .position(|entry| !entry.is_local())
+            .unwrap_or(0);
+        let claude_gen: Arc<dyn crate::generators::Generator> = self
+            .available_providers
+            .get(initial_provider_index)
+            .filter(|entry| !entry.is_local())
+            .and_then(|entry| crate::providers::create_provider_from_entry(entry).ok())
+            .map(|provider| {
+                let inner: Arc<dyn crate::generators::Generator> = Arc::new(ClaudeGenerator::new(
+                    Arc::new(crate::claude::ClaudeClient::with_provider(provider)),
+                ));
+                Arc::new(ProfiledGenerator::new(
+                    self.available_providers[initial_provider_index].profile_name(),
+                    inner,
+                )) as Arc<dyn crate::generators::Generator>
+            })
+            .unwrap_or_else(|| {
+                Arc::new(ClaudeGenerator::new(Arc::new(self.claude_client.clone())))
+            });
+        let qwen_gen: Arc<dyn crate::generators::Generator> =
+            if let Some(client) = self.daemon_client.clone() {
+                let profile_name = self
+                    .available_providers
+                    .iter()
+                    .find(|entry| entry.is_local())
+                    .map(|entry| entry.profile_name())
+                    .unwrap_or_else(|| "local".to_string());
+                Arc::new(DaemonLocalGenerator::new(client, profile_name))
+            } else {
+                Arc::new(QwenGenerator::new(
+                    Arc::clone(&self.local_generator),
+                    Arc::clone(&self.tokenizer),
+                    Some(Arc::clone(&self.tool_executor)),
+                ))
+            };
 
         // Get generator state from bootstrap loader
         let generator_state = Arc::clone(self.bootstrap_loader.state());
@@ -1646,6 +1688,8 @@ impl Repl {
             self.memory_system.clone(),
             self.session_label.clone(),
             self.available_providers.clone(),
+            initial_provider_index,
+            self.daemon_client.clone(),
             self.memory_context_lines,
             self.max_verbatim_messages,
             self.context_recall_k,
@@ -2831,8 +2875,17 @@ impl Repl {
             io::stdout().flush()?;
         }
 
-        // DAEMON MODE: If daemon client is available, use it
-        if let Some(daemon_client) = &self.daemon_client {
+        // Explicit local profiles use the daemon-owned model. Cloud profiles
+        // continue through the selected TeacherSession below.
+        let local_profile_active = self
+            .available_providers
+            .get(self.active_provider_index)
+            .is_some_and(|entry| entry.is_local());
+        if local_profile_active {
+            let daemon_client = self
+                .daemon_client
+                .as_ref()
+                .context("Local model selected but the daemon is unavailable")?;
             if self.is_interactive {
                 io::stdout()
                     .execute(cursor::MoveToColumn(0))?
@@ -2840,8 +2893,16 @@ impl Repl {
                 self.output_status("→ Using daemon for query");
             }
 
-            match daemon_client.query_text(query).await {
-                Ok(response) => {
+            match daemon_client
+                .query_local(self.conversation.read().await.get_messages(), vec![])
+                .await
+            {
+                Ok(local_response) => {
+                    let response = local_response
+                        .choices
+                        .first()
+                        .and_then(|choice| choice.message.content.clone())
+                        .unwrap_or_default();
                     // Add assistant response to conversation
                     self.conversation
                         .write()
@@ -3559,7 +3620,7 @@ impl Repl {
             } else {
                 "[cloud]"
             };
-            let name = provider.display_name();
+            let name = provider.profile_name();
             let ptype = provider.provider_type();
 
             let detail = if provider.is_local() {
@@ -3599,29 +3660,14 @@ impl Repl {
 
     /// Handle /model <name> command
     async fn handle_model_switch(&mut self, name: &str) -> Result<()> {
-        // Try to parse as number first (1-indexed)
-        let target_index = if let Ok(num) = name.parse::<usize>() {
-            if num == 0 || num > self.available_providers.len() {
-                self.output_error(format!(
-                    "Invalid model number: {}. Use 1-{}",
-                    num,
-                    self.available_providers.len()
-                ));
+        let target_index = match super::repl_event::event_loop::resolve_provider_profile(
+            &self.available_providers,
+            name,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                self.output_error(error);
                 return Ok(());
-            }
-            num - 1
-        } else {
-            // Find by provider type or display name
-            match self.available_providers.iter().position(|p| {
-                p.provider_type().eq_ignore_ascii_case(name)
-                    || p.display_name().eq_ignore_ascii_case(name)
-            }) {
-                Some(idx) => idx,
-                None => {
-                    self.output_error(format!("Provider '{}' not found", name));
-                    self.output_status("Use '/model list' to see available providers");
-                    return Ok(());
-                }
             }
         };
 
@@ -3631,21 +3677,40 @@ impl Repl {
         }
 
         let new_entry = self.available_providers[target_index].clone();
-        let old_name = self.available_providers[self.active_provider_index]
-            .display_name()
-            .to_string();
+        let old_name = self.available_providers[self.active_provider_index].profile_name();
 
         if new_entry.is_local() {
-            // Local provider — just update the index; the event loop uses the
-            // local generator for queries, not the teacher session.
-            self.active_provider_index = target_index;
-            // Keep active_teacher_index pointing at the first cloud provider
-            // for when we fall back to the cloud path.
-            self.output_status(format!(
-                "✓ Switched provider: {} → {} (local inference)",
-                old_name,
-                new_entry.display_name()
-            ));
+            let Some(client) = self.daemon_client.as_ref() else {
+                self.output_error("Local model switching requires a running Finch daemon");
+                return Ok(());
+            };
+            match client.local_model_status().await {
+                Ok(crate::client::LocalModelStatus::Ready(model)) => {
+                    self.active_provider_index = target_index;
+                    self.output_status(format!(
+                        "✓ Switched provider: {} → {} ({})",
+                        old_name,
+                        new_entry.profile_name(),
+                        model
+                    ));
+                }
+                Ok(crate::client::LocalModelStatus::Initializing)
+                | Ok(crate::client::LocalModelStatus::Downloading(_))
+                | Ok(crate::client::LocalModelStatus::Loading(_)) => {
+                    self.output_status(format!(
+                        "⏳ {} is still starting; the current model remains active. Retry /model {} shortly.",
+                        new_entry.profile_name(),
+                        new_entry.profile_name()
+                    ));
+                }
+                Ok(crate::client::LocalModelStatus::Failed(error)) => {
+                    self.output_error(format!("Local model failed to start: {error}"));
+                }
+                Ok(crate::client::LocalModelStatus::NotAvailable) => {
+                    self.output_error("The daemon was started without a local model enabled");
+                }
+                Err(error) => self.output_error(format!("Could not read local status: {error}")),
+            }
         } else {
             // Cloud provider — create a new teacher session.
             let llm_provider = match crate::providers::create_provider_from_entry(&new_entry) {
@@ -3675,7 +3740,7 @@ impl Repl {
             }
             self.active_provider_index = target_index;
 
-            let new_name = new_entry.display_name().to_string();
+            let new_name = new_entry.profile_name();
             let memory_info = if let Some(ref memory) = self.memory_system {
                 let stats = memory.stats().await?;
                 format!(" (💾 {} nodes in memory)", stats.tree_node_count)
@@ -3694,7 +3759,7 @@ impl Repl {
     /// Handle /model show command
     async fn handle_model_show(&self) -> Result<()> {
         let active = &self.available_providers[self.active_provider_index];
-        self.output_status(format!("📖 Current Provider: {}", active.display_name()));
+        self.output_status(format!("📖 Current Model: {}", active.profile_name()));
         self.output_status(format!("Type: {}", active.provider_type()));
 
         if active.is_local() {

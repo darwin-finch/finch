@@ -24,8 +24,9 @@ use crate::router::Router;
 use crate::tools::types::ToolDefinition;
 
 use super::events::{LlmRequest, ReplEvent};
+use super::model_selection::GeneratorPins;
 use super::query_processor::{process_query_with_tools, ActiveToolUsesMap};
-use super::query_state::QueryStateManager;
+use super::query_state::{QueryState, QueryStateManager};
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// LLM worker loop — owns AI generation concerns, runs as its own Tokio task.
@@ -37,14 +38,16 @@ pub struct LlmLoop {
 
     // ── LLM-specific state ─────────────────────────────────────────────────
     cloud_gen: Arc<RwLock<Arc<dyn Generator>>>,
+    /// Generator snapshot for each top-level query. Tool continuations keep
+    /// using this snapshot even if `/model` changes the session default.
+    pinned_generators: Arc<GeneratorPins>,
     qwen_gen: Arc<dyn Generator>,
     router: Arc<Router>,
     generator_state: Arc<RwLock<GeneratorState>>,
     tool_definitions: Arc<Vec<ToolDefinition>>,
     tool_coordinator: ToolExecutionCoordinator,
-    tool_call_history: Arc<
-        RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
-    >,
+    tool_call_history:
+        Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
 
     // ── Shared state (Arc clones also held by EventLoop) ───────────────────
     conversation: Arc<RwLock<ConversationHistory>>,
@@ -106,6 +109,7 @@ impl LlmLoop {
             llm_rx,
             event_tx,
             cloud_gen,
+            pinned_generators: Arc::new(GeneratorPins::default()),
             qwen_gen,
             router,
             generator_state,
@@ -152,11 +156,17 @@ impl LlmLoop {
         if !query.is_empty() {
             let mut g = self.current_graph.lock().await;
             g.reset(query_id, &self.session_label);
-            g.add_node(crate::graph::NodeKind::UserInput { text: query.clone() });
+            g.add_node(crate::graph::NodeKind::UserInput {
+                text: query.clone(),
+            });
         }
 
         let event_tx = self.event_tx.clone();
-        let claude_gen = self.cloud_gen.read().await.clone();
+        let active_generator = self.cloud_gen.read().await.clone();
+        let claude_gen = self
+            .pinned_generators
+            .for_turn(query_id, !query.is_empty(), active_generator)
+            .await;
         let qwen_gen = Arc::clone(&self.qwen_gen);
         let router = Arc::clone(&self.router);
         let generator_state = Arc::clone(&self.generator_state);
@@ -184,6 +194,8 @@ impl LlmLoop {
         // Always use the capable cloud model for summarisation, regardless of routing.
         let summary_gen = Arc::clone(&claude_gen);
         let tool_call_history = Arc::clone(&self.tool_call_history);
+        let pinned_generators = Arc::clone(&self.pinned_generators);
+        let terminal_query_states = Arc::clone(&query_states);
 
         tokio::spawn(async move {
             process_query_with_tools(
@@ -215,6 +227,16 @@ impl LlmLoop {
                 tool_call_history,
             )
             .await;
+
+            // Returning in ExecutingTools means another turn with the same ID
+            // is imminent. Every other return is terminal (including transport
+            // errors that currently leave QueryState as Processing).
+            if !matches!(
+                terminal_query_states.get_state(query_id).await,
+                Some(QueryState::ExecutingTools { .. })
+            ) {
+                pinned_generators.release(query_id).await;
+            }
         });
     }
 }
