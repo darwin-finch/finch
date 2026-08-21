@@ -592,6 +592,18 @@ impl Config {
             anyhow::bail!("session_timeout_minutes must be greater than 0");
         }
 
+        if self.server.auth_enabled
+            && self
+                .server
+                .api_keys
+                .iter()
+                .filter(|key| !key.trim().is_empty())
+                .count()
+                != 1
+        {
+            anyhow::bail!("server authentication requires exactly one non-empty Finch API key");
+        }
+
         if self.client.timeout_seconds == 0 {
             anyhow::bail!("timeout_seconds must be greater than 0");
         }
@@ -784,6 +796,19 @@ struct TomlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_server_config_persists_single_finch_api_key() {
+        let mut server = ServerConfig::default();
+        server.auth_enabled = true;
+        server.api_keys = vec!["custom-secret".to_string()];
+
+        let encoded = toml::to_string(&server).unwrap();
+        let decoded: ServerConfig = toml::from_str(&encoded).unwrap();
+
+        assert!(decoded.auth_enabled);
+        assert_eq!(decoded.api_keys, vec!["custom-secret"]);
+    }
 
     #[test]
     fn test_server_config_persists_brain_password() {

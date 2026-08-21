@@ -20,7 +20,7 @@ pub use handlers::{
     create_router, handle_file_get, handle_file_put, handle_node_info, handle_node_stats,
     health_check, metrics_endpoint,
 };
-pub use middleware::{auth_middleware, RateLimiter};
+pub use middleware::{auth_middleware, DaemonAuth, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
 pub use openai_types::*;
 pub use session::{SessionManager, SessionState};
@@ -311,6 +311,8 @@ impl AgentServer {
             tracing::info!("Model monitor task exiting");
         });
 
+        let auth = DaemonAuth::new(self.config.auth_enabled, self.config.api_keys.clone());
+
         // Use the existing Arc as application state.
         let app_state = self;
 
@@ -318,6 +320,7 @@ impl AgentServer {
         // 4MB is generous for natural-language queries while blocking obvious DoS attempts.
         let app = create_router(app_state)
             .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)) // 4MB
+            .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
             .layer(TraceLayer::new_for_http());
 
         tracing::info!("Starting Shammah agent server on {}", addr);

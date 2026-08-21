@@ -4,7 +4,7 @@
 // Automatically spawns daemon if not running.
 
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::{header, Client};
 use std::time::Duration;
 use tracing::{debug, error, info};
 
@@ -25,6 +25,8 @@ pub struct DaemonConfig {
     pub auto_spawn: bool,
     /// Request timeout in seconds
     pub timeout_seconds: u64,
+    /// Shared model-API key sent as an OpenAI-compatible bearer token.
+    pub api_key: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -33,6 +35,7 @@ impl Default for DaemonConfig {
             bind_address: crate::config::constants::DEFAULT_DAEMON_ADDR.to_string(),
             auto_spawn: true,
             timeout_seconds: 120,
+            api_key: None,
         }
     }
 }
@@ -44,6 +47,7 @@ impl DaemonConfig {
             bind_address: client_config.daemon_address.clone(),
             auto_spawn: client_config.auto_spawn,
             timeout_seconds: client_config.timeout_seconds,
+            api_key: None,
         }
     }
 }
@@ -80,7 +84,15 @@ impl DaemonClient {
             Self::check_health(&base_url).await?;
         }
 
+        let mut default_headers = header::HeaderMap::new();
+        if let Some(api_key) = config.api_key.as_deref().filter(|key| !key.is_empty()) {
+            let value = header::HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .context("Finch API key contains invalid header characters")?;
+            default_headers.insert(header::AUTHORIZATION, value);
+        }
+
         let client = Client::builder()
+            .default_headers(default_headers)
             .timeout(Duration::from_secs(config.timeout_seconds))
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(0) // Disable connection pooling

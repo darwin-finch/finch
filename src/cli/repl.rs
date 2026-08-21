@@ -729,6 +729,7 @@ impl Repl {
             bind_address: config.client.daemon_address.clone(),
             auto_spawn: config.client.auto_spawn,
             timeout_seconds: 5, // Short timeout for non-blocking check
+            api_key: config.server.api_keys.first().cloned(),
         };
 
         match DaemonClient::connect(daemon_config).await {

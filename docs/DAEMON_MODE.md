@@ -159,9 +159,15 @@ enabled = false  # Set to true to enable by default
 bind_address = "127.0.0.1:8000"
 max_sessions = 100
 session_timeout_minutes = 30
-auth_enabled = false  # Phase 4 feature
-api_keys = []  # Phase 4 feature
+auth_enabled = true
+api_keys = ["replace-with-a-long-random-key"]  # one key for all model providers
 ```
+
+The setup wizard configures this as **Finch client key**. OpenAI-compatible
+clients send it in the standard `Authorization: Bearer <key>` header. Provider
+API keys remain separate and are never accepted as daemon client credentials.
+The key protects the model API; Finch's independently authenticated peer
+protocol and the daemon health probe are unaffected.
 
 ## Architecture
 
@@ -385,7 +391,6 @@ Currently provides basic Prometheus metrics endpoint. Phase 4 will add:
 - Audit trail
 
 ### Phase 4: Production Readiness (Weeks 10-12)
-- **API key authentication**
 - **Rate limiting per session**
 - **Tool sandboxing**
 - **Enhanced Prometheus metrics**
@@ -429,14 +434,13 @@ tail -f ~/.finch/metrics/$(date +%Y-%m-%d).jsonl
 
 ## Security Considerations
 
-**Phase 1 Status:**
-- ⚠️ No authentication - anyone with network access can use
+**Current Status:**
+- ✅ Optional bearer-token authentication shared by all model providers
 - ⚠️ No rate limiting - vulnerable to abuse
 - ⚠️ No input validation beyond basic parsing
 - ⚠️ Binds to localhost by default (safe for development)
 
-**Phase 4 Will Add:**
-- API key authentication
+**Future hardening:**
 - Per-client rate limiting
 - Input sanitization
 - TLS support recommendation

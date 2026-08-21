@@ -2,20 +2,84 @@
 
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    extract::State,
+    http::{header, HeaderMap, Request, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
+    Json,
 };
 use dashmap::DashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Authentication middleware (placeholder for Phase 4)
-pub async fn auth_middleware(request: Request<Body>, next: Next) -> Result<Response, StatusCode> {
-    // TODO: Implement API key authentication in Phase 4
-    // For now, allow all requests
-    Ok(next.run(request).await)
+/// Model-API client authentication shared by every provider profile.
+#[derive(Clone, Debug)]
+pub struct DaemonAuth {
+    enabled: bool,
+    api_keys: Arc<[String]>,
+}
+
+impl DaemonAuth {
+    pub fn new(enabled: bool, api_keys: Vec<String>) -> Self {
+        let api_keys = api_keys
+            .into_iter()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .collect::<Vec<_>>()
+            .into();
+        Self { enabled, api_keys }
+    }
+
+    fn authorizes(&self, path: &str, headers: &HeaderMap) -> bool {
+        if !self.enabled || !requires_client_auth(path) {
+            return true;
+        }
+
+        bearer_token(headers).is_some_and(|candidate| {
+            self.api_keys
+                .iter()
+                .any(|configured| configured == candidate)
+        })
+    }
+}
+
+fn requires_client_auth(path: &str) -> bool {
+    matches!(path, "/v1/chat/completions" | "/v1/models" | "/v1/messages")
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+}
+
+/// Require the shared API key on model endpoints using the standard OpenAI
+/// bearer format. Health and Finch peer-protocol endpoints remain unaffected.
+pub async fn auth_middleware(
+    State(auth): State<DaemonAuth>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if auth.authorizes(request.uri().path(), request.headers()) {
+        return next.run(request).await;
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(serde_json::json!({
+            "error": {
+                "message": "Invalid or missing Finch API key",
+                "type": "authentication_error"
+            }
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +184,41 @@ pub async fn rate_limit_middleware(
     } else {
         tracing::warn!(ip = %ip, "Rate limit exceeded");
         Err(StatusCode::TOO_MANY_REQUESTS)
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn headers(value: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = value {
+            headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn configured_key_is_required_and_validated() {
+        let auth = DaemonAuth::new(true, vec!["custom-secret".to_string()]);
+
+        assert!(!auth.authorizes("/v1/chat/completions", &headers(None)));
+        assert!(!auth.authorizes("/v1/chat/completions", &headers(Some("Bearer finch-local"))));
+        assert!(auth.authorizes(
+            "/v1/chat/completions",
+            &headers(Some("Bearer custom-secret"))
+        ));
+    }
+
+    #[test]
+    fn disabled_auth_health_and_peer_protocol_do_not_require_a_key() {
+        let disabled = DaemonAuth::new(false, vec![]);
+        let enabled = DaemonAuth::new(true, vec!["custom-secret".to_string()]);
+
+        assert!(disabled.authorizes("/v1/models", &headers(None)));
+        assert!(enabled.authorizes("/health", &headers(None)));
+        assert!(enabled.authorizes("/v1/registry/join", &headers(None)));
     }
 }
 

@@ -209,6 +209,8 @@ enum SectionState {
         editing_mode: bool,
         editing_model_mode: bool, // editing model name for selected entry
         model_input: String,      // model name input buffer
+        finch_api_key: String,
+        editing_finch_api_key: bool,
         adding_provider: Option<AddProviderStep>,
         error: Option<String>,
     },
@@ -403,6 +405,10 @@ impl WizardState {
                 editing_mode: false,
                 editing_model_mode: false,
                 model_input: String::new(),
+                finch_api_key: existing_config
+                    .and_then(|config| config.server.api_keys.first().cloned())
+                    .unwrap_or_default(),
+                editing_finch_api_key: false,
                 adding_provider: None,
                 error: None,
             },
@@ -540,6 +546,9 @@ pub struct SetupResult {
     pub custom_model_repo: Option<String>,
     pub teachers: Vec<TeacherEntry>,
 
+    /// Single key accepted by the daemon's model API for every provider.
+    pub finch_api_key: String,
+
     // Persona
     pub default_persona: String,
 
@@ -650,6 +659,7 @@ pub fn apply_and_save(result: &SetupResult) -> Result<()> {
 
     let providers = result.providers.clone();
     let mut new_config = Config::with_providers(providers);
+    apply_daemon_api_key(&mut new_config, &result.finch_api_key);
     new_config.active_theme = result.active_theme.clone();
     new_config.active_persona = result.default_persona.clone();
     if let Some(ref hf_tok) = result.hf_token {
@@ -683,6 +693,17 @@ pub fn apply_and_save(result: &SetupResult) -> Result<()> {
     }
     new_config.save()?;
     Ok(())
+}
+
+/// Apply the wizard's single client key to the existing server representation.
+pub fn apply_daemon_api_key(config: &mut crate::config::Config, api_key: &str) {
+    let api_key = api_key.trim();
+    config.server.auth_enabled = !api_key.is_empty();
+    config.server.api_keys = if api_key.is_empty() {
+        Vec::new()
+    } else {
+        vec![api_key.to_string()]
+    };
 }
 
 /// Returns true if the Models section is currently in the Scanning sub-step
@@ -864,6 +885,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
         editing_mode,
         editing_model_mode,
         model_input,
+        finch_api_key,
+        editing_finch_api_key,
         adding_provider,
         error,
     }) = state.sections.get_mut(&WizardSection::Models)
@@ -1323,7 +1346,18 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
             return Ok(false);
         }
 
-        if *editing_model_mode {
+        if *editing_finch_api_key {
+            match key.code {
+                KeyCode::Char(c) => finch_api_key.push(c),
+                KeyCode::Backspace => {
+                    finch_api_key.pop();
+                }
+                KeyCode::Enter | KeyCode::Esc => {
+                    *editing_finch_api_key = false;
+                }
+                _ => {}
+            }
+        } else if *editing_model_mode {
             // Editing model name for the selected entry
             match key.code {
                 KeyCode::Char(c) => {
@@ -1433,6 +1467,9 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     };
                     *model_input = current_model;
                     *editing_model_mode = true;
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    *editing_finch_api_key = true;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     // Open add-provider overlay (type selection first)
@@ -1646,6 +1683,19 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
     Ok(false)
 }
 
+#[cfg(target_os = "macos")]
+const SETTINGS_FEATURE_COUNT: usize = 9;
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_FEATURE_COUNT: usize = 8;
+#[cfg(target_os = "macos")]
+const SETTINGS_AUTO_DISCOVER_IDX: usize = 7;
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_AUTO_DISCOVER_IDX: usize = 6;
+#[cfg(target_os = "macos")]
+const SETTINGS_CONTEXT_IDX: usize = 8;
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_CONTEXT_IDX: usize = 7;
+
 /// Handle input for Features section (with arrow key navigation)
 fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     if let Some(SectionState::Features {
@@ -1682,16 +1732,6 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
 
         // non-macOS: 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=auto_discover, 7=ctx_lines
         // macOS:     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=auto_discover, 8=ctx_lines
-        #[cfg(target_os = "macos")]
-        let num_features = 9;
-        #[cfg(not(target_os = "macos"))]
-        let num_features = 8;
-
-        #[cfg(target_os = "macos")]
-        let ctx_idx = 8usize;
-        #[cfg(not(target_os = "macos"))]
-        let ctx_idx = 7usize;
-
         match key.code {
             KeyCode::Up => {
                 if *selected_idx > 0 {
@@ -1699,19 +1739,19 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 }
             }
             KeyCode::Down => {
-                if *selected_idx < num_features - 1 {
+                if *selected_idx < SETTINGS_FEATURE_COUNT - 1 {
                     *selected_idx += 1;
                 }
             }
             KeyCode::Left => {
                 // Decrement context_lines spinner (min 1)
-                if *selected_idx == ctx_idx && *memory_context_lines > 1 {
+                if *selected_idx == SETTINGS_CONTEXT_IDX && *memory_context_lines > 1 {
                     *memory_context_lines -= 1;
                 }
             }
             KeyCode::Right => {
                 // Increment context_lines spinner (max 8)
-                if *selected_idx == ctx_idx && *memory_context_lines < 8 {
+                if *selected_idx == SETTINGS_CONTEXT_IDX && *memory_context_lines < 8 {
                     *memory_context_lines += 1;
                 }
             }
@@ -1726,7 +1766,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     // index 4 = hf_token (no toggle)
                     5 => *daemon_only_mode = !*daemon_only_mode,
                     6 => *mdns_discovery = !*mdns_discovery,
-                    7 => *auto_discover = !*auto_discover,
+                    SETTINGS_AUTO_DISCOVER_IDX => *auto_discover = !*auto_discover,
                     // index 8 = ctx_lines (use ◀/▶)
                     _ => {}
                 }
@@ -1738,7 +1778,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     // index 3 = hf_token (no toggle)
                     4 => *daemon_only_mode = !*daemon_only_mode,
                     5 => *mdns_discovery = !*mdns_discovery,
-                    6 => *auto_discover = !*auto_discover,
+                    SETTINGS_AUTO_DISCOVER_IDX => *auto_discover = !*auto_discover,
                     // index 7 = ctx_lines (use ◀/▶)
                     _ => {}
                 }
@@ -1795,13 +1835,19 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract models
-    let (primary_model, tool_models) = if let Some(SectionState::Models {
+    let (primary_model, tool_models, finch_api_key) = if let Some(SectionState::Models {
         primary_model,
         tool_models,
+        finch_api_key,
         ..
-    }) = state.sections.get(&WizardSection::Models)
+    }) =
+        state.sections.get(&WizardSection::Models)
     {
-        (primary_model.clone(), tool_models.clone())
+        (
+            primary_model.clone(),
+            tool_models.clone(),
+            finch_api_key.trim().to_string(),
+        )
     } else {
         anyhow::bail!("Models not configured");
     };
@@ -2015,6 +2061,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         model_size,
         custom_model_repo: None,
         teachers,
+        finch_api_key,
         default_persona,
         auto_approve_tools: auto_approve,
         streaming_enabled: streaming,
@@ -2082,7 +2129,9 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     // Render help text
     let help_text = match state.current_section {
         WizardSection::Themes => "↑/↓: Choose theme | Enter: Next | Tab: Jump to section",
-        WizardSection::Models => "E: API key  M: Model name  A: Add  D: Remove  Tab: Next",
+        WizardSection::Models => {
+            "E: Provider key  M: Model name  F: Finch client key  A: Add  Tab: Next"
+        }
         WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next | Tab: Jump",
         WizardSection::Features => {
             "↑/↓: Navigate | Space: Toggle | Enter: Save | Tab: Jump to section"
@@ -2115,6 +2164,8 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             editing_mode,
             editing_model_mode,
             model_input,
+            finch_api_key,
+            editing_finch_api_key,
             adding_provider,
             error,
         }) => render_models_section(
@@ -2126,6 +2177,8 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *editing_mode,
             *editing_model_mode,
             model_input,
+            finch_api_key,
+            *editing_finch_api_key,
             adding_provider.as_ref(),
             error.as_deref(),
         ),
@@ -2307,6 +2360,8 @@ fn render_models_section(
     editing_mode: bool,
     editing_model_mode: bool,
     model_input: &str,
+    finch_api_key: &str,
+    editing_finch_api_key: bool,
     adding_provider: Option<&AddProviderStep>,
     error: Option<&str>,
 ) {
@@ -2478,7 +2533,15 @@ fn render_models_section(
     f.render_widget(list, chunks[2]);
 
     // Input panel (chunks[3]): bordered text box when in editing mode, dim hint otherwise
-    if editing_mode {
+    if editing_finch_api_key {
+        let panel = Paragraph::new(format!("{}█", finch_api_key)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Edit Finch Client API Key")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        f.render_widget(panel, chunks[3]);
+    } else if editing_mode {
         // Show current API key in a bordered box so the user sees what they're typing
         let current_key = if selected_idx == 0 {
             match primary_model {
@@ -2507,18 +2570,31 @@ fn render_models_section(
         );
         f.render_widget(panel, chunks[3]);
     } else {
-        let hint =
-            Paragraph::new("Press E to edit API key · M to edit model name · P to make primary")
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center);
+        let client_key = if finch_api_key.is_empty() {
+            "Finch client key: [not set — authentication disabled]".to_string()
+        } else {
+            let prefix: String = finch_api_key.chars().take(4).collect();
+            let suffix: String = finch_api_key
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            format!("Finch client key: {prefix}...{suffix}")
+        };
+        let hint = Paragraph::new(format!("{client_key} · Press F to edit"))
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
         f.render_widget(hint, chunks[3]);
     }
 
     // Instructions (chunks[4])
-    let instructions_text = if editing_mode || editing_model_mode {
+    let instructions_text = if editing_mode || editing_model_mode || editing_finch_api_key {
         "Type here | Enter/Esc: Save & return"
     } else {
-        "E: API key | M: Model name | P: Make primary | A: Add | D: Remove | Tab: Next"
+        "E: Provider key | F: Finch key | M: Model | P: Primary | A: Add | D: Remove"
     };
     let instructions = Paragraph::new(instructions_text)
         .style(
@@ -3295,12 +3371,8 @@ fn render_features_section(
     }
 
     // Context-lines spinner row (always last)
-    #[cfg(not(target_os = "macos"))]
-    let ctx_idx = 6usize;
-    #[cfg(target_os = "macos")]
-    let ctx_idx = 7usize;
     {
-        let is_selected = selected_idx == ctx_idx;
+        let is_selected = selected_idx == SETTINGS_CONTEXT_IDX;
         let (prefix, suffix, label_style) = if is_selected {
             (
                 ">>> ",
@@ -3478,6 +3550,32 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn peer_discovery_and_context_lines_have_distinct_rows() {
+        assert_ne!(SETTINGS_AUTO_DISCOVER_IDX, SETTINGS_CONTEXT_IDX);
+        assert_eq!(SETTINGS_CONTEXT_IDX, SETTINGS_FEATURE_COUNT - 1);
+    }
+
+    #[test]
+    fn finch_client_key_can_be_entered_and_applied() {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Models;
+
+        handle_models_input(&mut state, key(KeyCode::Char('f'))).unwrap();
+        for c in "custom-secret".chars() {
+            handle_models_input(&mut state, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+        let result = build_setup_result(&state).unwrap();
+        assert_eq!(result.finch_api_key, "custom-secret");
+
+        let mut config = crate::config::Config::with_providers(result.providers);
+        apply_daemon_api_key(&mut config, &result.finch_api_key);
+        assert!(config.server.auth_enabled);
+        assert_eq!(config.server.api_keys, vec!["custom-secret"]);
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

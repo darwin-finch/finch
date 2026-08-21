@@ -560,6 +560,7 @@ async fn main() -> Result<()> {
                         let default_persona = result.default_persona.clone();
                         let daemon_only_mode = result.daemon_only_mode;
                         let mdns_discovery = result.mdns_discovery;
+                        let finch_api_key = result.finch_api_key.clone();
 
                         // Patch any empty API keys in the providers list with
                         // auto-detected values from environment variables.
@@ -592,6 +593,10 @@ async fn main() -> Result<()> {
                         }
 
                         let mut new_config = Config::with_providers(providers);
+                        finch::cli::setup_wizard::apply_daemon_api_key(
+                            &mut new_config,
+                            &finch_api_key,
+                        );
                         new_config.active_theme = active_theme;
                         new_config.active_persona = default_persona;
                         if let Some(hf_tok) = result.hf_token {
@@ -743,6 +748,7 @@ async fn main() -> Result<()> {
             bind_address: config.client.daemon_address.clone(),
             auto_spawn: config.client.auto_spawn,
             timeout_seconds: 5,
+            api_key: config.server.api_keys.first().cloned(),
         };
         match DaemonClient::connect(daemon_config).await {
             Ok(client) => {
@@ -1727,6 +1733,7 @@ async fn run_setup() -> Result<()> {
 
     // Create config from unified providers list
     let mut config = Config::with_providers(result.providers);
+    finch::cli::setup_wizard::apply_daemon_api_key(&mut config, &result.finch_api_key);
 
     // Apply feature flags
     config.features = finch::config::FeaturesConfig {
