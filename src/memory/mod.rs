@@ -9,6 +9,7 @@
 mod embeddings;
 mod memtree;
 pub mod neural_embedding;
+mod program_registry;
 pub mod quality;
 
 pub use embeddings::{average_embeddings, cosine_similarity, EmbeddingEngine, TfIdfEmbedding};
@@ -121,6 +122,13 @@ impl MemorySystem {
         // Silently ignored if the column already exists.
         let _ = conn.execute(
             "ALTER TABLE tree_nodes ADD COLUMN importance INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+
+        // Migration C: executable vocabulary gained explicit effect declarations.
+        // Unknown legacy definitions remain conservative and require approval.
+        let _ = conn.execute(
+            "ALTER TABLE program_registry ADD COLUMN effect TEXT NOT NULL DEFAULT 'unclassified'",
             [],
         );
 
@@ -437,6 +445,32 @@ impl MemorySystem {
         tree.set_next_id(max_id + 1);
 
         Ok(())
+    }
+
+    /// Persist a successful Lisp `(define ...)` expression for session replay.
+    pub async fn save_lisp_define(&self, expr: &str) -> Result<()> {
+        let created_at = chrono::Utc::now().timestamp();
+        {
+            let conn = self.db.lock().await;
+            conn.execute(
+                "INSERT INTO lisp_env (expr, created_at) VALUES (?1, ?2)",
+                rusqlite::params![expr, created_at],
+            )?;
+        }
+        if let Some(definition) = crate::programs::ProgramDefinition::from_lisp_define(expr, None) {
+            self.save_authored_program(definition).await?;
+        }
+        Ok(())
+    }
+
+    /// Load all persisted Lisp defines in definition order (for session replay).
+    pub async fn load_lisp_defines(&self) -> Result<Vec<String>> {
+        let conn = self.db.lock().await;
+        let mut stmt = conn.prepare("SELECT expr FROM lisp_env ORDER BY seq ASC")?;
+        let exprs: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(exprs)
     }
 
     /// Derive a short topic summary without any LLM call.

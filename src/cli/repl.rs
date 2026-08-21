@@ -261,10 +261,31 @@ impl Repl {
         let memory_system = if config.memory.enabled {
             match crate::memory::MemorySystem::new(config.memory.clone()) {
                 Ok(system) => {
+                    let system = Arc::new(system);
+                    // Plain-text program files are canonical; SQLite is their discovery index.
+                    if let Ok(cwd) = std::env::current_dir() {
+                        if let Some(root) = crate::programs::project_program_root(&cwd) {
+                            if let Err(error) = system
+                                .sync_program_files(&root, crate::programs::ProgramScope::Project)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to index project program vocabulary: {error}"
+                                );
+                            }
+                        }
+                    }
+                    let root = system.program_source_root();
+                    if let Err(error) = system
+                        .sync_program_files(&root, crate::programs::ProgramScope::Personal)
+                        .await
+                    {
+                        tracing::warn!("Failed to index personal program vocabulary: {error}");
+                    }
                     if is_interactive && !daemon_mode {
                         output_status!("✓ Memory system enabled");
                     }
-                    Some(Arc::new(system))
+                    Some(system)
                 }
                 Err(e) => {
                     output_status!("⚠️  Failed to initialize memory: {}", e);
@@ -354,11 +375,14 @@ impl Repl {
         // Phase 4: Register memory tools if memory system is enabled
         if let Some(ref memory) = memory_system {
             use crate::tools::implementations::{
-                CreateMemoryTool, ListRecentTool, SearchMemoryTool,
+                CreateMemoryTool, InspectProgramTool, ListRecentTool, SearchMemoryTool,
+                SearchVocabularyTool,
             };
             tool_registry.register(Box::new(SearchMemoryTool::new(memory.clone())));
             tool_registry.register(Box::new(CreateMemoryTool::new(memory.clone())));
             tool_registry.register(Box::new(ListRecentTool::new(memory.clone())));
+            tool_registry.register(Box::new(SearchVocabularyTool::new(memory.clone())));
+            tool_registry.register(Box::new(InspectProgramTool::new(memory.clone())));
             if is_interactive && !daemon_mode {
                 output_status!("✓ Memory tools registered (search_memory, create_memory, list_recent_memories)");
             }
@@ -1165,33 +1189,9 @@ impl Repl {
                 let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let signature = generate_tool_signature(tool_use, &working_dir);
 
-                // Auto-approve certain non-destructive operations
-                let is_auto_approved = {
-                    let tool_name = tool_use.name.as_str();
-
-                    // Always auto-approve EnterPlanMode (non-destructive mode change)
-                    if tool_name == "EnterPlanMode" || tool_name == "enter_plan_mode" {
-                        true
-                    } else {
-                        // Auto-approve read-only tools and user interaction tools when in plan mode
-                        let is_plan_mode = matches!(self.mode, ReplMode::Planning { .. });
-                        let is_readonly_tool = matches!(
-                            tool_name,
-                            "read"
-                                | "Read"
-                                | "glob"
-                                | "Glob"
-                                | "grep"
-                                | "Grep"
-                                | "web_fetch"
-                                | "WebFetch"
-                                | "AskUserQuestion"
-                                | "ask_user_question"
-                        );
-
-                        is_plan_mode && is_readonly_tool
-                    }
-                };
+                let is_auto_approved =
+                    crate::tools::permissions::legacy_tool_effect(&tool_use.name, &tool_use.input)
+                        .runs_autonomously();
 
                 // Check if pre-approved in cache
                 let approval_source = self.tool_executor.lock().await.is_approved(&signature);

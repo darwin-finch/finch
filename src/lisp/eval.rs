@@ -443,7 +443,7 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
 
 // ── Application ───────────────────────────────────────────────────────────────
 
-async fn apply(func: Val, args: Vec<Val>, ctx: Arc<LispCtx>) -> Result<Val> {
+pub(crate) async fn apply(func: Val, args: Vec<Val>, ctx: Arc<LispCtx>) -> Result<Val> {
     match func {
         Val::Native(f) => (f.f)(&args),
         Val::Lambda(lambda) => {

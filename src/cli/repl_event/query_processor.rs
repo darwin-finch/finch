@@ -396,6 +396,14 @@ pub(crate) async fn process_query_with_tools(
                     );
                 }
             }
+            // The registry, not model memory, is the source of truth. Refresh a compact
+            // manifest on every fresh turn so model switches and compaction cannot leave
+            // the active model with stale vocabulary assumptions.
+            if !query.is_empty() {
+                if let Ok(manifest) = mem.vm_manifest(&query, 12).await {
+                    inject_vm_manifest(&mut msgs, &manifest);
+                }
+            }
         }
         msgs
     };
@@ -769,6 +777,28 @@ pub(crate) async fn process_query_with_tools(
             });
         }
     }
+}
+
+fn inject_vm_manifest(
+    messages: &mut [crate::claude::Message],
+    manifest: &crate::programs::VmManifest,
+) -> bool {
+    let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return false;
+    };
+    let Some(ContentBlock::Text { text }) = last_user
+        .content
+        .iter_mut()
+        .find(|block| matches!(block, ContentBlock::Text { .. }))
+    else {
+        return false;
+    };
+    *text = format!("[{}]\n\n{}", manifest.prompt_block(), text);
+    true
 }
 
 /// Apply a sliding window to the message list, keeping only the last `max` messages

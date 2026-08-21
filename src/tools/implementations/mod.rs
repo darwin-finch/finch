@@ -46,6 +46,9 @@ pub mod llm_tools;
 // Memory tools (Phase 4)
 pub mod memory_tools;
 
+// Persistent program vocabulary introspection
+pub mod vocabulary_tools;
+
 // Session task list tools
 pub mod todo_tools;
 
@@ -88,6 +91,8 @@ pub use excel::{
 pub use llm_tools::LLMDelegationTool;
 
 pub use memory_tools::{CreateMemoryTool, ListRecentTool, SearchMemoryTool};
+
+pub use vocabulary_tools::{InspectProgramTool, SearchVocabularyTool};
 
 pub use todo_tools::{TodoReadTool, TodoWriteTool};
 

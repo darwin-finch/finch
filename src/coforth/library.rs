@@ -37,6 +37,8 @@ pub struct WordEntry {
     #[serde(default)]
     pub stack_effect: Option<String>, // Forth stack-effect comment e.g. "( n n -- n )"
     #[serde(default)]
+    pub effect: Option<String>, // Finch effect class: pure, vm_read, workspace_write, ...
+    #[serde(default)]
     pub boot: bool, // if true, Forth code runs at startup (used for boot poetry etc.)
     #[serde(default)]
     pub remote: bool, // if true, peers may call this word via /v1/forth/eval
@@ -5405,6 +5407,7 @@ mod completeness_tests {
             kind: "task".to_string(),
             sense: None,
             stack_effect: Some("( n -- n )".to_string()),
+            effect: Some("pure".to_string()),
             boot: false,
             remote: false,
         };
@@ -5424,6 +5427,7 @@ mod completeness_tests {
             kind: "task".to_string(),
             sense: None,
             stack_effect: None,
+            effect: None,
             boot: false,
             remote: false,
         };
@@ -5443,6 +5447,7 @@ mod completeness_tests {
             kind: "observation".to_string(),
             sense: None,
             stack_effect: None,
+            effect: None,
             boot: false,
             remote: false,
         };
@@ -5462,6 +5467,7 @@ mod completeness_tests {
             kind: "task".to_string(),
             sense: None,
             stack_effect: None,
+            effect: None,
             boot: false,
             remote: false,
         };
@@ -5482,6 +5488,7 @@ mod completeness_tests {
             kind: "task".to_string(),
             sense: None,
             stack_effect: None,
+            effect: None,
             boot: false,
             remote: false,
         };
@@ -5501,6 +5508,7 @@ mod completeness_tests {
             kind: "task".to_string(),
             sense: None,
             stack_effect: None,
+            effect: None,
             boot: false,
             remote: false,
         };
@@ -5521,6 +5529,7 @@ mod completeness_tests {
             kind: "task".to_string(),
             sense: None,
             stack_effect: None,
+            effect: None,
             boot: false,
             remote: false,
         };

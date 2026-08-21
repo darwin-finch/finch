@@ -103,6 +103,19 @@ pub async fn run_in(src: &str, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val> {
     Ok(last)
 }
 
+/// Evaluate a Lisp definition and invoke its named procedure with portable arguments.
+///
+/// This is the Lisp side of the shared program registry ABI. Each invocation receives a
+/// fresh standard environment so stored definitions cannot depend on unrelated REPL state.
+pub async fn invoke_source(name: &str, source: &str, args: Vec<Val>) -> Result<Val> {
+    let env = make_env();
+    let ctx = Arc::new(LispCtx::new());
+    run_in(source, env.clone(), ctx.clone()).await?;
+    let function = env::Env::get(&env, name)
+        .ok_or_else(|| anyhow::anyhow!("Lisp source did not define {name}"))?;
+    eval::apply(function, args, ctx).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

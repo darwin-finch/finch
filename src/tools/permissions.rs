@@ -8,6 +8,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
+use crate::programs::ExecutionEffect;
+
 /// Permission decision for a tool execution
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionCheck {
@@ -410,6 +412,40 @@ fn is_readonly_bash(command: &str) -> bool {
     readonly_prefixes.iter().any(|p| trimmed.starts_with(p))
 }
 
+/// Effect declaration for legacy tool adapters.
+///
+/// New VM programs carry this in their language-level signature. This table is
+/// the compatibility boundary while provider-native tools are still exposed.
+pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
+    match tool_name.to_ascii_lowercase().as_str() {
+        "search_vocabulary"
+        | "inspect_program"
+        | "search_memory"
+        | "list_recent_memories"
+        | "todoread" => ExecutionEffect::VmRead,
+        "todowrite" | "push" | "pop" | "clear" | "enterplanmode" | "presentplan"
+        | "askuserquestion" | "create_memory" => ExecutionEffect::VmWrite,
+        "read" | "glob" | "grep" | "hash_compare" | "excel_read" | "excel_range"
+        | "excel_sheets" | "gui_inspect" => ExecutionEffect::WorkspaceRead,
+        "web_fetch" => ExecutionEffect::ExternalRead,
+        "write" | "edit" | "patch" | "excel_write" | "excel_formula" => {
+            ExecutionEffect::WorkspaceWrite
+        }
+        "bash" => {
+            let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+            if is_readonly_bash(command) {
+                ExecutionEffect::WorkspaceRead
+            } else {
+                ExecutionEffect::ExternalWrite
+            }
+        }
+        "restart_session" => ExecutionEffect::Destructive,
+        "run" | "save_and_exec" | "spawn_task" | "ansible" | "gui_click" | "gui_type"
+        | "excel_activate" => ExecutionEffect::ExternalWrite,
+        _ => ExecutionEffect::Unclassified,
+    }
+}
+
 impl Default for PermissionManager {
     fn default() -> Self {
         Self::new()
@@ -728,5 +764,16 @@ mod tests {
         let input = serde_json::json!({"data": "other_pattern"});
         let check = manager.check_tool_use("test", &input);
         assert!(matches!(check, PermissionCheck::AskUser(_)));
+    }
+
+    #[test]
+    fn test_legacy_effects_auto_run_reads_but_not_writes() {
+        assert_eq!(
+            legacy_tool_effect("read", &serde_json::json!({"path": "src/lib.rs"})),
+            ExecutionEffect::WorkspaceRead
+        );
+        assert!(legacy_tool_effect("read", &serde_json::json!({})).runs_autonomously());
+        assert!(!legacy_tool_effect("write", &serde_json::json!({})).runs_autonomously());
+        assert!(!legacy_tool_effect("unknown", &serde_json::json!({})).runs_autonomously());
     }
 }

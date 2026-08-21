@@ -142,38 +142,9 @@ impl ToolExecutionCoordinator {
             // Check if tool needs approval
             let approval_source = tool_executor.lock().await.is_approved(&signature);
 
-            // Auto-approve certain non-destructive operations
-            let is_auto_approved = {
-                let tool_name = tool_use.name.as_str();
-
-                // Always auto-approve TodoWrite/TodoRead (in-memory only, no side effects).
-                // EnterPlanMode is NOT auto-approved — the AI must surface it as a
-                // confirmation dialog so the user can deny it and keep the session in
-                // normal executing mode.
-                if tool_name == "TodoWrite" || tool_name == "TodoRead" {
-                    true
-                } else {
-                    // Auto-approve read-only tools and user interaction tools when in plan mode
-                    let current_mode = repl_mode.read().await;
-                    let is_plan_mode =
-                        matches!(*current_mode, crate::cli::ReplMode::Planning { .. });
-                    let is_readonly_tool = matches!(
-                        tool_name,
-                        "read"
-                            | "Read"
-                            | "glob"
-                            | "Glob"
-                            | "grep"
-                            | "Grep"
-                            | "web_fetch"
-                            | "WebFetch"
-                            | "AskUserQuestion"
-                            | "ask_user_question"
-                    );
-
-                    is_plan_mode && is_readonly_tool
-                }
-            };
+            let is_auto_approved =
+                crate::tools::permissions::legacy_tool_effect(&tool_use.name, &tool_use.input)
+                    .runs_autonomously();
 
             let needs_approval = !is_auto_approved
                 && matches!(
