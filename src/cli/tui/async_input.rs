@@ -124,6 +124,14 @@ pub fn spawn_input_task(
         let mut pending_brain_content: Option<String> = None;
 
         loop {
+            // While an external editor owns the terminal, suspend all crossterm
+            // event polling.  Consuming events here would steal keystrokes from
+            // the editor process and cause visible flickering / input loss.
+            if crate::is_editor_active() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
             // The lock block returns (input_result, typing_hint).
             // typing_hint is Some(content) when text was modified but not submitted.
             let (input_result, typing_hint): (Result<Option<String>>, Option<String>) = {
@@ -522,11 +530,13 @@ pub fn spawn_input_task(
                         // Update ghost text suggestion based on new input
                         tui.update_ghost_text();
 
-                        if let Err(e) = tui.render() {
-                            tracing::error!("Async input render failed: {}", e);
-                            // Signal event loop that render failed - recovery needed
-                            tui.needs_full_refresh = true;
-                            tui.last_render_error = Some(e.to_string());
+                        // Skip render if an external editor has the terminal.
+                        if !crate::is_editor_active() {
+                            if let Err(e) = tui.render() {
+                                tracing::error!("Async input render failed: {}", e);
+                                tui.needs_full_refresh = true;
+                                tui.last_render_error = Some(e.to_string());
+                            }
                         }
 
                         // Capture current content for typing hint.

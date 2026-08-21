@@ -1279,6 +1279,9 @@ impl EventLoop {
     /// Run the event loop
     pub async fn run(&mut self) -> Result<()> {
         tracing::debug!("Event loop starting");
+        // Signal that the TUI owns the terminal so proposal editors perform a
+        // complete terminal-protocol handoff before launching $VISUAL/$EDITOR.
+        crate::set_tui_active(true);
 
         // ── Fork two peer event loops ─────────────────────────────────────────
         // boot_peers needs an async context, so we call it here rather than new().
@@ -3979,20 +3982,13 @@ Rules:\n\
         let peer_source = fetch_peer_vocab_source(&addr).await;
         let description = format!("peer: {addr} — edit and save to define these words locally");
 
-        {
-            let tui = self.tui_renderer.lock().await;
-            tui.suspend().ok();
-        }
-        let editor_result =
-            crate::tools::implementations::propose::propose_forth_in_editor(
-                &description,
-                &peer_source,
-            )
-            .await;
-        {
-            let mut tui = self.tui_renderer.lock().await;
-            tui.resume().ok();
-        }
+        // propose_forth_in_editor handles TUI suspend/resume internally via
+        // EDITOR_ACTIVE + TerminalRestorer — no manual tui.suspend()/resume() needed.
+        let editor_result = crate::tools::implementations::propose::propose_forth_in_editor(
+            &description,
+            &peer_source,
+        )
+        .await;
 
         if let Ok(Some(content)) = editor_result {
             // Strip comment lines before feeding back so only Forth code runs.
@@ -4499,7 +4495,18 @@ Rules:\n\
 
     /// Render the TUI
     async fn render_tui(&self) -> Result<()> {
+        // Skip all crossterm writes while an external editor owns the terminal.
+        if crate::is_editor_active() {
+            return Ok(());
+        }
         let mut tui = self.tui_renderer.lock().await;
+
+        // After returning from an external editor, call resume() to reset
+        // active_rows so the TUI live area repaints from scratch.
+        // enable_raw_mode() in resume() is idempotent — raw mode is already on.
+        if crate::take_tui_rebuild() {
+            tui.resume().ok();
+        }
 
         // Check if recovery needed from previous render failure
         if tui.needs_full_refresh {

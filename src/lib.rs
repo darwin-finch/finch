@@ -1,6 +1,55 @@
 // Shammah - Local-first Constitutional AI Proxy
 // Library exports
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set to `true` when the TUI event loop is active.
+///
+/// `propose_in_editor` uses this to know it must suspend/resume the TUI
+/// instead of just checking `stdin().is_terminal()`.
+pub static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Set to `true` while an external editor is open.
+///
+/// The TUI render loop checks this flag and skips its render pass while set,
+/// preventing crossterm writes from clobbering the editor's output.
+pub static EDITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mark the TUI as active (called at the start of the TUI event loop).
+pub fn set_tui_active(active: bool) {
+    TUI_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Returns `true` when the TUI event loop currently owns the terminal.
+pub fn is_tui_active() -> bool {
+    TUI_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Set to `true` when the TUI needs a full redraw after returning from an
+/// external editor (mirrors `TuiRenderer::resume` which sets `active_rows = 0`).
+pub static NEEDS_TUI_REBUILD: AtomicBool = AtomicBool::new(false);
+
+/// Gates the render loop: set `true` before opening an external editor,
+/// `false` after it returns.
+pub fn set_editor_active(active: bool) {
+    EDITOR_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+/// Returns `true` while an external editor has the terminal.
+pub fn is_editor_active() -> bool {
+    EDITOR_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Signal that the TUI needs a full redraw (called when editor closes).
+pub fn request_tui_rebuild() {
+    NEEDS_TUI_REBUILD.store(true, Ordering::SeqCst);
+}
+
+/// Consume the rebuild request; returns `true` if a full redraw is needed.
+pub fn take_tui_rebuild() -> bool {
+    NEEDS_TUI_REBUILD.swap(false, Ordering::SeqCst)
+}
+
 // Cap'n Proto generated code must live at the crate root so that the
 // self-references emitted by capnpc (`crate::finch_ipc_capnp::…`) resolve.
 #[allow(

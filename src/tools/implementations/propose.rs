@@ -11,9 +11,102 @@
 // approving.  Clearing the file aborts execution.
 
 use anyhow::Result;
+use crossterm::{cursor, event, execute, style::ResetColor, terminal};
 use std::io::{IsTerminal, Write as _};
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
 use tempfile::Builder;
 use tokio::task::spawn_blocking;
+
+fn suspend_terminal_for_editor() {
+    std::io::stdout().flush().ok();
+    // Raw mode alone is not the whole TUI protocol. Leaving bracketed paste or
+    // kitty keyboard enhancement enabled makes vi receive Finch's input dialect.
+    execute!(
+        std::io::stdout(),
+        event::PopKeyboardEnhancementFlags,
+        event::DisableBracketedPaste,
+        cursor::Show,
+        ResetColor,
+    )
+    .ok();
+    terminal::disable_raw_mode().ok();
+    std::io::stdout().flush().ok();
+}
+
+fn resume_terminal_after_editor() {
+    terminal::enable_raw_mode().ok();
+    execute!(
+        std::io::stdout(),
+        event::EnableBracketedPaste,
+        event::PushKeyboardEnhancementFlags(
+            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ),
+    )
+    .ok();
+    crate::request_tui_rebuild();
+    crate::set_editor_active(false);
+}
+
+/// Split the conventional `$VISUAL`/`$EDITOR` form without involving a shell.
+/// Supports whitespace, single/double quotes and backslash escaping.
+fn split_editor_command(value: &str) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                current.push(ch);
+            }
+        } else if ch.is_whitespace() && quote.is_none() {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if quote.is_some() {
+        anyhow::bail!("Unclosed quote in $VISUAL/$EDITOR");
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    if args.is_empty() {
+        anyhow::bail!("$VISUAL/$EDITOR is empty");
+    }
+    Ok(args)
+}
+
+fn run_editor(path: &Path) -> Result<std::process::ExitStatus> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut parts = split_editor_command(&editor)?;
+    let program = parts.remove(0);
+    Ok(std::process::Command::new(program)
+        .args(parts)
+        .arg(path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?)
+}
 
 /// Write `script` to a temp `.sh` file, open `$EDITOR`, read back the result.
 ///
@@ -32,13 +125,39 @@ pub async fn propose_in_editor(description: &str, code: &str) -> Result<Option<S
     }
 
     let script = build_script(description, code);
+    let tui_mode = crate::is_tui_active();
 
+    if tui_mode {
+        // Gate the render loop so it won't write crossterm sequences while the
+        // editor has the terminal.
+        crate::set_editor_active(true);
+        // Give any in-flight render one tick (33 ms) to finish.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The terminal restore runs inside spawn_blocking so that disable/enable
+    // raw mode are always paired even if the closure returns early via `?`.
     spawn_blocking(move || {
+        // RAII: restore terminal state no matter how the closure exits.
+        struct TerminalRestorer {
+            tui_mode: bool,
+        }
+        impl Drop for TerminalRestorer {
+            fn drop(&mut self) {
+                if self.tui_mode {
+                    resume_terminal_after_editor();
+                }
+            }
+        }
+        let _restore = TerminalRestorer { tui_mode };
+
+        if tui_mode {
+            // Flush any pending TUI output before handing the terminal to the editor.
+            suspend_terminal_for_editor();
+        }
+
         // Write to a temp file with a .sh extension so editors syntax-highlight it.
-        let mut tmp = Builder::new()
-            .prefix("finch_")
-            .suffix(".sh")
-            .tempfile()?;
+        let mut tmp = Builder::new().prefix("finch_").suffix(".sh").tempfile()?;
 
         tmp.write_all(script.as_bytes())?;
         tmp.flush()?;
@@ -55,10 +174,9 @@ pub async fn propose_in_editor(description: &str, code: &str) -> Result<Option<S
         }
 
         // Open the editor.  Fall back to vi if $EDITOR is not set.
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-        let status = std::process::Command::new(&editor)
-            .arg(&path)
-            .status()?;
+        // $VISUAL is the POSIX full-screen editor variable (preferred for diff editors).
+        // Fall back to $EDITOR, then vi.
+        let status = run_editor(&path)?;
 
         if !status.success() {
             // Editor exited non-zero — treat as abort.
@@ -68,18 +186,18 @@ pub async fn propose_in_editor(description: &str, code: &str) -> Result<Option<S
         // Read back whatever the user left in the file.
         let modified = std::fs::read_to_string(&path)?;
 
-        // Explicit keep: file is non-empty after stripping comments and whitespace.
+        // Keep if any non-comment, non-blank lines remain.
         let executable_content = modified
             .lines()
             .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
             .count();
 
         if executable_content == 0 {
-            // User cleared everything — abort.
             Ok(None)
         } else {
             Ok(Some(modified))
         }
+        // _restore drops here: enable_raw_mode + set_editor_active(false)
     })
     .await?
 }
@@ -144,13 +262,32 @@ pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Op
         return Ok(Some(code.to_string()));
     }
 
-    let header: String = description
-        .lines()
-        .map(|l| format!("\\ {l}\n"))
-        .collect();
+    let header: String = description.lines().map(|l| format!("\\ {l}\n")).collect();
     let content = format!("{header}\n{code}");
+    let tui_mode = crate::is_tui_active();
+
+    if tui_mode {
+        crate::set_editor_active(true);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     spawn_blocking(move || {
+        struct TerminalRestorer {
+            tui_mode: bool,
+        }
+        impl Drop for TerminalRestorer {
+            fn drop(&mut self) {
+                if self.tui_mode {
+                    resume_terminal_after_editor();
+                }
+            }
+        }
+        let _restore = TerminalRestorer { tui_mode };
+
+        if tui_mode {
+            suspend_terminal_for_editor();
+        }
+
         let mut tmp = Builder::new()
             .prefix("finch_")
             .suffix(".forth")
@@ -160,8 +297,9 @@ pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Op
         tmp.flush()?;
         let path = tmp.path().to_owned();
 
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-        let status = std::process::Command::new(&editor).arg(&path).status()?;
+        // $VISUAL is the POSIX full-screen editor variable (preferred for diff editors).
+        // Fall back to $EDITOR, then vi.
+        let status = run_editor(&path)?;
 
         if !status.success() {
             return Ok(None);
@@ -178,6 +316,7 @@ pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Op
         } else {
             Ok(Some(modified))
         }
+        // _restore drops here
     })
     .await?
 }
@@ -224,6 +363,19 @@ mod tests {
     fn test_build_script_ends_with_newline() {
         let s = build_script("desc", "cmd");
         assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_split_editor_command_preserves_quoted_arguments() {
+        assert_eq!(
+            split_editor_command(r#"code --wait --profile "Finch Work""#).unwrap(),
+            vec!["code", "--wait", "--profile", "Finch Work"]
+        );
+    }
+
+    #[test]
+    fn test_split_editor_command_rejects_unclosed_quote() {
+        assert!(split_editor_command("vi 'unfinished").is_err());
     }
 
     #[test]
