@@ -653,7 +653,10 @@ impl Config {
         let backend = providers
             .iter()
             .find_map(ProviderEntry::to_backend_config)
-            .unwrap_or_default();
+            .unwrap_or_else(|| BackendConfig {
+                enabled: false,
+                ..BackendConfig::default()
+            });
         Self::new_with_all(teachers, backend, providers)
     }
 
@@ -890,6 +893,10 @@ mod tests {
         assert_eq!(config.providers.len(), 1);
         assert!(config.active_provider().is_some());
         assert!(config.active_teacher().is_some());
+        assert!(
+            !config.backend.enabled,
+            "cloud-only provider lists must not start a local model"
+        );
     }
 
     #[test]
