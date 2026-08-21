@@ -19,8 +19,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   may execute workspace effects or reveal/rotate its credential.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an
   indivisible machine/workspace authority boundary.
-- [ ] Replace shared passwords with scoped, revocable credentials; do not advertise credentials
-  in mDNS discovery records.
+- [ ] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,
+  expiring participant credentials containing subject, audience, brain, environment generation,
+  and permitted roles. Initial scopes: `brain:read`, `brain:submit`, `brain:approve`,
+  `brain:control`, `environment:execute`, `environment:admin`, and `compute:submit`.
+- [ ] Enforce least privilege independently for event visibility, prompt/program submission,
+  approval, control-lease ownership, workspace effects, environment changes, credential minting,
+  and distributed inference. Never advertise credentials in mDNS discovery records.
 
 ## Client and model integration
 
@@ -43,8 +48,3 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   granting those nodes workspace or execution-environment authority.
 - [ ] Record remote inference provenance: node, model, input hash, resource budget, timing, and
   brain environment generation.
-
-## Verification and maintenance
-
-- [ ] Repair the local Apple Command Line Tools installation providing `clang_rt.osx`, then run
-  the full linked test suite. `cargo check --tests` currently succeeds, but test linking is blocked.
