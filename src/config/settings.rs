@@ -163,7 +163,8 @@ pub struct Config {
 }
 
 /// Server configuration for daemon mode
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     /// Enable daemon mode
     pub enabled: bool,
@@ -185,6 +186,9 @@ pub struct ServerConfig {
     pub service_name: String,
     /// Service description
     pub service_description: String,
+    /// Password required to attach to or mutate a brain from another machine.
+    /// Setup generates this value once and persists it in config.toml.
+    pub brain_password: String,
 }
 
 /// Client configuration for connecting to daemon
@@ -217,8 +221,13 @@ impl Default for ServerConfig {
             advertise: false,         // Disabled by default
             service_name: String::new(), // Empty = auto-generate from hostname
             service_description: "Finch AI Assistant".to_string(),
+            brain_password: default_brain_password(),
         }
     }
+}
+
+fn default_brain_password() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..20].to_string()
 }
 
 impl Default for ClientConfig {
@@ -734,6 +743,7 @@ impl Config {
             active_theme: Some(self.active_theme.clone()),
             huggingface_token: self.huggingface_token.clone(),
             client: Some(self.client.clone()),
+            server: Some(self.server.clone()),
             providers,
             colors: Some(self.colors.clone()),
             features: Some(self.features.clone()),
@@ -759,6 +769,8 @@ struct TomlConfig {
     huggingface_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     client: Option<ClientConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server: Option<ServerConfig>,
     #[serde(default)]
     providers: Vec<ProviderEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -772,6 +784,21 @@ struct TomlConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_server_config_persists_brain_password() {
+        let mut server = ServerConfig::default();
+        server.brain_password = "correct horse battery staple".to_string();
+        let encoded = toml::to_string(&server).unwrap();
+        let decoded: ServerConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.brain_password, "correct horse battery staple");
+    }
+
+    #[test]
+    fn test_server_config_generates_a_nonempty_brain_password() {
+        let server = ServerConfig::default();
+        assert!(server.brain_password.len() >= 16);
+    }
 
     #[test]
     fn test_features_config_safe_defaults() {

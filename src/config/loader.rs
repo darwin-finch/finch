@@ -45,7 +45,7 @@ pub fn load_config() -> Result<Config> {
 fn try_load_from_finch_config() -> Result<Option<Config>> {
     use super::backend::BackendConfig;
     use super::colors::ColorScheme;
-    use super::settings::{ClientConfig, FeaturesConfig, TeacherEntry};
+    use super::settings::{ClientConfig, FeaturesConfig, ServerConfig, TeacherEntry};
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let config_path = home.join(".finch/config.toml");
@@ -76,6 +76,8 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
         backend: Option<BackendConfig>,
         #[serde(default)]
         client: Option<ClientConfig>,
+        #[serde(default)]
+        server: Option<ServerConfig>,
         #[serde(default)]
         teachers: Vec<TeacherEntry>,
         #[serde(default)]
@@ -139,6 +141,9 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
 
     if let Some(client) = toml_config.client {
         config.client = client;
+    }
+    if let Some(server) = toml_config.server {
+        config.server = server;
     }
     if let Some(colors) = toml_config.colors {
         config.colors = colors;
