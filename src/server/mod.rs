@@ -353,6 +353,14 @@ impl AgentServer {
         self.providers.first().map(|slot| &slot.provider)
     }
 
+    /// Whether named cloud provider profiles are configured.
+    ///
+    /// The OpenAI-compatible API uses this to distinguish an unknown profile
+    /// name from the legacy configuration path, which has no provider pool.
+    pub fn has_provider_profiles(&self) -> bool {
+        !self.providers.is_empty()
+    }
+
     /// Get reference to router
     pub fn router(&self) -> &Arc<RwLock<Router>> {
         &self.router

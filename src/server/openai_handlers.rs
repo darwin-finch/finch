@@ -383,6 +383,20 @@ async fn handle_chat_completions_streaming(
     Ok(Sse::new(stream).into_response())
 }
 
+/// Interpret the OpenAI `model` field as a Finch provider profile selector.
+///
+/// The selected profile owns the actual upstream model, endpoint, and
+/// credentials. This keeps standard OpenAI-compatible clients interoperable:
+/// they only need to set their Model ID to the Finch profile name.
+fn provider_profile_name(model: &str) -> Result<&str, &'static str> {
+    let name = model.trim();
+    if name.is_empty() {
+        Err("model must name a configured Finch provider profile")
+    } else {
+        Ok(name)
+    }
+}
+
 /// Resolve the cloud provider to use, preferring the multi-provider pool.
 ///
 /// Falls back to `claude_client` (wrapped in a throw-away `ClaudeClient`) when
@@ -400,7 +414,7 @@ async fn forward_to_cloud(
         }
         let resp = provider.send_message(&req).await?;
         Ok(resp.content)
-    } else if let Some(name) = provider_name {
+    } else if let Some(name) = provider_name.filter(|_| server.has_provider_profiles()) {
         anyhow::bail!("Unknown or ambiguous provider profile '{name}'")
     } else {
         // No providers configured — fall back to legacy ClaudeClient
@@ -416,21 +430,19 @@ async fn forward_to_cloud(
 /// Handle POST /v1/chat/completions - OpenAI-compatible chat endpoint
 pub async fn handle_chat_completions(
     State(server): State<Arc<AgentServer>>,
-    headers: axum::http::HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     let start_time = Instant::now();
-
-    // Extract optional provider name from request header
-    let provider_name: Option<String> = headers
-        .get("x-finch-provider")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
 
     // Validate request
     if request.messages.is_empty() {
         return error_response("messages array cannot be empty", "invalid_request_error");
     }
+
+    let provider_name = match provider_profile_name(&request.model) {
+        Ok(name) => name.to_string(),
+        Err(message) => return error_response(message, "invalid_request_error"),
+    };
 
     // Handle streaming requests
     if request.stream {
@@ -482,7 +494,7 @@ pub async fn handle_chat_completions(
 
             match forward_to_cloud(
                 &server,
-                provider_name.as_deref(),
+                Some(&provider_name),
                 internal_messages.clone(),
                 internal_tools.clone(),
             )
@@ -518,7 +530,7 @@ pub async fn handle_chat_completions(
                             warn!("❌ Local generation returned None, falling back to teacher");
                             match forward_to_cloud(
                                 &server,
-                                provider_name.as_deref(),
+                                Some(&provider_name),
                                 internal_messages.clone(),
                                 internal_tools.clone(),
                             )
@@ -533,7 +545,7 @@ pub async fn handle_chat_completions(
                             warn!("❌ Local generation error: {}, falling back to teacher", e);
                             match forward_to_cloud(
                                 &server,
-                                provider_name.as_deref(),
+                                Some(&provider_name),
                                 internal_messages.clone(),
                                 internal_tools,
                             )
@@ -550,7 +562,7 @@ pub async fn handle_chat_completions(
                     info!("Model not ready, forwarding to cloud provider");
                     match forward_to_cloud(
                         &server,
-                        provider_name.as_deref(),
+                        Some(&provider_name),
                         internal_messages.clone(),
                         internal_tools,
                     )
@@ -975,6 +987,20 @@ fn error_response(message: &str, error_type: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_id_selects_provider_profile() {
+        assert_eq!(provider_profile_name("work-grok"), Ok("work-grok"));
+        assert_eq!(provider_profile_name("  Claude Code  "), Ok("Claude Code"));
+    }
+
+    #[test]
+    fn empty_model_id_is_rejected() {
+        assert_eq!(
+            provider_profile_name("  "),
+            Err("model must name a configured Finch provider profile")
+        );
+    }
 
     #[test]
     fn test_convert_messages() {
