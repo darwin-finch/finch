@@ -24,10 +24,12 @@ enum AddProviderStep {
     },
     // Cloud AI path — single dialog (provider, model, api key on one screen)
     ConfigureRemote {
-        provider_idx: usize,  // index into CLOUD_PROVIDERS
-        model: String,        // editable model name
-        api_key: String,      // editable API key
-        focused_field: usize, // 0=Provider, 1=Model, 2=APIKey
+        provider_idx: usize,        // index into CLOUD_PROVIDERS
+        name: String,               // stable public name used by /model and API clients
+        model: String,              // editable model name
+        api_key: String,            // editable API key
+        focused_field: usize,       // 0=Provider, 1=Name, 2=Model, 3=APIKey
+        editing_idx: Option<usize>, // 0=primary, n=tool model index + 1
     },
     // Local model path — single dialog (backend, family, size, device on one screen)
     ConfigureLocal {
@@ -188,7 +190,7 @@ impl WizardSection {
     fn name(&self) -> &str {
         match self {
             Self::Themes => "Look & Feel",
-            Self::Models => "API Key",
+            Self::Models => "Model Setup",
             Self::Personas => "Style",
             Self::Features => "Settings",
             Self::Review => "Finish",
@@ -252,6 +254,7 @@ pub enum ModelConfig {
     },
     Remote {
         provider: String,
+        name: String,
         api_key: String,
         model: String,
         enabled: bool,
@@ -279,13 +282,11 @@ impl ModelConfig {
             Self::Local { family, size, .. } => {
                 format!("Local {} {}", family.name(), model_size_display(size))
             }
-            Self::Remote {
-                provider, model, ..
-            } => {
+            Self::Remote { name, model, .. } => {
                 if !model.is_empty() {
-                    format!("{} - {}", provider, model)
+                    format!("{} - {}", name, model)
                 } else {
-                    provider.clone()
+                    name.clone()
                 }
             }
         }
@@ -352,6 +353,10 @@ impl WizardState {
                 // Remote API is primary
                 ModelConfig::Remote {
                     provider: teacher.provider.clone(),
+                    name: teacher
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| teacher.provider.clone()),
                     api_key: teacher.api_key.clone(),
                     model: teacher.model.clone().unwrap_or_default(),
                     enabled: true,
@@ -363,6 +368,7 @@ impl WizardState {
                     .unwrap_or_default();
                 ModelConfig::Remote {
                     provider: "claude".to_string(),
+                    name: "claude".to_string(),
                     api_key: detected_key,
                     model: String::new(),
                     enabled: true,
@@ -375,6 +381,7 @@ impl WizardState {
                 .unwrap_or_default();
             ModelConfig::Remote {
                 provider: "claude".to_string(),
+                name: "claude".to_string(),
                 api_key: detected_key,
                 model: String::new(),
                 enabled: true,
@@ -388,6 +395,7 @@ impl WizardState {
                     .skip(1) // Skip first teacher (that's the primary)
                     .map(|t| ModelConfig::Remote {
                         provider: t.provider.clone(),
+                        name: t.name.clone().unwrap_or_else(|| t.provider.clone()),
                         api_key: t.api_key.clone(),
                         model: t.model.clone().unwrap_or_default(),
                         enabled: true,
@@ -950,6 +958,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 KeyCode::Esc => {
                     match adding_provider {
                         // From single-screen dialogs, go back to type selection
+                        Some(AddProviderStep::ConfigureRemote {
+                            editing_idx: Some(_),
+                            ..
+                        }) => *adding_provider = None,
                         Some(AddProviderStep::ConfigureLocal { .. })
                         | Some(AddProviderStep::ConfigureRemote { .. }) => {
                             *adding_provider = Some(AddProviderStep::SelectAddType { selected: 0 });
@@ -990,7 +1002,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                     }
                     Some(AddProviderStep::ConfigureRemote { focused_field, .. }) => {
-                        if *focused_field < 2 {
+                        if *focused_field < 3 {
                             *focused_field += 1;
                         }
                     }
@@ -1067,7 +1079,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     let default = CLOUD_PROVIDERS[new_idx].2;
                                     *model = default.to_string();
                                 }
-                                1 => {
+                                2 => {
                                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
                                     let models = known_models_for(provider_id);
                                     if !models.is_empty() {
@@ -1146,7 +1158,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     let default = CLOUD_PROVIDERS[new_idx].2;
                                     *model = default.to_string();
                                 }
-                                1 => {
+                                2 => {
                                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
                                     let models = known_models_for(provider_id);
                                     if !models.is_empty() {
@@ -1165,6 +1177,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 }
                 KeyCode::Char(c) => {
                     if let Some(AddProviderStep::ConfigureRemote {
+                        name,
                         model,
                         api_key,
                         focused_field,
@@ -1172,10 +1185,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     }) = adding_provider
                     {
                         match *focused_field {
-                            1 => {
+                            1 => name.push(c),
+                            2 => {
                                 model.push(c);
                             }
-                            2 => {
+                            3 => {
                                 api_key.push(c);
                             }
                             _ => {}
@@ -1184,6 +1198,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 }
                 KeyCode::Backspace => {
                     if let Some(AddProviderStep::ConfigureRemote {
+                        name,
                         model,
                         api_key,
                         focused_field,
@@ -1192,9 +1207,12 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     {
                         match *focused_field {
                             1 => {
-                                model.pop();
+                                name.pop();
                             }
                             2 => {
+                                model.pop();
+                            }
+                            3 => {
                                 api_key.pop();
                             }
                             _ => {}
@@ -1216,9 +1234,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 let default_model = CLOUD_PROVIDERS[selected].2.to_string();
                                 Some(AddProviderStep::ConfigureRemote {
                                     provider_idx: selected,
+                                    name: CLOUD_PROVIDERS[selected].0.to_string(),
                                     model: default_model,
                                     api_key: String::new(),
-                                    focused_field: 2, // Start on API key field
+                                    focused_field: 3, // Start on API key field
+                                    editing_idx: None,
                                 })
                             } else if selected == n_cloud {
                                 // Open single-screen local model dialog
@@ -1252,8 +1272,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         // ── single-screen remote dialog — confirm ────────────────────
                         Some(AddProviderStep::ConfigureRemote {
                             provider_idx,
+                            name,
                             model,
                             api_key,
+                            editing_idx,
                             ..
                         }) => {
                             let (provider_id, _, default_model, _) =
@@ -1263,25 +1285,35 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             } else {
                                 model
                             };
-                            let replace_primary = matches!(
+                            let edited = ModelConfig::Remote {
+                                provider: provider_id.to_string(),
+                                name: if name.trim().is_empty() {
+                                    provider_id.to_string()
+                                } else {
+                                    name.trim().to_string()
+                                },
+                                api_key,
+                                model: resolved_model,
+                                enabled: true,
+                            };
+                            if let Some(index) = editing_idx {
+                                if index == 0 {
+                                    *primary_model = edited;
+                                } else if let Some(slot) = tool_models.get_mut(index - 1) {
+                                    let enabled = slot.enabled();
+                                    *slot = edited;
+                                    slot.set_enabled(enabled);
+                                }
+                                *selected_idx = index;
+                            } else if matches!(
                                 primary_model,
                                 ModelConfig::Remote { api_key: ref k, .. } if k.is_empty()
-                            ) && tool_models.is_empty();
-                            if replace_primary {
-                                *primary_model = ModelConfig::Remote {
-                                    provider: provider_id.to_string(),
-                                    api_key,
-                                    model: resolved_model,
-                                    enabled: true,
-                                };
+                            ) && tool_models.is_empty()
+                            {
+                                *primary_model = edited;
                                 *selected_idx = 0;
                             } else {
-                                tool_models.push(ModelConfig::Remote {
-                                    provider: provider_id.to_string(),
-                                    api_key,
-                                    model: resolved_model,
-                                    enabled: true,
-                                });
+                                tool_models.push(edited);
                                 *selected_idx = tool_models.len();
                             }
                             None
@@ -1325,6 +1357,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 let agent = &agents[selected.min(agents.len() - 1)];
                                 tool_models.push(ModelConfig::Remote {
                                     provider: "finch".to_string(),
+                                    name: agent.name.clone(),
                                     api_key: String::new(),
                                     model: format!("{}:{}", agent.host, agent.port),
                                     enabled: true,
@@ -1432,28 +1465,37 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                     }
                 }
-                KeyCode::Char('e') | KeyCode::Char('E') => {
-                    // Enter API key edit mode
-                    *editing_mode = true;
-                }
-                KeyCode::Char('m') | KeyCode::Char('M') => {
-                    // Edit model name for selected entry
-                    let current_model = if *selected_idx == 0 {
-                        if let ModelConfig::Remote { model, .. } = primary_model {
-                            model.clone()
-                        } else {
-                            String::new()
-                        }
+                KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
+                    let selected = if *selected_idx == 0 {
+                        Some(&*primary_model)
                     } else {
-                        let tool_idx = *selected_idx - 1;
-                        if let Some(ModelConfig::Remote { model, .. }) = tool_models.get(tool_idx) {
-                            model.clone()
-                        } else {
-                            String::new()
-                        }
+                        tool_models.get(*selected_idx - 1)
                     };
-                    *model_input = current_model;
-                    *editing_model_mode = true;
+                    if let Some(ModelConfig::Remote {
+                        provider,
+                        name,
+                        model,
+                        api_key,
+                        ..
+                    }) = selected
+                    {
+                        let provider_idx = CLOUD_PROVIDERS
+                            .iter()
+                            .position(|(id, ..)| *id == provider)
+                            .unwrap_or(0);
+                        *adding_provider = Some(AddProviderStep::ConfigureRemote {
+                            provider_idx,
+                            name: name.clone(),
+                            model: model.clone(),
+                            api_key: api_key.clone(),
+                            focused_field: 1,
+                            editing_idx: Some(*selected_idx),
+                        });
+                    } else {
+                        *error = Some(
+                            "Local-model editing is available when adding a replacement".into(),
+                        );
+                    }
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     // Open add-provider overlay (type selection first)
@@ -1486,7 +1528,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     state.mark_completed(WizardSection::Models);
                     state.next_section();
                 }
-                KeyCode::Enter | KeyCode::Tab => {
+                KeyCode::Tab => {
                     // Always allow advancing — no key format validation
                     state.mark_completed(WizardSection::Models);
                     state.next_section();
@@ -1975,12 +2017,12 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     // Primary model as first teacher (if remote)
     if let ModelConfig::Remote {
         provider,
+        name,
         api_key,
         model,
         ..
     } = &primary_model
     {
-        let profile_name = if model.is_empty() { provider } else { model };
         teachers.push(TeacherEntry {
             provider: provider.clone(),
             api_key: api_key.clone(),
@@ -1990,7 +2032,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                 Some(model.clone())
             },
             base_url: None,
-            name: Some(profile_name.clone()),
+            name: Some(name.clone()),
         });
     }
 
@@ -1998,13 +2040,13 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     for tool_model in &tool_models {
         if let ModelConfig::Remote {
             provider,
+            name,
             api_key,
             model,
             enabled,
         } = tool_model
         {
             if *enabled {
-                let profile_name = if model.is_empty() { provider } else { model };
                 teachers.push(TeacherEntry {
                     provider: provider.clone(),
                     api_key: api_key.clone(),
@@ -2014,7 +2056,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
                         Some(model.clone())
                     },
                     base_url: None,
-                    name: Some(profile_name.clone()),
+                    name: Some(name.clone()),
                 });
             }
         }
@@ -2147,7 +2189,7 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     // Render help text
     let help_text = match state.current_section {
         WizardSection::Themes => "↑/↓: Choose theme | Enter: Next | Tab: Jump to section",
-        WizardSection::Models => "E: Provider key  M: Model name  A: Add  D: Remove  Tab: Next",
+        WizardSection::Models => "Enter: Edit provider  A: Add  D: Remove  Tab: Next",
         WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next | Tab: Jump",
         WizardSection::Features => {
             "↑/↓: Navigate | Space: Toggle | Enter: Save | Tab: Jump to section"
@@ -2457,7 +2499,7 @@ fn render_models_section(
             )
         }
         ModelConfig::Remote {
-            provider,
+            name,
             api_key,
             model,
             ..
@@ -2485,7 +2527,7 @@ fn render_models_section(
             };
             format!(
                 "{}★ Primary: {}{} [{}]{}",
-                prefix, provider, model_display, key_display, suffix
+                prefix, name, model_display, key_display, suffix
             )
         }
     };
@@ -2525,9 +2567,7 @@ fn render_models_section(
                     suffix
                 )
             }
-            ModelConfig::Remote {
-                provider, model, ..
-            } => {
+            ModelConfig::Remote { name, model, .. } => {
                 let model_display = if !model.is_empty() {
                     format!(" - {}", model)
                 } else {
@@ -2535,7 +2575,7 @@ fn render_models_section(
                 };
                 format!(
                     "{}{} Tool: {}{}{}",
-                    prefix, checkbox, provider, model_display, suffix
+                    prefix, checkbox, name, model_display, suffix
                 )
             }
         };
@@ -2576,7 +2616,7 @@ fn render_models_section(
         );
         f.render_widget(panel, chunks[3]);
     } else {
-        let hint = Paragraph::new("Press E to edit provider key · M to edit model · P for primary")
+        let hint = Paragraph::new("Press Enter to edit the selected provider · P for primary")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         f.render_widget(hint, chunks[3]);
@@ -2586,7 +2626,7 @@ fn render_models_section(
     let instructions_text = if editing_mode || editing_model_mode {
         "Type here | Enter/Esc: Save & return"
     } else {
-        "E: Provider key | M: Model | P: Primary | A: Add | D: Remove | Tab: Next"
+        "Enter: Edit | P: Primary | A: Add | D: Remove | Tab: Next"
     };
     let instructions = Paragraph::new(instructions_text)
         .style(
@@ -2717,17 +2757,21 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
         // ── single-screen cloud provider dialog ──────────────────────────────────────
         AddProviderStep::ConfigureRemote {
             provider_idx,
+            name,
             model,
             api_key,
             focused_field,
+            editing_idx,
         } => {
             render_configure_remote_overlay(
                 f,
                 inner,
                 *provider_idx,
+                name,
                 model,
                 api_key,
                 *focused_field,
+                editing_idx.is_some(),
             );
         }
         // ── single-screen local model dialog ─────────────────────────────────────────
@@ -2817,9 +2861,11 @@ fn render_configure_remote_overlay(
     f: &mut Frame,
     area: Rect,
     provider_idx: usize,
+    name: &str,
     model: &str,
     api_key: &str,
     focused_field: usize,
+    editing: bool,
 ) {
     let (provider_id, provider_name, _default_model, key_hint) =
         CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)];
@@ -2869,8 +2915,9 @@ fn render_configure_remote_overlay(
     let mut lines = vec![
         Line::from(""),
         make_row("Provider", &provider_value, focused_field == 0, false),
-        make_row("Model", model_display, focused_field == 1, true),
-        make_row("API Key", &key_display, focused_field == 2, true),
+        make_row("Name", name, focused_field == 1, true),
+        make_row("Model", model_display, focused_field == 2, true),
+        make_row("API Key", &key_display, focused_field == 3, true),
         Line::from(""),
         Line::from(Span::styled(
             "─".repeat(area.width as usize),
@@ -2886,12 +2933,20 @@ fn render_configure_remote_overlay(
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ navigate · ←→ change provider/model · type API key · Enter to add · Esc back",
+        if editing {
+            "↑↓ navigate · type to edit · Enter saves · Esc cancels"
+        } else {
+            "↑↓ navigate · ←→ change provider/model · Enter adds · Esc back"
+        },
         Style::default().fg(Color::Yellow),
     )));
 
     let para = Paragraph::new(lines)
-        .block(Block::default().title("Add Cloud Provider"))
+        .block(Block::default().title(if editing {
+            "Edit Provider"
+        } else {
+            "Add Cloud Provider"
+        }))
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
@@ -3587,6 +3642,43 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
+    fn models_tab_describes_model_setup() {
+        assert_eq!(WizardSection::Models.name(), "Model Setup");
+    }
+
+    #[test]
+    fn enter_opens_provider_editor_and_saves_public_name() {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Models;
+
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+        if let Some(AddProviderStep::ConfigureRemote {
+            name, editing_idx, ..
+        }) = state
+            .sections
+            .get_mut(&WizardSection::Models)
+            .and_then(|section| match section {
+                SectionState::Models {
+                    adding_provider, ..
+                } => adding_provider.as_mut(),
+                _ => None,
+            })
+        {
+            *name = "work-claude".to_string();
+            assert_eq!(*editing_idx, Some(0));
+        } else {
+            panic!("expected provider editor");
+        }
+
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+        if let Some(ModelConfig::Remote { name, .. }) = get_primary(&state) {
+            assert_eq!(name, "work-claude");
+        } else {
+            panic!("expected remote primary");
+        }
+    }
+
+    #[test]
     fn peer_discovery_and_context_lines_have_distinct_rows() {
         assert_ne!(SETTINGS_AUTO_DISCOVER_IDX, SETTINGS_CONTEXT_IDX);
         assert_ne!(SETTINGS_FINCH_API_KEY_IDX, SETTINGS_AUTO_DISCOVER_IDX);
@@ -3680,9 +3772,11 @@ mod tests {
     fn default_configure_remote(focused_field: usize) -> AddProviderStep {
         AddProviderStep::ConfigureRemote {
             provider_idx: 0, // grok
+            name: "grok".to_string(),
             model: CLOUD_PROVIDERS[0].2.to_string(),
             api_key: String::new(),
             focused_field,
+            editing_idx: None,
         }
     }
 
@@ -3909,6 +4003,7 @@ mod tests {
         {
             *primary_model = ModelConfig::Remote {
                 provider: "claude".to_string(),
+                name: "claude".to_string(),
                 api_key: "sk-ant-abc123".to_string(),
                 model: String::new(),
                 enabled: true,
@@ -3965,11 +4060,11 @@ mod tests {
     }
 
     #[test]
-    fn test_configure_remote_down_clamps_at_two() {
-        let mut state = state_with_step(default_configure_remote(2));
+    fn test_configure_remote_down_clamps_at_three() {
+        let mut state = state_with_step(default_configure_remote(3));
         handle_models_input(&mut state, key(KeyCode::Down)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { focused_field, .. }) = get_step(&state) {
-            assert_eq!(*focused_field, 2);
+            assert_eq!(*focused_field, 3);
         } else {
             panic!("expected ConfigureRemote");
         }
@@ -4027,9 +4122,11 @@ mod tests {
         let first_model = known_models_for("claude")[0];
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
+            name: "claude".to_string(),
             model: first_model.to_string(),
             api_key: String::new(),
-            focused_field: 1, // Model field
+            focused_field: 2, // Model field
+            editing_idx: None,
         });
         handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { model, .. }) = get_step(&state) {
@@ -4049,9 +4146,11 @@ mod tests {
         let first_model = known_models_for("claude")[0];
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
+            name: "claude".to_string(),
             model: first_model.to_string(),
             api_key: String::new(),
-            focused_field: 1,
+            focused_field: 2,
+            editing_idx: None,
         });
         handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { model, .. }) = get_step(&state) {
@@ -4067,7 +4166,7 @@ mod tests {
 
     #[test]
     fn test_configure_remote_typing_appends_to_api_key_field() {
-        let mut state = state_with_step(default_configure_remote(2)); // focused APIKey
+        let mut state = state_with_step(default_configure_remote(3)); // focused APIKey
         handle_models_input(&mut state, key(KeyCode::Char('s'))).unwrap();
         handle_models_input(&mut state, key(KeyCode::Char('k'))).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { api_key, .. }) = get_step(&state) {
@@ -4079,7 +4178,7 @@ mod tests {
 
     #[test]
     fn test_configure_remote_typing_appends_to_model_field() {
-        let mut state = state_with_step(default_configure_remote(1)); // focused Model
+        let mut state = state_with_step(default_configure_remote(2)); // focused Model
         handle_models_input(&mut state, key(KeyCode::Char('m'))).unwrap();
         handle_models_input(&mut state, key(KeyCode::Char('y'))).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { model, .. }) = get_step(&state) {
@@ -4094,9 +4193,11 @@ mod tests {
     fn test_configure_remote_backspace_removes_from_api_key() {
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: 0,
+            name: "grok".to_string(),
             model: "grok-code-fast-1".to_string(),
             api_key: "abc".to_string(),
-            focused_field: 2,
+            focused_field: 3,
+            editing_idx: None,
         });
         handle_models_input(&mut state, key(KeyCode::Backspace)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { api_key, .. }) = get_step(&state) {
@@ -4134,9 +4235,11 @@ mod tests {
             .unwrap();
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: grok_idx,
+            name: "grok".to_string(),
             model: "grok-code-fast-1".to_string(),
             api_key: "xai-test-key".to_string(),
-            focused_field: 2,
+            focused_field: 3,
+            editing_idx: None,
         });
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         assert!(get_step(&state).is_none());
@@ -4164,9 +4267,11 @@ mod tests {
         let default_claude_model = CLOUD_PROVIDERS[claude_idx].2;
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
+            name: "claude".to_string(),
             model: String::new(), // empty — should use default
             api_key: "sk-ant-key".to_string(),
-            focused_field: 2,
+            focused_field: 3,
+            editing_idx: None,
         });
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         if let Some(ModelConfig::Remote { model, .. }) = get_primary(&state) {
@@ -4231,7 +4336,7 @@ mod tests {
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { focused_field, .. }) = get_step(&state) {
             assert_eq!(
-                *focused_field, 2,
+                *focused_field, 3,
                 "ConfigureRemote should open focused on API key field"
             );
         } else {
@@ -4286,6 +4391,7 @@ mod tests {
         {
             *primary_model = ModelConfig::Remote {
                 provider: "claude".to_string(),
+                name: "claude".to_string(),
                 api_key: "sk-ant-test".to_string(),
                 model: "claude-sonnet-4-6".to_string(),
                 enabled: true,
