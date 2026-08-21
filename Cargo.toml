@@ -139,6 +139,7 @@ fs2 = "0.4"  # File locking for concurrent weight updates
 # CoreML/Metal support (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]
 # ONNX Runtime uses CoreML execution provider
+ort = { version = "2.0.0-rc.11", features = ["coreml"] }
 # Candle uses Metal (requires candle feature flag)
 candle-metal-kernels = { version = "0.8", optional = true }
 # GUI automation (Phase 3: Accessibility tools)

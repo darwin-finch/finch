@@ -84,6 +84,8 @@ impl OnnxLoader {
                             info!("Requesting CoreML execution provider");
                             providers.push(ep::CoreML::default().build());
                         }
+                        #[cfg(not(target_os = "macos"))]
+                        warn!("CoreML was requested on a non-macOS host; falling back to CPU");
                     }
                     ConfigExecutionProvider::CUDA => {
                         #[cfg(feature = "cuda")]
