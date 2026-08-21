@@ -128,7 +128,19 @@ pub enum ReplEvent {
     VocabSync(String),
 
     /// A message arrived from the peer event loop (the AI's own loop).
-    PeerMessage { text: String },
+    PeerMessage {
+        text: String,
+    },
+
+    /// Snapshot or live event from the currently attached named brain.
+    RemoteBrainMessage {
+        target: String,
+        message: crate::brain::shared::BrainWireMessage,
+    },
+    RemoteBrainError {
+        target: String,
+        error: String,
+    },
 
     /// Translations of a phrase arrived — update the corner ticker.
     /// Each item is `(language_name, translated_text)`.

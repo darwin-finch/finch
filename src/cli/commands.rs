@@ -1,6 +1,7 @@
 // Slash command handling
 
 use anyhow::Result;
+use crossterm::style::Stylize;
 
 use crate::metrics::MetricsLogger;
 use crate::models::ThresholdValidator;
@@ -56,9 +57,12 @@ pub enum Command {
     LicenseActivate(String), // /license activate <key>
     LicenseRemove,           // /license remove
     // Daemon brain sessions
-    Brain(String),       // /brain <task>  — spawn background research brain
-    Brains,              // /brains        — list active brain sessions
-    BrainCancel(String), // /brain cancel <name-or-id>
+    Brain(String),                 // /brain <task>  — spawn background research brain
+    Brains,                        // /brains        — list active brain sessions
+    BrainCancel(String),           // /brain cancel <name-or-id>
+    BrainAttach(String),           // /brain attach <name@machine[:port]>
+    BrainDetach,                   // /brain detach
+    BrainPassword(Option<String>), // /brain password [new-password]
     // Execution graph
     Graph, // /graph — show causal trace of last query
     // Co-Forth VM stack ops
@@ -175,6 +179,8 @@ impl Command {
             "/license remove" => return Some(Command::LicenseRemove),
             // Brain sessions
             "/brains" | "/brains list" => return Some(Command::Brains),
+            "/brain detach" => return Some(Command::BrainDetach),
+            "/brain password" => return Some(Command::BrainPassword(None)),
             "/graph" => return Some(Command::Graph),
             // Co-Forth VM
             "/vm" | "/vm dump" | "/vm copy" => return Some(Command::VmDump),
@@ -427,6 +433,18 @@ impl Command {
         }
 
         // Handle /brain cancel <name-or-id>
+        if let Some(rest) = trimmed.strip_prefix("/brain attach ") {
+            let target = rest.trim();
+            if !target.is_empty() {
+                return Some(Command::BrainAttach(target.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/brain password ") {
+            let password = rest.trim();
+            if !password.is_empty() {
+                return Some(Command::BrainPassword(Some(password.to_string())));
+            }
+        }
         if let Some(rest) = trimmed.strip_prefix("/brain cancel ") {
             let name = rest.trim();
             if !name.is_empty() {
@@ -713,7 +731,12 @@ pub fn handle_command(
             CommandOutput::Status("License commands should be handled in REPL.".to_string()),
         ),
         // Brain commands are handled directly in REPL
-        Command::Brain(_) | Command::Brains | Command::BrainCancel(_) => Ok(CommandOutput::Status(
+        Command::Brain(_)
+        | Command::Brains
+        | Command::BrainCancel(_)
+        | Command::BrainAttach(_)
+        | Command::BrainDetach
+        | Command::BrainPassword(_) => Ok(CommandOutput::Status(
             "Brain commands should be handled in REPL.".to_string(),
         )),
         // Graph command is handled directly in REPL
@@ -923,6 +946,9 @@ pub fn format_help() -> String {
          \x1b[90m                     Example: /brain investigate why auth tests are flaky\x1b[0m\n\
          \x1b[36m  /brains\x1b[0m            List active brain sessions\n\
          \x1b[36m  /brain cancel <n>\x1b[0m  Cancel a brain by name or id\n\
+         __BRAIN_ATTACH__  Attach to a named remote brain\n\
+         __BRAIN_DETACH__      Return to this local session\n\
+         __BRAIN_PASSWORD__ Show or rotate the local brain credential\n\
          \x1b[0m\n\
          \x1b[90m  Brains run in the daemon and survive REPL disconnects.\x1b[0m\n\
          \x1b[90m  When a brain has a question or plan, a dialog appears in the REPL.\x1b[0m\n\n\
@@ -937,6 +963,18 @@ pub fn format_help() -> String {
          \x1b[90m  • Find all TODO comments in my code\x1b[0m\n\n\
          \x1b[1;36m─────────────────────────────────────────────────────────────────────────\x1b[0m\n\
          \x1b[90mTip: Use Ctrl+C to cancel long-running queries\x1b[0m".to_string()
+    .replace(
+        "__BRAIN_ATTACH__",
+        &format!("  {}", "/brain attach <brain@machine>".cyan()),
+    )
+    .replace(
+        "__BRAIN_DETACH__",
+        &format!("  {}", "/brain detach".cyan()),
+    )
+    .replace(
+        "__BRAIN_PASSWORD__",
+        &format!("  {}", "/brain password [new]".cyan()),
+    )
 }
 
 pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
@@ -1087,6 +1125,22 @@ pub fn format_training(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_named_brain_attachment_commands() {
+        assert!(matches!(
+            Command::parse("/brain attach finch@workstation.local"),
+            Some(Command::BrainAttach(target)) if target == "finch@workstation.local"
+        ));
+        assert!(matches!(
+            Command::parse("/brain detach"),
+            Some(Command::BrainDetach)
+        ));
+        assert!(matches!(
+            Command::parse("/brain password new-secret-value"),
+            Some(Command::BrainPassword(Some(password))) if password == "new-secret-value"
+        ));
+    }
 
     #[test]
     fn test_parse_patterns_list() {

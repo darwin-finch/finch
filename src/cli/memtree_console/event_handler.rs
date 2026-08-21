@@ -95,6 +95,8 @@ impl EventHandler {
             ReplEvent::VocabSync(_) => {}
             ReplEvent::PeerMessage { .. } => {}
             ReplEvent::Translations { .. } => {}
+            ReplEvent::RemoteBrainMessage { .. } => {}
+            ReplEvent::RemoteBrainError { .. } => {}
         }
 
         Ok(())

@@ -293,6 +293,10 @@ pub struct EventLoop {
     /// Remote peer daemon addresses (host:port) from --peer flag.
     remote_peers: Vec<String>,
 
+    /// Explicit destination for prompts and VM programs while attached.
+    /// This is singular by design: host effects are never broadcast.
+    active_remote_brain: Option<crate::brain::remote::RemoteBrainClient>,
+
     /// Base URL of the local daemon (e.g. "http://127.0.0.1:8000").
     /// Used by the cross-machine relay poller.
     daemon_base_url: Option<String>,
@@ -1324,6 +1328,7 @@ impl EventLoop {
             joined_channels: load_joined_channels(),
             recent_channel_msgs: std::collections::VecDeque::new(),
             remote_peers,
+            active_remote_brain: None,
             daemon_base_url,
             peer_inbox_mirror_tx,
             llm_tx,
@@ -1370,6 +1375,10 @@ impl EventLoop {
             })
             .unwrap_or_else(|| "~".to_string());
         self.cwd = cwd.clone();
+        self.status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::SessionLabel,
+            format!("◆ {}", self.session_label),
+        );
 
         {
             let mut tui = self.tui_renderer.lock().await;
@@ -1779,6 +1788,8 @@ s" it is ours"      s" -1 is ours"     argue
                         ReplEvent::VocabSync(_) => "VocabSync",
                         ReplEvent::PeerMessage { .. } => "PeerMessage",
                         ReplEvent::Translations { .. } => "Translations",
+                        ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
+                        ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -2650,7 +2661,15 @@ Rules:\n\
                         self.execute_query(query).await?;
                     }
                     Command::ForthEval(code) => {
-                        self.handle_forth_eval(code).await?;
+                        if self.active_remote_brain.is_some() {
+                            self.push_remote_brain(crate::brain::shared::BrainEventKind::Program {
+                                language: crate::brain::shared::ProgramLanguage::Forth,
+                                source: code,
+                            })
+                            .await?;
+                        } else {
+                            self.handle_forth_eval(code).await?;
+                        }
                     }
                     Command::ForthUndo => {
                         self.handle_forth_undo().await?;
@@ -2699,6 +2718,15 @@ Rules:\n\
                     }
                     Command::Disconnect(name) => {
                         self.handle_disconnect(name).await?;
+                    }
+                    Command::BrainAttach(target) => {
+                        self.handle_brain_attach(target).await?;
+                    }
+                    Command::BrainDetach => {
+                        self.handle_brain_detach().await?;
+                    }
+                    Command::BrainPassword(password) => {
+                        self.handle_brain_password(password).await?;
                     }
                     Command::Room(uuid) => {
                         self.handle_room(uuid).await?;
@@ -2822,6 +2850,14 @@ Rules:\n\
 
         // ── Lisp: input starting with `(` is a Lisp expression ───────────────
         if input.trim_start().starts_with('(') {
+            if self.active_remote_brain.is_some() {
+                return self
+                    .push_remote_brain(crate::brain::shared::BrainEventKind::Program {
+                        language: crate::brain::shared::ProgramLanguage::Lisp,
+                        source: input,
+                    })
+                    .await;
+            }
             self.output_manager.write_user(input.clone());
             // Broadcast to channels so peers can see (and /exec) it.
             for chan in &self.joined_channels {
@@ -2942,6 +2978,12 @@ Rules:\n\
         echo: bool,
         chat_only: bool,
     ) -> Result<()> {
+        if self.active_remote_brain.is_some() {
+            return self
+                .push_remote_brain(crate::brain::shared::BrainEventKind::Prompt { text: input })
+                .await;
+        }
+
         // Drain any pending images from TUI (pasted before sending)
         let pending_images: Vec<(String, String)> = {
             let mut tui = self.tui_renderer.lock().await;
@@ -3797,6 +3839,19 @@ Rules:\n\
                     self.render_tui().await?;
                 }
             }
+            ReplEvent::RemoteBrainMessage { target, message } => {
+                let is_current = self
+                    .active_remote_brain
+                    .as_ref()
+                    .is_some_and(|client| client.target.display_name() == target);
+                if is_current {
+                    self.render_remote_brain_message(message).await?;
+                }
+            }
+            ReplEvent::RemoteBrainError { target, error } => {
+                self.output_manager.write_info(format!("{target}: {error}"));
+                self.render_tui().await?;
+            }
             ReplEvent::PeerMessage { text } => {
                 use crossterm::style::Stylize;
                 // Channel messages are tagged with a sentinel that may be preceded
@@ -4116,6 +4171,206 @@ Rules:\n\
         });
 
         Ok(())
+    }
+
+    /// Attach this TUI to one daemon-owned brain. All prompts and explicit
+    /// Forth/Lisp programs are routed to that host until `/brain detach`.
+    async fn handle_brain_attach(&mut self, value: String) -> Result<()> {
+        let target = match crate::brain::remote::RemoteBrainTarget::parse(&value) {
+            Ok(target) => target,
+            Err(error) => {
+                self.output_manager
+                    .write_info(format!("brain attach: {error}"));
+                self.render_tui().await?;
+                return Ok(());
+            }
+        };
+        let password = crate::config::load_config()
+            .map(|config| config.server.brain_password)
+            .unwrap_or_default();
+        let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let snapshot = match client.snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.output_manager.write_info(format!(
+                    "brain attach {}: {error}",
+                    client.target.display_name()
+                ));
+                self.render_tui().await?;
+                return Ok(());
+            }
+        };
+        client.target.machine = snapshot.environment.machine.clone();
+        let mut incoming = match client.watch().await {
+            Ok(incoming) => incoming,
+            Err(error) => {
+                self.output_manager.write_info(format!(
+                    "brain attach {}: {error}",
+                    client.target.display_name()
+                ));
+                self.render_tui().await?;
+                return Ok(());
+            }
+        };
+
+        let target_name = client.target.display_name();
+        self.active_remote_brain = Some(client);
+        self.status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::SessionLabel,
+            format!("◆ {target_name}"),
+        );
+        self.render_remote_brain_message(crate::brain::shared::BrainWireMessage::Snapshot {
+            brain: snapshot,
+        })
+        .await?;
+
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(message) = incoming.recv().await {
+                if event_tx
+                    .send(ReplEvent::RemoteBrainMessage {
+                        target: target_name.clone(),
+                        message,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn handle_brain_detach(&mut self) -> Result<()> {
+        if let Some(client) = self.active_remote_brain.take() {
+            self.output_manager
+                .write_info(format!("detached from {}", client.target.display_name()));
+        }
+        self.status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::SessionLabel,
+            format!("◆ {}", self.session_label),
+        );
+        self.render_tui().await
+    }
+
+    /// Show or rotate the credential only on the execution environment's local daemon.
+    async fn handle_brain_password(&mut self, password: Option<String>) -> Result<()> {
+        if self.active_remote_brain.is_some() {
+            self.output_manager
+                .write_info("brain password is visible only from the brain's execution host");
+            return self.render_tui().await;
+        }
+        let base = self
+            .daemon_base_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}", crate::config::constants::DEFAULT_HTTP_ADDR));
+        let http = reqwest::Client::new();
+        match password {
+            Some(password) => {
+                let response = http
+                    .put(format!("{base}/v1/brains/password"))
+                    .json(&serde_json::json!({"password": password}))
+                    .send()
+                    .await?;
+                if response.status().is_success() {
+                    self.output_manager.write_info("brain password updated");
+                } else {
+                    self.output_manager.write_info(format!(
+                        "brain password update failed: {}",
+                        response.text().await.unwrap_or_default()
+                    ));
+                }
+            }
+            None => {
+                let response = http
+                    .get(format!("{base}/v1/brains/password"))
+                    .send()
+                    .await?;
+                if response.status().is_success() {
+                    let body: serde_json::Value = response.json().await?;
+                    self.output_manager.write_info(format!(
+                        "brain password: {}",
+                        body["password"].as_str().unwrap_or("<not configured>")
+                    ));
+                } else {
+                    self.output_manager
+                        .write_info("brain password is unavailable from this client");
+                }
+            }
+        }
+        self.render_tui().await
+    }
+
+    async fn push_remote_brain(
+        &mut self,
+        kind: crate::brain::shared::BrainEventKind,
+    ) -> Result<()> {
+        let Some(client) = self.active_remote_brain.clone() else {
+            return Ok(());
+        };
+        let target = client.target.display_name();
+        let sender = self.session_label.clone();
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            if let Err(error) = client.push(&sender, kind).await {
+                let _ = event_tx.send(ReplEvent::RemoteBrainError {
+                    target,
+                    error: error.to_string(),
+                });
+            }
+        });
+        Ok(())
+    }
+
+    async fn render_remote_brain_message(
+        &mut self,
+        message: crate::brain::shared::BrainWireMessage,
+    ) -> Result<()> {
+        match message {
+            crate::brain::shared::BrainWireMessage::Snapshot { brain } => {
+                self.output_manager.clear();
+                self.output_manager.write_info(format!(
+                    "environment: {}:{} (generation {})",
+                    brain.environment.machine,
+                    brain.environment.workspace.display(),
+                    brain.environment.generation,
+                ));
+                for event in &brain.events {
+                    self.render_remote_brain_event(event);
+                }
+            }
+            crate::brain::shared::BrainWireMessage::Event { event } => {
+                self.render_remote_brain_event(&event);
+            }
+        }
+        self.render_tui().await
+    }
+
+    fn render_remote_brain_event(&self, event: &crate::brain::shared::BrainEvent) {
+        use crate::brain::shared::BrainEventKind;
+        match &event.kind {
+            BrainEventKind::Prompt { text } => self
+                .output_manager
+                .write_user(format!("{}: {text}", event.sender)),
+            BrainEventKind::Program { language, source } => {
+                let command = match language {
+                    crate::brain::shared::ProgramLanguage::Forth => "/forth",
+                    crate::brain::shared::ProgramLanguage::Lisp => "/lisp",
+                };
+                self.output_manager
+                    .write_user(format!("{} {command} {source}", event.sender));
+            }
+            BrainEventKind::ProgramPopped { program_seq } => self
+                .output_manager
+                .write_info(format!("{} popped program #{program_seq}", event.sender)),
+            BrainEventKind::Result { output, error, .. } => {
+                if let Some(error) = error {
+                    self.output_manager.write_info(format!("error: {error}"));
+                } else if !output.is_empty() {
+                    self.output_manager.write_response(output.clone());
+                }
+            }
+        }
     }
 
     /// `/connect <host:port>` — manually add a peer to peers list and current room.
