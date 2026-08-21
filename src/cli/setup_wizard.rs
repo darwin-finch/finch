@@ -209,8 +209,6 @@ enum SectionState {
         editing_mode: bool,
         editing_model_mode: bool, // editing model name for selected entry
         model_input: String,      // model name input buffer
-        finch_api_key: String,
-        editing_finch_api_key: bool,
         adding_provider: Option<AddProviderStep>,
         error: Option<String>,
     },
@@ -229,6 +227,8 @@ enum SectionState {
         debug: bool,
         hf_token: String,
         editing_hf_token: bool,
+        finch_api_key: String,
+        editing_finch_api_key: bool,
         #[cfg(target_os = "macos")]
         gui_automation: bool,
         daemon_only_mode: bool,
@@ -405,10 +405,6 @@ impl WizardState {
                 editing_mode: false,
                 editing_model_mode: false,
                 model_input: String::new(),
-                finch_api_key: existing_config
-                    .and_then(|config| config.server.api_keys.first().cloned())
-                    .unwrap_or_default(),
-                editing_finch_api_key: false,
                 adding_provider: None,
                 error: None,
             },
@@ -467,6 +463,10 @@ impl WizardState {
                     .and_then(|c| c.huggingface_token.clone())
                     .unwrap_or_default(),
                 editing_hf_token: false,
+                finch_api_key: existing_config
+                    .and_then(|config| config.server.api_keys.first().cloned())
+                    .unwrap_or_default(),
+                editing_finch_api_key: false,
                 #[cfg(target_os = "macos")]
                 gui_automation: existing_config
                     .map(|c| c.features.gui_automation)
@@ -885,8 +885,6 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
         editing_mode,
         editing_model_mode,
         model_input,
-        finch_api_key,
-        editing_finch_api_key,
         adding_provider,
         error,
     }) = state.sections.get_mut(&WizardSection::Models)
@@ -1346,18 +1344,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
             return Ok(false);
         }
 
-        if *editing_finch_api_key {
-            match key.code {
-                KeyCode::Char(c) => finch_api_key.push(c),
-                KeyCode::Backspace => {
-                    finch_api_key.pop();
-                }
-                KeyCode::Enter | KeyCode::Esc => {
-                    *editing_finch_api_key = false;
-                }
-                _ => {}
-            }
-        } else if *editing_model_mode {
+        if *editing_model_mode {
             // Editing model name for the selected entry
             match key.code {
                 KeyCode::Char(c) => {
@@ -1467,9 +1454,6 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     };
                     *model_input = current_model;
                     *editing_model_mode = true;
-                }
-                KeyCode::Char('f') | KeyCode::Char('F') => {
-                    *editing_finch_api_key = true;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     // Open add-provider overlay (type selection first)
@@ -1684,17 +1668,33 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
 }
 
 #[cfg(target_os = "macos")]
+const SETTINGS_FEATURE_COUNT: usize = 10;
+#[cfg(not(target_os = "macos"))]
 const SETTINGS_FEATURE_COUNT: usize = 9;
-#[cfg(not(target_os = "macos"))]
-const SETTINGS_FEATURE_COUNT: usize = 8;
 #[cfg(target_os = "macos")]
+const SETTINGS_HF_TOKEN_IDX: usize = 4;
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_HF_TOKEN_IDX: usize = 3;
+#[cfg(target_os = "macos")]
+const SETTINGS_FINCH_API_KEY_IDX: usize = 5;
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_FINCH_API_KEY_IDX: usize = 4;
+#[cfg(target_os = "macos")]
+const SETTINGS_DAEMON_ONLY_IDX: usize = 6;
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_DAEMON_ONLY_IDX: usize = 5;
+#[cfg(target_os = "macos")]
+const SETTINGS_MDNS_IDX: usize = 7;
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_MDNS_IDX: usize = 6;
+#[cfg(target_os = "macos")]
+const SETTINGS_AUTO_DISCOVER_IDX: usize = 8;
+#[cfg(not(target_os = "macos"))]
 const SETTINGS_AUTO_DISCOVER_IDX: usize = 7;
-#[cfg(not(target_os = "macos"))]
-const SETTINGS_AUTO_DISCOVER_IDX: usize = 6;
 #[cfg(target_os = "macos")]
-const SETTINGS_CONTEXT_IDX: usize = 8;
+const SETTINGS_CONTEXT_IDX: usize = 9;
 #[cfg(not(target_os = "macos"))]
-const SETTINGS_CONTEXT_IDX: usize = 7;
+const SETTINGS_CONTEXT_IDX: usize = 8;
 
 /// Handle input for Features section (with arrow key navigation)
 fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
@@ -1704,6 +1704,8 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         debug,
         hf_token,
         editing_hf_token,
+        finch_api_key,
+        editing_finch_api_key,
         #[cfg(target_os = "macos")]
         gui_automation,
         daemon_only_mode,
@@ -1730,8 +1732,22 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
             return Ok(false);
         }
 
-        // non-macOS: 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=auto_discover, 7=ctx_lines
-        // macOS:     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=auto_discover, 8=ctx_lines
+        if *editing_finch_api_key {
+            match key.code {
+                KeyCode::Char(c) => finch_api_key.push(c),
+                KeyCode::Backspace => {
+                    finch_api_key.pop();
+                }
+                KeyCode::Enter | KeyCode::Esc => {
+                    *editing_finch_api_key = false;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        // Text fields and toggle rows share these constants with the renderer so
+        // keyboard focus and visual selection cannot drift apart.
         match key.code {
             KeyCode::Up => {
                 if *selected_idx > 0 {
@@ -1763,9 +1779,8 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     1 => *auto_approve = !*auto_approve,
                     2 => *debug = !*debug,
                     3 => *gui_automation = !*gui_automation,
-                    // index 4 = hf_token (no toggle)
-                    5 => *daemon_only_mode = !*daemon_only_mode,
-                    6 => *mdns_discovery = !*mdns_discovery,
+                    SETTINGS_DAEMON_ONLY_IDX => *daemon_only_mode = !*daemon_only_mode,
+                    SETTINGS_MDNS_IDX => *mdns_discovery = !*mdns_discovery,
                     SETTINGS_AUTO_DISCOVER_IDX => *auto_discover = !*auto_discover,
                     // index 8 = ctx_lines (use ◀/▶)
                     _ => {}
@@ -1775,22 +1790,18 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     0 => *streaming = !*streaming,
                     1 => *auto_approve = !*auto_approve,
                     2 => *debug = !*debug,
-                    // index 3 = hf_token (no toggle)
-                    4 => *daemon_only_mode = !*daemon_only_mode,
-                    5 => *mdns_discovery = !*mdns_discovery,
+                    SETTINGS_DAEMON_ONLY_IDX => *daemon_only_mode = !*daemon_only_mode,
+                    SETTINGS_MDNS_IDX => *mdns_discovery = !*mdns_discovery,
                     SETTINGS_AUTO_DISCOVER_IDX => *auto_discover = !*auto_discover,
                     // index 7 = ctx_lines (use ◀/▶)
                     _ => {}
                 }
             }
             KeyCode::Char('e') | KeyCode::Char('E') => {
-                // 'E' enters HF token edit mode when that row is selected
-                #[cfg(target_os = "macos")]
-                let hf_idx = 4;
-                #[cfg(not(target_os = "macos"))]
-                let hf_idx = 3;
-                if *selected_idx == hf_idx {
+                if *selected_idx == SETTINGS_HF_TOKEN_IDX {
                     *editing_hf_token = true;
+                } else if *selected_idx == SETTINGS_FINCH_API_KEY_IDX {
+                    *editing_finch_api_key = true;
                 }
             }
             KeyCode::Enter => {
@@ -1835,19 +1846,13 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract models
-    let (primary_model, tool_models, finch_api_key) = if let Some(SectionState::Models {
+    let (primary_model, tool_models) = if let Some(SectionState::Models {
         primary_model,
         tool_models,
-        finch_api_key,
         ..
-    }) =
-        state.sections.get(&WizardSection::Models)
+    }) = state.sections.get(&WizardSection::Models)
     {
-        (
-            primary_model.clone(),
-            tool_models.clone(),
-            finch_api_key.trim().to_string(),
-        )
+        (primary_model.clone(), tool_models.clone())
     } else {
         anyhow::bail!("Models not configured");
     };
@@ -1868,6 +1873,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         streaming,
         debug,
         hf_token_val,
+        finch_api_key_val,
         daemon_only,
         mdns,
         auto_disc,
@@ -1877,6 +1883,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         streaming,
         debug,
         hf_token,
+        finch_api_key,
         daemon_only_mode,
         mdns_discovery,
         auto_discover,
@@ -1893,13 +1900,24 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
             } else {
                 Some(hf_token.clone())
             },
+            finch_api_key.trim().to_string(),
             *daemon_only_mode,
             *mdns_discovery,
             *auto_discover,
             *memory_context_lines,
         )
     } else {
-        (false, true, false, None, false, false, true, 4)
+        (
+            false,
+            true,
+            false,
+            None,
+            String::new(),
+            false,
+            false,
+            true,
+            4,
+        )
     };
 
     #[cfg(target_os = "macos")]
@@ -2061,7 +2079,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         model_size,
         custom_model_repo: None,
         teachers,
-        finch_api_key,
+        finch_api_key: finch_api_key_val,
         default_persona,
         auto_approve_tools: auto_approve,
         streaming_enabled: streaming,
@@ -2129,9 +2147,7 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     // Render help text
     let help_text = match state.current_section {
         WizardSection::Themes => "↑/↓: Choose theme | Enter: Next | Tab: Jump to section",
-        WizardSection::Models => {
-            "E: Provider key  M: Model name  F: Finch client key  A: Add  Tab: Next"
-        }
+        WizardSection::Models => "E: Provider key  M: Model name  A: Add  D: Remove  Tab: Next",
         WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next | Tab: Jump",
         WizardSection::Features => {
             "↑/↓: Navigate | Space: Toggle | Enter: Save | Tab: Jump to section"
@@ -2164,8 +2180,6 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             editing_mode,
             editing_model_mode,
             model_input,
-            finch_api_key,
-            editing_finch_api_key,
             adding_provider,
             error,
         }) => render_models_section(
@@ -2177,8 +2191,6 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *editing_mode,
             *editing_model_mode,
             model_input,
-            finch_api_key,
-            *editing_finch_api_key,
             adding_provider.as_ref(),
             error.as_deref(),
         ),
@@ -2205,6 +2217,8 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             debug,
             hf_token,
             editing_hf_token,
+            finch_api_key,
+            editing_finch_api_key,
             #[cfg(target_os = "macos")]
             gui_automation,
             daemon_only_mode,
@@ -2220,6 +2234,8 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *debug,
             hf_token,
             *editing_hf_token,
+            finch_api_key,
+            *editing_finch_api_key,
             #[cfg(target_os = "macos")]
             *gui_automation,
             *daemon_only_mode,
@@ -2360,8 +2376,6 @@ fn render_models_section(
     editing_mode: bool,
     editing_model_mode: bool,
     model_input: &str,
-    finch_api_key: &str,
-    editing_finch_api_key: bool,
     adding_provider: Option<&AddProviderStep>,
     error: Option<&str>,
 ) {
@@ -2533,15 +2547,7 @@ fn render_models_section(
     f.render_widget(list, chunks[2]);
 
     // Input panel (chunks[3]): bordered text box when in editing mode, dim hint otherwise
-    if editing_finch_api_key {
-        let panel = Paragraph::new(format!("{}█", finch_api_key)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Edit Finch Client API Key")
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
-        f.render_widget(panel, chunks[3]);
-    } else if editing_mode {
+    if editing_mode {
         // Show current API key in a bordered box so the user sees what they're typing
         let current_key = if selected_idx == 0 {
             match primary_model {
@@ -2570,31 +2576,17 @@ fn render_models_section(
         );
         f.render_widget(panel, chunks[3]);
     } else {
-        let client_key = if finch_api_key.is_empty() {
-            "Finch client key: [not set — authentication disabled]".to_string()
-        } else {
-            let prefix: String = finch_api_key.chars().take(4).collect();
-            let suffix: String = finch_api_key
-                .chars()
-                .rev()
-                .take(4)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            format!("Finch client key: {prefix}...{suffix}")
-        };
-        let hint = Paragraph::new(format!("{client_key} · Press F to edit"))
+        let hint = Paragraph::new("Press E to edit provider key · M to edit model · P for primary")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         f.render_widget(hint, chunks[3]);
     }
 
     // Instructions (chunks[4])
-    let instructions_text = if editing_mode || editing_model_mode || editing_finch_api_key {
+    let instructions_text = if editing_mode || editing_model_mode {
         "Type here | Enter/Esc: Save & return"
     } else {
-        "E: Provider key | F: Finch key | M: Model | P: Primary | A: Add | D: Remove"
+        "E: Provider key | M: Model | P: Primary | A: Add | D: Remove | Tab: Next"
     };
     let instructions = Paragraph::new(instructions_text)
         .style(
@@ -3129,6 +3121,8 @@ fn render_features_section(
     debug: bool,
     hf_token: &str,
     editing_hf_token: bool,
+    finch_api_key: &str,
+    editing_finch_api_key: bool,
     #[cfg(target_os = "macos")] gui_automation: bool,
     daemon_only_mode: bool,
     mdns_discovery: bool,
@@ -3154,9 +3148,7 @@ fn render_features_section(
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
-    // Build feature list: toggle-able booleans + HF token text field + numeric spinner
-    // Index mapping (non-macOS): 0=streaming, 1=auto_approve, 2=debug, 3=hf_token, 4=daemon, 5=mdns, 6=auto_discover, 7=ctx_lines
-    // Index mapping (macOS):     0=streaming, 1=auto_approve, 2=debug, 3=gui_auto, 4=hf_token, 5=daemon, 6=mdns, 7=auto_discover, 8=ctx_lines
+    // Build feature list: toggle-able booleans, editable credentials, and a spinner.
 
     #[cfg(not(target_os = "macos"))]
     let bool_features: Vec<(&str, bool, &str)> = vec![
@@ -3232,19 +3224,14 @@ fn render_features_section(
         ),
     ];
 
-    #[cfg(not(target_os = "macos"))]
-    let hf_idx = 3usize;
-    #[cfg(target_os = "macos")]
-    let hf_idx = 4usize;
-
-    // Build list items interleaving bool features with the HF token row
+    // Build list items interleaving bool features with editable credential rows.
     let mut items: Vec<ListItem> = Vec::new();
     let mut list_idx = 0usize; // tracks which visual row we're building
 
     for (name, enabled, desc) in bool_features.iter() {
         // Insert HF token row before the appropriate bool feature
-        if list_idx == hf_idx {
-            let is_hf_selected = selected_idx == hf_idx;
+        if list_idx == SETTINGS_HF_TOKEN_IDX {
+            let is_hf_selected = selected_idx == SETTINGS_HF_TOKEN_IDX;
             let (prefix, suffix, style) = if is_hf_selected {
                 (
                     ">>> ",
@@ -3284,6 +3271,52 @@ fn render_features_section(
                 )),
             ];
             items.push(ListItem::new(hf_lines));
+            list_idx += 1;
+        }
+
+        if list_idx == SETTINGS_FINCH_API_KEY_IDX {
+            let is_selected = selected_idx == SETTINGS_FINCH_API_KEY_IDX;
+            let (prefix, suffix, style) = if is_selected {
+                (
+                    ">>> ",
+                    " <<<",
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("    ", "", Style::default().fg(Color::Cyan))
+            };
+            let key_display = if editing_finch_api_key {
+                format!("{}Finch client key: {}|{}", prefix, finch_api_key, suffix)
+            } else if finch_api_key.is_empty() {
+                format!(
+                    "{}Finch client key: [not set — authentication disabled; press E to enter]{}",
+                    prefix, suffix
+                )
+            } else {
+                let masked = format!(
+                    "{}...{}",
+                    finch_api_key.chars().take(4).collect::<String>(),
+                    finch_api_key
+                        .chars()
+                        .rev()
+                        .take(4)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect::<String>()
+                );
+                format!("{}Finch client key: {}{}", prefix, masked, suffix)
+            };
+            items.push(ListItem::new(vec![
+                Line::from(Span::styled(key_display, style)),
+                Line::from(Span::styled(
+                    "        Key OpenAI-compatible clients use to connect to Finch",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]));
             list_idx += 1;
         }
 
@@ -3327,7 +3360,7 @@ fn render_features_section(
     }
 
     // If hf_idx is after all bool features, append it at the end
-    if hf_idx >= list_idx {
+    if SETTINGS_HF_TOKEN_IDX >= list_idx {
         let is_hf_selected = selected_idx == list_idx;
         let (prefix, suffix, style) = if is_hf_selected {
             (
@@ -3410,8 +3443,10 @@ fn render_features_section(
 
     let instructions_text = if editing_hf_token {
         "Type HuggingFace token | Enter/Esc: Done"
+    } else if editing_finch_api_key {
+        "Type Finch client key | Enter/Esc: Done"
     } else {
-        "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit HF token | Enter: Continue"
+        "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit selected key/token | Enter: Continue"
     };
     let instructions = Paragraph::new(instructions_text)
         .style(
@@ -3554,19 +3589,26 @@ mod tests {
     #[test]
     fn peer_discovery_and_context_lines_have_distinct_rows() {
         assert_ne!(SETTINGS_AUTO_DISCOVER_IDX, SETTINGS_CONTEXT_IDX);
+        assert_ne!(SETTINGS_FINCH_API_KEY_IDX, SETTINGS_AUTO_DISCOVER_IDX);
+        assert_eq!(SETTINGS_AUTO_DISCOVER_IDX + 1, SETTINGS_CONTEXT_IDX);
         assert_eq!(SETTINGS_CONTEXT_IDX, SETTINGS_FEATURE_COUNT - 1);
     }
 
     #[test]
     fn finch_client_key_can_be_entered_and_applied() {
         let mut state = WizardState::new(None);
-        state.current_section = WizardSection::Models;
-
-        handle_models_input(&mut state, key(KeyCode::Char('f'))).unwrap();
-        for c in "custom-secret".chars() {
-            handle_models_input(&mut state, key(KeyCode::Char(c))).unwrap();
+        state.current_section = WizardSection::Features;
+        if let Some(SectionState::Features { selected_idx, .. }) =
+            state.sections.get_mut(&WizardSection::Features)
+        {
+            *selected_idx = SETTINGS_FINCH_API_KEY_IDX;
         }
-        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+        handle_features_input(&mut state, key(KeyCode::Char('e'))).unwrap();
+        for c in "custom-secret".chars() {
+            handle_features_input(&mut state, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_features_input(&mut state, key(KeyCode::Enter)).unwrap();
 
         let result = build_setup_result(&state).unwrap();
         assert_eq!(result.finch_api_key, "custom-secret");

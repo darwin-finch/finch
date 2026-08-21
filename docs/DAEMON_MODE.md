@@ -163,7 +163,7 @@ auth_enabled = true
 api_keys = ["replace-with-a-long-random-key"]  # one key for all model providers
 ```
 
-The setup wizard configures this as **Finch client key**. OpenAI-compatible
+The setup wizard configures this as **Finch client key** on the Settings page. OpenAI-compatible
 clients send it in the standard `Authorization: Bearer <key>` header. Provider
 API keys remain separate and are never accepted as daemon client credentials.
 The key protects the model API; Finch's independently authenticated peer
