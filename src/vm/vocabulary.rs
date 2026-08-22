@@ -81,6 +81,11 @@ pub fn core_vocabulary() -> Vocabulary {
             pure(vec![Type::String, Type::String], vec![Type::String]),
         ),
         ("bytes".into(), pure(vec![Type::String], vec![Type::Bytes])),
+        ("space".into(), pure(Vec::new(), vec![Type::String])),
+        (
+            "int-to-string".into(),
+            pure(vec![Type::Int], vec![Type::String]),
+        ),
         (
             "file-read".into(),
             capability(

@@ -459,6 +459,19 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             };
             stack.push(TypedValue::Bytes(value.into_bytes()));
         }
+        "int-to-string" => {
+            let value = pop(stack)?;
+            let TypedValue::Int(value) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-012",
+                    DiagnosticPhase::Interpretation,
+                    "int-to-string requires an integer",
+                    Some(origin),
+                ));
+            };
+            stack.push(TypedValue::String(value.to_string()));
+        }
+        "space" => stack.push(TypedValue::String(" ".into())),
         "path" => {
             let value = pop(stack)?;
             let TypedValue::String(relative) = value else {

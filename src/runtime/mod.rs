@@ -1659,6 +1659,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_forth_can_say_computed_values_progressively() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "s\"the result of 2+3 is \" say 2 3 + int-to-string space str-cat say s\"is that correct?\" say",
+                ExecutionEffect::VmRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.output, "the result of 2+3 is 5 is that correct?");
+    }
+
+    #[tokio::test]
     async fn inspection_reports_ordered_stack_and_vocabulary() {
         let runtime = ProgramRuntime::new();
         runtime

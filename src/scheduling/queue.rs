@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -29,55 +30,128 @@ pub struct ScheduledTask {
 }
 
 /// Task queue backed by SQLite
-#[allow(dead_code)]
 pub struct TaskQueue {
     db_path: PathBuf,
 }
 
 impl TaskQueue {
-    /// Create new task queue
-    ///
-    /// The SQLite backend is not yet implemented (GitHub Issue #8).
-    /// Tasks enqueued will not be persisted.
     pub fn new(db_path: PathBuf) -> Result<Self> {
-        Ok(Self { db_path })
+        let queue = Self { db_path };
+        queue.connection()?.execute_batch(
+            "CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scheduled_time TEXT NOT NULL,
+                task TEXT NOT NULL,
+                context TEXT NOT NULL,
+                recurring TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_run TEXT,
+                retries INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(queue)
     }
 
-    /// Enqueue a new task.
-    ///
-    /// **Not yet implemented** — the SQLite backend is missing.
-    /// Returns an error so callers know the task was not stored,
-    /// rather than silently discarding it.
-    pub async fn enqueue(&self, _task: ScheduledTask) -> Result<i64> {
-        anyhow::bail!(
-            "Task scheduling not yet implemented (GitHub Issue #8). \
-             The SQLite backend for the task queue has not been built. \
-             Task was not persisted."
-        )
+    fn connection(&self) -> Result<Connection> {
+        Ok(Connection::open(&self.db_path)?)
     }
 
-    /// Get ready tasks (scheduled_time <= now, status = Pending).
-    ///
-    /// Returns empty while the backend is unimplemented — the scheduler
-    /// loop runs but finds no work to do, which is harmless.
+    pub async fn enqueue(&self, task: ScheduledTask) -> Result<i64> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO scheduled_tasks
+             (scheduled_time, task, context, recurring, status, created_at, last_run, retries)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                task.scheduled_time.to_rfc3339(),
+                task.task,
+                task.context,
+                task.recurring,
+                serde_json::to_string(&task.status)?,
+                task.created_at.to_rfc3339(),
+                task.last_run.map(|time| time.to_rfc3339()),
+                task.retries,
+            ],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
     pub async fn get_ready_tasks(&self) -> Result<Vec<ScheduledTask>> {
-        Ok(Vec::new())
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, scheduled_time, task, context, recurring, status, created_at, last_run, retries
+             FROM scheduled_tasks WHERE status = ?1 AND scheduled_time <= ?2 ORDER BY scheduled_time, id",
+        )?;
+        let rows = statement.query_map(
+            params![
+                serde_json::to_string(&TaskStatus::Pending)?,
+                Utc::now().to_rfc3339()
+            ],
+            |row| {
+                let status: String = row.get(5)?;
+                Ok(ScheduledTask {
+                    id: row.get(0)?,
+                    scheduled_time: parse_time(row.get(1)?)?,
+                    task: row.get(2)?,
+                    context: row.get(3)?,
+                    recurring: row.get(4)?,
+                    status: serde_json::from_str(&status).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    created_at: parse_time(row.get(6)?)?,
+                    last_run: row
+                        .get::<_, Option<String>>(7)?
+                        .map(parse_time)
+                        .transpose()?,
+                    retries: row.get(8)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Mark task as completed (no-op while backend is unimplemented).
-    pub async fn mark_completed(&self, _task_id: i64) -> Result<()> {
+    pub async fn mark_completed(&self, task_id: i64) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE scheduled_tasks SET status = ?1, last_run = ?2 WHERE id = ?3",
+            params![
+                serde_json::to_string(&TaskStatus::Completed)?,
+                Utc::now().to_rfc3339(),
+                task_id
+            ],
+        )?;
         Ok(())
     }
 
-    /// Mark task as failed (no-op while backend is unimplemented).
-    pub async fn mark_failed(&self, _task_id: i64, _error: &str) -> Result<()> {
+    pub async fn mark_failed(&self, task_id: i64, _error: &str) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE scheduled_tasks SET status = ?1, last_run = ?2 WHERE id = ?3",
+            params![
+                serde_json::to_string(&TaskStatus::Failed)?,
+                Utc::now().to_rfc3339(),
+                task_id
+            ],
+        )?;
         Ok(())
     }
 
-    /// Increment retry count (no-op while backend is unimplemented).
-    pub async fn increment_retry(&self, _task_id: i64) -> Result<()> {
+    pub async fn increment_retry(&self, task_id: i64) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE scheduled_tasks SET retries = retries + 1, status = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&TaskStatus::Pending)?, task_id],
+        )?;
         Ok(())
     }
+}
+
+fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&value)
+        .map(|time| time.with_timezone(&Utc))
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 #[cfg(test)]
@@ -147,20 +221,17 @@ mod tests {
         drop(queue);
     }
 
-    // --- Regression: enqueue must return an error, not silently discard tasks ---
     #[tokio::test]
-    async fn test_enqueue_returns_error_not_implemented() {
-        let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q2.db")).unwrap();
+    async fn test_enqueue_persists_tasks() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = TaskQueue::new(database.path().to_path_buf()).unwrap();
         let task = make_task("test_task");
-        let result = queue.enqueue(task).await;
-        assert!(
-            result.is_err(),
-            "enqueue should return an error until SQLite backend is implemented"
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
+        let id = queue.enqueue(task).await.unwrap();
+        assert!(id > 0);
+        let ready = queue.get_ready_tasks().await.unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, Some(id));
+        assert_eq!(ready[0].task, "test_task");
     }
 
     #[tokio::test]
