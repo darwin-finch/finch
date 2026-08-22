@@ -17,6 +17,8 @@ pub struct TypedExecution {
     pub status: TypedExecutionStatus,
     pub values: Vec<TypedValue>,
     pub output: String,
+    #[serde(default)]
+    pub output_chunks: Vec<String>,
     pub effects: EffectSet,
     pub diagnostics: Vec<VmDiagnostic>,
 }
@@ -162,6 +164,7 @@ impl TypedRuntime {
                     status: TypedExecutionStatus::Failed,
                     values: Vec::new(),
                     output: String::new(),
+                    output_chunks: Vec::new(),
                     effects,
                     diagnostics: vec![diagnostic],
                 };
@@ -180,6 +183,7 @@ impl TypedRuntime {
                 },
                 values: Vec::new(),
                 output: String::new(),
+                output_chunks: Vec::new(),
                 effects,
                 diagnostics: Vec::new(),
             };
@@ -219,6 +223,7 @@ impl TypedRuntime {
                     // Return the committed stack snapshot.
                     values: self.stack.clone(),
                     output: handler.output(),
+                    output_chunks: handler.output_chunks(),
                     effects,
                     diagnostics: Vec::new(),
                 }
@@ -227,6 +232,7 @@ impl TypedRuntime {
                 status: TypedExecutionStatus::Failed,
                 values: Vec::new(),
                 output: String::new(),
+                output_chunks: Vec::new(),
                 effects,
                 diagnostics: vec![diagnostic],
             },
@@ -294,6 +300,7 @@ impl TypedExecution {
             status: TypedExecutionStatus::Failed,
             values: Vec::new(),
             output: String::new(),
+            output_chunks: Vec::new(),
             effects: EffectSet::pure(),
             diagnostics,
         }

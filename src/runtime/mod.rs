@@ -91,6 +91,7 @@ pub struct ProgramRuntime {
     workspace_root: Arc<PathBuf>,
     memory: RwLock<Option<Arc<crate::memory::MemorySystem>>>,
     network: Arc<Mutex<HashMap<String, TcpStream>>>,
+    output_sink: RwLock<Option<Arc<dyn Fn(String) + Send + Sync>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
 }
 
@@ -118,6 +119,7 @@ impl ProgramRuntime {
             ),
             memory: RwLock::new(None),
             network: Arc::new(Mutex::new(HashMap::new())),
+            output_sink: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
         }
     }
@@ -131,6 +133,12 @@ impl ProgramRuntime {
     /// second memory database or an ambient memory authority.
     pub fn attach_memory(&self, memory: Arc<crate::memory::MemorySystem>) {
         *self.memory.write().expect("memory binding lock poisoned") = Some(memory);
+    }
+
+    /// Install a live output sink for typed `say` chunks. The ordinary
+    /// submission result still contains the complete buffered output.
+    pub fn set_typed_output_sink(&self, sink: Option<Arc<dyn Fn(String) + Send + Sync>>) {
+        *self.output_sink.write().expect("output sink lock poisoned") = sink;
     }
 
     /// Grant a typed capability after an approval decision. The next
@@ -328,6 +336,7 @@ impl ProgramRuntime {
                         status: ExecutionStatus::Completed,
                         values: typed_values(execution.values)?,
                         output: truncate_output(execution.output, context.budget.max_output_bytes),
+                        output_chunks: execution.output_chunks,
                         diagnostics: Vec::new(),
                         vm_diagnostics: Vec::new(),
                         required_capabilities: Vec::new(),
@@ -344,6 +353,7 @@ impl ProgramRuntime {
                     status: ExecutionStatus::AuthorizationRequired,
                     values: Vec::new(),
                     output: String::new(),
+                    output_chunks: Vec::new(),
                     diagnostics: Vec::new(),
                     vm_diagnostics: execution.diagnostics,
                     approval_prompts: approval_prompts(
@@ -364,6 +374,7 @@ impl ProgramRuntime {
                     status: ExecutionStatus::Failed,
                     values: Vec::new(),
                     output: String::new(),
+                    output_chunks: Vec::new(),
                     diagnostics: execution
                         .diagnostics
                         .iter()
@@ -404,6 +415,7 @@ impl ProgramRuntime {
                     status: ExecutionStatus::Completed,
                     values,
                     output,
+                    output_chunks: Vec::new(),
                     diagnostics: Vec::new(),
                     vm_diagnostics: Vec::new(),
                     required_capabilities: Vec::new(),
@@ -446,6 +458,11 @@ impl ProgramRuntime {
             .expect("memory binding lock poisoned")
             .clone();
         let network = Arc::clone(&self.network);
+        let output_sink = self
+            .output_sink
+            .read()
+            .expect("output sink lock poisoned")
+            .clone();
         let scheduler = self
             .agent_scheduler
             .read()
@@ -500,6 +517,7 @@ impl ProgramRuntime {
                         memory,
                         vocabulary,
                         network,
+                        output_sink,
                     );
                     runtime.execute_with_handler(
                         language,
@@ -529,10 +547,12 @@ struct TypedHostHandler {
     automation: Arc<AutomationBroker>,
     workspace_root: Arc<PathBuf>,
     output: String,
+    output_chunks: Vec<String>,
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<crate::memory::MemorySystem>>,
     vocabulary: String,
     network: Arc<Mutex<HashMap<String, TcpStream>>>,
+    output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl TypedHostHandler {
@@ -543,15 +563,18 @@ impl TypedHostHandler {
         memory: Option<Arc<crate::memory::MemorySystem>>,
         vocabulary: String,
         network: Arc<Mutex<HashMap<String, TcpStream>>>,
+        output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> Self {
         Self {
             automation,
             workspace_root,
             output: String::new(),
+            output_chunks: Vec::new(),
             scheduler,
             memory,
             vocabulary,
             network,
+            output_sink,
         }
     }
 }
@@ -574,6 +597,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     ));
                 };
                 self.output.push_str(text);
+                self.output_chunks.push(text.clone());
+                self.emit(text);
                 return Ok(vec![TypedValue::Unit]);
             }
             crate::vm::CapabilityKind::VmRead => {
@@ -855,6 +880,16 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
 
     fn output(&self) -> String {
         self.output.clone()
+    }
+
+    fn output_chunks(&self) -> Vec<String> {
+        self.output_chunks.clone()
+    }
+
+    fn emit(&mut self, chunk: &str) {
+        if let Some(sink) = &self.output_sink {
+            sink(chunk.to_string());
+        }
     }
 }
 
@@ -1600,6 +1635,27 @@ mod tests {
         assert_eq!(approved.status, ExecutionStatus::Completed);
         assert_eq!(approved.values, vec![ProgramValue::Bytes(b"pong".to_vec())]);
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_say_emits_stream_chunks_and_buffers_result() {
+        let runtime = ProgramRuntime::new();
+        let chunks = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink_chunks = Arc::clone(&chunks);
+        runtime.set_typed_output_sink(Some(Arc::new(move |chunk| {
+            sink_chunks.lock().unwrap().push(chunk);
+        })));
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "s\" first\" say s\" second\" say",
+                ExecutionEffect::VmRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.output, "firstsecond");
+        assert_eq!(&*chunks.lock().unwrap(), &["first", "second"]);
+        assert_eq!(outcome.output_chunks, vec!["first", "second"]);
     }
 
     #[tokio::test]

@@ -28,6 +28,8 @@ pub struct ExecutionOutcome {
     pub status: ExecutionStatus,
     pub values: Vec<ProgramValue>,
     pub output: String,
+    #[serde(default)]
+    pub output_chunks: Vec<String>,
     pub diagnostics: Vec<String>,
     #[serde(default)]
     pub vm_diagnostics: Vec<VmDiagnostic>,
@@ -56,6 +58,7 @@ impl ExecutionOutcome {
             status: ExecutionStatus::Failed,
             values: Vec::new(),
             output: String::new(),
+            output_chunks: Vec::new(),
             diagnostics: vec![diagnostic.into()],
             vm_diagnostics: Vec::new(),
             required_capabilities: Vec::new(),

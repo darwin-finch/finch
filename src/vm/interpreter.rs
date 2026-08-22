@@ -17,6 +17,14 @@ pub trait CapabilityHandler {
     fn output(&self) -> String {
         String::new()
     }
+
+    /// Receive each user-visible output chunk as it is produced. The default
+    /// keeps non-streaming handlers source-compatible.
+    fn emit(&mut self, _chunk: &str) {}
+
+    fn output_chunks(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl<T: CapabilityHandler + ?Sized> CapabilityHandler for &mut T {
@@ -31,6 +39,14 @@ impl<T: CapabilityHandler + ?Sized> CapabilityHandler for &mut T {
 
     fn output(&self) -> String {
         (**self).output()
+    }
+
+    fn emit(&mut self, chunk: &str) {
+        (**self).emit(chunk)
+    }
+
+    fn output_chunks(&self) -> Vec<String> {
+        (**self).output_chunks()
     }
 }
 
