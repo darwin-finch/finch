@@ -9,6 +9,7 @@ pub mod scheduler;
 use crate::coforth::{Forth, Library};
 use crate::lisp::{self, EnvRef, LispCtx, Val};
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
+use crate::scheduling::{ScheduledTask, TaskQueue, TaskStatus};
 use crate::vm::{
     ApprovalPrompt, CapabilityRequest, CapabilityRequirement, EffectSet, SourceOrigin, Type,
     TypedExecutionStatus, TypedRuntime, TypedValue, VmDiagnostic,
@@ -92,6 +93,7 @@ pub struct ProgramRuntime {
     memory: RwLock<Option<Arc<crate::memory::MemorySystem>>>,
     network: Arc<Mutex<HashMap<String, TcpStream>>>,
     output_sink: RwLock<Option<Arc<dyn Fn(String) + Send + Sync>>>,
+    schedule_queue: RwLock<Option<Arc<TaskQueue>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
 }
 
@@ -120,6 +122,7 @@ impl ProgramRuntime {
             memory: RwLock::new(None),
             network: Arc::new(Mutex::new(HashMap::new())),
             output_sink: RwLock::new(None),
+            schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
         }
     }
@@ -139,6 +142,13 @@ impl ProgramRuntime {
     /// submission result still contains the complete buffered output.
     pub fn set_typed_output_sink(&self, sink: Option<Arc<dyn Fn(String) + Send + Sync>>) {
         *self.output_sink.write().expect("output sink lock poisoned") = sink;
+    }
+
+    pub fn attach_schedule_queue(&self, queue: Arc<TaskQueue>) {
+        *self
+            .schedule_queue
+            .write()
+            .expect("schedule queue lock poisoned") = Some(queue);
     }
 
     /// Grant a typed capability after an approval decision. The next
@@ -337,6 +347,7 @@ impl ProgramRuntime {
                         values: typed_values(execution.values)?,
                         output: truncate_output(execution.output, context.budget.max_output_bytes),
                         output_chunks: execution.output_chunks,
+                        side_effects: execution.side_effects,
                         diagnostics: Vec::new(),
                         vm_diagnostics: Vec::new(),
                         required_capabilities: Vec::new(),
@@ -354,6 +365,7 @@ impl ProgramRuntime {
                     values: Vec::new(),
                     output: String::new(),
                     output_chunks: Vec::new(),
+                    side_effects: Vec::new(),
                     diagnostics: Vec::new(),
                     vm_diagnostics: execution.diagnostics,
                     approval_prompts: approval_prompts(
@@ -375,6 +387,7 @@ impl ProgramRuntime {
                     values: Vec::new(),
                     output: String::new(),
                     output_chunks: Vec::new(),
+                    side_effects: Vec::new(),
                     diagnostics: execution
                         .diagnostics
                         .iter()
@@ -416,6 +429,7 @@ impl ProgramRuntime {
                     values,
                     output,
                     output_chunks: Vec::new(),
+                    side_effects: Vec::new(),
                     diagnostics: Vec::new(),
                     vm_diagnostics: Vec::new(),
                     required_capabilities: Vec::new(),
@@ -462,6 +476,11 @@ impl ProgramRuntime {
             .output_sink
             .read()
             .expect("output sink lock poisoned")
+            .clone();
+        let schedule_queue = self
+            .schedule_queue
+            .read()
+            .expect("schedule queue lock poisoned")
             .clone();
         let scheduler = self
             .agent_scheduler
@@ -518,6 +537,7 @@ impl ProgramRuntime {
                         vocabulary,
                         network,
                         output_sink,
+                        schedule_queue,
                     );
                     runtime.execute_with_handler(
                         language,
@@ -548,11 +568,13 @@ struct TypedHostHandler {
     workspace_root: Arc<PathBuf>,
     output: String,
     output_chunks: Vec<String>,
+    side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<crate::memory::MemorySystem>>,
     vocabulary: String,
     network: Arc<Mutex<HashMap<String, TcpStream>>>,
     output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    schedule_queue: Option<Arc<TaskQueue>>,
 }
 
 impl TypedHostHandler {
@@ -564,17 +586,20 @@ impl TypedHostHandler {
         vocabulary: String,
         network: Arc<Mutex<HashMap<String, TcpStream>>>,
         output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        schedule_queue: Option<Arc<TaskQueue>>,
     ) -> Self {
         Self {
             automation,
             workspace_root,
             output: String::new(),
             output_chunks: Vec::new(),
+            side_effects: Vec::new(),
             scheduler,
             memory,
             vocabulary,
             network,
             output_sink,
+            schedule_queue,
         }
     }
 }
@@ -864,6 +889,45 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 response.truncate(size);
                 return Ok(vec![TypedValue::Bytes(response)]);
             }
+            crate::vm::CapabilityKind::ScheduleCreate => {
+                let [TypedValue::String(callback), TypedValue::Int(timestamp)] =
+                    arguments.as_slice()
+                else {
+                    return Err(host_binding_error(
+                        origin,
+                        "schedule-create requires a callback and Unix timestamp",
+                    ));
+                };
+                let Some(queue) = self.schedule_queue.clone() else {
+                    return Err(host_binding_error(origin, "schedule queue is unavailable"));
+                };
+                let callback = callback.clone();
+                let timestamp = *timestamp;
+                let scheduled_time = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+                    .ok_or_else(|| host_binding_error(origin, "invalid schedule timestamp"))?;
+                let id = block_on_host(async move {
+                    queue
+                        .enqueue(ScheduledTask {
+                            id: None,
+                            scheduled_time,
+                            task: callback.clone(),
+                            context: "{}".into(),
+                            recurring: None,
+                            status: TaskStatus::Pending,
+                            created_at: chrono::Utc::now(),
+                            last_run: None,
+                            retries: 0,
+                        })
+                        .await
+                        .map(|id| id.to_string())
+                })
+                .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::Resource {
+                    kind: "schedule".into(),
+                    handle: id,
+                    generation: 0,
+                }]);
+            }
             _ => {
                 return Err(host_binding_error(
                     origin,
@@ -886,7 +950,15 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         self.output_chunks.clone()
     }
 
+    fn side_effects(&self) -> Vec<crate::vm::interpreter::HostSideEffect> {
+        self.side_effects.clone()
+    }
+
     fn emit(&mut self, chunk: &str) {
+        self.side_effects
+            .push(crate::vm::interpreter::HostSideEffect::Emit {
+                text: chunk.to_string(),
+            });
         if let Some(sink) = &self.output_sink {
             sink(chunk.to_string());
         }
@@ -1656,6 +1728,17 @@ mod tests {
         assert_eq!(outcome.output, "firstsecond");
         assert_eq!(&*chunks.lock().unwrap(), &["first", "second"]);
         assert_eq!(outcome.output_chunks, vec!["first", "second"]);
+        assert_eq!(
+            outcome.side_effects,
+            vec![
+                crate::vm::interpreter::HostSideEffect::Emit {
+                    text: "first".into()
+                },
+                crate::vm::interpreter::HostSideEffect::Emit {
+                    text: "second".into()
+                }
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1670,6 +1753,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.output, "the result of 2+3 is 5 is that correct?");
+    }
+
+    #[tokio::test]
+    async fn typed_schedule_create_persists_callback() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
+        let runtime = ProgramRuntime::new();
+        runtime.attach_schedule_queue(Arc::clone(&queue));
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ScheduleCreate,
+                selector: crate::vm::ResourceSelector::Schedule { policy: None },
+            })
+            .unwrap();
+        let timestamp = chrono::Utc::now().timestamp() + 60;
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &format!("(schedule-create \"check\" {timestamp})"),
+                ExecutionEffect::VmWrite,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome.values.first(),
+            Some(ProgramValue::Resource { kind, .. }) if kind == "schedule"
+        ));
+        assert_eq!(queue.get_ready_tasks().await.unwrap().len(), 0);
     }
 
     #[tokio::test]

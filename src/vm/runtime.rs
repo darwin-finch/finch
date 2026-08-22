@@ -1,7 +1,7 @@
 use super::diagnostic::{DiagnosticPhase, SourceOrigin, VmDiagnostic};
 use super::effects::{CapabilityKind, CapabilityRequirement, EffectSet};
 use super::frontend::{forth::compile_forth_with_functions, lisp::compile_lisp_with_functions};
-use super::interpreter::{CapabilityHandler, Interpreter, InterpreterConfig};
+use super::interpreter::{CapabilityHandler, HostSideEffect, Interpreter, InterpreterConfig};
 use super::ir::Function;
 use super::types::TypedValue;
 use super::{core_vocabulary, VerifiedModule, Vocabulary};
@@ -19,6 +19,8 @@ pub struct TypedExecution {
     pub output: String,
     #[serde(default)]
     pub output_chunks: Vec<String>,
+    #[serde(default)]
+    pub side_effects: Vec<HostSideEffect>,
     pub effects: EffectSet,
     pub diagnostics: Vec<VmDiagnostic>,
 }
@@ -165,6 +167,7 @@ impl TypedRuntime {
                     values: Vec::new(),
                     output: String::new(),
                     output_chunks: Vec::new(),
+                    side_effects: Vec::new(),
                     effects,
                     diagnostics: vec![diagnostic],
                 };
@@ -184,6 +187,7 @@ impl TypedRuntime {
                 values: Vec::new(),
                 output: String::new(),
                 output_chunks: Vec::new(),
+                side_effects: Vec::new(),
                 effects,
                 diagnostics: Vec::new(),
             };
@@ -224,6 +228,7 @@ impl TypedRuntime {
                     values: self.stack.clone(),
                     output: handler.output(),
                     output_chunks: handler.output_chunks(),
+                    side_effects: handler.side_effects(),
                     effects,
                     diagnostics: Vec::new(),
                 }
@@ -233,6 +238,7 @@ impl TypedRuntime {
                 values: Vec::new(),
                 output: String::new(),
                 output_chunks: Vec::new(),
+                side_effects: Vec::new(),
                 effects,
                 diagnostics: vec![diagnostic],
             },
@@ -301,6 +307,7 @@ impl TypedExecution {
             values: Vec::new(),
             output: String::new(),
             output_chunks: Vec::new(),
+            side_effects: Vec::new(),
             effects: EffectSet::pure(),
             diagnostics,
         }

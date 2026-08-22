@@ -3,6 +3,12 @@ use super::effects::{CapabilityRequirement, EffectSet};
 use super::ir::Instruction;
 use super::types::TypedValue;
 use super::verifier::VerifiedModule;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostSideEffect {
+    Emit { text: String },
+}
 
 pub trait CapabilityHandler {
     fn request(
@@ -23,6 +29,10 @@ pub trait CapabilityHandler {
     fn emit(&mut self, _chunk: &str) {}
 
     fn output_chunks(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn side_effects(&self) -> Vec<HostSideEffect> {
         Vec::new()
     }
 }
@@ -47,6 +57,10 @@ impl<T: CapabilityHandler + ?Sized> CapabilityHandler for &mut T {
 
     fn output_chunks(&self) -> Vec<String> {
         (**self).output_chunks()
+    }
+
+    fn side_effects(&self) -> Vec<HostSideEffect> {
+        (**self).side_effects()
     }
 }
 

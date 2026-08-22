@@ -1,5 +1,5 @@
 use crate::programs::{ExecutionEffect, ProgramValue};
-use crate::vm::{ApprovalPrompt, CapabilityRequirement, VmDiagnostic};
+use crate::vm::{interpreter::HostSideEffect, ApprovalPrompt, CapabilityRequirement, VmDiagnostic};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -30,6 +30,8 @@ pub struct ExecutionOutcome {
     pub output: String,
     #[serde(default)]
     pub output_chunks: Vec<String>,
+    #[serde(default)]
+    pub side_effects: Vec<HostSideEffect>,
     pub diagnostics: Vec<String>,
     #[serde(default)]
     pub vm_diagnostics: Vec<VmDiagnostic>,
@@ -59,6 +61,7 @@ impl ExecutionOutcome {
             values: Vec::new(),
             output: String::new(),
             output_chunks: Vec::new(),
+            side_effects: Vec::new(),
             diagnostics: vec![diagnostic.into()],
             vm_diagnostics: Vec::new(),
             required_capabilities: Vec::new(),

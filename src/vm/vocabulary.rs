@@ -201,7 +201,7 @@ pub fn core_vocabulary() -> Vocabulary {
         (
             "schedule-create".into(),
             capability(
-                vec![Type::String, Type::Resource("program-ref".into())],
+                vec![Type::String, Type::Int],
                 vec![Type::Resource("schedule".into())],
                 CapabilityRequirement {
                     capability: CapabilityKind::ScheduleCreate,
