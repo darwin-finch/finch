@@ -2,6 +2,7 @@
 
 use crate::scheduling::queue::TaskQueue;
 use anyhow::Result;
+use futures::future::BoxFuture;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +12,13 @@ use tracing::{error, info};
 pub struct TaskScheduler {
     queue: Arc<TaskQueue>,
     running: Arc<AtomicBool>,
+    executor: Option<
+        Arc<
+            dyn Fn(crate::scheduling::ScheduledTask) -> BoxFuture<'static, Result<String>>
+                + Send
+                + Sync,
+        >,
+    >,
 }
 
 impl TaskScheduler {
@@ -19,6 +27,22 @@ impl TaskScheduler {
         Self {
             queue,
             running: Arc::new(AtomicBool::new(false)),
+            executor: None,
+        }
+    }
+
+    pub fn with_executor(
+        queue: Arc<TaskQueue>,
+        executor: Arc<
+            dyn Fn(crate::scheduling::ScheduledTask) -> BoxFuture<'static, Result<String>>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        Self {
+            queue,
+            running: Arc::new(AtomicBool::new(false)),
+            executor: Some(executor),
         }
     }
 
@@ -32,55 +56,51 @@ impl TaskScheduler {
             tokio::time::sleep(Duration::from_secs(60)).await;
 
             // Get ready tasks
-            let ready_tasks = self.queue.get_ready_tasks().await?;
+            self.run_once().await?;
+        }
+        Ok(())
+    }
 
-            if ready_tasks.is_empty() {
-                continue;
-            }
+    pub async fn run_once(&self) -> Result<()> {
+        let ready_tasks = self.queue.get_ready_tasks().await?;
+        if ready_tasks.is_empty() {
+            return Ok(());
+        }
+        info!("Found {} ready tasks", ready_tasks.len());
+        for task in ready_tasks {
+            info!("Executing task: {}", task.task);
 
-            info!("Found {} ready tasks", ready_tasks.len());
+            // TODO: Execute task
+            // TODO: Handle recurring tasks
+            // TODO: Update task status
 
-            for task in ready_tasks {
-                info!("Executing task: {}", task.task);
-
-                // TODO: Execute task
-                // TODO: Handle recurring tasks
-                // TODO: Update task status
-
-                match self.execute_task(&task).await {
-                    Ok(_) => {
-                        info!("Task completed: {}", task.task);
-                        if let Some(task_id) = task.id {
-                            self.queue.mark_completed(task_id).await?;
-                        }
+            match self.execute_task(&task).await {
+                Ok(_) => {
+                    info!("Task completed: {}", task.task);
+                    if let Some(task_id) = task.id {
+                        self.queue.mark_completed(task_id).await?;
                     }
-                    Err(e) => {
-                        error!("Task failed: {} (error: {})", task.task, e);
-                        if let Some(task_id) = task.id {
-                            if task.retries < 3 {
-                                self.queue.increment_retry(task_id).await?;
-                            } else {
-                                self.queue.mark_failed(task_id, &e.to_string()).await?;
-                            }
+                }
+                Err(e) => {
+                    error!("Task failed: {} (error: {})", task.task, e);
+                    if let Some(task_id) = task.id {
+                        if task.retries < 3 {
+                            self.queue.increment_retry(task_id).await?;
+                        } else {
+                            self.queue.mark_failed(task_id, &e.to_string()).await?;
                         }
                     }
                 }
             }
         }
-
         Ok(())
     }
 
-    /// Execute a single task.
-    ///
-    /// **Not yet implemented** — task execution requires wiring the generator
-    /// into the scheduler, which is tracked as GitHub Issue #8.
     async fn execute_task(&self, task: &crate::scheduling::queue::ScheduledTask) -> Result<String> {
-        anyhow::bail!(
-            "Task execution not yet implemented (GitHub Issue #8). \
-             Cannot execute scheduled task: '{}'",
-            task.task
-        )
+        let Some(executor) = &self.executor else {
+            anyhow::bail!("scheduled task executor is not attached")
+        };
+        executor(task.clone()).await
     }
 
     /// Stop scheduler
@@ -121,5 +141,31 @@ mod tests {
         scheduler.stop(); // already false
         scheduler.stop(); // still false
         assert!(!scheduler.running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn run_once_executes_ready_task_and_marks_it_complete() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
+        let task = crate::scheduling::ScheduledTask {
+            id: None,
+            scheduled_time: chrono::Utc::now(),
+            task: "typed callback".into(),
+            context: "{}".into(),
+            recurring: None,
+            status: crate::scheduling::TaskStatus::Pending,
+            created_at: chrono::Utc::now(),
+            last_run: None,
+            retries: 0,
+        };
+        let id = queue.enqueue(task).await.unwrap();
+        let executor = Arc::new(|task: crate::scheduling::ScheduledTask| {
+            Box::pin(async move { Ok(format!("ran {}", task.task)) })
+                as BoxFuture<'static, Result<String>>
+        });
+        let scheduler = TaskScheduler::with_executor(Arc::clone(&queue), executor);
+        scheduler.run_once().await.unwrap();
+        assert!(queue.get_ready_tasks().await.unwrap().is_empty());
+        assert!(id > 0);
     }
 }
