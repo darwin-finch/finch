@@ -772,6 +772,23 @@ mod tests {
     }
 
     #[test]
+    fn every_pure_core_word_has_an_interpreter_implementation() {
+        let vocabulary = core_vocabulary();
+        for (name, signature) in vocabulary {
+            if !signature.effects.is_pure() {
+                continue;
+            }
+            let mut stack = Vec::new();
+            if let Err(error) = execute_core(&name, &mut stack) {
+                assert_ne!(
+                    error.code, "E-LINK-004",
+                    "pure vocabulary word {name} has no interpreter implementation"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn executes_verified_arithmetic_transactionally() {
         let module = arithmetic_module(vec![
             Instruction::Constant {
