@@ -125,9 +125,12 @@ impl std::str::FromStr for ProgramLanguage {
 #[serde(rename_all = "snake_case")]
 pub enum ProgramScope {
     Builtin,
+    Task,
     Session,
     Project,
     Personal,
+    User,
+    Published,
     Imported,
 }
 
@@ -135,9 +138,12 @@ impl ProgramScope {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Builtin => "builtin",
+            Self::Task => "task",
             Self::Session => "session",
             Self::Project => "project",
             Self::Personal => "personal",
+            Self::User => "user",
+            Self::Published => "published",
             Self::Imported => "imported",
         }
     }
@@ -149,9 +155,12 @@ impl std::str::FromStr for ProgramScope {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "builtin" => Ok(Self::Builtin),
+            "task" => Ok(Self::Task),
             "session" => Ok(Self::Session),
             "project" => Ok(Self::Project),
             "personal" => Ok(Self::Personal),
+            "user" => Ok(Self::User),
+            "published" => Ok(Self::Published),
             "imported" => Ok(Self::Imported),
             other => bail!("unknown program scope: {other}"),
         }
@@ -406,7 +415,7 @@ impl ProgramDefinition {
             provenance: path.display().to_string(),
             trust: match scope {
                 ProgramScope::Imported => TrustState::Quarantined,
-                ProgramScope::Session => TrustState::Candidate,
+                ProgramScope::Session | ProgramScope::Task => TrustState::Candidate,
                 _ => TrustState::Approved,
             },
             scope,
@@ -728,6 +737,23 @@ mod tests {
     fn omitted_language_uses_compact_wire_inference() {
         assert_eq!(ProgramLanguage::infer_source("  (say \"hi\")"), ProgramLanguage::Lisp);
         assert_eq!(ProgramLanguage::infer_source("s\"hi\" say"), ProgramLanguage::Forth);
+    }
+
+    #[test]
+    fn vocabulary_scopes_cover_model_promotion_lifecycle() {
+        for scope in [
+            ProgramScope::Task,
+            ProgramScope::Session,
+            ProgramScope::Project,
+            ProgramScope::Personal,
+            ProgramScope::User,
+            ProgramScope::Published,
+        ] {
+            assert_eq!(scope.as_str().parse::<ProgramScope>().unwrap(), scope);
+        }
+        let task = ProgramDefinition::candidate("task-word", ProgramLanguage::Forth, "1");
+        assert_eq!(task.scope, ProgramScope::Session);
+        assert_eq!(task.trust, TrustState::Candidate);
     }
 
     #[test]
