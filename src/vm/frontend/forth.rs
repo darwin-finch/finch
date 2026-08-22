@@ -991,29 +991,6 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             continue;
         }
         let start = cursor;
-        // Compact streamable prose delimiter. Unlike interpolation or string
-        // replacement, this is just a typed string token; ordinary Forth
-        // resumes after the closing `["]`.
-        if source[start..].starts_with("[\"]") {
-            cursor += 3;
-            let content_start = cursor;
-            let Some(relative_end) = source[cursor..].find("[\"]") else {
-                return Err(vec![VmDiagnostic::error(
-                    "E-READ-002",
-                    DiagnosticPhase::Reader,
-                    "unterminated bracketed Co-Forth string literal",
-                    Some(origin(source_id, source, start, source.len())),
-                )]);
-            };
-            cursor += relative_end;
-            tokens.push(Token {
-                value: TokenValue::String(source[content_start..cursor].to_string()),
-                start,
-                end: cursor + 3,
-            });
-            cursor += 3;
-            continue;
-        }
         if source[start..].starts_with("s\"") {
             cursor += 2;
             if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
@@ -1135,10 +1112,10 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_string_delimiter_is_a_streamable_typed_literal() {
+    fn direct_output_and_string_literals_are_streamable() {
         let module = compile_forth(
             "input.forth",
-            ".\"Hello user, I am an LLM\" 3 5 + int-to-string say [\"]! [\"] say",
+            ".\"Hello user, I am an LLM\" 3 5 + int-to-string say s\"! \" say",
             Vec::new(),
             &core_vocabulary(),
         )

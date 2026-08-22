@@ -42,19 +42,12 @@ message.
 
 `process-run` consumes a command string and a list of argument strings; it never invokes a shell.
 
-For progressive prose, emit multiple typed chunks with `say`. A future template/quasiquote form
-may combine literal text and embedded expressions, but it will lower to the same checked sequence
-of `say` side effects; interpolation is never string replacement or an untyped eval escape. For
-compact streamable prose, `["] ... ["]` is an alternate string-literal delimiter:
+For progressive prose, emit multiple typed chunks with `say`. `s" ..."` is the sole
+string-literal form; it pushes a typed `string` and never evaluates its contents:
 
 ```forth
-["] Hello user, I am an LLM. ["] say
-3 5 + int-to-string say
-["]  is that correct? ["] say
+s" Hello user" say
 ```
-
-The bracket delimiters produce an ordinary typed `string` constant. They do not evaluate text
-inside the delimiters or interpolate implicitly.
 
 For standard Forth-style direct output, prefer `." text"`; Finch lowers it to a typed string
 followed by `say`, preserving the same capability and side-effect semantics:
