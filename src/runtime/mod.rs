@@ -961,6 +961,12 @@ fn required_effect(language: ProgramLanguage, source: &str) -> ExecutionEffect {
     if contains_any(&["agent-spawn", "agent-cancel"]) {
         return ExecutionEffect::VmWrite;
     }
+    if contains_any(&["mem-store", "mem-consolidate"]) {
+        return ExecutionEffect::VmWrite;
+    }
+    if contains_any(&["mem-recall", "mem-read"]) {
+        return ExecutionEffect::VmRead;
+    }
     if contains_any(&["agent-poll", "agent-await"]) {
         return ExecutionEffect::VmRead;
     }
@@ -1323,6 +1329,43 @@ mod tests {
             outcome.required_capabilities[0].capability,
             crate::vm::CapabilityKind::MemoryWrite
         );
+    }
+
+    #[tokio::test]
+    async fn typed_memory_host_reads_and_writes_through_attached_memtree() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let memory = Arc::new(
+            crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                db_path: database.path().to_path_buf(),
+                use_neural_embeddings: false,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let runtime = ProgramRuntime::new();
+        runtime.attach_memory(memory);
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::MemoryWrite,
+                selector: crate::vm::ResourceSelector::Memory {
+                    tree: "session".into(),
+                    path: "**".into(),
+                },
+            })
+            .unwrap();
+        let stored = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(mem-store \"typed memory fact\")",
+                ExecutionEffect::VmWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stored.status, ExecutionStatus::Completed);
+        assert!(matches!(
+            stored.values.first(),
+            Some(ProgramValue::Resource { kind, .. }) if kind == "memory-node"
+        ));
     }
 
     #[tokio::test]
