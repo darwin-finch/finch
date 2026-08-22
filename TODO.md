@@ -23,6 +23,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Do not require the later Cranelift JIT
   optimization tier to begin Brain convergence.
+- [ ] Later: define a signed, content-addressed vocabulary package protocol for pushing reviewed
+  `published` definitions between Finches; verify source/IR, dependencies, certificates, provenance,
+  and local capability policy before installation.
 
 ## Shared brains and environments
 
