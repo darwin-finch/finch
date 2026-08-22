@@ -214,6 +214,11 @@ pub enum ProgramValue {
     String(String),
     Bytes(Vec<u8>),
     List(Vec<ProgramValue>),
+    Option(Option<Box<ProgramValue>>),
+    Result {
+        ok: bool,
+        value: Box<ProgramValue>,
+    },
     Task(String),
     Resource {
         kind: String,
@@ -581,6 +586,19 @@ fn program_to_lisp(value: ProgramValue) -> crate::lisp::Val {
         ProgramValue::List(values) => {
             crate::lisp::Val::List(values.into_iter().map(program_to_lisp).collect())
         }
+        ProgramValue::Option(value) => match value {
+            Some(value) => crate::lisp::Val::List(vec![
+                crate::lisp::Val::Symbol("some".into()),
+                program_to_lisp(*value),
+            ]),
+            None => crate::lisp::Val::List(vec![crate::lisp::Val::Symbol(
+                "none".into(),
+            )]),
+        },
+        ProgramValue::Result { ok, value } => crate::lisp::Val::List(vec![
+            crate::lisp::Val::Symbol(if ok { "ok" } else { "err" }.into()),
+            program_to_lisp(*value),
+        ]),
     }
 }
 

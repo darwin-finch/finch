@@ -136,6 +136,16 @@ pub enum TypedValue {
         element_type: Type,
         values: Vec<TypedValue>,
     },
+    Option {
+        inner_type: Type,
+        value: Option<Box<TypedValue>>,
+    },
+    Result {
+        ok_type: Type,
+        error_type: Type,
+        is_ok: bool,
+        value: Box<TypedValue>,
+    },
     Record(Vec<(String, TypedValue)>),
     Variant {
         name: String,
@@ -171,6 +181,12 @@ impl TypedValue {
             Self::Bytes(_) => Type::Bytes,
             Self::Path { selector, .. } => Type::Path(selector.clone()),
             Self::List { element_type, .. } => Type::list(element_type.clone()),
+            Self::Option { inner_type, .. } => Type::Option(Box::new(inner_type.clone())),
+            Self::Result {
+                ok_type,
+                error_type,
+                ..
+            } => Type::Result(Box::new(ok_type.clone()), Box::new(error_type.clone())),
             Self::Record(fields) => Type::Record(
                 fields
                     .iter()
@@ -210,6 +226,24 @@ mod tests {
         assert_eq!(
             TypedValue::String("hello".into()).value_type(),
             Type::String
+        );
+        assert_eq!(
+            TypedValue::Option {
+                inner_type: Type::Int,
+                value: Some(Box::new(TypedValue::Int(7))),
+            }
+            .value_type(),
+            Type::Option(Box::new(Type::Int))
+        );
+        assert_eq!(
+            TypedValue::Result {
+                ok_type: Type::Int,
+                error_type: Type::String,
+                is_ok: false,
+                value: Box::new(TypedValue::String("bad".into())),
+            }
+            .value_type(),
+            Type::Result(Box::new(Type::Int), Box::new(Type::String))
         );
     }
 

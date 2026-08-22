@@ -1383,6 +1383,16 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
         TypedValue::String(value) => ProgramValue::String(value),
         TypedValue::Bytes(value) => ProgramValue::Bytes(value),
         TypedValue::List { values, .. } => ProgramValue::List(typed_values(values)?),
+        TypedValue::Option { value, .. } => ProgramValue::Option(
+            value
+                .map(|value| typed_value(*value))
+                .transpose()?
+                .map(Box::new),
+        ),
+        TypedValue::Result { is_ok, value, .. } => ProgramValue::Result {
+            ok: is_ok,
+            value: Box::new(typed_value(*value)?),
+        },
         TypedValue::Task(value) => ProgramValue::Task(value),
         TypedValue::Resource {
             kind,

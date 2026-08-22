@@ -1,7 +1,7 @@
 use super::diagnostic::{DiagnosticPhase, SourceOrigin, VmDiagnostic};
 use super::effects::{CapabilityRequirement, EffectSet, ResourceSelector};
 use super::ir::Instruction;
-use super::types::TypedValue;
+use super::types::{Type, TypedValue};
 use super::verifier::VerifiedModule;
 use serde::{Deserialize, Serialize};
 
@@ -534,6 +534,72 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             stack.push(TypedValue::Int(parsed));
         }
         "space" => stack.push(TypedValue::String(" ".into())),
+        "some" => {
+            let value = pop(stack)?;
+            let inner_type = value.value_type();
+            stack.push(TypedValue::Option {
+                inner_type,
+                value: Some(Box::new(value)),
+            });
+        }
+        "none" => stack.push(TypedValue::Option {
+            inner_type: Type::Dynamic,
+            value: None,
+        }),
+        "is-some" => {
+            let value = pop(stack)?;
+            let TypedValue::Option { value, .. } = value else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-014",
+                    DiagnosticPhase::Interpretation,
+                    "is-some requires an option",
+                    Some(origin),
+                ));
+            };
+            stack.push(TypedValue::Bool(value.is_some()));
+        }
+        "unwrap" => {
+            let value = pop(stack)?;
+            let TypedValue::Option { value, .. } = value else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-014",
+                    DiagnosticPhase::Interpretation,
+                    "unwrap requires an option",
+                    Some(origin),
+                ));
+            };
+            let Some(value) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-OPTION-001",
+                    DiagnosticPhase::Interpretation,
+                    "cannot unwrap none",
+                    Some(origin),
+                ));
+            };
+            stack.push(*value);
+        }
+        "ok" | "err" => {
+            let value = pop(stack)?;
+            let value_type = value.value_type();
+            stack.push(TypedValue::Result {
+                ok_type: if name == "ok" { value_type } else { Type::Dynamic },
+                error_type: if name == "err" { value.value_type() } else { Type::Dynamic },
+                is_ok: name == "ok",
+                value: Box::new(value),
+            });
+        }
+        "is-ok" => {
+            let value = pop(stack)?;
+            let TypedValue::Result { is_ok, .. } = value else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-015",
+                    DiagnosticPhase::Interpretation,
+                    "is-ok requires a result",
+                    Some(origin),
+                ));
+            };
+            stack.push(TypedValue::Bool(is_ok));
+        }
         "path" => {
             let value = pop(stack)?;
             let TypedValue::String(relative) = value else {
@@ -654,6 +720,20 @@ mod tests {
         Verifier::new(&core_vocabulary())
             .verify(Module::single(function))
             .unwrap()
+    }
+
+    #[test]
+    fn option_and_result_words_preserve_typed_values() {
+        let mut stack = vec![TypedValue::Int(7)];
+        execute_core("some", &mut stack).unwrap();
+        execute_core("is-some", &mut stack).unwrap();
+        assert_eq!(stack, vec![TypedValue::Bool(true)]);
+
+        let mut stack = vec![TypedValue::String("failure".into())];
+        execute_core("err", &mut stack).unwrap();
+        assert!(matches!(stack.as_slice(), [TypedValue::Result { is_ok: false, .. }]));
+        execute_core("is-ok", &mut stack).unwrap();
+        assert_eq!(stack, vec![TypedValue::Bool(false)]);
     }
 
     #[test]

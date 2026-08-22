@@ -101,6 +101,49 @@ pub fn core_vocabulary() -> Vocabulary {
         ),
         ("atoi".into(), pure(vec![Type::String], vec![Type::Int])),
         (
+            "some".into(),
+            pure(vec![a.clone()], vec![Type::Option(Box::new(a.clone()))]),
+        ),
+        (
+            "none".into(),
+            pure(Vec::new(), vec![Type::Option(Box::new(a.clone()))]),
+        ),
+        (
+            "is-some".into(),
+            pure(
+                vec![Type::Option(Box::new(a.clone()))],
+                vec![Type::Bool],
+            ),
+        ),
+        (
+            "unwrap".into(),
+            pure(
+                vec![Type::Option(Box::new(a.clone()))],
+                vec![a.clone()],
+            ),
+        ),
+        (
+            "ok".into(),
+            pure(
+                vec![a.clone()],
+                vec![Type::Result(Box::new(a.clone()), Box::new(Type::Dynamic))],
+            ),
+        ),
+        (
+            "err".into(),
+            pure(
+                vec![a.clone()],
+                vec![Type::Result(Box::new(Type::Dynamic), Box::new(a.clone()))],
+            ),
+        ),
+        (
+            "is-ok".into(),
+            pure(
+                vec![Type::Result(Box::new(a.clone()), Box::new(Type::Variable("E".into())))],
+                vec![Type::Bool],
+            ),
+        ),
+        (
             "file-read".into(),
             capability(
                 vec![Type::Path(
