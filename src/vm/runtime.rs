@@ -370,6 +370,19 @@ mod tests {
     }
 
     #[test]
+    fn forth_quotation_references_a_typed_word_and_executes_it() {
+        let mut runtime = TypedRuntime::new();
+        let result = runtime.execute(
+            ProgramLanguage::Forth,
+            "quotation.forth",
+            ": square ( S int -- S int ! {} ) dup * ; 9 ['] square execute",
+            1_000,
+        );
+        assert_eq!(result.status, TypedExecutionStatus::Completed);
+        assert_eq!(result.values, vec![TypedValue::Int(81)]);
+    }
+
+    #[test]
     fn missing_capability_suspends_before_stack_mutation() {
         let mut runtime = TypedRuntime::new();
         let before = runtime.stack().to_vec();

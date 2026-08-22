@@ -182,9 +182,97 @@ fn compile_forth_body_with_functions(
             });
     };
 
-    for token in tokens {
+    let mut token_index = 0;
+    while token_index < tokens.len() {
+        let token = tokens[token_index].clone();
         let origin = origin(source_id, source, token.start, token.end);
         if let TokenValue::Word(word) = &token.value {
+            if word == "[']" {
+                let Some(target) = tokens.get(token_index + 1) else {
+                    return Err(vec![control_error(
+                        "E-FORTH-QUOTE-001",
+                        "['] requires a persistent typed word name",
+                        origin,
+                    )]);
+                };
+                let TokenValue::Word(target_name) = &target.value else {
+                    return Err(vec![control_error(
+                        "E-FORTH-QUOTE-001",
+                        "quotation target must be a word name",
+                        origin,
+                    )]);
+                };
+                let Some(function) = linked_functions.get(target_name) else {
+                    return Err(vec![control_error(
+                        "E-FORTH-QUOTE-002",
+                        format!("quotation target '{target_name}' is not a typed word"),
+                        origin,
+                    )]);
+                };
+                let signature = function.signature.clone();
+                stack.push(Type::Function {
+                    arguments: signature.input.values.clone(),
+                    result: Box::new(
+                        signature
+                            .output
+                            .values
+                            .last()
+                            .cloned()
+                            .unwrap_or(Type::Unit),
+                    ),
+                    effects: signature.effects.clone(),
+                });
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::MakeClosure {
+                        function: target_name.clone(),
+                        capture_count: 0,
+                        signature,
+                    },
+                    origin,
+                );
+                token_index += 2;
+                continue;
+            }
+            if word == "execute" {
+                let Type::Function {
+                    arguments,
+                    result,
+                    effects: closure_effects,
+                } = stack.pop().ok_or_else(|| {
+                    vec![control_error(
+                        "E-STACK-001",
+                        "execute requires a quotation on top of the stack",
+                        origin.clone(),
+                    )]
+                })?
+                else {
+                    return Err(vec![control_error(
+                        "E-TYPE-011",
+                        "execute requires a typed quotation",
+                        origin,
+                    )]);
+                };
+                let signature = StackSignature {
+                    type_parameters: Vec::new(),
+                    input: StackRow::polymorphic("S", arguments),
+                    output: StackRow::polymorphic("S", vec![(*result).clone()]),
+                    effects: closure_effects.clone(),
+                    control: ControlEffect::Returns,
+                };
+                apply_signature_types(&signature, &mut stack, &origin)
+                    .map_err(|diagnostic| vec![diagnostic])?;
+                effects = effects.union(&closure_effects);
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::CallClosure { signature },
+                    origin,
+                );
+                token_index += 1;
+                continue;
+            }
             match word.as_str() {
                 "if" => {
                     let condition = stack.pop().ok_or_else(|| {
@@ -610,6 +698,7 @@ fn compile_forth_body_with_functions(
             }
         };
         emit(&mut blocks, current, instruction, origin);
+        token_index += 1;
     }
     if let Some(frame) = loops.last() {
         return Err(vec![control_error(

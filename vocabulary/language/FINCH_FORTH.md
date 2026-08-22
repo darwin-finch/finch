@@ -38,6 +38,11 @@ Quotations are typed executable values. A quotation is code; an escaping quotati
 environment is a closure. Runtime quotations are not macros. Macro/immediate expansion occurs in a
 separate bounded compile-time phase and the expanded program is reverified.
 
+The current surface form for a quotation reference is `['] word execute`; `word` must be a
+persistent typed definition and its declared stack signature supplies the quotation type. For
+example, `9 ['] square execute` applies `square` to `9`. Anonymous quotations and captured Co-Forth
+environments remain a later revision; Lisp lambdas already provide typed lexical closures.
+
 Use only words advertised by `get_vm_state`. Treat any other word as unavailable regardless of
 examples or prior sessions. Capability-bearing words contribute their structured requirement to the
 enclosing definition; a definition cannot claim `{}` while calling one.
