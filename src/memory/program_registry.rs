@@ -22,7 +22,11 @@ impl MemorySystem {
         definition: ProgramDefinition,
     ) -> Result<(ProgramRef, PathBuf)> {
         let root = self.program_source_root();
-        let authored_root = root.join("generated");
+        let authored_root = if definition.scope == ProgramScope::Personal {
+            root.join("generated")
+        } else {
+            root.join("generated").join(definition.scope.as_str())
+        };
         std::fs::create_dir_all(&authored_root).with_context(|| {
             format!(
                 "failed to create authored vocabulary directory {}",
@@ -41,7 +45,7 @@ impl MemorySystem {
         )?;
 
         let mut indexed =
-            ProgramDefinition::from_source_file(&path, &root, ProgramScope::Personal)?;
+            ProgramDefinition::from_source_file(&path, &root, definition.scope)?;
         indexed.documentation = definition.documentation;
         indexed.signature = definition.signature.or(indexed.signature);
         indexed.effect = definition.effect;
@@ -50,6 +54,8 @@ impl MemorySystem {
         indexed.tests = definition.tests;
         indexed.provenance = path.display().to_string();
         indexed.trust = definition.trust;
+        indexed.scope = definition.scope;
+        indexed.scope_key = definition.scope_key;
         indexed.environment_hash = definition.environment_hash;
         let reference = self.index_program_definition(indexed).await?;
         Ok((reference, path))
@@ -540,6 +546,31 @@ mod tests {
             std::fs::read_to_string(source_path).unwrap(),
             "; finch-effect: unclassified\n(define (triple x) (* x 3))\n"
         );
+    }
+
+    #[tokio::test]
+    async fn authored_program_preserves_promotion_scope() {
+        let temp = TempDir::new().unwrap();
+        let memory = memory(&temp);
+        let mut definition = ProgramDefinition::candidate(
+            "project-helper",
+            ProgramLanguage::Forth,
+            ": project-helper 1 ;",
+        );
+        definition.scope = ProgramScope::Project;
+        definition.scope_key = Some("workspace-alpha".into());
+        memory.save_authored_program(definition).await.unwrap();
+        let stored = memory
+            .get_program_by_name("project-helper", Some(ProgramLanguage::Forth))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.scope, ProgramScope::Project);
+        assert_eq!(stored.scope_key.as_deref(), Some("workspace-alpha"));
+        assert!(temp
+            .path()
+            .join("vocabulary/programs/generated/project/project-helper.forth")
+            .exists());
     }
 
     #[test]
