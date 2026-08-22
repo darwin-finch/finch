@@ -963,8 +963,8 @@ pub fn format_help() -> String {
          {gray}  Brains run in the daemon and survive REPL disconnects.{reset}\n\
          {gray}  When a brain has a question or plan, a dialog appears in the REPL.{reset}\n\n\
          {yellow_bold}📚 Learn More:{reset}\n\
-         {cyan}  GitHub:{reset}   https://github.com/schancel/finch\n\
-         {cyan}  Issues:{reset}   https://github.com/schancel/finch/issues\n\
+         {cyan}  GitHub:{reset}   https://github.com/darwin-finch/finch\n\
+         {cyan}  Issues:{reset}   https://github.com/darwin-finch/finch/issues\n\
          {cyan}  Docs:{reset}     See README.md and docs/ folder\n\n\
          {yellow_bold}💡 Quick Start:{reset}\n\
          Just type your question! Examples:\n\
