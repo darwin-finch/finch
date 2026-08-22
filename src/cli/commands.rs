@@ -1,7 +1,6 @@
 // Slash command handling
 
 use anyhow::Result;
-use crossterm::style::Stylize;
 
 use crate::metrics::MetricsLogger;
 use crate::models::ThresholdValidator;
@@ -956,9 +955,9 @@ pub fn format_help() -> String {
          {gray}                     Example: /brain investigate why auth tests are flaky{reset}\n\
          {cyan}  /brains{reset}            List active brain sessions\n\
          {cyan}  /brain cancel <n>{reset}  Cancel a brain by name or id\n\
-         __BRAIN_ATTACH__  Attach to a named remote brain\n\
-         __BRAIN_DETACH__      Return to this local session\n\
-         __BRAIN_PASSWORD__ Show or rotate the local brain credential\n\
+         {cyan}  /brain attach <brain@machine>{reset}  Attach to a named remote brain\n\
+         {cyan}  /brain detach{reset}      Return to this local session\n\
+         {cyan}  /brain password [new]{reset} Show or rotate the local brain credential\n\
          {reset}\n\
          {gray}  Brains run in the daemon and survive REPL disconnects.{reset}\n\
          {gray}  When a brain has a question or plan, a dialog appears in the REPL.{reset}\n\n\
@@ -972,19 +971,7 @@ pub fn format_help() -> String {
          {gray}  • Can you read my Cargo.toml and explain the dependencies?{reset}\n\
          {gray}  • Find all TODO comments in my code{reset}\n\n\
          {cyan_bold}─────────────────────────────────────────────────────────────────────────{reset}\n\
-         {gray}Tip: Use Ctrl+C to cancel long-running queries{reset}".to_string()
-    .replace(
-        "__BRAIN_ATTACH__",
-        &format!("  {}", "/brain attach <brain@machine>".cyan()),
-    )
-    .replace(
-        "__BRAIN_DETACH__",
-        &format!("  {}", "/brain detach".cyan()),
-    )
-    .replace(
-        "__BRAIN_PASSWORD__",
-        &format!("  {}", "/brain password [new]".cyan()),
-    )
+         {gray}Tip: Use Ctrl+C to cancel long-running queries{reset}")
 }
 
 pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
