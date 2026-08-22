@@ -9,7 +9,7 @@ pub mod scheduler;
 use crate::coforth::{Forth, Library};
 use crate::lisp::{self, EnvRef, LispCtx, Val};
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
-use crate::scheduling::{ScheduledTask, TaskQueue, TaskStatus};
+use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
     ApprovalPrompt, CapabilityRequest, CapabilityRequirement, EffectSet, SourceOrigin, Type,
     TypedExecutionStatus, TypedRuntime, TypedValue, VmDiagnostic,
@@ -149,6 +149,21 @@ impl ProgramRuntime {
             .schedule_queue
             .write()
             .expect("schedule queue lock poisoned") = Some(queue);
+    }
+
+    /// Construct the durable scheduler with this runtime's typed callback
+    /// executor. Keeping construction here prevents callers from accidentally
+    /// falling back to an unbound scheduler that cannot execute callbacks.
+    pub fn task_scheduler(self: &Arc<Self>) -> Option<TaskScheduler> {
+        let queue = self
+            .schedule_queue
+            .read()
+            .expect("schedule queue lock poisoned")
+            .clone()?;
+        Some(TaskScheduler::with_executor(
+            queue,
+            Arc::clone(self).scheduled_executor(),
+        ))
     }
 
     /// Build the executor used by the durable scheduler. Each callback gets a
@@ -1837,10 +1852,8 @@ mod tests {
             .await
             .unwrap();
         let runtime = Arc::new(ProgramRuntime::new());
-        let scheduler = crate::scheduling::TaskScheduler::with_executor(
-            Arc::clone(&queue),
-            runtime.scheduled_executor(),
-        );
+        runtime.attach_schedule_queue(Arc::clone(&queue));
+        let scheduler = runtime.task_scheduler().expect("scheduler is attached");
         scheduler.run_once().await.unwrap();
         assert!(queue.get_ready_tasks().await.unwrap().is_empty());
     }
