@@ -56,6 +56,15 @@ compact streamable prose, `["] ... ["]` is an alternate string-literal delimiter
 The bracket delimiters produce an ordinary typed `string` constant. They do not evaluate text
 inside the delimiters or interpolate implicitly.
 
+For standard Forth-style direct output, prefer `." text"`; Finch lowers it to a typed string
+followed by `say`, preserving the same capability and side-effect semantics:
+
+```forth
+." The result is "
+3 5 + int-to-string say
+."  — correct?"
+```
+
 Typed conditionals use `if ... else ... then`. Typed loops use `begin ... while ... repeat` or
 `begin ... until`. Structural words must be properly nested. The condition is `bool`; the
 stack/type shape after consuming it and at every back-edge must equal the loop-header shape. Each

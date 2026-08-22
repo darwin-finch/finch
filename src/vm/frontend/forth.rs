@@ -1039,6 +1039,38 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             cursor += 1;
             continue;
         }
+        // Standard Forth-style immediate output string. Lower it to the same
+        // typed string literal followed by `say` used by ordinary programs.
+        if source[start..].starts_with(".\"") {
+            cursor += 2;
+            if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let content_start = cursor;
+            while cursor < bytes.len() && bytes[cursor] != b'"' {
+                cursor += 1;
+            }
+            if cursor == bytes.len() {
+                return Err(vec![VmDiagnostic::error(
+                    "E-READ-003",
+                    DiagnosticPhase::Reader,
+                    "unterminated Co-Forth output string literal",
+                    Some(origin(source_id, source, start, source.len())),
+                )]);
+            }
+            tokens.push(Token {
+                value: TokenValue::String(source[content_start..cursor].to_string()),
+                start,
+                end: cursor + 1,
+            });
+            tokens.push(Token {
+                value: TokenValue::Word("say".into()),
+                start,
+                end: cursor + 1,
+            });
+            cursor += 1;
+            continue;
+        }
         while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
@@ -1106,7 +1138,7 @@ mod tests {
     fn bracketed_string_delimiter_is_a_streamable_typed_literal() {
         let module = compile_forth(
             "input.forth",
-            "[\"]Hello user, I am an LLM[\"] say 3 5 + int-to-string say",
+            ".\"Hello user, I am an LLM\" 3 5 + int-to-string say [\"]! [\"] say",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -1140,7 +1172,7 @@ mod tests {
         })
         .execute(&mut stack)
         .unwrap();
-        assert_eq!(handler.output(), "Hello user, I am an LLM8");
+        assert_eq!(handler.output(), "Hello user, I am an LLM8! ");
     }
 
     #[test]
