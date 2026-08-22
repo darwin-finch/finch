@@ -38,6 +38,8 @@ Agent words operate on opaque task handles: `s" task" agent-spawn`, `agent-poll`
 and `agent-cancel`. Poll is nonblocking and returns serialized status; await returns the final
 message.
 
+`vm-vocabulary` returns the current serialized typed word manifest.
+
 Typed conditionals use `if ... else ... then`. Typed loops use `begin ... while ... repeat` or
 `begin ... until`. Structural words must be properly nested. The condition is `bool`; the
 stack/type shape after consuming it and at every back-edge must equal the loop-header shape. Each

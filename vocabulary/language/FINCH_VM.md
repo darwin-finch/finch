@@ -65,6 +65,9 @@ Child-agent handles are opaque task values. `agent-spawn` starts bounded work, `
 a nonblocking JSON snapshot, `agent-await` joins and returns the final message, and `agent-cancel`
 requests cancellation. Scheduler ancestry and ownership are checked for every operation.
 
+`vm-vocabulary` is a pure VM inspection operation that returns the current serialized typed
+vocabulary. Use it (or the external `get_vm_state` tool) instead of guessing callable names.
+
 Workspace file access uses refined paths rather than raw strings. `(path "relative/name")`
 constructs a path constrained to the workspace selector; `(file-read path)` returns `bytes`, and
 `(file-write path bytes)` returns `unit`. The host canonicalizes and rechecks the path, so `..`,

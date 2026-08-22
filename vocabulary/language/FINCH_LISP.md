@@ -53,3 +53,5 @@ approval before execution.
 Agent coordination uses opaque task handles: `(agent-spawn "task")`, `(agent-poll task)`,
 `(agent-await task)`, and `(agent-cancel task)`. Poll while work is running; await only when the
 final result is needed.
+
+`(vm-vocabulary)` returns the current typed word manifest for programmatic introspection.
