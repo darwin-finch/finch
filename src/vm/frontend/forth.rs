@@ -991,6 +991,29 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             continue;
         }
         let start = cursor;
+        // Compact streamable prose delimiter. Unlike interpolation or string
+        // replacement, this is just a typed string token; ordinary Forth
+        // resumes after the closing `["]`.
+        if source[start..].starts_with("[\"]") {
+            cursor += 3;
+            let content_start = cursor;
+            let Some(relative_end) = source[cursor..].find("[\"]") else {
+                return Err(vec![VmDiagnostic::error(
+                    "E-READ-002",
+                    DiagnosticPhase::Reader,
+                    "unterminated bracketed Co-Forth string literal",
+                    Some(origin(source_id, source, start, source.len())),
+                )]);
+            };
+            cursor += relative_end;
+            tokens.push(Token {
+                value: TokenValue::String(source[content_start..cursor].to_string()),
+                start,
+                end: cursor + 3,
+            });
+            cursor += 3;
+            continue;
+        }
         if source[start..].starts_with("s\"") {
             cursor += 2;
             if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
@@ -1065,8 +1088,8 @@ fn line_column(source: &str, byte: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::interpreter::{DenyCapabilities, Interpreter, InterpreterConfig};
-    use crate::vm::{core_vocabulary, TypedValue};
+    use crate::vm::interpreter::{CapabilityHandler, DenyCapabilities, Interpreter, InterpreterConfig};
+    use crate::vm::{core_vocabulary, CapabilityKind, CapabilityRequirement, ResourceSelector, TypedValue};
 
     #[test]
     fn compiles_and_executes_user_forth_text() {
@@ -1077,6 +1100,47 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Int(11)]);
+    }
+
+    #[test]
+    fn bracketed_string_delimiter_is_a_streamable_typed_literal() {
+        let module = compile_forth(
+            "input.forth",
+            "[\"]Hello user, I am an LLM[\"] say 3 5 + int-to-string say",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        #[derive(Default)]
+        struct EmitHandler(String);
+        impl crate::vm::interpreter::CapabilityHandler for EmitHandler {
+            fn request(
+                &mut self,
+                requirement: &CapabilityRequirement,
+                arguments: Vec<TypedValue>,
+                _origin: &SourceOrigin,
+            ) -> Result<Vec<TypedValue>, VmDiagnostic> {
+                assert_eq!(requirement.capability, CapabilityKind::SessionEmit);
+                let [TypedValue::String(text)] = arguments.as_slice() else {
+                    panic!("expected string emission");
+                };
+                self.0.push_str(text);
+                Ok(vec![TypedValue::Unit])
+            }
+            fn output(&self) -> String { self.0.clone() }
+        }
+        let mut handler = EmitHandler::default();
+        Interpreter::new(&module, &mut handler, InterpreterConfig {
+            fuel: 100_000,
+            grants: EffectSet::from_requirement(CapabilityRequirement {
+                capability: CapabilityKind::SessionEmit,
+                selector: ResourceSelector::None,
+            }),
+        })
+        .execute(&mut stack)
+        .unwrap();
+        assert_eq!(handler.output(), "Hello user, I am an LLM8");
     }
 
     #[test]

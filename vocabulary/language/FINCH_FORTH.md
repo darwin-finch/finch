@@ -44,7 +44,17 @@ message.
 
 For progressive prose, emit multiple typed chunks with `say`. A future template/quasiquote form
 may combine literal text and embedded expressions, but it will lower to the same checked sequence
-of `say` side effects; interpolation is never string replacement or an untyped eval escape.
+of `say` side effects; interpolation is never string replacement or an untyped eval escape. For
+compact streamable prose, `["] ... ["]` is an alternate string-literal delimiter:
+
+```forth
+["] Hello user, I am an LLM. ["] say
+3 5 + int-to-string say
+["]  is that correct? ["] say
+```
+
+The bracket delimiters produce an ordinary typed `string` constant. They do not evaluate text
+inside the delimiters or interpolate implicitly.
 
 Typed conditionals use `if ... else ... then`. Typed loops use `begin ... while ... repeat` or
 `begin ... until`. Structural words must be properly nested. The condition is `bool`; the
