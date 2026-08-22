@@ -3,9 +3,9 @@
   "$id": "https://darwin-finch.github.io/schema/finch-vm-language-1.json",
   "title": "Finch typed VM program envelope",
   "type": "object",
-  "required": ["language", "source", "intent", "effect", "manifest_generation"],
+  "required": ["source", "intent", "effect", "manifest_generation"],
   "properties": {
-    "language": { "enum": ["lisp", "forth"] },
+    "language": { "enum": ["lisp", "forth"], "description": "Optional; omitted source beginning with '(' is Lisp, otherwise Forth" },
     "source": { "type": "string", "minLength": 1 },
     "intent": { "type": "string", "minLength": 1 },
     "effect": {
