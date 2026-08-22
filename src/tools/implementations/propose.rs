@@ -19,6 +19,44 @@ use std::time::Duration;
 use tempfile::Builder;
 use tokio::task::spawn_blocking;
 
+/// Decision encoded in an editor-backed proposal file. The source remains
+/// untrusted and must still pass the normal tool/VM authorization path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalDecision {
+    Execute { source: String },
+    Chat { context: String },
+    Cancel,
+}
+
+/// Read a reserved Finch action directive without interpreting ordinary
+/// comments (including Git's instructional comments).
+pub fn parse_proposal_decision(content: &str) -> ProposalDecision {
+    let action = content.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let directive = trimmed
+            .strip_prefix("# finch:")
+            .or_else(|| trimmed.strip_prefix("\\ finch:"))
+            .or_else(|| trimmed.strip_prefix(";; finch:"))?;
+        directive.trim().strip_prefix("action=")
+    });
+    match action {
+        Some("cancel") => ProposalDecision::Cancel,
+        Some("chat") => ProposalDecision::Chat {
+            context: content.to_string(),
+        },
+        _ if content.lines().all(|line| {
+            let line = line.trim();
+            line.is_empty()
+                || line.starts_with('#')
+                || line.starts_with('\\')
+                || line.starts_with(";;")
+        }) => ProposalDecision::Cancel,
+        _ => ProposalDecision::Execute {
+            source: content.to_string(),
+        },
+    }
+}
+
 fn suspend_terminal_for_editor() {
     std::io::stdout().flush().ok();
     // Raw mode alone is not the whole TUI protocol. Leaving bracketed paste or
@@ -388,5 +426,29 @@ mod tests {
     fn test_run_script_captures_stderr() {
         let out = run_script("#!/bin/bash\necho err >&2").unwrap();
         assert!(out.contains("err"));
+    }
+
+    #[test]
+    fn proposal_directives_distinguish_execute_chat_and_cancel() {
+        assert!(matches!(
+            parse_proposal_decision("# finch: action=execute\necho hi"),
+            ProposalDecision::Execute { .. }
+        ));
+        assert!(matches!(
+            parse_proposal_decision("# finch: action=chat\nplease discuss this"),
+            ProposalDecision::Chat { .. }
+        ));
+        assert_eq!(
+            parse_proposal_decision("# finch: action=cancel\necho hi"),
+            ProposalDecision::Cancel
+        );
+    }
+
+    #[test]
+    fn ordinary_git_comments_do_not_control_proposal() {
+        assert!(matches!(
+            parse_proposal_decision("# Please enter the commit message\necho hi"),
+            ProposalDecision::Execute { .. }
+        ));
     }
 }
