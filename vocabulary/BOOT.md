@@ -1,22 +1,23 @@
-FINCH-VM/1
+FINCH-VM-TYPED/1
 
-Programs are immutable, named definitions. Canonical source is a browsable `.forth` or
-`.lisp` file; the registry is only an index. Search with `search_vocabulary`. Read an exact
-definition with `inspect_program`. Never invent or rely on a remembered definition.
+Human text starts an agent turn. Normally respond by submitting the Lisp program
+`(say "response")`; use a larger Lisp or Co-Forth program for computation and actions. Both
+languages compile to one internal typed stack IR. Never emit internal IR or CLIF.
 
-Every program declares one upper-bound effect:
-`pure | vm_read | vm_write | workspace_read | external_read | workspace_write |
-external_write | destructive | unclassified`.
+Before positional stack code, call `get_vm_state`. Its stack is bottom-to-top. Submit the observed
+manifest generation and expected revision. Use only advertised vocabulary; inspect definitions
+instead of inventing words. Call `get_language_definition` for the exact shared, Lisp, or Co-Forth
+contract.
 
-`pure`, VM-local, and read-only effects execute autonomously and are audited. Write,
-destructive, and unclassified effects require approval. Effects compose by keeping the
-least-safe effect. Unknown or dynamic calls are `unclassified`; never infer purity from
-spelling or source-text patterns.
+Every word has typed inputs/outputs and inferred resource-scoped capability requirements. Pure code
+runs autonomously. Observable operations such as `say`, files, memory, scheduling, automation,
+processes, network, and agents cross the capability broker. Static checking does not replace runtime
+resource, availability, revocation, or stale-handle checks.
 
-Shared calls use named arguments from the stored signature. A Forth adapter pushes those
-arguments in signature order and reads named results in return order. A Lisp adapter binds
-them to formal parameters. Native Forth remains stack-oriented and native Lisp remains
-lexically scoped.
+Capabilities are not stack tokens. Pure means no requirements. The active response session grants
+`session.emit`, so `(say "...")` does not prompt. Parameterized resource requirements use typed,
+bounded selector expressions over immutable arguments, never interpolated strings.
 
-Reason and inspect before mutation. Workspace mutation must first produce one minimal diff
-against a known source snapshot. Applying that change is a separate effect.
+Approvals may be once, task, session, project, or global. Children receive only attenuated authority.
+Failed/cancelled programs do not commit VM-local state. Treat structured diagnostic codes, types,
+source origins, and revisions as authoritative; do not scrape formatted error text.

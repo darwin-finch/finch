@@ -1,0 +1,36 @@
+//! Finch's typed, provider-neutral virtual-machine contracts.
+//!
+//! Co-Forth and Finch Lisp are source languages. Both compile to the typed IR
+//! defined here and are checked by the same verifier before execution.
+
+pub mod diagnostic;
+pub mod effects;
+pub mod frontend;
+pub mod interpreter;
+pub mod ir;
+pub mod runtime;
+pub mod signature;
+pub mod types;
+pub mod verifier;
+pub mod vocabulary;
+
+pub use capability::{
+    ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
+    CapabilityAvailability, CapabilityGrant, CapabilityRequest, GrantScope, GrantSet,
+};
+pub use diagnostic::{
+    DiagnosticPhase, Severity, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
+};
+pub use effects::{
+    CapabilityKind, CapabilityRequirement, EffectSet, FileOperation, FileSelector,
+    FileSelectorTemplate, FileSelectorTemplatePart, ResourceRoot, ResourceSelector, SelectorError,
+};
+pub use runtime::{TypedExecution, TypedExecutionStatus, TypedRuntime};
+pub use signature::{ControlEffect, StackRow, StackSignature};
+pub use types::{Type, TypedValue};
+pub use verifier::{VerifiedFunction, VerifiedModule, Verifier, Vocabulary};
+pub use vocabulary::core_vocabulary;
+
+/// Version of the typed VM contract and serialized IR family.
+pub const VM_TYPE_SYSTEM_VERSION: u32 = 1;
+pub mod capability;

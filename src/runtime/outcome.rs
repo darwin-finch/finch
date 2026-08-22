@@ -1,4 +1,5 @@
 use crate::programs::{ExecutionEffect, ProgramValue};
+use crate::vm::{ApprovalPrompt, CapabilityRequirement, VmDiagnostic};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -6,6 +7,7 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
     Completed,
+    AuthorizationRequired,
     Failed,
     Cancelled,
 }
@@ -14,6 +16,7 @@ pub enum ExecutionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionBackend {
     Forth,
+    TypedVm,
     LispCompiledToForth,
     LispNative,
 }
@@ -26,6 +29,12 @@ pub struct ExecutionOutcome {
     pub values: Vec<ProgramValue>,
     pub output: String,
     pub diagnostics: Vec<String>,
+    #[serde(default)]
+    pub vm_diagnostics: Vec<VmDiagnostic>,
+    #[serde(default)]
+    pub required_capabilities: Vec<CapabilityRequirement>,
+    #[serde(default)]
+    pub approval_prompts: Vec<ApprovalPrompt>,
     pub input_revision: u64,
     pub output_revision: u64,
     pub effect: ExecutionEffect,
@@ -48,6 +57,9 @@ impl ExecutionOutcome {
             values: Vec::new(),
             output: String::new(),
             diagnostics: vec![diagnostic.into()],
+            vm_diagnostics: Vec::new(),
+            required_capabilities: Vec::new(),
+            approval_prompts: Vec::new(),
             input_revision: revision,
             output_revision: revision,
             effect,

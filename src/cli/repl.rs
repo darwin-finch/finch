@@ -326,6 +326,9 @@ impl Repl {
         tool_registry.register(Box::new(
             crate::tools::implementations::GetVmStateTool::new(Arc::clone(&program_runtime)),
         ));
+        tool_registry.register(Box::new(
+            crate::tools::implementations::GetLanguageDefinitionTool,
+        ));
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()
@@ -488,6 +491,9 @@ impl Repl {
                     crate::tools::implementations::GetVmStateTool::new(Arc::clone(
                         &program_runtime,
                     )),
+                ));
+                fallback_registry.register(Box::new(
+                    crate::tools::implementations::GetLanguageDefinitionTool,
                 ));
                 fallback_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
                 fallback_registry

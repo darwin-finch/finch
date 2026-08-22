@@ -10,6 +10,49 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Retrieve the exact versioned source-language contract instead of relying on
+/// provider training data or a remembered vocabulary.
+pub struct GetLanguageDefinitionTool;
+
+#[async_trait]
+impl Tool for GetLanguageDefinitionTool {
+    fn name(&self) -> &str {
+        "get_language_definition"
+    }
+
+    fn description(&self) -> &str {
+        "Return Finch's exact shared VM, typed Lisp, typed Co-Forth, or machine-readable program-envelope definition. Use this before writing unfamiliar VM programs."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: json!({
+                "language": {
+                    "type": "string",
+                    "enum": ["shared", "lisp", "forth", "schema"],
+                    "description": "Definition to retrieve"
+                }
+            }),
+            required: vec!["language".to_string()],
+        }
+    }
+
+    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+        let language = input["language"]
+            .as_str()
+            .context("get_language_definition: missing language")?;
+        Ok(match language {
+            "shared" => crate::programs::VM_LANGUAGE_DEFINITION,
+            "lisp" => crate::programs::LISP_LANGUAGE_DEFINITION,
+            "forth" => crate::programs::FORTH_LANGUAGE_DEFINITION,
+            "schema" => crate::programs::LANGUAGE_SCHEMA,
+            _ => anyhow::bail!("unknown Finch language definition: {language}"),
+        }
+        .to_string())
+    }
+}
+
 pub struct SubmitProgramTool {
     runtime: Arc<ProgramRuntime>,
     caller: Option<crate::runtime::scheduler::AgentIdentity>,
@@ -66,6 +109,11 @@ impl Tool for SubmitProgramTool {
                     "enum": ["pure", "vm_read", "vm_write", "external_read", "external_write"],
                     "description": "Expected effect of this execution"
                 },
+                "declared_capabilities": {
+                    "type": "array",
+                    "items": { "type": "object" },
+                    "description": "Optional exact typed capability requirements inferred while composing the program"
+                },
                 "manifest_generation": {
                     "type": "integer",
                     "minimum": 1,
@@ -109,6 +157,12 @@ impl Tool for SubmitProgramTool {
             .as_u64()
             .context("submit_program: missing manifest_generation")?;
         let expected_revision = input.get("expected_revision").and_then(Value::as_u64);
+        let declared_capabilities = input
+            .get("declared_capabilities")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
 
         let outcome = self
             .runtime
@@ -118,9 +172,10 @@ impl Tool for SubmitProgramTool {
                     source,
                     intent,
                     effect,
-                manifest_generation,
-                expected_revision,
-                budget: None,
+                    declared_capabilities,
+                    manifest_generation,
+                    expected_revision,
+                    budget: None,
                 },
                 self.caller.clone(),
             )
@@ -177,6 +232,29 @@ impl Tool for GetVmStateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn language_definition_advertises_program_response_contract() {
+        let tool = GetLanguageDefinitionTool;
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            stack: None,
+            poset: None,
+        };
+        let definition = tool
+            .execute(json!({"language": "lisp"}), &context)
+            .await
+            .unwrap();
+        assert!(definition.contains("(say \"Hello\")"));
+        assert!(definition.contains("compiles directly"));
+    }
 
     #[tokio::test]
     async fn tool_round_trips_structured_forth_result() {

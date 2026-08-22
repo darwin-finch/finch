@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://darwin-finch.github.io/schema/finch-vm-language-1.json",
+  "title": "Finch typed VM program envelope",
+  "type": "object",
+  "required": ["language", "source", "intent", "effect", "manifest_generation"],
+  "properties": {
+    "language": { "enum": ["lisp", "forth"] },
+    "source": { "type": "string", "minLength": 1 },
+    "intent": { "type": "string", "minLength": 1 },
+    "effect": {
+      "enum": ["pure", "vm_read", "vm_write", "workspace_read", "external_read", "workspace_write", "external_write", "destructive", "unclassified"]
+    },
+    "manifest_generation": { "type": "integer", "minimum": 1 },
+    "expected_revision": { "type": "integer", "minimum": 0 },
+    "declared_capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/capability" },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "capability": {
+      "type": "object",
+      "required": ["capability", "selector"],
+      "properties": {
+        "capability": {
+          "enum": ["vm_read", "vm_write", "file_read", "file_write", "network_connect", "automation_inspect", "automation_write", "agent_spawn", "agent_await", "process_run", "session_emit", "memory_read", "memory_write", "memory_consolidate", "schedule_create", "schedule_read", "schedule_manage", "program_invoke", "unsafe_memory"]
+        },
+        "selector": { "$ref": "#/$defs/resource_selector" }
+      },
+      "additionalProperties": false
+    },
+    "resource_root": {
+      "oneOf": [
+        { "const": { "kind": "workspace" } },
+        { "const": { "kind": "project" } },
+        { "const": { "kind": "task_output" } },
+        {
+          "type": "object",
+          "required": ["kind", "name"],
+          "properties": { "kind": { "const": "named" }, "name": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "file_selector": {
+      "type": "object",
+      "required": ["root", "pattern"],
+      "properties": { "root": { "$ref": "#/$defs/resource_root" }, "pattern": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "file_template_part": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["part", "relative"],
+          "properties": { "part": { "const": "literal" }, "relative": { "type": "string" } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["part", "index", "bound"],
+          "properties": { "part": { "const": "argument" }, "index": { "type": "integer", "minimum": 0 }, "bound": { "$ref": "#/$defs/file_selector" } },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "file_selector_template": {
+      "type": "object",
+      "required": ["root", "parts", "upper_bound"],
+      "properties": {
+        "root": { "$ref": "#/$defs/resource_root" },
+        "parts": { "type": "array", "items": { "$ref": "#/$defs/file_template_part" } },
+        "upper_bound": { "$ref": "#/$defs/file_selector" }
+      },
+      "additionalProperties": false
+    },
+    "resource_selector": {
+      "oneOf": [
+        { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "none" } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "selector"], "properties": { "kind": { "const": "file" }, "selector": { "$ref": "#/$defs/file_selector" } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "template"], "properties": { "kind": { "const": "file_template" }, "template": { "$ref": "#/$defs/file_selector_template" } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "host", "ports"], "properties": { "kind": { "const": "network" }, "host": { "type": "string" }, "ports": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 65535 }, "uniqueItems": true } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "application"], "properties": { "kind": { "const": "automation" }, "application": { "type": ["string", "null"] } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "providers", "max_depth", "max_children"], "properties": { "kind": { "const": "agent" }, "providers": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "max_depth": { "type": "integer", "minimum": 0, "maximum": 65535 }, "max_children": { "type": "integer", "minimum": 0, "maximum": 65535 } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "executables"], "properties": { "kind": { "const": "process" }, "executables": { "type": "array", "items": { "type": "string" }, "uniqueItems": true } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "tree", "path"], "properties": { "kind": { "const": "memory" }, "tree": { "type": "string" }, "path": { "type": "string" } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "policy"], "properties": { "kind": { "const": "schedule" }, "policy": { "type": ["string", "null"] } }, "additionalProperties": false }
+      ]
+    }
+  },
+  "additionalProperties": false
+}

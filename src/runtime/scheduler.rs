@@ -4,7 +4,7 @@ use crate::claude::{ContentBlock, Message};
 use crate::generators::Generator;
 use crate::runtime::ProgramRuntime;
 use crate::tools::implementations::{
-    GetVmStateTool, GlobTool, GrepTool, ReadTool, SubmitProgramTool,
+    GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, ReadTool, SubmitProgramTool,
 };
 use crate::tools::permissions::{PermissionCheck, PermissionManager};
 use crate::tools::registry::Tool;
@@ -533,6 +533,7 @@ impl AgentScheduler {
                 identity.clone(),
             )),
             Box::new(GetVmStateTool::new(Arc::clone(&self.runtime))),
+            Box::new(GetLanguageDefinitionTool),
         ];
         if identity.depth < MAX_DEPTH {
             tools.push(Box::new(
@@ -706,6 +707,7 @@ mod tests {
                 source: r#"s" inspect the VM" agent-spawn agent-await"#.to_string(),
                 intent: "fork and join a child".to_string(),
                 effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
                 budget: None,
@@ -733,6 +735,7 @@ mod tests {
                     .to_string(),
                 intent: "fork and join a child".to_string(),
                 effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
                 manifest_generation: runtime.manifest_generation(),
                 expected_revision: None,
                 budget: None,

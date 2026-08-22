@@ -1,13 +1,36 @@
 # Finch TODO
 
 This is the short, discoverable work queue. Detailed rationale and protocol sketches live in
-[`docs/SHARED_PROGRAM_RUNTIME_PLAN.md`](docs/SHARED_PROGRAM_RUNTIME_PLAN.md).
+[`docs/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md`](docs/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md),
+[`docs/SHARED_PROGRAM_RUNTIME_PLAN.md`](docs/SHARED_PROGRAM_RUNTIME_PLAN.md), and
+[`docs/BRAIN_CONVERGENCE_PLAN.md`](docs/BRAIN_CONVERGENCE_PLAN.md).
+
+## Typed Lisp/Co-Forth VM — prerequisite for Brain convergence
+
+- [ ] Finish both source frontends and their shared typed IR semantics: definitions/signatures,
+  conditionals, metered loops, locals, quotations, closures, collections, bounded macros, and
+  structured error/result forms.
+- [ ] Generate every production word/function from one typed signature, effect, documentation, and
+  host-implementation registry.
+- [ ] Finish the capability broker: bounded argument templates, availability, grants, attenuation,
+  revocation, audit, approval dialogs, runtime guards, and typed suspend/resume.
+- [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
+  and agent fork/join/model selection through typed VM primitives.
+- [ ] Make `ProgramRuntime` and VM inspection use one persistent typed stack, dictionary, heap,
+  transaction manager, and revision history for Lisp and Co-Forth.
+- [ ] Remove the Lisp-to-Forth text compiler, native Lisp fallback, source-text effect inference,
+  and duplicate direct model-tool paths after conformance parity.
+- [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
+  tests, concurrency tests, and provider conformance tests. Do not require the later Cranelift JIT
+  optimization tier to begin Brain convergence.
 
 ## Shared brains and environments
 
-- [ ] Consolidate the three current "brain" concepts. A brain is one authoritative context,
-  event log, program stack, and VM state; background agents become worker jobs attached to it,
-  and legacy shared-context strings become a projection/migration path.
+- [ ] After every VM prerequisite above passes, execute
+  [`docs/BRAIN_CONVERGENCE_PLAN.md`](docs/BRAIN_CONVERGENCE_PLAN.md): consolidate the three current
+  Brain concepts into one daemon-authoritative event log, VM history, environment, and authority
+  boundary; model interactive turns, speculative helpers, schedules, and subagents as `BrainRun`s;
+  and make local, embedded, IPC, HTTP/WebSocket, and remote clients projections of one service.
 - [ ] Persist complete VM checkpoints or reversible VM deltas at committed program boundaries.
 - [ ] Split reducible VM state from the execute-once host-effect journal. Never replay file,
   process, dialog, or network effects while restoring VM state.

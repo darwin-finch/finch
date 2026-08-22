@@ -100,7 +100,7 @@ pub use memory_tools::{CreateMemoryTool, ListRecentTool, SearchMemoryTool};
 
 pub use vocabulary_tools::{InspectProgramTool, SearchVocabularyTool};
 
-pub use program::{GetVmStateTool, SubmitProgramTool};
+pub use program::{GetLanguageDefinitionTool, GetVmStateTool, SubmitProgramTool};
 
 pub use agent::{AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool};
 

@@ -9,11 +9,16 @@ pub mod scheduler;
 use crate::coforth::{Forth, Library};
 use crate::lisp::{self, EnvRef, LispCtx, Val};
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
+use crate::vm::{
+    ApprovalPrompt, CapabilityRequest, CapabilityRequirement, EffectSet, SourceOrigin, Type,
+    TypedExecutionStatus, TypedRuntime, TypedValue, VmDiagnostic,
+};
 use anyhow::{bail, Result};
 use automation::AutomationBroker;
 use context::{ExecutionBudget, ExecutionContext};
 use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock, Weak};
@@ -25,6 +30,8 @@ pub struct ProgramSubmission {
     pub source: String,
     pub intent: String,
     pub effect: ExecutionEffect,
+    #[serde(default)]
+    pub declared_capabilities: Vec<CapabilityRequirement>,
     pub manifest_generation: u64,
     #[serde(default)]
     pub expected_revision: Option<u64>,
@@ -46,16 +53,30 @@ pub struct VmVocabularyEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypedVmStackCell {
+    pub index_from_bottom: usize,
+    pub value_type: Type,
+    pub value: TypedValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmStateSnapshot {
     pub manifest_generation: u64,
     pub revision: u64,
     pub stack: Vec<VmStackCell>,
     pub vocabulary: Vec<VmVocabularyEntry>,
+    #[serde(default)]
+    pub typed_stack: Vec<TypedVmStackCell>,
+    #[serde(default)]
+    pub typed_vocabulary: Vec<VmVocabularyEntry>,
+    #[serde(default)]
+    pub granted_capabilities: Vec<CapabilityRequirement>,
 }
 
 /// One session's persistent language runtimes.
 pub struct ProgramRuntime {
     forth: Arc<Mutex<Forth>>,
+    typed: Arc<Mutex<TypedRuntime>>,
     lisp_env: EnvRef,
     lisp_ctx: Arc<LispCtx>,
     revision: Arc<AtomicU64>,
@@ -77,6 +98,7 @@ impl ProgramRuntime {
         forth.set_automation_broker(Arc::clone(&automation));
         Self {
             forth: Arc::new(Mutex::new(forth)),
+            typed: Arc::new(Mutex::new(TypedRuntime::new())),
             lisp_env: lisp::make_env(),
             lisp_ctx,
             revision: Arc::new(AtomicU64::new(0)),
@@ -108,6 +130,7 @@ impl ProgramRuntime {
 
     pub async fn inspect(&self) -> Result<VmStateSnapshot> {
         let forth = Arc::clone(&self.forth);
+        let typed = Arc::clone(&self.typed);
         let revision = Arc::clone(&self.revision);
         let manifest_generation = self.manifest_generation();
         tokio::task::spawn_blocking(move || {
@@ -115,7 +138,7 @@ impl ProgramRuntime {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Forth VM lock poisoned"))?;
             let revision = revision.load(Ordering::Acquire);
-            let stack = forth
+            let mut stack: Vec<VmStackCell> = forth
                 .data_stack()
                 .iter()
                 .copied()
@@ -131,11 +154,52 @@ impl ProgramRuntime {
                 .into_iter()
                 .map(|(name, signature)| VmVocabularyEntry { name, signature })
                 .collect();
+            drop(forth);
+            let typed = typed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?;
+            let typed_stack: Vec<_> = typed
+                .stack()
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index_from_bottom, value)| TypedVmStackCell {
+                    index_from_bottom,
+                    value_type: value.value_type(),
+                    value,
+                })
+                .collect();
+            if stack.is_empty() {
+                stack = typed_stack
+                    .iter()
+                    .filter_map(|cell| {
+                        typed_value(cell.value.clone())
+                            .ok()
+                            .map(|value| VmStackCell {
+                                index_from_bottom: cell.index_from_bottom,
+                                type_name: cell.value_type.to_string(),
+                                value,
+                            })
+                    })
+                    .collect();
+            }
+            let typed_vocabulary = typed
+                .vocabulary()
+                .iter()
+                .map(|(name, signature)| VmVocabularyEntry {
+                    name: name.clone(),
+                    signature: Some(signature.to_string()),
+                })
+                .collect();
+            let granted_capabilities = typed.grants().0.iter().cloned().collect();
             Ok(VmStateSnapshot {
                 manifest_generation,
                 revision,
                 stack,
                 vocabulary,
+                typed_stack,
+                typed_vocabulary,
+                granted_capabilities,
             })
         })
         .await?
@@ -199,6 +263,76 @@ impl ProgramRuntime {
 
         let context = ExecutionContext::new(generation, submission.budget.unwrap_or_default());
         let started = Instant::now();
+        if let Some(execution) = self
+            .execute_typed_program(
+                submission.language,
+                &submission.source,
+                &context,
+                &submission.declared_capabilities,
+            )
+            .await?
+        {
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            return Ok(match execution.status {
+                TypedExecutionStatus::Completed => {
+                    let output_revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                    ExecutionOutcome {
+                        execution_id: context.execution_id,
+                        status: ExecutionStatus::Completed,
+                        values: typed_values(execution.values)?,
+                        output: truncate_output(execution.output, context.budget.max_output_bytes),
+                        diagnostics: Vec::new(),
+                        vm_diagnostics: Vec::new(),
+                        required_capabilities: Vec::new(),
+                        approval_prompts: Vec::new(),
+                        input_revision,
+                        output_revision,
+                        effect: submission.effect,
+                        backend: ExecutionBackend::TypedVm,
+                        elapsed_ms,
+                    }
+                }
+                TypedExecutionStatus::AuthorizationRequired { requirements } => ExecutionOutcome {
+                    execution_id: context.execution_id,
+                    status: ExecutionStatus::AuthorizationRequired,
+                    values: Vec::new(),
+                    output: String::new(),
+                    diagnostics: Vec::new(),
+                    vm_diagnostics: execution.diagnostics,
+                    approval_prompts: approval_prompts(
+                        context.execution_id,
+                        &requirements,
+                        &submission.source,
+                        &submission.intent,
+                    ),
+                    required_capabilities: requirements,
+                    input_revision,
+                    output_revision: input_revision,
+                    effect: submission.effect,
+                    backend: ExecutionBackend::TypedVm,
+                    elapsed_ms,
+                },
+                TypedExecutionStatus::Failed => ExecutionOutcome {
+                    execution_id: context.execution_id,
+                    status: ExecutionStatus::Failed,
+                    values: Vec::new(),
+                    output: String::new(),
+                    diagnostics: execution
+                        .diagnostics
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    vm_diagnostics: execution.diagnostics,
+                    required_capabilities: Vec::new(),
+                    approval_prompts: Vec::new(),
+                    input_revision,
+                    output_revision: input_revision,
+                    effect: submission.effect,
+                    backend: ExecutionBackend::TypedVm,
+                    elapsed_ms,
+                },
+            });
+        }
         let result = match submission.language {
             ProgramLanguage::Forth => self
                 .execute_forth(&submission.source, &context, caller.clone())
@@ -224,6 +358,9 @@ impl ProgramRuntime {
                     values,
                     output,
                     diagnostics: Vec::new(),
+                    vm_diagnostics: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    approval_prompts: Vec::new(),
                     input_revision,
                     output_revision,
                     effect: submission.effect,
@@ -242,6 +379,61 @@ impl ProgramRuntime {
                 error.to_string(),
                 elapsed_ms,
             )),
+        }
+    }
+
+    async fn execute_typed_program(
+        &self,
+        language: ProgramLanguage,
+        source: &str,
+        context: &ExecutionContext,
+        declared_capabilities: &[CapabilityRequirement],
+    ) -> Result<Option<crate::vm::TypedExecution>> {
+        let runtime = Arc::clone(&self.typed);
+        let source = source.to_string();
+        let declared = (!declared_capabilities.is_empty())
+            .then(|| EffectSet(declared_capabilities.iter().cloned().collect()));
+        let fuel = context.budget.forth_fuel.min(u64::MAX as usize) as u64;
+        let execution = tokio::task::spawn_blocking(move || {
+            runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))
+                .map(|mut runtime| {
+                    runtime.execute_with_declaration(
+                        language,
+                        match language {
+                            ProgramLanguage::Forth => "provider-response.forth",
+                            ProgramLanguage::Lisp => "provider-response.lisp",
+                        },
+                        &source,
+                        fuel,
+                        declared.as_ref(),
+                    )
+                })
+        })
+        .await??;
+        if matches!(execution.status, TypedExecutionStatus::Failed)
+            && execution.diagnostics.iter().all(typed_frontend_unsupported)
+        {
+            Ok(None)
+        } else if matches!(
+            &execution.status,
+            TypedExecutionStatus::AuthorizationRequired { requirements }
+                if !requirements.is_empty()
+                    && requirements.iter().all(|requirement| matches!(
+                        requirement.capability,
+                        crate::vm::CapabilityKind::AgentSpawn
+                            | crate::vm::CapabilityKind::AgentAwait
+                    ))
+        ) {
+            // The existing scheduler already enforces task ownership and
+            // ancestry. Keep these forms on that compatibility path until the
+            // typed interpreter has an asynchronous scheduler host binding;
+            // treating a missing binding as a permission prompt would strand
+            // a program that cannot resume successfully.
+            Ok(None)
+        } else {
+            Ok(Some(execution))
         }
     }
 
@@ -477,6 +669,62 @@ fn lisp_value(value: Val) -> Result<ProgramValue> {
     })
 }
 
+fn approval_prompts(
+    execution_id: uuid::Uuid,
+    requirements: &[CapabilityRequirement],
+    source: &str,
+    intent: &str,
+) -> Vec<ApprovalPrompt> {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    let program_hash = format!("{:016x}", hasher.finish());
+    requirements
+        .iter()
+        .cloned()
+        .map(|requirement| {
+            ApprovalPrompt::for_request(CapabilityRequest {
+                id: uuid::Uuid::new_v4(),
+                execution_id,
+                reason: intent.to_string(),
+                requirement,
+                arguments: Vec::new(),
+                origin: SourceOrigin::generated("capability-preflight"),
+                agent_ancestry: Vec::new(),
+                program_hash: program_hash.clone(),
+            })
+        })
+        .collect()
+}
+
+fn typed_frontend_unsupported(diagnostic: &VmDiagnostic) -> bool {
+    matches!(
+        diagnostic.code.as_str(),
+        "E-LINK-002"
+            | "E-NAME-001"
+            | "E-TYPE-005"
+            | "E-LISP-DEF-002"
+            | "E-FORTH-SIG-001"
+            | "E-FORTH-DEF-003"
+    )
+}
+
+fn typed_values(values: Vec<TypedValue>) -> Result<Vec<ProgramValue>> {
+    values.into_iter().map(typed_value).collect()
+}
+
+fn typed_value(value: TypedValue) -> Result<ProgramValue> {
+    Ok(match value {
+        TypedValue::Unit => ProgramValue::Nil,
+        TypedValue::Bool(value) => ProgramValue::Bool(value),
+        TypedValue::Int(value) => ProgramValue::Int(value),
+        TypedValue::Float(value) => ProgramValue::Float(value),
+        TypedValue::String(value) => ProgramValue::String(value),
+        TypedValue::Bytes(value) => ProgramValue::Bytes(value),
+        TypedValue::List { values, .. } => ProgramValue::List(typed_values(values)?),
+        other => bail!("typed VM value is not portable: {other:?}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +739,7 @@ mod tests {
             source: source.to_string(),
             intent: "test".to_string(),
             effect,
+            declared_capabilities: Vec::new(),
             manifest_generation: 1,
             expected_revision: None,
             budget: None,
@@ -580,7 +829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portable_lisp_reports_forth_backend() {
+    async fn portable_lisp_uses_the_typed_vm_without_forth_text() {
         let runtime = ProgramRuntime::new();
         let outcome = runtime
             .submit(submission(
@@ -590,8 +839,94 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(outcome.backend, ExecutionBackend::LispCompiledToForth);
+        assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
         assert_eq!(outcome.values, vec![ProgramValue::Int(11)]);
+    }
+
+    #[tokio::test]
+    async fn typed_dictionary_is_shared_between_forth_and_lisp_submissions() {
+        let runtime = ProgramRuntime::new();
+        let definition = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                ": square ( S int -- S int ! {} ) dup * ;",
+                ExecutionEffect::VmWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(definition.backend, ExecutionBackend::TypedVm);
+        let call = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(square 12)",
+                ExecutionEffect::VmRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(call.backend, ExecutionBackend::TypedVm);
+        assert_eq!(call.values, vec![ProgramValue::Int(144)]);
+    }
+
+    #[tokio::test]
+    async fn say_is_a_typed_lisp_response_program() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(say \"hello from Lisp\")",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
+        assert_eq!(outcome.output, "hello from Lisp");
+    }
+
+    #[tokio::test]
+    async fn typed_capability_request_does_not_mutate_or_fallback() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(mem-store \"remember this\")",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::AuthorizationRequired);
+        assert_eq!(outcome.output_revision, outcome.input_revision);
+        assert_eq!(outcome.required_capabilities.len(), 1);
+        assert_eq!(outcome.approval_prompts.len(), 1);
+        assert_eq!(
+            outcome.approval_prompts[0].exact,
+            outcome.required_capabilities[0]
+        );
+        assert_eq!(
+            outcome.required_capabilities[0].capability,
+            crate::vm::CapabilityKind::MemoryWrite
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_exposes_typed_stack_vocabulary_and_grants() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(+ 20 22)",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        let state = runtime.inspect().await.unwrap();
+        assert_eq!(state.typed_stack.len(), 1);
+        assert_eq!(state.typed_stack[0].value, TypedValue::Int(42));
+        assert!(state.typed_vocabulary.iter().any(|word| word.name == "say"));
+        assert!(state
+            .granted_capabilities
+            .iter()
+            .any(|grant| grant.capability == crate::vm::CapabilityKind::SessionEmit));
     }
 
     #[tokio::test]
@@ -616,7 +951,11 @@ mod tests {
     async fn rejects_stale_vm_revision() {
         let runtime = ProgramRuntime::new();
         runtime
-            .submit(submission(ProgramLanguage::Forth, "1", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "1",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
         let mut request = submission(ProgramLanguage::Forth, "2 +", ExecutionEffect::VmWrite);

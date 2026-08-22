@@ -14,6 +14,11 @@ pub const MANIFEST_PROTOCOL_VERSION: u32 = 1;
 
 /// Minimal language/runtime definition supplied to every fresh model context.
 pub const BOOT_CAPSULE: &str = include_str!("../../vocabulary/BOOT.md");
+pub const VM_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_VM.md");
+pub const FORTH_LANGUAGE_DEFINITION: &str =
+    include_str!("../../vocabulary/language/FINCH_FORTH.md");
+pub const LISP_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_LISP.md");
+pub const LANGUAGE_SCHEMA: &str = include_str!("../../vocabulary/language/schema.json");
 
 /// Upper bound on what executing a program may affect.
 ///
