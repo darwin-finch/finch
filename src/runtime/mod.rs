@@ -443,6 +443,8 @@ impl ProgramRuntime {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))
                 .map(|mut runtime| {
+                    let vocabulary = serde_json::to_string(runtime.vocabulary())
+                        .unwrap_or_else(|_| "[]".to_string());
                     if automation.is_enabled()
                         && matches!(language, ProgramLanguage::Forth | ProgramLanguage::Lisp)
                     {
@@ -478,6 +480,7 @@ impl ProgramRuntime {
                         Arc::clone(&workspace_root),
                         scheduler,
                         memory,
+                        vocabulary,
                     );
                     runtime.execute_with_handler(
                         language,
@@ -509,6 +512,7 @@ struct TypedHostHandler {
     output: String,
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<crate::memory::MemorySystem>>,
+    vocabulary: String,
 }
 
 impl TypedHostHandler {
@@ -517,6 +521,7 @@ impl TypedHostHandler {
         workspace_root: Arc<PathBuf>,
         scheduler: Option<agent_vm::AgentVmBinding>,
         memory: Option<Arc<crate::memory::MemorySystem>>,
+        vocabulary: String,
     ) -> Self {
         Self {
             automation,
@@ -524,6 +529,7 @@ impl TypedHostHandler {
             output: String::new(),
             scheduler,
             memory,
+            vocabulary,
         }
     }
 }
@@ -547,6 +553,15 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 };
                 self.output.push_str(text);
                 return Ok(vec![TypedValue::Unit]);
+            }
+            crate::vm::CapabilityKind::VmRead => {
+                if origin.word.as_deref() == Some("vm-vocabulary") {
+                    return Ok(vec![TypedValue::String(self.vocabulary.clone())]);
+                }
+                return Err(host_binding_error(
+                    origin,
+                    "unknown VM inspection operation",
+                ));
             }
             crate::vm::CapabilityKind::AutomationInspect => match origin.word.as_deref() {
                 Some("automation-displays") => AutomationRequest::Displays,
@@ -1387,6 +1402,25 @@ mod tests {
             .granted_capabilities
             .iter()
             .any(|grant| grant.capability == crate::vm::CapabilityKind::SessionEmit));
+    }
+
+    #[tokio::test]
+    async fn typed_vm_can_introspect_its_vocabulary() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(vm-vocabulary)",
+                ExecutionEffect::VmRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        let Some(ProgramValue::String(manifest)) = outcome.values.first() else {
+            panic!("expected serialized vocabulary");
+        };
+        assert!(manifest.contains("vm-vocabulary"));
+        assert!(manifest.contains("file-read"));
     }
 
     #[tokio::test]

@@ -51,13 +51,18 @@ impl TypedRuntime {
             capability: CapabilityKind::SessionEmit,
             selector: super::effects::ResourceSelector::None,
         };
+        let vm_read = CapabilityRequirement {
+            capability: CapabilityKind::VmRead,
+            selector: super::effects::ResourceSelector::None,
+        };
         Self {
             stack: Vec::new(),
             vocabulary: core_vocabulary(),
             functions: BTreeMap::new(),
             // Producing the requested assistant response is part of the
             // session contract, not an ambient host permission.
-            grants: EffectSet::from_requirement(response),
+            grants: EffectSet::from_requirement(response)
+                .union(&EffectSet::from_requirement(vm_read)),
         }
     }
 

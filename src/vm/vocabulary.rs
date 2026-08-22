@@ -132,6 +132,14 @@ pub fn core_vocabulary() -> Vocabulary {
             ),
         ),
         (
+            "vm-vocabulary".into(),
+            capability(
+                Vec::new(),
+                vec![Type::String],
+                unscoped(CapabilityKind::VmRead),
+            ),
+        ),
+        (
             "mem-recall".into(),
             capability(
                 vec![Type::String],
