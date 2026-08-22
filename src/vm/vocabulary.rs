@@ -389,4 +389,44 @@ mod tests {
         assert_eq!(vocabulary["dup"].to_string(), "( S A -- S A A ! {} )");
         assert!(!vocabulary["agent-spawn"].effects.is_pure());
     }
+
+    #[test]
+    fn language_schema_advertises_every_core_capability_kind() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../vocabulary/language/schema.json"
+        ))
+        .unwrap();
+        let advertised = schema["$defs"]["capability"]["properties"]["capability"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        for capability in [
+            CapabilityKind::VmRead,
+            CapabilityKind::VmWrite,
+            CapabilityKind::FileRead,
+            CapabilityKind::FileWrite,
+            CapabilityKind::NetworkConnect,
+            CapabilityKind::AutomationInspect,
+            CapabilityKind::AutomationWrite,
+            CapabilityKind::AgentSpawn,
+            CapabilityKind::AgentAwait,
+            CapabilityKind::AgentPoll,
+            CapabilityKind::AgentCancel,
+            CapabilityKind::ProcessRun,
+            CapabilityKind::SessionEmit,
+            CapabilityKind::MemoryRead,
+            CapabilityKind::MemoryWrite,
+            CapabilityKind::MemoryConsolidate,
+            CapabilityKind::ScheduleCreate,
+            CapabilityKind::ScheduleRead,
+            CapabilityKind::ScheduleManage,
+            CapabilityKind::ProgramInvoke,
+            CapabilityKind::UnsafeMemory,
+        ] {
+            let serialized = serde_json::to_value(capability).unwrap();
+            assert!(advertised.contains(serialized.as_str().unwrap()));
+        }
+    }
 }
