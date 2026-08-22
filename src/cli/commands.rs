@@ -822,147 +822,157 @@ fn parse_word_id(s: &str) -> Option<usize> {
 }
 
 pub fn format_help() -> String {
-    "\x1b[1;36m╔═══════════════════════════════════════════════════════════════════════╗\x1b[0m\n\
-         \x1b[1;36m║\x1b[0m                   \x1b[1;32mFinch Help - Commands & Shortcuts\x1b[0m                   \x1b[1;36m║\x1b[0m\n\
-         \x1b[1;36m╚═══════════════════════════════════════════════════════════════════════╝\x1b[0m\n\n\
-         \x1b[1;33m📋 Basic Commands:\x1b[0m\n\
-         \x1b[36m  /help\x1b[0m              Show this help message\n\
-         \x1b[36m  /quit\x1b[0m              Exit the REPL (also: Ctrl+D)\n\
-         \x1b[36m  /clear\x1b[0m             Clear conversation history and free up context\n\
-         \x1b[36m  /compact [note]\x1b[0m    Clear history but keep a summary in context\n\
-         \x1b[36m  /debug\x1b[0m             Toggle debug output\n\
-         \x1b[36m  /metrics\x1b[0m           Display usage statistics\n\
-         \x1b[36m  /memory\x1b[0m            Show memory usage (system and process)\n\
-         \x1b[36m  /training\x1b[0m          Show detailed training statistics\n\n\
-         \x1b[1;33m🤖 Provider Commands:\x1b[0m\n\
-         \x1b[36m  /model\x1b[0m             Show current named model profile\n\
-         \x1b[36m  /model list\x1b[0m        List configured cloud and local profiles\n\
-         \x1b[36m  /model <name>\x1b[0m      Switch profiles without clearing context\n\
-         \x1b[0m                     Example: /provider grok\n\
-         \x1b[36m  /local <query>\x1b[0m     Query local ONNX model directly (bypass routing)\n\
-         \x1b[0m                     Example: /local What is 2+2?\n\
-         \x1b[0m\n\
-         \x1b[90m  Aliases: /model and /teacher also work (kept for compatibility)\x1b[0m\n\
-         \x1b[90m  Switch between Claude, Grok, GPT-4, local ONNX, etc.\x1b[0m\n\
-         \x1b[90m  Conversation history is preserved across switches.\x1b[0m\n\n\
-         \x1b[1;33m🔌 MCP Plugin Commands:\x1b[0m\n\
-         \x1b[36m  /mcp list\x1b[0m          List connected MCP servers\n\
-         \x1b[36m  /mcp tools\x1b[0m         List all MCP tools from all servers\n\
-         \x1b[36m  /mcp tools <srv>\x1b[0m   List tools from specific server\n\
-         \x1b[36m  /mcp refresh\x1b[0m       Refresh tool list from all servers\n\
-         \x1b[36m  /mcp reload\x1b[0m        Reconnect to all MCP servers\n\
-         \x1b[0m\n\
-         \x1b[90m  What is MCP?\x1b[0m Model Context Protocol - extend Finch with external\n\
-         \x1b[90m  tools (GitHub, filesystem, databases, etc.) via MCP servers.\n\n\
-         \x1b[1;33m🎭 Persona Commands:\x1b[0m\n\
-         \x1b[36m  /persona\x1b[0m           List available personas\n\
-         \x1b[36m  /persona select <name>\x1b[0m Switch to a different persona\n\
-         \x1b[36m  /persona show\x1b[0m      Show current persona and system prompt\n\
-         \x1b[0m\n\
-         \x1b[90m  What are personas?\x1b[0m Customize AI behavior and personality.\n\
-         \x1b[90m  Built-in:\x1b[0m default, expert-coder, teacher, analyst, creative, researcher\n\n\
-         \x1b[1;33m🔍 Service Discovery:\x1b[0m\n\
-         \x1b[36m  /machines\x1b[0m          List known peer machines on the LAN\n\
-         \x1b[36m  /discover\x1b[0m          Scan LAN for new Finch daemons (mDNS)\n\
-         \x1b[0m\n\
-         \x1b[90m  Uses mDNS/Bonjour to find remote Finch instances for distributed GPU access.\x1b[0m\n\n\
-         \x1b[1;33m🔒 Tool Confirmation Patterns:\x1b[0m\n\
-         \x1b[36m  /patterns\x1b[0m          List all saved confirmation patterns\n\
-         \x1b[36m  /patterns add\x1b[0m      Add a new pattern (interactive wizard)\n\
-         \x1b[36m  /patterns rm <id>\x1b[0m  Remove a specific pattern by ID\n\
-         \x1b[36m  /patterns clear\x1b[0m    Remove all patterns (requires confirmation)\n\
-         \x1b[0m\n\
-         \x1b[90m  What are patterns?\x1b[0m Saved rules for auto-approving tool executions.\n\
-         \x1b[90m  Example:\x1b[0m \"Always allow reading *.rs files\" or \"Allow git status\"\n\n\
-         \x1b[1;33m📝 Plan Mode:\x1b[0m\n\
-         \x1b[90m  Claude can enter plan mode to explore your codebase in read-only mode,\x1b[0m\n\
-         \x1b[90m  then present a plan for your approval via an interactive dialog.\x1b[0m\n\
-         \x1b[0m\n\
-         \x1b[90m  Workflow:\x1b[0m 1. Ask Claude to plan → 2. Claude explores (read-only) →\n\
-         \x1b[90m            3. Claude presents plan → 4. Dialog appears automatically →\n\
-         \x1b[90m            5. You approve/request changes/reject → 6. Execution\n\n\
-         \x1b[1;33m🎓 Weighted Feedback (LoRA Fine-Tuning):\x1b[0m\n\
-         \x1b[36m  /critical [note]\x1b[0m   Mark response as \x1b[31mcritical error\x1b[0m (10x training weight)\n\
-         \x1b[36m  /medium [note]\x1b[0m     Mark response \x1b[33mneeds improvement\x1b[0m (3x weight)\n\
-         \x1b[36m  /good [note]\x1b[0m       Mark response as \x1b[32mgood example\x1b[0m (1x weight)\n\
-         \x1b[0m\n\
-         \x1b[90m  Aliases:\x1b[0m /feedback critical|high|medium|good [note]\n\
-         \x1b[0m\n\
-         \x1b[90m  Examples:\x1b[0m\n\
-         \x1b[90m    /critical\x1b[0m Never use .unwrap() in production code\n\
-         \x1b[90m    /medium\x1b[0m Prefer iterator chains over manual loops\n\
-         \x1b[90m    /good\x1b[0m This is exactly the right approach\n\n\
-         \x1b[1;33m⌨️  Keyboard Shortcuts:\x1b[0m\n\
-         \x1b[36m  Ctrl+C\x1b[0m             Cancel current query (interrupts generation)\n\
-         \x1b[36m  Ctrl+D\x1b[0m             Exit REPL (same as /quit)\n\
-         \x1b[36m  Ctrl+G\x1b[0m             Mark last response as \x1b[32mgood\x1b[0m (1x training weight)\n\
-         \x1b[36m  Ctrl+B\x1b[0m             Mark last response as \x1b[31mbad\x1b[0m (10x training weight)\n\
-         \x1b[36m  Ctrl+Z\x1b[0m             Undo last Forth definition (/undefine)\n\
-         \x1b[36m  Ctrl+P\x1b[0m             Pop top word off vocabulary stack (/pop)\n\
-         \x1b[36m  Tab\x1b[0m                Complete /command (accepts ghost text)\n\
-         \x1b[36m  Shift+Tab\x1b[0m          Toggle plan mode on/off\n\
-         \x1b[36m  Shift+Enter\x1b[0m        Multi-line input (insert newline)\n\
-         \x1b[36m  Shift+PgUp\x1b[0m         Scroll up in history\n\
-         \x1b[36m  Shift+PgDown\x1b[0m       Scroll down in history\n\
-         \x1b[90m  ↑ / ↓ arrows\x1b[0m       Navigate command history\n\n\
-         \x1b[1;33m🛠️  Tool Execution:\x1b[0m\n\
+    use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+    let reset = SetAttribute(Attribute::Reset);
+    let cyan = SetForegroundColor(Color::DarkCyan);
+    let gray = SetForegroundColor(Color::DarkGrey);
+    let red = SetForegroundColor(Color::DarkRed);
+    let green = SetForegroundColor(Color::DarkGreen);
+    let yellow = SetForegroundColor(Color::DarkYellow);
+    let cyan_bold = format!("{}{}", SetAttribute(Attribute::Bold), cyan);
+    let green_bold = format!("{}{}", SetAttribute(Attribute::Bold), green);
+    let yellow_bold = format!("{}{}", SetAttribute(Attribute::Bold), yellow);
+    format!("{cyan_bold}╔═══════════════════════════════════════════════════════════════════════╗{reset}\n\
+         {cyan_bold}║{reset}                   {green_bold}Finch Help - Commands & Shortcuts{reset}                   {cyan_bold}║{reset}\n\
+         {cyan_bold}╚═══════════════════════════════════════════════════════════════════════╝{reset}\n\n\
+         {yellow_bold}📋 Basic Commands:{reset}\n\
+         {cyan}  /help{reset}              Show this help message\n\
+         {cyan}  /quit{reset}              Exit the REPL (also: Ctrl+D)\n\
+         {cyan}  /clear{reset}             Clear conversation history and free up context\n\
+         {cyan}  /compact [note]{reset}    Clear history but keep a summary in context\n\
+         {cyan}  /debug{reset}             Toggle debug output\n\
+         {cyan}  /metrics{reset}           Display usage statistics\n\
+         {cyan}  /memory{reset}            Show memory usage (system and process)\n\
+         {cyan}  /training{reset}          Show detailed training statistics\n\n\
+         {yellow_bold}🤖 Provider Commands:{reset}\n\
+         {cyan}  /model{reset}             Show current named model profile\n\
+         {cyan}  /model list{reset}        List configured cloud and local profiles\n\
+         {cyan}  /model <name>{reset}      Switch profiles without clearing context\n\
+         {reset}                     Example: /provider grok\n\
+         {cyan}  /local <query>{reset}     Query local ONNX model directly (bypass routing)\n\
+         {reset}                     Example: /local What is 2+2?\n\
+         {reset}\n\
+         {gray}  Aliases: /model and /teacher also work (kept for compatibility){reset}\n\
+         {gray}  Switch between Claude, Grok, GPT-4, local ONNX, etc.{reset}\n\
+         {gray}  Conversation history is preserved across switches.{reset}\n\n\
+         {yellow_bold}🔌 MCP Plugin Commands:{reset}\n\
+         {cyan}  /mcp list{reset}          List connected MCP servers\n\
+         {cyan}  /mcp tools{reset}         List all MCP tools from all servers\n\
+         {cyan}  /mcp tools <srv>{reset}   List tools from specific server\n\
+         {cyan}  /mcp refresh{reset}       Refresh tool list from all servers\n\
+         {cyan}  /mcp reload{reset}        Reconnect to all MCP servers\n\
+         {reset}\n\
+         {gray}  What is MCP?{reset} Model Context Protocol - extend Finch with external\n\
+         {gray}  tools (GitHub, filesystem, databases, etc.) via MCP servers.\n\n\
+         {yellow_bold}🎭 Persona Commands:{reset}\n\
+         {cyan}  /persona{reset}           List available personas\n\
+         {cyan}  /persona select <name>{reset} Switch to a different persona\n\
+         {cyan}  /persona show{reset}      Show current persona and system prompt\n\
+         {reset}\n\
+         {gray}  What are personas?{reset} Customize AI behavior and personality.\n\
+         {gray}  Built-in:{reset} default, expert-coder, teacher, analyst, creative, researcher\n\n\
+         {yellow_bold}🔍 Service Discovery:{reset}\n\
+         {cyan}  /machines{reset}          List known peer machines on the LAN\n\
+         {cyan}  /discover{reset}          Scan LAN for new Finch daemons (mDNS)\n\
+         {reset}\n\
+         {gray}  Uses mDNS/Bonjour to find remote Finch instances for distributed GPU access.{reset}\n\n\
+         {yellow_bold}🔒 Tool Confirmation Patterns:{reset}\n\
+         {cyan}  /patterns{reset}          List all saved confirmation patterns\n\
+         {cyan}  /patterns add{reset}      Add a new pattern (interactive wizard)\n\
+         {cyan}  /patterns rm <id>{reset}  Remove a specific pattern by ID\n\
+         {cyan}  /patterns clear{reset}    Remove all patterns (requires confirmation)\n\
+         {reset}\n\
+         {gray}  What are patterns?{reset} Saved rules for auto-approving tool executions.\n\
+         {gray}  Example:{reset} \"Always allow reading *.rs files\" or \"Allow git status\"\n\n\
+         {yellow_bold}📝 Plan Mode:{reset}\n\
+         {gray}  Claude can enter plan mode to explore your codebase in read-only mode,{reset}\n\
+         {gray}  then present a plan for your approval via an interactive dialog.{reset}\n\
+         {reset}\n\
+         {gray}  Workflow:{reset} 1. Ask Claude to plan → 2. Claude explores (read-only) →\n\
+         {gray}            3. Claude presents plan → 4. Dialog appears automatically →\n\
+         {gray}            5. You approve/request changes/reject → 6. Execution\n\n\
+         {yellow_bold}🎓 Weighted Feedback (LoRA Fine-Tuning):{reset}\n\
+         {cyan}  /critical [note]{reset}   Mark response as {red}critical error{reset} (10x training weight)\n\
+         {cyan}  /medium [note]{reset}     Mark response {yellow}needs improvement{reset} (3x weight)\n\
+         {cyan}  /good [note]{reset}       Mark response as {green}good example{reset} (1x weight)\n\
+         {reset}\n\
+         {gray}  Aliases:{reset} /feedback critical|high|medium|good [note]\n\
+         {reset}\n\
+         {gray}  Examples:{reset}\n\
+         {gray}    /critical{reset} Never use .unwrap() in production code\n\
+         {gray}    /medium{reset} Prefer iterator chains over manual loops\n\
+         {gray}    /good{reset} This is exactly the right approach\n\n\
+         {yellow_bold}⌨️  Keyboard Shortcuts:{reset}\n\
+         {cyan}  Ctrl+C{reset}             Cancel current query (interrupts generation)\n\
+         {cyan}  Ctrl+D{reset}             Exit REPL (same as /quit)\n\
+         {cyan}  Ctrl+G{reset}             Mark last response as {green}good{reset} (1x training weight)\n\
+         {cyan}  Ctrl+B{reset}             Mark last response as {red}bad{reset} (10x training weight)\n\
+         {cyan}  Ctrl+Z{reset}             Undo last Forth definition (/undefine)\n\
+         {cyan}  Ctrl+P{reset}             Pop top word off vocabulary stack (/pop)\n\
+         {cyan}  Tab{reset}                Complete /command (accepts ghost text)\n\
+         {cyan}  Shift+Tab{reset}          Toggle plan mode on/off\n\
+         {cyan}  Shift+Enter{reset}        Multi-line input (insert newline)\n\
+         {cyan}  Shift+PgUp{reset}         Scroll up in history\n\
+         {cyan}  Shift+PgDown{reset}       Scroll down in history\n\
+         {gray}  ↑ / ↓ arrows{reset}       Navigate command history\n\n\
+         {yellow_bold}🛠️  Tool Execution:{reset}\n\
          When Claude needs to use tools (read files, run commands, etc.), you'll\n\
          be asked to approve each action. You can:\n\
-         \x1b[32m  • Approve once\x1b[0m              Execute this time only\n\
-         \x1b[32m  • Approve for session\x1b[0m      Allow during this session\n\
-         \x1b[32m  • Remember pattern\x1b[0m         Always allow (saves to /patterns)\n\
-         \x1b[31m  • Deny\x1b[0m                     Reject the action\n\n\
+         {green}  • Approve once{reset}              Execute this time only\n\
+         {green}  • Approve for session{reset}      Allow during this session\n\
+         {green}  • Remember pattern{reset}         Always allow (saves to /patterns)\n\
+         {red}  • Deny{reset}                     Reject the action\n\n\
          Available tools: Read, Glob, Grep, WebFetch, Bash, Restart\n\n\
-         \x1b[1;33m📚 Co-Forth VM:\x1b[0m\n\
-         \x1b[36m  /push <text>\x1b[0m       Push a word onto the stack (silent)\n\
-         \x1b[36m  /pop\x1b[0m               Remove top item (undo last push)\n\
-         \x1b[36m  /run\x1b[0m               Execute the program (shows approval dialog)\n\
-         \x1b[36m  /program\x1b[0m           Show current program as Forth source\n\
-         \x1b[36m  /stack\x1b[0m             Show stack contents\n\
-         \x1b[36m  /stack clear\x1b[0m       Drop all stack items\n\
-         \x1b[36m  /describe <word>\x1b[0m   Show library definition + related words\n\
-         \x1b[36m  /define <w> <def>\x1b[0m  Add/override a word in your personal library\n\
-         \x1b[36m  /define \"phrase\" <def>\x1b[0m Override a multi-word phrase or Chinese term\n\
-         \x1b[36m  /define <w>:<sense>\x1b[0m Add a specific sense (e.g. /define bank:river the sloping land)\n\
-         \x1b[90m                     (1030 English words preloaded — override at your peril)\x1b[0m\n\
-         \x1b[0m\n\
-         \x1b[90m  Type text to push words. The AI pushes back via Push tool.\n\
-         The stack builds a Forth dialect. /run executes it.\x1b[0m\n\
-         \x1b[90m  /run collapses the stack and executes it.\x1b[0m\n\n\
-         \x1b[1;33m💬 Channel Commands:\x1b[0m\n\
-         \x1b[36m  /join #channel\x1b[0m     Join a named channel; announce to all peers\n\
-         \x1b[36m  /part #channel\x1b[0m     Leave a named channel\n\
-         \x1b[36m  /say #channel msg\x1b[0m  Send a message to a channel\n\
-         \x1b[0m\n\
-         \x1b[1;33m🔀 Diff Proposal Flow:\x1b[0m\n\
-         \x1b[90m  Peers (AI or remote) propose diffs in the room. You argue back in chat.\x1b[0m\n\
-         \x1b[90m  When you're satisfied, accept or reject:\x1b[0m\n\
-         \x1b[36m  /accept\x1b[0m            Apply the most recent pending diff\n\
-         \x1b[36m  /accept <prefix>\x1b[0m   Apply the diff whose id starts with prefix\n\
-         \x1b[36m  /reject [reason]\x1b[0m   Reject the most recent pending diff\n\
-         \x1b[0m\n\
-         \x1b[1;33m🧠 Daemon Brain Sessions:\x1b[0m\n\
-         \x1b[36m  /brain <task>\x1b[0m      Spawn a background research brain\n\
-         \x1b[90m                     Example: /brain investigate why auth tests are flaky\x1b[0m\n\
-         \x1b[36m  /brains\x1b[0m            List active brain sessions\n\
-         \x1b[36m  /brain cancel <n>\x1b[0m  Cancel a brain by name or id\n\
+         {yellow_bold}📚 Co-Forth VM:{reset}\n\
+         {cyan}  /push <text>{reset}       Push a word onto the stack (silent)\n\
+         {cyan}  /pop{reset}               Remove top item (undo last push)\n\
+         {cyan}  /run{reset}               Execute the program (shows approval dialog)\n\
+         {cyan}  /program{reset}           Show current program as Forth source\n\
+         {cyan}  /stack{reset}             Show stack contents\n\
+         {cyan}  /stack clear{reset}       Drop all stack items\n\
+         {cyan}  /describe <word>{reset}   Show library definition + related words\n\
+         {cyan}  /define <w> <def>{reset}  Add/override a word in your personal library\n\
+         {cyan}  /define \"phrase\" <def>{reset} Override a multi-word phrase or Chinese term\n\
+         {cyan}  /define <w>:<sense>{reset} Add a specific sense (e.g. /define bank:river the sloping land)\n\
+         {gray}                     (1030 English words preloaded — override at your peril){reset}\n\
+         {reset}\n\
+         {gray}  Type text to push words. The AI pushes back via Push tool.\n\
+         The stack builds a Forth dialect. /run executes it.{reset}\n\
+         {gray}  /run collapses the stack and executes it.{reset}\n\n\
+         {yellow_bold}💬 Channel Commands:{reset}\n\
+         {cyan}  /join #channel{reset}     Join a named channel; announce to all peers\n\
+         {cyan}  /part #channel{reset}     Leave a named channel\n\
+         {cyan}  /say #channel msg{reset}  Send a message to a channel\n\
+         {reset}\n\
+         {yellow_bold}🔀 Diff Proposal Flow:{reset}\n\
+         {gray}  Peers (AI or remote) propose diffs in the room. You argue back in chat.{reset}\n\
+         {gray}  When you're satisfied, accept or reject:{reset}\n\
+         {cyan}  /accept{reset}            Apply the most recent pending diff\n\
+         {cyan}  /accept <prefix>{reset}   Apply the diff whose id starts with prefix\n\
+         {cyan}  /reject [reason]{reset}   Reject the most recent pending diff\n\
+         {reset}\n\
+         {yellow_bold}🧠 Daemon Brain Sessions:{reset}\n\
+         {cyan}  /brain <task>{reset}      Spawn a background research brain\n\
+         {gray}                     Example: /brain investigate why auth tests are flaky{reset}\n\
+         {cyan}  /brains{reset}            List active brain sessions\n\
+         {cyan}  /brain cancel <n>{reset}  Cancel a brain by name or id\n\
          __BRAIN_ATTACH__  Attach to a named remote brain\n\
          __BRAIN_DETACH__      Return to this local session\n\
          __BRAIN_PASSWORD__ Show or rotate the local brain credential\n\
-         \x1b[0m\n\
-         \x1b[90m  Brains run in the daemon and survive REPL disconnects.\x1b[0m\n\
-         \x1b[90m  When a brain has a question or plan, a dialog appears in the REPL.\x1b[0m\n\n\
-         \x1b[1;33m📚 Learn More:\x1b[0m\n\
-         \x1b[36m  GitHub:\x1b[0m   https://github.com/schancel/finch\n\
-         \x1b[36m  Issues:\x1b[0m   https://github.com/schancel/finch/issues\n\
-         \x1b[36m  Docs:\x1b[0m     See README.md and docs/ folder\n\n\
-         \x1b[1;33m💡 Quick Start:\x1b[0m\n\
+         {reset}\n\
+         {gray}  Brains run in the daemon and survive REPL disconnects.{reset}\n\
+         {gray}  When a brain has a question or plan, a dialog appears in the REPL.{reset}\n\n\
+         {yellow_bold}📚 Learn More:{reset}\n\
+         {cyan}  GitHub:{reset}   https://github.com/schancel/finch\n\
+         {cyan}  Issues:{reset}   https://github.com/schancel/finch/issues\n\
+         {cyan}  Docs:{reset}     See README.md and docs/ folder\n\n\
+         {yellow_bold}💡 Quick Start:{reset}\n\
          Just type your question! Examples:\n\
-         \x1b[90m  • How do I implement a binary search in Rust?\x1b[0m\n\
-         \x1b[90m  • Can you read my Cargo.toml and explain the dependencies?\x1b[0m\n\
-         \x1b[90m  • Find all TODO comments in my code\x1b[0m\n\n\
-         \x1b[1;36m─────────────────────────────────────────────────────────────────────────\x1b[0m\n\
-         \x1b[90mTip: Use Ctrl+C to cancel long-running queries\x1b[0m".to_string()
+         {gray}  • How do I implement a binary search in Rust?{reset}\n\
+         {gray}  • Can you read my Cargo.toml and explain the dependencies?{reset}\n\
+         {gray}  • Find all TODO comments in my code{reset}\n\n\
+         {cyan_bold}─────────────────────────────────────────────────────────────────────────{reset}\n\
+         {gray}Tip: Use Ctrl+C to cancel long-running queries{reset}".to_string()
     .replace(
         "__BRAIN_ATTACH__",
         &format!("  {}", "/brain attach <brain@machine>".cyan()),

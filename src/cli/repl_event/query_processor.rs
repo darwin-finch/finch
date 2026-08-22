@@ -104,9 +104,10 @@ pub(super) async fn refresh_context_strip(
         _ => format!("finch · {} · {}", session_label, cwd),
     };
     {
-        use std::io::Write as _;
-        print!("\x1b]0;{}\x07", title);
-        let _ = std::io::stdout().flush();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::SetTitle(title)
+        );
     }
 }
 
@@ -427,12 +428,13 @@ pub(crate) async fn process_query_with_tools(
         let mut token_count: usize = 0;
         let mut input_token_count: Option<u32> = None;
         {
-            use std::io::Write as _;
-            print!(
-                "\x1b]0;finch · {} · {} · ↓ streaming…\x07",
-                session_label, cwd
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::SetTitle(format!(
+                    "finch · {} · {} · ↓ streaming…",
+                    session_label, cwd
+                ))
             );
-            let _ = std::io::stdout().flush();
         }
 
         match generator

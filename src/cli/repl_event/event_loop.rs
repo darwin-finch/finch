@@ -1453,9 +1453,13 @@ impl EventLoop {
 
         // Set initial terminal window/tab title (no topic yet on fresh start)
         {
-            use std::io::Write as _;
-            print!("\x1b]0;finch · {} · {}\x07", self.session_label, cwd);
-            let _ = std::io::stdout().flush();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::terminal::SetTitle(format!(
+                    "finch · {} · {}",
+                    self.session_label, cwd
+                ))
+            );
         }
 
         // Attempt initial summary — populates on restart from previous memory

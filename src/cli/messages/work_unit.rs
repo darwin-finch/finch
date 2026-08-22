@@ -12,6 +12,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+use std::fmt;
 
 /// Curated word list for the thinking spinner verb.
 const SPINNER_WORDS: &[&str] = &[
@@ -58,11 +60,25 @@ use crate::config::ColorScheme;
 // Animation frames: small → large → small (creates a "throb" pulse effect)
 const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
 
-const RESET: &str = "\x1b[0m";
-const CYAN: &str = "\x1b[36m";
-const GRAY: &str = "\x1b[90m";
-const GRAY_DIM: &str = "\x1b[2;90m";
-const RED_COLOR: &str = "\x1b[31m";
+const RESET: SetAttribute = SetAttribute(Attribute::Reset);
+const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
+const GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
+const RED_COLOR: SetForegroundColor = SetForegroundColor(Color::Red);
+
+struct GrayDim;
+
+impl fmt::Display for GrayDim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{}",
+            SetForegroundColor(Color::DarkGrey),
+            SetAttribute(Attribute::Dim)
+        )
+    }
+}
+
+const GRAY_DIM: GrayDim = GrayDim;
 
 // ============================================================================
 // WorkRowStatus / WorkRow

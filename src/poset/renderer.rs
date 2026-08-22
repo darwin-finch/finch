@@ -1,21 +1,26 @@
 use super::{NodeAuthor, NodeStatus, Poset};
+use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 
-const RESET: &str = "\x1b[0m";
-const DIM: &str = "\x1b[2m";
-const CYAN: &str = "\x1b[96m";
-const GREEN: &str = "\x1b[92m";
-const YELLOW: &str = "\x1b[93m";
-const RED: &str = "\x1b[91m";
-const MAGENTA: &str = "\x1b[95m";
-const BLUE: &str = "\x1b[94m";
+#[derive(Clone, Copy, PartialEq)]
+enum CellStyle {
+    Plain,
+    Dim,
+    Color(Color),
+}
 
-// Suppress unused-constant warning for YELLOW (used as status color future use)
-#[allow(dead_code)]
-const _YELLOW_USED: &str = YELLOW;
+impl CellStyle {
+    fn write_to(self, output: &mut String) {
+        match self {
+            Self::Plain => {}
+            Self::Dim => output.push_str(&SetAttribute(Attribute::Dim).to_string()),
+            Self::Color(color) => output.push_str(&SetForegroundColor(color).to_string()),
+        }
+    }
+}
 
 struct Cell {
     ch: char,
-    color: &'static str,
+    style: CellStyle,
     depth: f32,
 }
 
@@ -23,7 +28,7 @@ impl Default for Cell {
     fn default() -> Self {
         Self {
             ch: ' ',
-            color: "",
+            style: CellStyle::Plain,
             depth: f32::NEG_INFINITY,
         }
     }
@@ -121,21 +126,19 @@ pub fn render(poset: &Poset, width: usize, height: usize) -> Vec<String> {
     grid.into_iter()
         .map(|row| {
             let mut s = String::new();
-            let mut cur: &str = "";
+            let mut current = CellStyle::Plain;
             for cell in row {
-                if cell.color != cur {
-                    if !cur.is_empty() {
-                        s.push_str(RESET);
+                if cell.style != current {
+                    if current != CellStyle::Plain {
+                        s.push_str(&SetAttribute(Attribute::Reset).to_string());
                     }
-                    if !cell.color.is_empty() {
-                        s.push_str(cell.color);
-                    }
-                    cur = cell.color;
+                    cell.style.write_to(&mut s);
+                    current = cell.style;
                 }
                 s.push(cell.ch);
             }
-            if !cur.is_empty() {
-                s.push_str(RESET);
+            if current != CellStyle::Plain {
+                s.push_str(&SetAttribute(Attribute::Reset).to_string());
             }
             s
         })
@@ -150,18 +153,18 @@ fn project(pos: [f32; 3], yaw: f32, pitch: f32) -> [f32; 3] {
     [x1, pos[1] * cp - z1 * sp, pos[1] * sp + z1 * cp]
 }
 
-fn node_glyph(node: &super::Node, depth: f32) -> (char, &'static str) {
-    let color: &'static str = match node.status {
-        NodeStatus::Done => GREEN,
-        NodeStatus::Running => CYAN,
-        NodeStatus::Failed => RED,
+fn node_glyph(node: &super::Node, depth: f32) -> (char, CellStyle) {
+    let color = match node.status {
+        NodeStatus::Done => Color::Green,
+        NodeStatus::Running => Color::Cyan,
+        NodeStatus::Failed => Color::Red,
         NodeStatus::Pending => match node.author {
-            NodeAuthor::User => MAGENTA,
-            NodeAuthor::Ai => BLUE,
+            NodeAuthor::User => Color::Magenta,
+            NodeAuthor::Ai => Color::Blue,
         },
     };
     let ch = node.kind.symbol(depth > -0.2);
-    (ch, color)
+    (ch, CellStyle::Color(color))
 }
 
 fn draw_edge(
@@ -195,7 +198,7 @@ fn draw_edge(
             if grid[y][x].ch == ' ' {
                 grid[y][x] = Cell {
                     ch,
-                    color: DIM,
+                    style: CellStyle::Dim,
                     depth: depth - 0.5,
                 };
             }
@@ -208,7 +211,7 @@ fn put(
     x: isize,
     y: isize,
     ch: char,
-    color: &'static str,
+    style: CellStyle,
     depth: f32,
     width: usize,
     height: usize,
@@ -218,7 +221,7 @@ fn put(
     }
     let (x, y) = (x as usize, y as usize);
     if depth >= grid[y][x].depth {
-        grid[y][x] = Cell { ch, color, depth };
+        grid[y][x] = Cell { ch, style, depth };
     }
 }
 

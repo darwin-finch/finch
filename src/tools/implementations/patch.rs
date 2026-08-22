@@ -16,14 +16,15 @@ use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use serde_json::Value;
 use std::fs;
 
-const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
-const GRAY: &str = "\x1b[90m";
-const BOLD: &str = "\x1b[1m";
-const RESET: &str = "\x1b[0m";
+const RED: SetForegroundColor = SetForegroundColor(Color::Red);
+const GREEN: SetForegroundColor = SetForegroundColor(Color::Green);
+const GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
+const BOLD: SetAttribute = SetAttribute(Attribute::Bold);
+const RESET: SetAttribute = SetAttribute(Attribute::Reset);
 
 pub struct PatchTool;
 

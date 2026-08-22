@@ -5,42 +5,50 @@
 
 use super::{Message, MessageId, MessageStatus};
 use crate::config::{ColorScheme, ColorSpec};
+use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+use std::fmt;
 use std::sync::{Arc, RwLock};
 
-/// Helper to convert ColorSpec to ANSI escape code
+/// Render a configured color using crossterm's terminal command formatter.
 fn color_to_ansi(color: &ColorSpec) -> String {
-    match color {
-        ColorSpec::Named(name) => {
-            // Map named colors to ANSI codes
-            match name.to_lowercase().as_str() {
-                "black" => "\x1b[30m",
-                "red" => "\x1b[31m",
-                "green" => "\x1b[32m",
-                "yellow" => "\x1b[33m",
-                "blue" => "\x1b[34m",
-                "magenta" => "\x1b[35m",
-                "cyan" => "\x1b[36m",
-                "white" => "\x1b[37m",
-                "gray" | "grey" => "\x1b[90m",
-                "darkgray" | "darkgrey" => "\x1b[90m",
-                "lightred" => "\x1b[91m",
-                "lightgreen" => "\x1b[92m",
-                "lightyellow" => "\x1b[93m",
-                "lightblue" => "\x1b[94m",
-                "lightmagenta" => "\x1b[95m",
-                "lightcyan" => "\x1b[96m",
-                _ => "\x1b[37m", // Default to white
-            }
-            .to_string()
-        }
-        ColorSpec::Rgb(r, g, b) => {
-            // True color ANSI escape code
-            format!("\x1b[38;2;{};{};{}m", r, g, b)
-        }
-    }
+    let color = match color {
+        ColorSpec::Named(name) => match name.to_lowercase().as_str() {
+            "black" => Color::Black,
+            "red" => Color::DarkRed,
+            "green" => Color::DarkGreen,
+            "yellow" => Color::DarkYellow,
+            "blue" => Color::DarkBlue,
+            "magenta" => Color::DarkMagenta,
+            "cyan" => Color::DarkCyan,
+            "white" => Color::Grey,
+            "gray" | "grey" | "darkgray" | "darkgrey" => Color::DarkGrey,
+            "lightred" => Color::Red,
+            "lightgreen" => Color::Green,
+            "lightyellow" => Color::Yellow,
+            "lightblue" => Color::Blue,
+            "lightmagenta" => Color::Magenta,
+            "lightcyan" => Color::Cyan,
+            _ => Color::Grey,
+        },
+        ColorSpec::Rgb(r, g, b) => Color::Rgb { r: *r, g: *g, b: *b },
+    };
+    SetForegroundColor(color).to_string()
 }
 
-const RESET: &str = "\x1b[0m";
+const RESET: SetAttribute = SetAttribute(Attribute::Reset);
+
+struct GrayDim;
+
+impl fmt::Display for GrayDim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{}",
+            SetForegroundColor(Color::DarkGrey),
+            SetAttribute(Attribute::Dim)
+        )
+    }
+}
 
 // ============================================================================
 // UserQueryMessage - Immutable message for user input
@@ -535,10 +543,10 @@ impl LiveToolMessage {
     }
 }
 
-const CYAN: &str = "\x1b[36m";
-const GRAY: &str = "\x1b[90m";
-const RED_COLOR: &str = "\x1b[31m";
-const GRAY_DIM: &str = "\x1b[2;90m";
+const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
+const GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
+const RED_COLOR: SetForegroundColor = SetForegroundColor(Color::Red);
+const GRAY_DIM: GrayDim = GrayDim;
 
 impl Message for LiveToolMessage {
     fn id(&self) -> MessageId {

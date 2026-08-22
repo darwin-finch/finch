@@ -58,11 +58,9 @@ pub use tabbed_dialog_widget::TabbedDialogWidget;
 // Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
 pub use crate::config::ColorScheme;
 
-// ─── ANSI helpers ─────────────────────────────────────────────────────────────
-
-const RESET: &str = "\x1b[0m";
-const CYAN: &str = "\x1b[36m";
-const DIM_GRAY: &str = "\x1b[90m";
+const RESET: SetAttribute = SetAttribute(Attribute::Reset);
+const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
+const DIM_GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
 
 // ─── CWD helper ───────────────────────────────────────────────────────────────
 
@@ -158,12 +156,12 @@ fn poset_to_forth_lines(
     max_lines: usize,
 ) -> Vec<String> {
     use crate::poset::NodeStatus;
-    const C: &str = "\x1b[36m"; // cyan
-    const Y: &str = "\x1b[33m"; // yellow
-    const G: &str = "\x1b[32m"; // green
-    const R: &str = "\x1b[31m"; // red
-    const D: &str = "\x1b[90m"; // dim
-    const RST: &str = "\x1b[0m";
+    const C: SetForegroundColor = SetForegroundColor(Color::DarkCyan);
+    const Y: SetForegroundColor = SetForegroundColor(Color::DarkYellow);
+    const G: SetForegroundColor = SetForegroundColor(Color::DarkGreen);
+    const R: SetForegroundColor = SetForegroundColor(Color::DarkRed);
+    const D: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
+    const RST: SetAttribute = SetAttribute(Attribute::Reset);
 
     let mut lines: Vec<String> = Vec::new();
 
@@ -1455,11 +1453,18 @@ impl TuiRenderer {
 /// When the row is selected, returns cyan bold + filled marker.
 /// When unselected, returns dim gray + hollow marker.
 /// This is extracted so it can be unit-tested without a real terminal.
-pub(crate) fn other_row_parts(is_selected: bool) -> (&'static str, &'static str) {
+pub(crate) fn other_row_parts(is_selected: bool) -> (String, &'static str) {
     if is_selected {
-        ("\x1b[1;36m", "●")
+        (
+            format!(
+                "{}{}",
+                SetAttribute(Attribute::Bold),
+                CYAN
+            ),
+            "●",
+        )
     } else {
-        (DIM_GRAY, "◌")
+        (DIM_GRAY.to_string(), "◌")
     }
 }
 
@@ -1472,7 +1477,13 @@ pub(crate) fn other_row_parts(is_selected: bool) -> (&'static str, &'static str)
 pub(crate) fn format_custom_input_content(input: &str, cursor: usize) -> String {
     let before: String = input.chars().take(cursor).collect();
     let after: String = input.chars().skip(cursor).collect();
-    format!("> {}\x1b[7m \x1b[m{}", before, after)
+    format!(
+        "> {}{} {}{}",
+        before,
+        SetAttribute(Attribute::Reverse),
+        SetAttribute(Attribute::Reset),
+        after
+    )
 }
 
 /// Render the "Other (custom response)" row inline inside the dialog box.
@@ -2681,7 +2692,7 @@ mod tests {
     fn other_row_unselected_uses_dim_gray_and_hollow_marker() {
         let (ansi, marker) = other_row_parts(false);
         assert_eq!(
-            ansi, DIM_GRAY,
+            ansi, DIM_GRAY.to_string(),
             "unselected Other row must use DIM_GRAY, got: {:?}",
             ansi
         );
@@ -2692,8 +2703,9 @@ mod tests {
     fn other_row_selected_uses_cyan_and_filled_marker() {
         let (ansi, marker) = other_row_parts(true);
         assert_eq!(
-            ansi, "\x1b[1;36m",
-            "selected Other row must use cyan bold (\\x1b[1;36m), got: {:?}",
+            ansi,
+            format!("{}{}", SetAttribute(Attribute::Bold), CYAN),
+            "selected Other row must use crossterm cyan bold, got: {:?}",
             ansi
         );
         assert_eq!(marker, "●", "selected Other row must use filled marker ●");
@@ -2704,7 +2716,7 @@ mod tests {
         // Regression: the bug was using DIM_GRAY even when selected.
         let (ansi, _) = other_row_parts(true);
         assert_ne!(
-            ansi, DIM_GRAY,
+            ansi, DIM_GRAY.to_string(),
             "selected Other row must NOT use DIM_GRAY (regression guard)"
         );
     }
@@ -2824,7 +2836,8 @@ mod tests {
         };
         let (ansi, _) = other_row_parts(selected_index == options_len);
         assert_eq!(
-            ansi, "\x1b[1;36m",
+            ansi,
+            format!("{}{}", SetAttribute(Attribute::Bold), CYAN),
             "renderer must use cyan highlight when cursor is on 'Other'"
         );
     }
@@ -2868,7 +2881,8 @@ mod tests {
         };
         let (ansi, _) = other_row_parts(cursor_index == options_len);
         assert_eq!(
-            ansi, "\x1b[1;36m",
+            ansi,
+            format!("{}{}", SetAttribute(Attribute::Bold), CYAN),
             "renderer must use cyan highlight when cursor is on 'Other' in MultiSelect"
         );
     }

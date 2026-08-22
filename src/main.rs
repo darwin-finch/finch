@@ -529,8 +529,9 @@ async fn main() -> Result<()> {
             let auto_teachers = build_teachers_from_env();
             if !auto_teachers.is_empty() {
                 let names: Vec<&str> = auto_teachers.iter().map(|t| t.provider.as_str()).collect();
-                eprintln!("\n\x1b[1;32m✓ Auto-configured: {}\x1b[0m", names.join(", "));
-                eprintln!("\x1b[33m  Run `finch setup` any time to change settings.\x1b[0m\n");
+                use crossterm::style::Stylize as _;
+                eprintln!("\n{}", format!("✓ Auto-configured: {}", names.join(", ")).green().bold());
+                eprintln!("{}\n", "  Run `finch setup` any time to change settings.".yellow());
                 let cfg = Config::new(auto_teachers);
                 cfg.save().ok();
                 cfg
@@ -629,24 +630,24 @@ async fn main() -> Result<()> {
                             new_config.streaming_enabled = new_config.features.streaming_enabled;
                         }
                         new_config.save()?;
-                        eprintln!("\n\x1b[1;32m✓ Configuration saved!\x1b[0m\n");
+                        use crossterm::style::Stylize as _;
+                        eprintln!("\n{}\n", "✓ Configuration saved!".green().bold());
                         new_config
                     }
                     Err(wizard_err) if wizard_err.to_string().contains("Setup cancelled") => {
                         // User pressed Escape/Ctrl+C — don't crash, fall back gracefully
-                        eprintln!("\n\x1b[33mSetup skipped. Detecting API keys from environment...\x1b[0m");
+                        use crossterm::style::Stylize as _;
+                        eprintln!("\n{}", "Setup skipped. Detecting API keys from environment...".yellow());
 
                         let teachers = build_teachers_from_env();
 
                         if teachers.is_empty() {
-                            eprintln!(
-                            "\x1b[33mNo API keys found. Set ANTHROPIC_API_KEY (or OPENAI_API_KEY / GROK_API_KEY)\x1b[0m"
-                        );
-                            eprintln!("\x1b[33mand re-run, or run `finch setup` to configure interactively.\x1b[0m\n");
+                            eprintln!("{}", "No API keys found. Set ANTHROPIC_API_KEY (or OPENAI_API_KEY / GROK_API_KEY)".yellow());
+                            eprintln!("{}\n", "and re-run, or run `finch setup` to configure interactively.".yellow());
                         } else {
                             let names: Vec<&str> =
                                 teachers.iter().map(|t| t.provider.as_str()).collect();
-                            eprintln!("\x1b[32m✓ Auto-configured: {}\x1b[0m\n", names.join(", "));
+                            eprintln!("{}\n", format!("✓ Auto-configured: {}", names.join(", ")).green());
                         }
 
                         let cfg = Config::new(teachers);
@@ -1022,9 +1023,10 @@ async fn run_daemon_status() -> Result<()> {
 
     // Check if daemon is running
     if !lifecycle.is_running() {
-        println!("\x1b[1;33m⚠ Daemon is not running\x1b[0m");
+        use crossterm::style::Stylize as _;
+        println!("{}", "⚠ Daemon is not running".yellow().bold());
         println!("\nStart the daemon with:");
-        println!("  \x1b[1;36mfinch daemon-start\x1b[0m");
+        println!("  {}", "finch daemon-start".cyan().bold());
         return Ok(());
     }
 
@@ -1063,9 +1065,10 @@ async fn run_daemon_status() -> Result<()> {
         .context("Failed to parse health response")?;
 
     // Display status
-    println!("\x1b[1;32m✓ Daemon Status\x1b[0m");
+    use crossterm::style::Stylize as _;
+    println!("{}", "✓ Daemon Status".green().bold());
     println!();
-    println!("  Status:          \x1b[1;32m{}\x1b[0m", health.status);
+    println!("  Status:          {}", health.status.green().bold());
     println!("  PID:             {}", pid);
     println!("  Uptime:          {}s", health.uptime_seconds);
     println!("  Active Sessions: {}", health.active_sessions);
@@ -1089,7 +1092,8 @@ async fn run_train_command(train_command: TrainCommand) -> Result<()> {
 async fn run_train_setup() -> Result<()> {
     use std::process::Command;
 
-    println!("\x1b[1;36m🔧 Setting up Python environment for LoRA training\x1b[0m\n");
+    use crossterm::style::Stylize as _;
+    println!("{}\n", "🔧 Setting up Python environment for LoRA training".cyan().bold());
 
     // Determine paths
     let home =
@@ -1182,13 +1186,13 @@ async fn run_train_setup() -> Result<()> {
     }
 
     // Success message
-    println!("\n\x1b[1;32m✅ Setup complete!\x1b[0m\n");
+    println!("\n{}\n", "✅ Setup complete!".green().bold());
     println!(
-        "Python environment ready at: \x1b[1m{}\x1b[0m",
-        venv_dir.display()
+        "Python environment ready at: {}",
+        venv_dir.display().to_string().bold()
     );
     println!("\nTo use the training scripts:");
-    println!("  \x1b[1;36m~/.finch/venv/bin/python scripts/train_lora.py\x1b[0m");
+    println!("  {}", "~/.finch/venv/bin/python scripts/train_lora.py".cyan().bold());
     println!("\nTraining will run automatically when you provide feedback.");
 
     Ok(())

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
+use crossterm::style::Stylize as _;
 
 /// Check `X-Finch-Token` header against this daemon's token.
 /// Returns Ok(()) if valid, Err(StatusCode::FORBIDDEN) with a log entry if not.
@@ -20,7 +21,7 @@ fn check_peer_token(headers: &HeaderMap, peer_ip: &str, endpoint: &str) -> Resul
         Some(v) if v.as_bytes() == expected.as_bytes() => Ok(()),
         Some(_) => {
             tracing::warn!(ip = %peer_ip, endpoint, "rejected: wrong peer token");
-            let notice = format!("\x1b[33m{}\x1b[0m tried to get in (wrong key)", peer_ip);
+            let notice = format!("{} tried to get in (wrong key)", peer_ip.yellow());
             let _ = PUSH_INBOX.send(notice);
             Err((
                 StatusCode::FORBIDDEN,
@@ -30,7 +31,7 @@ fn check_peer_token(headers: &HeaderMap, peer_ip: &str, endpoint: &str) -> Resul
         }
         None => {
             tracing::warn!(ip = %peer_ip, endpoint, "rejected: no peer token");
-            let notice = format!("\x1b[33m{}\x1b[0m knocked ({})", peer_ip, endpoint);
+            let notice = format!("{} knocked ({})", peer_ip.yellow(), endpoint);
             let _ = PUSH_INBOX.send(notice);
             Err((
                 StatusCode::FORBIDDEN,

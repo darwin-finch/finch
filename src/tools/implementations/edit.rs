@@ -12,6 +12,7 @@ use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
+use crossterm::style::{Attribute, Color, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use serde_json::Value;
 use std::fs;
 use std::io::IsTerminal;
@@ -30,13 +31,12 @@ fn run_post_save_hook(file_path: &str) {
     }
 }
 
-// ANSI colors for diff display
-const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
-const GRAY: &str = "\x1b[90m";
-const RED_BG: &str = "\x1b[48;5;52m"; // Dark red background
-const GREEN_BG: &str = "\x1b[48;5;22m"; // Dark green background
-const RESET: &str = "\x1b[0m";
+const RED: SetForegroundColor = SetForegroundColor(Color::Red);
+const GREEN: SetForegroundColor = SetForegroundColor(Color::Green);
+const GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
+const RED_BG: SetBackgroundColor = SetBackgroundColor(Color::AnsiValue(52));
+const GREEN_BG: SetBackgroundColor = SetBackgroundColor(Color::AnsiValue(22));
+const RESET: SetAttribute = SetAttribute(Attribute::Reset);
 
 const CONTEXT_LINES: usize = 3;
 

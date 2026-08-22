@@ -17,11 +17,12 @@
 //! bar and in tests.
 
 use serde_json::Value;
+use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 
-const CYAN: &str = "\x1b[36m";
-const GRAY: &str = "\x1b[90m";
-const BOLD: &str = "\x1b[1m";
-const RESET: &str = "\x1b[0m";
+const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
+const GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
+const BOLD: SetAttribute = SetAttribute(Attribute::Bold);
+const RESET: SetAttribute = SetAttribute(Attribute::Reset);
 
 const MAX_PARAM_LEN: usize = 60;
 
@@ -186,7 +187,7 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
             let mut body: Vec<String> = body_lines.into_iter().take(MAX_TOOL_BODY_LINES).collect();
             if total > MAX_TOOL_BODY_LINES {
                 body.push(format!(
-                    "\x1b[90m… +{} lines (ctrl+o to expand)\x1b[0m",
+                    "{GRAY}… +{} lines (ctrl+o to expand){RESET}",
                     total - MAX_TOOL_BODY_LINES
                 ));
             }
@@ -231,7 +232,7 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
             let mut body: Vec<String> = lines.iter().take(8).map(|l| l.to_string()).collect();
             if total > 8 {
                 body.push(format!(
-                    "\x1b[90m… +{} more (ctrl+o to expand)\x1b[0m",
+                    "{GRAY}… +{} more (ctrl+o to expand){RESET}",
                     total - 8
                 ));
             }
@@ -249,7 +250,7 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
                 .collect();
             if total > MAX_TOOL_BODY_LINES {
                 body.push(format!(
-                    "\x1b[90m… +{} lines (ctrl+o to expand)\x1b[0m",
+                    "{GRAY}… +{} lines (ctrl+o to expand){RESET}",
                     total - MAX_TOOL_BODY_LINES
                 ));
             }

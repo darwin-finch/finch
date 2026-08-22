@@ -2,6 +2,7 @@
 // Loads API key from ~/.finch/config.toml or environment variable
 
 use anyhow::{bail, Context, Result};
+use crossterm::style::Stylize as _;
 use std::fs;
 
 use super::provider::ProviderEntry;
@@ -30,15 +31,15 @@ pub fn load_config() -> Result<Config> {
 
     // No config found - prompt user to run setup
     bail!(
-        "No configuration found. Please run the setup wizard:\n\n\
-        \x1b[1;36mfinch setup\x1b[0m\n\n\
+        "No configuration found. Please run the setup wizard:\n\n{}\n\n\
         This will guide you through:\n\
         • API key configuration (Claude, OpenAI, etc.)\n\
         • Local model selection (Qwen, Gemma, Llama, Mistral)\n\
         • Device selection (CoreML, Metal, CUDA, CPU)\n\
         • Model size selection based on your RAM\n\n\
         Alternatively, set environment variable:\n\
-        export ANTHROPIC_API_KEY=\"sk-ant-...\""
+        export ANTHROPIC_API_KEY=\"sk-ant-...\"",
+        "finch setup".cyan().bold()
     );
 }
 
