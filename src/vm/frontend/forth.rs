@@ -320,6 +320,7 @@ fn compile_forth_body_with_functions(
                     });
                     control.push(ControlKind::If);
                     current = then_block;
+                    token_index += 1;
                     continue;
                 }
                 "else" => {
@@ -355,6 +356,7 @@ fn compile_forth_body_with_functions(
                     );
                     current = frame.else_block;
                     stack = frame.entry_stack.clone();
+                    token_index += 1;
                     continue;
                 }
                 "then" => {
@@ -410,6 +412,7 @@ fn compile_forth_body_with_functions(
                     );
                     current = frame.merge_block;
                     stack = merged_stack;
+                    token_index += 1;
                     continue;
                 }
                 "begin" => {
