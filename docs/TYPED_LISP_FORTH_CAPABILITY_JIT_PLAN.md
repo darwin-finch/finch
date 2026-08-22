@@ -26,19 +26,15 @@ quasiquote/template syntax may package those chunks together, but each embedded 
 lower to ordinary typed IR before execution; textual interpolation and implicit evaluation are
 not permitted.
 
-The current runtime is a migration starting point, not the target:
+The repository now contains the first verified typed path: both frontends lower directly to typed
+IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scoped capability
+requirements, diagnostics carry stable codes, and host execution is transactional. The migration
+is not complete: the legacy Co-Forth interpreter and native Lisp evaluator still exist for
+compatibility, some production words are not yet generated exclusively from the typed registry,
+and the typed broker still needs true suspension/resumption and complete provider parity.
 
-- the Co-Forth data stack is effectively `Vec<i64>`;
-- stack effects count cells but do not validate their types;
-- `ExecutionEffect` is a coarse ordered classification;
-- the portable Lisp compiler emits Forth source text;
-- unsupported Lisp falls back to the native Lisp evaluator;
-- diagnostics are mostly strings;
-- successful persistent execution is serialized by a per-session transaction gate.
-
-The target removes the native Lisp fallback after semantic parity, replaces coarse effects with
-resource-scoped capability sets, and gives interpreted and JIT execution the same verified IR,
-transaction, and error behavior.
+The target removes those compatibility paths after conformance parity and gives interpreted and
+JIT execution the same verified IR, transaction, and error behavior.
 
 ## Outcomes
 
