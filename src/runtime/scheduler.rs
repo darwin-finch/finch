@@ -752,4 +752,48 @@ mod tests {
         );
         assert_eq!(scheduler.tasks.read().await.len(), 1);
     }
+
+    #[tokio::test]
+    async fn typed_task_handles_can_be_polled_across_submissions() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let spawn = runtime
+            .submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source: r#"(agent-spawn "inspect the VM")"#.to_string(),
+                intent: "start a child for status polling".to_string(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            spawn.values.first(),
+            Some(crate::programs::ProgramValue::Task(_))
+        ));
+        let poll = runtime
+            .submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source: "agent-poll".to_string(),
+                intent: "poll the child".to_string(),
+                effect: crate::programs::ExecutionEffect::VmRead,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            })
+            .await;
+        assert!(poll.is_ok());
+        assert!(matches!(
+            poll.unwrap().values.first(),
+            Some(crate::programs::ProgramValue::String(_))
+        ));
+        assert_eq!(scheduler.tasks.read().await.len(), 1);
+    }
 }
