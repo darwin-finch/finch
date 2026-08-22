@@ -68,6 +68,9 @@ requests cancellation. Scheduler ancestry and ownership are checked for every op
 `vm-vocabulary` is a pure VM inspection operation that returns the current serialized typed
 vocabulary. Use it (or the external `get_vm_state` tool) instead of guessing callable names.
 
+`process-run` accepts a command path and a list of argument strings. It invokes the executable
+directly, never through a shell, and requires an explicit `process.run` capability and approval.
+
 Workspace file access uses refined paths rather than raw strings. `(path "relative/name")`
 constructs a path constrained to the workspace selector; `(file-read path)` returns `bytes`, and
 `(file-write path bytes)` returns `unit`. The host canonicalizes and rechecks the path, so `..`,

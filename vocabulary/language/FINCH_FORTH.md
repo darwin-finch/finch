@@ -40,6 +40,8 @@ message.
 
 `vm-vocabulary` returns the current serialized typed word manifest.
 
+`process-run` consumes a command string and a list of argument strings; it never invokes a shell.
+
 Typed conditionals use `if ... else ... then`. Typed loops use `begin ... while ... repeat` or
 `begin ... until`. Structural words must be properly nested. The condition is `bool`; the
 stack/type shape after consuming it and at every back-edge must equal the loop-header shape. Each

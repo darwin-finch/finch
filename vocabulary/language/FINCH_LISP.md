@@ -55,3 +55,6 @@ Agent coordination uses opaque task handles: `(agent-spawn "task")`, `(agent-pol
 final result is needed.
 
 `(vm-vocabulary)` returns the current typed word manifest for programmatic introspection.
+
+`(process-run command (list arguments...))` runs an executable directly without shell parsing and
+is capability-bearing.
