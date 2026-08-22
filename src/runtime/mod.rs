@@ -331,47 +331,6 @@ impl ProgramRuntime {
                 );
             }
         }
-        let required_effect = required_effect(submission.language, &submission.source);
-        if !effect_allows(submission.effect, required_effect) {
-            bail!(
-                "declared effect '{}' does not cover derived effect '{}'",
-                submission.effect.as_str(),
-                required_effect.as_str()
-            );
-        }
-        let vm_local = matches!(
-            submission.effect,
-            ExecutionEffect::Pure | ExecutionEffect::VmRead | ExecutionEffect::VmWrite
-        );
-        let enabled_automation = self.automation.is_enabled()
-            && matches!(
-                submission.effect,
-                ExecutionEffect::ExternalRead | ExecutionEffect::ExternalWrite
-            )
-            && is_automation_only_source(submission.language, &submission.source);
-        let enabled_typed_files = matches!(
-            submission.effect,
-            ExecutionEffect::WorkspaceRead | ExecutionEffect::WorkspaceWrite
-        ) && is_typed_file_source(&submission.source);
-        let enabled_typed_process = matches!(submission.effect, ExecutionEffect::ExternalWrite)
-            && submission
-                .source
-                .to_ascii_lowercase()
-                .contains("process-run");
-        let enabled_typed_network = matches!(submission.effect, ExecutionEffect::ExternalWrite)
-            && submission.source.to_ascii_lowercase().contains("network-");
-        if !vm_local
-            && !enabled_automation
-            && !enabled_typed_files
-            && !enabled_typed_process
-            && !enabled_typed_network
-        {
-            bail!(
-                "effect '{}' is not enabled in the initial VM runtime",
-                submission.effect.as_str()
-            );
-        }
-
         let context = ExecutionContext::new(generation, submission.budget.unwrap_or_default());
         let started = Instant::now();
         if let Some(execution) = self
@@ -450,6 +409,35 @@ impl ProgramRuntime {
                     elapsed_ms,
                 },
             });
+        }
+
+        // Legacy compatibility paths still need their coarse source-based
+        // gate. Typed submissions have already been compiled and authorized
+        // above, so their inferred capability set is authoritative.
+        let required_effect = required_effect(submission.language, &submission.source);
+        if !effect_allows(submission.effect, required_effect) {
+            bail!(
+                "declared effect '{}' does not cover derived effect '{}'",
+                submission.effect.as_str(),
+                required_effect.as_str()
+            );
+        }
+        let vm_local = matches!(
+            submission.effect,
+            ExecutionEffect::Pure | ExecutionEffect::VmRead | ExecutionEffect::VmWrite
+        );
+        let enabled_automation = self.automation.is_enabled()
+            && matches!(
+                submission.effect,
+                ExecutionEffect::ExternalRead | ExecutionEffect::ExternalWrite
+            )
+            && is_automation_only_source(submission.language, &submission.source);
+        let enabled_legacy = vm_local || enabled_automation;
+        if !enabled_legacy {
+            bail!(
+                "effect '{}' is not enabled in the legacy runtime",
+                submission.effect.as_str()
+            );
         }
         let result = match submission.language {
             ProgramLanguage::Forth => self
@@ -1167,11 +1155,6 @@ fn is_automation_only_source(language: ProgramLanguage, source: &str) -> bool {
     !forbidden.iter().any(|word| normalized.contains(word))
 }
 
-fn is_typed_file_source(source: &str) -> bool {
-    let source = source.to_ascii_lowercase();
-    source.contains("file-read") || source.contains("file-write")
-}
-
 fn effect_allows(declared: ExecutionEffect, required: ExecutionEffect) -> bool {
     use ExecutionEffect::*;
     matches!(
@@ -1534,15 +1517,19 @@ mod tests {
     #[tokio::test]
     async fn source_cannot_hide_external_effect_behind_pure_declaration() {
         let runtime = ProgramRuntime::new();
-        let error = runtime
+        let outcome = runtime
             .submit(submission(
                 ProgramLanguage::Forth,
-                "s\" data\" s\" path\" file-write",
+                "s\" path\" path s\" data\" bytes file-write",
                 ExecutionEffect::Pure,
             ))
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("derived effect"));
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::AuthorizationRequired);
+        assert!(outcome
+            .required_capabilities
+            .iter()
+            .any(|requirement| requirement.capability == crate::vm::CapabilityKind::FileWrite));
     }
 
     #[tokio::test]

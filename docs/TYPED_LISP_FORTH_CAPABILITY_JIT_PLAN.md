@@ -444,6 +444,31 @@ Code modules, type descriptions, source maps, and published vocabulary versions 
 shareable. Session dictionary updates use versioned transactions. Concurrent executions begin at a
 declared VM revision and explicitly commit compatible deltas; they do not mutate one global stack.
 
+### Model-authored vocabulary evolution
+
+Executable knowledge is a first-class product surface, separate from model-weight adaptation and
+MemTree/context adaptation. A model may discover a reusable procedure and define it using the same
+typed vocabulary available to a human:
+
+```forth
+: investigate-regression  repo diff affected-tests run-tests summarize ;
+```
+
+Definitions have explicit lifetimes and promotion boundaries:
+
+```text
+ephemeral → task → session → project → user → published package
+```
+
+An ephemeral or task-local definition may be created in the execution transaction. Promotion to a
+broader dictionary is an authority-bearing operation, not an incidental side effect. For example,
+`project.publish` requires `{vm.write(dictionary="project")}` and a published package additionally
+requires provenance, dependency versions, signature/effect certificates, tests, and review state.
+Each promotion creates an immutable word version; existing callers continue to reference their
+original version. Revocation removes the promoted name from future manifests without invalidating
+already-audited historical executions. Providers discover the relevant vocabulary manifest rather
+than receiving arbitrary model-authored words implicitly.
+
 Managed values initially use Rust-owned reference-counted immutable objects and uniquely owned
 builders for efficient construction. Cyclic mutable structures should either be excluded initially
 or placed in a per-runtime tracing heap with explicit safepoints. Do not add a process-wide collector
