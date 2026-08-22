@@ -663,6 +663,15 @@ pub fn run_setup_wizard() -> Result<Option<SetupResult>> {
 ///
 /// Used both by `main.rs` (first-run) and by the `/setup` REPL command.
 pub fn apply_and_save(result: &SetupResult) -> Result<()> {
+    config_from_setup_result(result).save()
+}
+
+/// Convert wizard output into the complete configuration written to disk.
+///
+/// Keep this mapping in one place so first-run setup, `finch setup`, and the
+/// in-REPL `/setup` command cannot silently persist different subsets of the
+/// settings shown by the wizard.
+fn config_from_setup_result(result: &SetupResult) -> crate::config::Config {
     use crate::config::{Config, FeaturesConfig};
 
     let providers = result.providers.clone();
@@ -687,19 +696,18 @@ pub fn apply_and_save(result: &SetupResult) -> Result<()> {
         enable_summarization: new_config.features.enable_summarization,
         auto_compact_enabled: new_config.features.auto_compact_enabled,
     };
-    if result.daemon_only_mode {
-        new_config.server.mode = "daemon-only".to_string();
-    }
-    if result.mdns_discovery {
-        new_config.server.advertise = true;
-    }
+    new_config.server.mode = if result.daemon_only_mode {
+        "daemon-only".to_string()
+    } else {
+        "full".to_string()
+    };
+    new_config.server.advertise = result.mdns_discovery;
     new_config.client.auto_discover = result.auto_discover;
     #[allow(deprecated)]
     {
         new_config.streaming_enabled = new_config.features.streaming_enabled;
     }
-    new_config.save()?;
-    Ok(())
+    new_config
 }
 
 /// Apply the wizard's single client key to the existing server representation.
@@ -3678,6 +3686,62 @@ mod tests {
         assert_ne!(SETTINGS_FINCH_API_KEY_IDX, SETTINGS_AUTO_DISCOVER_IDX);
         assert_eq!(SETTINGS_AUTO_DISCOVER_IDX + 1, SETTINGS_CONTEXT_IDX);
         assert_eq!(SETTINGS_CONTEXT_IDX, SETTINGS_FEATURE_COUNT - 1);
+    }
+
+    #[test]
+    fn wizard_settings_survive_config_mapping_and_reopen() {
+        let mut state = WizardState::new(None);
+        if let Some(SectionState::Features {
+            auto_approve,
+            #[cfg(target_os = "macos")]
+            gui_automation,
+            daemon_only_mode,
+            mdns_discovery,
+            auto_discover,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Features)
+        {
+            *auto_approve = true;
+            #[cfg(target_os = "macos")]
+            {
+                *gui_automation = true;
+            }
+            *daemon_only_mode = true;
+            *mdns_discovery = true;
+            *auto_discover = true;
+        } else {
+            panic!("expected settings section");
+        }
+
+        let result = build_setup_result(&state).unwrap();
+        let config = config_from_setup_result(&result);
+        assert!(config.features.auto_approve_tools);
+        #[cfg(target_os = "macos")]
+        assert!(config.features.gui_automation);
+        assert_eq!(config.server.mode, "daemon-only");
+        assert!(config.server.advertise);
+        assert!(config.client.auto_discover);
+
+        let reopened = WizardState::new(Some(&config));
+        if let Some(SectionState::Features {
+            auto_approve,
+            #[cfg(target_os = "macos")]
+            gui_automation,
+            daemon_only_mode,
+            mdns_discovery,
+            auto_discover,
+            ..
+        }) = reopened.sections.get(&WizardSection::Features)
+        {
+            assert!(*auto_approve);
+            #[cfg(target_os = "macos")]
+            assert!(*gui_automation);
+            assert!(*daemon_only_mode);
+            assert!(*mdns_discovery);
+            assert!(*auto_discover);
+        } else {
+            panic!("expected settings section");
+        }
     }
 
     #[test]

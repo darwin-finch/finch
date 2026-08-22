@@ -2527,37 +2527,12 @@ fn finish_wire_metric(
 /// Run interactive setup wizard
 async fn run_setup() -> Result<()> {
     use finch::cli::show_setup_wizard;
-    use finch::config::Config;
 
     println!("Starting Shammah setup wizard...\n");
 
     // Run the wizard
     let result = show_setup_wizard()?;
-
-    // Create config from unified providers list
-    let mut config = Config::with_providers(result.providers);
-    finch::cli::setup_wizard::apply_daemon_api_key(&mut config, &result.finch_api_key);
-
-    // Apply feature flags
-    config.features = finch::config::FeaturesConfig {
-        auto_approve_tools: result.auto_approve_tools,
-        streaming_enabled: result.streaming_enabled,
-        debug_logging: result.debug_logging,
-        #[cfg(target_os = "macos")]
-        gui_automation: false,
-        memory_context_lines: result.memory_context_lines,
-        max_verbatim_messages: config.features.max_verbatim_messages,
-        context_recall_k: config.features.context_recall_k,
-        enable_summarization: config.features.enable_summarization,
-        auto_compact_enabled: config.features.auto_compact_enabled,
-    };
-    #[allow(deprecated)]
-    {
-        config.streaming_enabled = config.features.streaming_enabled;
-    }
-
-    // Save configuration
-    config.save()?;
+    finch::cli::setup_wizard::apply_and_save(&result)?;
 
     println!("\n✓ Configuration saved to ~/.finch/config.toml");
     println!("  You can now run: finch");

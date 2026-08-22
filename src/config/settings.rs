@@ -737,6 +737,7 @@ impl Config {
             streaming_enabled: self.features.streaming_enabled,
             tui_enabled: self.tui_enabled,
             active_theme: Some(self.active_theme.clone()),
+            active_persona: Some(self.active_persona.clone()),
             huggingface_token: self.huggingface_token.clone(),
             client: Some(self.client.clone()),
             server: Some(self.server.clone()),
@@ -761,6 +762,8 @@ struct TomlConfig {
     tui_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_persona: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     huggingface_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -792,6 +795,27 @@ mod tests {
 
         assert!(decoded.auth_enabled);
         assert_eq!(decoded.api_keys, vec!["custom-secret"]);
+    }
+
+    #[test]
+    fn test_serialized_config_persists_active_persona() {
+        let encoded = toml::to_string(&TomlConfig {
+            streaming_enabled: true,
+            tui_enabled: true,
+            active_theme: Some("dark".to_string()),
+            active_persona: Some("expert-coder".to_string()),
+            huggingface_token: None,
+            client: None,
+            server: None,
+            providers: Vec::new(),
+            colors: None,
+            features: None,
+            license: LicenseConfig::default(),
+        })
+        .unwrap();
+        let decoded: TomlConfig = toml::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.active_persona.as_deref(), Some("expert-coder"));
     }
 
     #[test]
