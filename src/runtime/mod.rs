@@ -1233,6 +1233,9 @@ fn required_effect(language: ProgramLanguage, source: &str) -> ExecutionEffect {
     if contains_any(&["mem-store", "mem-consolidate"]) {
         return ExecutionEffect::VmWrite;
     }
+    if contains_any(&["schedule-create", "schedule-manage"]) {
+        return ExecutionEffect::VmWrite;
+    }
     if contains_any(&["mem-recall", "mem-read"]) {
         return ExecutionEffect::VmRead;
     }
