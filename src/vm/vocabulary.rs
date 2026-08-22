@@ -140,6 +140,14 @@ pub fn core_vocabulary() -> Vocabulary {
             ),
         ),
         (
+            "process-run".into(),
+            capability(
+                vec![Type::String, Type::list(Type::String)],
+                vec![Type::String],
+                unscoped(CapabilityKind::ProcessRun),
+            ),
+        ),
+        (
             "mem-recall".into(),
             capability(
                 vec![Type::String],

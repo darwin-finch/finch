@@ -283,7 +283,12 @@ impl ProgramRuntime {
             submission.effect,
             ExecutionEffect::WorkspaceRead | ExecutionEffect::WorkspaceWrite
         ) && is_typed_file_source(&submission.source);
-        if !vm_local && !enabled_automation && !enabled_typed_files {
+        let enabled_typed_process = matches!(submission.effect, ExecutionEffect::ExternalWrite)
+            && submission
+                .source
+                .to_ascii_lowercase()
+                .contains("process-run");
+        if !vm_local && !enabled_automation && !enabled_typed_files && !enabled_typed_process {
             bail!(
                 "effect '{}' is not enabled in the initial VM runtime",
                 submission.effect.as_str()
@@ -724,6 +729,38 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     generation: 0,
                 }]);
             }
+            crate::vm::CapabilityKind::ProcessRun => {
+                let [TypedValue::String(command), TypedValue::List { values, .. }] =
+                    arguments.as_slice()
+                else {
+                    return Err(host_binding_error(
+                        origin,
+                        "process-run requires a command and string arguments",
+                    ));
+                };
+                let mut process = std::process::Command::new(command);
+                for value in values {
+                    let TypedValue::String(value) = value else {
+                        return Err(host_binding_error(
+                            origin,
+                            "process-run arguments must be strings",
+                        ));
+                    };
+                    process.arg(value);
+                }
+                let output = process
+                    .output()
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                if !output.status.success() {
+                    return Err(host_binding_error(
+                        origin,
+                        format!("process exited with status {}", output.status),
+                    ));
+                }
+                return Ok(vec![TypedValue::String(
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                )]);
+            }
             _ => {
                 return Err(host_binding_error(
                     origin,
@@ -981,6 +1018,9 @@ fn required_effect(language: ProgramLanguage, source: &str) -> ExecutionEffect {
     }
     if contains_any(&["mem-recall", "mem-read"]) {
         return ExecutionEffect::VmRead;
+    }
+    if contains_any(&["process-run"]) {
+        return ExecutionEffect::ExternalWrite;
     }
     if contains_any(&["agent-poll", "agent-await"]) {
         return ExecutionEffect::VmRead;
@@ -1421,6 +1461,27 @@ mod tests {
         };
         assert!(manifest.contains("vm-vocabulary"));
         assert!(manifest.contains("file-read"));
+    }
+
+    #[tokio::test]
+    async fn approved_typed_process_runs_without_a_shell() {
+        let runtime = ProgramRuntime::new();
+        let request = submission(
+            ProgramLanguage::Lisp,
+            "(process-run \"/usr/bin/printf\" (list \"ok\"))",
+            ExecutionEffect::ExternalWrite,
+        );
+        let pending = runtime.submit(request.clone()).await.unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ProcessRun,
+                selector: crate::vm::ResourceSelector::None,
+            })
+            .unwrap();
+        let approved = runtime.submit(request).await.unwrap();
+        assert_eq!(approved.status, ExecutionStatus::Completed);
+        assert_eq!(approved.values, vec![ProgramValue::String("ok".into())]);
     }
 
     #[tokio::test]
