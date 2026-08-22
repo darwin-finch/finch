@@ -13,6 +13,11 @@ s" Hello from Finch" say
 Booleans are `true` and `false`. The stack manifest is ordered bottom-to-top. Never assume it is
 empty; inspect it and include `expected_revision` when manipulating existing values.
 
+`'name` pushes a typed symbol value. It is data, not a dictionary lookup; `['] word execute`
+remains the form for obtaining and invoking a typed word reference. `some`/`none` and `ok`/`err`
+construct typed option/result values; use `is-some`, `is-ok`, `unwrap`, `result-unwrap`, and
+`result-error` for inspection and projection.
+
 Typed signatures use `S` for the preserved unknown lower stack:
 
 ```forth

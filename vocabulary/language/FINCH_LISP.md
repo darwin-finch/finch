@@ -26,6 +26,11 @@ definitions are reserved for a later language revision and must not be emitted f
 Core types include `unit`, `bool`, `int`, `uint`, `float`, `char`, `string`, `bytes`, typed
 collections/results, refined paths, tasks, resources, closures, and explicit `dynamic` values.
 
+`'name` (or `(quote name)`) produces a typed `symbol`, which is an identifier value rather than
+text. `some`/`none` construct `option<T>` values; `ok`/`err` construct `result<T,E>` values;
+`is-some`, `is-ok`, `unwrap`, `result-unwrap`, and `result-error` inspect or project them with
+structured diagnostics on invalid branches.
+
 MemTree and scheduling are explicit effects. Scheduled work stores an immutable program reference,
 typed arguments, budgets, context references, and a revocable policy reference—not raw authority or
 an unvalidated Lisp string. A callback starts a fresh audited task and revalidates its environment
