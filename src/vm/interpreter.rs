@@ -236,20 +236,6 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
                         Instruction::CapabilityRequest {
                             requirement, input, ..
                         } => {
-                            let requested = EffectSet::from_requirement(requirement.clone());
-                            if !self.config.grants.grants(&requested) {
-                                let mut diagnostic = VmDiagnostic::error(
-                                    "E-CAP-002",
-                                    DiagnosticPhase::Authorization,
-                                    format!(
-                                        "capability {:?} is outside this execution's grants",
-                                        requirement.capability
-                                    ),
-                                    Some(located.origin.clone()),
-                                );
-                                diagnostic.capability = Some(requirement.clone());
-                                return Err(diagnostic);
-                            }
                             let start = stack.len() - input.len();
                             let arguments: Vec<TypedValue> = stack.drain(start..).collect();
                             // Refine argument-dependent capabilities at the host boundary. The
@@ -264,6 +250,20 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
                                         Some(located.origin.clone()),
                                     )
                                 })?;
+                            let requested = EffectSet::from_requirement(concrete.clone());
+                            if !self.config.grants.grants(&requested) {
+                                let mut diagnostic = VmDiagnostic::error(
+                                    "E-CAP-002",
+                                    DiagnosticPhase::Authorization,
+                                    format!(
+                                        "capability {:?} is outside this execution's grants",
+                                        concrete.capability
+                                    ),
+                                    Some(located.origin.clone()),
+                                );
+                                diagnostic.capability = Some(concrete);
+                                return Err(diagnostic);
+                            }
                             let values = self
                                 .handler
                                 .request(&concrete, arguments, &located.origin)?;
