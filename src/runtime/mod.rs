@@ -1476,6 +1476,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_boundary_preserves_symbols_and_results() {
+        let runtime = ProgramRuntime::new();
+        let symbol = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "'bash",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(symbol.values, vec![ProgramValue::Symbol("bash".into())]);
+
+        let result = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(ok 7)",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.values,
+            vec![
+                ProgramValue::Symbol("bash".into()),
+                ProgramValue::Result {
+                    ok: true,
+                    value: Box::new(ProgramValue::Int(7)),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_stale_manifest_generation() {
         let runtime = ProgramRuntime::new();
         let mut request = submission(ProgramLanguage::Forth, "1", ExecutionEffect::Pure);
