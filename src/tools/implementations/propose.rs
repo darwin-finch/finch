@@ -57,6 +57,18 @@ pub fn parse_proposal_decision(content: &str) -> ProposalDecision {
     }
 }
 
+/// Editor-backed proposal API that preserves the user's explicit action.
+/// Existing callers may continue using `propose_in_editor` while migrating.
+pub async fn propose_with_decision(
+    description: &str,
+    code: &str,
+) -> Result<ProposalDecision> {
+    Ok(match propose_in_editor(description, code).await? {
+        Some(content) => parse_proposal_decision(&content),
+        None => ProposalDecision::Cancel,
+    })
+}
+
 fn suspend_terminal_for_editor() {
     std::io::stdout().flush().ok();
     // Raw mode alone is not the whole TUI protocol. Leaving bracketed paste or
