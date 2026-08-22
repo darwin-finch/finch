@@ -80,6 +80,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "str-cat".into(),
             pure(vec![Type::String, Type::String], vec![Type::String]),
         ),
+        ("bytes".into(), pure(vec![Type::String], vec![Type::Bytes])),
         (
             "file-read".into(),
             capability(
@@ -145,6 +146,22 @@ pub fn core_vocabulary() -> Vocabulary {
                 vec![Type::String, Type::list(Type::String)],
                 vec![Type::String],
                 unscoped(CapabilityKind::ProcessRun),
+            ),
+        ),
+        (
+            "network-connect".into(),
+            capability(
+                vec![Type::String, Type::Int],
+                vec![Type::Resource("network-socket".into())],
+                unscoped(CapabilityKind::NetworkConnect),
+            ),
+        ),
+        (
+            "network-send".into(),
+            capability(
+                vec![Type::Resource("network-socket".into()), Type::Bytes],
+                vec![Type::Bytes],
+                unscoped(CapabilityKind::NetworkConnect),
             ),
         ),
         (

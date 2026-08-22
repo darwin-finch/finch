@@ -19,7 +19,10 @@ use automation::AutomationRequest;
 use context::{ExecutionBudget, ExecutionContext};
 use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -87,6 +90,7 @@ pub struct ProgramRuntime {
     automation: Arc<AutomationBroker>,
     workspace_root: Arc<PathBuf>,
     memory: RwLock<Option<Arc<crate::memory::MemorySystem>>>,
+    network: Arc<Mutex<HashMap<String, TcpStream>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
 }
 
@@ -113,6 +117,7 @@ impl ProgramRuntime {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ),
             memory: RwLock::new(None),
+            network: Arc::new(Mutex::new(HashMap::new())),
             agent_scheduler: RwLock::new(Weak::new()),
         }
     }
@@ -288,7 +293,14 @@ impl ProgramRuntime {
                 .source
                 .to_ascii_lowercase()
                 .contains("process-run");
-        if !vm_local && !enabled_automation && !enabled_typed_files && !enabled_typed_process {
+        let enabled_typed_network = matches!(submission.effect, ExecutionEffect::ExternalWrite)
+            && submission.source.to_ascii_lowercase().contains("network-");
+        if !vm_local
+            && !enabled_automation
+            && !enabled_typed_files
+            && !enabled_typed_process
+            && !enabled_typed_network
+        {
             bail!(
                 "effect '{}' is not enabled in the initial VM runtime",
                 submission.effect.as_str()
@@ -433,6 +445,7 @@ impl ProgramRuntime {
             .read()
             .expect("memory binding lock poisoned")
             .clone();
+        let network = Arc::clone(&self.network);
         let scheduler = self
             .agent_scheduler
             .read()
@@ -486,6 +499,7 @@ impl ProgramRuntime {
                         scheduler,
                         memory,
                         vocabulary,
+                        network,
                     );
                     runtime.execute_with_handler(
                         language,
@@ -518,6 +532,7 @@ struct TypedHostHandler {
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<crate::memory::MemorySystem>>,
     vocabulary: String,
+    network: Arc<Mutex<HashMap<String, TcpStream>>>,
 }
 
 impl TypedHostHandler {
@@ -527,6 +542,7 @@ impl TypedHostHandler {
         scheduler: Option<agent_vm::AgentVmBinding>,
         memory: Option<Arc<crate::memory::MemorySystem>>,
         vocabulary: String,
+        network: Arc<Mutex<HashMap<String, TcpStream>>>,
     ) -> Self {
         Self {
             automation,
@@ -535,6 +551,7 @@ impl TypedHostHandler {
             scheduler,
             memory,
             vocabulary,
+            network,
         }
     }
 }
@@ -760,6 +777,67 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 return Ok(vec![TypedValue::String(
                     String::from_utf8_lossy(&output.stdout).into_owned(),
                 )]);
+            }
+            crate::vm::CapabilityKind::NetworkConnect => {
+                if origin.word.as_deref() == Some("network-connect") {
+                    let [TypedValue::String(host), TypedValue::Int(port)] = arguments.as_slice()
+                    else {
+                        return Err(host_binding_error(
+                            origin,
+                            "network-connect requires host and port",
+                        ));
+                    };
+                    let port = u16::try_from(*port)
+                        .map_err(|_| host_binding_error(origin, "network port is out of range"))?;
+                    let address = (host.as_str(), port)
+                        .to_socket_addrs()
+                        .map_err(|error| host_binding_error(origin, error.to_string()))?
+                        .next()
+                        .ok_or_else(|| host_binding_error(origin, "host has no addresses"))?;
+                    let stream =
+                        TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))
+                            .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                    let handle = uuid::Uuid::new_v4().to_string();
+                    self.network
+                        .lock()
+                        .map_err(|_| host_binding_error(origin, "network lock poisoned"))?
+                        .insert(handle.clone(), stream);
+                    return Ok(vec![TypedValue::Resource {
+                        kind: "network-socket".into(),
+                        handle,
+                        generation: 0,
+                    }]);
+                }
+                let [TypedValue::Resource { kind, handle, .. }, TypedValue::Bytes(payload)] =
+                    arguments.as_slice()
+                else {
+                    return Err(host_binding_error(
+                        origin,
+                        "network-send requires a socket and bytes",
+                    ));
+                };
+                if kind != "network-socket" {
+                    return Err(host_binding_error(
+                        origin,
+                        "resource is not a network socket",
+                    ));
+                }
+                let mut sockets = self
+                    .network
+                    .lock()
+                    .map_err(|_| host_binding_error(origin, "network lock poisoned"))?;
+                let stream = sockets
+                    .get_mut(handle)
+                    .ok_or_else(|| host_binding_error(origin, "unknown network socket"))?;
+                stream
+                    .write_all(payload)
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                let mut response = vec![0; 4096];
+                let size = stream
+                    .read(&mut response)
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                response.truncate(size);
+                return Ok(vec![TypedValue::Bytes(response)]);
             }
             _ => {
                 return Err(host_binding_error(
@@ -1020,6 +1098,9 @@ fn required_effect(language: ProgramLanguage, source: &str) -> ExecutionEffect {
         return ExecutionEffect::VmRead;
     }
     if contains_any(&["process-run"]) {
+        return ExecutionEffect::ExternalWrite;
+    }
+    if contains_any(&["network-connect", "network-send"]) {
         return ExecutionEffect::ExternalWrite;
     }
     if contains_any(&["agent-poll", "agent-await"]) {
@@ -1482,6 +1563,43 @@ mod tests {
         let approved = runtime.submit(request).await.unwrap();
         assert_eq!(approved.status, ExecutionStatus::Completed);
         assert_eq!(approved.values, vec![ProgramValue::String("ok".into())]);
+    }
+
+    #[tokio::test]
+    async fn approved_typed_network_connect_and_send_use_scoped_host_binding() {
+        let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind test listener: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut input = [0; 4];
+            std::io::Read::read_exact(&mut stream, &mut input).unwrap();
+            assert_eq!(&input, b"ping");
+            std::io::Write::write_all(&mut stream, b"pong").unwrap();
+        });
+        let runtime = ProgramRuntime::new();
+        let source =
+            format!("s\" 127.0.0.1\" {port} network-connect s\" ping\" bytes network-send");
+        let request = submission(
+            ProgramLanguage::Forth,
+            &source,
+            ExecutionEffect::ExternalWrite,
+        );
+        let pending = runtime.submit(request.clone()).await.unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::NetworkConnect,
+                selector: crate::vm::ResourceSelector::None,
+            })
+            .unwrap();
+        let approved = runtime.submit(request).await.unwrap();
+        assert_eq!(approved.status, ExecutionStatus::Completed);
+        assert_eq!(approved.values, vec![ProgramValue::Bytes(b"pong".to_vec())]);
+        server.join().unwrap();
     }
 
     #[tokio::test]

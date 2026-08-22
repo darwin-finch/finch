@@ -431,6 +431,18 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             result.push_str(&right);
             stack.push(TypedValue::String(result));
         }
+        "bytes" => {
+            let value = pop(stack)?;
+            let TypedValue::String(value) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-011",
+                    DiagnosticPhase::Interpretation,
+                    "bytes requires a string",
+                    Some(origin),
+                ));
+            };
+            stack.push(TypedValue::Bytes(value.into_bytes()));
+        }
         "path" => {
             let value = pop(stack)?;
             let TypedValue::String(relative) = value else {
