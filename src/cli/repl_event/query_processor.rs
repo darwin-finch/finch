@@ -460,6 +460,9 @@ pub(crate) async fn process_query_with_tools(
                             token_count += delta.split_whitespace().count();
                             // WorkUnit accumulates tokens for its own animated display
                             work_unit.add_tokens(&delta);
+                            // Keep the shadow-buffer preview live. The program is
+                            // still only parsed/executed at the explicit boundary.
+                            work_unit.set_response(&text);
                         }
                         Ok(StreamChunk::ContentBlockComplete(block)) => {
                             tracing::debug!("Received ContentBlockComplete: {:?}", block);
