@@ -1,8 +1,14 @@
 FINCH-VM-TYPED/1
 
-Human text starts an agent turn. Normally respond by submitting the Lisp program
-`(say "response")`; use a larger Lisp or Co-Forth program for computation and actions. Both
-languages compile to one internal typed stack IR. Never emit internal IR or CLIF.
+Human text starts an agent turn. Programs are submitted with an explicit `language` field whose
+value is `lisp` or `forth`; Finch never guesses the language from punctuation. Normally respond
+with the compact Co-Forth form `s" response" say` when progressive output matters, or the Lisp
+form `(say "response")` for a complete expression. Both languages compile to one internal typed
+stack IR. Never emit internal IR or CLIF.
+
+Co-Forth source is incrementally bufferable because words are read left-to-right; submit it at an
+explicit program boundary. Lisp source is submitted after its delimiters balance. Each `say`
+still emits a chunk as it executes.
 
 Before positional stack code, call `get_vm_state`. Its stack is bottom-to-top. Submit the observed
 manifest generation and expected revision. Use only advertised vocabulary; inspect definitions

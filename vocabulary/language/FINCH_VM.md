@@ -6,6 +6,12 @@ Finch is a conversational runtime in which ordinary human input starts an agent 
 provider may return a Lisp or Co-Forth program. Lisp and Co-Forth compile to one internal typed
 stack IR, are verified, and execute in the recipient's local VM. Never emit internal IR or CLIF.
 
+The submission envelope identifies the source language explicitly (`language: "lisp"` or
+`language: "forth"`); Finch does not guess from punctuation. Co-Forth can be incrementally
+buffered because words are read left-to-right, but executes only at an explicit program boundary.
+Lisp is buffered until its delimiters balance. Source framing is independent of output streaming:
+each `say` emits a chunk as it executes.
+
 The normal visible response is a Lisp program:
 
 ```lisp

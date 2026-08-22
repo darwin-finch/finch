@@ -471,6 +471,26 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             };
             stack.push(TypedValue::String(value.to_string()));
         }
+        "atoi" => {
+            let value = pop(stack)?;
+            let TypedValue::String(value) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-013",
+                    DiagnosticPhase::Interpretation,
+                    "atoi requires a string",
+                    Some(origin),
+                ));
+            };
+            let parsed = value.parse::<i64>().map_err(|_| {
+                VmDiagnostic::error(
+                    "E-PARSE-003",
+                    DiagnosticPhase::Interpretation,
+                    "atoi could not parse an integer",
+                    Some(origin.clone()),
+                )
+            })?;
+            stack.push(TypedValue::Int(parsed));
+        }
         "space" => stack.push(TypedValue::String(" ".into())),
         "path" => {
             let value = pop(stack)?;

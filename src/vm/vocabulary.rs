@@ -86,6 +86,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "int-to-string".into(),
             pure(vec![Type::Int], vec![Type::String]),
         ),
+        ("atoi".into(), pure(vec![Type::String], vec![Type::Int])),
         (
             "file-read".into(),
             capability(
