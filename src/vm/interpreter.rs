@@ -600,6 +600,31 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             };
             stack.push(TypedValue::Bool(is_ok));
         }
+        "result-unwrap" | "result-error" => {
+            let value = pop(stack)?;
+            let TypedValue::Result { is_ok, value, .. } = value else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-015",
+                    DiagnosticPhase::Interpretation,
+                    format!("{name} requires a result"),
+                    Some(origin),
+                ));
+            };
+            let wanted_ok = name == "result-unwrap";
+            if is_ok != wanted_ok {
+                return Err(VmDiagnostic::error(
+                    if wanted_ok { "E-RESULT-001" } else { "E-RESULT-002" },
+                    DiagnosticPhase::Interpretation,
+                    if wanted_ok {
+                        "cannot unwrap an error result"
+                    } else {
+                        "cannot extract an error from an ok result"
+                    },
+                    Some(origin),
+                ));
+            }
+            stack.push(*value);
+        }
         "path" => {
             let value = pop(stack)?;
             let TypedValue::String(relative) = value else {
@@ -734,6 +759,16 @@ mod tests {
         assert!(matches!(stack.as_slice(), [TypedValue::Result { is_ok: false, .. }]));
         execute_core("is-ok", &mut stack).unwrap();
         assert_eq!(stack, vec![TypedValue::Bool(false)]);
+
+        let mut stack = vec![TypedValue::Int(9)];
+        execute_core("ok", &mut stack).unwrap();
+        execute_core("result-unwrap", &mut stack).unwrap();
+        assert_eq!(stack, vec![TypedValue::Int(9)]);
+
+        let mut stack = vec![TypedValue::String("bad".into())];
+        execute_core("err", &mut stack).unwrap();
+        let error = execute_core("result-unwrap", &mut stack).unwrap_err();
+        assert_eq!(error.code, "E-RESULT-001");
     }
 
     #[test]

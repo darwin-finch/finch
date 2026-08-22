@@ -144,6 +144,26 @@ pub fn core_vocabulary() -> Vocabulary {
             ),
         ),
         (
+            "result-unwrap".into(),
+            pure(
+                vec![Type::Result(
+                    Box::new(a.clone()),
+                    Box::new(Type::Variable("E".into())),
+                )],
+                vec![a.clone()],
+            ),
+        ),
+        (
+            "result-error".into(),
+            pure(
+                vec![Type::Result(
+                    Box::new(Type::Variable("A".into())),
+                    Box::new(a.clone()),
+                )],
+                vec![a.clone()],
+            ),
+        ),
+        (
             "file-read".into(),
             capability(
                 vec![Type::Path(

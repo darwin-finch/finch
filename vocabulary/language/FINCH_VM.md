@@ -78,8 +78,9 @@ vocabulary. Use it (or the external `get_vm_state` tool) instead of guessing cal
 
 Structured values are part of the shared ABI. `some` and `none` construct `option<T>` values;
 `is-some` tests one and `unwrap` extracts its payload (returning a structured `E-OPTION-001`
-diagnostic for `none`). `ok` and `err` construct `result<T,E>` values, while `is-ok` inspects
-which branch was produced. These values remain typed when crossing the VM/runtime boundary and
+diagnostic for `none`). `ok` and `err` construct `result<T,E>` values, `is-ok` inspects which
+branch was produced, and `result-unwrap`/`result-error` project the corresponding payload with a
+structured diagnostic on the wrong branch. These values remain typed when crossing the VM/runtime boundary and
 are rendered to legacy Lisp callers as `(some value)`, `(none)`, `(ok value)`, or `(err value)`.
 
 Lisp symbols are identifiers, not strings: `'name` is quoted data (equivalent to `(quote name)`),
