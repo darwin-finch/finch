@@ -1,5 +1,5 @@
 use super::diagnostic::{DiagnosticPhase, SourceOrigin, VmDiagnostic};
-use super::effects::{CapabilityRequirement, EffectSet};
+use super::effects::{CapabilityRequirement, EffectSet, ResourceSelector};
 use super::ir::Instruction;
 use super::types::TypedValue;
 use super::verifier::VerifiedModule;
@@ -251,10 +251,22 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
                                 return Err(diagnostic);
                             }
                             let start = stack.len() - input.len();
-                            let arguments = stack.drain(start..).collect();
-                            let values =
-                                self.handler
-                                    .request(requirement, arguments, &located.origin)?;
+                            let arguments: Vec<TypedValue> = stack.drain(start..).collect();
+                            // Refine argument-dependent capabilities at the host boundary. The
+                            // verifier checks the template's conservative upper bound, while the
+                            // handler receives the concrete request for approval/audit rendering.
+                            let concrete = instantiate_requirement(requirement, &arguments)
+                                .map_err(|message| {
+                                    VmDiagnostic::error(
+                                        "E-CAP-003",
+                                        DiagnosticPhase::Authorization,
+                                        message,
+                                        Some(located.origin.clone()),
+                                    )
+                                })?;
+                            let values = self
+                                .handler
+                                .request(&concrete, arguments, &located.origin)?;
                             stack.extend(values);
                         }
                         Instruction::Jump { target } => {
@@ -324,6 +336,22 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
         self.fuel -= 1;
         Ok(())
     }
+}
+
+fn instantiate_requirement(
+    requirement: &CapabilityRequirement,
+    arguments: &[TypedValue],
+) -> Result<CapabilityRequirement, String> {
+    let ResourceSelector::FileTemplate { template } = &requirement.selector else {
+        return Ok(requirement.clone());
+    };
+    let selector = template
+        .instantiate(arguments)
+        .map_err(|error| format!("capability selector could not be instantiated: {error}"))?;
+    Ok(CapabilityRequirement {
+        capability: requirement.capability.clone(),
+        selector: ResourceSelector::File { selector },
+    })
 }
 
 fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnostic> {

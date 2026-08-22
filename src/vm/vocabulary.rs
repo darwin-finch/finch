@@ -1,5 +1,6 @@
 use super::effects::{
-    CapabilityKind, CapabilityRequirement, EffectSet, FileOperation, FileSelector, ResourceSelector,
+    CapabilityKind, CapabilityRequirement, EffectSet, FileSelector,
+    FileSelectorTemplate, FileSelectorTemplatePart, ResourceRoot, ResourceSelector,
 };
 use super::signature::{ControlEffect, StackRow, StackSignature};
 use super::types::Type;
@@ -31,6 +32,18 @@ fn unscoped(kind: CapabilityKind) -> CapabilityRequirement {
     CapabilityRequirement {
         capability: kind,
         selector: ResourceSelector::None,
+    }
+}
+
+fn path_template() -> FileSelectorTemplate {
+    let upper_bound = FileSelector::parse("./**").expect("valid workspace root");
+    FileSelectorTemplate {
+        root: ResourceRoot::Workspace,
+        parts: vec![FileSelectorTemplatePart::Argument {
+            index: 0,
+            bound: upper_bound.clone(),
+        }],
+        upper_bound,
     }
 }
 
@@ -94,10 +107,12 @@ pub fn core_vocabulary() -> Vocabulary {
                     FileSelector::parse("./**").expect("valid workspace root"),
                 )],
                 vec![Type::Bytes],
-                CapabilityRequirement::file(
-                    FileOperation::Read,
-                    FileSelector::parse("./**").expect("valid workspace root"),
-                ),
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
             ),
         ),
         (
@@ -108,10 +123,12 @@ pub fn core_vocabulary() -> Vocabulary {
                     Type::Bytes,
                 ],
                 vec![Type::Unit],
-                CapabilityRequirement::file(
-                    FileOperation::Write,
-                    FileSelector::parse("./**").expect("valid workspace root"),
-                ),
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileWrite,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
             ),
         ),
         (
