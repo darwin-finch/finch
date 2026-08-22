@@ -69,10 +69,28 @@ pub enum LocalModelStatus {
     NotAvailable,
 }
 
+fn first_model_profile(models: &serde_json::Value) -> Option<&str> {
+    models
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_str()
+        .filter(|id| !id.trim().is_empty())
+}
+
 impl DaemonClient {
     /// Create a new daemon client and ensure daemon is running
-    pub async fn connect(config: DaemonConfig) -> Result<Self> {
+    pub async fn connect(mut config: DaemonConfig) -> Result<Self> {
         let base_url = format!("http://{}", config.bind_address);
+
+        // Clients created from the legacy ClientConfig do not carry the global
+        // Finch API key. Fill it from the same local config used by the daemon.
+        if config.api_key.is_none() {
+            config.api_key = crate::config::load_config()
+                .ok()
+                .and_then(|config| config.server.api_keys.first().cloned());
+        }
 
         // Ensure daemon is running (auto-spawn if enabled)
         if config.auto_spawn {
@@ -146,9 +164,12 @@ impl DaemonClient {
             })
             .collect();
 
-        // Build request
+        // The daemon publishes configured provider profile names through the
+        // standard models endpoint. Select the first profile instead of using
+        // the old hardcoded local-model ID.
+        let model = self.default_model_profile().await?;
         let request = ChatCompletionRequest {
-            model: "qwen-local".to_string(),
+            model,
             messages: openai_messages,
             max_tokens: None,
             temperature: None,
@@ -321,6 +342,7 @@ impl DaemonClient {
         tools: Vec<ToolDefinition>,
         tool_executor: &ToolExecutor,
     ) -> Result<String> {
+        let model = self.default_model_profile().await?;
         let mut messages = vec![Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
@@ -343,7 +365,7 @@ impl DaemonClient {
 
             // Send request
             let request = ChatCompletionRequest {
-                model: "qwen-local".to_string(),
+                model: model.clone(),
                 messages: openai_messages,
                 tools: Some(openai_tools),
                 max_tokens: None,
@@ -593,6 +615,25 @@ impl DaemonClient {
     /// Get configuration
     pub fn config(&self) -> &DaemonConfig {
         &self.config
+    }
+
+    async fn default_model_profile(&self) -> Result<String> {
+        let response = self
+            .client
+            .get(format!("{}/v1/models", self.base_url))
+            .send()
+            .await
+            .context("Failed to list daemon model profiles")?
+            .error_for_status()
+            .context("Daemon model-profile request failed")?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse daemon model profiles")?;
+
+        first_model_profile(&body)
+            .map(str::to_string)
+            .context("Daemon returned no model profiles")
     }
 
     /// Query local model directly, bypassing routing
@@ -1181,5 +1222,27 @@ mod tests {
         assert_eq!(config.bind_address, "127.0.0.1:11435"); // Port 11435 to avoid Ollama conflict
         assert!(config.auto_spawn);
         assert_eq!(config.timeout_seconds, 120);
+    }
+
+    #[test]
+    fn selects_first_published_model_profile() {
+        let models = serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "grok-code-fast-1"},
+                {"id": "local-qwen"}
+            ]
+        });
+
+        assert_eq!(first_model_profile(&models), Some("grok-code-fast-1"));
+    }
+
+    #[test]
+    fn rejects_empty_model_profile_lists() {
+        assert_eq!(first_model_profile(&serde_json::json!({"data": []})), None);
+        assert_eq!(
+            first_model_profile(&serde_json::json!({"data": [{"id": " "}]})),
+            None
+        );
     }
 }
