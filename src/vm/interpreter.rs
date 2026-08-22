@@ -11,6 +11,27 @@ pub trait CapabilityHandler {
         arguments: Vec<TypedValue>,
         origin: &SourceOrigin,
     ) -> Result<Vec<TypedValue>, VmDiagnostic>;
+
+    /// Optional user-facing output accumulated by a host binding. Capability
+    /// handlers that do not produce text can keep the default implementation.
+    fn output(&self) -> String {
+        String::new()
+    }
+}
+
+impl<T: CapabilityHandler + ?Sized> CapabilityHandler for &mut T {
+    fn request(
+        &mut self,
+        requirement: &CapabilityRequirement,
+        arguments: Vec<TypedValue>,
+        origin: &SourceOrigin,
+    ) -> Result<Vec<TypedValue>, VmDiagnostic> {
+        (**self).request(requirement, arguments, origin)
+    }
+
+    fn output(&self) -> String {
+        (**self).output()
+    }
 }
 
 pub struct DenyCapabilities;

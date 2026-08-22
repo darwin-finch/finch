@@ -15,6 +15,7 @@ use crate::vm::{
 };
 use anyhow::{bail, Result};
 use automation::AutomationBroker;
+use automation::AutomationRequest;
 use context::{ExecutionBudget, ExecutionContext};
 use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
@@ -390,6 +391,7 @@ impl ProgramRuntime {
         declared_capabilities: &[CapabilityRequirement],
     ) -> Result<Option<crate::vm::TypedExecution>> {
         let runtime = Arc::clone(&self.typed);
+        let automation = Arc::clone(&self.automation);
         let source = source.to_string();
         let declared = (!declared_capabilities.is_empty())
             .then(|| EffectSet(declared_capabilities.iter().cloned().collect()));
@@ -399,7 +401,20 @@ impl ProgramRuntime {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))
                 .map(|mut runtime| {
-                    runtime.execute_with_declaration(
+                    if automation.is_enabled()
+                        && matches!(language, ProgramLanguage::Forth | ProgramLanguage::Lisp)
+                    {
+                        runtime.grant(CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::AutomationInspect,
+                            selector: crate::vm::ResourceSelector::Automation { application: None },
+                        });
+                        runtime.grant(CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::AutomationWrite,
+                            selector: crate::vm::ResourceSelector::Automation { application: None },
+                        });
+                    }
+                    let mut handler = TypedHostHandler::new(Arc::clone(&automation));
+                    runtime.execute_with_handler(
                         language,
                         match language {
                             ProgramLanguage::Forth => "provider-response.forth",
@@ -408,6 +423,7 @@ impl ProgramRuntime {
                         &source,
                         fuel,
                         declared.as_ref(),
+                        &mut handler,
                     )
                 })
         })
@@ -436,7 +452,114 @@ impl ProgramRuntime {
             Ok(Some(execution))
         }
     }
+}
 
+struct TypedHostHandler {
+    automation: Arc<AutomationBroker>,
+    output: String,
+}
+
+impl TypedHostHandler {
+    fn new(automation: Arc<AutomationBroker>) -> Self {
+        Self {
+            automation,
+            output: String::new(),
+        }
+    }
+}
+
+impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
+    fn request(
+        &mut self,
+        requirement: &CapabilityRequirement,
+        arguments: Vec<TypedValue>,
+        origin: &crate::vm::SourceOrigin,
+    ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
+        let request = match requirement.capability {
+            crate::vm::CapabilityKind::SessionEmit => {
+                let [TypedValue::String(text)] = arguments.as_slice() else {
+                    return Err(VmDiagnostic::error(
+                        "E-HOST-001",
+                        crate::vm::DiagnosticPhase::HostCall,
+                        "session.emit requires one string",
+                        Some(origin.clone()),
+                    ));
+                };
+                self.output.push_str(text);
+                return Ok(vec![TypedValue::Unit]);
+            }
+            crate::vm::CapabilityKind::AutomationInspect => match origin.word.as_deref() {
+                Some("automation-displays") => AutomationRequest::Displays,
+                Some("automation-windows") => AutomationRequest::Windows,
+                _ => AutomationRequest::Availability,
+            },
+            crate::vm::CapabilityKind::AutomationWrite => {
+                if arguments.len() == 4 {
+                    let [TypedValue::Float(x), TypedValue::Float(y), TypedValue::String(button), TypedValue::Int(count)] =
+                        arguments.as_slice()
+                    else {
+                        return Err(host_binding_error(
+                            origin,
+                            "automation-click argument types are invalid",
+                        ));
+                    };
+                    AutomationRequest::Click {
+                        x: *x,
+                        y: *y,
+                        button: button.clone(),
+                        count: u8::try_from(*count).map_err(|_| {
+                            host_binding_error(origin, "click count is out of range")
+                        })?,
+                    }
+                } else {
+                    let [TypedValue::String(text), TypedValue::Int(delay_ms)] =
+                        arguments.as_slice()
+                    else {
+                        return Err(host_binding_error(
+                            origin,
+                            "automation-type argument types are invalid",
+                        ));
+                    };
+                    AutomationRequest::Type {
+                        text: text.clone(),
+                        delay_ms: u64::try_from(*delay_ms).map_err(|_| {
+                            host_binding_error(origin, "delay must be non-negative")
+                        })?,
+                    }
+                }
+            }
+            _ => {
+                return Err(host_binding_error(
+                    origin,
+                    "authorized capability has no typed host binding",
+                ));
+            }
+        };
+        let value = self
+            .automation
+            .execute(request)
+            .map_err(|error| host_binding_error(origin, error.to_string()))?;
+        Ok(vec![TypedValue::String(value.to_string())])
+    }
+
+    fn output(&self) -> String {
+        self.output.clone()
+    }
+}
+
+fn host_binding_error(
+    origin: &crate::vm::SourceOrigin,
+    message: impl Into<String>,
+) -> VmDiagnostic {
+    VmDiagnostic::error(
+        "E-HOST-002",
+        crate::vm::DiagnosticPhase::HostCall,
+        message,
+        Some(origin.clone()),
+    )
+}
+
+impl ProgramRuntime {
     async fn execute_forth(
         &self,
         source: &str,
@@ -881,6 +1004,25 @@ mod tests {
         assert_eq!(outcome.status, ExecutionStatus::Completed);
         assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
         assert_eq!(outcome.output, "hello from Lisp");
+    }
+
+    #[tokio::test]
+    async fn enabled_automation_is_available_through_typed_lisp() {
+        let runtime = ProgramRuntime::with_automation(true);
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(automation-availability)",
+                ExecutionEffect::ExternalRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert!(matches!(
+            outcome.values.first(),
+            Some(ProgramValue::String(_))
+        ));
     }
 
     #[tokio::test]

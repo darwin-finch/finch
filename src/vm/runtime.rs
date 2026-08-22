@@ -103,6 +103,22 @@ impl TypedRuntime {
         fuel: u64,
         declared: Option<&EffectSet>,
     ) -> TypedExecution {
+        let mut handler = RuntimeCapabilities::default();
+        self.execute_with_handler(language, source_id, source, fuel, declared, &mut handler)
+    }
+
+    /// Execute using a host-owned capability handler. This is the integration
+    /// seam for automation, files, agents, memory, scheduling, and provider
+    /// services; authorization and VM transactions remain in the shared VM.
+    pub fn execute_with_handler<H: CapabilityHandler>(
+        &mut self,
+        language: ProgramLanguage,
+        source_id: &str,
+        source: &str,
+        fuel: u64,
+        declared: Option<&EffectSet>,
+        handler: &mut H,
+    ) -> TypedExecution {
         let initial_types = self.stack.iter().map(TypedValue::value_type).collect();
         let compiled = match language {
             ProgramLanguage::Forth => compile_forth_with_functions(
@@ -173,10 +189,9 @@ impl TypedRuntime {
             })
             .map(|(name, function)| (name.clone(), function.clone()))
             .collect::<Vec<_>>();
-        let mut handler = RuntimeCapabilities::default();
         let result = Interpreter::new(
             &module,
-            &mut handler,
+            &mut *handler,
             InterpreterConfig {
                 fuel,
                 grants: self.grants.clone(),
@@ -198,7 +213,7 @@ impl TypedRuntime {
                     // depth, so a length delta is not a meaningful result ABI.
                     // Return the committed stack snapshot.
                     values: self.stack.clone(),
-                    output: handler.output,
+                    output: handler.output(),
                     effects,
                     diagnostics: Vec::new(),
                 }
@@ -227,7 +242,7 @@ struct RuntimeCapabilities {
     output: String,
 }
 
-impl CapabilityHandler for &mut RuntimeCapabilities {
+impl CapabilityHandler for RuntimeCapabilities {
     fn request(
         &mut self,
         requirement: &CapabilityRequirement,
@@ -261,6 +276,10 @@ impl CapabilityHandler for &mut RuntimeCapabilities {
                 Err(diagnostic)
             }
         }
+    }
+
+    fn output(&self) -> String {
+        self.output.clone()
     }
 }
 

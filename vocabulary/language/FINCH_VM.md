@@ -55,3 +55,8 @@ and cannot be undone by rolling back the VM.
 
 Use `get_language_definition` for exact syntax and `get_vm_state` for the current vocabulary.
 Inspect definitions instead of inventing words.
+
+When desktop automation is enabled, the typed vocabulary exposes
+`automation-availability`, `automation-displays`, `automation-windows`, `automation-click`, and
+`automation-type`. These return serialized operation results as strings and remain capability- and
+availability-checked at the host boundary.

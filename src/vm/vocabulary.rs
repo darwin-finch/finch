@@ -151,6 +151,61 @@ pub fn core_vocabulary() -> Vocabulary {
                 unscoped(CapabilityKind::AgentAwait),
             ),
         ),
+        (
+            "automation-availability".into(),
+            capability(
+                Vec::new(),
+                vec![Type::String],
+                CapabilityRequirement {
+                    capability: CapabilityKind::AutomationInspect,
+                    selector: ResourceSelector::Automation { application: None },
+                },
+            ),
+        ),
+        (
+            "automation-displays".into(),
+            capability(
+                Vec::new(),
+                vec![Type::String],
+                CapabilityRequirement {
+                    capability: CapabilityKind::AutomationInspect,
+                    selector: ResourceSelector::Automation { application: None },
+                },
+            ),
+        ),
+        (
+            "automation-windows".into(),
+            capability(
+                Vec::new(),
+                vec![Type::String],
+                CapabilityRequirement {
+                    capability: CapabilityKind::AutomationInspect,
+                    selector: ResourceSelector::Automation { application: None },
+                },
+            ),
+        ),
+        (
+            "automation-click".into(),
+            capability(
+                vec![Type::Float, Type::Float, Type::String, Type::Int],
+                vec![Type::String],
+                CapabilityRequirement {
+                    capability: CapabilityKind::AutomationWrite,
+                    selector: ResourceSelector::Automation { application: None },
+                },
+            ),
+        ),
+        (
+            "automation-type".into(),
+            capability(
+                vec![Type::String, Type::Int],
+                vec![Type::String],
+                CapabilityRequirement {
+                    capability: CapabilityKind::AutomationWrite,
+                    selector: ResourceSelector::Automation { application: None },
+                },
+            ),
+        ),
     ])
 }
 
