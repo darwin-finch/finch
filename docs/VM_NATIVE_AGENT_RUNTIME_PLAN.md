@@ -33,6 +33,9 @@ the shared program identity, manifest, tagged values, and effect model described
    negotiated provider capabilities, not provider-name checks.
 7. **Bounded execution.** Every program and child agent has fuel, time, memory/output, nesting,
    concurrency, and cancellation limits.
+8. **Optional capabilities are discoverable.** Automation and other opt-in facilities appear in
+   the runtime manifest only when enabled, supported on the host, and successfully initialized.
+   Programs receive a typed `CapabilityUnavailable` result when availability changes.
 
 ## Target model-facing API
 
@@ -97,6 +100,7 @@ Start with these typed native capabilities:
 | Session | emit text, dialog, plan, memory, VM state | Never |
 | Network | HTTP request through URL and credential policy | Never |
 | Agents | spawn, poll/await, cancel, send message, collect result | Never |
+| Automation | inspect UI, focus, click, type, key, scroll; scheduled program management | Never by default |
 | Processes | executable plus argv, cwd, env delta, timeout | Only for external programs |
 | Shell | explicit script string | Only when explicitly requested and approved |
 
@@ -135,6 +139,108 @@ The exact names may follow existing vocabulary conventions, but the operations, 
 effects, errors, and permission behavior must be equivalent. Do not implement the Lisp layer
 by generating Forth text, or the Forth layer by generating Lisp text; both bind directly to
 the shared Rust capability registry.
+
+## Optional automation capabilities
+
+The VM must be able to use Finch automation directly when the feature is enabled. Automation is
+not injected as a permanent set of words with ambient authority. It is a broker capability
+advertised by the runtime manifest and bound into both Forth and Lisp through the same typed ABI.
+
+### Availability and discovery
+
+Represent availability independently from permission:
+
+```text
+disabled                 user configuration is off
+unsupported              host/platform has no implementation
+permission_required      OS consent, such as Accessibility, is missing
+available                initialized and callable
+degraded(reason)         only a documented subset is available
+```
+
+The manifest includes the automation backend, version, supported operations, coordinate/display
+model, and availability state. Enabling or disabling the feature, granting or revoking OS consent,
+changing displays, or reconnecting to a daemon increments the environment generation and refreshes
+the manifest. A program compiled when automation was available must still recheck availability and
+authority at execution time.
+
+Top-level agents do not need separate direct `gui_*` tool schemas once program submission is the
+default. They discover `automation.*` in the manifest and invoke it from Forth or Lisp. Legacy
+`gui_click`, `gui_type`, and `gui_inspect` remain thin broker adapters during migration.
+
+### Native desktop automation
+
+Expose typed operations such as:
+
+```text
+automation.displays()
+automation.windows(application?)
+automation.focused()
+automation.find(selector)
+automation.focus(element)
+automation.click(element | point, button?, count?)
+automation.type(text, target?, delay?)
+automation.key(key, modifiers?)
+automation.scroll(target | point, delta)
+```
+
+Inspection returns structured applications, windows, and accessibility elements rather than a
+formatted report. Element references include the owning process, role, label, bounds, and a short
+generation-bound handle. Mutating operations prefer an inspected element handle; coordinate clicks
+remain an explicit fallback and include the display ID and coordinate space.
+
+On macOS, use the Accessibility APIs for application/window/element inspection and actions, and
+CoreGraphics for input events that truly require synthesized input. The current AppleScript/
+`osascript` inspection path should not be the VM implementation. It may remain a named compatibility
+backend temporarily, reported as `degraded`, and any use must appear as an explicit external-process
+effect. No automation primitive silently constructs or launches a shell command.
+
+Classify inspection as a sensitive external read and input/focus/click operations as external
+writes. Every mutating request records the target application, element metadata or coordinates,
+and originating agent ancestry. Typed text is redacted from routine logs; audit records retain a
+hash and length unless policy explicitly allows content retention.
+
+Automation grants are narrow and do not automatically flow to child agents. A parent may delegate
+only a subset such as inspect-only access, a specific application, or a bounded operation count.
+Background, remote-peer, and scheduled runs default to no desktop mutation even when GUI automation
+is globally enabled. They require an explicit policy grant appropriate to an unattended action.
+
+### Scheduled automation
+
+Time-based automation is distinct from desktop control and from the in-memory fork/join scheduler.
+When durable scheduling is implemented and enabled, expose:
+
+```text
+automation.schedule(program_ref, trigger, arguments, policy_ref)
+automation.list-schedules(filter?)
+automation.inspect-schedule(schedule_id)
+automation.pause/resume/cancel(schedule_id)
+automation.run-now(schedule_id)
+```
+
+A schedule stores an immutable `ProgramRef`, typed arguments, trigger/time zone, environment
+requirements, owner, capability-policy reference, retry/concurrency policy, and context hashes. It
+must not persist an arbitrary English task string as executable authority. When fired, it creates a
+normal root execution in the runtime scheduler, resolves its provider only if the program requests
+an agent, and emits the same task/effect events as an interactive run.
+
+The existing task queue and scheduler are currently non-persistent execution stubs. Do not expose
+successful VM scheduling until storage, claiming/leases, missed-run behavior, retries, cancellation,
+and actual `ProgramRuntime` execution are implemented. Until then the manifest reports scheduled
+automation as unavailable rather than accepting and discarding work.
+
+### Automation UI and emergency control
+
+An active automation operation appears beneath its owning task in the task tree, including target
+application, operation type, elapsed time, and approval state. The UI provides a persistent
+automation-active indicator and an emergency stop action that cancels the automation subtree and
+releases held input state. The inspector shows structured observations and targets without placing
+sensitive typed content in scrollback.
+
+Approval dialogs must identify the full agent ancestry and target. A sequence may be approved once
+as a hash-bound program/effect plan; changing the target, source, program version, or derived effects
+invalidates that approval. The UI must never imply that global feature enablement is equivalent to
+approval for every automation action.
 
 ## Clarify snapshot, fork, and subagent semantics
 
@@ -476,6 +582,8 @@ Lisp definitions through the identical function-tool contract, with no shell or 
   Forth primitives, Lisp primitives, and subagents.
 - Move existing native read, glob, search, write, edit, patch, hash, HTTP, dialog, memory, and
   plan implementations behind broker handlers instead of duplicating their logic.
+- Move enabled GUI automation behind the broker, replace AppleScript inspection with native host
+  APIs, and bind the supported operations into both VM languages.
 - Split process execution into `process.run(executable, argv, ...)` and an explicitly named
   `shell.run(script, ...)` capability.
 - Add changeset preview, content hashes, atomic application, and stale-file conflict results.
@@ -542,6 +650,7 @@ src/runtime/broker.rs           permissions, dispatch, audit
 src/runtime/scheduler.rs        VM tasks and child agents
 src/runtime/providers.rs        dynamic provider/model resolver
 src/runtime/changeset.rs        preview, hashes, atomic application
+src/runtime/automation.rs       optional automation capability and availability
 src/coforth/capabilities.rs     Forth bindings only
 src/lisp/capabilities.rs        Lisp bindings only
 src/tools/implementations/program.rs  thin provider-tool adapters
@@ -568,6 +677,11 @@ Every phase adds unit, integration, and provider-contract tests.
 | UI event projection | Replay and reconnect produce the same task tree without duplicates |
 | Concurrent rendering | Coalesced child updates do not block execution or redraw unchanged cells |
 | Attention routing | Child questions and approvals show ancestry and resume the right continuation |
+| Automation disabled | No automation vocabulary is advertised or callable |
+| Automation consent | Missing/revoked OS permission returns structured availability changes |
+| Native automation | Inspect/click/type paths invoke no shell or AppleScript process |
+| Automation delegation | Children receive only explicitly delegated automation grants |
+| Scheduled execution | Durable trigger invokes the pinned program once under stored policy |
 | Model switch | New children use the active provider unless explicitly pinned |
 | Stale manifest | Execution fails safely and returns the current generation |
 | Changeset conflict | Modified files are not overwritten after hash mismatch |
@@ -584,6 +698,7 @@ Program-first becomes the default only when all of these are true:
 - 100% of native capability tests use the shared broker from top-level agents and subagents;
 - Grok, Claude, OpenAI-compatible, and local-provider fixtures pass the same contract suite;
 - representative read/search/edit tasks require zero shell invocations;
+- enabled native automation requires zero implicit shell invocations;
 - no workspace mutation occurs without a previewable, hash-bound changeset or explicit policy;
 - cancellation and limits terminate runaway VM programs and recursive agents;
 - stored-program reuse reduces median model round trips without increasing failure rate;
