@@ -42,6 +42,10 @@ message.
 
 `process-run` consumes a command string and a list of argument strings; it never invokes a shell.
 
+For progressive prose, emit multiple typed chunks with `say`. A future template/quasiquote form
+may combine literal text and embedded expressions, but it will lower to the same checked sequence
+of `say` side effects; interpolation is never string replacement or an untyped eval escape.
+
 Typed conditionals use `if ... else ... then`. Typed loops use `begin ... while ... repeat` or
 `begin ... until`. Structural words must be properly nested. The condition is `bool`; the
 stack/type shape after consuming it and at every back-edge must equal the loop-header shape. Each

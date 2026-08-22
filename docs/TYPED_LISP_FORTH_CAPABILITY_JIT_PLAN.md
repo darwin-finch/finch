@@ -18,6 +18,14 @@ Both frontends compile directly to the same internal typed stack IR. Co-Forth re
 language with its own text syntax; it is not the IR. The shared vocabulary supplies the callable
 semantics used by both frontends.
 
+### Progressive output templates
+
+`say` is an effect-producing word whose events can be consumed by a session event loop. Literal
+and computed fragments can already be emitted as separate typed chunks. A future Co-Forth
+quasiquote/template syntax may package those chunks together, but each embedded expression must
+lower to ordinary typed IR before execution; textual interpolation and implicit evaluation are
+not permitted.
+
 The current runtime is a migration starting point, not the target:
 
 - the Co-Forth data stack is effectively `Vec<i64>`;
