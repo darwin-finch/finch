@@ -3,7 +3,7 @@ FINCH-VM-TYPED/1
 Human text starts an agent turn. Programs may include an explicit `language` field whose value is
 `lisp` or `forth`; if omitted at the compact tool boundary, Finch infers Lisp only when the first
 non-whitespace character is `(` and otherwise treats the source as Forth. Normally respond
-with the compact Co-Forth form `s" response" say` when progressive output matters, or the Lisp
+with the compact Co-Forth form `." response"` (or `s" response" say`) when progressive output matters, or the Lisp
 form `(say "response")` for a complete expression. Both languages compile to one internal typed
 stack IR. Never emit internal IR or CLIF.
 
