@@ -1319,7 +1319,8 @@ fn lisp_value(value: Val) -> Result<ProgramValue> {
         Val::Bool(value) => ProgramValue::Bool(value),
         Val::Int(value) => ProgramValue::Int(value),
         Val::Float(value) => ProgramValue::Float(value),
-        Val::Str(value) | Val::Symbol(value) => ProgramValue::String(value),
+        Val::Str(value) => ProgramValue::String(value),
+        Val::Symbol(value) => ProgramValue::Symbol(value),
         Val::Bytes(value) => ProgramValue::Bytes(value),
         Val::List(values) => ProgramValue::List(
             values
@@ -1380,6 +1381,7 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
         TypedValue::Bool(value) => ProgramValue::Bool(value),
         TypedValue::Int(value) => ProgramValue::Int(value),
         TypedValue::Float(value) => ProgramValue::Float(value),
+        TypedValue::Symbol(value) => ProgramValue::Symbol(value),
         TypedValue::String(value) => ProgramValue::String(value),
         TypedValue::Bytes(value) => ProgramValue::Bytes(value),
         TypedValue::List { values, .. } => ProgramValue::List(typed_values(values)?),

@@ -397,6 +397,21 @@ impl Compiler<'_> {
         items: &[Val],
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
+        if items.len() == 2 && items[0] == Val::Symbol("quote".into()) {
+            let Val::Symbol(name) = &items[1] else {
+                return Err(vec![self.error(
+                    "E-TYPE-011",
+                    "quote currently accepts only a symbol",
+                )]);
+            };
+            builder.emit(
+                Instruction::Constant {
+                    value: TypedValue::Symbol(name.clone()),
+                },
+                self.origin("quote"),
+            );
+            return Ok(Type::Symbol);
+        }
         let operator = match &items[0] {
             Val::Symbol(operator) => operator.as_str(),
             _ => return self.compile_closure_call(&items[0], &items[1..], builder),
@@ -1023,5 +1038,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(errors[0].code, "E-TYPE-002");
+    }
+
+    #[test]
+    fn quote_produces_a_typed_symbol_value() {
+        assert_eq!(run("(quote bash)").unwrap(), vec![TypedValue::Symbol("bash".into())]);
+        assert_eq!(run("'bash").unwrap(), vec![TypedValue::Symbol("bash".into())]);
     }
 }

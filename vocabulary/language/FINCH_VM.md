@@ -84,8 +84,8 @@ are rendered to legacy Lisp callers as `(some value)`, `(none)`, `(ok value)`, o
 
 Lisp symbols are identifiers, not strings: `'name` is quoted data (equivalent to `(quote name)`),
 whereas `(say "name")` contains text. Co-Forth uses bare tokens for executable dictionary words;
-`['] word execute` passes an execution token as data. A future symbol literal may use the same
-quoted-token convention, but it must remain distinct from a word reference and from a string.
+`'name` produces a typed symbol value and `['] word execute` passes an execution token as data.
+These remain distinct from both a dictionary word reference and a string.
 
 `process-run` accepts a command path and a list of argument strings. It invokes the executable
 directly, never through a shell, and requires an explicit `process.run` capability and approval.

@@ -211,6 +211,7 @@ pub enum ProgramValue {
     Bool(bool),
     Int(i64),
     Float(f64),
+    Symbol(String),
     String(String),
     Bytes(Vec<u8>),
     List(Vec<ProgramValue>),
@@ -579,6 +580,7 @@ fn program_to_lisp(value: ProgramValue) -> crate::lisp::Val {
         ProgramValue::Bool(value) => crate::lisp::Val::Bool(value),
         ProgramValue::Int(value) => crate::lisp::Val::Int(value),
         ProgramValue::Float(value) => crate::lisp::Val::Float(value),
+        ProgramValue::Symbol(value) => crate::lisp::Val::Symbol(value),
         ProgramValue::String(value) => crate::lisp::Val::Str(value),
         ProgramValue::Bytes(value) => crate::lisp::Val::Bytes(value),
         ProgramValue::Task(value) => crate::lisp::Val::Str(value),
@@ -608,9 +610,8 @@ fn lisp_to_program(value: crate::lisp::Val) -> Result<ProgramValue> {
         crate::lisp::Val::Bool(value) => Ok(ProgramValue::Bool(value)),
         crate::lisp::Val::Int(value) => Ok(ProgramValue::Int(value)),
         crate::lisp::Val::Float(value) => Ok(ProgramValue::Float(value)),
-        crate::lisp::Val::Str(value) | crate::lisp::Val::Symbol(value) => {
-            Ok(ProgramValue::String(value))
-        }
+        crate::lisp::Val::Str(value) => Ok(ProgramValue::String(value)),
+        crate::lisp::Val::Symbol(value) => Ok(ProgramValue::Symbol(value)),
         crate::lisp::Val::Bytes(value) => Ok(ProgramValue::Bytes(value)),
         crate::lisp::Val::List(values) => {
             match values.as_slice() {

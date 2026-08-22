@@ -637,7 +637,12 @@ fn compile_forth_body_with_functions(
                 }
             }
             TokenValue::Word(word) => {
-                if let Ok(value) = word.parse::<i64>() {
+                if let Some(symbol) = word.strip_prefix('\'').filter(|symbol| !symbol.is_empty()) {
+                    stack.push(Type::Symbol);
+                    Instruction::Constant {
+                        value: TypedValue::Symbol(symbol.to_string()),
+                    }
+                } else if let Ok(value) = word.parse::<i64>() {
                     stack.push(Type::Int);
                     Instruction::Constant {
                         value: TypedValue::Int(value),
@@ -1297,5 +1302,15 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(errors[0].code, "E-FORTH-CONTROL-001");
+    }
+
+    #[test]
+    fn quoted_word_produces_a_typed_symbol_value() {
+        let module = compile_forth("input.forth", "'bash", Vec::new(), &core_vocabulary()).unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(stack, vec![TypedValue::Symbol("bash".into())]);
     }
 }
