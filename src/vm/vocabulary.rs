@@ -187,6 +187,22 @@ pub fn core_vocabulary() -> Vocabulary {
             ),
         ),
         (
+            "agent-poll".into(),
+            capability(
+                vec![Type::Task(Box::new(Type::String))],
+                vec![Type::String],
+                unscoped(CapabilityKind::AgentPoll),
+            ),
+        ),
+        (
+            "agent-cancel".into(),
+            capability(
+                vec![Type::Task(Box::new(Type::String))],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::AgentCancel),
+            ),
+        ),
+        (
             "automation-availability".into(),
             capability(
                 Vec::new(),

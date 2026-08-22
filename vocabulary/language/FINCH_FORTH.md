@@ -34,6 +34,10 @@ Workspace file words use refined paths: `s" Cargo.toml" path file-read` leaves `
 workspace-relative and checked against their declared selector at both verification and host
 execution. Missing file grants pause for approval rather than being silently widened.
 
+Agent words operate on opaque task handles: `s" task" agent-spawn`, `agent-poll`, `agent-await`,
+and `agent-cancel`. Poll is nonblocking and returns serialized status; await returns the final
+message.
+
 Typed conditionals use `if ... else ... then`. Typed loops use `begin ... while ... repeat` or
 `begin ... until`. Structural words must be properly nested. The condition is `bool`; the
 stack/type shape after consuming it and at every back-edge must equal the loop-header shape. Each

@@ -86,6 +86,7 @@ pub struct ProgramRuntime {
     submission_gate: tokio::sync::Mutex<()>,
     automation: Arc<AutomationBroker>,
     workspace_root: Arc<PathBuf>,
+    memory: RwLock<Option<Arc<crate::memory::MemorySystem>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
 }
 
@@ -111,12 +112,20 @@ impl ProgramRuntime {
             workspace_root: Arc::new(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ),
+            memory: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
         }
     }
 
     pub fn automation(&self) -> Arc<AutomationBroker> {
         Arc::clone(&self.automation)
+    }
+
+    /// Attach the host's MemTree service to the typed capability boundary.
+    /// Keeping this explicit prevents a VM from accidentally acquiring a
+    /// second memory database or an ambient memory authority.
+    pub fn attach_memory(&self, memory: Arc<crate::memory::MemorySystem>) {
+        *self.memory.write().expect("memory binding lock poisoned") = Some(memory);
     }
 
     /// Grant a typed capability after an approval decision. The next
@@ -414,6 +423,11 @@ impl ProgramRuntime {
         let runtime = Arc::clone(&self.typed);
         let automation = Arc::clone(&self.automation);
         let workspace_root = Arc::clone(&self.workspace_root);
+        let memory = self
+            .memory
+            .read()
+            .expect("memory binding lock poisoned")
+            .clone();
         let scheduler = self
             .agent_scheduler
             .read()
@@ -450,11 +464,20 @@ impl ProgramRuntime {
                             capability: crate::vm::CapabilityKind::AgentAwait,
                             selector: crate::vm::ResourceSelector::None,
                         });
+                        runtime.grant(CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::AgentPoll,
+                            selector: crate::vm::ResourceSelector::None,
+                        });
+                        runtime.grant(CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::AgentCancel,
+                            selector: crate::vm::ResourceSelector::None,
+                        });
                     }
                     let mut handler = TypedHostHandler::new(
                         Arc::clone(&automation),
                         Arc::clone(&workspace_root),
                         scheduler,
+                        memory,
                     );
                     runtime.execute_with_handler(
                         language,
@@ -485,6 +508,7 @@ struct TypedHostHandler {
     workspace_root: Arc<PathBuf>,
     output: String,
     scheduler: Option<agent_vm::AgentVmBinding>,
+    memory: Option<Arc<crate::memory::MemorySystem>>,
 }
 
 impl TypedHostHandler {
@@ -492,12 +516,14 @@ impl TypedHostHandler {
         automation: Arc<AutomationBroker>,
         workspace_root: Arc<PathBuf>,
         scheduler: Option<agent_vm::AgentVmBinding>,
+        memory: Option<Arc<crate::memory::MemorySystem>>,
     ) -> Self {
         Self {
             automation,
             workspace_root,
             output: String::new(),
             scheduler,
+            memory,
         }
     }
 }
@@ -616,6 +642,73 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![TypedValue::String(result.final_message)]);
             }
+            crate::vm::CapabilityKind::AgentPoll => {
+                let [TypedValue::Task(task_id)] = arguments.as_slice() else {
+                    return Err(host_binding_error(origin, "agent-poll requires one task"));
+                };
+                let Some(binding) = self.scheduler.clone() else {
+                    return Err(host_binding_error(origin, "agent scheduler is unavailable"));
+                };
+                let task_id = agent_vm::parse_task_id(task_id)
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                let poll_binding = binding.clone();
+                let snapshot = binding
+                    .block_on(async move { poll_binding.poll(task_id).await })
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                let json = serde_json::to_string(&snapshot)
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::String(json)]);
+            }
+            crate::vm::CapabilityKind::AgentCancel => {
+                let [TypedValue::Task(task_id)] = arguments.as_slice() else {
+                    return Err(host_binding_error(origin, "agent-cancel requires one task"));
+                };
+                let Some(binding) = self.scheduler.clone() else {
+                    return Err(host_binding_error(origin, "agent scheduler is unavailable"));
+                };
+                let task_id = agent_vm::parse_task_id(task_id)
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                let cancel_binding = binding.clone();
+                binding
+                    .block_on(async move { cancel_binding.cancel(task_id).await })
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::Unit]);
+            }
+            crate::vm::CapabilityKind::MemoryRead => {
+                let [TypedValue::String(query)] = arguments.as_slice() else {
+                    return Err(host_binding_error(origin, "mem-recall requires one query"));
+                };
+                let Some(memory) = self.memory.clone() else {
+                    return Err(host_binding_error(origin, "memory service is unavailable"));
+                };
+                let query = query.clone();
+                let values = block_on_host(async move { memory.query(&query, None).await })
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::List {
+                    element_type: Type::String,
+                    values: values.into_iter().map(TypedValue::String).collect(),
+                }]);
+            }
+            crate::vm::CapabilityKind::MemoryWrite => {
+                let [TypedValue::String(content)] = arguments.as_slice() else {
+                    return Err(host_binding_error(origin, "mem-store requires one string"));
+                };
+                let Some(memory) = self.memory.clone() else {
+                    return Err(host_binding_error(origin, "memory service is unavailable"));
+                };
+                let content = content.clone();
+                block_on_host(async move {
+                    memory
+                        .insert_conversation("assistant", &content, None, None)
+                        .await
+                })
+                .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::Resource {
+                    kind: "memory-node".into(),
+                    handle: uuid::Uuid::new_v4().to_string(),
+                    generation: 0,
+                }]);
+            }
             _ => {
                 return Err(host_binding_error(
                     origin,
@@ -645,6 +738,21 @@ fn host_binding_error(
         message,
         Some(origin.clone()),
     )
+}
+
+fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| anyhow::anyhow!("typed host requires a Tokio runtime"))?;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || handle.block_on(future))
+            .join()
+            .map_err(|_| anyhow::anyhow!("typed host worker panicked"))?
+    })
 }
 
 fn secure_workspace_path(
@@ -976,6 +1084,16 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
         TypedValue::String(value) => ProgramValue::String(value),
         TypedValue::Bytes(value) => ProgramValue::Bytes(value),
         TypedValue::List { values, .. } => ProgramValue::List(typed_values(values)?),
+        TypedValue::Task(value) => ProgramValue::Task(value),
+        TypedValue::Resource {
+            kind,
+            handle,
+            generation,
+        } => ProgramValue::Resource {
+            kind,
+            handle,
+            generation,
+        },
         other => bail!("typed VM value is not portable: {other:?}"),
     })
 }

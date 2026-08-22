@@ -61,6 +61,10 @@ When desktop automation is enabled, the typed vocabulary exposes
 `automation-type`. These return serialized operation results as strings and remain capability- and
 availability-checked at the host boundary.
 
+Child-agent handles are opaque task values. `agent-spawn` starts bounded work, `agent-poll` returns
+a nonblocking JSON snapshot, `agent-await` joins and returns the final message, and `agent-cancel`
+requests cancellation. Scheduler ancestry and ownership are checked for every operation.
+
 Workspace file access uses refined paths rather than raw strings. `(path "relative/name")`
 constructs a path constrained to the workspace selector; `(file-read path)` returns `bytes`, and
 `(file-write path bytes)` returns `unit`. The host canonicalizes and rechecks the path, so `..`,

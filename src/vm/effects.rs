@@ -304,6 +304,8 @@ pub enum CapabilityKind {
     AutomationWrite,
     AgentSpawn,
     AgentAwait,
+    AgentPoll,
+    AgentCancel,
     ProcessRun,
     SessionEmit,
     MemoryRead,

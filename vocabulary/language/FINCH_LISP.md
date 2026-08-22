@@ -49,3 +49,7 @@ manifest generation and expected VM revision.
 `path` creates a workspace-relative refined path. `file-read` produces `bytes`; `file-write`
 consumes a refined path and bytes. These are capability-bearing host calls and may require an
 approval before execution.
+
+Agent coordination uses opaque task handles: `(agent-spawn "task")`, `(agent-poll task)`,
+`(agent-await task)`, and `(agent-cancel task)`. Poll while work is running; await only when the
+final result is needed.

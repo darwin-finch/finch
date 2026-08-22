@@ -204,6 +204,12 @@ pub enum ProgramValue {
     String(String),
     Bytes(Vec<u8>),
     List(Vec<ProgramValue>),
+    Task(String),
+    Resource {
+        kind: String,
+        handle: String,
+        generation: u64,
+    },
 }
 
 /// Canonical definition and review metadata for one program version.
@@ -560,6 +566,8 @@ fn program_to_lisp(value: ProgramValue) -> crate::lisp::Val {
         ProgramValue::Float(value) => crate::lisp::Val::Float(value),
         ProgramValue::String(value) => crate::lisp::Val::Str(value),
         ProgramValue::Bytes(value) => crate::lisp::Val::Bytes(value),
+        ProgramValue::Task(value) => crate::lisp::Val::Str(value),
+        ProgramValue::Resource { handle, .. } => crate::lisp::Val::Str(handle),
         ProgramValue::List(values) => {
             crate::lisp::Val::List(values.into_iter().map(program_to_lisp).collect())
         }
