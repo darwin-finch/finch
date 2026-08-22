@@ -439,6 +439,7 @@ fn compile_forth_body_with_functions(
                         origin,
                     });
                     control.push(ControlKind::Loop);
+                    token_index += 1;
                     continue;
                 }
                 "while" => {
@@ -512,6 +513,7 @@ fn compile_forth_body_with_functions(
                     );
                     frame.exit = Some(exit);
                     current = body;
+                    token_index += 1;
                     continue;
                 }
                 "repeat" => {
@@ -554,6 +556,7 @@ fn compile_forth_body_with_functions(
                     );
                     current = exit;
                     stack = frame.stack;
+                    token_index += 1;
                     continue;
                 }
                 "until" => {
@@ -620,6 +623,7 @@ fn compile_forth_body_with_functions(
                     );
                     current = exit;
                     stack = frame.stack;
+                    token_index += 1;
                     continue;
                 }
                 _ => {}
