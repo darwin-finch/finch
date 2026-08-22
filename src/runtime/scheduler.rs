@@ -748,7 +748,7 @@ mod tests {
         );
         assert_eq!(
             outcome.backend,
-            crate::runtime::outcome::ExecutionBackend::LispNative
+            crate::runtime::outcome::ExecutionBackend::TypedVm
         );
         assert_eq!(scheduler.tasks.read().await.len(), 1);
     }

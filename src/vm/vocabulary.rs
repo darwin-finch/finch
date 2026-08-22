@@ -182,10 +182,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "agent-await".into(),
             capability(
                 vec![Type::Task(Box::new(Type::String))],
-                vec![Type::result(
-                    Type::String,
-                    Type::Resource("agent-error".into()),
-                )],
+                vec![Type::String],
                 unscoped(CapabilityKind::AgentAwait),
             ),
         ),

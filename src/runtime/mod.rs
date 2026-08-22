@@ -289,6 +289,7 @@ impl ProgramRuntime {
                 &submission.source,
                 &context,
                 &submission.declared_capabilities,
+                caller.clone(),
             )
             .await?
         {
@@ -408,10 +409,17 @@ impl ProgramRuntime {
         source: &str,
         context: &ExecutionContext,
         declared_capabilities: &[CapabilityRequirement],
+        caller: Option<scheduler::AgentIdentity>,
     ) -> Result<Option<crate::vm::TypedExecution>> {
         let runtime = Arc::clone(&self.typed);
         let automation = Arc::clone(&self.automation);
         let workspace_root = Arc::clone(&self.workspace_root);
+        let scheduler = self
+            .agent_scheduler
+            .read()
+            .expect("agent scheduler lock poisoned")
+            .upgrade()
+            .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, caller));
         let source = source.to_string();
         let declared = (!declared_capabilities.is_empty())
             .then(|| EffectSet(declared_capabilities.iter().cloned().collect()));
@@ -433,8 +441,21 @@ impl ProgramRuntime {
                             selector: crate::vm::ResourceSelector::Automation { application: None },
                         });
                     }
-                    let mut handler =
-                        TypedHostHandler::new(Arc::clone(&automation), Arc::clone(&workspace_root));
+                    if scheduler.is_some() {
+                        runtime.grant(CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::AgentSpawn,
+                            selector: crate::vm::ResourceSelector::None,
+                        });
+                        runtime.grant(CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::AgentAwait,
+                            selector: crate::vm::ResourceSelector::None,
+                        });
+                    }
+                    let mut handler = TypedHostHandler::new(
+                        Arc::clone(&automation),
+                        Arc::clone(&workspace_root),
+                        scheduler,
+                    );
                     runtime.execute_with_handler(
                         language,
                         match language {
@@ -453,22 +474,6 @@ impl ProgramRuntime {
             && execution.diagnostics.iter().all(typed_frontend_unsupported)
         {
             Ok(None)
-        } else if matches!(
-            &execution.status,
-            TypedExecutionStatus::AuthorizationRequired { requirements }
-                if !requirements.is_empty()
-                    && requirements.iter().all(|requirement| matches!(
-                        requirement.capability,
-                        crate::vm::CapabilityKind::AgentSpawn
-                            | crate::vm::CapabilityKind::AgentAwait
-                    ))
-        ) {
-            // The existing scheduler already enforces task ownership and
-            // ancestry. Keep these forms on that compatibility path until the
-            // typed interpreter has an asynchronous scheduler host binding;
-            // treating a missing binding as a permission prompt would strand
-            // a program that cannot resume successfully.
-            Ok(None)
         } else {
             Ok(Some(execution))
         }
@@ -479,14 +484,20 @@ struct TypedHostHandler {
     automation: Arc<AutomationBroker>,
     workspace_root: Arc<PathBuf>,
     output: String,
+    scheduler: Option<agent_vm::AgentVmBinding>,
 }
 
 impl TypedHostHandler {
-    fn new(automation: Arc<AutomationBroker>, workspace_root: Arc<PathBuf>) -> Self {
+    fn new(
+        automation: Arc<AutomationBroker>,
+        workspace_root: Arc<PathBuf>,
+        scheduler: Option<agent_vm::AgentVmBinding>,
+    ) -> Self {
         Self {
             automation,
             workspace_root,
             output: String::new(),
+            scheduler,
         }
     }
 }
@@ -575,6 +586,35 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 std::fs::write(path, bytes)
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![TypedValue::Unit]);
+            }
+            crate::vm::CapabilityKind::AgentSpawn => {
+                let [TypedValue::String(task)] = arguments.as_slice() else {
+                    return Err(host_binding_error(origin, "agent-spawn requires one task"));
+                };
+                let Some(binding) = self.scheduler.clone() else {
+                    return Err(host_binding_error(origin, "agent scheduler is unavailable"));
+                };
+                let spawn_binding = binding.clone();
+                let task = task.clone();
+                let identity = binding
+                    .block_on(async move { spawn_binding.spawn(task).await })
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::Task(identity.task_id.to_string())]);
+            }
+            crate::vm::CapabilityKind::AgentAwait => {
+                let [TypedValue::Task(task_id)] = arguments.as_slice() else {
+                    return Err(host_binding_error(origin, "agent-await requires one task"));
+                };
+                let Some(binding) = self.scheduler.clone() else {
+                    return Err(host_binding_error(origin, "agent scheduler is unavailable"));
+                };
+                let task_id = agent_vm::parse_task_id(task_id)
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                let wait_binding = binding.clone();
+                let result = binding
+                    .block_on(async move { wait_binding.wait(task_id).await })
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::String(result.final_message)]);
             }
             _ => {
                 return Err(host_binding_error(
