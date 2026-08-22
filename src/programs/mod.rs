@@ -752,6 +752,22 @@ mod tests {
     }
 
     #[test]
+    fn structured_values_round_trip_through_lisp_abi() {
+        let values = [
+            ProgramValue::Option(Some(Box::new(ProgramValue::Int(5)))),
+            ProgramValue::Option(None),
+            ProgramValue::Result {
+                ok: false,
+                value: Box::new(ProgramValue::String("bad".into())),
+            },
+        ];
+        for value in values {
+            let lisp = program_to_lisp(value.clone());
+            assert_eq!(lisp_to_program(lisp).unwrap(), value);
+        }
+    }
+
+    #[test]
     fn test_manifest_prompt_omits_program_source() {
         let definition =
             ProgramDefinition::candidate("secret-helper", ProgramLanguage::Forth, "12345 67890 +");
