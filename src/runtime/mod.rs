@@ -20,6 +20,7 @@ use context::{ExecutionBudget, ExecutionContext};
 use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock, Weak};
@@ -84,6 +85,7 @@ pub struct ProgramRuntime {
     manifest_generation: AtomicU64,
     submission_gate: tokio::sync::Mutex<()>,
     automation: Arc<AutomationBroker>,
+    workspace_root: Arc<PathBuf>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
 }
 
@@ -106,12 +108,25 @@ impl ProgramRuntime {
             manifest_generation: AtomicU64::new(1),
             submission_gate: tokio::sync::Mutex::new(()),
             automation,
+            workspace_root: Arc::new(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            ),
             agent_scheduler: RwLock::new(Weak::new()),
         }
     }
 
     pub fn automation(&self) -> Arc<AutomationBroker> {
         Arc::clone(&self.automation)
+    }
+
+    /// Grant a typed capability after an approval decision. The next
+    /// submission is still checked against this structured grant.
+    pub fn grant_typed_capability(&self, requirement: CapabilityRequirement) -> Result<()> {
+        self.typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
+            .grant(requirement);
+        Ok(())
     }
 
     pub fn attach_agent_scheduler(&self, scheduler: &Arc<scheduler::AgentScheduler>) {
@@ -255,7 +270,11 @@ impl ProgramRuntime {
                 ExecutionEffect::ExternalRead | ExecutionEffect::ExternalWrite
             )
             && is_automation_only_source(submission.language, &submission.source);
-        if !vm_local && !enabled_automation {
+        let enabled_typed_files = matches!(
+            submission.effect,
+            ExecutionEffect::WorkspaceRead | ExecutionEffect::WorkspaceWrite
+        ) && is_typed_file_source(&submission.source);
+        if !vm_local && !enabled_automation && !enabled_typed_files {
             bail!(
                 "effect '{}' is not enabled in the initial VM runtime",
                 submission.effect.as_str()
@@ -392,6 +411,7 @@ impl ProgramRuntime {
     ) -> Result<Option<crate::vm::TypedExecution>> {
         let runtime = Arc::clone(&self.typed);
         let automation = Arc::clone(&self.automation);
+        let workspace_root = Arc::clone(&self.workspace_root);
         let source = source.to_string();
         let declared = (!declared_capabilities.is_empty())
             .then(|| EffectSet(declared_capabilities.iter().cloned().collect()));
@@ -413,7 +433,8 @@ impl ProgramRuntime {
                             selector: crate::vm::ResourceSelector::Automation { application: None },
                         });
                     }
-                    let mut handler = TypedHostHandler::new(Arc::clone(&automation));
+                    let mut handler =
+                        TypedHostHandler::new(Arc::clone(&automation), Arc::clone(&workspace_root));
                     runtime.execute_with_handler(
                         language,
                         match language {
@@ -456,13 +477,15 @@ impl ProgramRuntime {
 
 struct TypedHostHandler {
     automation: Arc<AutomationBroker>,
+    workspace_root: Arc<PathBuf>,
     output: String,
 }
 
 impl TypedHostHandler {
-    fn new(automation: Arc<AutomationBroker>) -> Self {
+    fn new(automation: Arc<AutomationBroker>, workspace_root: Arc<PathBuf>) -> Self {
         Self {
             automation,
+            workspace_root,
             output: String::new(),
         }
     }
@@ -528,6 +551,31 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     }
                 }
             }
+            crate::vm::CapabilityKind::FileRead => {
+                let [TypedValue::Path { relative, selector }] = arguments.as_slice() else {
+                    return Err(host_binding_error(origin, "file-read requires one path"));
+                };
+                let path = secure_workspace_path(&self.workspace_root, selector, relative)
+                    .map_err(|message| host_binding_error(origin, message))?;
+                let bytes = std::fs::read(path)
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::Bytes(bytes)]);
+            }
+            crate::vm::CapabilityKind::FileWrite => {
+                let [TypedValue::Path { relative, selector }, TypedValue::Bytes(bytes)] =
+                    arguments.as_slice()
+                else {
+                    return Err(host_binding_error(
+                        origin,
+                        "file-write requires a path and bytes",
+                    ));
+                };
+                let path = secure_workspace_path(&self.workspace_root, selector, relative)
+                    .map_err(|message| host_binding_error(origin, message))?;
+                std::fs::write(path, bytes)
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::Unit]);
+            }
             _ => {
                 return Err(host_binding_error(
                     origin,
@@ -557,6 +605,40 @@ fn host_binding_error(
         message,
         Some(origin.clone()),
     )
+}
+
+fn secure_workspace_path(
+    root: &PathBuf,
+    selector: &crate::vm::FileSelector,
+    relative: &str,
+) -> std::result::Result<PathBuf, String> {
+    if !selector.matches(relative) || relative.contains(['*', '?']) {
+        return Err("path is outside its declared selector".to_string());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("workspace root is unavailable: {error}"))?;
+    let candidate = root.join(relative);
+    let check = if candidate.exists() {
+        candidate
+            .canonicalize()
+            .map_err(|error| format!("path cannot be canonicalized: {error}"))?
+    } else {
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| "path has no parent".to_string())?
+            .canonicalize()
+            .map_err(|error| format!("path parent cannot be canonicalized: {error}"))?;
+        parent.join(
+            candidate
+                .file_name()
+                .ok_or_else(|| "path has no filename".to_string())?,
+        )
+    };
+    if !check.starts_with(&root) {
+        return Err("path escapes the workspace root".to_string());
+    }
+    Ok(check)
 }
 
 impl ProgramRuntime {
@@ -653,6 +735,11 @@ fn is_automation_only_source(language: ProgramLanguage, source: &str) -> bool {
     !forbidden.iter().any(|word| normalized.contains(word))
 }
 
+fn is_typed_file_source(source: &str) -> bool {
+    let source = source.to_ascii_lowercase();
+    source.contains("file-read") || source.contains("file-write")
+}
+
 fn effect_allows(declared: ExecutionEffect, required: ExecutionEffect) -> bool {
     use ExecutionEffect::*;
     matches!(
@@ -676,7 +763,11 @@ fn effect_allows(declared: ExecutionEffect, required: ExecutionEffect) -> bool {
 }
 
 fn required_effect(language: ProgramLanguage, source: &str) -> ExecutionEffect {
+    let uses_typed_host_word = source.to_ascii_lowercase().contains("file-read")
+        || source.to_ascii_lowercase().contains("file-write")
+        || source.to_ascii_lowercase().contains("automation-");
     if language == ProgramLanguage::Lisp
+        && !uses_typed_host_word
         && crate::lisp::forth_compiler::compile_source(source).is_ok()
     {
         return ExecutionEffect::Pure;
@@ -687,11 +778,11 @@ fn required_effect(language: ProgramLanguage, source: &str) -> ExecutionEffect {
     if contains_any(&[
         "automation-click",
         "automation-type",
+        "file-write",
         "ssh-connect",
         "ssh-auth-key",
         "ssh-exec",
         "ssh-write-file",
-        "file-write",
         "file-append",
         "b64>file",
         "xlsx-write-cell",
@@ -727,6 +818,7 @@ fn required_effect(language: ProgramLanguage, source: &str) -> ExecutionEffect {
     }
     if contains_any(&[
         "file-fetch",
+        "file-read",
         "file-slice",
         "file-size",
         "file-sha256",
@@ -1022,6 +1114,31 @@ mod tests {
         assert!(matches!(
             outcome.values.first(),
             Some(ProgramValue::String(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn approved_typed_file_read_resumes_with_a_refined_path() {
+        let runtime = ProgramRuntime::new();
+        let request = submission(
+            ProgramLanguage::Lisp,
+            "(file-read (path \"Cargo.toml\"))",
+            ExecutionEffect::WorkspaceRead,
+        );
+        let pending = runtime.submit(request.clone()).await.unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        assert_eq!(pending.required_capabilities.len(), 1);
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
+        let approved = runtime.submit(request).await.unwrap();
+        assert_eq!(approved.status, ExecutionStatus::Completed);
+        assert!(matches!(
+            approved.values.first(),
+            Some(ProgramValue::Bytes(_))
         ));
     }
 

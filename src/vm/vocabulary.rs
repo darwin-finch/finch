@@ -1,4 +1,6 @@
-use super::effects::{CapabilityKind, CapabilityRequirement, EffectSet, ResourceSelector};
+use super::effects::{
+    CapabilityKind, CapabilityRequirement, EffectSet, FileOperation, FileSelector, ResourceSelector,
+};
 use super::signature::{ControlEffect, StackRow, StackSignature};
 use super::types::Type;
 use super::verifier::Vocabulary;
@@ -54,6 +56,15 @@ pub fn core_vocabulary() -> Vocabulary {
         ("abs".into(), pure(vec![Type::Int], vec![Type::Int])),
         ("not".into(), pure(vec![Type::Bool], vec![Type::Bool])),
         (
+            "path".into(),
+            pure(
+                vec![Type::String],
+                vec![Type::Path(
+                    FileSelector::parse("./**").expect("valid workspace root"),
+                )],
+            ),
+        ),
+        (
             "dup".into(),
             pure(vec![a.clone()], vec![a.clone(), a.clone()]),
         ),
@@ -68,6 +79,33 @@ pub fn core_vocabulary() -> Vocabulary {
         (
             "str-cat".into(),
             pure(vec![Type::String, Type::String], vec![Type::String]),
+        ),
+        (
+            "file-read".into(),
+            capability(
+                vec![Type::Path(
+                    FileSelector::parse("./**").expect("valid workspace root"),
+                )],
+                vec![Type::Bytes],
+                CapabilityRequirement::file(
+                    FileOperation::Read,
+                    FileSelector::parse("./**").expect("valid workspace root"),
+                ),
+            ),
+        ),
+        (
+            "file-write".into(),
+            capability(
+                vec![
+                    Type::Path(FileSelector::parse("./**").expect("valid workspace root")),
+                    Type::Bytes,
+                ],
+                vec![Type::Unit],
+                CapabilityRequirement::file(
+                    FileOperation::Write,
+                    FileSelector::parse("./**").expect("valid workspace root"),
+                ),
+            ),
         ),
         (
             "list-length".into(),

@@ -60,3 +60,10 @@ When desktop automation is enabled, the typed vocabulary exposes
 `automation-availability`, `automation-displays`, `automation-windows`, `automation-click`, and
 `automation-type`. These return serialized operation results as strings and remain capability- and
 availability-checked at the host boundary.
+
+Workspace file access uses refined paths rather than raw strings. `(path "relative/name")`
+constructs a path constrained to the workspace selector; `(file-read path)` returns `bytes`, and
+`(file-write path bytes)` returns `unit`. The host canonicalizes and rechecks the path, so `..`,
+absolute paths, and wildcard-bearing runtime arguments cannot escape the declared selector. A
+submission that needs file access produces an approval prompt when the corresponding scoped grant
+is absent; after approval, resubmit the same source with the current VM revision.

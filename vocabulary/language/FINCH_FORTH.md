@@ -29,6 +29,11 @@ dictionary. Typed definitions are persistent and immediately callable from Finch
 Control-flow merge points must have identical stack types, and loops require stable invariants.
 Checked arithmetic reports division-by-zero or overflow traps.
 
+Workspace file words use refined paths: `s" Cargo.toml" path file-read` leaves `bytes`, while
+`s" generated/result.bin" path data file-write` consumes the bytes and leaves `unit`. Paths are
+workspace-relative and checked against their declared selector at both verification and host
+execution. Missing file grants pause for approval rather than being silently widened.
+
 Typed conditionals use `if ... else ... then`. Typed loops use `begin ... while ... repeat` or
 `begin ... until`. Structural words must be properly nested. The condition is `bool`; the
 stack/type shape after consuming it and at every back-edge must equal the loop-header shape. Each

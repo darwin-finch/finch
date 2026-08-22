@@ -431,6 +431,34 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             result.push_str(&right);
             stack.push(TypedValue::String(result));
         }
+        "path" => {
+            let value = pop(stack)?;
+            let TypedValue::String(relative) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-010",
+                    DiagnosticPhase::Interpretation,
+                    "path requires a string",
+                    Some(origin),
+                ));
+            };
+            let selector = super::effects::FileSelector::parse("./**").map_err(|error| {
+                VmDiagnostic::error(
+                    "E-PATH-001",
+                    DiagnosticPhase::Interpretation,
+                    error.to_string(),
+                    Some(SourceOrigin::generated(name)),
+                )
+            })?;
+            if !selector.matches(&relative) || relative.contains(['*', '?']) {
+                return Err(VmDiagnostic::error(
+                    "E-PATH-002",
+                    DiagnosticPhase::Interpretation,
+                    "path is not a normalized relative workspace path",
+                    Some(SourceOrigin::generated(name)),
+                ));
+            }
+            stack.push(TypedValue::Path { selector, relative });
+        }
         "list-length" => {
             let value = pop(stack)?;
             let TypedValue::List { values, .. } = value else {

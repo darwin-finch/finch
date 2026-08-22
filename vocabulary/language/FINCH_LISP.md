@@ -14,6 +14,8 @@ The ordinary response is `(say "Hello")`. Pure and compound examples:
 (let ((n 10)) ((lambda ((x : int)) (+ x n)) 5))
 (define (square (x : int)) (* x x))
 (list-get (list 4 8 15 16) 2)
+(file-read (path "Cargo.toml"))
+(file-write (path "generated/result.bin") data)
 ```
 
 Lambda parameters use `(name : type)`. A lambda evaluates to a closure containing immutable code
@@ -43,3 +45,7 @@ during migration; do not depend on that fallback for new provider programs.
 Use only functions in the current VM manifest. Call `get_vm_state` and vocabulary introspection
 instead of guessing names or signatures. Submit raw source through `submit_program` with the observed
 manifest generation and expected VM revision.
+
+`path` creates a workspace-relative refined path. `file-read` produces `bytes`; `file-write`
+consumes a refined path and bytes. These are capability-bearing host calls and may require an
+approval before execution.
