@@ -38,8 +38,12 @@ impl ClaudeClient {
 
     /// Convert MessageRequest to ProviderRequest
     fn to_provider_request(&self, request: &MessageRequest) -> ProviderRequest {
+        // The provider profile owns the upstream model. `MessageRequest`
+        // predates named providers and always carries a Claude-oriented model
+        // field, so forwarding it would override Grok/OpenAI/etc. configuration.
+        let model = self.provider.default_model();
         let mut provider_req = ProviderRequest::new(request.messages.clone())
-            .with_model(request.model.clone())
+            .with_model(model)
             .with_max_tokens(request.max_tokens);
 
         if let Some(system) = &request.system {
@@ -76,6 +80,31 @@ impl ClaudeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{ProviderResponse, StreamChunk as ProviderStreamChunk};
+
+    struct ConfiguredProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ConfiguredProvider {
+        async fn send_message(&self, _request: &ProviderRequest) -> Result<ProviderResponse> {
+            unreachable!("conversion test does not send requests")
+        }
+
+        async fn send_message_stream(
+            &self,
+            _request: &ProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<ProviderStreamChunk>>> {
+            unreachable!("conversion test does not send requests")
+        }
+
+        fn name(&self) -> &str {
+            "grok"
+        }
+
+        fn default_model(&self) -> &str {
+            "grok-code-fast-1"
+        }
+    }
 
     #[test]
     fn test_client_creation() {
@@ -89,5 +118,16 @@ mod tests {
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.messages[0].role, "user");
         assert_eq!(request.messages[0].text(), "Hello");
+    }
+
+    #[test]
+    fn configured_provider_model_is_authoritative() {
+        let client = ClaudeClient::with_provider(Box::new(ConfiguredProvider));
+
+        let mut request = MessageRequest::new("Hello");
+        request.model = "wrong-request-model".to_string();
+        let converted = client.to_provider_request(&request);
+
+        assert_eq!(converted.model, "grok-code-fast-1");
     }
 }

@@ -11,7 +11,7 @@ use axum::{
         IntoResponse, Json, Response,
     },
 };
-use futures::stream::{self};
+use futures::{stream, StreamExt};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
@@ -203,12 +203,27 @@ async fn handle_chat_completions_streaming(
         ));
     }
 
-    // Check if local-only mode requested
+    // Standard OpenAI-compatible clients use streaming for cloud models. The
+    // provider profile named by `model` owns the upstream model configuration.
     if !request.local_only.unwrap_or(false) {
-        return Err(error_response(
-            "streaming is only supported for local-only queries",
-            "invalid_request_error",
-        ));
+        let provider_name = provider_profile_name(&request.model)
+            .map_err(|message| error_response(message, "invalid_request_error"))?;
+        let internal_messages = convert_messages_to_internal(&request.messages)
+            .map_err(|e| error_response(&e.to_string(), "invalid_request_error"))?;
+        let internal_tools = request
+            .tools
+            .as_ref()
+            .map(|tools| convert_tools_to_internal(tools));
+        let content = forward_to_cloud(
+            &server,
+            Some(provider_name),
+            internal_messages,
+            internal_tools,
+        )
+        .await
+        .map_err(|e| error_response(&e.to_string(), "api_error"))?;
+
+        return Ok(openai_sse_response(content, &request.model));
     }
 
     // Convert OpenAI messages to internal format
@@ -380,7 +395,79 @@ async fn handle_chat_completions_streaming(
         },
     );
 
-    Ok(Sse::new(stream).into_response())
+    // OpenAI clients use the sentinel to distinguish a cleanly completed
+    // stream from a dropped connection.
+    let done = stream::once(async { Ok::<_, Infallible>(Event::default().data("[DONE]")) });
+    Ok(Sse::new(stream.chain(done)).into_response())
+}
+
+/// Turn a completed provider response into a standards-compatible SSE stream.
+///
+/// This compatibility path supports clients such as Roo Code immediately,
+/// while provider-native token streaming can be added independently later.
+fn openai_sse_response(content: Vec<ContentBlock>, model: &str) -> Response {
+    let events = openai_stream_chunks(content, model);
+    let chunks = events
+        .into_iter()
+        .map(|chunk| Ok::<_, Infallible>(Event::default().json_data(chunk).expect("JSON event")));
+    let done = std::iter::once(Ok::<_, Infallible>(Event::default().data("[DONE]")));
+    Sse::new(stream::iter(chunks.chain(done))).into_response()
+}
+
+fn openai_stream_chunks(content: Vec<ContentBlock>, model: &str) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    let created = chrono::Utc::now().timestamp();
+    let mut used_tools = false;
+    let mut tool_index = 0_u32;
+
+    for block in content {
+        let delta = match block {
+            ContentBlock::Text { text } => serde_json::json!({ "content": text }),
+            ContentBlock::ToolUse { id, name, input } => {
+                used_tools = true;
+                let delta = serde_json::json!({
+                    "tool_calls": [{
+                        "index": tool_index,
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": input.to_string()
+                        }
+                    }]
+                });
+                tool_index += 1;
+                delta
+            }
+            ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => continue,
+        };
+        events.push(serde_json::json!({
+            "id": &completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": null
+            }]
+        }));
+    }
+
+    events.push(serde_json::json!({
+        "id": &completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": if used_tools { "tool_calls" } else { "stop" }
+        }]
+    }));
+
+    events
 }
 
 /// Interpret the OpenAI `model` field as a Finch provider profile selector.
@@ -1017,6 +1104,43 @@ mod tests {
         assert_eq!(
             provider_profile_name("  "),
             Err("model must name a configured Finch provider profile")
+        );
+    }
+
+    #[test]
+    fn cloud_stream_uses_profile_model_and_finishes() {
+        let chunks = openai_stream_chunks(
+            vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            "grok-fast",
+        );
+
+        assert_eq!(chunks[0]["model"], "grok-fast");
+        assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "hello");
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "stop"
+        );
+    }
+
+    #[test]
+    fn cloud_stream_serializes_tool_calls() {
+        let chunks = openai_stream_chunks(
+            vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "README.md"}),
+            }],
+            "grok-fast",
+        );
+
+        let call = &chunks[0]["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["id"], "call-1");
+        assert_eq!(call["function"]["name"], "read_file");
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
         );
     }
 
