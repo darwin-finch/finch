@@ -83,6 +83,10 @@ directly, never through a shell, and requires an explicit `process.run` capabili
 the complete buffered response remains available in the execution result. Use multiple `say`
 operations for progressive UI updates; there is no separate streaming language.
 
+At the execution boundary, chunks are represented as ordered typed side-effect events. A session
+may render, buffer, inspect, test, or reject those events; the VM does not require the UI to mutate
+state synchronously during interpretation.
+
 Workspace file access uses refined paths rather than raw strings. `(path "relative/name")`
 constructs a path constrained to the workspace selector; `(file-read path)` returns `bytes`, and
 `(file-write path bytes)` returns `unit`. The host canonicalizes and rechecks the path, so `..`,
