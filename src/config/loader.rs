@@ -90,6 +90,8 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
         #[serde(default)]
         active_theme: Option<String>,
         #[serde(default)]
+        active_persona: Option<String>,
+        #[serde(default)]
         huggingface_token: Option<String>,
         #[serde(default)]
         license: super::settings::LicenseConfig,
@@ -151,6 +153,9 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
     }
     if let Some(theme) = toml_config.active_theme {
         config.active_theme = theme;
+    }
+    if let Some(persona) = toml_config.active_persona {
+        config.active_persona = persona;
     }
     if let Some(token) = toml_config.huggingface_token {
         config.huggingface_token = Some(token);
