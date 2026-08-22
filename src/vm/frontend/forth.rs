@@ -996,24 +996,13 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
-            let content_start = cursor;
-            while cursor < bytes.len() && bytes[cursor] != b'"' {
-                cursor += 1;
-            }
-            if cursor == bytes.len() {
-                return Err(vec![VmDiagnostic::error(
-                    "E-READ-001",
-                    DiagnosticPhase::Reader,
-                    "unterminated Co-Forth string literal",
-                    Some(origin(source_id, source, start, source.len())),
-                )]);
-            }
+            let (value, end) = read_string(source_id, source, cursor, start, "E-READ-001", "unterminated Co-Forth string literal")?;
             tokens.push(Token {
-                value: TokenValue::String(source[content_start..cursor].to_string()),
+                value: TokenValue::String(value),
                 start,
-                end: cursor + 1,
+                end,
             });
-            cursor += 1;
+            cursor = end;
             continue;
         }
         // Standard Forth-style immediate output string. Lower it to the same
@@ -1023,29 +1012,18 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
-            let content_start = cursor;
-            while cursor < bytes.len() && bytes[cursor] != b'"' {
-                cursor += 1;
-            }
-            if cursor == bytes.len() {
-                return Err(vec![VmDiagnostic::error(
-                    "E-READ-003",
-                    DiagnosticPhase::Reader,
-                    "unterminated Co-Forth output string literal",
-                    Some(origin(source_id, source, start, source.len())),
-                )]);
-            }
+            let (value, end) = read_string(source_id, source, cursor, start, "E-READ-003", "unterminated Co-Forth output string literal")?;
             tokens.push(Token {
-                value: TokenValue::String(source[content_start..cursor].to_string()),
+                value: TokenValue::String(value),
                 start,
                 end: cursor + 1,
             });
             tokens.push(Token {
                 value: TokenValue::Word("say".into()),
                 start,
-                end: cursor + 1,
+                end,
             });
-            cursor += 1;
+            cursor = end;
             continue;
         }
         while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
@@ -1058,6 +1036,49 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         });
     }
     Ok(tokens)
+}
+
+fn read_string(
+    source_id: &str,
+    source: &str,
+    mut cursor: usize,
+    start: usize,
+    code: &str,
+    message: &str,
+) -> Result<(String, usize), Vec<VmDiagnostic>> {
+    let mut value = String::new();
+    while cursor < source.len() {
+        let mut chars = source[cursor..].chars();
+        let character = chars.next().expect("cursor remains on a UTF-8 boundary");
+        match character {
+            '"' => return Ok((value, cursor + character.len_utf8())),
+            '\\' => {
+                let escape_start = cursor + character.len_utf8();
+                let Some(escaped) = source[escape_start..].chars().next() else {
+                    break;
+                };
+                cursor = escape_start;
+                value.push(match escaped {
+                    '"' => '"',
+                    '\\' => '\\',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+                cursor += escaped.len_utf8();
+                continue;
+            }
+            other => value.push(other),
+        }
+        cursor += character.len_utf8();
+    }
+    Err(vec![VmDiagnostic::error(
+        code,
+        DiagnosticPhase::Reader,
+        message,
+        Some(origin(source_id, source, start, source.len())),
+    )])
 }
 
 fn origin(source_id: &str, source: &str, start: usize, end: usize) -> SourceOrigin {
@@ -1115,7 +1136,7 @@ mod tests {
     fn direct_output_and_string_literals_are_streamable() {
         let module = compile_forth(
             "input.forth",
-            ".\"Hello user, I am an LLM\" 3 5 + int-to-string say s\"! \" say",
+            ".\"Hello \\\"世界\\\"\" 3 5 + int-to-string say s\"! \" say",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -1149,7 +1170,7 @@ mod tests {
         })
         .execute(&mut stack)
         .unwrap();
-        assert_eq!(handler.output(), "Hello user, I am an LLM8! ");
+        assert_eq!(handler.output(), "Hello \"世界\"8! ");
     }
 
     #[test]
