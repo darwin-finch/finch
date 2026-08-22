@@ -36,6 +36,7 @@
 /// ```
 pub mod env;
 pub mod eval;
+pub mod forth_compiler;
 pub mod reader;
 pub mod stdlib;
 pub mod types;
@@ -47,6 +48,7 @@ pub use env::EnvRef;
 pub use types::Val;
 
 use crate::ssh::SshSessionStore;
+use crate::runtime::automation::AutomationBroker;
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
@@ -55,13 +57,36 @@ use crate::ssh::SshSessionStore;
 /// Holds the SSH session store and (in the future) any other I/O resources the
 /// Lisp evaluator needs to cross task boundaries.
 pub struct LispCtx {
-    pub ssh_sessions: SshSessionStore,
+    pub ssh_sessions: Arc<SshSessionStore>,
+    pub automation: Arc<AutomationBroker>,
+    pub agent: Option<crate::runtime::agent_vm::AgentVmBinding>,
 }
 
 impl LispCtx {
     pub fn new() -> Self {
         Self {
-            ssh_sessions: SshSessionStore::new(),
+            ssh_sessions: Arc::new(SshSessionStore::new()),
+            automation: Arc::new(AutomationBroker::new(false)),
+            agent: None,
+        }
+    }
+
+    pub fn with_automation(automation: Arc<AutomationBroker>) -> Self {
+        Self {
+            ssh_sessions: Arc::new(SshSessionStore::new()),
+            automation,
+            agent: None,
+        }
+    }
+
+    pub fn with_agent(
+        &self,
+        agent: Option<crate::runtime::agent_vm::AgentVmBinding>,
+    ) -> Self {
+        Self {
+            ssh_sessions: Arc::clone(&self.ssh_sessions),
+            automation: Arc::clone(&self.automation),
+            agent,
         }
     }
 }

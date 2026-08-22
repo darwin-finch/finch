@@ -28,7 +28,7 @@ use crossterm::{
         EndSynchronizedUpdate,
     },
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
@@ -474,6 +474,10 @@ pub struct TuiRenderer {
     // Session task list (set after construction via set_todo_list)
     todo_list: Option<Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>>,
 
+    // Live child-agent tree projected from scheduler lifecycle events.
+    agent_tasks: HashMap<uuid::Uuid, crate::runtime::scheduler::AgentTaskSnapshot>,
+    agent_active_tools: HashMap<uuid::Uuid, String>,
+
     // Output of the user-defined `check` word — shown in the corner if set.
     pub corner: Arc<std::sync::Mutex<Option<String>>>,
 
@@ -595,6 +599,8 @@ impl TuiRenderer {
             image_counter: 0,
 
             todo_list: None,
+            agent_tasks: HashMap::new(),
+            agent_active_tools: HashMap::new(),
             corner: Arc::new(std::sync::Mutex::new(None)),
             stack: None,
             poset: None,
@@ -616,6 +622,28 @@ impl TuiRenderer {
         todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
     ) {
         self.todo_list = Some(todo_list);
+    }
+
+    /// Fold a scheduler event into the live child-agent projection.
+    pub fn apply_agent_event(&mut self, event: &crate::runtime::scheduler::AgentEvent) {
+        use crate::runtime::scheduler::AgentEvent;
+        match event {
+            AgentEvent::TaskQueued { snapshot } | AgentEvent::TaskStarted { snapshot } => {
+                self.agent_tasks
+                    .insert(snapshot.identity.task_id, snapshot.clone());
+            }
+            AgentEvent::ToolStarted { task_id, name } => {
+                self.agent_active_tools.insert(*task_id, name.clone());
+            }
+            AgentEvent::ToolCompleted { task_id, .. } => {
+                self.agent_active_tools.remove(task_id);
+            }
+            AgentEvent::TaskFinished { result } => {
+                self.agent_tasks.remove(&result.identity.task_id);
+                self.agent_active_tools.remove(&result.identity.task_id);
+            }
+        }
+        self.live_area_dirty = true;
     }
 
     /// Attach the Co-Forth shared stack so the live area can display it.
@@ -791,7 +819,46 @@ impl TuiRenderer {
             }
         }
 
-        // ── 1c. Co-Forth panel ────────────────────────────────────────────────
+        // ── 1c. Child-agent task tree ─────────────────────────────────────────
+        let mut agent_tasks = self.agent_tasks.values().collect::<Vec<_>>();
+        agent_tasks.sort_by_key(|task| (task.identity.depth, task.identity.task_id));
+        for task in agent_tasks {
+            let indent = "  ".repeat(task.identity.depth);
+            let symbol = match task.status {
+                crate::runtime::scheduler::AgentTaskStatus::Queued => "○",
+                crate::runtime::scheduler::AgentTaskStatus::Running => "●",
+                _ => "✓",
+            };
+            let model = &task.identity.provider_model;
+            let tool = self
+                .agent_active_tools
+                .get(&task.identity.task_id)
+                .map(|name| format!(" · {name}"))
+                .unwrap_or_default();
+            let prefix_width = indent.chars().count() + 2;
+            let available = term_width.saturating_sub(prefix_width + model.chars().count() + tool.chars().count() + 3);
+            let task_text = task.task.chars().take(available).collect::<String>();
+            execute!(
+                stdout,
+                SetForegroundColor(if matches!(task.status, crate::runtime::scheduler::AgentTaskStatus::Running) {
+                    Color::Cyan
+                } else {
+                    Color::DarkGrey
+                }),
+                Print(&indent),
+                Print(symbol),
+                ResetColor,
+                Print(" "),
+                Print(task_text),
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!(" · {model}{tool}")),
+                ResetColor,
+                Print("\r\n")
+            )?;
+            rows += 1;
+        }
+
+        // ── 1d. Co-Forth panel ────────────────────────────────────────────────
         // The panel is rendered as a floating overlay in draw_poset_overlay()
         // (top-right corner of the viewport) — not inline here.  This avoids
         // all cursor-row-counting issues; the overlay uses SavePosition /

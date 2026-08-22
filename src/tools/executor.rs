@@ -589,6 +589,11 @@ impl ToolExecutor {
         &self.registry
     }
 
+    /// Register session-scoped tools after their runtime dependencies exist.
+    pub fn registry_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.registry
+    }
+
     /// Get reference to permissions manager
     pub fn permissions(&self) -> &PermissionManager {
         &self.permissions

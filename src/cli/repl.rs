@@ -119,6 +119,7 @@ pub struct Repl {
     // Tool execution
     tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
     tool_definitions: Vec<ToolDefinition>, // Cached tool definitions for Claude API
+    program_runtime: Arc<crate::runtime::ProgramRuntime>,
     // UI state
     is_interactive: bool,
     streaming_enabled: bool,
@@ -299,6 +300,16 @@ impl Repl {
 
         // Initialize tool execution system
         let mut tool_registry = ToolRegistry::new();
+        let program_runtime = Arc::new(crate::runtime::ProgramRuntime::with_automation({
+            #[cfg(target_os = "macos")]
+            {
+                config.features.gui_automation
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        }));
         tool_registry.register(Box::new(ReadTool));
         tool_registry.register(Box::new(GlobTool));
         tool_registry.register(Box::new(GrepTool));
@@ -309,6 +320,12 @@ impl Repl {
         tool_registry.register(Box::new(WriteTool));
         tool_registry.register(Box::new(HashCompareTool));
         tool_registry.register(Box::new(AnsibleTool));
+        tool_registry.register(Box::new(
+            crate::tools::implementations::SubmitProgramTool::new(Arc::clone(&program_runtime)),
+        ));
+        tool_registry.register(Box::new(
+            crate::tools::implementations::GetVmStateTool::new(Arc::clone(&program_runtime)),
+        ));
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()
@@ -436,6 +453,11 @@ impl Repl {
             "describe",
             "view",
             "search",
+            "get_vm_state",
+            "spawn_agent",
+            "await_agent",
+            "poll_agent",
+            "cancel_agent",
         ] {
             permissions.register_tool_config(tool.to_string(), allow_config.clone());
         }
@@ -457,6 +479,16 @@ impl Repl {
                 fallback_registry.register(Box::new(GrepTool));
                 fallback_registry.register(Box::new(WebFetchTool::new()));
                 fallback_registry.register(Box::new(BashTool));
+                fallback_registry.register(Box::new(
+                    crate::tools::implementations::SubmitProgramTool::new(Arc::clone(
+                        &program_runtime,
+                    )),
+                ));
+                fallback_registry.register(Box::new(
+                    crate::tools::implementations::GetVmStateTool::new(Arc::clone(
+                        &program_runtime,
+                    )),
+                ));
                 fallback_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
                 fallback_registry
                     .register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
@@ -664,6 +696,7 @@ impl Repl {
             tokenizer,
             tool_executor,
             tool_definitions,
+            program_runtime,
             is_interactive,
             streaming_enabled,
             debug_enabled: false,
@@ -1669,6 +1702,34 @@ impl Repl {
             ReplMode::Normal,
         )));
 
+        // Child agents share the currently selected generator through this
+        // resolver, and share the same persistent VM runtime as the root.
+        let provider_resolver = crate::runtime::scheduler::ProviderResolver::with_profiles(
+            Arc::clone(&claude_gen),
+            self.available_providers.clone(),
+            self.daemon_client.clone(),
+        );
+        let agent_scheduler = crate::runtime::scheduler::AgentScheduler::new(
+            provider_resolver.clone(),
+            Arc::clone(&self.program_runtime),
+        );
+        let tool_definitions = {
+            let mut executor = self.tool_executor.lock().await;
+            executor.registry_mut().register(Box::new(
+                crate::tools::implementations::AgentSpawnTool::new(Arc::clone(&agent_scheduler)),
+            ));
+            executor.registry_mut().register(Box::new(
+                crate::tools::implementations::AgentAwaitTool::new(Arc::clone(&agent_scheduler)),
+            ));
+            executor.registry_mut().register(Box::new(
+                crate::tools::implementations::AgentPollTool::new(Arc::clone(&agent_scheduler)),
+            ));
+            executor.registry_mut().register(Box::new(
+                crate::tools::implementations::AgentCancelTool::new(Arc::clone(&agent_scheduler)),
+            ));
+            executor.list_all_tools().await
+        };
+
         // Create EventLoop with all dependencies
         let mut event_loop = EventLoop::new(
             Arc::clone(&self.conversation),
@@ -1676,7 +1737,7 @@ impl Repl {
             qwen_gen,
             Arc::new(self.router.clone()),
             generator_state,
-            self.tool_definitions.clone(),
+            tool_definitions,
             Arc::clone(&self.tool_executor),
             tui_renderer,
             Arc::new(self.output_manager.clone()),
@@ -1724,6 +1785,8 @@ impl Repl {
             self.daemon_client
                 .as_ref()
                 .map(|c| c.base_url().to_string()),
+            provider_resolver,
+            agent_scheduler,
         );
 
         // Run the event loop

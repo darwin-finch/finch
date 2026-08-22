@@ -153,6 +153,17 @@ impl PermissionManager {
             return PermissionCheck::Deny(reason);
         }
 
+        // Pure and VM-local programs do not cross a host-effect boundary. External
+        // program effects continue through the configured/default approval rule.
+        if tool_name == "submit_program"
+            && matches!(
+                input.get("effect").and_then(Value::as_str),
+                Some("pure" | "vm_read" | "vm_write")
+            )
+        {
+            return PermissionCheck::Allow;
+        }
+
         // Apply tool-specific patterns
         if let Some(cfg) = config {
             if let Some(reason) = self.check_patterns(tool_name, input, cfg) {
@@ -183,8 +194,20 @@ impl PermissionManager {
         }
 
         match tool_name {
-            // Silent allow: read-only examination
-            "read" | "glob" | "grep" => PermissionCheck::Allow,
+            // Silent allow: read-only examination and scheduler-local control.
+            // Agent tools enforce task-tree ownership themselves.
+            "read" | "glob" | "grep" | "get_vm_state" | "spawn_agent" | "await_agent"
+            | "poll_agent" | "cancel_agent" => PermissionCheck::Allow,
+
+            // Pure and VM-local programs cannot cross a host-effect boundary.
+            "submit_program"
+                if matches!(
+                    input.get("effect").and_then(Value::as_str),
+                    Some("pure" | "vm_read" | "vm_write")
+                ) =>
+            {
+                PermissionCheck::Allow
+            }
 
             // Write/edit/patch: must surface as diff proposal in the room
             // The caller (peer loop) is responsible for converting Allow here into

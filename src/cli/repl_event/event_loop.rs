@@ -1125,7 +1125,7 @@ impl EventLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         conversation: Arc<RwLock<ConversationHistory>>,
-        cloud_gen: Arc<dyn Generator>,
+        _cloud_gen: Arc<dyn Generator>,
         qwen_gen: Arc<dyn Generator>,
         router: Arc<Router>,
         generator_state: Arc<RwLock<GeneratorState>>,
@@ -1154,9 +1154,27 @@ impl EventLoop {
         auto_discover: bool,
         remote_peers: Vec<String>,
         daemon_base_url: Option<String>,
+        provider_resolver: crate::runtime::scheduler::ProviderResolver,
+        agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
+
+        let mut agent_events = agent_scheduler.subscribe();
+        let agent_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match agent_events.recv().await {
+                    Ok(event) => {
+                        if agent_event_tx.send(ReplEvent::AgentLifecycle(event)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
 
         // Create Co-Forth shared stack before TUI so both hold the same Arc.
         let stack: Arc<tokio::sync::Mutex<Vec<String>>> =
@@ -1252,7 +1270,10 @@ impl EventLoop {
             input_rx,
             conversation,
             query_states: Arc::new(QueryStateManager::new()),
-            model_selection: ModelSelection::new(active_provider_index, cloud_gen),
+            model_selection: ModelSelection::from_handle(
+                active_provider_index,
+                provider_resolver.generator_handle(),
+            ),
             qwen_gen,
             available_providers,
             daemon_client,
@@ -1779,6 +1800,7 @@ s" it is ours"      s" -1 is ours"     argue
                         ReplEvent::OutputReady { .. } => "OutputReady",
                         ReplEvent::UserInput { .. } => "UserInput",
                         ReplEvent::StatsUpdate { .. } => "StatsUpdate",
+                        ReplEvent::AgentLifecycle(_) => "AgentLifecycle",
                         ReplEvent::CancelQuery => "CancelQuery",
                         ReplEvent::Shutdown => "Shutdown",
                         ReplEvent::BrainQuestion { .. } => "BrainQuestion",
@@ -3695,6 +3717,32 @@ Rules:\n\
                 self.status_bar
                     .update_live_stats(model, input_tokens, output_tokens, latency_ms);
                 // Render to display updated stats
+                self.render_tui().await?;
+            }
+
+            ReplEvent::AgentLifecycle(event) => {
+                let finished = match &event {
+                    crate::runtime::scheduler::AgentEvent::TaskFinished { result } => {
+                        Some(result.clone())
+                    }
+                    _ => None,
+                };
+                self.tui_renderer.lock().await.apply_agent_event(&event);
+                if let Some(result) = finished {
+                    let summary = if result.final_message.trim().is_empty() {
+                        result.diagnostics.join("; ")
+                    } else {
+                        result.final_message
+                    };
+                    self.output_manager.write_info(format!(
+                        "child {} {:?} ({} turns, {} ms)\n{}",
+                        result.identity.agent_id,
+                        result.status,
+                        result.turns,
+                        result.elapsed_ms,
+                        summary
+                    ));
+                }
                 self.render_tui().await?;
             }
 

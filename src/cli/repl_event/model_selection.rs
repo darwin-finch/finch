@@ -24,8 +24,15 @@ pub(crate) struct ModelSelection {
 
 impl ModelSelection {
     pub(crate) fn new(active_index: usize, generator: Arc<dyn Generator>) -> Self {
+        Self::from_handle(active_index, Arc::new(RwLock::new(generator)))
+    }
+
+    pub(crate) fn from_handle(
+        active_index: usize,
+        generator: Arc<RwLock<Arc<dyn Generator>>>,
+    ) -> Self {
         Self {
-            generator: Arc::new(RwLock::new(generator)),
+            generator,
             active_index: Arc::new(RwLock::new(active_index)),
             pending_index: Arc::new(RwLock::new(None)),
             generation: Arc::new(AtomicU64::new(0)),

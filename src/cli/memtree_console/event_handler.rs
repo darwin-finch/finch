@@ -96,7 +96,7 @@ impl EventHandler {
             ReplEvent::PeerMessage { .. } => {}
             ReplEvent::Translations { .. } => {}
             ReplEvent::RemoteBrainMessage { .. } => {}
-            ReplEvent::RemoteBrainError { .. } => {}
+            ReplEvent::RemoteBrainError { .. } | ReplEvent::AgentLifecycle(_) => {}
         }
 
         Ok(())

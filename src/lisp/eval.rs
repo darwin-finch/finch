@@ -19,6 +19,7 @@ use std::sync::Arc;
 use super::env::{Env, EnvRef};
 use super::types::{Lambda, Type, Val};
 use super::LispCtx;
+use crate::runtime::automation::AutomationRequest;
 
 /// Evaluate `expr` in `env`.  Returns a `BoxFuture` to enable async recursion
 /// without blowing the Rust call stack.
@@ -57,6 +58,147 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
     // ── Special forms (head is a known symbol) ────────────────────────────────
     if let Val::Symbol(ref name) = head {
         match name.as_str() {
+            "agent-spawn" => {
+                check_arity("agent-spawn", &rest, 1, 1)?;
+                let task = expect_string(
+                    "agent-spawn",
+                    eval(rest[0].clone(), env.clone(), ctx.clone()).await?,
+                )?;
+                let binding = ctx
+                    .agent
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
+                return Ok(Val::Str(binding.spawn(task).await?.task_id.to_string()));
+            }
+            "agent-poll" => {
+                check_arity("agent-poll", &rest, 1, 1)?;
+                let task_id = expect_string(
+                    "agent-poll",
+                    eval(rest[0].clone(), env.clone(), ctx.clone()).await?,
+                )?;
+                let binding = ctx
+                    .agent
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
+                return json_to_lisp(serde_json::to_value(
+                    binding.poll(crate::runtime::agent_vm::parse_task_id(&task_id)?).await?,
+                )?);
+            }
+            "agent-await" => {
+                check_arity("agent-await", &rest, 1, 1)?;
+                let task_id = expect_string(
+                    "agent-await",
+                    eval(rest[0].clone(), env.clone(), ctx.clone()).await?,
+                )?;
+                let binding = ctx
+                    .agent
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
+                return json_to_lisp(serde_json::to_value(
+                    binding.wait(crate::runtime::agent_vm::parse_task_id(&task_id)?).await?,
+                )?);
+            }
+            "agent-cancel" => {
+                check_arity("agent-cancel", &rest, 1, 1)?;
+                let task_id = expect_string(
+                    "agent-cancel",
+                    eval(rest[0].clone(), env.clone(), ctx.clone()).await?,
+                )?;
+                let binding = ctx
+                    .agent
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
+                binding
+                    .cancel(crate::runtime::agent_vm::parse_task_id(&task_id)?)
+                    .await?;
+                return Ok(Val::Bool(true));
+            }
+            "automation-availability" => {
+                check_arity("automation-availability", &rest, 0, 0)?;
+                let value = serde_json::to_value(ctx.automation.availability())?;
+                return json_to_lisp(value);
+            }
+            "automation-displays" => {
+                check_arity("automation-displays", &rest, 0, 0)?;
+                let broker = Arc::clone(&ctx.automation);
+                let value = tokio::task::spawn_blocking(move || {
+                    broker.execute(AutomationRequest::Displays)
+                })
+                .await??;
+                return json_to_lisp(value);
+            }
+            "automation-windows" => {
+                check_arity("automation-windows", &rest, 0, 0)?;
+                let broker = Arc::clone(&ctx.automation);
+                let value = tokio::task::spawn_blocking(move || {
+                    broker.execute(AutomationRequest::Windows)
+                })
+                .await??;
+                return json_to_lisp(value);
+            }
+            "automation-click" => {
+                check_arity("automation-click", &rest, 2, 4)?;
+                let x = expect_f64(
+                    "automation-click",
+                    eval(rest[0].clone(), env.clone(), ctx.clone()).await?,
+                )?;
+                let y = expect_f64(
+                    "automation-click",
+                    eval(rest[1].clone(), env.clone(), ctx.clone()).await?,
+                )?;
+                let button = if let Some(value) = rest.get(2) {
+                    expect_string(
+                        "automation-click",
+                        eval(value.clone(), env.clone(), ctx.clone()).await?,
+                    )?
+                } else {
+                    "left".to_string()
+                };
+                let count = if let Some(value) = rest.get(3) {
+                    expect_i64(
+                        "automation-click",
+                        eval(value.clone(), env.clone(), ctx.clone()).await?,
+                    )?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("automation-click: invalid count"))?
+                } else {
+                    1
+                };
+                let broker = Arc::clone(&ctx.automation);
+                let value = tokio::task::spawn_blocking(move || {
+                    broker.execute(AutomationRequest::Click {
+                        x,
+                        y,
+                        button,
+                        count,
+                    })
+                })
+                .await??;
+                return json_to_lisp(value);
+            }
+            "automation-type" => {
+                check_arity("automation-type", &rest, 1, 2)?;
+                let text = expect_string(
+                    "automation-type",
+                    eval(rest[0].clone(), env.clone(), ctx.clone()).await?,
+                )?;
+                let delay_ms = if let Some(value) = rest.get(1) {
+                    expect_i64(
+                        "automation-type",
+                        eval(value.clone(), env.clone(), ctx.clone()).await?,
+                    )?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("automation-type: invalid delay"))?
+                } else {
+                    0
+                };
+                let broker = Arc::clone(&ctx.automation);
+                let value = tokio::task::spawn_blocking(move || {
+                    broker.execute(AutomationRequest::Type { text, delay_ms })
+                })
+                .await??;
+                return json_to_lisp(value);
+            }
             // ── (quote datum) ─────────────────────────────────────────────────
             "quote" => {
                 check_arity("quote", &rest, 1, 1)?;
@@ -439,6 +581,59 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
         args.push(eval(arg, env.clone(), ctx.clone()).await?);
     }
     apply(func, args, ctx).await
+}
+
+fn json_to_lisp(value: serde_json::Value) -> Result<Val> {
+    Ok(match value {
+        serde_json::Value::Null => Val::Nil,
+        serde_json::Value::Bool(value) => Val::Bool(value),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Val::Int(value)
+            } else {
+                Val::Float(
+                    value
+                        .as_f64()
+                        .ok_or_else(|| anyhow::anyhow!("invalid JSON number"))?,
+                )
+            }
+        }
+        serde_json::Value::String(value) => Val::Str(value),
+        serde_json::Value::Array(values) => Val::List(
+            values
+                .into_iter()
+                .map(json_to_lisp)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        serde_json::Value::Object(values) => Val::List(
+            values
+                .into_iter()
+                .map(|(key, value)| Ok(Val::List(vec![Val::Symbol(key), json_to_lisp(value)?])))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
+}
+
+fn expect_string(operation: &str, value: Val) -> Result<String> {
+    match value {
+        Val::Str(value) | Val::Symbol(value) => Ok(value),
+        other => bail!("{operation}: expected string, got {}", other.type_name()),
+    }
+}
+
+fn expect_i64(operation: &str, value: Val) -> Result<i64> {
+    match value {
+        Val::Int(value) => Ok(value),
+        other => bail!("{operation}: expected integer, got {}", other.type_name()),
+    }
+}
+
+fn expect_f64(operation: &str, value: Val) -> Result<f64> {
+    match value {
+        Val::Int(value) => Ok(value as f64),
+        Val::Float(value) => Ok(value),
+        other => bail!("{operation}: expected number, got {}", other.type_name()),
+    }
 }
 
 // ── Application ───────────────────────────────────────────────────────────────

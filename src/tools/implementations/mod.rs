@@ -49,6 +49,12 @@ pub mod memory_tools;
 // Persistent program vocabulary introspection
 pub mod vocabulary_tools;
 
+// Provider-neutral direct Forth/Lisp execution
+pub mod program;
+
+// Structured child-agent fork/join
+pub mod agent;
+
 // Session task list tools
 pub mod todo_tools;
 
@@ -93,6 +99,10 @@ pub use llm_tools::LLMDelegationTool;
 pub use memory_tools::{CreateMemoryTool, ListRecentTool, SearchMemoryTool};
 
 pub use vocabulary_tools::{InspectProgramTool, SearchVocabularyTool};
+
+pub use program::{GetVmStateTool, SubmitProgramTool};
+
+pub use agent::{AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool};
 
 pub use todo_tools::{TodoReadTool, TodoWriteTool};
 

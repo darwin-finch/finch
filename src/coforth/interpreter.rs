@@ -173,6 +173,15 @@ enum Builtin {
     IsPrime,      // ( n -- flag )      -1 if n is prime, 0 otherwise
     NextPrime,    // ( n -- p )         smallest prime >= n
     AppleScript,  // ( script-idx -- result-idx )  run osascript, push stdout as string
+    AutomationAvailable, // ( -- flag ) native automation enabled and authorized
+    AutomationDisplays,  // ( -- json-idx ) structured display information
+    AutomationWindows,   // ( -- json-idx ) structured window information
+    AutomationClick,     // ( x y -- ) click screen coordinates
+    AutomationType,      // ( text-idx delay-ms -- ) type into focused element
+    AgentSpawn,          // ( task-idx -- task-id-idx ) fork a child agent
+    AgentPoll,           // ( task-id-idx -- json-idx ) non-blocking task state
+    AgentAwait,          // ( task-id-idx -- json-idx ) join a child agent
+    AgentCancel,         // ( task-id-idx -- flag ) request child cancellation
     // ── xlsx native (pure Rust, no Excel app needed) ──────────────────────────
     XlsxAt,       // ( file-idx addr-idx -- val-idx )      read one cell (first sheet)
     XlsxAtSheet,  // ( file-idx sheet-idx addr-idx -- val-idx ) read cell from named sheet
@@ -584,6 +593,9 @@ pub struct Forth {
     confirm_fn: Option<ConfirmFn>,
     /// Optional AI generation callback.  Wired to the active generator in the REPL.
     gen_fn: Option<GenFn>,
+    /// Optional native automation capability, installed by ProgramRuntime.
+    automation: Option<Arc<crate::runtime::automation::AutomationBroker>>,
+    agent: Option<crate::runtime::agent_vm::AgentVmBinding>,
     /// Optional dialog-select callback.  Wired to the TUI in the REPL.
     select_fn: Option<SelectFn>,
     /// Words that remote peers are allowed to call via `/v1/forth/eval`.
@@ -1609,6 +1621,8 @@ impl Forth {
             effect_cache: HashMap::new(),
             confirm_fn: None,
             gen_fn: None,
+            automation: None,
+            agent: None,
             select_fn: None,
             remote_whitelist: std::collections::HashSet::new(),
             ensembles: HashMap::new(),
@@ -1655,6 +1669,15 @@ impl Forth {
         self.strings.push(s.to_string());
         self.string_dedup.insert(self.strings[idx].clone(), idx);
         idx
+    }
+
+    fn agent_task_id(&mut self, word: &str) -> Result<uuid::Uuid> {
+        let idx = self.pop()? as usize;
+        let value = self
+            .strings
+            .get(idx)
+            .ok_or_else(|| anyhow::anyhow!("{word}: invalid string index"))?;
+        crate::runtime::agent_vm::parse_task_id(value)
     }
 
     /// Run Forth source and return collected output.
@@ -1705,6 +1728,20 @@ impl Forth {
     /// Set the AI generation callback on an existing instance.
     pub fn set_gen_fn(&mut self, f: GenFn) {
         self.gen_fn = Some(f);
+    }
+
+    pub fn set_automation_broker(
+        &mut self,
+        broker: Arc<crate::runtime::automation::AutomationBroker>,
+    ) {
+        self.automation = Some(broker);
+    }
+
+    pub fn set_agent_binding(
+        &mut self,
+        binding: Option<crate::runtime::agent_vm::AgentVmBinding>,
+    ) {
+        self.agent = binding;
     }
 
     /// Attach a dialog-select callback (builder pattern).
@@ -1805,6 +1842,43 @@ impl Forth {
     /// Return a snapshot of the current data stack (top = last element).
     pub fn data_stack(&self) -> &[i64] {
         &self.data
+    }
+
+    /// Sorted provider-facing vocabulary with the best known stack signature.
+    pub fn vocabulary_snapshot(&self) -> Vec<(String, Option<String>)> {
+        let mut words = self
+            .name_index
+            .keys()
+            .map(|name| {
+                let signature = self
+                    .effect_cache
+                    .get(name)
+                    .cloned()
+                    .or_else(|| name_to_builtin(name).and_then(builtin_effect))
+                    .map(|effect| effect.to_string());
+                (name.clone(), signature)
+            })
+            .collect::<Vec<_>>();
+        // Native words do not live in `name_index`; include the stable core
+        // surface used by generated and Lisp-lowered programs explicitly.
+        const CORE_BUILTINS: &[&str] = &[
+            "+", "-", "*", "/", "mod", "dup", "drop", "swap", "over", "rot", "nip",
+            "tuck", "2dup", "2drop", "=", "<", ">", "<=", ">=", "<>", "0=", "and",
+            "or", "xor", "invert", "negate", "abs", "max", "min", ".", ".s", "cr",
+            "depth", "agent-spawn", "agent-poll", "agent-await", "agent-cancel",
+            "automation-available?", "automation-displays", "automation-windows",
+            "automation-click", "automation-type",
+        ];
+        for name in CORE_BUILTINS {
+            if !words.iter().any(|(existing, _)| existing == name) {
+                let signature = name_to_builtin(name)
+                    .and_then(builtin_effect)
+                    .map(|effect| effect.to_string());
+                words.push(((*name).to_string(), signature));
+            }
+        }
+        words.sort_by(|left, right| left.0.cmp(&right.0));
+        words
     }
 
     /// Push values onto the data stack (used to inject remote results locally).
@@ -1928,6 +2002,8 @@ impl Forth {
             effect_cache: self.effect_cache.clone(),
             confirm_fn: None,
             gen_fn: None,
+            automation: self.automation.clone(),
+            agent: self.agent.clone(),
             select_fn: None,
             remote_whitelist: self.remote_whitelist.clone(),
             ensembles: self.ensembles.clone(),
@@ -5695,13 +5771,121 @@ impl Forth {
                 }
                 self.data.push(candidate);
             }
+            Builtin::AutomationAvailable => {
+                use crate::runtime::automation::AutomationState;
+                let available = self
+                    .automation
+                    .as_ref()
+                    .map(|broker| broker.availability().state == AutomationState::Available)
+                    .unwrap_or(false);
+                self.data.push(if available { -1 } else { 0 });
+            }
+            Builtin::AutomationDisplays => {
+                let broker = self
+                    .automation
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("automation is disabled"))?;
+                let result = broker.execute(
+                    crate::runtime::automation::AutomationRequest::Displays,
+                )?;
+                let idx = self.intern_str(&serde_json::to_string(&result)?);
+                self.data.push(idx as i64);
+            }
+            Builtin::AutomationWindows => {
+                let broker = self
+                    .automation
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("automation is disabled"))?;
+                let result = broker.execute(
+                    crate::runtime::automation::AutomationRequest::Windows,
+                )?;
+                let idx = self.intern_str(&serde_json::to_string(&result)?);
+                self.data.push(idx as i64);
+            }
+            Builtin::AutomationClick => {
+                let y = self.pop()? as f64;
+                let x = self.pop()? as f64;
+                let broker = self
+                    .automation
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("automation is disabled"))?;
+                broker.execute(crate::runtime::automation::AutomationRequest::Click {
+                    x,
+                    y,
+                    button: "left".to_string(),
+                    count: 1,
+                })?;
+            }
+            Builtin::AutomationType => {
+                let delay_ms = self.pop()?;
+                let text_idx = self.pop()? as usize;
+                let text = self
+                    .strings
+                    .get(text_idx)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("automation-type: invalid string index"))?;
+                let broker = self
+                    .automation
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("automation is disabled"))?;
+                broker.execute(crate::runtime::automation::AutomationRequest::Type {
+                    text,
+                    delay_ms: delay_ms
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("automation-type: negative delay"))?,
+                })?;
+            }
+            Builtin::AgentSpawn => {
+                let task_idx = self.pop()? as usize;
+                let task = self
+                    .strings
+                    .get(task_idx)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("agent-spawn: invalid string index"))?;
+                let binding = self
+                    .agent
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
+                let worker = binding.clone();
+                let identity = binding.block_on(async move { worker.spawn(task).await })?;
+                let idx = self.intern_str(&identity.task_id.to_string());
+                self.data.push(idx as i64);
+            }
+            Builtin::AgentPoll => {
+                let task_id = self.agent_task_id("agent-poll")?;
+                let binding = self
+                    .agent
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
+                let worker = binding.clone();
+                let snapshot = binding.block_on(async move { worker.poll(task_id).await })?;
+                let idx = self.intern_str(&serde_json::to_string(&snapshot)?);
+                self.data.push(idx as i64);
+            }
+            Builtin::AgentAwait => {
+                let task_id = self.agent_task_id("agent-await")?;
+                let binding = self
+                    .agent
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
+                let worker = binding.clone();
+                let result = binding.block_on(async move { worker.wait(task_id).await })?;
+                let idx = self.intern_str(&serde_json::to_string(&result)?);
+                self.data.push(idx as i64);
+            }
+            Builtin::AgentCancel => {
+                let task_id = self.agent_task_id("agent-cancel")?;
+                let binding = self
+                    .agent
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
+                let worker = binding.clone();
+                binding.block_on(async move { worker.cancel(task_id).await })?;
+                self.data.push(-1);
+            }
             Builtin::AppleScript => {
                 let idx = self.pop()? as usize;
-                let script = self
-                    .strings
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or_default();
+                let script = self.strings.get(idx).cloned().unwrap_or_default();
                 #[cfg(target_os = "macos")]
                 {
                     let output = std::process::Command::new("osascript")
@@ -10846,6 +11030,15 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "ceil" | "ceiling" => Builtin::Ceil,
         "prime?" => Builtin::IsPrime,
         "next-prime" => Builtin::NextPrime,
+        "automation-available?" => Builtin::AutomationAvailable,
+        "automation-displays" => Builtin::AutomationDisplays,
+        "automation-windows" => Builtin::AutomationWindows,
+        "automation-click" => Builtin::AutomationClick,
+        "automation-type" => Builtin::AutomationType,
+        "agent-spawn" => Builtin::AgentSpawn,
+        "agent-poll" => Builtin::AgentPoll,
+        "agent-await" => Builtin::AgentAwait,
+        "agent-cancel" => Builtin::AgentCancel,
         "applescript" => Builtin::AppleScript,
         "xlsx@"      => Builtin::XlsxAt,
         "xlsx@/"     => Builtin::XlsxAtSheet,

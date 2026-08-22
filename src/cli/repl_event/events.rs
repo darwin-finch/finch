@@ -72,6 +72,9 @@ pub enum ReplEvent {
         latency_ms: Option<u64>,
     },
 
+    /// A child-agent lifecycle update for the live task projection.
+    AgentLifecycle(crate::runtime::scheduler::AgentEvent),
+
     /// User requested query cancellation (Ctrl+C)
     CancelQuery,
 

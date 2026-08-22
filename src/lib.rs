@@ -100,6 +100,7 @@ pub mod lisp;      // Scheme-flavoured Lisp dialect with async SSH + crypto
 pub mod ssh;       // SSH client (russh) — sessions referenced from Lisp
 pub mod registry; // Peer registry — machines check in, you query who's alive
 pub mod router;
+pub mod runtime; // Provider-neutral Forth/Lisp execution and capabilities
 pub mod scheduling; // Autonomous task scheduling (Phase 5)
 pub mod server; // HTTP daemon mode (Phase 1)
 pub mod service; // Service discovery (Phase 3)
