@@ -612,12 +612,29 @@ fn lisp_to_program(value: crate::lisp::Val) -> Result<ProgramValue> {
             Ok(ProgramValue::String(value))
         }
         crate::lisp::Val::Bytes(value) => Ok(ProgramValue::Bytes(value)),
-        crate::lisp::Val::List(values) => Ok(ProgramValue::List(
-            values
-                .into_iter()
-                .map(lisp_to_program)
-                .collect::<Result<Vec<_>>>()?,
-        )),
+        crate::lisp::Val::List(values) => {
+            match values.as_slice() {
+                [crate::lisp::Val::Symbol(tag)] if tag == "none" => {
+                    Ok(ProgramValue::Option(None))
+                }
+                [crate::lisp::Val::Symbol(tag), value]
+                    if matches!(tag.as_str(), "some" | "ok" | "err") =>
+                {
+                    let value = Box::new(lisp_to_program(value.clone())?);
+                    if tag == "some" {
+                        Ok(ProgramValue::Option(Some(value)))
+                    } else {
+                        Ok(ProgramValue::Result {
+                            ok: tag == "ok",
+                            value,
+                        })
+                    }
+                }
+                _ => Ok(ProgramValue::List(
+                    values.into_iter().map(lisp_to_program).collect::<Result<Vec<_>>>()?,
+                )),
+            }
+        }
         other => bail!("Lisp value is not portable: {other}"),
     }
 }
