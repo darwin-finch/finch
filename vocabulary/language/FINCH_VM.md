@@ -71,6 +71,10 @@ vocabulary. Use it (or the external `get_vm_state` tool) instead of guessing cal
 `process-run` accepts a command path and a list of argument strings. It invokes the executable
 directly, never through a shell, and requires an explicit `process.run` capability and approval.
 
+`say` is stream-capable: each invocation yields an output chunk to the active session sink while
+the complete buffered response remains available in the execution result. Use multiple `say`
+operations for progressive UI updates; there is no separate streaming language.
+
 Workspace file access uses refined paths rather than raw strings. `(path "relative/name")`
 constructs a path constrained to the workspace selector; `(file-read path)` returns `bytes`, and
 `(file-write path bytes)` returns `unit`. The host canonicalizes and rechecks the path, so `..`,
