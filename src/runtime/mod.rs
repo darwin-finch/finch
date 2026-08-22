@@ -151,6 +151,38 @@ impl ProgramRuntime {
             .expect("schedule queue lock poisoned") = Some(queue);
     }
 
+    /// Build the executor used by the durable scheduler. Each callback gets a
+    /// fresh submission context and never inherits an approval decision from
+    /// the scheduling call.
+    pub fn scheduled_executor(
+        self: Arc<Self>,
+    ) -> Arc<
+        dyn Fn(ScheduledTask) -> futures::future::BoxFuture<'static, Result<String>> + Send + Sync,
+    > {
+        Arc::new(move |task| {
+            let runtime = Arc::clone(&self);
+            Box::pin(async move {
+                let language = ProgramLanguage::infer_source(&task.task);
+                let outcome = runtime
+                    .submit(ProgramSubmission {
+                        language,
+                        source: task.task,
+                        intent: "scheduled callback".into(),
+                        effect: ExecutionEffect::VmRead,
+                        declared_capabilities: Vec::new(),
+                        manifest_generation: runtime.manifest_generation(),
+                        expected_revision: None,
+                        budget: None,
+                    })
+                    .await?;
+                if !matches!(outcome.status, ExecutionStatus::Completed) {
+                    anyhow::bail!("scheduled callback did not complete: {:?}", outcome.status);
+                }
+                Ok(outcome.output)
+            })
+        })
+    }
+
     /// Grant a typed capability after an approval decision. The next
     /// submission is still checked against this structured grant.
     pub fn grant_typed_capability(&self, requirement: CapabilityRequirement) -> Result<()> {
@@ -1781,6 +1813,33 @@ mod tests {
             Some(ProgramValue::Resource { kind, .. }) if kind == "schedule"
         ));
         assert_eq!(queue.get_ready_tasks().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_scheduler_reenters_typed_runtime_for_callbacks() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
+        queue
+            .enqueue(ScheduledTask {
+                id: None,
+                scheduled_time: chrono::Utc::now(),
+                task: "s\"scheduled callback\" say".into(),
+                context: "{}".into(),
+                recurring: None,
+                status: TaskStatus::Pending,
+                created_at: chrono::Utc::now(),
+                last_run: None,
+                retries: 0,
+            })
+            .await
+            .unwrap();
+        let runtime = Arc::new(ProgramRuntime::new());
+        let scheduler = crate::scheduling::TaskScheduler::with_executor(
+            Arc::clone(&queue),
+            runtime.scheduled_executor(),
+        );
+        scheduler.run_once().await.unwrap();
+        assert!(queue.get_ready_tasks().await.unwrap().is_empty());
     }
 
     #[tokio::test]
