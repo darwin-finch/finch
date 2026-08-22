@@ -76,6 +76,17 @@ requests cancellation. Scheduler ancestry and ownership are checked for every op
 `vm-vocabulary` is a pure VM inspection operation that returns the current serialized typed
 vocabulary. Use it (or the external `get_vm_state` tool) instead of guessing callable names.
 
+Structured values are part of the shared ABI. `some` and `none` construct `option<T>` values;
+`is-some` tests one and `unwrap` extracts its payload (returning a structured `E-OPTION-001`
+diagnostic for `none`). `ok` and `err` construct `result<T,E>` values, while `is-ok` inspects
+which branch was produced. These values remain typed when crossing the VM/runtime boundary and
+are rendered to legacy Lisp callers as `(some value)`, `(none)`, `(ok value)`, or `(err value)`.
+
+Lisp symbols are identifiers, not strings: `'name` is quoted data (equivalent to `(quote name)`),
+whereas `(say "name")` contains text. Co-Forth uses bare tokens for executable dictionary words;
+`['] word execute` passes an execution token as data. A future symbol literal may use the same
+quoted-token convention, but it must remain distinct from a word reference and from a string.
+
 `process-run` accepts a command path and a list of argument strings. It invokes the executable
 directly, never through a shell, and requires an explicit `process.run` capability and approval.
 
