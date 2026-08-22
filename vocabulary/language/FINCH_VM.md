@@ -87,6 +87,20 @@ At the execution boundary, chunks are represented as ordered typed side-effect e
 may render, buffer, inspect, test, or reject those events; the VM does not require the UI to mutate
 state synchronously during interpretation.
 
+Editor-backed proposals are language-neutral host operations, not a property of Forth. An explicit
+Lisp/control-plane proposal may carry Bash, Python, Lisp, Forth, or another supported script:
+
+```lisp
+(proposal-open :language 'bash
+               :intent "Regenerate local indexes"
+               :source "#!/usr/bin/env bash\n...")
+```
+
+The outer event loop owns the editor and returns `execute`, `chat`, or `cancel`. `execute` submits
+the edited payload through that language's normal validator and capability boundary; `chat` returns
+the edited buffer as context without running it; `cancel` discards it. Ordinary Forth execution
+never opens an editor implicitly.
+
 Workspace file access uses refined paths rather than raw strings. `(path "relative/name")`
 constructs a path constrained to the workspace selector; `(file-read path)` returns `bytes`, and
 `(file-write path bytes)` returns `unit`. The host canonicalizes and rechecks the path, so `..`,
