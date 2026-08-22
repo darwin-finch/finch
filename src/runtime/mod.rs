@@ -1368,7 +1368,7 @@ mod tests {
             .submit(submission(
                 ProgramLanguage::Lisp,
                 "(mem-store \"remember this\")",
-                ExecutionEffect::Pure,
+                ExecutionEffect::VmWrite,
             ))
             .await
             .unwrap();
