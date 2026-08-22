@@ -96,6 +96,16 @@ impl ProgramLanguage {
             Self::Lisp => "lisp",
         }
     }
+
+    /// Compact wire-format inference used only when the submission envelope
+    /// omits `language`; the resolved value is recorded before execution.
+    pub fn infer_source(source: &str) -> Self {
+        if source.trim_start().starts_with('(') {
+            Self::Lisp
+        } else {
+            Self::Forth
+        }
+    }
 }
 
 impl std::str::FromStr for ProgramLanguage {
@@ -677,6 +687,12 @@ fn declared_effect(source: &str, language: ProgramLanguage) -> Option<ExecutionE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omitted_language_uses_compact_wire_inference() {
+        assert_eq!(ProgramLanguage::infer_source("  (say \"hi\")"), ProgramLanguage::Lisp);
+        assert_eq!(ProgramLanguage::infer_source("s\"hi\" say"), ProgramLanguage::Forth);
+    }
 
     #[test]
     fn test_forth_program_invocation_uses_shared_values() {

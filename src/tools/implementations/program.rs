@@ -126,7 +126,6 @@ impl Tool for SubmitProgramTool {
                 }
             }),
             required: vec![
-                "language".to_string(),
                 "source".to_string(),
                 "intent".to_string(),
                 "effect".to_string(),
@@ -136,14 +135,16 @@ impl Tool for SubmitProgramTool {
     }
 
     async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
-        let language = input["language"]
-            .as_str()
-            .context("submit_program: missing language")?
-            .parse::<ProgramLanguage>()?;
         let source = input["source"]
             .as_str()
             .context("submit_program: missing source")?
             .to_string();
+        let language = input
+            .get("language")
+            .and_then(Value::as_str)
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or_else(|| ProgramLanguage::infer_source(&source));
         let intent = input["intent"]
             .as_str()
             .context("submit_program: missing intent")?
