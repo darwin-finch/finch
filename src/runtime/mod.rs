@@ -702,6 +702,15 @@ impl ProgramRuntime {
             .remove(&execution_id)
             .expect("execution was checked while its pending lock was held");
         drop(pending_runs);
+        self.deny_pending_typed_execution(execution_id, pending, reason)
+    }
+
+    fn deny_pending_typed_execution(
+        &self,
+        execution_id: uuid::Uuid,
+        pending: PendingTypedExecution,
+        reason: String,
+    ) -> Result<ExecutionOutcome> {
         self.release_output_handles(execution_id)?;
 
         let mut effect_journal = pending.suspension.effect_journal.clone();
@@ -727,6 +736,49 @@ impl ProgramRuntime {
             backend: ExecutionBackend::TypedVm,
             elapsed_ms: 0,
         })
+    }
+
+    /// Serialized denial path for the portable resume ABI. The legacy
+    /// synchronous helper above remains available to older adapters, while a
+    /// remote event host must not race a result/cancellation for the same
+    /// `(execution_id, sequence)` pair.
+    async fn deny_typed_execution_for_effect_serialized(
+        &self,
+        execution_id: uuid::Uuid,
+        effect_sequence: u64,
+        reason: String,
+    ) -> Result<ExecutionOutcome> {
+        let pending = {
+            let _submission = self.submission_gate.lock().await;
+            let mut pending_runs = self
+                .pending_typed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?;
+            let pending = pending_runs.get(&execution_id).ok_or_else(|| {
+                anyhow::anyhow!("no resumable typed execution {execution_id}")
+            })?;
+            let actual = pending
+                .suspension
+                .pending_host_call
+                .as_ref()
+                .and_then(|_| {
+                    pending
+                        .suspension
+                        .event_journal
+                        .last()
+                        .map(|effect| effect.sequence)
+                })
+                .ok_or_else(|| anyhow::anyhow!("typed execution is not awaiting a host effect"))?;
+            if actual != effect_sequence {
+                bail!(
+                    "stale typed effect denial: supplied sequence {effect_sequence}, pending sequence is {actual}"
+                );
+            }
+            pending_runs
+                .remove(&execution_id)
+                .expect("execution was checked while its pending lock was held")
+        };
+        self.deny_pending_typed_execution(execution_id, pending, reason)
     }
 
     /// Resume a typed execution that previously yielded or awaited approval.
@@ -780,11 +832,14 @@ impl ProgramRuntime {
                 )
                 .await
             }
-            VmResumeResponse::Denied { reason } => self.deny_typed_execution_for_effect(
-                resume.execution_id,
-                resume.sequence,
-                reason,
-            ),
+            VmResumeResponse::Denied { reason } => {
+                self.deny_typed_execution_for_effect_serialized(
+                    resume.execution_id,
+                    resume.sequence,
+                    reason,
+                )
+                .await
+            }
             VmResumeResponse::Cancelled { reason } => {
                 self.cancel_typed_execution_for_effect(
                     resume.execution_id,
@@ -3819,6 +3874,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn portable_denial_records_the_exact_effect_without_resuming_it() {
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        let sequence = pending.approval_prompts[0]
+            .request
+            .effect_sequence
+            .expect("pending request has a portable sequence");
+
+        let denied = runtime
+            .resume_vm_effect(VmResume {
+                execution_id: pending.execution_id,
+                sequence,
+                response: VmResumeResponse::Denied {
+                    reason: "user declined workspace access".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(denied.status, ExecutionStatus::Failed);
+        assert!(denied.diagnostics[0].contains("user declined workspace access"));
+        assert!(matches!(
+            denied.effect_journal.last(),
+            Some(crate::vm::EffectJournalEntry {
+                state: crate::vm::EffectJournalState::Denied,
+                ..
+            })
+        ));
+        assert!(runtime
+            .pending_typed_execution(pending.execution_id)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
