@@ -2299,6 +2299,31 @@ mod tests {
     }
 
     #[test]
+    fn typed_forth_definitions_can_recursively_call_themselves() {
+        let module = compile_forth(
+            "factorial.forth",
+            r#"
+: factorial ( S int -- S int ! {} )
+  locals| n |
+  n 1 <= if
+    1
+  else
+    n n 1 - factorial *
+  then ;
+6 factorial
+"#,
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("a declared-pure Co-Forth word should be able to recurse");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("recursive Co-Forth program should execute");
+        assert_eq!(stack, vec![TypedValue::Int(720)]);
+    }
+
+    #[test]
     fn retains_finch_doc_comment_on_typed_definition() {
         let module = compile_forth(
             "documented.forth",
