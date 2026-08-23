@@ -3,6 +3,7 @@ use super::effects::{CapabilityKind, CapabilityRequirement, EffectSet, ResourceS
 use super::ir::{BlockId, Instruction};
 use super::types::{Type, TypedValue};
 use super::verifier::VerifiedModule;
+use super::vocabulary::{core_word_spec, CoreWordImplementation};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1000,6 +1001,33 @@ impl<'a> VmTrampoline<'a> {
                 .push(self.frame_for(function, captures, stack_base)?);
             Ok(None)
         } else {
+            let Some(spec) = core_word_spec(function) else {
+                return Err(self.with_trace_at(
+                    VmDiagnostic::error(
+                        "E-LINK-004",
+                        DiagnosticPhase::Linking,
+                        format!("core word '{function}' has no registered implementation"),
+                        Some(origin.clone()),
+                    ),
+                    continuation,
+                    origin,
+                ));
+            };
+            if spec.implementation != CoreWordImplementation::Interpreter {
+                return Err(self.with_trace_at(
+                    VmDiagnostic::error(
+                        "E-LINK-005",
+                        DiagnosticPhase::Linking,
+                        format!(
+                            "core word '{function}' is registered as {:?} but was not lowered to its typed VM instruction",
+                            spec.implementation
+                        ),
+                        Some(origin.clone()),
+                    ),
+                    continuation,
+                    origin,
+                ));
+            }
             execute_core(function, &mut continuation.stack)
                 .map_err(|diagnostic| self.with_trace_at(diagnostic, continuation, origin))?;
             Ok(None)

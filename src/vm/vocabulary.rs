@@ -21,11 +21,43 @@ pub struct CoreWordDocumentation {
     pub example: &'static str,
 }
 
+/// The executable destination of a built-in word after verification.
+///
+/// This is deliberately part of the core-word contract instead of being
+/// inferred from its effect row.  A pure word may execute in the interpreter,
+/// while an effectful word may be lowered to a portable host request; the
+/// effect row expresses authority, not implementation ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreWordImplementation {
+    /// The typed interpreter evaluates the word directly on its private VM
+    /// stack.  These words must have an `execute_core` arm.
+    Interpreter,
+    /// The frontends lower the word to a typed VM instruction rather than a
+    /// generic call (for example `yield` and output-handle operations).
+    VmInstruction,
+    /// The frontends lower the word to a capability request that a host
+    /// adapter must authorize, journal, and resume.
+    HostEffect,
+}
+
+/// One inspectable production core-word contract.
+///
+/// Frontends, the verifier, provider discovery, and interpreter dispatch all
+/// consume this registry.  This prevents a word from acquiring a signature or
+/// documentation without also declaring where its verified implementation
+/// lives.
+#[derive(Debug, Clone)]
+pub struct CoreWordSpec {
+    pub signature: StackSignature,
+    pub documentation: CoreWordDocumentation,
+    pub implementation: CoreWordImplementation,
+}
+
 /// Return provider-neutral documentation for a registered core word.
 ///
 /// Keep this total: the stack signature and capability requirement remain the
 /// normative contract even while prose for a newly added word is minimal.
-pub fn core_word_documentation(name: &str) -> CoreWordDocumentation {
+fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
     match name {
         "say" => CoreWordDocumentation { summary: "Append one exact text chunk to the current response stream. It adds no space or newline and leaves no value on the stack.", lisp: "(say text)", forth: "text say", example: "(say (str-cat \"answer: \" (int-to-string (+ 2 3))))" },
         "emit" => CoreWordDocumentation { summary: "Alias of say for a terminal response chunk. Prefer say in provider responses.", lisp: "(emit text)", forth: "text emit", example: "s\"progress\\n\" emit" },
@@ -128,7 +160,7 @@ fn host_path_template() -> FileSelectorTemplate {
 /// Canonical signatures for the first verified core. Runtime implementations,
 /// provider documentation, and tests consume this registry rather than keeping
 /// independent handwritten signature tables.
-pub fn core_vocabulary() -> Vocabulary {
+fn core_signatures() -> Vocabulary {
     let a = Type::Variable("A".into());
     let int_binary = || pure(vec![Type::Int, Type::Int], vec![Type::Int]);
     let comparison = || pure(vec![Type::Int, Type::Int], vec![Type::Bool]);
@@ -786,6 +818,65 @@ pub fn core_vocabulary() -> Vocabulary {
     ])
 }
 
+/// Build the production registry from the signature declarations and attach
+/// the corresponding provider contract and executable destination exactly
+/// once.  Callers should consume this instead of keeping their own list of
+/// built-ins.
+pub fn core_word_registry() -> BTreeMap<String, CoreWordSpec> {
+    core_signatures()
+        .into_iter()
+        .map(|(name, signature)| {
+            let implementation = match name.as_str() {
+                // These forms are first-class IR instructions so that their
+                // suspension/output semantics cannot be reimplemented by a
+                // generic host-call path.
+                "yield"
+                | "output-open"
+                | "output-append"
+                | "output-replace"
+                | "output-status"
+                | "output-progress"
+                | "output-complete"
+                | "output-fail" => CoreWordImplementation::VmInstruction,
+                _ if signature.effects.is_pure() => CoreWordImplementation::Interpreter,
+                _ => CoreWordImplementation::HostEffect,
+            };
+            let documentation = core_word_documentation_template(&name);
+            (name, CoreWordSpec {
+                signature,
+                documentation,
+                implementation,
+            })
+        })
+        .collect()
+}
+
+/// Return the complete contract for one core word.  This is the canonical
+/// lookup used by execution and provider discovery.
+pub fn core_word_spec(name: &str) -> Option<CoreWordSpec> {
+    core_word_registry().remove(name)
+}
+
+/// Return provider-neutral documentation for a registered core word.
+///
+/// Unknown names receive the generic fallback so older discovery clients can
+/// still display a useful response while the caller reports the missing word.
+pub fn core_word_documentation(name: &str) -> CoreWordDocumentation {
+    core_word_spec(name)
+        .map(|spec| spec.documentation)
+        .unwrap_or_else(|| core_word_documentation_template(name))
+}
+
+/// Canonical signatures for verifier-facing consumers.  The returned map is
+/// derived from the complete core-word registry so signatures cannot drift
+/// from documentation or execution ownership.
+pub fn core_vocabulary() -> Vocabulary {
+    core_word_registry()
+        .into_iter()
+        .map(|(name, spec)| (name, spec.signature))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -795,6 +886,30 @@ mod tests {
         let vocabulary = core_vocabulary();
         assert_eq!(vocabulary["dup"].to_string(), "( S A -- S A A ! {} )");
         assert!(!vocabulary["agent-spawn"].effects.is_pure());
+    }
+
+    #[test]
+    fn registry_declares_signature_documentation_and_execution_ownership() {
+        let registry = core_word_registry();
+        let say = &registry["say"];
+        assert_eq!(say.implementation, CoreWordImplementation::HostEffect);
+        assert_eq!(say.documentation.forth, "text say");
+        assert!(!say.signature.effects.is_pure());
+
+        assert_eq!(
+            registry["+"].implementation,
+            CoreWordImplementation::Interpreter
+        );
+        assert_eq!(
+            registry["output-open"].implementation,
+            CoreWordImplementation::VmInstruction
+        );
+
+        let signatures: Vocabulary = registry
+            .into_iter()
+            .map(|(name, spec)| (name, spec.signature))
+            .collect();
+        assert_eq!(signatures, core_vocabulary());
     }
 
     #[test]
