@@ -2051,6 +2051,24 @@ mod tests {
     }
 
     #[test]
+    fn pure_mutually_recursive_forth_words_are_visible_during_compilation() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute(
+            ProgramLanguage::Forth,
+            "words.forth",
+            ": even? ( S int -- S bool ! {} ) \
+               locals| n | n 0 = if true else n 1 - odd? then ; \
+             : odd? ( S int -- S bool ! {} ) \
+               locals| n | n 0 = if false else n 1 - even? then ;",
+            1_000,
+        );
+        assert_eq!(definition.status, TypedExecutionStatus::Completed);
+        let call = runtime.execute(ProgramLanguage::Lisp, "call.lisp", "(even? 42)", 1_000);
+        assert_eq!(call.status, TypedExecutionStatus::Completed);
+        assert_eq!(call.values, vec![TypedValue::Bool(true)]);
+    }
+
+    #[test]
     fn forth_quotation_references_a_typed_word_and_executes_it() {
         let mut runtime = TypedRuntime::new();
         let result = runtime.execute(

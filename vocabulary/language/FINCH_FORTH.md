@@ -61,7 +61,10 @@ cannot leak into the caller.
 
 Use `! {}` to assert purity or `! infer` to accept the transitively inferred capability set in the
 current frontend. A false purity assertion rejects the entire submission and does not modify the
-dictionary. Typed definitions are persistent and immediately callable from Finch Lisp.
+dictionary. Declared-pure definitions are predeclared as a group, so they may be self- or
+mutually-recursive in one submission; `! infer` definitions remain sequential until their inferred
+effects can be represented in a forward signature. Typed definitions are persistent and immediately
+callable from Finch Lisp.
 
 `dup`, `drop`, and `swap` are polymorphic. Arithmetic does not coerce strings or dynamic values.
 Control-flow merge points must have identical stack types, and loops require stable invariants.

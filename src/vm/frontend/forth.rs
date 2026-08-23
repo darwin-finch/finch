@@ -7,7 +7,7 @@ use crate::vm::interpreter::UiOperation;
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
 use crate::vm::types::{Type, TypedValue};
 use crate::vm::verifier::{apply_signature_types, VerifiedModule, Verifier, Vocabulary};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 struct LocalBinding {
@@ -95,17 +95,29 @@ pub fn compile_forth_with_functions(
 
     let mut functions = linked_functions.clone();
     let mut local_vocabulary = vocabulary.clone();
-    for definition in definitions {
+    let mut definition_names = BTreeSet::new();
+    for definition in &definitions {
         if vocabulary.contains_key(&definition.name)
             || functions.contains_key(&definition.name)
             || definition.name == "main"
+            || !definition_names.insert(definition.name.clone())
         {
             return Err(vec![control_error(
                 "E-FORTH-DEF-001",
                 format!("word '{}' is already defined", definition.name),
-                definition.origin,
+                definition.origin.clone(),
             )]);
         }
+        // A declared-pure signature is complete authority information, so it
+        // can safely be made visible before compiling bodies. This supports
+        // pure mutually-recursive words without an untyped forward reference.
+        // `! infer` words intentionally remain sequential: their effects are
+        // learned from their body and must not be guessed for a sibling call.
+        if definition.declares_pure {
+            local_vocabulary.insert(definition.name.clone(), definition.signature.clone());
+        }
+    }
+    for definition in definitions {
         local_vocabulary.insert(definition.name.clone(), definition.signature.clone());
         let compiled = compile_forth_body_with_locals(
             source_id,
