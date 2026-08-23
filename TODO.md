@@ -98,8 +98,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Adapt discovered MCP client tools into versioned namespaced typed VM bindings with schema
   validation, managed JSON fallback, parameter-bounded `mcp.call` capability grants, and normal
   suspension/resume; keep MCP transport lifecycle host-owned rather than a VM subagent protocol.
-- [ ] Make `ProgramRuntime` and VM inspection use one persistent typed stack, dictionary, heap,
-  transaction manager, and revision history for Lisp and Co-Forth.
+- [ ] Finish the persistent `ProgramRuntime` state model. Lisp and Co-Forth already share one
+  persistent typed stack and dictionary, exposed by one inspection/revision boundary; add the
+  managed heap, transaction manager, and durable revision history before treating it as a
+  restartable Brain state.
 - [ ] Remove the Lisp-to-Forth text compiler, native Lisp fallback, source-text effect inference,
   and duplicate direct model-tool paths after conformance parity.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
