@@ -560,6 +560,27 @@ mod script_tests {
         );
     }
 
+    #[tokio::test]
+    async fn direct_forth_uses_the_typed_runtime_and_rejects_legacy_definitions() {
+        run_direct_typed_source(
+            finch::programs::ProgramLanguage::Forth,
+            "6 7 * int-to-string say",
+        )
+        .await
+        .unwrap();
+
+        let error = run_direct_typed_source(
+            finch::programs::ProgramLanguage::Forth,
+            ": legacy-only 1 ;",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("E-FORTH-SIG-001"),
+            "expected typed-only rejection, got: {error:#}"
+        );
+    }
+
     #[test]
     fn terminal_script_adapter_terminates_only_a_nonempty_unfinished_response() {
         assert_eq!(terminal_script_presentation(""), None);
@@ -679,13 +700,13 @@ async fn main() -> Result<()> {
         return run_finch_script(script, args.json).await;
     }
 
-    // --forth: pure Forth eval, no AI, no TUI, no config needed
+    // --forth: direct typed Co-Forth evaluation, no AI, TUI, or config
+    // needed. The explicit `coforth` maintenance subcommand remains the
+    // legacy interpreter's home; provider-facing/direct source must not gain
+    // a bypass around the shared verifier and capability broker.
     if let Some(forth_expr) = &args.forth {
-        match finch::coforth::Forth::run(forth_expr) {
-            Ok(output) => print!("{}", output),
-            Err(e) => eprintln!("forth error: {}", e),
-        }
-        return Ok(());
+        return run_direct_typed_source(finch::programs::ProgramLanguage::Forth, forth_expr)
+            .await;
     }
 
     // Check for piped input BEFORE initializing anything else
