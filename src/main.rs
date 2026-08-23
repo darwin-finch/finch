@@ -531,6 +531,18 @@ mod script_tests {
             Some("already complete\n".into())
         );
     }
+
+    #[test]
+    fn one_shot_wire_repair_is_limited_to_static_vm_diagnostics() {
+        assert!(is_repairable_one_shot_wire_diagnostic("E-READ-004: missing quote"));
+        assert!(is_repairable_one_shot_wire_diagnostic("E-LINK-002: unknown word"));
+        assert!(!is_repairable_one_shot_wire_diagnostic("E-LIMIT-001: fuel exhausted"));
+
+        let request = one_shot_wire_repair_request("Hello!", "E-LINK-002: unknown word");
+        assert!(request.contains("exactly one complete raw Finch Lisp or Co-Forth program"));
+        assert!(request.contains("Hello!"));
+        assert!(request.contains("E-LINK-002"));
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -1926,13 +1938,14 @@ async fn run_query_teacher_only(
     );
 
     const MAX_TURNS: usize = 25;
+    let mut wire_repair_requested = false;
     for _ in 0..MAX_TURNS {
         let request = MessageRequest {
             model: model.clone(),
             max_tokens: finch::config::constants::DEFAULT_MAX_TOKENS,
             messages: messages.clone(),
             system: Some(system.clone()),
-            tools: Some(tool_definitions.clone()),
+            tools: (!wire_repair_requested).then(|| tool_definitions.clone()),
         };
 
         let response = claude_client.send_message(&request).await?;
@@ -1942,12 +1955,21 @@ async fn run_query_teacher_only(
         // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
             let source = response.text();
-            let language = finch::programs::ProgramLanguage::infer_wire_source(&source)?;
+            let language = match finch::programs::ProgramLanguage::infer_wire_source(&source) {
+                Ok(language) => language,
+                Err(error) if !wire_repair_requested && is_repairable_one_shot_wire_diagnostic(&error.to_string()) => {
+                    messages.push(response.to_message());
+                    messages.push(Message::user(one_shot_wire_repair_request(&source, &error.to_string())));
+                    wire_repair_requested = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let runtime = finch::runtime::ProgramRuntime::new();
             let outcome = runtime
                 .submit_typed_only(finch::runtime::ProgramSubmission {
                     language,
-                    source,
+                    source: source.clone(),
                     intent: "one-shot provider VM-wire response".to_string(),
                     effect: finch::programs::ExecutionEffect::Pure,
                     declared_capabilities: Vec::new(),
@@ -1956,15 +1978,31 @@ async fn run_query_teacher_only(
                     budget: None,
                 })
                 .await?;
-            if outcome.status != finch::runtime::outcome::ExecutionStatus::Completed {
-                anyhow::bail!(
-                    "provider VM-wire program ended as {:?}: {}",
-                    outcome.status,
-                    outcome.diagnostics.join("; ")
-                );
+            if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
+                print!("{}", outcome.output);
+                return Ok(());
             }
-            print!("{}", outcome.output);
-            return Ok(());
+
+            let diagnostic = outcome
+                .diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+            if !wire_repair_requested && can_repair_one_shot_wire_outcome(&outcome) {
+                messages.push(response.to_message());
+                messages.push(Message::user(one_shot_wire_repair_request(&source, &diagnostic)));
+                wire_repair_requested = true;
+                continue;
+            }
+            anyhow::bail!(
+                "provider VM-wire program ended as {:?}: {}",
+                outcome.status,
+                diagnostic
+            );
+        }
+
+        if wire_repair_requested {
+            anyhow::bail!("provider used tools while repairing a rejected Finch VM wire program");
         }
 
         // Execute tool calls and collect results
@@ -2010,6 +2048,47 @@ async fn run_query_teacher_only(
 
     eprintln!("⚠️  Reached max tool turns without a final answer");
     Ok(())
+}
+
+/// One-shot provider calls use the same conservative repair boundary as the
+/// interactive VM-wire receiver: only a rejected, effect-free source program
+/// may be corrected once.  Execution, approval, and partial-effect outcomes
+/// are never replayed merely because a model can generate another response.
+fn can_repair_one_shot_wire_outcome(outcome: &finch::runtime::outcome::ExecutionOutcome) -> bool {
+    use finch::runtime::outcome::ExecutionStatus;
+
+    outcome.status == ExecutionStatus::Failed
+        && outcome.side_effects.is_empty()
+        && outcome.vm_side_effects.is_empty()
+        && outcome.effect_journal.is_empty()
+        && outcome
+            .vm_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .chain(outcome.diagnostics.iter().map(String::as_str))
+            .any(is_repairable_one_shot_wire_diagnostic)
+}
+
+fn is_repairable_one_shot_wire_diagnostic(diagnostic: &str) -> bool {
+    matches!(
+        diagnostic,
+        value if value.starts_with("E-READ-")
+            || value.starts_with("E-TYPE-")
+            || value.starts_with("E-STACK-")
+            || value.starts_with("E-LISP-")
+            || value.starts_with("E-FORTH-")
+            || value.starts_with("E-LINK-")
+            || value.starts_with("E-CAP-")
+    )
+}
+
+fn one_shot_wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
+    format!(
+        "The preceding Finch VM wire program was rejected before execution. \
+         Re-emit exactly one complete raw Finch Lisp or Co-Forth program; do not use Markdown, prose, or tools.\n\n\
+         Rejected source:\n---\n{rejected_source}\n---\n\
+         Diagnostic:\n{diagnostic}"
+    )
 }
 
 /// Run interactive setup wizard
