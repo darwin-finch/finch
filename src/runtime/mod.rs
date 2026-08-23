@@ -1573,15 +1573,20 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         let _binding = registered_host_binding(requirement, origin)?;
         let request = match requirement.capability {
             crate::vm::CapabilityKind::SessionEmit => {
-                let [TypedValue::String(text)] = arguments.as_slice() else {
-                    return Err(VmDiagnostic::error(
-                        "E-HOST-001",
-                        crate::vm::DiagnosticPhase::HostCall,
-                        "session.emit requires one string",
-                        Some(origin.clone()),
-                    ));
-                };
+                // `output-open` uses the same session-emission authority as
+                // ordinary visible output, but its awaited host request
+                // returns an opaque handle rather than emitting its title as
+                // a response chunk. Recognize it before validating the
+                // ordinary one-string `say` ABI.
                 if origin.word.as_deref() == Some("output-open") {
+                    let [TypedValue::String(_title)] = arguments.as_slice() else {
+                        return Err(VmDiagnostic::error(
+                            "E-HOST-001",
+                            crate::vm::DiagnosticPhase::HostCall,
+                            "output-open requires one title string",
+                            Some(origin.clone()),
+                        ));
+                    };
                     let handle = uuid::Uuid::new_v4().to_string();
                     self.output_handles
                         .lock()
@@ -1601,6 +1606,14 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         generation: 0,
                     }]);
                 }
+                let [TypedValue::String(text)] = arguments.as_slice() else {
+                    return Err(VmDiagnostic::error(
+                        "E-HOST-001",
+                        crate::vm::DiagnosticPhase::HostCall,
+                        "session.emit requires one string",
+                        Some(origin.clone()),
+                    ));
+                };
                 self.output.push_str(text);
                 self.output_chunks.push(text.clone());
                 self.emit(text);
