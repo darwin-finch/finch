@@ -2417,25 +2417,26 @@ async fn run_node_info() -> Result<()> {
 
 // ── finch coforth ─────────────────────────────────────────────────────────────
 
-fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
+fn execute_coforth_code(code: &str) -> Result<String> {
     // Use the pre-compiled VM so major words and the full library are available.
     // Do not run legacy `boot` entries implicitly: they can print poetry or run
     // proof demonstrations before the requested program, and startup work must
     // be an explicit, reviewed BrainRun rather than ambient VM behavior.
-    let run_in_vm = |code: &str| -> Result<String> {
-        let mut vm = finch::coforth::Library::precompiled_vm();
-        vm.exec(code)?;
-        Ok(std::mem::take(&mut vm.out))
-    };
+    let mut vm = finch::coforth::Library::precompiled_vm();
+    vm.exec(code)?;
+    Ok(std::mem::take(&mut vm.out))
+}
+
+fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
     match cmd {
-        CoforthCommand::Run { code } => match run_in_vm(&code) {
+        CoforthCommand::Run { code } => match execute_coforth_code(&code) {
             Ok(out) => print!("{out}"),
             Err(e) => {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         },
-        CoforthCommand::Validate { code } => match run_in_vm(&code) {
+        CoforthCommand::Validate { code } => match execute_coforth_code(&code) {
             Ok(out) if !out.is_empty() => {
                 println!("ok  →  {:?}", out.trim());
             }
@@ -3251,4 +3252,15 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute_coforth_code;
+
+    #[test]
+    fn coforth_command_does_not_run_legacy_boot_entries_implicitly() {
+        let output = execute_coforth_code("1 2 + .").expect("program executes");
+        assert_eq!(output, "3 ");
+    }
 }
