@@ -103,6 +103,11 @@ const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
         description: "Exhaustive Co-Forth result branch: result if-ok ... else ... then.",
     },
     SourceSyntaxEntry {
+        name: "case",
+        languages: &["forth"],
+        description: "Typed integer selector: value case literal of ... endof ... otherwise ... endcase. Arms do not fall through.",
+    },
+    SourceSyntaxEntry {
         name: "begin",
         languages: &["lisp", "forth"],
         description: "Sequencing form. Lisp evaluates expressions left-to-right; Co-Forth begins a loop with while/repeat.",
@@ -146,6 +151,16 @@ const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
         name: "locals|",
         languages: &["forth"],
         description: "First form of a typed word definition; names all declared inputs in bottom-to-top order.",
+    },
+    SourceSyntaxEntry {
+        name: "s\"",
+        languages: &["forth"],
+        description: "Typed Co-Forth string literal. s\"text\" pushes string; it does not emit output until passed to say or another word.",
+    },
+    SourceSyntaxEntry {
+        name: "s\"\"\"",
+        languages: &["forth"],
+        description: "Verbatim Co-Forth string literal for prose or multiline text; it ends at the next triple quote.",
     },
     SourceSyntaxEntry {
         name: "[']",
@@ -522,6 +537,20 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry["name"] == "if"));
+
+        let case_result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "case"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(case_result["matches"].as_array().unwrap().is_empty());
+        assert!(case_result["syntax_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "case"));
     }
 
     #[tokio::test]
