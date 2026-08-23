@@ -110,9 +110,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
-- [ ] Complete the fiber/task split: `(defer :cpu (lambda () ...))` / `defer-cpu` has private-stack
-  CPU work with poll/join/cancel; future repeatedly-yielding fibers remain separate from subagents
-  and their bidirectional resume design is deferred until a concrete need exists.
+- [x] Complete the fiber/task split: `(defer :cpu (lambda () ...))` / `defer-cpu` has private-stack,
+  immutable-capture CPU work with typed `task<T>` poll/join/cancel operations. A running join
+  suspends the parent VM continuation rather than blocking the event loop; CPU fibers reject
+  effects and never share their parent stack. Repeatedly-yielding fibers remain separate from
+  subagents, and bidirectional resume remains deferred until a concrete need exists.
 - [ ] Design and implement a typed lazy sequence protocol separately from scheduler `yield`: an
   opaque `stream<T>`/iterator handle with bounded `next -> option<T>`, cancellation, ownership,
   capability propagation, and Lisp/Co-Forth lowering. Do not expose legacy Co-Forth generators as
