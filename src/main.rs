@@ -614,6 +614,56 @@ mod script_tests {
         assert!(is_clearly_forth(".\" Forth shorthand works\""));
         assert!(is_clearly_forth("s\"Forth strings are data\" say"));
     }
+
+    #[tokio::test]
+    async fn query_tools_and_terminal_wire_share_one_typed_runtime() {
+        use finch::tools::types::ToolContext;
+        use finch::tools::ToolRegistry;
+
+        let runtime = Arc::new(finch::runtime::ProgramRuntime::new());
+        let mut registry = ToolRegistry::new();
+        register_query_vm_tools(&mut registry, Arc::clone(&runtime));
+        for name in [
+            "submit_program",
+            "get_vm_state",
+            "get_language_definition",
+            "search_vm_vocabulary",
+            "inspect_vm_word",
+        ] {
+            assert!(registry.has_tool(name), "missing query VM tool {name}");
+        }
+
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            stack: None,
+            poset: None,
+        };
+        let before = runtime.revision();
+        registry
+            .get("submit_program")
+            .unwrap()
+            .execute(
+                serde_json::json!({
+                    "language": "lisp",
+                    "source": "(+ 20 22)",
+                    "intent": "query runtime sharing regression test",
+                    "effect": "pure",
+                    "manifest_generation": runtime.manifest_generation(),
+                    "expected_revision": before,
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(runtime.revision() > before);
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -1781,6 +1831,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 async fn build_query_tool_executor(config: &Config) -> Result<(
     Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
     Vec<finch::tools::types::ToolDefinition>,
+    Arc<finch::runtime::ProgramRuntime>,
 )> {
     use finch::tools::implementations::{
         BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, WebFetchTool, WriteTool,
@@ -1797,6 +1848,9 @@ async fn build_query_tool_executor(config: &Config) -> Result<(
     registry.register(Box::new(PatchTool));
     registry.register(Box::new(WriteTool));
 
+    let program_runtime = Arc::new(finch::runtime::ProgramRuntime::new());
+    register_query_vm_tools(&mut registry, Arc::clone(&program_runtime));
+
     // Auto-approve everything in non-interactive mode
     let permissions = PermissionManager::new().with_default_rule(PermissionRule::Allow);
     let patterns_path = dirs::home_dir()
@@ -1811,7 +1865,33 @@ async fn build_query_tool_executor(config: &Config) -> Result<(
 
     let tool_definitions = executor.lock().await.list_all_tools().await;
 
-    Ok((executor, tool_definitions))
+    Ok((executor, tool_definitions, program_runtime))
+}
+
+/// Install the typed-VM discovery and execution tools used by a one-shot
+/// provider loop. The final raw wire response receives this same runtime.
+fn register_query_vm_tools(
+    registry: &mut finch::tools::ToolRegistry,
+    program_runtime: Arc<finch::runtime::ProgramRuntime>,
+) {
+    use finch::tools::implementations::{
+        GetLanguageDefinitionTool, GetVmStateTool, InspectVmWordTool, SearchVmVocabularyTool,
+        SubmitProgramTool,
+    };
+
+    // Provider tool calls and the terminal VM-wire program must share this
+    // exact runtime. Otherwise a model can inspect or define a word through
+    // `submit_program`, then have its final raw Lisp/Co-Forth response run in
+    // a different empty stack/dictionary.
+    registry.register(Box::new(SubmitProgramTool::new(Arc::clone(
+        &program_runtime,
+    ))));
+    registry.register(Box::new(GetVmStateTool::new(Arc::clone(&program_runtime))));
+    registry.register(Box::new(GetLanguageDefinitionTool));
+    registry.register(Box::new(SearchVmVocabularyTool::new(Arc::clone(
+        &program_runtime,
+    ))));
+    registry.register(Box::new(InspectVmWordTool::new(program_runtime)));
 }
 
 /// Returns true when the input is unambiguously Forth code that should bypass
@@ -1917,20 +1997,22 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
     let config = load_config()?;
 
     // Build tool executor (same tools as the REPL)
-    let (executor, tool_definitions) = build_query_tool_executor(&config).await?;
+    let (executor, tool_definitions, program_runtime) = build_query_tool_executor(&config).await?;
 
     // A one-shot cloud-only query must not first attempt the daemon. Besides
     // defeating the flag, that startup attempt can consume the whole caller
     // timeout and makes direct-provider smoke tests look hung.
     if cloud_only {
-        return run_query_teacher_only(query, &config, executor, tool_definitions).await;
+        return run_query_teacher_only(query, &config, executor, tool_definitions, program_runtime)
+            .await;
     }
 
     // Ensure daemon is running (auto-spawn if needed)
     if let Err(e) = ensure_daemon_running(Some(&config.client.daemon_address)).await {
         eprintln!("⚠️  Daemon failed to start: {}", e);
         eprintln!("   Using teacher API directly (no local model)");
-        return run_query_teacher_only(query, &config, executor, tool_definitions).await;
+        return run_query_teacher_only(query, &config, executor, tool_definitions, program_runtime)
+            .await;
     }
 
     // Create daemon client and run full tool loop
@@ -1952,6 +2034,7 @@ async fn run_query_teacher_only(
     config: &Config,
     executor: Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
     tool_definitions: Vec<finch::tools::types::ToolDefinition>,
+    program_runtime: Arc<finch::runtime::ProgramRuntime>,
 ) -> Result<()> {
     use finch::claude::{ContentBlock, Message, MessageRequest};
 
@@ -2002,16 +2085,15 @@ async fn run_query_teacher_only(
                 }
                 Err(error) => return Err(error),
             };
-            let runtime = finch::runtime::ProgramRuntime::new();
-            let outcome = runtime
+            let outcome = program_runtime
                 .submit_typed_only(finch::runtime::ProgramSubmission {
                     language,
                     source: source.clone(),
                     intent: "one-shot provider VM-wire response".to_string(),
                     effect: finch::programs::ExecutionEffect::Pure,
                     declared_capabilities: Vec::new(),
-                    manifest_generation: runtime.manifest_generation(),
-                    expected_revision: Some(runtime.revision()),
+                    manifest_generation: program_runtime.manifest_generation(),
+                    expected_revision: Some(program_runtime.revision()),
                     budget: None,
                 })
                 .await?;
