@@ -36,6 +36,17 @@ else
 then
 ```
 
+`if-ok` is the equivalent structured result branch. It consumes a `result<T,E>`, supplies `T` to
+the then branch and `E` to the required `else` branch:
+
+```forth
+5 ok if-ok
+  drop
+else
+  drop
+then
+```
+
 Typed signatures use `S` for the preserved unknown lower stack:
 
 ```forth

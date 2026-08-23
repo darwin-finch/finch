@@ -3,8 +3,8 @@ use crate::vm::diagnostic::{
     DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
 };
 use crate::vm::effects::EffectSet;
-use crate::vm::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
 use crate::vm::interpreter::UiOperation;
+use crate::vm::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
 use crate::vm::types::{Type, TypedValue};
 use crate::vm::verifier::{apply_signature_types, VerifiedModule, Verifier, Vocabulary};
@@ -484,10 +484,9 @@ impl Compiler<'_> {
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if items.len() == 2 && items[0] == Val::Symbol("quote".into()) {
             let Val::Symbol(name) = &items[1] else {
-                return Err(vec![self.error(
-                    "E-TYPE-011",
-                    "quote currently accepts only a symbol",
-                )]);
+                return Err(vec![
+                    self.error("E-TYPE-011", "quote currently accepts only a symbol")
+                ]);
             };
             builder.emit(
                 Instruction::Constant {
@@ -506,6 +505,7 @@ impl Compiler<'_> {
             "let" => self.compile_let(&items[1..], builder),
             "if" => self.compile_if(&items[1..], builder),
             "match-option" => self.compile_match_option(&items[1..], builder),
+            "match-result" => self.compile_match_result(&items[1..], builder),
             "while" => self.compile_while(&items[1..], builder),
             "break" => self.compile_loop_exit("break", &items[1..], builder),
             "continue" => self.compile_loop_exit("continue", &items[1..], builder),
@@ -571,7 +571,9 @@ impl Compiler<'_> {
             effects,
         } = closure_type
         else {
-            return Err(vec![self.error("E-FIBER-003", "defer-cpu requires a typed closure")]);
+            return Err(vec![
+                self.error("E-FIBER-003", "defer-cpu requires a typed closure")
+            ]);
         };
         if !arguments.is_empty() {
             return Err(vec![self.error(
@@ -580,10 +582,9 @@ impl Compiler<'_> {
             )]);
         }
         if !effects.is_pure() {
-            return Err(vec![self.error(
-                "E-FIBER-005",
-                "defer-cpu requires a pure closure",
-            )]);
+            return Err(vec![
+                self.error("E-FIBER-005", "defer-cpu requires a pure closure")
+            ]);
         }
         builder.stack.pop();
         builder.emit(Instruction::DeferCpu, self.origin("defer-cpu"));
@@ -658,14 +659,15 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 1 {
-            return Err(vec![self.error(
-                "E-FIBER-020",
-                "task-cancel requires exactly one task<T>",
-            )]);
+            return Err(vec![
+                self.error("E-FIBER-020", "task-cancel requires exactly one task<T>")
+            ]);
         }
         let task_type = self.compile_expression(&expressions[0], builder)?;
         if !matches!(task_type, Type::Task(_)) {
-            return Err(vec![self.error("E-FIBER-020", "task-cancel requires task<T>")]);
+            return Err(vec![
+                self.error("E-FIBER-020", "task-cancel requires task<T>")
+            ]);
         }
         builder.stack.pop();
         builder.emit(Instruction::CancelCpuFiber, self.origin("task-cancel"));
@@ -962,6 +964,156 @@ impl Compiler<'_> {
         );
         builder.switch_to(merge_block, none_stack);
         Ok(builder.stack.pop().expect("match-option leaves a value"))
+    }
+
+    /// Compile a total result match. Both edges consume the result and bind
+    /// exactly the selected payload, so ordinary error handling never needs a
+    /// dynamic value or a potentially trapping `result-unwrap`.
+    ///
+    /// ```lisp
+    /// (match-result operation
+    ///   (ok value (use value))
+    ///   (err problem (recover problem)))
+    /// ```
+    fn compile_match_result(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [result_expression, ok_arm, err_arm] = expressions else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-005",
+                "match-result requires a result expression, (ok name body...), and (err name body...)",
+            )]);
+        };
+        let Type::Result(ok_type, err_type) =
+            self.compile_expression(result_expression, builder)?
+        else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-006",
+                "match-result requires a result<T,E> expression",
+            )]);
+        };
+        builder.stack.pop();
+        let branch_stack = builder.stack.clone();
+
+        let parse_arm = |arm: &Val,
+                         marker: &str,
+                         code: &str|
+         -> Result<(String, Vec<Val>), Vec<VmDiagnostic>> {
+            let Val::List(items) = arm else {
+                return Err(vec![self.error(
+                    code,
+                    format!("match-result's {marker} arm must be ({marker} name body...)"),
+                )]);
+            };
+            let [Val::Symbol(found), Val::Symbol(binding), body @ ..] = items.as_slice() else {
+                return Err(vec![self.error(
+                    code,
+                    format!("match-result's {marker} arm must be ({marker} name body...)"),
+                )]);
+            };
+            if found != marker || body.is_empty() {
+                return Err(vec![self.error(
+                    code,
+                    format!("match-result's {marker} arm must be ({marker} name body...)"),
+                )]);
+            }
+            Ok((binding.clone(), body.to_vec()))
+        };
+        let (ok_binding, ok_body) = parse_arm(ok_arm, "ok", "E-LISP-MATCH-007")?;
+        let (err_binding, err_body) = parse_arm(err_arm, "err", "E-LISP-MATCH-008")?;
+
+        builder.emit(Instruction::Dup, self.origin("match-result/test"));
+        builder.emit(
+            Instruction::Call {
+                function: "is-ok".into(),
+            },
+            self.origin("match-result/test"),
+        );
+        let ok_block = builder.new_block();
+        let err_block = builder.new_block();
+        let merge_block = builder.new_block();
+        builder.emit(
+            Instruction::Branch {
+                then_block: ok_block,
+                else_block: err_block,
+            },
+            self.origin("match-result/test"),
+        );
+
+        builder.switch_to(ok_block, branch_stack.clone());
+        builder.emit(
+            Instruction::Call {
+                function: "result-unwrap".into(),
+            },
+            self.origin("match-result/ok"),
+        );
+        builder.stack.push((*ok_type).clone());
+        let index = builder.allocate_local((*ok_type).clone());
+        builder.stack.pop();
+        builder.emit(
+            Instruction::LocalSet { index },
+            self.origin(ok_binding.clone()),
+        );
+        builder.scopes.push(HashMap::from([(
+            ok_binding,
+            Binding::Local {
+                index,
+                ty: (*ok_type).clone(),
+            },
+        )]));
+        let ok_result = self.compile_begin(&ok_body, builder)?;
+        builder.scopes.pop();
+        builder.stack.push(ok_result.clone());
+        let ok_stack = builder.stack.clone();
+        builder.emit(
+            Instruction::Jump {
+                target: merge_block,
+            },
+            self.origin("match-result/ok-end"),
+        );
+
+        builder.switch_to(err_block, branch_stack);
+        builder.emit(
+            Instruction::Call {
+                function: "result-error".into(),
+            },
+            self.origin("match-result/err"),
+        );
+        builder.stack.push((*err_type).clone());
+        let index = builder.allocate_local((*err_type).clone());
+        builder.stack.pop();
+        builder.emit(
+            Instruction::LocalSet { index },
+            self.origin(err_binding.clone()),
+        );
+        builder.scopes.push(HashMap::from([(
+            err_binding,
+            Binding::Local {
+                index,
+                ty: (*err_type).clone(),
+            },
+        )]));
+        let err_result = self.compile_begin(&err_body, builder)?;
+        builder.scopes.pop();
+        builder.stack.push(err_result.clone());
+        let err_stack = builder.stack.clone();
+        if ok_result != err_result || ok_stack != err_stack {
+            return Err(vec![VmDiagnostic::type_mismatch(
+                ok_result,
+                err_result,
+                Some(self.origin("match-result")),
+            )]);
+        }
+        builder.emit(
+            Instruction::Jump {
+                target: merge_block,
+            },
+            self.origin("match-result/err-end"),
+        );
+        builder.switch_to(merge_block, err_stack);
+        Ok(builder.stack.pop().expect("match-result leaves a value"))
     }
 
     fn compile_while(
@@ -1659,11 +1811,9 @@ mod tests {
     #[test]
     fn compiles_a_recursively_typed_function() {
         assert_eq!(
-            run(
-                "(define (factorial (n : int)) : int \
+            run("(define (factorial (n : int)) : int \
                    (if (<= n 1) 1 (* n (factorial (- n 1))))) \
-                 (factorial 6)"
-            )
+                 (factorial 6)")
             .unwrap(),
             vec![TypedValue::Int(720)]
         );
@@ -1733,6 +1883,19 @@ mod tests {
     }
 
     #[test]
+    fn matches_typed_result_payloads_without_unsafe_projection() {
+        assert_eq!(
+            run("(match-result (ok 5) (ok value (+ value 1)) (err problem (begin problem 0)))")
+                .unwrap(),
+            vec![TypedValue::Int(6)]
+        );
+        assert_eq!(
+            run("(match-result (err \"bad\") (ok value (begin value 0)) (err problem (begin problem 3)))").unwrap(),
+            vec![TypedValue::Int(3)]
+        );
+    }
+
+    #[test]
     fn accepts_parameterized_return_annotations() {
         assert_eq!(
             run(
@@ -1766,8 +1929,14 @@ mod tests {
 
     #[test]
     fn quote_produces_a_typed_symbol_value() {
-        assert_eq!(run("(quote bash)").unwrap(), vec![TypedValue::Symbol("bash".into())]);
-        assert_eq!(run("'bash").unwrap(), vec![TypedValue::Symbol("bash".into())]);
+        assert_eq!(
+            run("(quote bash)").unwrap(),
+            vec![TypedValue::Symbol("bash".into())]
+        );
+        assert_eq!(
+            run("'bash").unwrap(),
+            vec![TypedValue::Symbol("bash".into())]
+        );
     }
 
     #[test]
@@ -1800,12 +1969,15 @@ mod tests {
             &core_vocabulary(),
         )
         .unwrap();
-        assert!(module.module.functions["main"].blocks.values().any(|block| {
-            block
-                .instructions
-                .iter()
-                .any(|located| matches!(located.instruction, Instruction::Jump { .. }))
-        }));
+        assert!(module.module.functions["main"]
+            .blocks
+            .values()
+            .any(|block| {
+                block
+                    .instructions
+                    .iter()
+                    .any(|located| matches!(located.instruction, Instruction::Jump { .. }))
+            }));
     }
 
     #[test]

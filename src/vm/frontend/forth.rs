@@ -2,8 +2,8 @@ use crate::vm::diagnostic::{
     DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
 };
 use crate::vm::effects::EffectSet;
-use crate::vm::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
 use crate::vm::interpreter::UiOperation;
+use crate::vm::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
 use crate::vm::types::{Type, TypedValue};
 use crate::vm::verifier::{apply_signature_types, VerifiedModule, Verifier, Vocabulary};
@@ -43,12 +43,20 @@ struct IfFrame {
     else_block: u32,
     merge_block: u32,
     /// The stack supplied to the else branch.  Ordinary `if` uses the same
-    /// entry row for both branches; `if-some` consumes its option in each
-    /// branch and supplies the unwrapped value only to the then branch.
+    /// entry row for both branches; a structured match consumes its tagged
+    /// value in each branch and supplies the selected payload only to the
+    /// corresponding branch.
     entry_stack: Vec<Type>,
     then_stack: Option<Vec<Type>>,
-    option_condition: bool,
+    match_condition: Option<MatchCondition>,
+    else_payload: Option<Type>,
     origin: SourceOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchCondition {
+    Option,
+    Result,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,7 +409,8 @@ fn compile_forth_body_with_locals(
                         merge_block,
                         entry_stack: stack.clone(),
                         then_stack: None,
-                        option_condition: false,
+                        match_condition: None,
+                        else_payload: None,
                         origin,
                     });
                     control.push(ControlKind::If);
@@ -409,33 +418,48 @@ fn compile_forth_body_with_locals(
                     token_index += 1;
                     continue;
                 }
-                "if-some" => {
+                "if-some" | "if-ok" => {
                     let option = stack.pop().ok_or_else(|| {
                         vec![control_error(
                             "E-STACK-001",
-                            "if-some requires an option<T> condition",
+                            format!("{word} requires a tagged condition"),
                             origin.clone(),
                         )]
                     })?;
-                    let Type::Option(inner) = option else {
-                        return Err(vec![control_error(
-                            "E-TYPE-012",
-                            "if-some requires an option<T> condition",
-                            origin,
-                        )]);
+                    let (then_type, else_type, condition) = match option {
+                        Type::Option(inner) if word == "if-some" => {
+                            ((*inner).clone(), None, MatchCondition::Option)
+                        }
+                        Type::Result(ok, err) if word == "if-ok" => {
+                            ((*ok).clone(), Some((*err).clone()), MatchCondition::Result)
+                        }
+                        _ => {
+                            return Err(vec![control_error(
+                                "E-TYPE-012",
+                                if word == "if-some" {
+                                    "if-some requires an option<T> condition"
+                                } else {
+                                    "if-ok requires a result<T,E> condition"
+                                },
+                                origin,
+                            )]);
+                        }
                     };
 
-                    // Keep one copy of the option live across the branch,
-                    // and branch on a second copy. Each branch consumes the
-                    // live option: the then edge receives T, the else edge
-                    // receives nothing. This is structured lowering to the
-                    // existing typed IR, not a dynamic type test.
+                    // Keep one copy of the tagged value live across the
+                    // branch, and branch on a second copy. Each branch
+                    // consumes the live value and receives only its selected
+                    // payload.
                     emit(&mut blocks, current, Instruction::Dup, origin.clone());
                     emit(
                         &mut blocks,
                         current,
                         Instruction::Call {
-                            function: "is-some".into(),
+                            function: if condition == MatchCondition::Option {
+                                "is-some".into()
+                            } else {
+                                "is-ok".into()
+                            },
                         },
                         origin.clone(),
                     );
@@ -466,7 +490,8 @@ fn compile_forth_body_with_locals(
                         merge_block,
                         entry_stack: stack.clone(),
                         then_stack: None,
-                        option_condition: true,
+                        match_condition: Some(condition),
+                        else_payload: else_type,
                         origin: origin.clone(),
                     });
                     control.push(ControlKind::If);
@@ -475,11 +500,15 @@ fn compile_forth_body_with_locals(
                         &mut blocks,
                         current,
                         Instruction::Call {
-                            function: "unwrap".into(),
+                            function: if condition == MatchCondition::Option {
+                                "unwrap".into()
+                            } else {
+                                "result-unwrap".into()
+                            },
                         },
                         origin,
                     );
-                    stack.push(*inner);
+                    stack.push(then_type);
                     token_index += 1;
                     continue;
                 }
@@ -516,13 +545,28 @@ fn compile_forth_body_with_locals(
                     );
                     current = frame.else_block;
                     stack = frame.entry_stack.clone();
-                    if frame.option_condition {
-                        emit(
-                            &mut blocks,
-                            current,
-                            Instruction::Drop,
-                            origin.clone(),
-                        );
+                    if let Some(condition) = frame.match_condition {
+                        match condition {
+                            MatchCondition::Option => {
+                                emit(&mut blocks, current, Instruction::Drop, origin.clone())
+                            }
+                            MatchCondition::Result => {
+                                emit(
+                                    &mut blocks,
+                                    current,
+                                    Instruction::Call {
+                                        function: "result-error".into(),
+                                    },
+                                    origin.clone(),
+                                );
+                                stack.push(
+                                    frame
+                                        .else_payload
+                                        .clone()
+                                        .expect("result match stores error type"),
+                                );
+                            }
+                        }
                     }
                     token_index += 1;
                     continue;
@@ -553,10 +597,10 @@ fn compile_forth_body_with_locals(
                         }
                         stack.clone()
                     } else {
-                        if frame.option_condition {
+                        if frame.match_condition.is_some() {
                             return Err(vec![control_error(
                                 "E-FORTH-IF-003",
-                                "if-some requires an else branch so the none option is consumed",
+                                "structured matches require an else branch so the alternate value is consumed",
                                 frame.origin,
                             )]);
                         }
@@ -604,8 +648,13 @@ fn compile_forth_body_with_locals(
                             )]);
                         };
                         if label.is_empty()
-                            || matches!(label.as_str(), "if" | "else" | "then" | "while" | "repeat" | "until")
-                            || loops.iter().any(|frame| frame.label.as_deref() == Some(label))
+                            || matches!(
+                                label.as_str(),
+                                "if" | "else" | "then" | "while" | "repeat" | "until"
+                            )
+                            || loops
+                                .iter()
+                                .any(|frame| frame.label.as_deref() == Some(label))
                         {
                             return Err(vec![control_error(
                                 "E-FORTH-LOOP-006",
@@ -693,12 +742,7 @@ fn compile_forth_body_with_locals(
                     } else {
                         frame.header
                     };
-                    emit(
-                        &mut blocks,
-                        current,
-                        Instruction::Jump { target },
-                        origin,
-                    );
+                    emit(&mut blocks, current, Instruction::Jump { target }, origin);
                     token_index += 2;
                     continue;
                 }
@@ -1318,7 +1362,12 @@ fn parse_definition_locals(
                 "local name must be an identifier",
             )]);
         };
-        if name == "|" || name == "locals|" || locals.iter().any(|local: &LocalBinding| local.name == *name) {
+        if name == "|"
+            || name == "locals|"
+            || locals
+                .iter()
+                .any(|local: &LocalBinding| local.name == *name)
+        {
             return Err(vec![definition_error(
                 source_id,
                 source,
@@ -1515,7 +1564,14 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
-            let (value, end) = read_string(source_id, source, cursor, start, "E-READ-001", "unterminated Co-Forth string literal")?;
+            let (value, end) = read_string(
+                source_id,
+                source,
+                cursor,
+                start,
+                "E-READ-001",
+                "unterminated Co-Forth string literal",
+            )?;
             tokens.push(Token {
                 value: TokenValue::String(value),
                 start,
@@ -1637,8 +1693,12 @@ fn line_column(source: &str, byte: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::interpreter::{CapabilityHandler, DenyCapabilities, Interpreter, InterpreterConfig};
-    use crate::vm::{core_vocabulary, CapabilityKind, CapabilityRequirement, ResourceSelector, TypedValue};
+    use crate::vm::interpreter::{
+        CapabilityHandler, DenyCapabilities, Interpreter, InterpreterConfig,
+    };
+    use crate::vm::{
+        core_vocabulary, CapabilityKind, CapabilityRequirement, ResourceSelector, TypedValue,
+    };
 
     #[test]
     fn compiles_and_executes_user_forth_text() {
@@ -1677,16 +1737,22 @@ mod tests {
                 self.0.push_str(text);
                 Ok(vec![TypedValue::Unit])
             }
-            fn output(&self) -> String { self.0.clone() }
+            fn output(&self) -> String {
+                self.0.clone()
+            }
         }
         let mut handler = EmitHandler::default();
-        Interpreter::new(&module, &mut handler, InterpreterConfig {
-            fuel: 100_000,
-            grants: EffectSet::from_requirement(CapabilityRequirement {
-                capability: CapabilityKind::SessionEmit,
-                selector: ResourceSelector::None,
-            }),
-        })
+        Interpreter::new(
+            &module,
+            &mut handler,
+            InterpreterConfig {
+                fuel: 100_000,
+                grants: EffectSet::from_requirement(CapabilityRequirement {
+                    capability: CapabilityKind::SessionEmit,
+                    selector: ResourceSelector::None,
+                }),
+            },
+        )
         .execute(&mut stack)
         .unwrap();
         assert_eq!(handler.output(), "Hello \"世界\"8! ");
@@ -1717,17 +1783,23 @@ mod tests {
                 self.0.push_str(text);
                 Ok(vec![TypedValue::Unit])
             }
-            fn output(&self) -> String { self.0.clone() }
+            fn output(&self) -> String {
+                self.0.clone()
+            }
         }
         let mut stack = Vec::new();
         let mut handler = EmitHandler::default();
-        Interpreter::new(&module, &mut handler, InterpreterConfig {
-            fuel: 100_000,
-            grants: EffectSet::from_requirement(CapabilityRequirement {
-                capability: CapabilityKind::SessionEmit,
-                selector: ResourceSelector::None,
-            }),
-        })
+        Interpreter::new(
+            &module,
+            &mut handler,
+            InterpreterConfig {
+                fuel: 100_000,
+                grants: EffectSet::from_requirement(CapabilityRequirement {
+                    capability: CapabilityKind::SessionEmit,
+                    selector: ResourceSelector::None,
+                }),
+            },
+        )
         .execute(&mut stack)
         .unwrap();
         assert_eq!(handler.output(), "legacy output");
@@ -1743,9 +1815,13 @@ mod tests {
         )
         .unwrap();
         let mut break_stack = Vec::new();
-        Interpreter::new(&break_module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut break_stack)
-            .unwrap();
+        Interpreter::new(
+            &break_module,
+            DenyCapabilities,
+            InterpreterConfig::default(),
+        )
+        .execute(&mut break_stack)
+        .unwrap();
         assert_eq!(break_stack, vec![TypedValue::Int(2)]);
 
         let continue_module = compile_forth(
@@ -1756,10 +1832,55 @@ mod tests {
         )
         .unwrap();
         let mut continue_stack = Vec::new();
-        Interpreter::new(&continue_module, DenyCapabilities, InterpreterConfig::default())
-            .execute(&mut continue_stack)
-            .unwrap();
+        Interpreter::new(
+            &continue_module,
+            DenyCapabilities,
+            InterpreterConfig::default(),
+        )
+        .execute(&mut continue_stack)
+        .unwrap();
         assert_eq!(continue_stack, vec![TypedValue::Int(3)]);
+    }
+
+    #[test]
+    fn if_ok_binds_each_result_payload_on_its_selected_edge() {
+        let ok_module = compile_forth(
+            "ok.forth",
+            "5 ok if-ok drop else drop then",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let err_module = compile_forth(
+            "err.forth",
+            "s\"bad\" err if-ok drop else drop then",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        for module in [ok_module, err_module] {
+            let mut stack = Vec::new();
+            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+                .execute(&mut stack)
+                .unwrap();
+            assert!(stack.is_empty());
+        }
+    }
+
+    #[test]
+    fn result_error_projects_the_error_of_a_heterogeneous_result() {
+        let module = compile_forth(
+            "result-error.forth",
+            "s\"bad\" err result-error",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(stack, vec![TypedValue::String("bad".into())]);
     }
 
     #[test]

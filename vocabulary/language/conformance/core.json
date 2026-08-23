@@ -92,6 +92,20 @@
       "expected_output": ""
     },
     {
+      "name": "structured-result-match-ok",
+      "forth": "5 ok if-ok drop 6 else drop 0 then",
+      "lisp": "(match-result (ok 5) (ok value (+ value 1)) (err problem (begin problem 0)))",
+      "expected_values": [{ "type": "int", "value": 6 }],
+      "expected_output": ""
+    },
+    {
+      "name": "structured-result-match-err",
+      "forth": "s\"bad\" err if-ok drop 0 else drop 3 then",
+      "lisp": "(match-result (err \"bad\") (ok value (begin value 0)) (err problem (begin problem 3)))",
+      "expected_values": [{ "type": "int", "value": 3 }],
+      "expected_output": ""
+    },
+    {
       "name": "symbol-data",
       "forth": "'bash",
       "lisp": "'bash",

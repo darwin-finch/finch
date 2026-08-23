@@ -182,9 +182,9 @@ pub fn core_vocabulary() -> Vocabulary {
             pure(
                 vec![Type::Result(
                     Box::new(Type::Variable("A".into())),
-                    Box::new(a.clone()),
+                    Box::new(Type::Variable("E".into())),
                 )],
-                vec![a.clone()],
+                vec![Type::Variable("E".into())],
             ),
         ),
         (

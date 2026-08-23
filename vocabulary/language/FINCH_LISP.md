@@ -50,6 +50,15 @@ lexically and its `none` arm receives no synthetic value; both arms must return 
   (none 0))
 ```
 
+`match-result` is the corresponding total branch for `result<T,E>` values. It binds the selected
+payload in each required arm:
+
+```lisp
+(match-result (ok 5)
+  (ok value (begin value 0))
+  (err problem (begin problem 0)))
+```
+
 MemTree and scheduling are explicit effects. Scheduled work stores an immutable program reference,
 typed arguments, budgets, context references, and a revocable policy reference—not raw authority or
 an unvalidated Lisp string. A callback starts a fresh audited task and revalidates its environment
