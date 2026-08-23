@@ -56,7 +56,8 @@ struct Args {
     #[arg(long = "cloud-only", alias = "teacher-only")]
     cloud_only: bool,
 
-    /// Evaluate a Forth expression directly and print the result (no AI, no REPL)
+    /// Evaluate a typed Co-Forth expression directly through the shared VM
+    /// (no AI, no REPL, and no legacy interpreter fallback).
     #[arg(long = "forth", short = 'f')]
     forth: Option<String>,
 
