@@ -87,9 +87,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   bindings for accessibility, browser, mail, messaging, and credential-backed services as
   parameterized capabilities with audit/event-journal projection; never treat broad shell access
   as the integration contract.
-- [ ] Add a typed executable-script command that consumes the tested Finch shebang envelope through
-  `ProgramRuntime` (never the legacy interpreters), with explicit isolated-versus-named-Brain state,
-  structured/JSON output, and the ordinary capability broker.
+- [ ] Extend the existing typed executable-script command with explicit isolated-versus-named-Brain
+  state. `finch --exec` already consumes the tested Finch shebang envelope through `ProgramRuntime`
+  (never the legacy interpreters), returns structured `--json` output, and uses the ordinary
+  capability broker; it currently creates only an isolated runtime. Do not add named-Brain script
+  state until the Brain convergence gate is open.
 - [ ] Add package/import namespaces only after self-contained scripts and task/session/project/user
   vocabulary lifetimes are reliable. Keep promotion to project/user/published vocabulary an
   authority-bearing, reviewable operation.
