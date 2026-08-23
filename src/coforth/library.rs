@@ -386,7 +386,14 @@ impl Library {
 /// could be misread as a much larger, impossible fraction.
 fn parse_prove_all_summary(output: &str) -> Option<(usize, usize)> {
     let plain = strip_ansi_csi(output);
-    for token in plain.split_whitespace() {
+    let tokens = plain.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        // A diagnostic can contain arbitrary slash-separated values.  Only
+        // accept the runner's actual `N/M passed` summary, never the first
+        // fraction that happens to appear in an error message.
+        if tokens.get(index + 1) != Some(&"passed") {
+            continue;
+        }
         let Some((passed, total)) = token.split_once('/') else {
             continue;
         };
@@ -395,8 +402,9 @@ fn parse_prove_all_summary(output: &str) -> Option<(usize, usize)> {
             && passed.bytes().all(|byte| byte.is_ascii_digit())
             && total.bytes().all(|byte| byte.is_ascii_digit())
         {
-            let passed = passed.parse().ok()?;
-            let total = total.parse().ok()?;
+            let (Ok(passed), Ok(total)) = (passed.parse(), total.parse()) else {
+                continue;
+            };
             if total > 0 {
                 return Some((passed, total));
             }
@@ -4832,7 +4840,7 @@ mod tests {
 
     #[test]
     fn prove_all_summary_skips_non_summary_numbers() {
-        let output = "test 9 failed previously\n── 12/13 passed ──\n";
+        let output = "previous run was 9/10 broken\n── 12/13 passed ──\n";
         assert_eq!(parse_prove_all_summary(output), Some((12, 13)));
     }
 
