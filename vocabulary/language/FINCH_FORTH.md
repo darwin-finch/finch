@@ -44,6 +44,10 @@ Typed signatures use `S` for the preserved unknown lower stack:
 ;
 ```
 
+Type names may be parameterized in a signature, including nested forms such as `list<int>`,
+`map<string,int>`, `option<list<string>>`, `result<T,E>`, `task<T>`, `resource<kind>`, and
+`capability<kind>`.
+
 Named input locals are an optional direct IR spelling. `locals|` must be the first form in a typed
 word and must name every declared input in bottom-to-top stack order:
 

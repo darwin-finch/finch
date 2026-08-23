@@ -21,6 +21,7 @@ The ordinary response is `(say "Hello")`. Pure and compound examples:
 (define (square (x : int)) (* x x))
 (define (factorial (n : int)) : int
   (if (<= n 1) 1 (* n (factorial (- n 1)))))
+(define (singleton (x : int)) : list<int> (list x))
 (list-get (list 4 8 15 16) 2)
 (file-read (path "Cargo.toml"))
 (file-write (path "generated/result.bin") data)
@@ -31,8 +32,9 @@ plus explicit captured lexical values. Calling a closure is runtime behavior. A 
 syntax during bounded, capability-free compilation; expansion cannot hide runtime effects. Macro
 definitions are reserved for a later language revision and must not be emitted for version 1.
 
-Core types include `unit`, `bool`, `int`, `uint`, `float`, `char`, `string`, `bytes`, typed
-collections/results, refined paths, tasks, resources, closures, and explicit `dynamic` values.
+Core types include `unit`, `bool`, `int`, `uint`, `float`, `char`, `string`, `bytes`, and explicit
+`dynamic` values. Parameterized spellings compose directly: `list<int>`, `map<string,int>`,
+`option<T>`, `result<T,E>`, `task<T>`, `resource<kind>`, and `capability<kind>`.
 
 `'name` (or `(quote name)`) produces a typed `symbol`, which is an identifier value rather than
 text. `some`/`none` construct `option<T>` values; `ok`/`err` construct `result<T,E>` values;

@@ -1405,23 +1405,14 @@ fn parse_stack_types(
                     "stack type must be an identifier",
                 )]);
             };
-            match name.as_str() {
-                "unit" => Ok(Type::Unit),
-                "bool" => Ok(Type::Bool),
-                "int" => Ok(Type::Int),
-                "uint" => Ok(Type::UInt),
-                "float" => Ok(Type::Float),
-                "char" => Ok(Type::Char),
-                "string" | "str" => Ok(Type::String),
-                "bytes" => Ok(Type::Bytes),
-                "dynamic" | "any" => Ok(Type::Dynamic),
-                _ => Err(vec![definition_error(
+            super::lisp::parse_type_name(name).map_err(|_| {
+                vec![definition_error(
                     source_id,
                     source,
                     token,
                     format!("unknown stack type '{name}'"),
-                )]),
-            }
+                )]
+            })
         })
         .collect()
 }
@@ -1849,6 +1840,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(errors.iter().any(|error| error.code == "E-FORTH-SIG-001"));
+    }
+
+    #[test]
+    fn accepts_parameterized_stack_signature_types() {
+        let module = compile_forth(
+            "generic.forth",
+            ": list-id ( S list<int> -- S list<int> ! {} ) ;",
+            vec![Type::list(Type::Int)],
+            &core_vocabulary(),
+        )
+        .unwrap();
+        assert_eq!(
+            module.module.functions["list-id"].signature.input.values,
+            vec![Type::list(Type::Int)]
+        );
     }
 
     #[test]

@@ -1450,7 +1450,15 @@ fn parse_type(value: &Val) -> Result<Type, Vec<VmDiagnostic>> {
             None,
         )]);
     };
-    match name.as_str() {
+    parse_type_name(name)
+}
+
+/// Parse the compact type spelling shared by Lisp annotations and Co-Forth
+/// stack signatures. The reader keeps `list<int>` as one symbol, so this
+/// parser deliberately handles nested angle brackets without adding a second
+/// syntax tree for type expressions.
+pub(crate) fn parse_type_name(name: &str) -> Result<Type, Vec<VmDiagnostic>> {
+    match name {
         "unit" | "nil" => Ok(Type::Unit),
         "bool" => Ok(Type::Bool),
         "int" => Ok(Type::Int),
@@ -1460,13 +1468,72 @@ fn parse_type(value: &Val) -> Result<Type, Vec<VmDiagnostic>> {
         "string" | "str" => Ok(Type::String),
         "bytes" => Ok(Type::Bytes),
         "dynamic" | "any" => Ok(Type::Dynamic),
-        _ => Err(vec![VmDiagnostic::error(
-            "E-TYPE-009",
-            DiagnosticPhase::TypeInference,
-            format!("unknown type '{name}'"),
-            None,
-        )]),
+        _ => parse_generic_type(name).ok_or_else(|| {
+            vec![VmDiagnostic::error(
+                "E-TYPE-009",
+                DiagnosticPhase::TypeInference,
+                format!("unknown type '{name}'"),
+                None,
+            )]
+        }),
     }
+}
+
+fn parse_generic_type(name: &str) -> Option<Type> {
+    let (head, arguments) = name.split_once('<')?;
+    let inner = arguments.strip_suffix('>')?;
+    let arguments = split_type_arguments(inner)?;
+    let one = || {
+        (arguments.len() == 1)
+            .then(|| parse_type_name(arguments[0]).ok())
+            .flatten()
+    };
+    match head {
+        "list" => one().map(Type::list),
+        "option" => one().map(|inner| Type::Option(Box::new(inner))),
+        "task" => one().map(|inner| Type::Task(Box::new(inner))),
+        "resource" => (arguments.len() == 1).then(|| Type::Resource(arguments[0].to_string())),
+        "capability" => (arguments.len() == 1).then(|| Type::Capability(arguments[0].to_string())),
+        "map" if arguments.len() == 2 => Some(Type::Map(
+            Box::new(parse_type_name(arguments[0]).ok()?),
+            Box::new(parse_type_name(arguments[1]).ok()?),
+        )),
+        "result" if arguments.len() == 2 => Some(Type::result(
+            parse_type_name(arguments[0]).ok()?,
+            parse_type_name(arguments[1]).ok()?,
+        )),
+        _ => None,
+    }
+}
+
+fn split_type_arguments(source: &str) -> Option<Vec<&str>> {
+    let mut arguments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (index, character) in source.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                let argument = source[start..index].trim();
+                if argument.is_empty() {
+                    return None;
+                }
+                arguments.push(argument);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let argument = source[start..].trim();
+    if argument.is_empty() {
+        return None;
+    }
+    arguments.push(argument);
+    Some(arguments)
 }
 
 fn source_origin(source_id: &str, source: &str, word: impl Into<String>) -> SourceOrigin {
@@ -1616,6 +1683,26 @@ mod tests {
         assert_eq!(
             run("(list-length (list \"a\" \"b\"))").unwrap(),
             vec![TypedValue::Int(2)]
+        );
+    }
+
+    #[test]
+    fn accepts_parameterized_return_annotations() {
+        assert_eq!(
+            run(
+                "(define (singleton (value : int)) : list<int> (list value)) \
+                 (list-get (singleton 7) 0)"
+            )
+            .unwrap(),
+            vec![TypedValue::Int(7)]
+        );
+    }
+
+    #[test]
+    fn parses_nested_parameterized_type_annotations() {
+        assert_eq!(
+            parse_type_name("result<option<list<int>>,string>").unwrap(),
+            Type::result(Type::Option(Box::new(Type::list(Type::Int))), Type::String,)
         );
     }
 
