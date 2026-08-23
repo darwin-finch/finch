@@ -1,7 +1,8 @@
 //! Persistent, language-neutral program vocabulary.
 //!
-//! Forth and Lisp keep their native evaluators. This module gives definitions a
-//! shared identity, metadata model, discovery manifest, and pure invocation ABI.
+//! Forth and Lisp lower into Finch's shared typed runtime. This module gives
+//! definitions a shared identity, metadata model, and discovery manifest; it
+//! must never select a legacy evaluator as an alternate invocation ABI.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -813,123 +814,6 @@ impl VmManifest {
     }
 }
 
-/// Invoke a native Forth definition through the shared pure-value ABI.
-pub fn invoke_forth(
-    definition: &ProgramDefinition,
-    args: &[ProgramValue],
-) -> Result<Vec<ProgramValue>> {
-    if definition.language != ProgramLanguage::Forth {
-        bail!("{} is not a Forth program", definition.name);
-    }
-    let mut vm = crate::coforth::Library::precompiled_vm();
-    let ints = args
-        .iter()
-        .map(|value| match value {
-            ProgramValue::Int(value) => Ok(*value),
-            other => bail!("initial Forth ABI accepts integers, got {other:?}"),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    vm.push_stack(&ints);
-    if definition.source.trim_start().starts_with(':') {
-        vm.exec(&definition.source)
-            .with_context(|| format!("failed to compile {}", definition.name))?;
-        vm.exec(&definition.name)
-            .with_context(|| format!("failed to invoke {}", definition.name))?;
-    } else {
-        vm.exec(&definition.source)
-            .with_context(|| format!("failed to invoke {}", definition.name))?;
-    }
-    Ok(vm
-        .data_stack()
-        .iter()
-        .copied()
-        .map(ProgramValue::Int)
-        .collect())
-}
-
-/// Invoke a Lisp definition through the shared pure-value ABI.
-pub async fn invoke_lisp(
-    definition: &ProgramDefinition,
-    args: &[ProgramValue],
-) -> Result<Vec<ProgramValue>> {
-    if definition.language != ProgramLanguage::Lisp {
-        bail!("{} is not a Lisp program", definition.name);
-    }
-    let values = args.iter().cloned().map(program_to_lisp).collect();
-    let value = crate::lisp::invoke_source(&definition.name, &definition.source, values).await?;
-    Ok(match value {
-        crate::lisp::Val::Nil => Vec::new(),
-        crate::lisp::Val::List(items) => items
-            .into_iter()
-            .map(lisp_to_program)
-            .collect::<Result<Vec<_>>>()?,
-        other => vec![lisp_to_program(other)?],
-    })
-}
-
-fn program_to_lisp(value: ProgramValue) -> crate::lisp::Val {
-    match value {
-        ProgramValue::Nil => crate::lisp::Val::Nil,
-        ProgramValue::Bool(value) => crate::lisp::Val::Bool(value),
-        ProgramValue::Int(value) => crate::lisp::Val::Int(value),
-        ProgramValue::Float(value) => crate::lisp::Val::Float(value),
-        ProgramValue::Symbol(value) => crate::lisp::Val::Symbol(value),
-        ProgramValue::String(value) => crate::lisp::Val::Str(value),
-        ProgramValue::Bytes(value) => crate::lisp::Val::Bytes(value),
-        ProgramValue::Task(value) => crate::lisp::Val::Str(value),
-        ProgramValue::Resource { handle, .. } => crate::lisp::Val::Str(handle),
-        ProgramValue::List(values) => {
-            crate::lisp::Val::List(values.into_iter().map(program_to_lisp).collect())
-        }
-        ProgramValue::Option(value) => match value {
-            Some(value) => crate::lisp::Val::List(vec![
-                crate::lisp::Val::Symbol("some".into()),
-                program_to_lisp(*value),
-            ]),
-            None => crate::lisp::Val::List(vec![crate::lisp::Val::Symbol("none".into())]),
-        },
-        ProgramValue::Result { ok, value } => crate::lisp::Val::List(vec![
-            crate::lisp::Val::Symbol(if ok { "ok" } else { "err" }.into()),
-            program_to_lisp(*value),
-        ]),
-    }
-}
-
-fn lisp_to_program(value: crate::lisp::Val) -> Result<ProgramValue> {
-    match value {
-        crate::lisp::Val::Nil => Ok(ProgramValue::Nil),
-        crate::lisp::Val::Bool(value) => Ok(ProgramValue::Bool(value)),
-        crate::lisp::Val::Int(value) => Ok(ProgramValue::Int(value)),
-        crate::lisp::Val::Float(value) => Ok(ProgramValue::Float(value)),
-        crate::lisp::Val::Str(value) => Ok(ProgramValue::String(value)),
-        crate::lisp::Val::Symbol(value) => Ok(ProgramValue::Symbol(value)),
-        crate::lisp::Val::Bytes(value) => Ok(ProgramValue::Bytes(value)),
-        crate::lisp::Val::List(values) => match values.as_slice() {
-            [crate::lisp::Val::Symbol(tag)] if tag == "none" => Ok(ProgramValue::Option(None)),
-            [crate::lisp::Val::Symbol(tag), value]
-                if matches!(tag.as_str(), "some" | "ok" | "err") =>
-            {
-                let value = Box::new(lisp_to_program(value.clone())?);
-                if tag == "some" {
-                    Ok(ProgramValue::Option(Some(value)))
-                } else {
-                    Ok(ProgramValue::Result {
-                        ok: tag == "ok",
-                        value,
-                    })
-                }
-            }
-            _ => Ok(ProgramValue::List(
-                values
-                    .into_iter()
-                    .map(lisp_to_program)
-                    .collect::<Result<Vec<_>>>()?,
-            )),
-        },
-        other => bail!("Lisp value is not portable: {other}"),
-    }
-}
-
 /// SHA-256 of canonical source or environment material.
 pub fn hash_text(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
@@ -1101,44 +985,6 @@ mod tests {
         let task = ProgramDefinition::candidate("task-word", ProgramLanguage::Forth, "1");
         assert_eq!(task.scope, ProgramScope::Session);
         assert_eq!(task.trust, TrustState::Candidate);
-    }
-
-    #[test]
-    fn test_forth_program_invocation_uses_shared_values() {
-        let mut definition =
-            ProgramDefinition::candidate("double", ProgramLanguage::Forth, ": double 2 * ;");
-        definition.signature = Some("( n -- n )".to_string());
-        let result = invoke_forth(&definition, &[ProgramValue::Int(21)]).unwrap();
-        assert_eq!(result, vec![ProgramValue::Int(42)]);
-    }
-
-    #[tokio::test]
-    async fn test_lisp_program_invocation_uses_shared_values() {
-        let definition = ProgramDefinition::candidate(
-            "double",
-            ProgramLanguage::Lisp,
-            "(define (double x) (* x 2))",
-        );
-        let result = invoke_lisp(&definition, &[ProgramValue::Int(21)])
-            .await
-            .unwrap();
-        assert_eq!(result, vec![ProgramValue::Int(42)]);
-    }
-
-    #[test]
-    fn structured_values_round_trip_through_lisp_abi() {
-        let values = [
-            ProgramValue::Option(Some(Box::new(ProgramValue::Int(5)))),
-            ProgramValue::Option(None),
-            ProgramValue::Result {
-                ok: false,
-                value: Box::new(ProgramValue::String("bad".into())),
-            },
-        ];
-        for value in values {
-            let lisp = program_to_lisp(value.clone());
-            assert_eq!(lisp_to_program(lisp).unwrap(), value);
-        }
     }
 
     #[test]
