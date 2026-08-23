@@ -60,6 +60,105 @@ pub struct SearchVmVocabularyTool {
     runtime: Arc<ProgramRuntime>,
 }
 
+/// Frontend syntax is deliberately not represented as a callable vocabulary
+/// word.  Returning it alongside word matches prevents a model from treating
+/// a failed lookup for `if`, `define`, or `while` as evidence that the
+/// construct is unavailable, while preserving the distinction between source
+/// syntax and a runtime function with a stack signature.
+struct SourceSyntaxEntry {
+    name: &'static str,
+    languages: &'static [&'static str],
+    description: &'static str,
+}
+
+const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
+    SourceSyntaxEntry {
+        name: "if",
+        languages: &["lisp", "forth"],
+        description: "Typed conditional. Lisp: (if condition then else); Co-Forth: condition if ... else ... then.",
+    },
+    SourceSyntaxEntry {
+        name: "match",
+        languages: &["lisp"],
+        description: "Type-directed exhaustive option/result match: some/none or ok/err arms.",
+    },
+    SourceSyntaxEntry {
+        name: "match-option",
+        languages: &["lisp"],
+        description: "Exhaustive option branch with a bound some payload and a none arm.",
+    },
+    SourceSyntaxEntry {
+        name: "match-result",
+        languages: &["lisp"],
+        description: "Exhaustive result branch with bound ok and err payloads.",
+    },
+    SourceSyntaxEntry {
+        name: "if-some",
+        languages: &["forth"],
+        description: "Exhaustive Co-Forth option branch: option if-some ... else ... then.",
+    },
+    SourceSyntaxEntry {
+        name: "if-ok",
+        languages: &["forth"],
+        description: "Exhaustive Co-Forth result branch: result if-ok ... else ... then.",
+    },
+    SourceSyntaxEntry {
+        name: "begin",
+        languages: &["lisp", "forth"],
+        description: "Sequencing form. Lisp evaluates expressions left-to-right; Co-Forth begins a loop with while/repeat.",
+    },
+    SourceSyntaxEntry {
+        name: "while",
+        languages: &["lisp", "forth"],
+        description: "Metered typed loop. Its body must preserve the declared loop stack row.",
+    },
+    SourceSyntaxEntry {
+        name: "break",
+        languages: &["lisp", "forth"],
+        description: "Named structured loop exit; it must preserve the target loop stack row.",
+    },
+    SourceSyntaxEntry {
+        name: "continue",
+        languages: &["lisp", "forth"],
+        description: "Named structured loop continuation; it must preserve the target loop stack row.",
+    },
+    SourceSyntaxEntry {
+        name: "define",
+        languages: &["lisp"],
+        description: "Persistent typed function definition. Recursive functions require an explicit return type.",
+    },
+    SourceSyntaxEntry {
+        name: "lambda",
+        languages: &["lisp"],
+        description: "Typed lexical closure expression; parameters use (name : type).",
+    },
+    SourceSyntaxEntry {
+        name: "let",
+        languages: &["lisp"],
+        description: "Lexical immutable bindings: (let ((name value) ...) body...).",
+    },
+    SourceSyntaxEntry {
+        name: ":",
+        languages: &["forth"],
+        description: "Persistent typed word definition: : name ( S inputs -- S outputs ! effects ) body ;.",
+    },
+    SourceSyntaxEntry {
+        name: "locals|",
+        languages: &["forth"],
+        description: "First form of a typed word definition; names all declared inputs in bottom-to-top order.",
+    },
+    SourceSyntaxEntry {
+        name: "[']",
+        languages: &["forth"],
+        description: "Quote a persistent typed word as a closure; invoke it with execute.",
+    },
+    SourceSyntaxEntry {
+        name: ".\"",
+        languages: &["forth"],
+        description: "Standard Co-Forth output literal, lowered to s\"...\" say.",
+    },
+];
+
 impl SearchVmVocabularyTool {
     pub fn new(runtime: Arc<ProgramRuntime>) -> Self {
         Self { runtime }
@@ -73,7 +172,7 @@ impl Tool for SearchVmVocabularyTool {
     }
 
     fn description(&self) -> &str {
-        "Search Finch's built-in typed VM words and return exact stack signatures. Use this for VM discovery; search_vocabulary only searches persisted user/project definitions."
+        "Search Finch's built-in typed VM words and return exact stack signatures, plus matching Lisp/Co-Forth source syntax. Use this for VM discovery; search_vocabulary only searches persisted user/project definitions."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -106,10 +205,23 @@ impl Tool for SearchVmVocabularyTool {
             .take(limit)
             .map(|entry| json!({"name": entry.name, "signature": entry.signature}))
             .collect::<Vec<_>>();
+        let syntax_matches = SOURCE_SYNTAX
+            .iter()
+            .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
+            .take(limit)
+            .map(|entry| {
+                json!({
+                    "name": entry.name,
+                    "languages": entry.languages,
+                    "description": entry.description,
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "query": query,
             "matches": matches,
-            "truncated": matches.len() == limit,
+            "syntax_matches": syntax_matches,
+            "truncated": matches.len() == limit || syntax_matches.len() == limit,
             "manifest_generation": state.manifest_generation,
         })
         .to_string())
@@ -369,7 +481,8 @@ mod tests {
             poset: None,
         };
         let result: Value = serde_json::from_str(
-            &tool.execute(json!({"query": "say"}), &context)
+            &tool
+                .execute(json!({"query": "say"}), &context)
                 .await
                 .unwrap(),
         )
@@ -379,6 +492,36 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry["name"] == "say"));
+    }
+
+    #[tokio::test]
+    async fn source_syntax_is_discoverable_without_lying_about_callable_words() {
+        let tool = SearchVmVocabularyTool::new(Arc::new(ProgramRuntime::new()));
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            stack: None,
+            poset: None,
+        };
+        let result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "if"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(result["matches"].as_array().unwrap().is_empty());
+        assert!(result["syntax_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "if"));
     }
 
     #[tokio::test]
