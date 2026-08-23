@@ -13,6 +13,7 @@ use crate::vm::{
     ApprovalPrompt, CapabilityRequest, CapabilityRequirement, EffectSet, SourceOrigin, Type,
     TypedExecutionStatus, TypedRuntime, TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
+use crate::vm::vocabulary::{core_word_spec, CoreHostBinding, CoreWordImplementation};
 use anyhow::{bail, Result};
 use automation::AutomationBroker;
 use automation::AutomationRequest;
@@ -1569,6 +1570,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         arguments: Vec<TypedValue>,
         origin: &crate::vm::SourceOrigin,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
+        let _binding = registered_host_binding(requirement, origin)?;
         let request = match requirement.capability {
             crate::vm::CapabilityKind::SessionEmit => {
                 let [TypedValue::String(text)] = arguments.as_slice() else {
@@ -2271,6 +2273,60 @@ impl TypedHostHandler {
     }
 }
 
+/// Resolve a portable host request through the same core-word registry used
+/// by the parser, verifier, and provider discovery.  A verified module should
+/// already make this true; the host boundary repeats the check so a corrupted
+/// cached module or foreign embedder cannot route (for example) a `file-read`
+/// request through an unrelated word name with the same coarse capability.
+fn registered_host_binding(
+    requirement: &CapabilityRequirement,
+    origin: &crate::vm::SourceOrigin,
+) -> std::result::Result<Option<CoreHostBinding>, VmDiagnostic> {
+    let Some(name) = origin.word.as_deref() else {
+        // Embedders may produce a host request with a generated origin. Its
+        // capability/result rows are still checked by the VM resume boundary.
+        return Ok(None);
+    };
+    let Some(spec) = core_word_spec(name) else {
+        // User-defined calls inherit a source origin at a higher level; they
+        // must not be mistaken for missing core host bindings.
+        return Ok(None);
+    };
+
+    let binding = match spec.implementation {
+        CoreWordImplementation::HostEffect(binding) => binding,
+        // `output-open` is an explicit VM instruction which deliberately
+        // awaits a host-issued opaque resource. It is the only instruction
+        // class currently reaching this request adapter.
+        CoreWordImplementation::VmInstruction if name == "output-open" => return Ok(None),
+        implementation => {
+            return Err(host_binding_error(
+                origin,
+                format!(
+                    "core word '{name}' is registered as {implementation:?}, not as a host request"
+                ),
+            ))
+        }
+    };
+
+    let declares_capability = spec
+        .signature
+        .effects
+        .0
+        .iter()
+        .any(|declared| declared.capability == requirement.capability);
+    if !declares_capability {
+        return Err(host_binding_error(
+            origin,
+            format!(
+                "core word '{name}' is registered without capability {:?}",
+                requirement.capability
+            ),
+        ));
+    }
+    Ok(Some(binding))
+}
+
 fn host_binding_error(
     origin: &crate::vm::SourceOrigin,
     message: impl Into<String>,
@@ -2636,6 +2692,30 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_requests_are_routed_through_registered_core_bindings() {
+        let origin = SourceOrigin::generated("file-read");
+        let requirement = core_word_spec("file-read")
+            .unwrap()
+            .signature
+            .effects
+            .0
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            registered_host_binding(&requirement, &origin).unwrap(),
+            Some(CoreHostBinding::FileRead)
+        );
+
+        let wrong_requirement = CapabilityRequirement {
+            capability: crate::vm::CapabilityKind::SessionEmit,
+            selector: crate::vm::ResourceSelector::None,
+        };
+        assert!(registered_host_binding(&wrong_requirement, &origin).is_err());
+        assert!(registered_host_binding(&requirement, &SourceOrigin::generated("+"),).is_err());
+    }
 
     #[test]
     fn bounded_line_reader_preserves_cursor_position_and_normalizes_newlines() {

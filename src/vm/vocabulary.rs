@@ -28,6 +28,40 @@ pub struct CoreWordDocumentation {
 /// while an effectful word may be lowered to a portable host request; the
 /// effect row expresses authority, not implementation ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreHostBinding {
+    SessionEmit,
+    VmVocabulary,
+    FileRead,
+    FileSize,
+    FileSlice,
+    FileLinesOpen,
+    FileLinesNext,
+    FileLinesClose,
+    CsvOpen,
+    CsvNext,
+    CsvClose,
+    StreamNext,
+    StreamClose,
+    FileWrite,
+    ProcessRun,
+    ProposalOpen,
+    NetworkConnect,
+    NetworkSend,
+    MemoryRecall,
+    MemoryStore,
+    ScheduleCreate,
+    AgentSpawn,
+    AgentAwait,
+    AgentPoll,
+    AgentCancel,
+    AutomationAvailability,
+    AutomationDisplays,
+    AutomationWindows,
+    AutomationClick,
+    AutomationType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreWordImplementation {
     /// The typed interpreter evaluates the word directly on its private VM
     /// stack.  These words must have an `execute_core` arm.
@@ -35,9 +69,10 @@ pub enum CoreWordImplementation {
     /// The frontends lower the word to a typed VM instruction rather than a
     /// generic call (for example `yield` and output-handle operations).
     VmInstruction,
-    /// The frontends lower the word to a capability request that a host
-    /// adapter must authorize, journal, and resume.
-    HostEffect,
+    /// The frontends lower the word to this specific capability request. The
+    /// host adapter must authorize, journal, and resume it by this binding,
+    /// never by an untyped source-name convention.
+    HostEffect(CoreHostBinding),
 }
 
 /// One inspectable production core-word contract.
@@ -839,7 +874,37 @@ pub fn core_word_registry() -> BTreeMap<String, CoreWordSpec> {
                 | "output-complete"
                 | "output-fail" => CoreWordImplementation::VmInstruction,
                 _ if signature.effects.is_pure() => CoreWordImplementation::Interpreter,
-                _ => CoreWordImplementation::HostEffect,
+                "say" | "emit" => CoreWordImplementation::HostEffect(CoreHostBinding::SessionEmit),
+                "vm-vocabulary" => CoreWordImplementation::HostEffect(CoreHostBinding::VmVocabulary),
+                "file-read" | "host-file-read" => CoreWordImplementation::HostEffect(CoreHostBinding::FileRead),
+                "file-size" => CoreWordImplementation::HostEffect(CoreHostBinding::FileSize),
+                "file-slice" => CoreWordImplementation::HostEffect(CoreHostBinding::FileSlice),
+                "file-lines-open" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesOpen),
+                "file-lines-next" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesNext),
+                "file-lines-close" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesClose),
+                "csv-open" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvOpen),
+                "csv-next" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvNext),
+                "csv-close" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvClose),
+                "stream-next" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamNext),
+                "stream-close" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamClose),
+                "file-write" | "host-file-write" => CoreWordImplementation::HostEffect(CoreHostBinding::FileWrite),
+                "process-run" => CoreWordImplementation::HostEffect(CoreHostBinding::ProcessRun),
+                "proposal-open" => CoreWordImplementation::HostEffect(CoreHostBinding::ProposalOpen),
+                "network-connect" => CoreWordImplementation::HostEffect(CoreHostBinding::NetworkConnect),
+                "network-send" => CoreWordImplementation::HostEffect(CoreHostBinding::NetworkSend),
+                "mem-recall" => CoreWordImplementation::HostEffect(CoreHostBinding::MemoryRecall),
+                "mem-store" => CoreWordImplementation::HostEffect(CoreHostBinding::MemoryStore),
+                "schedule-create" => CoreWordImplementation::HostEffect(CoreHostBinding::ScheduleCreate),
+                "agent-spawn" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentSpawn),
+                "agent-await" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentAwait),
+                "agent-poll" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentPoll),
+                "agent-cancel" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentCancel),
+                "automation-availability" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationAvailability),
+                "automation-displays" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationDisplays),
+                "automation-windows" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationWindows),
+                "automation-click" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationClick),
+                "automation-type" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationType),
+                _ => unreachable!("every effectful core word needs a host binding: {name}"),
             };
             let documentation = core_word_documentation_template(&name);
             (name, CoreWordSpec {
@@ -892,7 +957,10 @@ mod tests {
     fn registry_declares_signature_documentation_and_execution_ownership() {
         let registry = core_word_registry();
         let say = &registry["say"];
-        assert_eq!(say.implementation, CoreWordImplementation::HostEffect);
+        assert_eq!(
+            say.implementation,
+            CoreWordImplementation::HostEffect(CoreHostBinding::SessionEmit)
+        );
         assert_eq!(say.documentation.forth, "text say");
         assert!(!say.signature.effects.is_pure());
 
