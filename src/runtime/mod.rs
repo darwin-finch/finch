@@ -4036,6 +4036,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_forth_dot_quote_is_a_session_emit_shorthand() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                ".\" hello from standard Forth\"",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
+        assert_eq!(outcome.output, "hello from standard Forth");
+        assert_eq!(
+            outcome.side_effects,
+            vec![crate::vm::interpreter::HostSideEffect::Emit {
+                text: "hello from standard Forth".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn typed_forth_can_say_computed_values_progressively() {
         let runtime = ProgramRuntime::new();
         let outcome = runtime
