@@ -1078,6 +1078,8 @@ mod tests {
             panic!("the user message must retain its text block");
         };
         assert!(text.contains("FINCH-VM-TYPED/1"));
+        assert!(text.contains("## Mandatory response shape"));
+        assert!(text.contains("Default to Lisp"));
         assert!(text.contains("otherwise treats the source as Forth"));
         assert!(text.contains("s\"response\" say"));
         assert!(!text.contains(".\" response\""));
