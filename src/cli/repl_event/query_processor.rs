@@ -1022,24 +1022,39 @@ pub(crate) async fn process_query_with_tools(
 }
 
 fn inject_vm_manifest(
-    messages: &mut [crate::claude::Message],
+    messages: &mut Vec<crate::claude::Message>,
     manifest: &crate::programs::VmManifest,
 ) -> bool {
-    let Some(last_user) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| message.role == "user")
-    else {
-        return false;
-    };
-    let Some(ContentBlock::Text { text }) = last_user
-        .content
-        .iter_mut()
-        .find(|block| matches!(block, ContentBlock::Text { .. }))
-    else {
-        return false;
-    };
-    *text = format!("[{}]\n\n{}", manifest.prompt_block(), text);
+    let protocol = manifest.prompt_block();
+    let section = format!("## Finch VM wire protocol\n{protocol}");
+
+    // The response shape is an execution contract, not user-provided context.
+    // Keep it in the existing system instruction whenever the provider request
+    // has one. Prepending it to every user turn made the contract easy for a
+    // model to treat as ordinary quoted context (and was notably fragile for
+    // models that already have strong chat-format priors).
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        if let Some(ContentBlock::Text { text }) = system
+            .content
+            .iter_mut()
+            .find(|block| matches!(block, ContentBlock::Text { .. }))
+        {
+            *text = format!("{text}\n\n{section}");
+            return true;
+        }
+        system.content.push(ContentBlock::Text { text: section });
+        return true;
+    }
+
+    // Providers without a preexisting persona still receive a real system
+    // message. Do not fall back to smuggling the protocol into the user turn.
+    messages.insert(
+        0,
+        crate::claude::Message {
+            role: "system".to_string(),
+            content: vec![ContentBlock::Text { text: section }],
+        },
+    );
     true
 }
 
@@ -1284,8 +1299,11 @@ mod tests {
         }];
 
         assert!(inject_vm_manifest(&mut messages, &fallback_vm_manifest()));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
         let ContentBlock::Text { text } = &messages[0].content[0] else {
-            panic!("the user message must retain its text block");
+            panic!("the system message must retain its text block");
         };
         assert!(text.contains("FINCH-VM-TYPED/1"));
         assert!(text.contains("## Mandatory response shape"));
@@ -1293,7 +1311,28 @@ mod tests {
         assert!(text.contains("otherwise treats the source as Forth"));
         assert!(text.contains("s\"response\" say"));
         assert!(!text.contains(".\" response\""));
-        assert!(text.ends_with("add two numbers"));
+        assert!(messages[1].content[0].as_text().is_some_and(|text| text == "add two numbers"));
+    }
+
+    #[test]
+    fn manifest_joins_an_existing_system_instruction_not_the_user_turn() {
+        let mut messages = vec![
+            crate::claude::Message {
+                role: "system".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "You are Finch's coding assistant.".to_string(),
+                }],
+            },
+            crate::claude::Message::user("say hello"),
+        ];
+
+        assert!(inject_vm_manifest(&mut messages, &fallback_vm_manifest()));
+        assert_eq!(messages.len(), 2);
+        let system = messages[0].content[0].as_text().unwrap();
+        assert!(system.starts_with("You are Finch's coding assistant."));
+        assert!(system.contains("## Finch VM wire protocol"));
+        assert!(system.contains("FINCH-VM-TYPED/1"));
+        assert_eq!(messages[1].content[0].as_text(), Some("say hello"));
     }
 
     #[tokio::test]
