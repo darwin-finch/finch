@@ -91,6 +91,21 @@ mutually-recursive pure functions, put a return type after the header:
 compiling bodies, so recursive calls remain type-checked. Return-annotated definitions must be pure
 until effect annotations are added. Definitions enter the persistent shared dictionary only if the
 entire submission verifies, is authorized, and commits.
+
+The first string immediately after a `define` header and optional return annotation is a docstring,
+following Common Lisp/Python practice. It is retained in the immutable definition metadata and
+omitted from typed IR, so it neither pushes a runtime value nor changes the function's cost:
+
+```lisp
+(define (factorial (n : int)) : int
+  "Return n factorial for non-negative n."
+  (if (<= n 1) 1 (* n (factorial (- n 1)))))
+```
+
+For a self-contained Co-Forth script, use leading `\\` comments (or `\\ finch-doc:` for an
+explicit documentation line). Comments remain non-executable metadata; they never grant authority
+or change a word signature.
+
 Legacy variable definitions and other unsupported legacy forms are not part of the provider
 language. They require an explicitly named host migration API; ordinary program submission never
 falls back to a compatibility evaluator.

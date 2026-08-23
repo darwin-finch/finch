@@ -78,10 +78,7 @@ impl ForthWireBuffer {
     }
 }
 
-fn complete_forth_wire_tokens(
-    source: &str,
-    final_boundary: bool,
-) -> Result<Vec<(usize, usize)>> {
+fn complete_forth_wire_tokens(source: &str, final_boundary: bool) -> Result<Vec<(usize, usize)>> {
     let bytes = source.as_bytes();
     let mut cursor = 0;
     let mut tokens = Vec::new();
@@ -616,7 +613,9 @@ impl ProgramDefinition {
             name,
             language: ProgramLanguage::Lisp,
             source: source.to_string(),
-            documentation: "Persisted Lisp definition".to_string(),
+            documentation: lisp_definition_documentation(source)
+                .filter(|documentation| !documentation.is_empty())
+                .unwrap_or_else(|| "Persisted Lisp definition".to_string()),
             signature,
             effect: declared_effect(source, ProgramLanguage::Lisp)
                 .unwrap_or(ExecutionEffect::Unclassified),
@@ -781,12 +780,14 @@ impl VmManifest {
             let packages = self
                 .language_packages
                 .iter()
-                .map(|package| format!(
-                    "{}@{}#{}",
-                    package.name,
-                    package.version,
-                    &package.sha256[..12]
-                ))
+                .map(|package| {
+                    format!(
+                        "{}@{}#{}",
+                        package.name,
+                        package.version,
+                        &package.sha256[..12]
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(format!("Language packages: {packages}"));
@@ -840,6 +841,32 @@ fn lisp_definition_identity(source: &str) -> Option<(String, Option<String>)> {
             let arity = head.len().saturating_sub(1);
             Some((name.clone(), Some(format!("({arity} args -> value)"))))
         }
+        _ => None,
+    }
+}
+
+/// Return a Python/Common-Lisp-style docstring from a typed Finch `define`.
+/// The typed compiler treats the first body string as metadata and omits it
+/// from the emitted IR, so this parser deliberately follows the same rule.
+fn lisp_definition_documentation(source: &str) -> Option<String> {
+    use crate::lisp::Val;
+    let expression = crate::lisp::reader::parse_str(source)
+        .ok()?
+        .into_iter()
+        .next()?;
+    let Val::List(parts) = expression else {
+        return None;
+    };
+    if parts.first() != Some(&Val::Symbol("define".to_string())) {
+        return None;
+    }
+    let body_start = if parts.get(2) == Some(&Val::Symbol(":".to_string())) {
+        4
+    } else {
+        2
+    };
+    match parts.get(body_start) {
+        Some(Val::Str(documentation)) => Some(documentation.clone()),
         _ => None,
     }
 }
@@ -912,8 +939,7 @@ mod tests {
 
     #[test]
     fn compact_wire_inference_rejects_markdown_wrappers() {
-        let error = ProgramLanguage::infer_wire_source("```forth\ns\"hi\" say\n```")
-            .unwrap_err();
+        let error = ProgramLanguage::infer_wire_source("```forth\ns\"hi\" say\n```").unwrap_err();
         assert!(error.to_string().contains("Markdown code fence"));
         assert_eq!(
             ProgramLanguage::infer_wire_source("  (say \"hi\")").unwrap(),
@@ -1054,7 +1080,11 @@ mod tests {
 
         let mut unterminated = ForthWireBuffer::default();
         unterminated.push("s\"unfinished").unwrap();
-        assert!(unterminated.finish().unwrap_err().to_string().contains("unterminated"));
+        assert!(unterminated
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("unterminated"));
     }
 
     #[test]
@@ -1099,5 +1129,15 @@ mod tests {
         assert_eq!(forth.effect, ExecutionEffect::Pure);
         assert_eq!(lisp.effect, ExecutionEffect::WorkspaceRead);
         assert!(forth.effect.runs_autonomously());
+    }
+
+    #[test]
+    fn persisted_lisp_definition_uses_first_body_string_as_docstring() {
+        let definition = ProgramDefinition::from_lisp_define(
+            "(define (double (n : int)) : int \"Return twice n.\" (* n 2))",
+            None,
+        )
+        .unwrap();
+        assert_eq!(definition.documentation, "Return twice n.");
     }
 }

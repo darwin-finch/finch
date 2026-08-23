@@ -1593,6 +1593,10 @@ struct Definition<'a> {
     name: &'a str,
     parameters: Vec<(String, Type)>,
     return_type: Option<Type>,
+    /// The first body string is a Python-style docstring. It is protocol
+    /// metadata, never a runtime stack value or an instruction in the typed
+    /// function body.
+    _documentation: Option<&'a str>,
     body: &'a [Val],
 }
 
@@ -1641,6 +1645,10 @@ fn parse_definition(expression: &Val) -> Result<Definition<'_>, Vec<VmDiagnostic
     } else {
         (None, &items[2..])
     };
+    let (documentation, body) = match body.split_first() {
+        Some((Val::Str(documentation), body)) => (Some(documentation.as_str()), body),
+        _ => (None, body),
+    };
     if body.is_empty() {
         return Err(vec![VmDiagnostic::error(
             "E-LISP-DEF-001",
@@ -1653,6 +1661,7 @@ fn parse_definition(expression: &Val) -> Result<Definition<'_>, Vec<VmDiagnostic
         name,
         parameters,
         return_type,
+        _documentation: documentation,
         body,
     })
 }
@@ -1875,6 +1884,15 @@ mod tests {
                  (factorial 6)")
             .unwrap(),
             vec![TypedValue::Int(720)]
+        );
+    }
+
+    #[test]
+    fn strips_common_lisp_style_definition_docstrings_from_the_ir() {
+        assert_eq!(
+            run("(define (double (n : int)) : int \"Return twice n.\" (* n 2)) (double 21)")
+                .unwrap(),
+            vec![TypedValue::Int(42)]
         );
     }
 
