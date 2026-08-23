@@ -92,6 +92,19 @@ fn source_syntax_matches(entry: &SourceSyntaxEntry, query: &str) -> bool {
             .any(|language| language.to_ascii_lowercase().contains(query))
 }
 
+fn name_match_rank(name: &str, query: &str) -> u8 {
+    let name = name.to_ascii_lowercase();
+    if name == query {
+        0
+    } else if name.contains(query) {
+        1
+    } else {
+        // A documentation-only hit is useful discovery context, but it must
+        // never crowd an exact/partial name out of a compact result page.
+        2
+    }
+}
+
 fn core_word_matches(name: &str, query: &str) -> bool {
     let documentation = vm_core_word_documentation(name);
     name.to_ascii_lowercase().contains(query)
@@ -243,10 +256,14 @@ impl Tool for SearchVmVocabularyTool {
             .unwrap_or(25)
             .clamp(1, 100) as usize;
         let state = self.runtime.inspect().await?;
-        let matches = state
+        let mut matching_words = state
             .typed_vocabulary
             .into_iter()
             .filter(|entry| core_word_matches(&entry.name, &query))
+            .collect::<Vec<_>>();
+        matching_words.sort_by_key(|entry| name_match_rank(&entry.name, &query));
+        let matches = matching_words
+            .into_iter()
             .take(limit)
             .map(|entry| {
                 let documentation = vm_core_word_documentation(&entry.name);
@@ -259,9 +276,13 @@ impl Tool for SearchVmVocabularyTool {
                 })
             })
             .collect::<Vec<_>>();
-        let syntax_matches = SOURCE_SYNTAX
+        let mut matching_syntax = SOURCE_SYNTAX
             .iter()
             .filter(|entry| source_syntax_matches(entry, &query))
+            .collect::<Vec<_>>();
+        matching_syntax.sort_by_key(|entry| name_match_rank(entry.name, &query));
+        let syntax_matches = matching_syntax
+            .into_iter()
             .take(limit)
             .map(|entry| {
                 json!({
@@ -398,10 +419,14 @@ impl Tool for SearchWordTool {
             .unwrap_or(25)
             .clamp(1, 100) as usize;
         let state = self.runtime.inspect().await?;
-        let core_matches = state
+        let mut matching_words = state
             .typed_vocabulary
             .into_iter()
             .filter(|entry| core_word_matches(&entry.name, &query))
+            .collect::<Vec<_>>();
+        matching_words.sort_by_key(|entry| name_match_rank(&entry.name, &query));
+        let core_matches = matching_words
+            .into_iter()
             .take(limit)
             .map(|entry| {
                 let documentation = vm_core_word_documentation(&entry.name);
@@ -415,9 +440,13 @@ impl Tool for SearchWordTool {
                 })
             })
             .collect::<Vec<_>>();
-        let syntax_matches = SOURCE_SYNTAX
+        let mut matching_syntax = SOURCE_SYNTAX
             .iter()
             .filter(|entry| source_syntax_matches(entry, &query))
+            .collect::<Vec<_>>();
+        matching_syntax.sort_by_key(|entry| name_match_rank(entry.name, &query));
+        let syntax_matches = matching_syntax
+            .into_iter()
             .take(limit)
             .map(|entry| {
                 json!({
