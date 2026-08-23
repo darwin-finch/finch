@@ -427,6 +427,24 @@ impl Compiler<'_> {
     fn predeclare_definition(&mut self, expression: &Val) -> Result<(), Vec<VmDiagnostic>> {
         let definition = parse_definition(expression)?;
         let Some(result) = definition.return_type else {
+            // A recursive definition needs an input/output contract before we
+            // compile its body.  Without it the eventual failure looks like
+            // an unrelated unknown-word error, which is especially unhelpful
+            // to a provider repairing a wire program.
+            if definition
+                .body
+                .iter()
+                .any(|body| expression_mentions_symbol(body, definition.name))
+            {
+                return Err(vec![self.error(
+                    "E-LISP-DEF-008",
+                    format!(
+                        "recursive function '{}' requires a return type: \
+                         (define ({} (arg : type) ...) : result-type body...)",
+                        definition.name, definition.name
+                    ),
+                )]);
+            }
             return Ok(());
         };
         if definition.name == "main"
@@ -1325,6 +1343,19 @@ impl Compiler<'_> {
     }
 }
 
+/// Conservative structural check used only to improve the diagnostic for an
+/// unannotated self-recursive definition.  The reader has no separate call
+/// node: a list whose first item is the definition name is a named call.
+fn expression_mentions_symbol(expression: &Val, name: &str) -> bool {
+    match expression {
+        Val::List(items) => items.iter().any(|item| match item {
+            Val::Symbol(symbol) => symbol == name,
+            nested => expression_mentions_symbol(nested, name),
+        }),
+        _ => false,
+    }
+}
+
 fn output_operation(word: &str) -> Option<UiOperation> {
     match word {
         "output-append" => Some(UiOperation::Append),
@@ -1636,6 +1667,21 @@ mod tests {
             .unwrap(),
             vec![TypedValue::Int(720)]
         );
+    }
+
+    #[test]
+    fn explains_that_unannotated_recursion_needs_a_return_type() {
+        let errors = compile_lisp(
+            "input.lisp",
+            "(define (factorial (n : int)) \
+                (if (<= n 1) 1 (* n (factorial (- n 1)))))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| {
+            error.code == "E-LISP-DEF-008" && error.message.contains("return type")
+        }));
     }
 
     #[test]
