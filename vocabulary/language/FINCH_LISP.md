@@ -19,6 +19,8 @@ The ordinary response is `(say "Hello")`. Pure and compound examples:
 (if (> 4 2) (say "yes") (say "no"))
 (let ((n 10)) ((lambda ((x : int)) (+ x n)) 5))
 (define (square (x : int)) (* x x))
+(define (factorial (n : int)) : int
+  (if (<= n 1) 1 (* n (factorial (- n 1)))))
 (list-get (list 4 8 15 16) 2)
 (file-read (path "Cargo.toml"))
 (file-write (path "generated/result.bin") data)
@@ -62,8 +64,12 @@ extra result values; it is not an arbitrary jump.
 
 The version-1 typed frontend currently accepts literals, homogeneous non-empty lists, core
 vocabulary calls, `begin`, lexical `let`, typed `if`, typed `while`, typed `lambda`, closure calls,
-and typed function definitions using `(define (name (arg : type) ...) body...)`. Definitions enter
-the persistent shared dictionary only if the entire submission verifies, is authorized, and commits.
+and typed function definitions using `(define (name (arg : type) ...) body...)`. For self- or
+mutually-recursive pure functions, put a return type after the header:
+`(define (name (arg : type) ...) : result-type body...)`. Finch predeclares that signature before
+compiling bodies, so recursive calls remain type-checked. Return-annotated definitions must be pure
+until effect annotations are added. Definitions enter the persistent shared dictionary only if the
+entire submission verifies, is authorized, and commits.
 Legacy variable definitions and other unsupported legacy forms are not part of the provider
 language. They require an explicitly named host migration API; ordinary program submission never
 falls back to a compatibility evaluator.

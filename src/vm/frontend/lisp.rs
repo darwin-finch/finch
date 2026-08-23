@@ -161,6 +161,10 @@ struct Compiler<'a> {
     source_id: &'a str,
     source: &'a str,
     vocabulary: Vocabulary,
+    /// Explicitly typed definitions are registered before their bodies compile.
+    /// This makes recursive and mutually-recursive calls visible without
+    /// introducing an untyped placeholder into the shared vocabulary.
+    predeclared: BTreeMap<String, StackSignature>,
     functions: BTreeMap<String, Function>,
     next_lambda: u64,
 }
@@ -201,9 +205,15 @@ pub fn compile_lisp_with_functions(
         source_id,
         source,
         vocabulary: vocabulary.clone(),
+        predeclared: BTreeMap::new(),
         functions: BTreeMap::new(),
         next_lambda: 0,
     };
+    for expression in &expressions {
+        if is_definition(expression) {
+            compiler.predeclare_definition(expression)?;
+        }
+    }
     let mut executable = Vec::new();
     for expression in &expressions {
         if is_definition(expression) {
@@ -349,38 +359,18 @@ impl Compiler<'_> {
     }
 
     fn compile_definition(&mut self, expression: &Val) -> Result<(), Vec<VmDiagnostic>> {
-        let Val::List(items) = expression else {
-            unreachable!("definition predicate only accepts lists");
-        };
-        if items.len() < 3 {
-            return Err(vec![self.error(
-                "E-LISP-DEF-001",
-                "define requires a function header and body",
-            )]);
-        }
-        let Val::List(header) = &items[1] else {
-            return Err(vec![self.error(
-                "E-LISP-DEF-002",
-                "typed define must use (define (name (arg : type) ...) body...)",
-            )]);
-        };
-        let Some(Val::Symbol(name)) = header.first() else {
-            return Err(vec![self.error(
-                "E-LISP-DEF-003",
-                "function definition requires a symbol name",
-            )]);
-        };
-        if name == "main" || self.vocabulary.contains_key(name) || self.functions.contains_key(name)
+        let definition = parse_definition(expression)?;
+        let name = definition.name;
+        if name == "main"
+            || self.functions.contains_key(name)
+            || (self.vocabulary.contains_key(name) && !self.predeclared.contains_key(name))
         {
             return Err(vec![self.error(
                 "E-LISP-DEF-004",
                 format!("function '{name}' is already defined"),
             )]);
         }
-        let parameters = header[1..]
-            .iter()
-            .map(parse_parameter)
-            .collect::<Result<Vec<_>, _>>()?;
+        let parameters = definition.parameters;
         let arguments = parameters
             .iter()
             .map(|(_, ty)| ty.clone())
@@ -405,14 +395,67 @@ impl Compiler<'_> {
                 self.origin("define-parameter"),
             );
         }
-        let result_type = self.compile_begin(&items[2..], &mut child)?;
+        let result_type = self.compile_begin(definition.body, &mut child)?;
+        if let Some(expected) = definition.return_type {
+            if result_type != expected {
+                return Err(vec![self.error(
+                    "E-LISP-DEF-005",
+                    format!(
+                        "function '{name}' declares return type {expected}, but its body returns {result_type}"
+                    ),
+                )]);
+            }
+            if !child.effects.is_pure() {
+                return Err(vec![self.error(
+                    "E-LISP-DEF-007",
+                    format!(
+                        "function '{name}' has a predeclared recursive signature and must be pure; effect annotations are not implemented yet"
+                    ),
+                )]);
+            }
+        }
         child.stack.push(result_type);
         child.emit(Instruction::Return, self.origin("define-return"));
         let output = child.stack.clone();
         let function = child.finish(output);
         self.vocabulary
-            .insert(name.clone(), function.signature.clone());
-        self.functions.insert(name.clone(), function);
+            .insert(name.to_string(), function.signature.clone());
+        self.functions.insert(name.to_string(), function);
+        Ok(())
+    }
+
+    fn predeclare_definition(&mut self, expression: &Val) -> Result<(), Vec<VmDiagnostic>> {
+        let definition = parse_definition(expression)?;
+        let Some(result) = definition.return_type else {
+            return Ok(());
+        };
+        if definition.name == "main"
+            || self.vocabulary.contains_key(definition.name)
+            || self.predeclared.contains_key(definition.name)
+        {
+            return Err(vec![self.error(
+                "E-LISP-DEF-004",
+                format!("function '{}' is already defined", definition.name),
+            )]);
+        }
+        let signature = StackSignature {
+            type_parameters: Vec::new(),
+            input: StackRow::polymorphic(
+                "S",
+                definition
+                    .parameters
+                    .iter()
+                    .map(|(_, ty)| ty.clone())
+                    .collect(),
+            ),
+            output: StackRow::polymorphic("S", vec![result]),
+            effects: EffectSet::pure(),
+            control: ControlEffect::Returns,
+        };
+        self.vocabulary
+            .insert(definition.name.to_string(), signature.clone());
+        self.predeclared
+            .insert(definition.name.to_string(), signature);
         Ok(())
     }
 
@@ -1301,6 +1344,77 @@ fn is_definition(expression: &Val) -> bool {
     )
 }
 
+/// Parsed typed function definition. An explicit `: return-type` after the
+/// header makes the signature available before the body is compiled, which is
+/// required for self- and mutually-recursive calls.
+struct Definition<'a> {
+    name: &'a str,
+    parameters: Vec<(String, Type)>,
+    return_type: Option<Type>,
+    body: &'a [Val],
+}
+
+fn parse_definition(expression: &Val) -> Result<Definition<'_>, Vec<VmDiagnostic>> {
+    let Val::List(items) = expression else {
+        unreachable!("definition predicate only accepts lists");
+    };
+    if items.len() < 3 {
+        return Err(vec![VmDiagnostic::error(
+            "E-LISP-DEF-001",
+            DiagnosticPhase::TypeInference,
+            "define requires a function header and body",
+            None,
+        )]);
+    }
+    let Val::List(header) = &items[1] else {
+        return Err(vec![VmDiagnostic::error(
+            "E-LISP-DEF-002",
+            DiagnosticPhase::TypeInference,
+            "typed define must use (define (name (arg : type) ...) [: return-type] body...)",
+            None,
+        )]);
+    };
+    let Some(Val::Symbol(name)) = header.first() else {
+        return Err(vec![VmDiagnostic::error(
+            "E-LISP-DEF-003",
+            DiagnosticPhase::TypeInference,
+            "function definition requires a symbol name",
+            None,
+        )]);
+    };
+    let parameters = header[1..]
+        .iter()
+        .map(parse_parameter)
+        .collect::<Result<Vec<_>, _>>()?;
+    let (return_type, body) = if items.get(2) == Some(&Val::Symbol(":".into())) {
+        let Some(annotation) = items.get(3) else {
+            return Err(vec![VmDiagnostic::error(
+                "E-LISP-DEF-006",
+                DiagnosticPhase::TypeInference,
+                "function return annotation requires a type after ':'",
+                None,
+            )]);
+        };
+        (Some(parse_type(annotation)?), &items[4..])
+    } else {
+        (None, &items[2..])
+    };
+    if body.is_empty() {
+        return Err(vec![VmDiagnostic::error(
+            "E-LISP-DEF-001",
+            DiagnosticPhase::TypeInference,
+            "define requires a function body",
+            None,
+        )]);
+    }
+    Ok(Definition {
+        name,
+        parameters,
+        return_type,
+        body,
+    })
+}
+
 fn parse_parameter(parameter: &Val) -> Result<(String, Type), Vec<VmDiagnostic>> {
     let (name, type_value) = match parameter {
         Val::List(parts) if parts.len() == 3 && parts[1] == Val::Symbol(":".into()) => {
@@ -1442,6 +1556,43 @@ mod tests {
             instructions[3].instruction,
             Instruction::LocalGet { index: 1 }
         ));
+    }
+
+    #[test]
+    fn compiles_a_recursively_typed_function() {
+        assert_eq!(
+            run(
+                "(define (factorial (n : int)) : int \
+                   (if (<= n 1) 1 (* n (factorial (- n 1))))) \
+                 (factorial 6)"
+            )
+            .unwrap(),
+            vec![TypedValue::Int(720)]
+        );
+    }
+
+    #[test]
+    fn rejects_a_definition_whose_return_annotation_disagrees_with_its_body() {
+        let errors = compile_lisp(
+            "input.lisp",
+            "(define (wrong (n : int)) : string (+ n 1))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "E-LISP-DEF-005"));
+    }
+
+    #[test]
+    fn rejects_an_effectful_predeclared_definition_until_effect_annotations_exist() {
+        let errors = compile_lisp(
+            "input.lisp",
+            "(define (announce (text : string)) : unit (say text))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "E-LISP-DEF-007"));
     }
 
     #[test]
