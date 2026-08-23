@@ -22,6 +22,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Specify and implement the provider wire discriminator: leading `(` selects Lisp and all other
   valid program starts select Co-Forth; make the receiver incrementally tokenize Co-Forth while
   retaining complete-program verification and clear malformed-wire diagnostics.
+- [ ] Add one bounded provider-wire repair turn for reader/type/capability diagnostics. Preserve the
+  rejected source and its diagnostic as journaled program/output WorkUnits, send the structured
+  error plus exact source back to the same provider, and render any replacement as a new program
+  rather than silently overwriting history. Never auto-retry a host effect, approval, cancellation,
+  timeout, or externally partial operation.
 - [ ] Publish the canonical source surface in the generated language package: `s"..."` strings,
   exact escaping/comment rules, `say` composition, Lisp form examples, and no-free-prose protocol
   rule. Include common stack-error corrections rather than only error codes.
