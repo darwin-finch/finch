@@ -686,6 +686,8 @@ mod script_tests {
             "get_language_definition",
             "search_vm_vocabulary",
             "inspect_vm_word",
+            "search_word",
+            "inspect_word",
         ] {
             assert!(registry.has_tool(name), "missing query VM tool {name}");
         }
