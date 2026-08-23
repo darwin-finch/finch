@@ -10,12 +10,20 @@
 ///
 /// ## Entry points
 ///
-/// ```
+/// ```no_run
+/// use std::sync::Arc;
+/// use finch::lisp::{self, LispCtx};
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let ctx = Arc::new(LispCtx::new());
 /// // Parse + eval one or more top-level expressions.  Returns the last value.
-/// let result = lisp::run("(+ 1 2)", &ctx).await?;
+/// let result = lisp::run("(+ 1 2)", Arc::clone(&ctx)).await?;
 ///
 /// // Evaluate into a pre-existing environment (persists defines across calls).
-/// let result = lisp::run_in(src, env, ctx).await?;
+/// let env = lisp::make_env();
+/// let result = lisp::run_in("(define answer 42)", env, ctx).await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// ## SSH example
