@@ -517,7 +517,10 @@ async fn run_direct_typed_source(
         .first()
         .cloned()
         .unwrap_or_else(|| format!("program ended as {:?}", outcome.status));
-    anyhow::bail!("typed {} program did not complete: {detail}", language.as_str())
+    anyhow::bail!(
+        "typed {} program did not complete: {detail}",
+        language.as_str()
+    )
 }
 
 #[cfg(test)]
@@ -526,8 +529,7 @@ mod script_tests {
 
     #[test]
     fn shebang_style_exec_arguments_parse_as_a_script_invocation() {
-        let args =
-            Args::try_parse_from(["finch", "--exec", "reply.lisp", "--json"]).unwrap();
+        let args = Args::try_parse_from(["finch", "--exec", "reply.lisp", "--json"]).unwrap();
         assert_eq!(args.exec_script, Some(PathBuf::from("reply.lisp")));
         assert!(args.json);
     }
@@ -552,9 +554,8 @@ mod script_tests {
         let error = run_finch_script(script.path().to_path_buf(), false)
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("E-FORTH-SIG-001"),
+        assert!(
+            error.to_string().contains("E-FORTH-SIG-001"),
             "expected typed-only rejection, got: {error:#}"
         );
 
@@ -564,9 +565,8 @@ mod script_tests {
         let error = run_finch_script(script.path().to_path_buf(), true)
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("E-FORTH-SIG-001"),
+        assert!(
+            error.to_string().contains("E-FORTH-SIG-001"),
             "expected JSON-mode typed rejection, got: {error:#}"
         );
     }
@@ -596,12 +596,10 @@ mod script_tests {
         .await
         .unwrap();
 
-        let error = run_direct_typed_source(
-            finch::programs::ProgramLanguage::Forth,
-            ": legacy-only 1 ;",
-        )
-        .await
-        .unwrap_err();
+        let error =
+            run_direct_typed_source(finch::programs::ProgramLanguage::Forth, ": legacy-only 1 ;")
+                .await
+                .unwrap_err();
         assert!(
             error.to_string().contains("E-FORTH-SIG-001"),
             "expected typed-only rejection, got: {error:#}"
@@ -623,9 +621,18 @@ mod script_tests {
 
     #[test]
     fn one_shot_wire_repair_is_limited_to_static_vm_diagnostics() {
-        assert!(is_repairable_one_shot_wire_diagnostic("E-READ-004: missing quote"));
-        assert!(is_repairable_one_shot_wire_diagnostic("E-LINK-002: unknown word"));
-        assert!(!is_repairable_one_shot_wire_diagnostic("E-LIMIT-001: fuel exhausted"));
+        assert!(is_repairable_one_shot_wire_diagnostic(
+            "E-READ-004: missing quote"
+        ));
+        assert!(is_repairable_one_shot_wire_diagnostic(
+            "E-LINK-002: unknown word"
+        ));
+        assert!(is_repairable_one_shot_wire_diagnostic(
+            "E-WIRE-002: Markdown code fence"
+        ));
+        assert!(!is_repairable_one_shot_wire_diagnostic(
+            "E-LIMIT-001: fuel exhausted"
+        ));
 
         let request = one_shot_wire_repair_request("Hello!", "E-LINK-002: unknown word");
         assert!(request.contains("exactly one complete raw Finch Lisp or Co-Forth program"));
@@ -636,7 +643,9 @@ mod script_tests {
     #[test]
     fn daemon_and_teacher_one_shot_paths_share_the_vm_wire_contract() {
         let prompt = vm_wire_system_prompt();
-        assert!(prompt.contains("Every text response is exactly one complete executable Finch program"));
+        assert!(
+            prompt.contains("Every text response is exactly one complete executable Finch program")
+        );
         assert!(prompt.contains("Default to Lisp"));
     }
 
@@ -802,8 +811,7 @@ async fn main() -> Result<()> {
     // legacy interpreter's home; provider-facing/direct source must not gain
     // a bypass around the shared verifier and capability broker.
     if let Some(forth_expr) = &args.forth {
-        return run_direct_typed_source(finch::programs::ProgramLanguage::Forth, forth_expr)
-            .await;
+        return run_direct_typed_source(finch::programs::ProgramLanguage::Forth, forth_expr).await;
     }
 
     // Check for piped input BEFORE initializing anything else
@@ -1875,7 +1883,9 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
 /// Build the standard tool registry + executor used for non-interactive query mode.
 /// Auto-approves all tools (no interactive prompting in non-interactive mode).
-async fn build_query_tool_executor(config: &Config) -> Result<(
+async fn build_query_tool_executor(
+    config: &Config,
+) -> Result<(
     Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
     Vec<finch::tools::types::ToolDefinition>,
     Arc<finch::runtime::ProgramRuntime>,
@@ -2189,9 +2199,15 @@ async fn run_query_teacher_only(
             let source = response.text();
             let outcome = match execute_one_shot_wire_source(&program_runtime, &source).await {
                 Ok(outcome) => outcome,
-                Err(error) if !wire_repair_requested && is_repairable_one_shot_wire_diagnostic(&error.to_string()) => {
+                Err(error)
+                    if !wire_repair_requested
+                        && is_repairable_one_shot_wire_diagnostic(&error.to_string()) =>
+                {
                     messages.push(response.to_message());
-                    messages.push(Message::user(one_shot_wire_repair_request(&source, &error.to_string())));
+                    messages.push(Message::user(one_shot_wire_repair_request(
+                        &source,
+                        &error.to_string(),
+                    )));
                     wire_repair_requested = true;
                     continue;
                 }
@@ -2209,7 +2225,10 @@ async fn run_query_teacher_only(
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
             if !wire_repair_requested && can_repair_one_shot_wire_outcome(&outcome) {
                 messages.push(response.to_message());
-                messages.push(Message::user(one_shot_wire_repair_request(&source, &diagnostic)));
+                messages.push(Message::user(one_shot_wire_repair_request(
+                    &source,
+                    &diagnostic,
+                )));
                 wire_repair_requested = true;
                 continue;
             }
@@ -2333,6 +2352,7 @@ fn is_repairable_one_shot_wire_diagnostic(diagnostic: &str) -> bool {
             || value.starts_with("E-FORTH-")
             || value.starts_with("E-LINK-")
             || value.starts_with("E-CAP-")
+            || value.starts_with("E-WIRE-")
     )
 }
 
