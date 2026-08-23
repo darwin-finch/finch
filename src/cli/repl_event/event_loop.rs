@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::claude::ContentBlock;
 use crate::cli::commands::{format_help, Command};
 use crate::cli::conversation::ConversationHistory;
-use crate::cli::output_manager::OutputManager;
+use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::{spawn_input_task, TuiRenderer};
@@ -3086,17 +3086,12 @@ Rules:\n\
     async fn handle_forth_or_query(&mut self, input: String) -> Result<()> {
         // Lisp
         if input.trim_start().starts_with('(') {
-            let src = input.clone();
-            let ctx = self.lisp_ctx.clone();
-            let env = self.lisp_env.clone();
-            let event_tx = self.event_tx.clone();
-            tokio::spawn(async move {
-                let result = crate::lisp::run_in(&src, env, ctx)
-                    .await
-                    .map(|v| v.to_string());
-                let _ = event_tx.send(super::events::ReplEvent::LispResult { result });
-            });
-            return Ok(());
+            return self
+                .execute_interactive_typed_program(
+                    crate::programs::ProgramLanguage::Lisp,
+                    input,
+                )
+                .await;
         }
         let is_nl = looks_like_natural_language(
             &input,
@@ -3109,6 +3104,58 @@ Rules:\n\
             return self.execute_query(input).await;
         }
         self.handle_stack_push(input).await
+    }
+
+    /// Execute explicit interactive source through the same typed runtime and
+    /// portable output projection as provider wire responses.  Legacy Lisp is
+    /// intentionally not a fallback here: an opening `(` is an unambiguous
+    /// Finch-Lisp program and must receive typed diagnostics.
+    async fn execute_interactive_typed_program(
+        &mut self,
+        language: crate::programs::ProgramLanguage,
+        source: String,
+    ) -> Result<()> {
+        self.program_runtime.grant_typed_capability(crate::vm::CapabilityRequirement {
+            capability: crate::vm::CapabilityKind::SessionEmit,
+            selector: crate::vm::ResourceSelector::None,
+        })?;
+
+        let source_unit = self.output_manager.start_work_unit("typed program");
+        source_unit.set_program_source(language.as_str());
+        source_unit.set_response(source.clone());
+        source_unit.set_complete();
+        let output_unit = self.output_manager.start_work_unit("VM program output");
+        output_unit.set_program_output();
+        let projection = VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
+        let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
+            projection.project(&envelope.effect);
+        });
+        let outcome = self
+            .program_runtime
+            .submit_with_deferred_program_effects(
+                crate::runtime::ProgramSubmission {
+                    language,
+                    source,
+                    intent: "interactive typed source".into(),
+                    effect: crate::programs::ExecutionEffect::Unclassified,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: self.program_runtime.manifest_generation(),
+                    expected_revision: Some(self.program_runtime.revision()),
+                    budget: None,
+                },
+                sink,
+            )
+            .await?;
+        if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
+            let detail = outcome
+                .diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+            output_unit.append_response(&format!("VM error: {detail}"));
+        }
+        output_unit.set_complete();
+        self.render_tui().await
     }
 
     /// Execute a query with echo (used by /run where the query hasn't been displayed yet).
