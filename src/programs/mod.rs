@@ -114,7 +114,10 @@ fn complete_forth_wire_tokens(source: &str, final_boundary: bool) -> Result<Vec<
                 None => break,
             }
         }
-        if source[start..].starts_with("s\"") {
+        // `s"..."` pushes a string and standard Forth `."..."` emits one.
+        // Both use the same escaping and optional single-space delimiter, so
+        // the wire receiver must keep either form intact while it is streamed.
+        if source[start..].starts_with("s\"") || source[start..].starts_with(".\"") {
             cursor += 2;
             if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
@@ -1097,6 +1100,24 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unterminated"));
+    }
+
+    #[test]
+    fn forth_wire_buffer_keeps_standard_dot_quote_output_literal_atomic() {
+        let mut buffer = ForthWireBuffer::default();
+        assert!(buffer.push(".\" hello").unwrap().is_empty());
+        assert_eq!(
+            buffer.push(" world\" ").unwrap(),
+            vec![ForthWireToken {
+                start_byte: 0,
+                end_byte: 15,
+                source: ".\" hello world\"".into(),
+            }]
+        );
+
+        let mut unterminated = ForthWireBuffer::default();
+        unterminated.push(".\" unfinished").unwrap();
+        assert!(unterminated.finish().unwrap_err().to_string().contains("unterminated"));
     }
 
     #[test]
