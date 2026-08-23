@@ -1636,10 +1636,13 @@ impl EventLoop {
 
         {
             let mut tui = self.tui_renderer.lock().await;
-            if let Err(e) = tui.print_startup_header(&model_name, &cwd, &self.session_label) {
-                tracing::warn!("Failed to print startup header: {}", e);
-            }
+            tui.set_session_label(self.session_label.clone());
         }
+        self.output_manager.write_info(TuiRenderer::startup_header(
+            &model_name,
+            &cwd,
+            &self.session_label,
+        ));
         // ─────────────────────────────────────────────────────────────────────
 
         // Show weekly license notice for non-commercial users (honor system)

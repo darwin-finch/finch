@@ -516,7 +516,8 @@ pub struct TuiRenderer {
     // True once we've shown the first-panel hint line — shown once, then silent.
     panel_hint_shown: bool,
 
-    // Session identity — set by print_startup_header(); shown in separator line.
+    // Session identity — set before the first live-area render; shown in the
+    // separator line.
     session_label: String,
 
     /// Words currently being typed (updated on each keystroke via set_typing_words).
@@ -1273,82 +1274,23 @@ impl TuiRenderer {
 // ─── Startup header ───────────────────────────────────────────────────────────
 
 impl TuiRenderer {
-    pub fn print_startup_header(
-        &mut self,
-        model: &str,
-        cwd: &str,
-        session_label: &str,
-    ) -> Result<()> {
+    /// Set session identity without writing to the terminal.  Startup content
+    /// must reach scrollback through `OutputManager` so it participates in the
+    /// same ordered commit path as every other message.
+    pub fn set_session_label(&mut self, session_label: impl Into<String>) {
+        self.session_label = session_label.into();
+    }
+
+    /// Build the static startup artifact for `OutputManager` projection.
+    ///
+    /// This deliberately returns plain text rather than issuing crossterm
+    /// commands: direct header writes can race the shadow-buffer live area and
+    /// corrupt scrollback accounting on the first redraw.
+    pub fn startup_header(model: &str, cwd: &str, session_label: &str) -> String {
         let version = env!("CARGO_PKG_VERSION");
-
-        // Store session label so blit_visible_area() can embed it in the separator.
-        self.session_label = session_label.to_string();
-
-        // Darwin finch ASCII bird — 6 lines.
-        // Columns 0-14: bird art.  Column 15+: info text.
-        //
-        //   Line 1:       ▄▄▄▄▄▄              (head top — art only)
-        //   Line 2:     ▗▟█●██▙►  finch v…    (head + beak + version)
-        //   Line 3:   ▐████████▌  <model>      (upper body + model name)
-        //   Line 4:   ▝▜██████▛▘  <cwd>        (lower body + cwd)
-        //   Line 5:      ╥  ╥                  (legs)
-        //   Line 6:     ╱    ╲                 (perch)
-        execute!(
-            io::stdout(),
-            // Line 1 — head top
-            Print("      "),
-            SetForegroundColor(Color::DarkYellow),
-            Print("▄▄▄▄▄▄"),
-            ResetColor,
-            Print("\r\n"),
-            // Line 2 — head with eye, beak, version
-            Print("    "),
-            SetForegroundColor(Color::DarkYellow),
-            Print("▗▟█"),
-            SetForegroundColor(Color::White),
-            Print("●"),
-            SetForegroundColor(Color::DarkYellow),
-            Print("██▙"),
-            SetForegroundColor(Color::Yellow),
-            SetAttribute(Attribute::Bold),
-            Print("►"),
-            ResetColor,
-            Print("  "),
-            SetAttribute(Attribute::Bold),
-            Print(format!("finch v{}", version)),
-            SetAttribute(Attribute::Reset),
-            Print("\r\n"),
-            // Line 3 — upper body + model name
-            Print("  "),
-            SetForegroundColor(Color::DarkYellow),
-            Print("▐████████▌"),
-            ResetColor,
-            Print(format!("   {}\r\n", model)),
-            // Line 4 — lower body + session · cwd
-            Print("  "),
-            SetForegroundColor(Color::DarkYellow),
-            Print("▝▜██████▛▘"),
-            ResetColor,
-            Print("   "),
-            SetForegroundColor(Color::DarkGrey),
-            Print(format!("{}  ·  {}", session_label, cwd)),
-            ResetColor,
-            Print("\r\n"),
-            // Line 5 — legs + proof count
-            Print("     "),
-            SetForegroundColor(Color::DarkGrey),
-            Print("╥  ╥"),
-            ResetColor,
-            Print("\r\n"),
-            // Line 6 — perch
-            Print("    "),
-            SetForegroundColor(Color::DarkGrey),
-            Print("╱    ╲"),
-            ResetColor,
-            Print("\r\n"),
-        )?;
-
-        self.draw_live_area()
+        format!(
+            "      ▄▄▄▄▄▄\n    ▗▟█●██▙►  finch v{version}\n  ▐████████▌   {model}\n  ▝▜██████▛▘   {session_label}  ·  {cwd}\n     ╥  ╥\n    ╱    ╲"
+        )
     }
 }
 
@@ -2387,6 +2329,15 @@ mod tests {
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
     use crate::cli::messages::WorkUnit;
+
+    #[test]
+    fn startup_header_is_plain_scrollback_content() {
+        let header = TuiRenderer::startup_header("grok-code-fast-1", "~/repo", "amber-river");
+        assert!(header.contains("finch v"));
+        assert!(header.contains("grok-code-fast-1"));
+        assert!(header.contains("amber-river  ·  ~/repo"));
+        assert!(!header.contains('\x1b'));
+    }
 
     // ── count_status_lines ────────────────────────────────────────────────────
 
