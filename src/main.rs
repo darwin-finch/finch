@@ -480,6 +480,47 @@ fn terminal_script_presentation(output: &str) -> Option<String> {
     })
 }
 
+/// Evaluate source supplied directly at the command line through the same
+/// typed runtime as scripts and provider wire responses.  This deliberately
+/// does not fall back to either legacy interpreter: a direct Lisp/Co-Forth
+/// program must have the same verifier, capabilities, and diagnostics as an
+/// LLM-authored program.
+async fn run_direct_typed_source(
+    language: finch::programs::ProgramLanguage,
+    source: &str,
+) -> Result<()> {
+    let runtime = finch::runtime::ProgramRuntime::new();
+    runtime.grant_typed_capability(finch::vm::CapabilityRequirement {
+        capability: finch::vm::CapabilityKind::SessionEmit,
+        selector: finch::vm::ResourceSelector::None,
+    })?;
+    let outcome = runtime
+        .submit_typed_only(finch::runtime::ProgramSubmission {
+            language,
+            source: source.to_string(),
+            intent: "direct typed command-line program".to_string(),
+            effect: finch::programs::ExecutionEffect::Unclassified,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: None,
+            budget: None,
+        })
+        .await?;
+
+    if let Some(presentation) = terminal_script_presentation(&outcome.output) {
+        print!("{presentation}");
+    }
+    if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
+        return Ok(());
+    }
+    let detail = outcome
+        .diagnostics
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("program ended as {:?}", outcome.status));
+    anyhow::bail!("typed {} program did not complete: {detail}", language.as_str())
+}
+
 #[cfg(test)]
 mod script_tests {
     use super::*;
@@ -1859,29 +1900,17 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
     use finch::client::DaemonClient;
     use finch::daemon::ensure_daemon_running;
 
-    // Short-circuit: Lisp expressions (start with `(` or `$`) — before Forth check.
-    if query.trim_start().starts_with('(') || query.trim_start().starts_with('$') {
+    // Short-circuit: typed Lisp expressions start with `(` — before Forth check.
+    if query.trim_start().starts_with('(') {
         println!("{}", query);
-        let ctx = std::sync::Arc::new(finch::lisp::LispCtx::new());
-        let env = finch::lisp::make_env();
-        match finch::lisp::run_in(query, env, ctx).await {
-            Ok(val) => println!("{}", val),
-            Err(e) => eprintln!("lisp error: {}", e),
-        }
+        run_direct_typed_source(finch::programs::ProgramLanguage::Lisp, query).await?;
         return Ok(());
     }
 
-    // Short-circuit: run Forth code directly in the VM, no AI involved.
+    // Short-circuit: run typed Co-Forth directly, no AI involved.
     if is_clearly_forth(query) {
         println!("{}", query);
-        match finch::coforth::Forth::run(query) {
-            Ok(out) => {
-                if !out.is_empty() {
-                    print!("{}", out);
-                }
-            }
-            Err(e) => eprintln!("forth error: {}", e),
-        }
+        run_direct_typed_source(finch::programs::ProgramLanguage::Forth, query).await?;
         return Ok(());
     }
 
