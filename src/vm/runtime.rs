@@ -2032,6 +2032,25 @@ mod tests {
     }
 
     #[test]
+    fn recursive_forth_definition_persists_for_later_program_runs() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute(
+            ProgramLanguage::Forth,
+            "words.forth",
+            ": factorial ( S int -- S int ! {} ) \
+               locals| n | \
+               n 1 <= if 1 else n n 1 - factorial * then ;",
+            1_000,
+        );
+        assert_eq!(definition.status, TypedExecutionStatus::Completed);
+        assert!(runtime.functions().contains_key("factorial"));
+
+        let call = runtime.execute(ProgramLanguage::Lisp, "call.lisp", "(factorial 6)", 1_000);
+        assert_eq!(call.status, TypedExecutionStatus::Completed);
+        assert_eq!(call.values, vec![TypedValue::Int(720)]);
+    }
+
+    #[test]
     fn forth_quotation_references_a_typed_word_and_executes_it() {
         let mut runtime = TypedRuntime::new();
         let result = runtime.execute(
