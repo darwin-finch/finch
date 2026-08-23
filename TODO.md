@@ -102,6 +102,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   persistent typed stack and dictionary, exposed by one inspection/revision boundary; add the
   managed heap, transaction manager, and durable revision history before treating it as a
   restartable Brain state.
+- [ ] Replace same-runtime submission serialization with revisioned private working snapshots and
+  conflict-aware commits. A `ProgramRuntime` is intentionally not a process-wide GIL—separate
+  runtimes and CPU fibers already run independently—but two ProgramRuns against one persistent
+  stack/dictionary currently serialize under its submission gate. Preserve exact external-effect
+  journals and reject or explicitly merge stale deltas; never let a losing commit hide, replay, or
+  compensate a host effect.
 - [ ] Remove the Lisp-to-Forth text compiler, native Lisp fallback, source-text effect inference,
   and duplicate direct model-tool paths after conformance parity.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
