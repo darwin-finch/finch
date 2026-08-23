@@ -413,7 +413,11 @@ impl Message for WorkUnit {
                         source
                     }
                     WorkUnitPresentation::ProgramOutput => {
-                        format!("{}{}", inner.response_text, timing)
+                        // VM output is a portable side effect, not assistant
+                        // prose. Preserve it exactly: timing belongs to the
+                        // source/activity WorkUnit and must never become part
+                        // of a `say`/output-handle payload.
+                        inner.response_text.clone()
                     }
                 };
 
@@ -665,6 +669,7 @@ mod tests {
         let output = WorkUnit::new("ignored");
         output.set_program_output();
         output.set_response("hello");
+        output.add_tokens("one two");
         output.set_complete();
         assert_eq!(output.format(&colors()), "hello");
     }
