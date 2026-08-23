@@ -14,11 +14,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Finish both source frontends and their shared typed IR semantics: definitions/signatures,
   conditionals, metered loops, locals, quotations, closures, collections, bounded macros, and
   structured error/result forms.
-- [ ] Extend the implemented typed option branches—Co-Forth `if-some ... else ... then` and Lisp
-  `match-option`—to general structured `match`/`case` plus expression-valued named `break` after
-  the loop verifier is generalized to check each target's declared result stack row. Simple named
-  stack-preserving `break`/`continue` already lower to verified loop edges; do not add
-  unrestricted jumps or C-style fallthrough switches.
+- [ ] Extend the implemented typed option/result branches, type-directed Lisp `match`, and
+  no-fallthrough integer Co-Forth `case` to richer structured patterns plus expression-valued
+  named `break` after the loop verifier is generalized to check each target's declared result
+  stack row. Simple named stack-preserving `break`/`continue` already lower to verified loop
+  edges; do not add unrestricted jumps or C-style fallthrough switches.
 - [ ] Specify and implement the provider wire discriminator: leading `(` selects Lisp and all other
   valid program starts select Co-Forth; make the receiver incrementally tokenize Co-Forth while
   retaining complete-program verification and clear malformed-wire diagnostics.

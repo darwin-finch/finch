@@ -54,6 +54,10 @@ payload lexically. Both arms are required and must merge with the same verified 
 Lisp may use the type-directed `(match value arms...)` spelling for these two exhaustive tagged
 forms; it selects the same lowering and never falls back to dynamic pattern dispatch.
 
+Co-Forth also supports an integer `case` with `of ... endof` arms and an optional `otherwise`.
+It lowers to the same verified branch edges, has no fallthrough, and requires every reachable arm
+to leave the same stack row. It is not a dynamic dictionary dispatch or C-style switch.
+
 Capabilities are positive, scoped grants such as:
 
 ```text

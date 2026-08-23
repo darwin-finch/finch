@@ -52,6 +52,23 @@ else
 then
 ```
 
+`case` is a typed integer switch with no fallthrough. Each `of ... endof` arm and the optional
+`otherwise` arm must leave the same stack row. The selector is removed before an arm begins;
+`otherwise` is required whenever an unmatched case must produce values. This is structured branch
+syntax, not a dynamic dictionary lookup:
+
+```forth
+2 case
+  1 of 10 endof
+  2 of 20 endof
+  otherwise 30
+endcase                 \ leaves 20
+```
+
+Without `otherwise`, a non-matching selector is simply dropped, so every selected arm must also
+leave no values. Use a typed `if`/`if-some`/`if-ok` when the branch condition is not an integer
+selector.
+
 Typed signatures use `S` for the preserved unknown lower stack:
 
 ```forth

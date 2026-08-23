@@ -501,8 +501,9 @@ stack invariant. Arbitrary jumps are not part of verified source.
 The initial named-loop form is implemented without arbitrary jumps: Lisp spells a label as
 `(while :label label condition body...)` and uses `(break label)` / `(continue label)`; Co-Forth
 uses `begin: label` with `break label` / `continue label`. Each exit must preserve exactly the
-target loop's header stack row. The next structured forms are `match`/`case` (not C-style
-fallthrough `switch`) and expression-valued named breaks, where a break target declares its
+target loop's header stack row. Lisp `match` and integer Co-Forth `case` (with no C-style
+fallthrough) now lower to verified branch edges. The next control-flow extension is
+expression-valued named breaks, where a break target declares its
 result stack row and every reachable break must produce exactly that row. This permits nested-loop
 exits and useful expression-valued loops without allowing a branch to strand intermediate values
 on a caller stack. `for` may be added only as a bounded desugaring to these loop blocks. `try` handles

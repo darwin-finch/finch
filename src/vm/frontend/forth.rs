@@ -53,6 +53,22 @@ struct IfFrame {
     origin: SourceOrigin,
 }
 
+/// A conventional Co-Forth integer `case` expression.  The selector stays on
+/// the operand stack while arms are tested, but is removed before either a
+/// selected arm or an explicit `otherwise` arm runs.  This makes every arm
+/// start with the same stack row and keeps the construct a small lowering to
+/// the existing typed branch IR rather than a second dispatch mechanism.
+#[derive(Debug, Clone)]
+struct CaseFrame {
+    end_block: u32,
+    selector_stack: Vec<Type>,
+    arm_output: Option<Vec<Type>>,
+    next_else: Option<u32>,
+    arm_open: bool,
+    in_default: bool,
+    origin: SourceOrigin,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchCondition {
     Option,
@@ -63,6 +79,7 @@ enum MatchCondition {
 enum ControlKind {
     If,
     Loop,
+    Case,
 }
 
 /// Compile user/model-entered Co-Forth source text directly into Finch typed
@@ -218,6 +235,7 @@ fn compile_forth_body_with_locals(
     let mut next_block = 1;
     let mut loops: Vec<LoopFrame> = Vec::new();
     let mut conditionals: Vec<IfFrame> = Vec::new();
+    let mut cases: Vec<CaseFrame> = Vec::new();
     let mut control = Vec::new();
     let local_indexes = locals
         .iter()
@@ -367,6 +385,249 @@ fn compile_forth_body_with_locals(
                 continue;
             }
             match word.as_str() {
+                "case" => {
+                    let selector = stack.last().cloned().ok_or_else(|| {
+                        vec![control_error(
+                            "E-FORTH-CASE-001",
+                            "case requires an integer selector",
+                            origin.clone(),
+                        )]
+                    })?;
+                    if selector != Type::Int {
+                        return Err(vec![VmDiagnostic::type_mismatch(
+                            Type::Int,
+                            selector,
+                            Some(origin),
+                        )]);
+                    }
+                    let end_block = next_block;
+                    next_block += 1;
+                    blocks.insert(
+                        end_block,
+                        BasicBlock {
+                            id: end_block,
+                            instructions: Vec::new(),
+                        },
+                    );
+                    let selector_stack = stack.clone();
+                    emit(&mut blocks, current, Instruction::Dup, origin.clone());
+                    stack.push(Type::Int);
+                    cases.push(CaseFrame {
+                        end_block,
+                        selector_stack,
+                        arm_output: None,
+                        next_else: None,
+                        arm_open: false,
+                        in_default: false,
+                        origin,
+                    });
+                    control.push(ControlKind::Case);
+                    token_index += 1;
+                    continue;
+                }
+                "of" => {
+                    if control.last() != Some(&ControlKind::Case) {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-002",
+                            "of has no matching case",
+                            origin,
+                        )]);
+                    }
+                    let Some(frame) = cases.last_mut() else {
+                        unreachable!("case control has a case frame");
+                    };
+                    if frame.arm_open || frame.in_default {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-003",
+                            "of must follow case or endof and precede otherwise/endcase",
+                            origin,
+                        )]);
+                    }
+                    let comparison = vocabulary
+                        .get("=")
+                        .expect("core vocabulary contains integer equality");
+                    apply_signature_types(comparison, &mut stack, &origin)
+                        .map_err(|diagnostic| vec![diagnostic])?;
+                    effects = effects.union(&comparison.effects);
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::Call {
+                            function: "=".into(),
+                        },
+                        origin.clone(),
+                    );
+                    // The comparison result controls the branch; it is not
+                    // part of either arm's typed entry row.
+                    stack.pop();
+                    let then_block = next_block;
+                    let else_block = next_block + 1;
+                    next_block += 2;
+                    for id in [then_block, else_block] {
+                        blocks.insert(
+                            id,
+                            BasicBlock {
+                                id,
+                                instructions: Vec::new(),
+                            },
+                        );
+                    }
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::Branch {
+                            then_block,
+                            else_block,
+                        },
+                        origin.clone(),
+                    );
+                    frame.next_else = Some(else_block);
+                    frame.arm_open = true;
+                    current = then_block;
+                    // The selector is only needed along the non-matching
+                    // path. A selected arm begins from the original lower
+                    // stack row, exactly like an `if` branch.
+                    emit(&mut blocks, current, Instruction::Drop, origin.clone());
+                    stack.pop();
+                    token_index += 1;
+                    continue;
+                }
+                "endof" => {
+                    if control.last() != Some(&ControlKind::Case) {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-004",
+                            "endof has no matching case",
+                            origin,
+                        )]);
+                    }
+                    let Some(frame) = cases.last_mut() else {
+                        unreachable!("case control has a case frame");
+                    };
+                    if !frame.arm_open {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-005",
+                            "endof requires a preceding of arm",
+                            origin,
+                        )]);
+                    }
+                    if let Some(expected) = &frame.arm_output {
+                        if stack != *expected {
+                            return Err(vec![control_error(
+                                "E-STACK-004",
+                                "case arms leave incompatible stack types",
+                                frame.origin.clone(),
+                            )]);
+                        }
+                    } else {
+                        frame.arm_output = Some(stack.clone());
+                    }
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::Jump {
+                            target: frame.end_block,
+                        },
+                        origin.clone(),
+                    );
+                    current = frame.next_else.take().expect("open arm has else block");
+                    stack = frame.selector_stack.clone();
+                    frame.arm_open = false;
+                    let next_is_terminal = matches!(
+                        tokens.get(token_index + 1).map(|token| &token.value),
+                        Some(TokenValue::Word(next)) if next == "otherwise" || next == "endcase"
+                    );
+                    if !next_is_terminal {
+                        emit(&mut blocks, current, Instruction::Dup, origin.clone());
+                        stack.push(Type::Int);
+                    }
+                    token_index += 1;
+                    continue;
+                }
+                "otherwise" => {
+                    if control.last() != Some(&ControlKind::Case) {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-006",
+                            "otherwise has no matching case",
+                            origin,
+                        )]);
+                    }
+                    let Some(frame) = cases.last_mut() else {
+                        unreachable!("case control has a case frame");
+                    };
+                    if frame.arm_open || frame.in_default || stack != frame.selector_stack {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-007",
+                            "otherwise must follow endof and may appear only once",
+                            origin,
+                        )]);
+                    }
+                    emit(&mut blocks, current, Instruction::Drop, origin.clone());
+                    stack.pop();
+                    frame.in_default = true;
+                    token_index += 1;
+                    continue;
+                }
+                "endcase" => {
+                    if control.last() != Some(&ControlKind::Case) {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-008",
+                            "endcase has no matching case",
+                            origin,
+                        )]);
+                    }
+                    let Some(frame) = cases.pop() else {
+                        unreachable!("case control has a case frame");
+                    };
+                    control.pop();
+                    if frame.arm_open {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-009",
+                            "case arm must end with endof before endcase",
+                            frame.origin,
+                        )]);
+                    }
+                    let Some(arm_output) = frame.arm_output else {
+                        return Err(vec![control_error(
+                            "E-FORTH-CASE-010",
+                            "case requires at least one of ... endof arm",
+                            frame.origin,
+                        )]);
+                    };
+                    if frame.in_default {
+                        if stack != arm_output {
+                            return Err(vec![control_error(
+                                "E-STACK-004",
+                                "case arms leave incompatible stack types",
+                                frame.origin,
+                            )]);
+                        }
+                    } else {
+                        // Standard Forth's no-match path discards the selector.
+                        // It is valid only if that path has the same result row
+                        // as a selected arm.
+                        emit(&mut blocks, current, Instruction::Drop, origin.clone());
+                        stack.pop();
+                        if stack != arm_output {
+                            return Err(vec![control_error(
+                                "E-STACK-004",
+                                "case without otherwise must leave the same stack row as every arm",
+                                frame.origin,
+                            )]);
+                        }
+                    }
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::Jump {
+                            target: frame.end_block,
+                        },
+                        origin,
+                    );
+                    current = frame.end_block;
+                    stack = arm_output;
+                    token_index += 1;
+                    continue;
+                }
                 "if" => {
                     let condition = stack.pop().ok_or_else(|| {
                         vec![control_error(
@@ -1140,6 +1401,13 @@ fn compile_forth_body_with_locals(
             frame.origin.clone(),
         )]);
     }
+    if let Some(frame) = cases.last() {
+        return Err(vec![control_error(
+            "E-FORTH-CASE-011",
+            "unterminated case",
+            frame.origin.clone(),
+        )]);
+    }
     emit(
         &mut blocks,
         current,
@@ -1865,6 +2133,62 @@ mod tests {
                 .unwrap();
             assert!(stack.is_empty());
         }
+    }
+
+    #[test]
+    fn typed_integer_case_has_no_fallthrough_and_requires_compatible_arms() {
+        let selected = compile_forth(
+            "case-selected.forth",
+            "2 case 1 of 10 endof 2 of 20 endof otherwise 30 endcase",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("integer case should compile");
+        let defaulted = compile_forth(
+            "case-default.forth",
+            "3 case 1 of 10 endof 2 of 20 endof otherwise 30 endcase",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("integer case with otherwise should compile");
+        for (module, expected) in [(selected, 20), (defaulted, 30)] {
+            let mut stack = Vec::new();
+            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+                .execute(&mut stack)
+                .unwrap();
+            assert_eq!(stack, vec![TypedValue::Int(expected)]);
+        }
+
+        let effect_only = compile_forth(
+            "case-effect.forth",
+            "1 case 1 of endof endcase",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("a case without otherwise may leave no values on every path");
+        let mut stack = Vec::new();
+        Interpreter::new(&effect_only, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert!(stack.is_empty());
+
+        let mismatch = compile_forth(
+            "case-mismatch.forth",
+            "1 case 1 of 10 endof otherwise endcase",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("every case path must leave the same stack row");
+        assert_eq!(mismatch[0].code, "E-STACK-004");
+
+        let non_integer = compile_forth(
+            "case-string.forth",
+            "s\" selector\" case 1 of 10 endof otherwise 20 endcase",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("case selectors are intentionally integer-only in version 1");
+        assert_eq!(non_integer[0].code, "E-TYPE-002");
     }
 
     #[test]
