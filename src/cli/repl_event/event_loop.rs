@@ -155,7 +155,7 @@ pub struct EventLoop {
     generator_state: Arc<RwLock<GeneratorState>>,
 
     /// Tool definitions for Claude API
-    tool_definitions: Arc<Vec<ToolDefinition>>,
+    tool_definitions: Arc<RwLock<Vec<ToolDefinition>>>,
 
     /// TUI renderer
     tui_renderer: Arc<Mutex<TuiRenderer>>,
@@ -1455,7 +1455,7 @@ impl EventLoop {
             daemon_client,
             router,
             generator_state,
-            tool_definitions: Arc::new(tool_definitions),
+            tool_definitions: Arc::new(RwLock::new(tool_definitions)),
             tui_renderer,
             output_manager,
             status_bar,
@@ -3605,6 +3605,7 @@ Rules:\n\
             match mcp_client.refresh_all_tools().await {
                 Ok(()) => {
                     let tools = mcp_client.list_tools().await;
+                    *self.tool_definitions.write().await = executor_guard.list_all_tools().await;
                     self.output_manager.write_info(format!(
                         "✓ Refreshed MCP tools ({} tools available)",
                         tools.len()
@@ -3625,11 +3626,23 @@ Rules:\n\
 
     /// Handle /mcp reload command - reconnect to all servers
     async fn handle_mcp_reload(&mut self) -> Result<()> {
-        self.output_manager.write_info(
-            "/mcp reload not yet implemented.\n\
-             This command will reconnect to all MCP servers.\n\
-             For now, restart the REPL to reconnect.",
-        );
+        let tool_executor = self.tool_coordinator.tool_executor();
+        let executor_guard = tool_executor.lock().await;
+        if let Some(mcp_client) = executor_guard.mcp_client() {
+            self.output_manager
+                .write_info("Reconnecting to configured MCP servers...");
+            mcp_client.reload().await?;
+            let servers = mcp_client.list_servers().await;
+            let tools = mcp_client.list_tools().await;
+            *self.tool_definitions.write().await = executor_guard.list_all_tools().await;
+            self.output_manager.write_info(format!(
+                "✓ Connected to {} MCP server(s) with {} tool(s)",
+                servers.len(),
+                tools.len()
+            ));
+        } else {
+            self.output_manager.write_info("No MCP servers configured.");
+        }
         self.render_tui().await?;
         Ok(())
     }

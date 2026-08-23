@@ -1717,7 +1717,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
 /// Build the standard tool registry + executor used for non-interactive query mode.
 /// Auto-approves all tools (no interactive prompting in non-interactive mode).
-async fn build_query_tool_executor() -> Result<(
+async fn build_query_tool_executor(config: &Config) -> Result<(
     Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
     Vec<finch::tools::types::ToolDefinition>,
 )> {
@@ -1743,7 +1743,9 @@ async fn build_query_tool_executor() -> Result<(
         .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
 
     let executor = ToolExecutor::new(registry, permissions, patterns_path)
-        .context("Failed to create tool executor")?;
+        .context("Failed to create tool executor")?
+        .with_mcp(config)
+        .await;
     let executor = Arc::new(tokio::sync::Mutex::new(executor));
 
     let tool_definitions = executor.lock().await.list_all_tools().await;
@@ -1866,7 +1868,7 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
     let config = load_config()?;
 
     // Build tool executor (same tools as the REPL)
-    let (executor, tool_definitions) = build_query_tool_executor().await?;
+    let (executor, tool_definitions) = build_query_tool_executor(&config).await?;
 
     // A one-shot cloud-only query must not first attempt the daemon. Besides
     // defeating the flag, that startup attempt can consume the whole caller

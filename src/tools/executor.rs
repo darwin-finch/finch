@@ -286,6 +286,15 @@ impl ToolExecutor {
         self.mcp_client.as_ref()
     }
 
+    /// Maximum execution time for a tool call. MCP servers can configure longer
+    /// operations than Finch's built-in-tool default.
+    pub fn execution_timeout(&self, tool_name: &str) -> std::time::Duration {
+        self.mcp_client
+            .as_ref()
+            .and_then(|client| client.timeout_for_tool(tool_name))
+            .unwrap_or_else(|| std::time::Duration::from_secs(30))
+    }
+
     /// Get list of all available tools (built-in + MCP)
     pub async fn list_all_tools(&self) -> Vec<crate::tools::types::ToolDefinition> {
         let mut tools = Vec::new();
@@ -385,6 +394,12 @@ impl ToolExecutor {
 
         // 1. Check if it's an MCP tool
         if tool_use.name.starts_with("mcp_") {
+            if let PermissionCheck::Deny(reason) = self
+                .permissions
+                .check_tool_use(&tool_use.name, &tool_use.input)
+            {
+                return Ok(ToolResult::error(tool_use.id.clone(), reason));
+            }
             if let Some(mcp) = &self.mcp_client {
                 info!("Routing to MCP client: {}", tool_use.name);
                 match mcp

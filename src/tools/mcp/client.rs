@@ -1,6 +1,6 @@
 // MCP client coordinator - manages multiple server connections
 //
-// Uses direct JSON-RPC 2.0 implementation over STDIO/SSE transports.
+// Uses a direct JSON-RPC 2.0 implementation over stdio.
 
 use super::config::McpServerConfig;
 use super::connection::McpConnection;
@@ -11,8 +11,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// MCP client that manages multiple server connections (stub implementation)
+/// MCP client that manages multiple server connections.
 pub struct McpClient {
+    /// Original configuration, retained for reloads and timeout lookup.
+    configs: HashMap<String, McpServerConfig>,
     /// Active server connections (name -> connection)
     connections: Arc<RwLock<HashMap<String, Arc<RwLock<McpConnection>>>>>,
 }
@@ -27,13 +29,17 @@ impl McpClient {
     /// Create a new MCP client
     pub fn new() -> Self {
         Self {
+            configs: HashMap::new(),
             connections: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Connect to MCP servers from configuration
     pub async fn from_config(servers: &HashMap<String, McpServerConfig>) -> Result<Self> {
-        let client = Self::new();
+        let client = Self {
+            configs: servers.clone(),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+        };
 
         for (name, config) in servers {
             if !config.enabled {
@@ -88,31 +94,56 @@ impl McpClient {
             }
         }
 
+        // HashMap iteration order is intentionally unstable. Stable tool order
+        // improves reproducible model requests and upstream prompt caching.
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
         tools
     }
 
     /// Execute a tool on the appropriate server
     pub async fn execute_tool(&self, tool_name: &str, params: Value) -> Result<String> {
-        // Parse prefixed name: "mcp_<server>_<tool>"
-        let parts: Vec<&str> = tool_name.split('_').collect();
-        if parts.len() < 3 || parts[0] != "mcp" {
-            anyhow::bail!("Invalid MCP tool name: {}", tool_name);
-        }
+        let connections = self.connections.read().await;
+        let unprefixed = tool_name
+            .strip_prefix("mcp_")
+            .with_context(|| format!("Invalid MCP tool name: {tool_name}"))?;
+        // Match configured names rather than splitting on `_`; both server and
+        // tool names may legitimately contain underscores. Prefer the longest
+        // matching server name when one name prefixes another.
+        let mut candidates: Vec<_> = connections
+            .keys()
+            .filter_map(|name| {
+                unprefixed
+                    .strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('_'))
+                    .map(|tool| (name.as_str(), tool.to_owned()))
+            })
+            .collect();
+        candidates.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
 
-        let server_name = parts[1];
-        let actual_tool_name = parts[2..].join("_");
+        let mut owner = None;
+        for (server_name, actual_tool_name) in candidates {
+            let conn = connections
+                .get(server_name)
+                .expect("candidate server must exist");
+            if conn
+                .read()
+                .await
+                .list_tools()
+                .iter()
+                .any(|tool| tool.name == actual_tool_name)
+            {
+                owner = Some((server_name, actual_tool_name, Arc::clone(conn)));
+                break;
+            }
+        }
+        let (server_name, actual_tool_name, conn) =
+            owner.with_context(|| format!("No connected MCP server owns tool '{tool_name}'"))?;
 
         tracing::debug!(
             "Executing MCP tool '{}' on server '{}'",
             actual_tool_name,
             server_name
         );
-
-        // Find the connection
-        let connections = self.connections.read().await;
-        let conn = connections
-            .get(server_name)
-            .with_context(|| format!("MCP server '{}' not found", server_name))?;
 
         // Call the tool
         let conn = conn.read().await;
@@ -140,9 +171,48 @@ impl McpClient {
         Ok(())
     }
 
+    /// Reconnect every enabled server using the configuration loaded at startup.
+    pub async fn reload(&self) -> Result<()> {
+        self.disconnect_all().await?;
+        for (name, config) in &self.configs {
+            if !config.enabled {
+                continue;
+            }
+            match McpConnection::connect(name.clone(), config).await {
+                Ok(connection) => {
+                    self.connections
+                        .write()
+                        .await
+                        .insert(name.clone(), Arc::new(RwLock::new(connection)));
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to reconnect to MCP server '{}': {}", name, error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Configured timeout for a prefixed MCP tool, if its server is known.
+    pub fn timeout_for_tool(&self, tool_name: &str) -> Option<std::time::Duration> {
+        let unprefixed = tool_name.strip_prefix("mcp_")?;
+        self.configs
+            .iter()
+            .filter_map(|(name, config)| {
+                unprefixed
+                    .strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('_'))
+                    .map(|_| (name.len(), config.timeout_secs))
+            })
+            .max_by_key(|(name_len, _)| *name_len)
+            .map(|(_, seconds)| std::time::Duration::from_secs(seconds))
+    }
+
     /// Get list of connected server names
     pub async fn list_servers(&self) -> Vec<String> {
-        self.connections.read().await.keys().cloned().collect()
+        let mut servers: Vec<_> = self.connections.read().await.keys().cloned().collect();
+        servers.sort();
+        servers
     }
 
     /// Check if a server is connected
@@ -245,6 +315,7 @@ mod tests {
                 env: HashMap::new(),
                 url: None,
                 enabled: true,
+                timeout_secs: 300,
             },
         );
         config.insert(
@@ -256,6 +327,7 @@ mod tests {
                 env: HashMap::new(),
                 url: None,
                 enabled: false, // Disabled
+                timeout_secs: 300,
             },
         );
 
@@ -280,6 +352,7 @@ mod tests {
                 env: HashMap::new(),
                 url: None,
                 enabled: true,
+                timeout_secs: 300,
             },
         );
 

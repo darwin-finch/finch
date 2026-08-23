@@ -1,6 +1,6 @@
-# MCP Plugin System - User Guide
+# MCP Client - User Guide
 
-**Model Context Protocol (MCP)** enables Shammah to use external tools from MCP servers without writing custom code. This guide shows you how to install, configure, and use MCP servers.
+**Model Context Protocol (MCP)** enables Finch to use external tools from MCP servers without writing custom integrations. Finch is an MCP client; its existing OpenAI-compatible HTTP endpoint remains the interface for applications that drive Finch as a model.
 
 ## Table of Contents
 
@@ -18,7 +18,7 @@
 **Model Context Protocol** is an open standard created by Anthropic for connecting AI assistants to external data sources and tools. MCP servers are small programs that expose tools via a JSON-RPC interface.
 
 **Benefits**:
-- ✅ **Extensible** - Add new capabilities without modifying Shammah
+- ✅ **Extensible** - Add new capabilities without modifying Finch
 - ✅ **Standard** - Works with hundreds of existing MCP servers
 - ✅ **Secure** - Tools run in separate processes with permission control
 - ✅ **Simple** - Configure via TOML, use via natural language
@@ -47,7 +47,7 @@ transport = "stdio"
 enabled = true
 ```
 
-**3. Start Shammah**:
+**3. Start Finch**:
 ```bash
 finch
 ```
@@ -64,7 +64,7 @@ finch
 > List all files in /tmp using the filesystem server
 ```
 
-Shammah will automatically use the `mcp_filesystem_list_directory` tool to answer your question!
+Finch will automatically include `mcp_filesystem_list_directory` in the tools available to its model.
 
 ## Installing MCP Servers
 
@@ -114,6 +114,7 @@ args = ["-y", "<package_name>"]    # Arguments to command
 transport = "stdio"                # Communication method (stdio only for now)
 enabled = true                     # Whether to connect on startup
 env = { }                          # Environment variables (optional)
+timeout_secs = 300                 # Per-request timeout (optional; default 300)
 ```
 
 ### Configuration Fields
@@ -125,6 +126,7 @@ env = { }                          # Environment variables (optional)
 | `transport` | Yes | Communication protocol | `"stdio"` (only option currently) |
 | `enabled` | Yes | Connect on startup | `true` or `false` |
 | `env` | No | Environment variables | `{ API_KEY = "$MY_API_KEY" }` |
+| `timeout_secs` | No | Maximum seconds for initialize, discovery, or a tool call | `300` |
 
 ### Example: Multiple Servers
 
@@ -155,9 +157,11 @@ env = { DATABASE_URL = "postgresql://localhost:5432/mydb" }
 
 ### Environment Variables
 
-Environment variables can be:
+Environment values can be:
 1. **Literal values**: `{ API_KEY = "abc123" }`
-2. **Shell variables**: `{ API_KEY = "$MY_API_KEY" }` (reads from shell environment)
+2. **Exact references**: `{ API_KEY = "$MY_API_KEY" }` or `{ API_KEY = "${MY_API_KEY}" }`
+
+Finch resolves exact references from its own environment without invoking a shell. A missing referenced variable prevents that server from connecting and is reported in the logs. Interpolation inside a larger string is deliberately not performed.
 
 **Security Note**: Store sensitive tokens in your shell environment (e.g., `~/.zshrc`), not in the config file:
 
@@ -223,7 +227,7 @@ Examples:
 
 ## REPL Commands
 
-Shammah provides `/mcp` commands to manage MCP servers at runtime.
+Finch provides `/mcp` commands to manage MCP servers at runtime.
 
 ### /mcp list
 
@@ -278,14 +282,14 @@ Use this if you update an MCP server or if tools aren't appearing correctly.
 
 ### /mcp reload
 
-**Reconnect to all servers** (future feature):
+**Reconnect to all configured servers**:
 ```
 > /mcp reload
-/mcp reload not yet implemented.
-For now, restart the REPL to reconnect.
+Reconnecting to configured MCP servers...
+✓ Connected to 2 MCP server(s) with 17 tool(s)
 ```
 
-Currently, restart Shammah to reconnect to servers. Full reload support coming soon.
+Disabled servers remain disabled. A failed server is logged while other configured servers continue connecting.
 
 ## Popular MCP Servers
 
@@ -626,7 +630,7 @@ finch 2>&1 | grep -i "mcp\|jsonrpc"
 
 ## Further Reading
 
-- **MCP Specification**: https://modelcontextprotocol.io/specification/2025-11-25/
+- **MCP Specification**: https://modelcontextprotocol.io/specification/2026-07-28/
 - **Official Server List**: https://github.com/modelcontextprotocol/servers
 - **JSON-RPC 2.0 Spec**: https://www.jsonrpc.org/specification
 - **Shammah Documentation**: `docs/` folder in repository
@@ -641,6 +645,6 @@ finch 2>&1 | grep -i "mcp\|jsonrpc"
 
 ---
 
-**Last Updated**: 2026-02-18
-**Shammah Version**: 0.2.2+
-**MCP Protocol Version**: 2024-11-05
+**Last Updated**: 2026-08-21
+**Finch Version**: 0.7.30+
+**Newest MCP Protocol Version**: 2026-07-28 (with negotiation for earlier revisions)

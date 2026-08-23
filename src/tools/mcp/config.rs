@@ -28,10 +28,18 @@ pub struct McpServerConfig {
     /// Whether server is enabled
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// Maximum time to wait for an MCP request, in seconds
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_timeout_secs() -> u64 {
+    300
 }
 
 /// Transport type for MCP servers
@@ -47,6 +55,22 @@ pub enum TransportType {
 impl McpServerConfig {
     /// Validate the configuration
     pub fn validate(&self, name: &str) -> anyhow::Result<()> {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character))
+        {
+            anyhow::bail!(
+                "MCP server name '{}': use only letters, digits, underscores, hyphens, or dots",
+                name
+            );
+        }
+        if self.timeout_secs == 0 {
+            anyhow::bail!(
+                "MCP server '{}': timeout_secs must be greater than zero",
+                name
+            );
+        }
         match self.transport {
             TransportType::Stdio => {
                 if self.command.is_none() {
@@ -82,6 +106,7 @@ mod tests {
             env: HashMap::new(),
             url: None,
             enabled: true,
+            timeout_secs: default_timeout_secs(),
         };
 
         assert!(config.validate("test").is_ok());
@@ -96,6 +121,7 @@ mod tests {
             env: HashMap::new(),
             url: None,
             enabled: true,
+            timeout_secs: default_timeout_secs(),
         };
 
         assert!(config.validate("test").is_err());
@@ -110,6 +136,7 @@ mod tests {
             env: HashMap::new(),
             url: Some("http://localhost:3000/mcp".to_string()),
             enabled: true,
+            timeout_secs: default_timeout_secs(),
         };
 
         assert!(config.validate("test").is_ok());
@@ -124,6 +151,7 @@ mod tests {
             env: HashMap::new(),
             url: None,
             enabled: true,
+            timeout_secs: default_timeout_secs(),
         };
 
         assert!(config.validate("test").is_err());
@@ -141,6 +169,7 @@ mod tests {
             env: HashMap::new(),
             url: None,
             enabled: true,
+            timeout_secs: default_timeout_secs(),
         };
 
         let serialized = toml::to_string(&config).unwrap();
@@ -166,6 +195,7 @@ mod tests {
             env,
             url: None,
             enabled: true,
+            timeout_secs: default_timeout_secs(),
         };
 
         assert!(config.validate("github").is_ok());
@@ -185,6 +215,7 @@ mod tests {
             env: HashMap::new(),
             url: None,
             enabled: false,
+            timeout_secs: default_timeout_secs(),
         };
 
         // Even invalid configs should validate if disabled

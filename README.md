@@ -77,6 +77,30 @@ Ask questions in plain English. finch has access to tools and will ask your perm
 
 ---
 
+## External tools with MCP
+
+Finch is an MCP client and can start configured stdio servers automatically. Add
+servers to `~/.finch/config.toml`:
+
+```toml
+[mcp_servers.filesystem]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
+env = { API_TOKEN = "$API_TOKEN" }
+timeout_secs = 300
+enabled = true
+```
+
+Use `/mcp list`, `/mcp tools`, `/mcp refresh`, and `/mcp reload` in the REPL.
+Configured tools are also available to `finch query`. See
+[the MCP client guide](docs/MCP_USER_GUIDE.md) for configuration and troubleshooting.
+
+Finch's OpenAI-compatible HTTP endpoint is the interface for clients that drive
+Finch as a model; Finch does not expose an MCP server.
+
+---
+
 ## Local model (offline use)
 
 If you want finch to run without any cloud provider, it can download and run a local model via ONNX Runtime. Six model families are supported (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek). Qwen 2.5 is the default, selected automatically based on your available RAM:

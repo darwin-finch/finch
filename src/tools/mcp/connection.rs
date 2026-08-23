@@ -14,6 +14,14 @@ use tokio::process::{
     Child as TokioChild, ChildStdin as TokioChildStdin, ChildStdout as TokioChildStdout,
 };
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
+
+use super::protocol::{
+    select_protocol_version, LATEST_LEGACY_PROTOCOL_VERSION, LATEST_PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+};
+
+const MODERN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// JSON-RPC 2.0 request
 #[derive(Debug, Serialize)]
@@ -46,7 +54,7 @@ struct JsonRpcError {
     data: Option<Value>,
 }
 
-/// MCP tool definition (simplified from rust-mcp-sdk schema)
+/// MCP tool definition used by Finch's JSON-RPC client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpTool {
     pub name: String,
@@ -77,6 +85,10 @@ pub struct McpConnection {
     /// Server info (if connected)
     server_info: Option<McpServerInfo>,
 
+    /// Negotiated MCP revision. Modern revisions are carried on every request;
+    /// legacy revisions are established by the initialize handshake.
+    protocol_version: Option<&'static str>,
+
     /// Connection status
     is_connected: bool,
 
@@ -91,6 +103,10 @@ pub struct McpConnection {
 
     /// Request ID counter
     next_id: Arc<AtomicU64>,
+
+    /// A stdio transport is one ordered stream. Keep a complete request/response
+    /// exchange atomic so concurrent tool calls cannot consume each other's replies.
+    request_lock: Arc<Mutex<()>>,
 }
 
 impl McpConnection {
@@ -120,11 +136,13 @@ impl McpConnection {
 
         // Spawn the server process
         let mut cmd = tokio::process::Command::new(command);
+        let environment = resolve_environment(&config.env)
+            .with_context(|| format!("Invalid environment for MCP server '{name}'"))?;
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()) // Show server logs
-            .envs(&config.env);
+            .envs(environment);
 
         let mut child = cmd
             .spawn()
@@ -147,11 +165,13 @@ impl McpConnection {
             config: config.clone(),
             tools: Vec::new(),
             server_info: None,
+            protocol_version: None,
             is_connected: false,
             child: Some(child),
             stdin: Some(stdin),
             stdout: Some(stdout),
             next_id: Arc::new(AtomicU64::new(1)),
+            request_lock: Arc::new(Mutex::new(())),
         };
 
         // Initialize the connection
@@ -172,16 +192,68 @@ impl McpConnection {
 
     /// Initialize the MCP connection
     async fn initialize(&mut self) -> Result<()> {
+        // MCP 2026-07-28 removed the initialize handshake. Probe first and use
+        // per-request metadata when supported; any ordinary error or timeout is
+        // the specified signal to fall back to a legacy initialize handshake.
+        let discover_params = with_protocol_metadata(None, LATEST_PROTOCOL_VERSION);
+        match self
+            .send_request_with_timeout(
+                "server/discover",
+                Some(discover_params),
+                MODERN_PROBE_TIMEOUT.min(Duration::from_secs(self.config.timeout_secs)),
+            )
+            .await
+        {
+            Ok(response) => {
+                let offered = response
+                    .get("supportedVersions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str);
+                let selected = select_protocol_version(offered).with_context(|| {
+                    format!(
+                        "MCP server '{}' did not advertise a protocol version Finch supports",
+                        self.name
+                    )
+                })?;
+                if selected != LATEST_PROTOCOL_VERSION {
+                    anyhow::bail!(
+                        "MCP server '{}' returned a legacy version from server/discover; legacy versions must use initialize",
+                        self.name
+                    );
+                }
+                self.protocol_version = Some(selected);
+                self.server_info = response
+                    .pointer("/_meta/io.modelcontextprotocol~1serverInfo")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok());
+                tracing::debug!(
+                    "MCP server '{}' negotiated modern protocol {}",
+                    self.name,
+                    selected
+                );
+                Ok(())
+            }
+            Err(probe_error) => {
+                tracing::debug!(
+                    "MCP server '{}' did not accept modern discovery ({}); falling back to {}",
+                    self.name,
+                    probe_error,
+                    LATEST_LEGACY_PROTOCOL_VERSION
+                );
+                self.initialize_legacy().await
+            }
+        }
+    }
+
+    async fn initialize_legacy(&mut self) -> Result<()> {
         let response = self
             .send_request(
                 "initialize",
                 Some(serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "roots": {
-                            "listChanged": false
-                        }
-                    },
+                    "protocolVersion": LATEST_LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {},
                     "clientInfo": {
                         "name": "finch",
                         "version": env!("CARGO_PKG_VERSION")
@@ -190,16 +262,27 @@ impl McpConnection {
             )
             .await?;
 
-        // Parse server info
-        if let Some(server_info_val) = response.get("serverInfo") {
-            self.server_info = serde_json::from_value(server_info_val.clone()).ok();
-        }
-
-        // Send initialized notification
+        let negotiated = response
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .context("MCP initialize response omitted protocolVersion")?;
+        let negotiated = SUPPORTED_PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .find(|version| *version == negotiated && *version != LATEST_PROTOCOL_VERSION)
+            .with_context(|| {
+                format!(
+                    "MCP server '{}' selected unsupported protocol version '{}'",
+                    self.name, negotiated
+                )
+            })?;
+        self.protocol_version = Some(negotiated);
+        self.server_info = response
+            .get("serverInfo")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
         self.send_notification("notifications/initialized", None)
-            .await?;
-
-        Ok(())
+            .await
     }
 
     /// Get the list of available tools
@@ -209,13 +292,28 @@ impl McpConnection {
 
     /// Refresh the list of available tools
     pub async fn refresh_tools(&mut self) -> Result<()> {
-        let response = self.send_request("tools/list", None).await?;
-
-        // Parse tools array
-        if let Some(tools_val) = response.get("tools") {
-            self.tools =
-                serde_json::from_value(tools_val.clone()).context("Failed to parse tools list")?;
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = cursor
+                .as_ref()
+                .map(|cursor| serde_json::json!({ "cursor": cursor }));
+            let response = self.send_request("tools/list", params).await?;
+            if let Some(tools_val) = response.get("tools") {
+                let mut page: Vec<McpTool> = serde_json::from_value(tools_val.clone())
+                    .context("Failed to parse tools list")?;
+                tools.append(&mut page);
+            }
+            cursor = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
         }
+        self.tools = tools;
 
         tracing::debug!(
             "Discovered {} tools from MCP server '{}'",
@@ -238,23 +336,44 @@ impl McpConnection {
             )
             .await?;
 
-        // Extract content from response
+        let is_error = response
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        // Preserve every content type. Text blocks remain plain text for the
+        // model; non-text blocks and structured content remain JSON.
+        let mut parts = Vec::new();
         if let Some(content) = response.get("content") {
             if let Some(arr) = content.as_array() {
-                // Concatenate all text content
-                let mut result = String::new();
                 for item in arr {
-                    if let Some(text) = item.get("text") {
-                        if let Some(text_str) = text.as_str() {
-                            if !result.is_empty() {
-                                result.push('\n');
-                            }
-                            result.push_str(text_str);
-                        }
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        parts.push(text.to_owned());
+                    } else {
+                        parts.push(serde_json::to_string_pretty(item)?);
                     }
                 }
-                return Ok(result);
             }
+        }
+        if let Some(structured) = response.get("structuredContent") {
+            parts.push(format!(
+                "Structured content:\n{}",
+                serde_json::to_string_pretty(structured)?
+            ));
+        }
+        let result = parts.join("\n");
+        if is_error {
+            anyhow::bail!(
+                "{}",
+                if result.is_empty() {
+                    "MCP tool failed"
+                } else {
+                    &result
+                }
+            );
+        }
+        if !result.is_empty() {
+            return Ok(result);
         }
 
         // Fallback: return entire response as JSON
@@ -263,6 +382,27 @@ impl McpConnection {
 
     /// Send a JSON-RPC request and get response
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        let params = match self.protocol_version {
+            Some(LATEST_PROTOCOL_VERSION) => {
+                Some(with_protocol_metadata(params, LATEST_PROTOCOL_VERSION))
+            }
+            _ => params,
+        };
+        self.send_request_with_timeout(
+            method,
+            params,
+            Duration::from_secs(self.config.timeout_secs),
+        )
+        .await
+    }
+
+    async fn send_request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        request_timeout: Duration,
+    ) -> Result<Value> {
+        let _request_guard = self.request_lock.lock().await;
         let stdin = self.stdin.as_ref().with_context(|| {
             format!(
                 "MCP server '{}' is not connected (stdin unavailable)",
@@ -296,17 +436,49 @@ impl McpConnection {
             stdin_guard.flush().await?;
         }
 
-        // Read response
-        let mut line = String::new();
-        {
-            let mut stdout_guard = stdout.lock().await;
-            stdout_guard.read_line(&mut line).await?;
-        }
+        // A server may emit notifications before the response. Read until the
+        // matching request ID arrives, while keeping the whole exchange locked.
+        let response = timeout(request_timeout, async {
+            loop {
+                let mut line = String::new();
+                let bytes = {
+                    let mut stdout_guard = stdout.lock().await;
+                    stdout_guard.read_line(&mut line).await?
+                };
+                if bytes == 0 {
+                    anyhow::bail!("MCP server '{}' closed stdout", self.name);
+                }
 
-        tracing::debug!("MCP response: {}", line.trim());
-
-        let response: JsonRpcResponse =
-            serde_json::from_str(&line).context("Failed to parse JSON-RPC response")?;
+                tracing::debug!("MCP response: {}", line.trim());
+                let value: Value = serde_json::from_str(&line)
+                    .context("Failed to parse JSON-RPC message from MCP server")?;
+                if value.get("id").is_none() {
+                    tracing::debug!("Ignoring MCP notification while awaiting request {id}");
+                    continue;
+                }
+                let response: JsonRpcResponse =
+                    serde_json::from_value(value).context("Failed to parse JSON-RPC response")?;
+                if response.id != id {
+                    tracing::debug!(
+                        "Ignoring MCP response {} while awaiting {} from '{}'",
+                        response.id,
+                        id,
+                        self.name
+                    );
+                    continue;
+                }
+                break Ok::<JsonRpcResponse, anyhow::Error>(response);
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "MCP server '{}' timed out after {} seconds calling '{}'",
+                self.name,
+                request_timeout.as_secs_f32(),
+                method
+            )
+        })??;
 
         // Check for errors
         if let Some(error) = response.error {
@@ -323,6 +495,7 @@ impl McpConnection {
 
     /// Send a JSON-RPC notification (no response expected)
     async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<()> {
+        let _request_guard = self.request_lock.lock().await;
         let stdin = self.stdin.as_ref().with_context(|| {
             format!(
                 "MCP server '{}' is not connected (stdin unavailable)",
@@ -375,6 +548,57 @@ impl McpConnection {
 
         Ok(())
     }
+}
+
+fn with_protocol_metadata(params: Option<Value>, version: &str) -> Value {
+    let mut params = match params {
+        Some(Value::Object(params)) => params,
+        Some(value) => {
+            let mut params = serde_json::Map::new();
+            params.insert("value".to_string(), value);
+            params
+        }
+        None => serde_json::Map::new(),
+    };
+    params.insert(
+        "_meta".to_string(),
+        serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "finch",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }),
+    );
+    Value::Object(params)
+}
+
+/// Expand exact `$NAME` and `${NAME}` references without invoking a shell.
+/// Literal values are passed through unchanged.
+fn resolve_environment(
+    configured: &std::collections::HashMap<String, String>,
+) -> Result<std::collections::HashMap<String, String>> {
+    configured
+        .iter()
+        .map(|(key, value)| {
+            let variable = value
+                .strip_prefix("${")
+                .and_then(|rest| rest.strip_suffix('}'))
+                .or_else(|| {
+                    value
+                        .strip_prefix('$')
+                        .filter(|name| !name.is_empty() && !name.contains('$'))
+                });
+            let resolved = match variable {
+                Some(name) => std::env::var(name).with_context(|| {
+                    format!("environment variable '{name}' referenced by '{key}' is not set")
+                })?,
+                None => value.clone(),
+            };
+            Ok((key.clone(), resolved))
+        })
+        .collect()
 }
 
 impl Drop for McpConnection {
@@ -441,9 +665,26 @@ mod tests {
             env: HashMap::new(),
             url: None,
             enabled: true,
+            timeout_secs: 300,
         };
 
         let result = McpConnection::connect("test".to_string(), &config).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolves_literal_environment_values() {
+        let configured = HashMap::from([("TOKEN".to_string(), "literal".to_string())]);
+        let resolved = resolve_environment(&configured).unwrap();
+        assert_eq!(resolved.get("TOKEN").map(String::as_str), Some("literal"));
+    }
+
+    #[test]
+    fn rejects_missing_environment_reference() {
+        let configured = HashMap::from([(
+            "TOKEN".to_string(),
+            "$FINCH_TEST_MISSING_MCP_TOKEN_82B7".to_string(),
+        )]);
+        assert!(resolve_environment(&configured).is_err());
     }
 }

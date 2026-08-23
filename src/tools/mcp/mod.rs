@@ -9,7 +9,7 @@
 //
 // Supported transports:
 // - STDIO: Launch local server processes (e.g., npx @modelcontextprotocol/server-*)
-// - SSE: Connect to remote HTTP+SSE servers (future)
+// - Streamable HTTP: not implemented; legacy SSE config is rejected explicitly
 //
 // Usage:
 // ```rust
@@ -21,6 +21,7 @@
 pub mod client;
 pub mod config;
 pub mod connection;
+pub mod protocol;
 
 pub use client::McpClient;
 pub use config::{McpServerConfig, TransportType};

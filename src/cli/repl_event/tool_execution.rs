@@ -303,7 +303,7 @@ impl ToolExecutionCoordinator {
             tool_executor.lock().await.poset = poset.clone();
 
             // Execute with timeout to prevent system freezing (especially for CPU-heavy operations)
-            let timeout_duration = std::time::Duration::from_secs(30);
+            let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
             let result = tokio::time::timeout(
                 timeout_duration,
                 tool_executor

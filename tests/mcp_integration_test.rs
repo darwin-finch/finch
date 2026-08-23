@@ -34,6 +34,7 @@ async fn test_mcp_client_with_invalid_server() {
             url: None,
             env: HashMap::new(),
             enabled: true,
+            timeout_secs: 300,
         },
     );
 
@@ -66,6 +67,7 @@ async fn test_mcp_client_with_disabled_server() {
             url: None,
             env: HashMap::new(),
             enabled: false, // Disabled
+            timeout_secs: 300,
         },
     );
 
@@ -97,6 +99,7 @@ async fn test_mcp_client_disconnect() {
             url: None,
             env: HashMap::new(),
             enabled: true,
+            timeout_secs: 300,
         },
     );
 
@@ -123,6 +126,7 @@ async fn test_mcp_client_disconnect_all() {
             url: None,
             env: HashMap::new(),
             enabled: true,
+            timeout_secs: 300,
         },
     );
     config.insert(
@@ -134,6 +138,7 @@ async fn test_mcp_client_disconnect_all() {
             url: None,
             env: HashMap::new(),
             enabled: true,
+            timeout_secs: 300,
         },
     );
 
@@ -161,6 +166,7 @@ async fn test_mcp_tool_name_prefixing() {
             url: None,
             env: HashMap::new(),
             enabled: true,
+            timeout_secs: 300,
         },
     );
 
@@ -248,6 +254,7 @@ async fn test_mcp_config_validation() {
             url: None,
             env: HashMap::new(),
             enabled: true,
+            timeout_secs: 300,
         },
     );
 
@@ -275,6 +282,7 @@ async fn test_mcp_multiple_servers_isolation() {
             url: None,
             env: HashMap::new(),
             enabled: true,
+            timeout_secs: 300,
         },
     );
     config.insert(
@@ -286,6 +294,7 @@ async fn test_mcp_multiple_servers_isolation() {
             url: None,
             env: HashMap::new(),
             enabled: true,
+            timeout_secs: 300,
         },
     );
 
@@ -317,6 +326,7 @@ fn test_mcp_config_serialization() {
             env
         },
         enabled: true,
+        timeout_secs: 300,
     };
 
     // Serialize to JSON
@@ -352,4 +362,87 @@ fn test_transport_type_serialization() {
 
     assert!(matches!(stdio_parsed, TransportType::Stdio));
     assert!(matches!(sse_parsed, TransportType::Sse));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_discovery_notification_and_tool_call() {
+    // A deterministic modern-protocol fixture: discovery, tools/list with a
+    // preceding notification, then tools/call.
+    let script = r#"
+IFS= read -r discover
+case "$discover" in *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;; *) exit 2;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fixture","version":"1"}}}}'
+IFS= read -r list_one
+case "$list_one" in *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;; *) exit 3;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo_value","description":"Echo a value","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}],"nextCursor":"page-two"}}'
+IFS= read -r list_two
+case "$list_two" in *'"cursor":"page-two"'*) ;; *) exit 4;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"second_tool","description":"Second page","inputSchema":{"type":"object"}}]}}'
+IFS= read -r call
+case "$call" in *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) ;; *) exit 5;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"fixture result"},{"type":"resource_link","name":"artifact","uri":"file:///tmp/artifact"}],"structuredContent":{"ok":true},"isError":false}}'
+"#;
+
+    let config = HashMap::from([(
+        "fixture_with_underscores".to_string(),
+        McpServerConfig {
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), script.to_string()],
+            transport: TransportType::Stdio,
+            url: None,
+            env: HashMap::new(),
+            enabled: true,
+            timeout_secs: 5,
+        },
+    )]);
+
+    let client = McpClient::from_config(&config).await.unwrap();
+    let tools = client.list_tools().await;
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].name, "mcp_fixture_with_underscores_echo_value");
+
+    let result = client
+        .execute_tool(
+            "mcp_fixture_with_underscores_echo_value",
+            serde_json::json!({ "value": "hello" }),
+        )
+        .await
+        .unwrap();
+    assert!(result.contains("fixture result"));
+    assert!(result.contains("resource_link"));
+    assert!(result.contains("Structured content"));
+    assert!(result.contains("\"ok\": true"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_falls_back_to_legacy_initialize() {
+    let script = r#"
+IFS= read -r discover
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}'
+IFS= read -r initialize
+case "$initialize" in *'"protocolVersion":"2025-11-25"'*) ;; *) exit 2;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"legacy-fixture","version":"1"}}}'
+IFS= read -r initialized
+IFS= read -r list
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"tools":[]}}'
+"#;
+    let config = HashMap::from([(
+        "legacy".to_string(),
+        McpServerConfig {
+            command: Some("sh".to_string()),
+            args: vec!["-c".to_string(), script.to_string()],
+            transport: TransportType::Stdio,
+            url: None,
+            env: HashMap::new(),
+            enabled: true,
+            timeout_secs: 5,
+        },
+    )]);
+
+    let client = McpClient::from_config(&config).await.unwrap();
+    assert!(client.is_connected("legacy").await);
+    assert!(client.list_tools().await.is_empty());
 }

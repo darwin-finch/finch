@@ -44,7 +44,7 @@ pub struct LlmLoop {
     qwen_gen: Arc<dyn Generator>,
     router: Arc<Router>,
     generator_state: Arc<RwLock<GeneratorState>>,
-    tool_definitions: Arc<Vec<ToolDefinition>>,
+    tool_definitions: Arc<RwLock<Vec<ToolDefinition>>>,
     tool_coordinator: ToolExecutionCoordinator,
     /// Shared typed runtime that receives raw provider VM-wire programs.
     program_runtime: Arc<crate::runtime::ProgramRuntime>,
@@ -85,7 +85,7 @@ impl LlmLoop {
         qwen_gen: Arc<dyn Generator>,
         router: Arc<Router>,
         generator_state: Arc<RwLock<GeneratorState>>,
-        tool_definitions: Arc<Vec<ToolDefinition>>,
+        tool_definitions: Arc<RwLock<Vec<ToolDefinition>>>,
         tool_coordinator: ToolExecutionCoordinator,
         program_runtime: Arc<crate::runtime::ProgramRuntime>,
         tool_call_history: Arc<
@@ -177,7 +177,7 @@ impl LlmLoop {
         let tool_defs: Arc<Vec<ToolDefinition>> = if no_tools {
             Arc::new(vec![])
         } else {
-            Arc::clone(&self.tool_definitions)
+            Arc::new(self.tool_definitions.read().await.clone())
         };
         let conversation = Arc::clone(&self.conversation);
         let query_states = Arc::clone(&self.query_states);
