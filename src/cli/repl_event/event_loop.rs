@@ -3827,6 +3827,24 @@ Rules:\n\
                 projection,
                 envelope,
             } => {
+                if envelope.effect.requirement.capability
+                    == crate::vm::CapabilityKind::ProgramInvoke
+                {
+                    let intent = match &envelope.effect.event {
+                        crate::vm::HostSideEffect::Request { arguments } => arguments
+                            .get(1)
+                            .and_then(|value| match value {
+                                crate::vm::TypedValue::String(text) => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("Review proposed program"),
+                        _ => "Review proposed program",
+                    };
+                    projection.append_default(&format!(
+                        "Proposal awaiting review: {intent} [run {}, effect {}]",
+                        envelope.execution_id, envelope.effect.sequence
+                    ));
+                }
                 projection.project(&envelope.effect);
                 self.render_tui().await?;
             }

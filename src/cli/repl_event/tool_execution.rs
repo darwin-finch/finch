@@ -67,6 +67,7 @@ struct WorkUnitPresentation {
     row_idx: usize,
     program: bool,
     vm_output: Option<VmOutputProjection>,
+    event_tx: mpsc::UnboundedSender<ReplEvent>,
 }
 
 impl LiveOutputSink for WorkUnitPresentation {
@@ -85,23 +86,17 @@ impl LiveOutputSink for WorkUnitPresentation {
     }
 
     fn vm_effect_envelope(&self, envelope: crate::runtime::VmEffectEnvelope) {
-        if envelope.effect.requirement.capability == crate::vm::CapabilityKind::ProgramInvoke {
-            let intent = match &envelope.effect.event {
-                crate::vm::HostSideEffect::Request { arguments } => arguments
-                    .get(1)
-                    .and_then(|value| match value {
-                        crate::vm::TypedValue::String(text) => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .unwrap_or("Review proposed program"),
-                _ => "Review proposed program",
-            };
-            self.work_unit.append_response(&format!(
-                "Proposal awaiting review: {intent} [run {}, effect {}]",
-                envelope.execution_id, envelope.effect.sequence
-            ));
+        if let Some(projection) = &self.vm_output {
+            // Program tools execute away from the terminal task. Retain the
+            // typed `(execution_id, sequence)` envelope and let the REPL
+            // event loop own the corresponding WorkUnit mutation.
+            let _ = self.event_tx.send(ReplEvent::VmEffect {
+                projection: projection.clone(),
+                envelope,
+            });
+        } else {
+            self.vm_side_effect(envelope.effect);
         }
-        self.vm_side_effect(envelope.effect);
     }
 
     fn defer_program_effects(&self) -> bool {
@@ -194,6 +189,7 @@ impl ToolExecutionCoordinator {
             row_idx,
             program,
             vm_output,
+            event_tx: event_tx.clone(),
         });
 
         tokio::spawn(async move {

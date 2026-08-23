@@ -68,6 +68,14 @@ impl VmOutputProjection {
         }
     }
 
+    /// Append host-rendered context (for example a proposal lifecycle notice)
+    /// to this projection's response port. This is intentionally separate
+    /// from `project`: the portable VM event remains unchanged and another
+    /// embedder may choose a different presentation for it.
+    pub fn append_default(&self, text: &str) {
+        self.default_response.append_response(text);
+    }
+
     fn project_ui(
         &self,
         operation: UiOperation,
