@@ -149,6 +149,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
   must be separately scheduled/approved BrainRuns. Do not revive the legacy mutable
   `boot = true` Co-Forth registry as an ambient startup hook.
+- [ ] After the VM gate, design an optional reviewed **semantic-convergence corpus** for a Brain:
+  versioned examples, equivalences, claims, and executable proofs that document how human/LLM
+  symbols acquire shared meaning. It may inform a provider manifest and be refined through
+  explicit proposals, but it must never silently redefine core words or execute as ambient boot
+  poetry.
 - [ ] Add per-brain control ownership/leases and participant roles. Only the bound environment
   may execute workspace effects or reveal/rotate its credential.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an
