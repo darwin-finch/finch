@@ -252,6 +252,42 @@ impl ProgramRuntime {
         Self::with_automation(false)
     }
 
+    /// Construct a fresh shared program runtime from reducible typed VM state.
+    /// The restored instance begins a new local revision lineage at zero: a
+    /// daemon/Brain event log is responsible for assigning durable revision
+    /// identity and restoring host-owned resources or approvals around it.
+    pub fn from_checkpoint(checkpoint: TypedRuntimeCheckpoint) -> Result<Self> {
+        let typed_runtime = TypedRuntime::from_checkpoint(checkpoint.clone())
+            .map_err(|diagnostics| anyhow::anyhow!(
+                "cannot restore typed runtime checkpoint: {}",
+                diagnostics
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))?;
+        let runtime = Self::new();
+        let vocabulary = typed_runtime.vocabulary().keys().cloned().collect();
+        let stack = typed_runtime.stack().to_vec();
+        *runtime
+            .typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))? = typed_runtime;
+        *runtime
+            .revision_history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))? = vec![
+            VmRevisionSnapshot {
+                revision: 0,
+                stack,
+                vocabulary,
+                checkpoint: Some(checkpoint),
+                checkpoint_diagnostic: None,
+            },
+        ];
+        Ok(runtime)
+    }
+
     pub fn with_automation(enabled: bool) -> Self {
         let automation = Arc::new(AutomationBroker::new(enabled));
         let typed_runtime = TypedRuntime::new();
@@ -4681,6 +4717,46 @@ mod tests {
 
         assert_eq!(result.status, TypedExecutionStatus::Completed);
         assert_eq!(restored.stack(), &[TypedValue::Int(49)]);
+    }
+
+    #[tokio::test]
+    async fn program_runtime_restarts_from_a_typed_checkpoint() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                ": square ( S int -- S int ! {} ) dup * ; 8",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .last()
+            .and_then(|snapshot| snapshot.checkpoint.clone())
+            .unwrap();
+
+        let restored = ProgramRuntime::from_checkpoint(checkpoint).unwrap();
+        let result = restored
+            .submit(submission(ProgramLanguage::Lisp, "(square 8)", ExecutionEffect::Pure))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ExecutionStatus::Completed);
+        assert_eq!(result.input_revision, 0);
+        assert_eq!(result.output_revision, 1);
+        assert_eq!(
+            restored
+                .inspect()
+                .await
+                .unwrap()
+                .typed_stack
+                .iter()
+                .map(|cell| cell.value.clone())
+                .collect::<Vec<_>>(),
+            vec![TypedValue::Int(8), TypedValue::Int(64)]
+        );
     }
 
     #[tokio::test]
