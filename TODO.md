@@ -32,7 +32,7 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   rule. Include common stack-error corrections rather than only error codes.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
-- [ ] Make documentation a first-class field of typed Lisp/Co-Forth definitions and promotion
+- [x] Make documentation a first-class field of typed Lisp/Co-Forth definitions and promotion
   records, not merely leading source comments. Preserve `; finch-doc:` / `\ finch-doc:` as a
   self-contained-script spelling, retain exact immutable version metadata, and converge provider
   discovery on `search_word` / `inspect_word`: compact search across core and persisted words,
