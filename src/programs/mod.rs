@@ -492,6 +492,10 @@ pub enum ProgramValue {
     Symbol(String),
     String(String),
     Bytes(Vec<u8>),
+    /// A portable, managed JSON tree returned by the typed VM. This preserves
+    /// its structured representation across the runtime boundary rather than
+    /// degrading it to an untyped string.
+    Json(serde_json::Value),
     List(Vec<ProgramValue>),
     Option(Option<Box<ProgramValue>>),
     Result {

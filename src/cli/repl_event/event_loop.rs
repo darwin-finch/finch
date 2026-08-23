@@ -1046,6 +1046,7 @@ fn peer_program_value(value: &crate::programs::ProgramValue) -> String {
         crate::programs::ProgramValue::Float(value) => value.to_string(),
         crate::programs::ProgramValue::Symbol(value) => format!("'{value}"),
         crate::programs::ProgramValue::String(value) => format!("{value:?}"),
+        crate::programs::ProgramValue::Json(value) => value.to_string(),
         other => format!("{other:?}"),
     }
 }

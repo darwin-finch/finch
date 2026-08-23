@@ -2608,6 +2608,7 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
         TypedValue::Symbol(value) => ProgramValue::Symbol(value),
         TypedValue::String(value) => ProgramValue::String(value),
         TypedValue::Bytes(value) => ProgramValue::Bytes(value),
+        TypedValue::Json(value) => ProgramValue::Json(value),
         TypedValue::List { values, .. } => ProgramValue::List(typed_values(values)?),
         TypedValue::Option { value, .. } => ProgramValue::Option(
             value
@@ -2826,6 +2827,25 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
         assert_eq!(outcome.values, vec![ProgramValue::Int(11)]);
+    }
+
+    #[tokio::test]
+    async fn managed_json_fields_cross_the_public_runtime_boundary() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(json-get (result-unwrap (json-parse \"{\\\"nested\\\":{\\\"answer\\\":42}}\")) \"nested\")",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .expect("managed JSON field lookup succeeds");
+        assert_eq!(
+            outcome.values,
+            vec![ProgramValue::Option(Some(Box::new(ProgramValue::Json(
+                serde_json::json!({"answer": 42}),
+            ))))]
+        );
     }
 
     #[tokio::test]
