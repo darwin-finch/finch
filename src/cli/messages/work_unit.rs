@@ -170,6 +170,18 @@ pub struct WorkUnit {
     inner: Arc<RwLock<WorkUnitInner>>,
 }
 
+impl fmt::Debug for WorkUnit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // WorkUnit contents are mutable UI state and can be very large. Event
+        // logs only need a stable, human-useful identity.
+        formatter
+            .debug_struct("WorkUnit")
+            .field("id", &self.id)
+            .field("verb", &self.verb)
+            .finish_non_exhaustive()
+    }
+}
+
 impl WorkUnit {
     /// Create a new WorkUnit with the given verb (e.g. `"Channeling"`).
     pub fn new(verb: impl Into<String>) -> Self {

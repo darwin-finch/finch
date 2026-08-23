@@ -84,6 +84,7 @@ impl EventHandler {
             // Ignore these events (they don't affect tree structure)
             ReplEvent::OutputReady { .. } => {}
             ReplEvent::VmEffect { .. } => {}
+            ReplEvent::TypedProgramComplete { .. } => {}
             ReplEvent::StreamingComplete { .. } => {}
             ReplEvent::CancelQuery => {}
             ReplEvent::Shutdown => {}

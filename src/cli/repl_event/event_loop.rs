@@ -1962,6 +1962,7 @@ impl EventLoop {
                         ReplEvent::ToolApprovalNeeded { .. } => "ToolApprovalNeeded",
                         ReplEvent::OutputReady { .. } => "OutputReady",
                         ReplEvent::VmEffect { .. } => "VmEffect",
+                        ReplEvent::TypedProgramComplete { .. } => "TypedProgramComplete",
                         ReplEvent::UserInput { .. } => "UserInput",
                         ReplEvent::StatsUpdate { .. } => "StatsUpdate",
                         ReplEvent::AgentLifecycle(_) => "AgentLifecycle",
@@ -3162,35 +3163,37 @@ Rules:\n\
         source_unit.set_complete();
         let output_unit = self.output_manager.start_work_unit("VM program output");
         output_unit.set_program_output();
-        let projection = VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
+        let projection =
+            VmOutputProjection::new(Arc::clone(&self.output_manager), Arc::clone(&output_unit));
+        let event_tx = self.event_tx.clone();
         let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
-            projection.project(&envelope.effect);
+            let _ = event_tx.send(ReplEvent::VmEffect {
+                projection: projection.clone(),
+                envelope,
+            });
         });
-        let outcome = self
-            .program_runtime
-            .submit_with_deferred_program_effects(
-                crate::runtime::ProgramSubmission {
-                    language,
-                    source,
-                    intent: "interactive typed source".into(),
-                    effect: crate::programs::ExecutionEffect::Unclassified,
-                    declared_capabilities: Vec::new(),
-                    manifest_generation: self.program_runtime.manifest_generation(),
-                    expected_revision: Some(self.program_runtime.revision()),
-                    budget: None,
-                },
-                sink,
-            )
-            .await?;
-        if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
-            let detail = outcome
-                .diagnostics
-                .first()
-                .cloned()
-                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-            output_unit.append_response(&format!("VM error: {detail}"));
-        }
-        output_unit.set_complete();
+        let submission = crate::runtime::ProgramSubmission {
+            language,
+            source,
+            intent: "interactive typed source".into(),
+            effect: crate::programs::ExecutionEffect::Unclassified,
+            declared_capabilities: Vec::new(),
+            manifest_generation: self.program_runtime.manifest_generation(),
+            expected_revision: Some(self.program_runtime.revision()),
+            budget: None,
+        };
+        let runtime = Arc::clone(&self.program_runtime);
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = runtime
+                .submit_with_deferred_program_effects(submission, sink)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = event_tx.send(ReplEvent::TypedProgramComplete {
+                output_unit,
+                result,
+            });
+        });
         self.render_tui().await
     }
 
@@ -3846,6 +3849,25 @@ Rules:\n\
                     ));
                 }
                 projection.project(&envelope.effect);
+                self.render_tui().await?;
+            }
+
+            ReplEvent::TypedProgramComplete {
+                output_unit,
+                result,
+            } => {
+                match result {
+                    Ok(outcome)
+                        if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {}
+                    Ok(outcome) => {
+                        let detail = outcome.diagnostics.first().cloned().unwrap_or_else(|| {
+                            format!("VM program ended as {:?}", outcome.status)
+                        });
+                        output_unit.append_response(&format!("VM error: {detail}"));
+                    }
+                    Err(error) => output_unit.append_response(&format!("VM error: {error}")),
+                }
+                output_unit.set_complete();
                 self.render_tui().await?;
             }
 

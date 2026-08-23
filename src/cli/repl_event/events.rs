@@ -8,12 +8,14 @@
 //! * **Brain** — `BrainQuestion`, `BrainProposedAction`.
 //! * **Daemon** — `DaemonBrainQuestion`, `DaemonBrainProposedAction`.
 
+use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::VmOutputProjection;
 use crate::runtime::VmEffectEnvelope;
 use crate::tools::executor::ToolSignature;
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::ToolUse;
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -80,6 +82,14 @@ pub enum ReplEvent {
     VmEffect {
         projection: VmOutputProjection,
         envelope: VmEffectEnvelope,
+    },
+
+    /// An explicitly entered typed program finished on a background worker.
+    /// Its output unit already exists in the shadow buffer; the event loop
+    /// owns final status/error projection and the corresponding redraw.
+    TypedProgramComplete {
+        output_unit: Arc<WorkUnit>,
+        result: std::result::Result<crate::runtime::outcome::ExecutionOutcome, String>,
     },
 
     /// Streaming response completed (used for non-streaming path)
@@ -359,6 +369,25 @@ mod tests {
         };
         match event {
             ReplEvent::ToolApprovalNeeded { query_id, .. } => assert_eq!(query_id, id),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn typed_program_completion_keeps_the_output_unit_on_the_event_loop() {
+        let unit = Arc::new(WorkUnit::new("typed program output"));
+        let event = ReplEvent::TypedProgramComplete {
+            output_unit: Arc::clone(&unit),
+            result: Err("cancelled before completion".to_string()),
+        };
+        match event {
+            ReplEvent::TypedProgramComplete {
+                output_unit,
+                result: Err(error),
+            } => {
+                assert!(Arc::ptr_eq(&unit, &output_unit));
+                assert_eq!(error, "cancelled before completion");
+            }
             _ => panic!("Wrong variant"),
         }
     }

@@ -59,8 +59,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   port append (`say`), append/replace/status/progress/complete/fail operations, per-handle ownership
   and generation checks, and journal-first projection into concurrent shadow-buffer WorkUnits. Provider
   wire effects and the provider `submit_program` tool now cross the client's ordered REPL event bus
-  before any WorkUnit mutation; still replace the remaining direct compatibility projections with
-  durable application-journal/replay support.
+  before any WorkUnit mutation, and explicitly entered typed programs run as background ProgramRuns
+  whose completion returns through that same loop; still replace the remaining direct compatibility
+  projections with durable application-journal/replay support.
 - [ ] Reimplement the existing model-facing `TodoRead`/`TodoWrite` tools over a typed, journaled
   task-list projection owned by the Brain/runtime. Keep their useful visible-plan UX and stable tool
   surface, but make task creation, status changes, hierarchy, progress, cancellation, and durable
