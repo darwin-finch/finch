@@ -146,16 +146,17 @@ For large text, CSV, or binary files, use `(file-size path)` and `(file-slice pa
 instead of `(file-read path)`. A slice returns at most the requested range (currently capped at
 8 MiB per call), with a shorter final value at EOF. Keep the byte offset in a lexical binding and
 process each slice before requesting the next. For UTF-8 line-oriented files,
-`(file-lines-open path)` returns a host-issued `resource<file-line-cursor>` and
-`(file-lines-next cursor)` returns `option<string>` one bounded line at a time (1 MiB maximum
-line); `(file-lines-close cursor)` releases it early. The cursor is owned by its ProgramRun and
-cannot be forged or reused by another run. CSV-record cursors are distinct because quoted fields
+`(file-lines-open path)` returns a host-issued `stream<string>` and `(stream-next stream)`
+returns `option<string>` one bounded line at a time (1 MiB maximum line); `(stream-close stream)`
+releases it early. The stream is owned by its ProgramRun and cannot be forged or reused by another
+run. `file-lines-next` / `file-lines-close` remain compatibility aliases. CSV record streams are
+distinct because quoted fields
 may span physical lines; workbook cursors remain future resources. An Excel document must not be
 treated as a single text string.
 
 ```lisp
-(let ((cursor (file-lines-open (path "data.csv"))))
-  (file-lines-next cursor))
+(let ((stream (file-lines-open (path "data.csv"))))
+  (stream-next stream))
 ```
 
 To process a text file without retaining prior rows, put the cursor in a named loop and make the
@@ -163,18 +164,18 @@ To process a text file without retaining prior rows, put the cursor in a named l
 close a cursor on any explicit early-return/error path until structured cleanup is added:
 
 ```lisp
-(let ((cursor (file-lines-open (path "data.csv"))))
+(let ((stream (file-lines-open (path "data.csv"))))
   (begin
     (while :label rows true
-      (match-option (file-lines-next cursor)
+      (match-option (stream-next stream)
         (some line (say line)) ; replace with bounded row processing
         (none (break rows))))
-    (file-lines-close cursor)))
+    (stream-close stream)))
 ```
 
-CSV must use a record cursor rather than a line cursor because quoted fields can contain commas and
-newlines. `(csv-open path)` returns `resource<csv-record-cursor>`;
-`(csv-next cursor)` returns `option<list<string>>`; `(csv-close cursor)` releases it. Fields are
+CSV must use a record stream rather than a line stream because quoted fields can contain commas and
+newlines. `(csv-open path)` returns `stream<list<string>>`;
+`(stream-next stream)` returns `option<list<string>>`; `(stream-close stream)` releases it. Fields are
 UTF-8, quoted fields follow RFC-style doubled-quote and multiline rules, malformed quote boundaries
 are rejected, and each complete record is limited to 8 MiB.
 
@@ -220,10 +221,10 @@ returns control to its event loop, and later resumes the following expression. I
   (say "Finished."))
 ```
 
-`yield` is not a sequence generator: version 1 has no `next`, lazy `generator<T>`, or iterable
-protocol. Do not infer those features from the legacy Co-Forth compatibility library. Use a bounded
-list for a known finite result, a cursor (`file-lines-next`/`csv-next`) for host-backed iteration,
-or ask for/add a typed stream primitive when lazy generated sequences are required.
+`yield` is not a sequence generator. Use a bounded list for a known finite result or a typed
+`stream<T>` with `stream-next` / `stream-close` for host-backed iteration. Do not infer arbitrary
+generators or iterables from the legacy Co-Forth compatibility library; producer-backed streams
+remain a future typed extension.
 
 `(vm-vocabulary)` returns the current typed word manifest for programmatic introspection.
 

@@ -564,6 +564,65 @@ pub(crate) fn apply_signature_types(
     apply_signature(signature, stack, origin)
 }
 
+/// Instantiate a polymorphic signature against the current concrete suffix
+/// without mutating the frontend's virtual stack. Awaited host effects carry
+/// this concrete row in their portable ABI, so a host result such as
+/// `option<string>` is not incorrectly compared with `option<A>` on resume.
+pub(crate) fn instantiate_signature_types(
+    signature: &StackSignature,
+    stack: &[Type],
+    origin: &SourceOrigin,
+) -> Result<StackSignature, VmDiagnostic> {
+    let required = signature.input.values.len();
+    if stack.len() < required {
+        return Err(underflow(origin, required, stack.len()));
+    }
+    if signature.input.tail.is_none() && stack.len() != required {
+        return Err(VmDiagnostic::error(
+            "E-STACK-002",
+            DiagnosticPhase::Verification,
+            format!(
+                "closed signature requires exactly {required} values, found {}",
+                stack.len()
+            ),
+            Some(origin.clone()),
+        ));
+    }
+    let prefix_len = stack.len() - required;
+    let mut substitutions = BTreeMap::<String, Type>::new();
+    for (expected, found) in signature
+        .input
+        .values
+        .iter()
+        .zip(stack[prefix_len..].iter())
+    {
+        unify(expected, found, &mut substitutions, origin)?;
+    }
+    Ok(StackSignature {
+        type_parameters: signature.type_parameters.clone(),
+        input: StackRow {
+            tail: signature.input.tail.clone(),
+            values: signature
+                .input
+                .values
+                .iter()
+                .map(|ty| substitute(ty, &substitutions))
+                .collect(),
+        },
+        output: StackRow {
+            tail: signature.output.tail.clone(),
+            values: signature
+                .output
+                .values
+                .iter()
+                .map(|ty| substitute(ty, &substitutions))
+                .collect(),
+        },
+        effects: signature.effects.clone(),
+        control: signature.control.clone(),
+    })
+}
+
 fn apply_stack_types(
     input: &[Type],
     output: &[Type],
@@ -600,7 +659,8 @@ fn unify(
     match (expected, found) {
         (Type::List(expected), Type::List(found))
         | (Type::Option(expected), Type::Option(found))
-        | (Type::Task(expected), Type::Task(found)) => {
+        | (Type::Task(expected), Type::Task(found))
+        | (Type::Stream(expected), Type::Stream(found)) => {
             unify(expected, found, substitutions, origin)
         }
         (Type::Map(expected_key, expected_value), Type::Map(found_key, found_value)) => {
@@ -637,6 +697,7 @@ fn substitute(ty: &Type, substitutions: &BTreeMap<String, Type>) -> Type {
             Box::new(substitute(value, substitutions)),
         ),
         Type::Task(inner) => Type::Task(Box::new(substitute(inner, substitutions))),
+        Type::Stream(inner) => Type::Stream(Box::new(substitute(inner, substitutions))),
         Type::Function {
             arguments,
             result,

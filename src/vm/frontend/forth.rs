@@ -6,7 +6,9 @@ use crate::vm::interpreter::UiOperation;
 use crate::vm::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
 use crate::vm::types::{Type, TypedValue};
-use crate::vm::verifier::{apply_signature_types, VerifiedModule, Verifier, Vocabulary};
+use crate::vm::verifier::{
+    apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -1360,6 +1362,8 @@ fn compile_forth_body_with_locals(
                             Some(origin),
                         )]);
                     };
+                    let concrete_signature = instantiate_signature_types(signature, &stack, &origin)
+                        .map_err(|diagnostic| vec![diagnostic])?;
                     apply_signature_types(signature, &mut stack, &origin)
                         .map_err(|diagnostic| vec![diagnostic])?;
                     effects = effects.union(&signature.effects);
@@ -1370,14 +1374,14 @@ fn compile_forth_body_with_locals(
                     } else if let Some(operation) = output_operation(&word) {
                         Instruction::UiEffect {
                             operation,
-                            input: signature.input.values.clone(),
-                            output: signature.output.values.clone(),
+                            input: concrete_signature.input.values.clone(),
+                            output: concrete_signature.output.values.clone(),
                         }
                     } else if signature.effects.0.len() == 1 {
                         Instruction::CapabilityRequest {
                             requirement: signature.effects.0.iter().next().unwrap().clone(),
-                            input: signature.input.values.clone(),
-                            output: signature.output.values.clone(),
+                            input: concrete_signature.input.values.clone(),
+                            output: concrete_signature.output.values.clone(),
                         }
                     } else {
                         Instruction::Call { function: word }

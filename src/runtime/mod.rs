@@ -1355,6 +1355,136 @@ impl TypedHostHandler {
             defer_program_invocations,
         }
     }
+
+    /// Advance one host-owned stream. The stream's opaque kind/ID is checked
+    /// here rather than inferred from a source string, and each backing cursor
+    /// remains owned by the ProgramRun that opened it.
+    fn stream_next(
+        &mut self,
+        arguments: &[TypedValue],
+        origin: &crate::vm::SourceOrigin,
+    ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
+        let [TypedValue::Stream {
+            id,
+            element_type,
+            kind,
+            generation,
+        }] = arguments
+        else {
+            return Err(host_binding_error(origin, "stream-next requires one stream<T>"));
+        };
+        match kind.as_str() {
+            "csv-records" if *element_type == Type::list(Type::String) => {
+                let mut cursors = self.csv_record_cursors.lock().map_err(|_| {
+                    host_binding_error(origin, "CSV stream registry lock poisoned")
+                })?;
+                let cursor = cursors.get_mut(id).ok_or_else(|| {
+                    host_binding_error(origin, "CSV stream is unknown or closed")
+                })?;
+                if cursor.owner != self.execution_id || cursor.generation != *generation {
+                    return Err(host_binding_error(
+                        origin,
+                        "CSV stream does not belong to this ProgramRun",
+                    ));
+                }
+                let record = read_bounded_csv_record(&mut cursor.reader)
+                    .map_err(|message| host_binding_error(origin, message))?;
+                Ok(vec![TypedValue::Option {
+                    inner_type: Type::list(Type::String),
+                    value: record.map(|fields| {
+                        Box::new(TypedValue::List {
+                            element_type: Type::String,
+                            values: fields.into_iter().map(TypedValue::String).collect(),
+                        })
+                    }),
+                }])
+            }
+            "file-lines" if *element_type == Type::String => {
+                let mut cursors = self.file_line_cursors.lock().map_err(|_| {
+                    host_binding_error(origin, "file line stream registry lock poisoned")
+                })?;
+                let cursor = cursors.get_mut(id).ok_or_else(|| {
+                    host_binding_error(origin, "file line stream is unknown or closed")
+                })?;
+                if cursor.owner != self.execution_id || cursor.generation != *generation {
+                    return Err(host_binding_error(
+                        origin,
+                        "file line stream does not belong to this ProgramRun",
+                    ));
+                }
+                let line = read_bounded_utf8_line(&mut cursor.reader)
+                    .map_err(|message| host_binding_error(origin, message))?;
+                Ok(vec![TypedValue::Option {
+                    inner_type: Type::String,
+                    value: line.map(|line| Box::new(TypedValue::String(line))),
+                }])
+            }
+            _ => Err(host_binding_error(
+                origin,
+                "stream-next received an unknown or malformed stream",
+            )),
+        }
+    }
+
+    /// Explicit stream cancellation/release. Closing twice fails rather than
+    /// silently creating a new cursor or masking an ownership violation.
+    fn stream_close(
+        &mut self,
+        arguments: &[TypedValue],
+        origin: &crate::vm::SourceOrigin,
+    ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
+        let [TypedValue::Stream {
+            id,
+            element_type,
+            kind,
+            generation,
+        }] = arguments
+        else {
+            return Err(host_binding_error(origin, "stream-close requires one stream<T>"));
+        };
+        let remove = match kind.as_str() {
+            "csv-records" if *element_type == Type::list(Type::String) => {
+                let mut cursors = self.csv_record_cursors.lock().map_err(|_| {
+                    host_binding_error(origin, "CSV stream registry lock poisoned")
+                })?;
+                let cursor = cursors.get(id).ok_or_else(|| {
+                    host_binding_error(origin, "CSV stream is unknown or closed")
+                })?;
+                if cursor.owner != self.execution_id || cursor.generation != *generation {
+                    return Err(host_binding_error(
+                        origin,
+                        "CSV stream does not belong to this ProgramRun",
+                    ));
+                }
+                cursors.remove(id);
+                true
+            }
+            "file-lines" if *element_type == Type::String => {
+                let mut cursors = self.file_line_cursors.lock().map_err(|_| {
+                    host_binding_error(origin, "file line stream registry lock poisoned")
+                })?;
+                let cursor = cursors.get(id).ok_or_else(|| {
+                    host_binding_error(origin, "file line stream is unknown or closed")
+                })?;
+                if cursor.owner != self.execution_id || cursor.generation != *generation {
+                    return Err(host_binding_error(
+                        origin,
+                        "file line stream does not belong to this ProgramRun",
+                    ));
+                }
+                cursors.remove(id);
+                true
+            }
+            _ => {
+                return Err(host_binding_error(
+                    origin,
+                    "stream-close received an unknown or malformed stream",
+                ))
+            }
+        };
+        debug_assert!(remove);
+        Ok(vec![TypedValue::Unit])
+    }
 }
 
 impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
@@ -1526,150 +1656,11 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             }
             crate::vm::CapabilityKind::FileRead => {
                 match origin.word.as_deref() {
-                    Some("csv-next") => {
-                        let [TypedValue::Resource {
-                            kind,
-                            handle,
-                            generation,
-                        }] = arguments.as_slice()
-                        else {
-                            return Err(host_binding_error(
-                                origin,
-                                "csv-next requires one CSV record cursor",
-                            ));
-                        };
-                        if kind != "csv-record-cursor" {
-                            return Err(host_binding_error(
-                                origin,
-                                "csv-next requires a CSV record cursor resource",
-                            ));
-                        }
-                        let mut cursors = self.csv_record_cursors.lock().map_err(|_| {
-                            host_binding_error(origin, "CSV cursor registry lock poisoned")
-                        })?;
-                        let cursor = cursors.get_mut(handle).ok_or_else(|| {
-                            host_binding_error(origin, "CSV cursor is unknown or closed")
-                        })?;
-                        if cursor.owner != self.execution_id || cursor.generation != *generation {
-                            return Err(host_binding_error(
-                                origin,
-                                "CSV cursor does not belong to this ProgramRun",
-                            ));
-                        }
-                        let record = read_bounded_csv_record(&mut cursor.reader)
-                            .map_err(|message| host_binding_error(origin, message))?;
-                        return Ok(vec![TypedValue::Option {
-                            inner_type: Type::list(Type::String),
-                            value: record.map(|fields| {
-                                Box::new(TypedValue::List {
-                                    element_type: Type::String,
-                                    values: fields.into_iter().map(TypedValue::String).collect(),
-                                })
-                            }),
-                        }]);
+                    Some("csv-next") | Some("file-lines-next") | Some("stream-next") => {
+                        return self.stream_next(&arguments, origin);
                     }
-                    Some("csv-close") => {
-                        let [TypedValue::Resource {
-                            kind,
-                            handle,
-                            generation,
-                        }] = arguments.as_slice()
-                        else {
-                            return Err(host_binding_error(
-                                origin,
-                                "csv-close requires one CSV record cursor",
-                            ));
-                        };
-                        if kind != "csv-record-cursor" {
-                            return Err(host_binding_error(
-                                origin,
-                                "csv-close requires a CSV record cursor resource",
-                            ));
-                        }
-                        let mut cursors = self.csv_record_cursors.lock().map_err(|_| {
-                            host_binding_error(origin, "CSV cursor registry lock poisoned")
-                        })?;
-                        let cursor = cursors.get(handle).ok_or_else(|| {
-                            host_binding_error(origin, "CSV cursor is unknown or closed")
-                        })?;
-                        if cursor.owner != self.execution_id || cursor.generation != *generation {
-                            return Err(host_binding_error(
-                                origin,
-                                "CSV cursor does not belong to this ProgramRun",
-                            ));
-                        }
-                        cursors.remove(handle);
-                        return Ok(vec![TypedValue::Unit]);
-                    }
-                    Some("file-lines-next") => {
-                        let [TypedValue::Resource {
-                            kind,
-                            handle,
-                            generation,
-                        }] = arguments.as_slice()
-                        else {
-                            return Err(host_binding_error(
-                                origin,
-                                "file-lines-next requires one file line cursor",
-                            ));
-                        };
-                        if kind != "file-line-cursor" {
-                            return Err(host_binding_error(
-                                origin,
-                                "file-lines-next requires a file line cursor resource",
-                            ));
-                        }
-                        let mut cursors = self.file_line_cursors.lock().map_err(|_| {
-                            host_binding_error(origin, "file line cursor registry lock poisoned")
-                        })?;
-                        let cursor = cursors.get_mut(handle).ok_or_else(|| {
-                            host_binding_error(origin, "file line cursor is unknown or closed")
-                        })?;
-                        if cursor.owner != self.execution_id || cursor.generation != *generation {
-                            return Err(host_binding_error(
-                                origin,
-                                "file line cursor does not belong to this ProgramRun",
-                            ));
-                        }
-                        let line = read_bounded_utf8_line(&mut cursor.reader)
-                            .map_err(|message| host_binding_error(origin, message))?;
-                        return Ok(vec![TypedValue::Option {
-                            inner_type: Type::String,
-                            value: line.map(|line| Box::new(TypedValue::String(line))),
-                        }]);
-                    }
-                    Some("file-lines-close") => {
-                        let [TypedValue::Resource {
-                            kind,
-                            handle,
-                            generation,
-                        }] = arguments.as_slice()
-                        else {
-                            return Err(host_binding_error(
-                                origin,
-                                "file-lines-close requires one file line cursor",
-                            ));
-                        };
-                        if kind != "file-line-cursor" {
-                            return Err(host_binding_error(
-                                origin,
-                                "file-lines-close requires a file line cursor resource",
-                            ));
-                        }
-                        let mut cursors = self.file_line_cursors.lock().map_err(|_| {
-                            host_binding_error(origin, "file line cursor registry lock poisoned")
-                        })?;
-                        let cursor = cursors.get(handle).ok_or_else(|| {
-                            host_binding_error(origin, "file line cursor is unknown or closed")
-                        })?;
-                        if cursor.owner != self.execution_id || cursor.generation != *generation {
-                            return Err(host_binding_error(
-                                origin,
-                                "file line cursor does not belong to this ProgramRun",
-                            ));
-                        }
-                        cursors.remove(handle);
-                        return Ok(vec![TypedValue::Unit]);
+                    Some("csv-close") | Some("file-lines-close") | Some("stream-close") => {
+                        return self.stream_close(&arguments, origin);
                     }
                     _ => {}
                 }
@@ -1705,9 +1696,10 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                     reader: BufReader::new(file),
                                 },
                             );
-                        return Ok(vec![TypedValue::Resource {
-                            kind: "csv-record-cursor".into(),
-                            handle,
+                        return Ok(vec![TypedValue::Stream {
+                            id: handle,
+                            element_type: Type::list(Type::String),
+                            kind: "csv-records".into(),
                             generation: 0,
                         }]);
                     }
@@ -1737,9 +1729,10 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                     reader: BufReader::new(file),
                                 },
                             );
-                        return Ok(vec![TypedValue::Resource {
-                            kind: "file-line-cursor".into(),
-                            handle,
+                        return Ok(vec![TypedValue::Stream {
+                            id: handle,
+                            element_type: Type::String,
+                            kind: "file-lines".into(),
                             generation: 0,
                         }]);
                     }
@@ -2621,6 +2614,16 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
             value: Box::new(typed_value(*value)?),
         },
         TypedValue::Task { id, .. } => ProgramValue::Task(id),
+        TypedValue::Stream {
+            id,
+            kind,
+            generation,
+            ..
+        } => ProgramValue::Resource {
+            kind: format!("stream:{kind}"),
+            handle: id,
+            generation,
+        },
         TypedValue::Resource {
             kind,
             handle,
@@ -3047,7 +3050,7 @@ mod tests {
         let pending = runtime
             .submit_typed_only(submission(
                 ProgramLanguage::Lisp,
-                "(let ((cursor (file-lines-open (path \"Cargo.toml\")))) (file-lines-next cursor))",
+                "(let ((stream (file-lines-open (path \"Cargo.toml\")))) (stream-next stream))",
                 ExecutionEffect::WorkspaceRead,
             ))
             .await
@@ -3082,7 +3085,7 @@ mod tests {
         let pending = runtime
             .submit_typed_only(submission(
                 ProgramLanguage::Forth,
-                "s\"Cargo.toml\" path csv-open dup csv-next swap csv-close drop",
+                "s\"Cargo.toml\" path csv-open dup stream-next swap stream-close drop",
                 ExecutionEffect::WorkspaceRead,
             ))
             .await
@@ -3149,13 +3152,13 @@ mod tests {
                 ProgramLanguage::Forth,
                 "s\"Cargo.toml\" path file-lines-open \
                  begin: lines true while \
-                   dup file-lines-next if-some \
+                   dup stream-next if-some \
                      say \
                    else \
                      break lines \
                    then \
                  repeat \
-                 file-lines-close",
+                 stream-close",
                 ExecutionEffect::WorkspaceRead,
             ))
             .await
@@ -3190,10 +3193,10 @@ mod tests {
                 "(let ((cursor (file-lines-open (path \"Cargo.toml\")))) \
                    (begin \
                      (while :label lines true \
-                       (match-option (file-lines-next cursor) \
+                       (match-option (stream-next cursor) \
                          (some line (say line)) \
                          (none (break lines)))) \
-                     (file-lines-close cursor)))",
+                     (stream-close cursor)))",
                 ExecutionEffect::WorkspaceRead,
             ))
             .await

@@ -134,17 +134,18 @@ explicitly installed `root<host-machine>` and the user has approved a matching s
 `s" var/log/system.log" host-path host-file-read`. Workspace `file-read` and `file-write` reject
 that value at verification time; bind `/` only for an intentional whole-machine grant.
 
-For UTF-8 line-oriented files, `file-lines-open` returns a host-issued
-`resource<file-line-cursor>` and `file-lines-next` returns `option<string>` one bounded line at a
-time (1 MiB maximum line); `file-lines-close` releases it early. The cursor is owned by its
-ProgramRun and cannot be forged or reused by another run. CSV-record cursors are distinct because
+For UTF-8 line-oriented files, `file-lines-open` returns a host-issued `stream<string>` and
+`stream-next` returns `option<string>` one bounded line at a time (1 MiB maximum line);
+`stream-close` releases it early. The stream is owned by its ProgramRun and cannot be forged or
+reused by another run. `file-lines-next` / `file-lines-close` remain compatibility aliases.
+CSV-record streams are distinct because
 quoted fields may span physical lines; workbook cursors remain future resources. Do not fake
 spreadsheet streaming by loading a whole workbook into a string.
 
 ```forth
 : first-line ( S -- S option<string> ! {file.read(./**)} )
   s" data.csv" path file-lines-open locals| cursor |
-  cursor file-lines-next
+  cursor stream-next
 ;
 ```
 
@@ -154,17 +155,17 @@ record without retaining it between iterations:
 ```forth
 s" data.csv" path file-lines-open
 begin: rows true while
-  dup file-lines-next if-some
+  dup stream-next if-some
     say                      \ replace with bounded row processing
   else
     break rows
   then
 repeat
-file-lines-close
+stream-close
 ```
 
-Use `csv-open` to obtain `resource<csv-record-cursor>`, `csv-next` to obtain
-`option<list<string>>`, and `csv-close` to release it. The cursor accepts UTF-8 RFC-style quoted
+Use `csv-open` to obtain `stream<list<string>>`, `stream-next` to obtain
+`option<list<string>>`, and `stream-close` to release it. The stream accepts UTF-8 RFC-style quoted
 fields, including doubled quotes and multiline fields, and bounds each complete record to 8 MiB.
 It rejects malformed quote boundaries instead of guessing. It has the same ProgramRun ownership and
 `file.read` requirement as a line cursor.

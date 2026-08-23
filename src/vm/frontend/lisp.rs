@@ -7,7 +7,9 @@ use crate::vm::interpreter::UiOperation;
 use crate::vm::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
 use crate::vm::types::{Type, TypedValue};
-use crate::vm::verifier::{apply_signature_types, VerifiedModule, Verifier, Vocabulary};
+use crate::vm::verifier::{
+    apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -1664,6 +1666,8 @@ impl Compiler<'_> {
             self.compile_expression(argument, builder)?;
         }
         let origin = self.origin(operator);
+        let concrete_signature = instantiate_signature_types(&signature, &builder.stack, &origin)
+            .map_err(|diagnostic| vec![diagnostic])?;
         apply_signature_types(&signature, &mut builder.stack, &origin)
             .map_err(|diagnostic| vec![diagnostic])?;
         builder.effects = builder.effects.union(&signature.effects);
@@ -1685,14 +1689,14 @@ impl Compiler<'_> {
         } else if let Some(operation) = output_operation(word) {
             Instruction::UiEffect {
                 operation,
-                input: signature.input.values.clone(),
-                output: signature.output.values.clone(),
+                input: concrete_signature.input.values.clone(),
+                output: concrete_signature.output.values.clone(),
             }
         } else if signature.effects.0.len() == 1 {
             Instruction::CapabilityRequest {
                 requirement: signature.effects.0.iter().next().unwrap().clone(),
-                input: signature.input.values.clone(),
-                output: signature.output.values.clone(),
+                input: concrete_signature.input.values.clone(),
+                output: concrete_signature.output.values.clone(),
             }
         } else {
             Instruction::Call {
@@ -2064,6 +2068,7 @@ fn parse_generic_type(name: &str) -> Option<Type> {
         "list" => one().map(Type::list),
         "option" => one().map(|inner| Type::Option(Box::new(inner))),
         "task" => one().map(|inner| Type::Task(Box::new(inner))),
+        "stream" => one().map(|inner| Type::Stream(Box::new(inner))),
         "resource" => (arguments.len() == 1).then(|| Type::Resource(arguments[0].to_string())),
         "capability" => (arguments.len() == 1).then(|| Type::Capability(arguments[0].to_string())),
         "map" if arguments.len() == 2 => Some(Type::Map(
@@ -2478,6 +2483,10 @@ mod tests {
         assert_eq!(
             parse_type_name("result<option<list<int>>,string>").unwrap(),
             Type::result(Type::Option(Box::new(Type::list(Type::Int))), Type::String,)
+        );
+        assert_eq!(
+            parse_type_name("stream<list<string>>").unwrap(),
+            Type::Stream(Box::new(Type::list(Type::String)))
         );
     }
 

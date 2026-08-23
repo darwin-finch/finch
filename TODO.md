@@ -115,10 +115,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   suspends the parent VM continuation rather than blocking the event loop; CPU fibers reject
   effects and never share their parent stack. Repeatedly-yielding fibers remain separate from
   subagents, and bidirectional resume remains deferred until a concrete need exists.
-- [ ] Design and implement a typed lazy sequence protocol separately from scheduler `yield`: an
-  opaque `stream<T>`/iterator handle with bounded `next -> option<T>`, cancellation, ownership,
-  capability propagation, and Lisp/Co-Forth lowering. Do not expose legacy Co-Forth generators as
-  typed-runtime vocabulary until their state, effects, and suspension semantics are verified.
+- [x] Implement a typed lazy sequence protocol separately from scheduler `yield`: host-backed
+  `stream<T>` handles now provide bounded `stream-next -> option<T>` and `stream-close`, with
+  ProgramRun ownership/generation checks, path-scoped capability propagation, concrete polymorphic
+  host-result rows, and shared Lisp/Co-Forth lowering. File-line and CSV streams are the first
+  backends; producer-backed repeated-yield fibers remain a distinct later extension. Legacy
+  Co-Forth generators remain outside typed-runtime vocabulary until their state, effects, and
+  suspension semantics are verified.
 - [ ] Make resource roots first-class capability objects. Workspace/project paths remain safely
   relative; an intentional full-machine grant is a separate audited host root, never ambient
   authority inferred from an absolute path string. `host-path` and distinct

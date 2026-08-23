@@ -117,28 +117,40 @@ fn legacy_core_word_documentation(name: &str) -> CoreWordDocumentation {
             example: "(file-size (path \"data.csv\"))",
         },
         "file-lines-open" => CoreWordDocumentation {
-            summary: "Open an authorized text-file line cursor. The opaque cursor owns no forgeable path authority.",
+            summary: "Open an authorized text-file stream<string>. The opaque stream owns no forgeable path authority.",
             lisp: "(file-lines-open path)",
             forth: "path file-lines-open",
             example: "(file-lines-open (path \"large.log\"))",
         },
-        "file-lines-next" => CoreWordDocumentation {
-            summary: "Return some(line) from a line cursor or none at EOF. Close the cursor when finished.",
-            lisp: "(file-lines-next cursor)",
-            forth: "cursor file-lines-next",
-            example: "(match-option (file-lines-next c) (some line (say line)) (none (file-lines-close c)))",
+        "file-lines-next" | "file-lines-close" => CoreWordDocumentation {
+            summary: "Compatibility aliases for stream-next and stream-close on file-line streams. Prefer the generic stream operations in new programs.",
+            lisp: "(stream-next stream), (stream-close stream)",
+            forth: "stream stream-next; stream stream-close",
+            example: "(match-option (stream-next lines) (some line (say line)) (none (stream-close lines)))",
         },
-        "file-lines-close" => CoreWordDocumentation {
-            summary: "Close a line cursor and release its host resource.",
-            lisp: "(file-lines-close cursor)",
-            forth: "cursor file-lines-close",
-            example: "c file-lines-close",
+        "csv-open" => CoreWordDocumentation {
+            summary: "Open an authorized stream<list<string>> of CSV records. CSV parsing preserves quoted fields and records spanning physical lines.",
+            lisp: "(csv-open path)",
+            forth: "path csv-open",
+            example: "(let ((rows (csv-open (path \"data.csv\")))) (stream-next rows))",
         },
-        "csv-open" | "csv-next" | "csv-close" => CoreWordDocumentation {
-            summary: "Open, advance, or close an authorized CSV record cursor. csv-next returns some(list<string>) or none at EOF; use it instead of loading a large CSV at once.",
-            lisp: "(csv-open path), (csv-next cursor), (csv-close cursor)",
-            forth: "path csv-open; cursor csv-next; cursor csv-close",
-            example: "(let ((c (csv-open (path \"data.csv\")))) (csv-next c))",
+        "csv-next" | "csv-close" => CoreWordDocumentation {
+            summary: "Compatibility aliases for stream-next and stream-close on CSV streams. Prefer the generic stream operations in new programs.",
+            lisp: "(stream-next stream), (stream-close stream)",
+            forth: "stream stream-next; stream stream-close",
+            example: "(stream-next rows)",
+        },
+        "stream-next" => CoreWordDocumentation {
+            summary: "Advance an opaque stream<T> by at most one item and return some(T), or none at end of stream. It cannot forge or widen the source stream's authority.",
+            lisp: "(stream-next stream)",
+            forth: "stream stream-next",
+            example: "(match-option (stream-next rows) (some row row) (none \"done\"))",
+        },
+        "stream-close" => CoreWordDocumentation {
+            summary: "Close an opaque stream<T>, release its backing cursor or producer, and make future operations fail safely.",
+            lisp: "(stream-close stream)",
+            forth: "stream stream-close",
+            example: "rows stream-close",
         },
         "file-write" | "host-file-write" => CoreWordDocumentation {
             summary: "Write bytes to an authorized refined path. This is an external mutation and requires an explicit write capability grant.",

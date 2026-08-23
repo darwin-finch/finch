@@ -34,6 +34,10 @@ pub enum Type {
         effects: super::effects::EffectSet,
     },
     Task(Box<Type>),
+    /// An opaque, scheduler/host-owned lazy sequence. Advancing it is
+    /// bounded and returns `option<T>`; source programs cannot manufacture a
+    /// cursor from a string or share its backing state implicitly.
+    Stream(Box<Type>),
     Resource(String),
     Capability(String),
     Variable(String),
@@ -114,6 +118,7 @@ impl fmt::Display for Type {
                 write!(f, ")->{result}!{effects}")
             }
             Self::Task(result) => write!(f, "task<{result}>"),
+            Self::Stream(element) => write!(f, "stream<{element}>"),
             Self::Resource(kind) => write!(f, "resource<{kind}>"),
             Self::Capability(kind) => write!(f, "capability<{kind}>"),
             Self::Variable(name) => f.write_str(name),
@@ -186,6 +191,14 @@ pub enum TypedValue {
         #[serde(default)]
         kind: TaskKind,
     },
+    /// A host- or scheduler-owned lazy sequence. `kind` is checked by the
+    /// host adapter; its opaque ID is not a file path or capability token.
+    Stream {
+        id: String,
+        element_type: Type,
+        kind: String,
+        generation: u64,
+    },
     Resource {
         kind: String,
         handle: String,
@@ -241,6 +254,7 @@ impl TypedValue {
                 effects: signature.effects.clone(),
             },
             Self::Task { result_type, .. } => Type::Task(Box::new(result_type.clone())),
+            Self::Stream { element_type, .. } => Type::Stream(Box::new(element_type.clone())),
             Self::Resource { kind, .. } => Type::Resource(kind.clone()),
             Self::Dynamic { .. } => Type::Dynamic,
         }
@@ -284,6 +298,16 @@ mod tests {
             }
             .value_type(),
             Type::Task(Box::new(Type::String))
+        );
+        assert_eq!(
+            TypedValue::Stream {
+                id: "stream-1".into(),
+                element_type: Type::String,
+                kind: "file-lines".into(),
+                generation: 0,
+            }
+            .value_type(),
+            Type::Stream(Box::new(Type::String))
         );
     }
 

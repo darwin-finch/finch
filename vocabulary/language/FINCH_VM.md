@@ -215,13 +215,14 @@ Ordinary `path` / `file-read` never widen to this root.
 `file-size(path)` and `file-slice(path, offset, length)` share the same refined `file.read(path)`
 requirement. A slice is bounded (currently 8 MiB maximum per call) and may be shorter at EOF, so
 large CSV/text/binary processing can keep only a bounded window in VM memory.
-`file-lines-open(path)` mints a ProgramRun-owned opaque `file-line-cursor`; `file-lines-next`
-returns bounded UTF-8 `option<string>` records (1 MiB maximum line) and `file-lines-close`
-releases the cursor. The initial path grant covers later cursor operations only because the cursor
-is unforgeable and host-validated on each call.
-`csv-open(path)` mints the distinct `csv-record-cursor`; `csv-next` returns bounded
-`option<list<string>>` CSV records and `csv-close` releases it. It parses quoted,
+`file-lines-open(path)` mints a ProgramRun-owned opaque `stream<string>`; `stream-next`
+returns bounded UTF-8 `option<string>` records (1 MiB maximum line) and `stream-close`
+releases the stream. The initial path grant covers later stream operations only because the stream
+is unforgeable and host-validated on each call. `file-lines-next` and `file-lines-close` remain
+compatibility aliases.
+`csv-open(path)` mints a distinct `stream<list<string>>`; `stream-next` returns bounded
+`option<list<string>>` CSV records and `stream-close` releases it. It parses quoted,
 comma-containing, and multiline fields rather than treating physical lines as records; malformed
-quote boundaries fail with a host diagnostic. Both cursor kinds use the same opaque-handle pattern;
+quote boundaries fail with a host diagnostic. Both stream kinds use the same opaque-handle pattern;
 workbook resources must follow it too and must not smuggle an ambient filesystem path back into VM
 values.

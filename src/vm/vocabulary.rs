@@ -41,10 +41,12 @@ pub fn core_word_documentation(name: &str) -> CoreWordDocumentation {
         "file-read" => CoreWordDocumentation { summary: "Read all bytes from an authorized workspace path. Prefer file-slice or cursor resources for large inputs.", lisp: "(file-read path)", forth: "path file-read", example: "(file-read (path \"Cargo.toml\"))" },
         "file-slice" => CoreWordDocumentation { summary: "Read a bounded byte range from an authorized workspace path: offset and maximum byte count.", lisp: "(file-slice path offset length)", forth: "path offset length file-slice", example: "(file-slice (path \"data.csv\") 0 4096)" },
         "file-size" => CoreWordDocumentation { summary: "Return the byte length of an authorized workspace file without reading its contents.", lisp: "(file-size path)", forth: "path file-size", example: "(file-size (path \"data.csv\"))" },
-        "file-lines-open" => CoreWordDocumentation { summary: "Open an authorized text-file line cursor. The opaque cursor owns no forgeable path authority.", lisp: "(file-lines-open path)", forth: "path file-lines-open", example: "(file-lines-open (path \"large.log\"))" },
-        "file-lines-next" => CoreWordDocumentation { summary: "Return some(line) from a line cursor or none at EOF. Close the cursor when finished.", lisp: "(file-lines-next cursor)", forth: "cursor file-lines-next", example: "(match-option (file-lines-next c) (some line (say line)) (none (file-lines-close c)))" },
-        "file-lines-close" => CoreWordDocumentation { summary: "Close a line cursor and release its host resource.", lisp: "(file-lines-close cursor)", forth: "cursor file-lines-close", example: "c file-lines-close" },
-        "csv-open" | "csv-next" | "csv-close" => CoreWordDocumentation { summary: "Open, advance, or close an authorized CSV record cursor. csv-next returns some(list<string>) or none at EOF; use it instead of loading a large CSV at once.", lisp: "(csv-open path), (csv-next cursor), (csv-close cursor)", forth: "path csv-open; cursor csv-next; cursor csv-close", example: "(let ((c (csv-open (path \"data.csv\")))) (csv-next c))" },
+        "file-lines-open" => CoreWordDocumentation { summary: "Open an authorized text-file stream<string>. The opaque stream owns no forgeable path authority.", lisp: "(file-lines-open path)", forth: "path file-lines-open", example: "(file-lines-open (path \"large.log\"))" },
+        "file-lines-next" | "file-lines-close" => CoreWordDocumentation { summary: "Compatibility aliases for stream-next and stream-close on file-line streams. Prefer the generic stream operations in new programs.", lisp: "(stream-next stream), (stream-close stream)", forth: "stream stream-next; stream stream-close", example: "(match-option (stream-next lines) (some line (say line)) (none (stream-close lines)))" },
+        "csv-open" => CoreWordDocumentation { summary: "Open an authorized stream<list<string>> of CSV records. CSV parsing preserves quoted fields and records spanning physical lines.", lisp: "(csv-open path)", forth: "path csv-open", example: "(let ((rows (csv-open (path \"data.csv\")))) (stream-next rows))" },
+        "csv-next" | "csv-close" => CoreWordDocumentation { summary: "Compatibility aliases for stream-next and stream-close on CSV streams. Prefer the generic stream operations in new programs.", lisp: "(stream-next stream), (stream-close stream)", forth: "stream stream-next; stream stream-close", example: "(stream-next rows)" },
+        "stream-next" => CoreWordDocumentation { summary: "Advance an opaque stream<T> by at most one item and return some(T), or none at end of stream. It cannot forge or widen the source stream's authority.", lisp: "(stream-next stream)", forth: "stream stream-next", example: "(match-option (stream-next rows) (some row row) (none \"done\"))" },
+        "stream-close" => CoreWordDocumentation { summary: "Close an opaque stream<T>, release its backing cursor or producer, and make future operations fail safely.", lisp: "(stream-close stream)", forth: "stream stream-close", example: "rows stream-close" },
         "file-write" | "host-file-write" => CoreWordDocumentation { summary: "Write bytes to an authorized refined path. This is an external mutation and requires an explicit write capability grant.", lisp: "(file-write path bytes)", forth: "path bytes file-write", example: "(file-write (path \"generated.txt\") (bytes \"hello\\n\"))" },
         "host-file-read" => CoreWordDocumentation { summary: "Read all bytes from an authorized host-machine path. It requires both an installed host root and a matching read grant.", lisp: "(host-file-read path)", forth: "path host-file-read", example: "(host-file-read (host-path \"/tmp/report.txt\"))" },
         "process-run" => CoreWordDocumentation { summary: "Run an approved executable directly with a list of string arguments; it never invokes a shell. Use proposal-open for editable scripts.", lisp: "(process-run command arguments)", forth: "command arguments process-run", example: "(process-run \"git\" (list \"status\" \"--short\"))" },
@@ -356,16 +358,16 @@ pub fn core_vocabulary() -> Vocabulary {
                 },
             ),
         ),
-        // Line cursors are host-issued resources. Only `file-lines-open`
-        // receives a path selector; `next`/`close` can operate under the
-        // already-authorized opaque resource and cannot fabricate a path.
+        // Streams are host-issued opaque cursors. Only their opening word
+        // receives a path selector; `stream-next`/`stream-close` operate on
+        // that already-authorized handle and cannot fabricate a path.
         (
             "file-lines-open".into(),
             capability(
                 vec![Type::Path(
                     FileSelector::parse("./**").expect("valid workspace root"),
                 )],
-                vec![Type::Resource("file-line-cursor".into())],
+                vec![Type::Stream(Box::new(Type::String))],
                 CapabilityRequirement {
                     capability: CapabilityKind::FileRead,
                     selector: ResourceSelector::FileTemplate {
@@ -377,7 +379,7 @@ pub fn core_vocabulary() -> Vocabulary {
         (
             "file-lines-next".into(),
             capability(
-                vec![Type::Resource("file-line-cursor".into())],
+                vec![Type::Stream(Box::new(Type::String))],
                 vec![Type::Option(Box::new(Type::String))],
                 unscoped(CapabilityKind::FileRead),
             ),
@@ -385,12 +387,12 @@ pub fn core_vocabulary() -> Vocabulary {
         (
             "file-lines-close".into(),
             capability(
-                vec![Type::Resource("file-line-cursor".into())],
+                vec![Type::Stream(Box::new(Type::String))],
                 vec![Type::Unit],
                 unscoped(CapabilityKind::FileRead),
             ),
         ),
-        // CSV records need their own cursor: quoted fields may legally span
+        // CSV records need their own stream: quoted fields may legally span
         // physical lines, so a line cursor cannot safely model a CSV row.
         (
             "csv-open".into(),
@@ -398,7 +400,7 @@ pub fn core_vocabulary() -> Vocabulary {
                 vec![Type::Path(
                     FileSelector::parse("./**").expect("valid workspace root"),
                 )],
-                vec![Type::Resource("csv-record-cursor".into())],
+                vec![Type::Stream(Box::new(Type::list(Type::String)))],
                 CapabilityRequirement {
                     capability: CapabilityKind::FileRead,
                     selector: ResourceSelector::FileTemplate {
@@ -410,7 +412,7 @@ pub fn core_vocabulary() -> Vocabulary {
         (
             "csv-next".into(),
             capability(
-                vec![Type::Resource("csv-record-cursor".into())],
+                vec![Type::Stream(Box::new(Type::list(Type::String)))],
                 vec![Type::Option(Box::new(Type::list(Type::String)))],
                 unscoped(CapabilityKind::FileRead),
             ),
@@ -418,7 +420,28 @@ pub fn core_vocabulary() -> Vocabulary {
         (
             "csv-close".into(),
             capability(
-                vec![Type::Resource("csv-record-cursor".into())],
+                vec![Type::Stream(Box::new(Type::list(Type::String)))],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::FileRead),
+            ),
+        ),
+        // Generic stream operations share the same bounded cursor contract
+        // across file, CSV, and future workbook/producer backends. The
+        // unscoped FileRead request is safely covered only by a path-scoped
+        // stream-open grant; host ownership/generation checks reject forged
+        // or cross-run handles at the call boundary.
+        (
+            "stream-next".into(),
+            capability(
+                vec![Type::Stream(Box::new(a.clone()))],
+                vec![Type::Option(Box::new(a.clone()))],
+                unscoped(CapabilityKind::FileRead),
+            ),
+        ),
+        (
+            "stream-close".into(),
+            capability(
+                vec![Type::Stream(Box::new(a.clone()))],
                 vec![Type::Unit],
                 unscoped(CapabilityKind::FileRead),
             ),
