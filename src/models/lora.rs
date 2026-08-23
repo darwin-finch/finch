@@ -413,11 +413,23 @@ impl TrainingCoordinator {
             .join(".finch")
             .join("training_queue.jsonl");
 
+        Self::with_queue_path(buffer_size, threshold, auto_train, queue_path)
+    }
+
+    /// Construct a coordinator with an explicit queue destination. Production
+    /// uses [`Self::new`]'s user-level queue; tests and isolated workers must
+    /// not append to that shared file.
+    pub fn with_queue_path(
+        buffer_size: usize,
+        threshold: usize,
+        auto_train: bool,
+        queue_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
         Self {
             buffer: std::sync::RwLock::new(ExampleBuffer::new(buffer_size)),
             threshold,
             auto_train,
-            queue_path,
+            queue_path: queue_path.into(),
         }
     }
 

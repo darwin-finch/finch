@@ -4,7 +4,6 @@
 
 use finch::models::{TrainingCoordinator, WeightedExample};
 use std::fs;
-use std::path::Path;
 
 #[test]
 fn test_training_coordinator_creation() {
@@ -76,7 +75,7 @@ fn test_jsonl_queue_writing() {
     let queue_path = temp_dir.path().join("test_queue.jsonl");
 
     // Create coordinator
-    let coordinator = TrainingCoordinator::new(100, 10, false);
+    let coordinator = TrainingCoordinator::with_queue_path(100, 10, false, queue_path);
 
     // Add some examples
     coordinator
