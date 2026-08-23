@@ -1877,33 +1877,23 @@ impl Repl {
         loop {
             // Check for shutdown (Ctrl+C)
             if shutdown_flag.load(Ordering::SeqCst) {
-                eprintln!("[DEBUG] Shutdown flag detected");
+                tracing::debug!("shutdown flag detected");
 
                 // CRITICAL: Disable raw mode FIRST so Ctrl+C can work if shutdown hangs
-                eprintln!("[DEBUG] Disabling raw mode...");
+                tracing::debug!("disabling raw mode for shutdown");
                 let _ = crossterm::terminal::disable_raw_mode();
 
-                if self.is_interactive {
-                    eprintln!();
-                    eprintln!("^C interrupt - shutting down...");
-                    eprintln!("(Press Ctrl+C again to force quit)");
-                }
-
-                eprintln!("[DEBUG] Saving models...");
+                tracing::debug!("saving models during shutdown");
                 self.save_models().await?;
-
-                if self.is_interactive {
-                    eprintln!("Models saved. Goodbye!");
-                }
 
                 // Shutdown TUI before exiting (in case Ctrl+C was pressed during processing)
                 if self.is_tui_active() {
-                    eprintln!("[DEBUG] Shutting down TUI...");
+                    tracing::debug!("shutting down TUI");
                     use crate::cli::global_output::shutdown_global_tui;
                     let _ = shutdown_global_tui();
-                    eprintln!("[DEBUG] TUI shutdown returned");
+                    tracing::debug!("TUI shutdown returned");
                 }
-                eprintln!("[DEBUG] Breaking from main loop");
+                tracing::debug!("breaking from REPL main loop");
                 break;
             }
 
@@ -1936,17 +1926,11 @@ impl Repl {
                         // CRITICAL: Disable raw mode FIRST so Ctrl+C works if shutdown hangs
                         let _ = crossterm::terminal::disable_raw_mode();
 
-                        eprintln!();
-                        eprintln!("Shutting down gracefully...");
-                        eprintln!("(Press Ctrl+C again to force quit if it hangs)");
-
                         self.save_models().await?;
-                        eprintln!("Models saved.");
 
                         // Shutdown TUI
                         use crate::cli::global_output::shutdown_global_tui;
                         let _ = shutdown_global_tui();
-                        eprintln!("Goodbye!");
                         break;
                     }
                     None => continue, // Lock failed - skip this iteration
@@ -2156,30 +2140,30 @@ impl Repl {
             }
         }
 
-        eprintln!("[DEBUG] After main loop - final cleanup");
+        tracing::debug!("REPL main loop exited; running final cleanup");
 
         // Before exiting REPL, save any pending patterns
         if let Err(e) = self.save_models().await {
-            eprintln!("⚠️  Failed to save on exit: {}", e);
+            tracing::warn!(error = %e, "failed to save models on exit");
         }
 
-        eprintln!("[DEBUG] Final save complete, disabling raw mode");
+        tracing::debug!("final model save complete; disabling raw mode");
         // Disable raw mode first so terminal is responsive
         let _ = crossterm::terminal::disable_raw_mode();
 
         // Shutdown TUI and restore terminal state (if not already done)
         // This is a safety net - TUI should already be shut down in the break paths above
         if self.is_tui_active() {
-            eprintln!("[DEBUG] Final TUI shutdown (safety net)");
+            tracing::debug!("performing final TUI shutdown safety net");
             use crate::cli::global_output::shutdown_global_tui;
 
             // shutdown_global_tui now has its own timeout/retry logic
             if let Err(e) = shutdown_global_tui() {
-                eprintln!("Warning: Failed to shutdown TUI: {}", e);
+                tracing::warn!(error = %e, "failed to shut down TUI during final cleanup");
             }
         }
 
-        eprintln!("[DEBUG] Exiting run() function");
+        tracing::debug!("exiting REPL run function");
         Ok(())
     }
 
