@@ -1,6 +1,7 @@
 //! Provider-facing adapters for the shared Forth/Lisp runtime.
 
-use crate::programs::{ExecutionEffect, ProgramLanguage};
+use crate::memory::MemorySystem;
+use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramRef};
 use crate::runtime::{ProgramRuntime, ProgramSubmission, TypedEffectSink};
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
@@ -9,6 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Model-facing documentation for an executable core word.  This deliberately
 /// lives beside the provider adapter rather than in Rust doc comments: Rust
@@ -549,6 +551,231 @@ impl Tool for InspectVmWordTool {
     }
 }
 
+/// Canonical vocabulary search across built-in VM words, source syntax, and
+/// persisted definitions. The older split tools remain available as compact
+/// compatibility views while providers migrate to this single entry point.
+pub struct SearchWordTool {
+    runtime: Arc<ProgramRuntime>,
+    memory: Option<Arc<MemorySystem>>,
+}
+
+impl SearchWordTool {
+    pub fn new(runtime: Arc<ProgramRuntime>, memory: Option<Arc<MemorySystem>>) -> Self {
+        Self { runtime, memory }
+    }
+}
+
+#[async_trait]
+impl Tool for SearchWordTool {
+    fn name(&self) -> &str {
+        "search_word"
+    }
+
+    fn description(&self) -> &str {
+        "Search all Finch vocabulary: built-in typed VM words, Lisp/Co-Forth source syntax, and persisted task/session/project/user definitions. Returns compact contracts only; call inspect_word for one exact contract or source version."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: json!({
+                "query": {"type": "string", "description": "Case-insensitive word-name, documentation, or source-syntax fragment"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum matches in each result category (default 25)"}
+            }),
+            required: vec!["query".to_string()],
+        }
+    }
+
+    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+        let query = input["query"]
+            .as_str()
+            .context("search_word: missing query")?
+            .trim()
+            .to_ascii_lowercase();
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(25)
+            .clamp(1, 100) as usize;
+        let state = self.runtime.inspect().await?;
+        let core_matches = state
+            .typed_vocabulary
+            .into_iter()
+            .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
+            .take(limit)
+            .map(|entry| {
+                let documentation = core_word_documentation(&entry.name);
+                json!({
+                    "kind": "core",
+                    "name": entry.name,
+                    "signature": entry.signature,
+                    "summary": documentation.summary,
+                    "lisp": documentation.lisp,
+                    "forth": documentation.forth,
+                })
+            })
+            .collect::<Vec<_>>();
+        let syntax_matches = SOURCE_SYNTAX
+            .iter()
+            .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
+            .take(limit)
+            .map(|entry| {
+                json!({
+                    "kind": "syntax",
+                    "name": entry.name,
+                    "languages": entry.languages,
+                    "description": entry.description,
+                })
+            })
+            .collect::<Vec<_>>();
+        let program_matches = match &self.memory {
+            Some(memory) => memory
+                .search_program_definitions(&query, limit)
+                .await?
+                .into_iter()
+                .map(|definition| {
+                    json!({
+                        "kind": "program",
+                        "id": definition.reference.id,
+                        "version": definition.reference.version,
+                        "name": definition.name,
+                        "language": definition.language,
+                        "documentation": definition.documentation,
+                        "signature": definition.signature,
+                        "effect": definition.effect,
+                        "scope": definition.scope,
+                        "trust": definition.trust,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        Ok(json!({
+            "query": query,
+            "core_matches": core_matches,
+            "syntax_matches": syntax_matches,
+            "program_matches": program_matches,
+            "program_registry_available": self.memory.is_some(),
+            "manifest_generation": state.manifest_generation,
+        })
+        .to_string())
+    }
+}
+
+/// Canonical inspection for one core word or immutable persisted definition.
+pub struct InspectWordTool {
+    runtime: Arc<ProgramRuntime>,
+    memory: Option<Arc<MemorySystem>>,
+}
+
+impl InspectWordTool {
+    pub fn new(runtime: Arc<ProgramRuntime>, memory: Option<Arc<MemorySystem>>) -> Self {
+        Self { runtime, memory }
+    }
+}
+
+#[async_trait]
+impl Tool for InspectWordTool {
+    fn name(&self) -> &str {
+        "inspect_word"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect one Finch core word by exact name, or an immutable persisted definition by id/version. Core words return their typed host contract; persisted definitions additionally return exact source, provenance, dependencies, and tests."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: json!({
+                "name": {"type": "string", "description": "Exact core word name, or exact persisted definition name when the registry is available"},
+                "id": {"type": "string", "description": "Persisted program UUID returned by search_word"},
+                "version": {"type": "integer", "minimum": 0, "description": "Immutable persisted program version returned by search_word"}
+            }),
+            required: Vec::new(),
+        }
+    }
+
+    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
+        if let Some(name) = input.get("name").and_then(Value::as_str) {
+            let state = self.runtime.inspect().await?;
+            if let Some(entry) = state
+                .typed_vocabulary
+                .into_iter()
+                .find(|entry| entry.name == name)
+            {
+                let documentation = core_word_documentation(&entry.name);
+                return Ok(json!({
+                    "kind": "core",
+                    "name": entry.name,
+                    "signature": entry.signature,
+                    "summary": documentation.summary,
+                    "lisp": documentation.lisp,
+                    "forth": documentation.forth,
+                    "example": documentation.example,
+                    "source": null,
+                    "source_note": "Built-in VM words are host bindings, not mutable source definitions. Their signature, capability requirements, and protocol documentation are the inspectable contract.",
+                    "manifest_generation": state.manifest_generation,
+                })
+                .to_string());
+            }
+            let memory = self.memory.as_ref().context(
+                "inspect_word: no persisted program registry is available; use an exact built-in word name",
+            )?;
+            let definitions = memory.search_program_definitions(name, 20).await?;
+            let definition = definitions
+                .into_iter()
+                .find(|definition| definition.name == name)
+                .with_context(|| format!("unknown Finch word '{name}'"))?;
+            return Ok(persisted_definition_contract(definition).to_string());
+        }
+
+        let id = input
+            .get("id")
+            .and_then(Value::as_str)
+            .context("inspect_word: provide name or id/version")?;
+        let version = input
+            .get("version")
+            .and_then(Value::as_u64)
+            .context("inspect_word: id requires version")?;
+        let memory = self
+            .memory
+            .as_ref()
+            .context("inspect_word: no persisted program registry is available")?;
+        let reference = ProgramRef {
+            id: Uuid::from_str(id).context("inspect_word: invalid program id")?,
+            version,
+        };
+        let definition = memory
+            .get_program_definition(&reference)
+            .await?
+            .context("inspect_word: program version not found")?;
+        Ok(persisted_definition_contract(definition).to_string())
+    }
+}
+
+fn persisted_definition_contract(definition: crate::programs::ProgramDefinition) -> Value {
+    json!({
+        "kind": "program",
+        "id": definition.reference.id,
+        "version": definition.reference.version,
+        "name": definition.name,
+        "language": definition.language,
+        "source": definition.source,
+        "documentation": definition.documentation,
+        "signature": definition.signature,
+        "effect": definition.effect,
+        "capabilities": definition.capabilities,
+        "dependencies": definition.dependencies,
+        "tests": definition.tests,
+        "scope": definition.scope,
+        "trust": definition.trust,
+        "provenance": definition.provenance,
+        "source_hash": definition.source_hash,
+        "environment_hash": definition.environment_hash,
+    })
+}
+
 pub struct SubmitProgramTool {
     runtime: Arc<ProgramRuntime>,
     caller: Option<crate::runtime::scheduler::AgentIdentity>,
@@ -850,6 +1077,49 @@ mod tests {
         assert!(result["example"]
             .as_str()
             .is_some_and(|example| example.contains("data.csv")));
+    }
+
+    #[tokio::test]
+    async fn canonical_word_tools_inspect_the_same_core_contracts() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let search = SearchWordTool::new(Arc::clone(&runtime), None);
+        let inspect = InspectWordTool::new(runtime, None);
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            stack: None,
+            poset: None,
+        };
+        let found: Value = serde_json::from_str(
+            &search
+                .execute(json!({"query": "file-slice"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(found["core_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "file-slice"));
+        assert!(!found["program_registry_available"].as_bool().unwrap());
+
+        let contract: Value = serde_json::from_str(
+            &inspect
+                .execute(json!({"name": "file-slice"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(contract["kind"], "core");
+        assert_eq!(contract["name"], "file-slice");
+        assert_eq!(contract["source"], Value::Null);
     }
 
     #[tokio::test]

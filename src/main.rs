@@ -1875,8 +1875,8 @@ fn register_query_vm_tools(
     program_runtime: Arc<finch::runtime::ProgramRuntime>,
 ) {
     use finch::tools::implementations::{
-        GetLanguageDefinitionTool, GetVmStateTool, InspectVmWordTool, SearchVmVocabularyTool,
-        SubmitProgramTool,
+        GetLanguageDefinitionTool, GetVmStateTool, InspectVmWordTool, InspectWordTool,
+        SearchVmVocabularyTool, SearchWordTool, SubmitProgramTool,
     };
 
     // Provider tool calls and the terminal VM-wire program must share this
@@ -1891,7 +1891,16 @@ fn register_query_vm_tools(
     registry.register(Box::new(SearchVmVocabularyTool::new(Arc::clone(
         &program_runtime,
     ))));
-    registry.register(Box::new(InspectVmWordTool::new(program_runtime)));
+    registry.register(Box::new(InspectVmWordTool::new(Arc::clone(
+        &program_runtime,
+    ))));
+    // One-shot query mode has no loaded persisted-program index, but the
+    // canonical tools still expose core words and report that limitation.
+    registry.register(Box::new(SearchWordTool::new(
+        Arc::clone(&program_runtime),
+        None,
+    )));
+    registry.register(Box::new(InspectWordTool::new(program_runtime, None)));
 }
 
 /// Returns true when the input is unambiguously Forth code that should bypass

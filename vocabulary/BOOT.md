@@ -58,10 +58,11 @@ still emits a chunk as it executes.
 For a normal Lisp reply, arithmetic, or the documented core forms, do not inspect anything first.
 Before positional stack manipulation against persistent state, call `get_vm_state`; its stack is
 bottom-to-top. Use only advertised vocabulary; inspect definitions instead of inventing words.
-Call `search_vm_vocabulary` for compact built-in typed-word summaries and `inspect_vm_word` for a
-built-in word's exact semantics and example (do not search the Finch source tree).
-`search_vocabulary` and `inspect_program` are the equivalent pair for immutable persisted
-user/project definitions. Call `get_language_definition` only for an unfamiliar language feature.
+Call `search_word` for compact matches across built-in typed words, source syntax, and persisted
+definitions, then `inspect_word` for one exact contract or immutable source version (do not search
+the Finch source tree). The legacy split pairs `search_vm_vocabulary`/`inspect_vm_word` and
+`search_vocabulary`/`inspect_program` remain compatibility tools. Call `get_language_definition`
+only for an unfamiliar language feature.
 
 Every word has typed inputs/outputs and inferred resource-scoped capability requirements. Pure code
 runs autonomously. Observable operations such as `say`, files, memory, scheduling, automation,

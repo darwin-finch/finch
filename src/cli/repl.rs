@@ -340,6 +340,18 @@ impl Repl {
         tool_registry.register(Box::new(
             crate::tools::implementations::InspectVmWordTool::new(Arc::clone(&program_runtime)),
         ));
+        tool_registry.register(Box::new(
+            crate::tools::implementations::SearchWordTool::new(
+                Arc::clone(&program_runtime),
+                memory_system.clone(),
+            ),
+        ));
+        tool_registry.register(Box::new(
+            crate::tools::implementations::InspectWordTool::new(
+                Arc::clone(&program_runtime),
+                memory_system.clone(),
+            ),
+        ));
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()
@@ -514,6 +526,18 @@ impl Repl {
                     crate::tools::implementations::InspectVmWordTool::new(Arc::clone(
                         &program_runtime,
                     )),
+                ));
+                fallback_registry.register(Box::new(
+                    crate::tools::implementations::SearchWordTool::new(
+                        Arc::clone(&program_runtime),
+                        memory_system.clone(),
+                    ),
+                ));
+                fallback_registry.register(Box::new(
+                    crate::tools::implementations::InspectWordTool::new(
+                        Arc::clone(&program_runtime),
+                        memory_system.clone(),
+                    ),
                 ));
                 fallback_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
                 fallback_registry

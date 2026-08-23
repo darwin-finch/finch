@@ -163,6 +163,8 @@ impl PermissionManager {
                 | "get_language_definition"
                 | "search_vm_vocabulary"
                 | "inspect_vm_word"
+                | "search_word"
+                | "inspect_word"
                 | "search_vocabulary"
                 | "inspect_program"
         ) {
