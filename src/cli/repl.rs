@@ -65,6 +65,12 @@ enum ConfirmationChoice {
 // Use ConfirmationResult from event loop module
 use super::repl_event::ConfirmationResult;
 
+/// Provider-visible tools exclude compatibility adapters that duplicate the
+/// direct typed VM response wire.
+fn model_visible_tool(tool: &ToolDefinition) -> bool {
+    tool.name != "submit_program"
+}
+
 /// Get current terminal width, or default to 80 if not a TTY
 fn terminal_width() -> usize {
     terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
@@ -329,6 +335,11 @@ impl Repl {
         tool_registry.register(Box::new(
             crate::tools::implementations::GetLanguageDefinitionTool,
         ));
+        tool_registry.register(Box::new(
+            crate::tools::implementations::SearchVmVocabularyTool::new(Arc::clone(
+                &program_runtime,
+            )),
+        ));
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()
@@ -413,16 +424,9 @@ impl Repl {
             crate::tools::todo::TodoList::default(),
         ));
         {
-            use crate::tools::implementations::{
-                StackClearTool, StackPushTool, StackRunTool, TodoReadTool, TodoWriteTool,
-            };
+            use crate::tools::implementations::{TodoReadTool, TodoWriteTool};
             tool_registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
             tool_registry.register(Box::new(TodoReadTool::new(Arc::clone(&todo_list))));
-            // Co-Forth VM — stack Arc is wired in later via with_stack()
-            // NOTE: StackPopTool intentionally omitted — only the user can pop (undo).
-            tool_registry.register(Box::new(StackPushTool));
-            tool_registry.register(Box::new(StackRunTool));
-            tool_registry.register(Box::new(StackClearTool));
         }
 
         // Create permission manager.
@@ -457,6 +461,8 @@ impl Repl {
             "view",
             "search",
             "get_vm_state",
+            "get_language_definition",
+            "search_vm_vocabulary",
             "spawn_agent",
             "await_agent",
             "poll_agent",
@@ -494,6 +500,11 @@ impl Repl {
                 ));
                 fallback_registry.register(Box::new(
                     crate::tools::implementations::GetLanguageDefinitionTool,
+                ));
+                fallback_registry.register(Box::new(
+                    crate::tools::implementations::SearchVmVocabularyTool::new(Arc::clone(
+                        &program_runtime,
+                    )),
                 ));
                 fallback_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
                 fallback_registry
@@ -533,9 +544,17 @@ impl Repl {
         let brain_enabled = config.features.brain_enabled;
         let auto_discover = config.client.auto_discover;
 
-        // Generate tool definitions from registry (includes built-in + MCP tools)
-        let tool_definitions: Vec<ToolDefinition> =
-            tool_executor.lock().await.list_all_tools().await;
+        // Generate the legacy-path model manifest. VM-wire turns have their
+        // own equivalent filtering below; keep both paths aligned while the
+        // older REPL request loop remains available.
+        let tool_definitions: Vec<ToolDefinition> = tool_executor
+            .lock()
+            .await
+            .list_all_tools()
+            .await
+            .into_iter()
+            .filter(model_visible_tool)
+            .collect();
 
         // Get global OutputManager and StatusBar (created in main.rs)
         // DO NOT create new instances - that would break stdout control!
@@ -1733,7 +1752,15 @@ impl Repl {
             executor.registry_mut().register(Box::new(
                 crate::tools::implementations::AgentCancelTool::new(Arc::clone(&agent_scheduler)),
             ));
-            executor.list_all_tools().await
+            // `submit_program` remains registered for scripts, CLI callers,
+            // and compatibility integrations, but VM-wire providers must not
+            // see it because it redundantly wraps direct source.
+            executor
+                .list_all_tools()
+                .await
+                .into_iter()
+                .filter(model_visible_tool)
+                .collect()
         };
 
         // Create EventLoop with all dependencies
@@ -1745,6 +1772,7 @@ impl Repl {
             generator_state,
             tool_definitions,
             Arc::clone(&self.tool_executor),
+            Arc::clone(&self.program_runtime),
             tui_renderer,
             Arc::new(self.output_manager.clone()),
             Arc::new(self.status_bar.clone()),
@@ -2374,7 +2402,6 @@ impl Repl {
                         | "AskUserQuestion"
                         | "EnterPlanMode"
                         | "ExitPlanMode"
-                        | "Push"
                 )
             }
         }

@@ -36,6 +36,7 @@
         { "const": { "kind": "workspace" } },
         { "const": { "kind": "project" } },
         { "const": { "kind": "task_output" } },
+        { "const": { "kind": "host_machine" } },
         {
           "type": "object",
           "required": ["kind", "name"],
@@ -76,15 +77,48 @@
       },
       "additionalProperties": false
     },
+    "network_selector_template": {
+      "type": "object",
+      "required": ["host_argument", "port_argument"],
+      "properties": {
+        "host_argument": { "type": "integer", "minimum": 0 },
+        "port_argument": { "type": "integer", "minimum": 0 },
+        "allowed_hosts": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "allowed_ports": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 65535 }, "uniqueItems": true }
+      },
+      "additionalProperties": false
+    },
+    "process_selector_template": {
+      "type": "object",
+      "required": ["executable_argument"],
+      "properties": {
+        "executable_argument": { "type": "integer", "minimum": 0 },
+        "allowed_executables": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      },
+      "additionalProperties": false
+    },
+    "program_selector_template": {
+      "type": "object",
+      "required": ["language_argument"],
+      "properties": {
+        "language_argument": { "type": "integer", "minimum": 0 },
+        "allowed_languages": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      },
+      "additionalProperties": false
+    },
     "resource_selector": {
       "oneOf": [
         { "type": "object", "required": ["kind"], "properties": { "kind": { "const": "none" } }, "additionalProperties": false },
         { "type": "object", "required": ["kind", "selector"], "properties": { "kind": { "const": "file" }, "selector": { "$ref": "#/$defs/file_selector" } }, "additionalProperties": false },
         { "type": "object", "required": ["kind", "template"], "properties": { "kind": { "const": "file_template" }, "template": { "$ref": "#/$defs/file_selector_template" } }, "additionalProperties": false },
         { "type": "object", "required": ["kind", "host", "ports"], "properties": { "kind": { "const": "network" }, "host": { "type": "string" }, "ports": { "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": 65535 }, "uniqueItems": true } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "template"], "properties": { "kind": { "const": "network_template" }, "template": { "$ref": "#/$defs/network_selector_template" } }, "additionalProperties": false },
         { "type": "object", "required": ["kind", "application"], "properties": { "kind": { "const": "automation" }, "application": { "type": ["string", "null"] } }, "additionalProperties": false },
         { "type": "object", "required": ["kind", "providers", "max_depth", "max_children"], "properties": { "kind": { "const": "agent" }, "providers": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "max_depth": { "type": "integer", "minimum": 0, "maximum": 65535 }, "max_children": { "type": "integer", "minimum": 0, "maximum": 65535 } }, "additionalProperties": false },
         { "type": "object", "required": ["kind", "executables"], "properties": { "kind": { "const": "process" }, "executables": { "type": "array", "items": { "type": "string" }, "uniqueItems": true } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "template"], "properties": { "kind": { "const": "process_template" }, "template": { "$ref": "#/$defs/process_selector_template" } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "languages"], "properties": { "kind": { "const": "program" }, "languages": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true } }, "additionalProperties": false },
+        { "type": "object", "required": ["kind", "template"], "properties": { "kind": { "const": "program_template" }, "template": { "$ref": "#/$defs/program_selector_template" } }, "additionalProperties": false },
         { "type": "object", "required": ["kind", "tree", "path"], "properties": { "kind": { "const": "memory" }, "tree": { "type": "string" }, "path": { "type": "string" } }, "additionalProperties": false },
         { "type": "object", "required": ["kind", "policy"], "properties": { "kind": { "const": "schedule" }, "policy": { "type": ["string", "null"] } }, "additionalProperties": false }
       ]

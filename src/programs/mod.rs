@@ -20,6 +20,172 @@ pub const FORTH_LANGUAGE_DEFINITION: &str =
 pub const LISP_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_LISP.md");
 pub const LANGUAGE_SCHEMA: &str = include_str!("../../vocabulary/language/schema.json");
 
+/// One complete Co-Forth lexical token observed while a provider response is
+/// still streaming. The runtime must not execute these incrementally: callers
+/// use them only for safe progress/display projection before the complete
+/// source is compiled and verified at the program boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForthWireToken {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub source: String,
+}
+
+/// Incremental lexical receiver for the compact Co-Forth wire form.
+///
+/// It accepts arbitrary UTF-8 fragments, including fragments that split a
+/// word, escape, raw string delimiter, or comment. `push` yields only tokens
+/// known to be complete. `finish` turns an incomplete quoted literal into a
+/// clear wire error and releases a final unterminated word. This deliberately
+/// does not type-check or execute a prefix; full typed verification remains an
+/// all-program operation.
+#[derive(Debug, Default)]
+pub struct ForthWireBuffer {
+    source: String,
+    emitted_tokens: usize,
+}
+
+impl ForthWireBuffer {
+    pub fn push(&mut self, fragment: &str) -> Result<Vec<ForthWireToken>> {
+        self.source.push_str(fragment);
+        self.collect_complete(false)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<ForthWireToken>> {
+        self.collect_complete(true)
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn collect_complete(&mut self, final_boundary: bool) -> Result<Vec<ForthWireToken>> {
+        let ranges = complete_forth_wire_tokens(&self.source, final_boundary)?;
+        let new_ranges = ranges
+            .get(self.emitted_tokens..)
+            .expect("append-only source cannot lose completed wire tokens");
+        let tokens = new_ranges
+            .iter()
+            .map(|&(start_byte, end_byte)| ForthWireToken {
+                start_byte,
+                end_byte,
+                source: self.source[start_byte..end_byte].to_string(),
+            })
+            .collect::<Vec<_>>();
+        self.emitted_tokens = ranges.len();
+        Ok(tokens)
+    }
+}
+
+fn complete_forth_wire_tokens(
+    source: &str,
+    final_boundary: bool,
+) -> Result<Vec<(usize, usize)>> {
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    let mut tokens = Vec::new();
+
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            break;
+        }
+        if bytes[cursor] == b'\\' {
+            match source[cursor..].find('\n') {
+                Some(offset) => {
+                    cursor += offset + 1;
+                    continue;
+                }
+                None if final_boundary => break,
+                None => break,
+            }
+        }
+
+        let start = cursor;
+        if source[start..].starts_with("s\"\"\"") {
+            let content_start = start + 4;
+            match source[content_start..].find("\"\"\"") {
+                Some(offset) => {
+                    cursor = content_start + offset + 3;
+                    tokens.push((start, cursor));
+                    continue;
+                }
+                None if final_boundary => bail!("unterminated Co-Forth raw string literal"),
+                None => break,
+            }
+        }
+        if source[start..].starts_with("s\"") {
+            cursor += 2;
+            if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let mut escaped = false;
+            let mut closed = None;
+            while cursor < source.len() {
+                let character = source[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor remains on a UTF-8 boundary");
+                cursor += character.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    closed = Some(cursor);
+                    break;
+                }
+            }
+            match closed {
+                Some(end) => {
+                    tokens.push((start, end));
+                    continue;
+                }
+                None if final_boundary => bail!("unterminated Co-Forth string literal"),
+                None => break,
+            }
+        }
+
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor == bytes.len() && !final_boundary {
+            break;
+        }
+        tokens.push((start, cursor));
+    }
+    Ok(tokens)
+}
+
+/// Identity of one normative artifact handed to a provider. The body is
+/// retrieved on demand, while the manifest carries this compact fingerprint so
+/// a resumed/provider-switched model can tell exactly which contract it saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanguagePackageIdentity {
+    pub name: String,
+    pub version: String,
+    pub sha256: String,
+}
+
+pub fn language_package_identities() -> Vec<LanguagePackageIdentity> {
+    [
+        ("boot", "FINCH-VM-TYPED/1", BOOT_CAPSULE),
+        ("shared", "FINCH-VM-TYPED/1", VM_LANGUAGE_DEFINITION),
+        ("forth", "FINCH-FORTH/1", FORTH_LANGUAGE_DEFINITION),
+        ("lisp", "FINCH-LISP/1", LISP_LANGUAGE_DEFINITION),
+        ("schema", "FINCH-SCHEMA/1", LANGUAGE_SCHEMA),
+    ]
+    .into_iter()
+    .map(|(name, version, contents)| LanguagePackageIdentity {
+        name: name.to_string(),
+        version: version.to_string(),
+        sha256: hash_text(contents),
+    })
+    .collect()
+}
+
 /// Upper bound on what executing a program may affect.
 ///
 /// This is deliberately about observable effects, not implementation language.
@@ -106,6 +272,24 @@ impl ProgramLanguage {
             Self::Forth
         }
     }
+
+    /// Resolve the compact provider wire form before parsing. The first
+    /// non-whitespace byte remains the intentionally cheap discriminator,
+    /// while common non-protocol wrappers receive a useful error instead of
+    /// being misreported as an unknown Co-Forth word.
+    pub fn infer_wire_source(source: &str) -> Result<Self> {
+        let trimmed = source.trim_start();
+        if trimmed.is_empty() {
+            bail!("Finch wire response is empty; emit a Lisp or Co-Forth program")
+        }
+        if trimmed.starts_with("```") {
+            bail!(
+                "Finch wire response must be raw Lisp/Co-Forth, not a Markdown code fence; \
+                 emit s\"...\" say for user prose"
+            )
+        }
+        Ok(Self::infer_source(trimmed))
+    }
 }
 
 impl std::str::FromStr for ProgramLanguage {
@@ -118,6 +302,90 @@ impl std::str::FromStr for ProgramLanguage {
             other => bail!("unknown program language: {other}"),
         }
     }
+}
+
+/// A self-executing Finch source file after its shebang has been removed.
+///
+/// This is deliberately only a parsed envelope. Callers submit `source` to
+/// the normal typed `ProgramRuntime`; a shebang can select a language, but it
+/// can never grant capabilities or bypass approval policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinchScript {
+    pub language: ProgramLanguage,
+    pub source: String,
+}
+
+/// Parse a Finch executable script header.
+///
+/// Supported form: `#!/path/to/finch --exec [--language=lisp|forth]`.
+/// The operating system passes the script path after the one optional shebang
+/// argument, so `--exec` is intentionally the only required execution-mode
+/// flag. Language selection is explicit when supplied, otherwise it follows
+/// `.lisp`/`.forth` extensions and finally the compact wire inference rule.
+pub fn parse_finch_script(path: &Path, contents: &str) -> Result<FinchScript> {
+    let Some((header, source)) = contents.split_once('\n') else {
+        bail!(
+            "Finch script '{}' has no source after its shebang",
+            path.display()
+        );
+    };
+    let header = header.strip_suffix('\r').unwrap_or(header);
+    let Some(command) = header.strip_prefix("#!") else {
+        bail!(
+            "Finch script '{}' must start with a Finch shebang",
+            path.display()
+        );
+    };
+    let mut parts = command.split_whitespace();
+    if parts.next().is_none() {
+        bail!("Finch script '{}' has an empty shebang", path.display());
+    }
+
+    let mut exec = false;
+    let mut language = None;
+    while let Some(argument) = parts.next() {
+        match argument {
+            "--exec" => exec = true,
+            "--language" => {
+                let Some(value) = parts.next() else {
+                    bail!(
+                        "Finch script '{}' is missing a language value",
+                        path.display()
+                    );
+                };
+                language = Some(value.parse()?);
+            }
+            value if value.starts_with("--language=") => {
+                language = Some(value["--language=".len()..].parse()?);
+            }
+            // The interpreter portion of a platform shebang is not Finch VM
+            // metadata. Ignore it: the operating system or explicit CLI
+            // invocation has already selected Finch before this parser runs.
+            other if !other.starts_with('-') => continue,
+            other => bail!(
+                "unsupported Finch script shebang option '{other}' in '{}'",
+                path.display()
+            ),
+        }
+    }
+    if !exec {
+        bail!(
+            "Finch script '{}' must use --exec; this does not bypass capability checks",
+            path.display()
+        );
+    }
+    let language = match language {
+        Some(language) => language,
+        None => match path.extension().and_then(|value| value.to_str()) {
+            Some("lisp") => ProgramLanguage::Lisp,
+            Some("forth") => ProgramLanguage::Forth,
+            _ => ProgramLanguage::infer_wire_source(source)?,
+        },
+    };
+    Ok(FinchScript {
+        language,
+        source: source.to_string(),
+    })
 }
 
 /// Persistence and visibility boundary for a definition.
@@ -491,6 +759,8 @@ pub struct VmManifest {
     pub registry_generation: u64,
     pub environment_hash: String,
     pub languages: Vec<ProgramLanguage>,
+    #[serde(default)]
+    pub language_packages: Vec<LanguagePackageIdentity>,
     pub core_effects: Vec<String>,
     pub relevant_programs: Vec<ProgramSummary>,
 }
@@ -506,6 +776,20 @@ impl VmManifest {
             ),
         ];
         lines.push("Languages: forth, lisp".to_string());
+        if !self.language_packages.is_empty() {
+            let packages = self
+                .language_packages
+                .iter()
+                .map(|package| format!(
+                    "{}@{}#{}",
+                    package.name,
+                    package.version,
+                    &package.sha256[..12]
+                ))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("Language packages: {packages}"));
+        }
         lines.push(format!("Effects: {}", self.core_effects.join(", ")));
         if !self.relevant_programs.is_empty() {
             lines.push("Relevant vocabulary:".to_string());
@@ -602,9 +886,7 @@ fn program_to_lisp(value: ProgramValue) -> crate::lisp::Val {
                 crate::lisp::Val::Symbol("some".into()),
                 program_to_lisp(*value),
             ]),
-            None => crate::lisp::Val::List(vec![crate::lisp::Val::Symbol(
-                "none".into(),
-            )]),
+            None => crate::lisp::Val::List(vec![crate::lisp::Val::Symbol("none".into())]),
         },
         ProgramValue::Result { ok, value } => crate::lisp::Val::List(vec![
             crate::lisp::Val::Symbol(if ok { "ok" } else { "err" }.into()),
@@ -622,29 +904,28 @@ fn lisp_to_program(value: crate::lisp::Val) -> Result<ProgramValue> {
         crate::lisp::Val::Str(value) => Ok(ProgramValue::String(value)),
         crate::lisp::Val::Symbol(value) => Ok(ProgramValue::Symbol(value)),
         crate::lisp::Val::Bytes(value) => Ok(ProgramValue::Bytes(value)),
-        crate::lisp::Val::List(values) => {
-            match values.as_slice() {
-                [crate::lisp::Val::Symbol(tag)] if tag == "none" => {
-                    Ok(ProgramValue::Option(None))
+        crate::lisp::Val::List(values) => match values.as_slice() {
+            [crate::lisp::Val::Symbol(tag)] if tag == "none" => Ok(ProgramValue::Option(None)),
+            [crate::lisp::Val::Symbol(tag), value]
+                if matches!(tag.as_str(), "some" | "ok" | "err") =>
+            {
+                let value = Box::new(lisp_to_program(value.clone())?);
+                if tag == "some" {
+                    Ok(ProgramValue::Option(Some(value)))
+                } else {
+                    Ok(ProgramValue::Result {
+                        ok: tag == "ok",
+                        value,
+                    })
                 }
-                [crate::lisp::Val::Symbol(tag), value]
-                    if matches!(tag.as_str(), "some" | "ok" | "err") =>
-                {
-                    let value = Box::new(lisp_to_program(value.clone())?);
-                    if tag == "some" {
-                        Ok(ProgramValue::Option(Some(value)))
-                    } else {
-                        Ok(ProgramValue::Result {
-                            ok: tag == "ok",
-                            value,
-                        })
-                    }
-                }
-                _ => Ok(ProgramValue::List(
-                    values.into_iter().map(lisp_to_program).collect::<Result<Vec<_>>>()?,
-                )),
             }
-        }
+            _ => Ok(ProgramValue::List(
+                values
+                    .into_iter()
+                    .map(lisp_to_program)
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+        },
         other => bail!("Lisp value is not portable: {other}"),
     }
 }
@@ -735,8 +1016,74 @@ mod tests {
 
     #[test]
     fn omitted_language_uses_compact_wire_inference() {
-        assert_eq!(ProgramLanguage::infer_source("  (say \"hi\")"), ProgramLanguage::Lisp);
-        assert_eq!(ProgramLanguage::infer_source("s\"hi\" say"), ProgramLanguage::Forth);
+        assert_eq!(
+            ProgramLanguage::infer_source("  (say \"hi\")"),
+            ProgramLanguage::Lisp
+        );
+        assert_eq!(
+            ProgramLanguage::infer_source("s\"hi\" say"),
+            ProgramLanguage::Forth
+        );
+    }
+
+    #[test]
+    fn compact_wire_inference_rejects_markdown_wrappers() {
+        let error = ProgramLanguage::infer_wire_source("```forth\ns\"hi\" say\n```")
+            .unwrap_err();
+        assert!(error.to_string().contains("Markdown code fence"));
+        assert_eq!(
+            ProgramLanguage::infer_wire_source("  (say \"hi\")").unwrap(),
+            ProgramLanguage::Lisp
+        );
+    }
+
+    #[test]
+    fn executable_lisp_script_strips_the_shebang_and_forces_its_language() {
+        let script = parse_finch_script(
+            Path::new("rebuild.finch"),
+            "#!/usr/local/finch --exec --language=lisp\n(begin (say \"ready\"))\n",
+        )
+        .unwrap();
+        assert_eq!(script.language, ProgramLanguage::Lisp);
+        assert_eq!(script.source, "(begin (say \"ready\"))\n");
+    }
+
+    #[test]
+    fn executable_script_uses_extension_or_compact_inference_when_unpinned() {
+        let forth = parse_finch_script(
+            Path::new("double.forth"),
+            "#!/usr/local/bin/finch --exec\n2 *\n",
+        )
+        .unwrap();
+        assert_eq!(forth.language, ProgramLanguage::Forth);
+
+        let lisp = parse_finch_script(
+            Path::new("unnamed"),
+            "#!/usr/bin/env finch --exec\n(+ 2 3)\n",
+        )
+        .unwrap();
+        assert_eq!(lisp.language, ProgramLanguage::Lisp);
+
+        let windows = parse_finch_script(
+            Path::new("script.lisp"),
+            "#!C:\\finch\\finch --exec\r\n(+ 2 3)\r\n",
+        )
+        .unwrap();
+        assert_eq!(windows.language, ProgramLanguage::Lisp);
+        assert_eq!(windows.source, "(+ 2 3)\r\n");
+    }
+
+    #[test]
+    fn executable_script_requires_exec_mode_but_not_a_redundant_interpreter_check() {
+        assert!(
+            parse_finch_script(Path::new("bad"), "#!/usr/local/bin/finch\n(+ 2 3)\n",).is_err()
+        );
+        let direct = parse_finch_script(
+            Path::new("direct.lisp"),
+            "#!C:\\Program Files\\Finch\\finch --exec\r\n(+ 2 3)\r\n",
+        )
+        .unwrap();
+        assert_eq!(direct.language, ProgramLanguage::Lisp);
     }
 
     #[test]
@@ -803,12 +1150,65 @@ mod tests {
             registry_generation: 2,
             environment_hash: "abc".to_string(),
             languages: vec![ProgramLanguage::Forth, ProgramLanguage::Lisp],
+            language_packages: language_package_identities(),
             core_effects: vec!["say".to_string()],
             relevant_programs: vec![ProgramSummary::from(&definition)],
         };
         let prompt = manifest.prompt_block();
         assert!(prompt.contains("secret-helper"));
         assert!(!prompt.contains("12345"));
+        assert!(prompt.contains("otherwise treats the source as Forth"));
+        assert!(prompt.contains("get_language_definition"));
+        assert!(prompt.contains("s\"response\" say"));
+        assert!(prompt.contains("s\"\"\"text\"\"\""));
+        assert!(prompt.contains("if-some ... else ... then"));
+        assert!(prompt.contains("Language packages: boot@FINCH-VM-TYPED/1#"));
+        assert!(!prompt.contains(".\" response\""));
+    }
+
+    #[test]
+    fn forth_wire_buffer_emits_only_complete_tokens_across_arbitrary_fragments() {
+        let mut buffer = ForthWireBuffer::default();
+        assert!(buffer.push("s\"hello").unwrap().is_empty());
+        assert_eq!(
+            buffer.push(" world\" sa").unwrap(),
+            vec![ForthWireToken {
+                start_byte: 0,
+                end_byte: 14,
+                source: "s\"hello world\"".into(),
+            }]
+        );
+        assert_eq!(
+            buffer.push("y \\ a partial").unwrap(),
+            vec![ForthWireToken {
+                start_byte: 15,
+                end_byte: 18,
+                source: "say".into(),
+            }]
+        );
+        assert_eq!(
+            buffer.push(" comment\n42 ").unwrap(),
+            vec![ForthWireToken {
+                start_byte: 39,
+                end_byte: 41,
+                source: "42".into(),
+            }]
+        );
+        assert!(buffer.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forth_wire_buffer_handles_raw_prose_and_rejects_unclosed_literals_at_finish() {
+        let mut buffer = ForthWireBuffer::default();
+        assert!(buffer.push("s\"\"\"Hello \"").unwrap().is_empty());
+        assert_eq!(
+            buffer.push("human\"\"\" ").unwrap()[0].source,
+            "s\"\"\"Hello \"human\"\"\""
+        );
+
+        let mut unterminated = ForthWireBuffer::default();
+        unterminated.push("s\"unfinished").unwrap();
+        assert!(unterminated.finish().unwrap_err().to_string().contains("unterminated"));
     }
 
     #[test]

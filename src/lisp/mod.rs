@@ -47,8 +47,8 @@ use std::sync::Arc;
 pub use env::EnvRef;
 pub use types::Val;
 
-use crate::ssh::SshSessionStore;
 use crate::runtime::automation::AutomationBroker;
+use crate::ssh::SshSessionStore;
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
@@ -79,10 +79,7 @@ impl LispCtx {
         }
     }
 
-    pub fn with_agent(
-        &self,
-        agent: Option<crate::runtime::agent_vm::AgentVmBinding>,
-    ) -> Self {
+    pub fn with_agent(&self, agent: Option<crate::runtime::agent_vm::AgentVmBinding>) -> Self {
         Self {
             ssh_sessions: Arc::clone(&self.ssh_sessions),
             automation: Arc::clone(&self.automation),
@@ -159,7 +156,9 @@ mod tests {
     async fn test_run_in_persists_defines() {
         let ctx = ctx();
         let env = make_env();
-        run_in("(define x 100)", env.clone(), ctx.clone()).await.unwrap();
+        run_in("(define x 100)", env.clone(), ctx.clone())
+            .await
+            .unwrap();
         let val = run_in("x", env.clone(), ctx.clone()).await.unwrap();
         assert_eq!(val, Val::Int(100));
     }
@@ -178,10 +177,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_crypto_sha256() {
-        let result = run(
-            r#"(bytes->hex (sha256 (string->bytes "abc")))"#,
-            ctx(),
-        ).await.unwrap();
+        let result = run(r#"(bytes->hex (sha256 (string->bytes "abc")))"#, ctx())
+            .await
+            .unwrap();
         // SHA-256("abc") = ba7816bf...
         assert!(result.starts_with("ba7816bf"), "unexpected: {result}");
     }
@@ -189,10 +187,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_ssh_session_not_found_without_connection() {
         // Connecting to a non-existent host returns an error, not a panic.
-        let err = run(
-            r#"(ssh-connect "127.0.0.1" 1 "nobody" "nopass")"#,
-            ctx(),
-        ).await;
+        let err = run(r#"(ssh-connect "127.0.0.1" 1 "nobody" "nopass")"#, ctx()).await;
         assert!(err.is_err());
     }
 }

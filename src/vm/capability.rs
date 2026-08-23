@@ -39,6 +39,11 @@ impl CapabilityGrant {
 pub struct CapabilityRequest {
     pub id: Uuid,
     pub execution_id: Uuid,
+    /// The portable VM effect sequence this approval may resume. `None` is
+    /// reserved for static/preflight requests that have not yet reached a
+    /// concrete runtime effect boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_sequence: Option<u64>,
     pub requirement: CapabilityRequirement,
     pub arguments: Vec<TypedValue>,
     pub reason: String,
@@ -177,6 +182,7 @@ mod tests {
         CapabilityRequest {
             id: Uuid::new_v4(),
             execution_id: Uuid::new_v4(),
+            effect_sequence: None,
             requirement,
             arguments: Vec::new(),
             reason: "test".into(),

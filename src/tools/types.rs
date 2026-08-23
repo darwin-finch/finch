@@ -11,8 +11,52 @@ use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::training::batch_trainer::BatchTrainer;
+use crate::vm::VmSideEffect;
+use crate::runtime::VmEffectEnvelope;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Per-tool presentation binding. Plain tools stream text lines; typed VM
+/// programs may additionally deliver portable, structured UI effects. The
+/// coordinator supplies the concrete shadow-buffer projection.
+pub trait LiveOutputSink: Send + Sync {
+    fn line(&self, text: String);
+
+    /// Preserve the historical live-text callback behavior for hosts that do
+    /// not care about richer UI events. Specialized sinks override this to
+    /// project the complete portable event stream.
+    fn vm_side_effect(&self, effect: VmSideEffect) {
+        if let crate::vm::HostSideEffect::Emit { text } = effect.event {
+            self.line(text);
+        }
+    }
+
+    /// Receive an event together with its ProgramRun identity. Hosts that do
+    /// not need durable handles can keep implementing `vm_side_effect`; a
+    /// proposal/IDE adapter can override this to retain `(execution_id,
+    /// sequence)` for an explicit later resume.
+    fn vm_effect_envelope(&self, envelope: VmEffectEnvelope) {
+        self.vm_side_effect(envelope.effect);
+    }
+
+    /// True only for a host that owns the explicit proposal lifecycle and can
+    /// resume deferred program effects. Plain output projections must leave
+    /// this false so compatibility editor behavior remains available.
+    fn defer_program_effects(&self) -> bool {
+        false
+    }
+}
+
+impl<F> LiveOutputSink for F
+where
+    F: Fn(String) + Send + Sync,
+{
+    fn line(&self, text: String) {
+        self(text);
+    }
+}
+
+pub type LiveOutput = Arc<dyn LiveOutputSink>;
 
 /// Context passed to tools during execution
 pub struct ToolContext<'a> {
@@ -40,7 +84,7 @@ pub struct ToolContext<'a> {
     /// Optional live-output callback for streaming tools (e.g. bash).
     /// Called once per output line while the tool is running.
     /// Allows the WorkUnit row to show a live scrolling preview.
-    pub live_output: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    pub live_output: Option<LiveOutput>,
 
     /// Co-Forth shared stack.  The AI can push items onto this stack via the
     /// `Push` tool; the user executes the combined stack with /pop.

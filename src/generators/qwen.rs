@@ -352,7 +352,11 @@ impl QwenGenerator {
         let executor = tool_executor.lock().await;
 
         for gen_tool_use in tool_calls {
-            tracing::info!("Executing tool: {} ({})", gen_tool_use.name, gen_tool_use.id);
+            tracing::info!(
+                "Executing tool: {} ({})",
+                gen_tool_use.name,
+                gen_tool_use.id
+            );
 
             // Convert generator ToolUse to executor ToolUse
             let tool_use = ToolsToolUse {

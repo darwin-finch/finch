@@ -58,9 +58,6 @@ pub mod agent;
 // Session task list tools
 pub mod todo_tools;
 
-// Co-Forth VM stack tools
-pub mod stack_tools;
-
 // File hashing and comparison
 pub mod hash_compare;
 
@@ -100,13 +97,11 @@ pub use memory_tools::{CreateMemoryTool, ListRecentTool, SearchMemoryTool};
 
 pub use vocabulary_tools::{InspectProgramTool, SearchVocabularyTool};
 
-pub use program::{GetLanguageDefinitionTool, GetVmStateTool, SubmitProgramTool};
+pub use program::{GetLanguageDefinitionTool, GetVmStateTool, SearchVmVocabularyTool, SubmitProgramTool};
 
 pub use agent::{AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool};
 
 pub use todo_tools::{TodoReadTool, TodoWriteTool};
-
-pub use stack_tools::{StackClearTool, StackPopTool, StackPushTool, StackRunTool};
 
 pub use ansible::AnsibleTool;
 pub use hash_compare::HashCompareTool;

@@ -50,7 +50,10 @@ pub fn parse_proposal_decision(content: &str) -> ProposalDecision {
                 || line.starts_with('#')
                 || line.starts_with('\\')
                 || line.starts_with(";;")
-        }) => ProposalDecision::Cancel,
+        }) =>
+        {
+            ProposalDecision::Cancel
+        }
         _ => ProposalDecision::Execute {
             source: content.to_string(),
         },
@@ -59,14 +62,63 @@ pub fn parse_proposal_decision(content: &str) -> ProposalDecision {
 
 /// Editor-backed proposal API that preserves the user's explicit action.
 /// Existing callers may continue using `propose_in_editor` while migrating.
-pub async fn propose_with_decision(
-    description: &str,
-    code: &str,
-) -> Result<ProposalDecision> {
+pub async fn propose_with_decision(description: &str, code: &str) -> Result<ProposalDecision> {
     Ok(match propose_in_editor(description, code).await? {
         Some(content) => parse_proposal_decision(&content),
         None => ProposalDecision::Cancel,
     })
+}
+
+/// Open a proposal artifact in the user editor and preserve the explicit
+/// `execute`/`chat`/`cancel` decision.  This is the language-neutral bridge
+/// used by the typed VM: accepting an edited artifact returns source data and
+/// does *not* execute it.  A caller must submit Finch source through the VM or
+/// use the normal separately-authorized external-script workflow.
+pub async fn propose_artifact_with_decision(
+    language: &str,
+    description: &str,
+    source: &str,
+) -> Result<ProposalDecision> {
+    let language = language.trim().to_ascii_lowercase();
+    match language.as_str() {
+        "forth" | "coforth" | "co-forth" => {
+            Ok(match propose_forth_in_editor(description, source).await? {
+                Some(content) => parse_proposal_decision(&content),
+                None => ProposalDecision::Cancel,
+            })
+        }
+        "bash" | "sh" | "shell" | "python" | "py" | "lisp" | "finch" | "text" => Ok(
+            match propose_in_editor_with_suffix(
+                description,
+                source,
+                artifact_suffix(&language),
+                artifact_comment_prefix(&language),
+                matches!(language.as_str(), "bash" | "sh" | "shell"),
+            )
+            .await?
+            {
+                Some(content) => parse_proposal_decision(&content),
+                None => ProposalDecision::Cancel,
+            },
+        ),
+        _ => anyhow::bail!("unsupported proposal artifact language '{language}'"),
+    }
+}
+
+fn artifact_comment_prefix(language: &str) -> &'static str {
+    match language {
+        "lisp" | "finch" => ";;",
+        _ => "#",
+    }
+}
+
+fn artifact_suffix(language: &str) -> &'static str {
+    match language {
+        "python" | "py" => ".py",
+        "lisp" | "finch" => ".lisp",
+        "text" => ".txt",
+        _ => ".sh",
+    }
 }
 
 fn suspend_terminal_for_editor() {
@@ -169,12 +221,22 @@ fn run_editor(path: &Path) -> Result<std::process::ExitStatus> {
 /// `description` is embedded as a `#`-comment block at the top so the user
 /// can read the English intent alongside the code.
 pub async fn propose_in_editor(description: &str, code: &str) -> Result<Option<String>> {
+    propose_in_editor_with_suffix(description, code, ".sh", "#", true).await
+}
+
+async fn propose_in_editor_with_suffix(
+    description: &str,
+    code: &str,
+    suffix: &'static str,
+    comment_prefix: &'static str,
+    executable: bool,
+) -> Result<Option<String>> {
     // Skip the editor when not running in an interactive terminal.
     if !std::io::stdin().is_terminal() {
         return Ok(Some(code.to_string()));
     }
 
-    let script = build_script(description, code);
+    let script = build_artifact(description, code, comment_prefix, executable);
     let tui_mode = crate::is_tui_active();
 
     if tui_mode {
@@ -206,17 +268,18 @@ pub async fn propose_in_editor(description: &str, code: &str) -> Result<Option<S
             suspend_terminal_for_editor();
         }
 
-        // Write to a temp file with a .sh extension so editors syntax-highlight it.
-        let mut tmp = Builder::new().prefix("finch_").suffix(".sh").tempfile()?;
+        // Preserve the artifact language for editor syntax highlighting.
+        let mut tmp = Builder::new().prefix("finch_").suffix(suffix).tempfile()?;
 
         tmp.write_all(script.as_bytes())?;
         tmp.flush()?;
 
         let path = tmp.path().to_owned();
 
-        // Make executable so the user can test it directly in a terminal.
+        // Make shell artifacts executable so the user can test them directly
+        // in a terminal. Other proposal kinds are intentionally only data.
         #[cfg(unix)]
-        {
+        if executable {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&path)?.permissions();
             perms.set_mode(0o755);
@@ -261,9 +324,21 @@ pub async fn propose_in_editor(description: &str, code: &str) -> Result<Option<S
 /// find ~/repos/finch/target -name "*.tmp" -delete
 /// ```
 pub fn build_script(description: &str, code: &str) -> String {
-    let mut out = String::from("#!/bin/bash\n");
+    build_artifact(description, code, "#", true)
+}
+
+/// Format an editable source artifact without making its language executable.
+/// The comment marker belongs to the artifact language, so an accepted Lisp
+/// proposal is still valid Lisp rather than a shell file with a renamed suffix.
+fn build_artifact(description: &str, code: &str, comment_prefix: &str, executable: bool) -> String {
+    let mut out = if executable {
+        String::from("#!/bin/bash\n")
+    } else {
+        String::new()
+    };
     for line in description.lines() {
-        out.push_str("# ");
+        out.push_str(comment_prefix);
+        out.push(' ');
         out.push_str(line);
         out.push('\n');
     }
@@ -462,5 +537,25 @@ mod tests {
             parse_proposal_decision("# Please enter the commit message\necho hi"),
             ProposalDecision::Execute { .. }
         ));
+    }
+
+    #[test]
+    fn lisp_artifacts_receive_lisp_comment_headers() {
+        let artifact = build_artifact("Explain intent", "(say \"ok\")", ";;", false);
+        assert!(artifact.starts_with(";; Explain intent\n"));
+        assert!(!artifact.starts_with("#!/bin/bash"));
+    }
+
+    #[tokio::test]
+    async fn noninteractive_artifact_proposal_returns_source_without_execution() {
+        let decision = propose_artifact_with_decision("python", "example", "print('ok')")
+            .await
+            .unwrap();
+        assert_eq!(
+            decision,
+            ProposalDecision::Execute {
+                source: "print('ok')".into()
+            }
+        );
     }
 }

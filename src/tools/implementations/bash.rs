@@ -73,7 +73,7 @@ impl Tool for BashTool {
         let mut stdout_lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = stdout_lines.next_line().await {
             if let Some(ref cb) = live_cb {
-                cb(line.clone());
+                cb.line(line.clone());
             }
             stdout_buf.push_str(&line);
             stdout_buf.push('\n');
@@ -179,7 +179,7 @@ mod tests {
 
         let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let received_clone = Arc::clone(&received);
-        let cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |line: String| {
+        let cb: crate::tools::types::LiveOutput = Arc::new(move |line: String| {
             received_clone.lock().unwrap().push(line);
         });
 
@@ -230,7 +230,7 @@ mod tests {
 
         let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let received_clone = Arc::clone(&received);
-        let cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |line: String| {
+        let cb: crate::tools::types::LiveOutput = Arc::new(move |line: String| {
             received_clone.lock().unwrap().push(line);
         });
 

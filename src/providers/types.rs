@@ -175,23 +175,22 @@ impl ProviderRequest {
                 }
 
                 // Collect the ToolUse IDs from the immediately preceding assistant message.
-                let allowed_ids: HashSet<String> = if i > 0
-                    && self.messages[i - 1].role == "assistant"
-                {
-                    self.messages[i - 1]
-                        .content
-                        .iter()
-                        .filter_map(|b| {
-                            if let ContentBlock::ToolUse { id, .. } = b {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                } else {
-                    HashSet::new()
-                };
+                let allowed_ids: HashSet<String> =
+                    if i > 0 && self.messages[i - 1].role == "assistant" {
+                        self.messages[i - 1]
+                            .content
+                            .iter()
+                            .filter_map(|b| {
+                                if let ContentBlock::ToolUse { id, .. } = b {
+                                    Some(id.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    } else {
+                        HashSet::new()
+                    };
 
                 // Retain only ToolResult blocks whose IDs are in allowed_ids;
                 // non-ToolResult blocks are always kept.

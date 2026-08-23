@@ -196,8 +196,17 @@ impl PermissionManager {
         match tool_name {
             // Silent allow: read-only examination and scheduler-local control.
             // Agent tools enforce task-tree ownership themselves.
-            "read" | "glob" | "grep" | "get_vm_state" | "spawn_agent" | "await_agent"
-            | "poll_agent" | "cancel_agent" => PermissionCheck::Allow,
+            "read"
+            | "glob"
+            | "grep"
+            | "get_vm_state"
+            | "get_language_definition"
+            | "search_vm_vocabulary"
+            | "search_vocabulary"
+            | "spawn_agent"
+            | "await_agent"
+            | "poll_agent"
+            | "cancel_agent" => PermissionCheck::Allow,
 
             // Pure and VM-local programs cannot cross a host-effect boundary.
             "submit_program"
@@ -441,7 +450,19 @@ fn is_readonly_bash(command: &str) -> bool {
 /// the compatibility boundary while provider-native tools are still exposed.
 pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
     match tool_name.to_ascii_lowercase().as_str() {
-        "search_vocabulary"
+        // Transitional adapter: ordinary provider turns still invoke the
+        // typed VM through a tool call. Preserve the program's declared upper
+        // bound so pure/VM-local work is not treated as an unclassified shell
+        // operation by the legacy approval gate.
+        "submit_program" => input
+            .get("effect")
+            .and_then(Value::as_str)
+            .and_then(|effect| effect.parse().ok())
+            .unwrap_or(ExecutionEffect::Unclassified),
+        "get_vm_state"
+        | "get_language_definition"
+        | "search_vm_vocabulary"
+        | "search_vocabulary"
         | "inspect_program"
         | "search_memory"
         | "list_recent_memories"
@@ -798,5 +819,37 @@ mod tests {
         assert!(legacy_tool_effect("read", &serde_json::json!({})).runs_autonomously());
         assert!(!legacy_tool_effect("write", &serde_json::json!({})).runs_autonomously());
         assert!(!legacy_tool_effect("unknown", &serde_json::json!({})).runs_autonomously());
+    }
+
+    #[test]
+    fn typed_program_submission_preserves_its_declared_effect() {
+        assert_eq!(
+            legacy_tool_effect("submit_program", &serde_json::json!({"effect": "pure"})),
+            ExecutionEffect::Pure
+        );
+        assert_eq!(
+            legacy_tool_effect(
+                "submit_program",
+                &serde_json::json!({"effect": "workspace_read"})
+            ),
+            ExecutionEffect::WorkspaceRead
+        );
+    }
+
+    #[test]
+    fn vm_discovery_tools_are_autonomous_vm_reads() {
+        for tool in [
+            "get_vm_state",
+            "get_language_definition",
+            "search_vm_vocabulary",
+            "search_vocabulary",
+            "inspect_program",
+        ] {
+            assert_eq!(
+                legacy_tool_effect(tool, &serde_json::json!({})),
+                ExecutionEffect::VmRead,
+                "{tool} must not open a host-effect approval dialog"
+            );
+        }
     }
 }

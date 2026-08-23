@@ -39,7 +39,10 @@ fn build_write_code(file_path: &str, content: &str) -> String {
         "python3 << 'PYEOF'\n",
         "import base64, os\n",
         &format!("path = {}\n", path_py),
-        &format!("content = base64.b64decode(b\"{}\").decode(\"utf-8\")\n", content_b64),
+        &format!(
+            "content = base64.b64decode(b\"{}\").decode(\"utf-8\")\n",
+            content_b64
+        ),
         "os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)\n",
         "is_new = not os.path.exists(path)\n",
         "with open(path, \"w\") as f:\n",

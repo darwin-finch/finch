@@ -30,7 +30,6 @@
 /// Memory is indexed in i64 cells (8 bytes each).  The sp starts at the top
 /// of a 256-cell region.  Negative immediate offsets (e.g. `#-8`) work in
 /// units of one cell (not bytes), keeping the model simple.
-
 use anyhow::{anyhow, Result};
 
 const MEM_SIZE: usize = 256;
@@ -39,26 +38,74 @@ const SP_INIT: i64 = MEM_SIZE as i64; // sp starts just past the top; first push
 /// Parsed AArch64 instruction (subset).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instr {
-    MovImm { dst: usize, imm: i64 },
-    MovReg { dst: usize, src: usize },
-    LdrBase { dst: usize, base: usize },
-    LdrOffset { dst: usize, base: usize, offset: i64 },
-    LdrPostInc { dst: usize, base: usize, inc: i64 },
-    StrBase { src: usize, base: usize },
-    StrOffset { src: usize, base: usize, offset: i64 },
-    StrPreDec { src: usize, base: usize, offset: i64 }, // [base, #offset]!
-    AddReg { dst: usize, lhs: usize, rhs: usize },
-    AddImm { dst: usize, lhs: usize, imm: i64 },
-    SubReg { dst: usize, lhs: usize, rhs: usize },
-    SubImm { dst: usize, lhs: usize, imm: i64 },
-    MulReg { dst: usize, lhs: usize, rhs: usize },
+    MovImm {
+        dst: usize,
+        imm: i64,
+    },
+    MovReg {
+        dst: usize,
+        src: usize,
+    },
+    LdrBase {
+        dst: usize,
+        base: usize,
+    },
+    LdrOffset {
+        dst: usize,
+        base: usize,
+        offset: i64,
+    },
+    LdrPostInc {
+        dst: usize,
+        base: usize,
+        inc: i64,
+    },
+    StrBase {
+        src: usize,
+        base: usize,
+    },
+    StrOffset {
+        src: usize,
+        base: usize,
+        offset: i64,
+    },
+    StrPreDec {
+        src: usize,
+        base: usize,
+        offset: i64,
+    }, // [base, #offset]!
+    AddReg {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
+    AddImm {
+        dst: usize,
+        lhs: usize,
+        imm: i64,
+    },
+    SubReg {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
+    SubImm {
+        dst: usize,
+        lhs: usize,
+        imm: i64,
+    },
+    MulReg {
+        dst: usize,
+        lhs: usize,
+        rhs: usize,
+    },
     Ret,
 }
 
 /// The VM state.
 pub struct ArmVm {
     pub regs: [i64; 32], // x0–x30 + sp (index 31)
-    pub mem:  Vec<i64>,  // flat cell memory
+    pub mem: Vec<i64>,   // flat cell memory
 }
 
 impl Default for ArmVm {
@@ -89,36 +136,48 @@ impl ArmVm {
                 }
                 Instr::LdrBase { dst, base } => {
                     let addr = self.regs[*base] as usize;
-                    self.regs[*dst] = *self.mem.get(addr)
+                    self.regs[*dst] = *self
+                        .mem
+                        .get(addr)
                         .ok_or_else(|| anyhow!("ldr: address {addr} out of bounds"))?;
                 }
                 Instr::LdrOffset { dst, base, offset } => {
                     let addr = (self.regs[*base] + offset) as usize;
-                    self.regs[*dst] = *self.mem.get(addr)
+                    self.regs[*dst] = *self
+                        .mem
+                        .get(addr)
                         .ok_or_else(|| anyhow!("ldr offset: address {addr} out of bounds"))?;
                 }
                 Instr::LdrPostInc { dst, base, inc } => {
                     let addr = self.regs[*base] as usize;
-                    self.regs[*dst] = *self.mem.get(addr)
+                    self.regs[*dst] = *self
+                        .mem
+                        .get(addr)
                         .ok_or_else(|| anyhow!("ldr post-inc: address {addr} out of bounds"))?;
                     self.regs[*base] += inc;
                 }
                 Instr::StrBase { src, base } => {
                     let addr = self.regs[*base] as usize;
-                    let cell = self.mem.get_mut(addr)
+                    let cell = self
+                        .mem
+                        .get_mut(addr)
                         .ok_or_else(|| anyhow!("str: address {addr} out of bounds"))?;
                     *cell = self.regs[*src];
                 }
                 Instr::StrOffset { src, base, offset } => {
                     let addr = (self.regs[*base] + offset) as usize;
-                    let cell = self.mem.get_mut(addr)
+                    let cell = self
+                        .mem
+                        .get_mut(addr)
                         .ok_or_else(|| anyhow!("str offset: address {addr} out of bounds"))?;
                     *cell = self.regs[*src];
                 }
                 Instr::StrPreDec { src, base, offset } => {
                     self.regs[*base] += offset; // offset is negative for push
                     let addr = self.regs[*base] as usize;
-                    let cell = self.mem.get_mut(addr)
+                    let cell = self
+                        .mem
+                        .get_mut(addr)
                         .ok_or_else(|| anyhow!("str pre-dec: address {addr} out of bounds"))?;
                     *cell = self.regs[*src];
                 }
@@ -146,14 +205,18 @@ impl ArmVm {
     /// Return the top of the VM's stack (the cell at mem[sp]).
     pub fn stack_top(&self) -> Option<i64> {
         let sp = self.regs[31] as usize;
-        if sp >= MEM_SIZE { return None; }
+        if sp >= MEM_SIZE {
+            return None;
+        }
         Some(self.mem[sp])
     }
 
     /// Return the full stack as a Vec (bottom to top).
     pub fn stack_snapshot(&self) -> Vec<i64> {
         let sp = self.regs[31] as usize;
-        if sp >= MEM_SIZE { return vec![]; }
+        if sp >= MEM_SIZE {
+            return vec![];
+        }
         self.mem[sp..MEM_SIZE].to_vec()
     }
 }
@@ -163,10 +226,14 @@ impl ArmVm {
 /// Parse a register name ("x0"–"x30", "sp") into an index (0–31).
 fn parse_reg(s: &str) -> Result<usize> {
     let s = s.trim().trim_matches(',');
-    if s == "sp" { return Ok(31); }
+    if s == "sp" {
+        return Ok(31);
+    }
     if let Some(n) = s.strip_prefix('x') {
         let idx: usize = n.parse().map_err(|_| anyhow!("bad register: {s}"))?;
-        if idx <= 30 { return Ok(idx); }
+        if idx <= 30 {
+            return Ok(idx);
+        }
     }
     Err(anyhow!("unknown register: {s}"))
 }
@@ -206,9 +273,15 @@ pub fn parse_instr(line: &str) -> Result<Instr> {
             let dst = parse_reg(operands.get(0).copied().unwrap_or(""))?;
             let src = operands.get(1).copied().unwrap_or("").trim();
             if src.starts_with('#') {
-                Ok(Instr::MovImm { dst, imm: parse_imm(src)? })
+                Ok(Instr::MovImm {
+                    dst,
+                    imm: parse_imm(src)?,
+                })
             } else {
-                Ok(Instr::MovReg { dst, src: parse_reg(src)? })
+                Ok(Instr::MovReg {
+                    dst,
+                    src: parse_reg(src)?,
+                })
             }
         }
         "ldr" => {
@@ -226,9 +299,17 @@ pub fn parse_instr(line: &str) -> Result<Instr> {
             let lhs = parse_reg(operands.get(1).copied().unwrap_or(""))?;
             let rhs_s = operands.get(2).copied().unwrap_or("").trim();
             if rhs_s.starts_with('#') {
-                Ok(Instr::AddImm { dst, lhs, imm: parse_imm(rhs_s)? })
+                Ok(Instr::AddImm {
+                    dst,
+                    lhs,
+                    imm: parse_imm(rhs_s)?,
+                })
             } else {
-                Ok(Instr::AddReg { dst, lhs, rhs: parse_reg(rhs_s)? })
+                Ok(Instr::AddReg {
+                    dst,
+                    lhs,
+                    rhs: parse_reg(rhs_s)?,
+                })
             }
         }
         "sub" => {
@@ -236,9 +317,17 @@ pub fn parse_instr(line: &str) -> Result<Instr> {
             let lhs = parse_reg(operands.get(1).copied().unwrap_or(""))?;
             let rhs_s = operands.get(2).copied().unwrap_or("").trim();
             if rhs_s.starts_with('#') {
-                Ok(Instr::SubImm { dst, lhs, imm: parse_imm(rhs_s)? })
+                Ok(Instr::SubImm {
+                    dst,
+                    lhs,
+                    imm: parse_imm(rhs_s)?,
+                })
             } else {
-                Ok(Instr::SubReg { dst, lhs, rhs: parse_reg(rhs_s)? })
+                Ok(Instr::SubReg {
+                    dst,
+                    lhs,
+                    rhs: parse_reg(rhs_s)?,
+                })
             }
         }
         "mul" => {
@@ -370,7 +459,9 @@ pub fn run_asm(src: &str) -> Result<i64> {
 mod tests {
     use super::*;
 
-    fn sp() -> usize { 31 }
+    fn sp() -> usize {
+        31
+    }
 
     #[test]
     fn test_push_pop() {
@@ -379,9 +470,18 @@ mod tests {
         let mut vm = ArmVm::new();
         vm.run(&[
             Instr::MovImm { dst: 0, imm: 42 },
-            Instr::StrPreDec { src: 0, base: sp(), offset: -1 },
-            Instr::LdrPostInc { dst: 1, base: sp(), inc: 1 },
-        ]).unwrap();
+            Instr::StrPreDec {
+                src: 0,
+                base: sp(),
+                offset: -1,
+            },
+            Instr::LdrPostInc {
+                dst: 1,
+                base: sp(),
+                inc: 1,
+            },
+        ])
+        .unwrap();
         assert_eq!(vm.regs[1], 42);
     }
 
@@ -391,10 +491,19 @@ mod tests {
         let mut vm = ArmVm::new();
         vm.run(&[
             Instr::MovImm { dst: 0, imm: 5 },
-            Instr::StrPreDec { src: 0, base: sp(), offset: -1 }, // push 5
-            Instr::LdrBase   { dst: 0, base: sp() },              // ldr x0, [sp]
-            Instr::StrPreDec { src: 0, base: sp(), offset: -1 }, // push x0 (dup)
-        ]).unwrap();
+            Instr::StrPreDec {
+                src: 0,
+                base: sp(),
+                offset: -1,
+            }, // push 5
+            Instr::LdrBase { dst: 0, base: sp() }, // ldr x0, [sp]
+            Instr::StrPreDec {
+                src: 0,
+                base: sp(),
+                offset: -1,
+            }, // push x0 (dup)
+        ])
+        .unwrap();
         let stack = vm.stack_snapshot();
         assert_eq!(stack, vec![5, 5], "dup must leave two copies");
     }
@@ -404,15 +513,40 @@ mod tests {
         // push 3; push 4; pop x0; pop x1; add x0,x0,x1; push result
         let mut vm = ArmVm::new();
         vm.run(&[
-            Instr::MovImm   { dst: 0, imm: 3 },
-            Instr::StrPreDec { src: 0, base: sp(), offset: -1 },
-            Instr::MovImm   { dst: 0, imm: 4 },
-            Instr::StrPreDec { src: 0, base: sp(), offset: -1 },
-            Instr::LdrPostInc { dst: 0, base: sp(), inc: 1 },
-            Instr::LdrPostInc { dst: 1, base: sp(), inc: 1 },
-            Instr::AddReg   { dst: 0, lhs: 0, rhs: 1 },
-            Instr::StrPreDec { src: 0, base: sp(), offset: -1 },
-        ]).unwrap();
+            Instr::MovImm { dst: 0, imm: 3 },
+            Instr::StrPreDec {
+                src: 0,
+                base: sp(),
+                offset: -1,
+            },
+            Instr::MovImm { dst: 0, imm: 4 },
+            Instr::StrPreDec {
+                src: 0,
+                base: sp(),
+                offset: -1,
+            },
+            Instr::LdrPostInc {
+                dst: 0,
+                base: sp(),
+                inc: 1,
+            },
+            Instr::LdrPostInc {
+                dst: 1,
+                base: sp(),
+                inc: 1,
+            },
+            Instr::AddReg {
+                dst: 0,
+                lhs: 0,
+                rhs: 1,
+            },
+            Instr::StrPreDec {
+                src: 0,
+                base: sp(),
+                offset: -1,
+            },
+        ])
+        .unwrap();
         assert_eq!(vm.stack_top(), Some(7));
     }
 
@@ -421,7 +555,14 @@ mod tests {
         let prog = parse_program("mov x0, #99; str x0, [sp, #-1]!").unwrap();
         assert_eq!(prog.len(), 2);
         assert_eq!(prog[0], Instr::MovImm { dst: 0, imm: 99 });
-        assert_eq!(prog[1], Instr::StrPreDec { src: 0, base: 31, offset: -1 });
+        assert_eq!(
+            prog[1],
+            Instr::StrPreDec {
+                src: 0,
+                base: 31,
+                offset: -1
+            }
+        );
     }
 
     #[test]
@@ -436,7 +577,8 @@ mod tests {
         // ARM dup: push N, ldr x0,[sp], str x0,[sp,#-1]!  → top == N
         // Forth dup: N dup  → top == N
         // Both should produce the same top-of-stack for N=5.
-        let arm_top = run_asm("mov x0, #5; str x0, [sp, #-1]!; ldr x0, [sp]; str x0, [sp, #-1]!").unwrap();
+        let arm_top =
+            run_asm("mov x0, #5; str x0, [sp, #-1]!; ldr x0, [sp]; str x0, [sp, #-1]!").unwrap();
         let forth_top = crate::coforth::interpreter::Forth::run("5 dup .")
             .unwrap()
             .trim()

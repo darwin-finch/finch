@@ -4,6 +4,7 @@ use crate::vm::diagnostic::{
 };
 use crate::vm::effects::EffectSet;
 use crate::vm::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
+use crate::vm::interpreter::UiOperation;
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
 use crate::vm::types::{Type, TypedValue};
 use crate::vm::verifier::{apply_signature_types, VerifiedModule, Verifier, Vocabulary};
@@ -14,6 +15,16 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 enum Binding {
     Local { index: u32, ty: Type },
     Capture { index: u32, ty: Type },
+}
+
+/// A lexically active structured loop.  It is compiler metadata only: the
+/// emitted IR still contains ordinary typed blocks and explicit jump edges.
+#[derive(Debug, Clone)]
+struct LoopBinding {
+    label: Option<String>,
+    header: BlockId,
+    exit: BlockId,
+    stack: Vec<Type>,
 }
 
 impl Binding {
@@ -32,6 +43,7 @@ struct FunctionBuilder {
     locals: Vec<Type>,
     captures: Vec<Type>,
     scopes: Vec<HashMap<String, Binding>>,
+    loops: Vec<LoopBinding>,
     stack: Vec<Type>,
     input: Vec<Type>,
     effects: EffectSet,
@@ -53,6 +65,7 @@ impl FunctionBuilder {
             locals: Vec::new(),
             captures: Vec::new(),
             scopes: vec![HashMap::new()],
+            loops: Vec::new(),
             stack: input.clone(),
             input,
             effects: EffectSet::pure(),
@@ -60,14 +73,25 @@ impl FunctionBuilder {
     }
 
     fn emit(&mut self, instruction: Instruction, origin: SourceOrigin) {
-        self.blocks
+        let block = self
+            .blocks
             .get_mut(&self.current)
-            .expect("current block exists")
+            .expect("current block exists");
+        // Structured loop exits terminate their current edge. Continue
+        // lowering only to close surrounding forms and type-check their live
+        // alternatives; never append a synthetic merge instruction after a
+        // terminator.
+        if block
             .instructions
-            .push(LocatedInstruction {
-                instruction,
-                origin,
-            });
+            .last()
+            .is_some_and(|located| located.instruction.is_terminator())
+        {
+            return;
+        }
+        block.instructions.push(LocatedInstruction {
+            instruction,
+            origin,
+        });
     }
 
     fn new_block(&mut self) -> BlockId {
@@ -420,8 +444,16 @@ impl Compiler<'_> {
             "begin" => self.compile_begin(&items[1..], builder),
             "let" => self.compile_let(&items[1..], builder),
             "if" => self.compile_if(&items[1..], builder),
+            "match-option" => self.compile_match_option(&items[1..], builder),
             "while" => self.compile_while(&items[1..], builder),
+            "break" => self.compile_loop_exit("break", &items[1..], builder),
+            "continue" => self.compile_loop_exit("continue", &items[1..], builder),
             "lambda" => self.compile_lambda(&items[1..], builder),
+            "defer" => self.compile_defer(&items[1..], builder),
+            "defer-cpu" => self.compile_defer_cpu(&items[1..], builder),
+            "task-poll" => self.compile_cpu_task_operation(&items[1..], builder, false),
+            "task-join" => self.compile_cpu_task_operation(&items[1..], builder, true),
+            "task-cancel" => self.compile_cpu_task_cancel(&items[1..], builder),
             "list" => self.compile_list_value(&items[1..], builder),
             _ if builder.resolve(operator).is_some() => {
                 self.compile_closure_call(&items[0], &items[1..], builder)
@@ -454,6 +486,129 @@ impl Compiler<'_> {
             .stack
             .pop()
             .expect("compiled expression leaves value"))
+    }
+
+    /// Lower a pure zero-argument closure directly to the shared IR's
+    /// `DeferCpu` instruction. The closure's captures have already been
+    /// materialized as typed values, so the worker can never retain a parent
+    /// stack frame or local binding.
+    fn compile_defer_cpu(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        if expressions.len() != 1 {
+            return Err(vec![self.error(
+                "E-FIBER-003",
+                "defer-cpu requires exactly one zero-argument closure",
+            )]);
+        }
+        let closure_type = self.compile_expression(&expressions[0], builder)?;
+        let Type::Function {
+            arguments,
+            result,
+            effects,
+        } = closure_type
+        else {
+            return Err(vec![self.error("E-FIBER-003", "defer-cpu requires a typed closure")]);
+        };
+        if !arguments.is_empty() {
+            return Err(vec![self.error(
+                "E-FIBER-004",
+                "defer-cpu requires a zero-argument closure; capture its arguments first",
+            )]);
+        }
+        if !effects.is_pure() {
+            return Err(vec![self.error(
+                "E-FIBER-005",
+                "defer-cpu requires a pure closure",
+            )]);
+        }
+        builder.stack.pop();
+        builder.emit(Instruction::DeferCpu, self.origin("defer-cpu"));
+        Ok(Type::Task(result))
+    }
+
+    /// User-facing deferred-work form. Modes deliberately remain explicit so
+    /// an LLM chooses CPU work rather than accidentally treating an I/O wait
+    /// as a native thread. `:cpu` is the first supported mode; cooperative
+    /// and agent modes will lower to different scheduler instructions.
+    fn compile_defer(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        if expressions.len() != 2 {
+            return Err(vec![self.error(
+                "E-FIBER-003",
+                "defer requires a mode and exactly one closure",
+            )]);
+        }
+        match &expressions[0] {
+            Val::Symbol(mode) if mode == ":cpu" => {
+                self.compile_defer_cpu(&expressions[1..], builder)
+            }
+            Val::Symbol(mode) => Err(vec![self.error(
+                "E-FIBER-019",
+                format!("unsupported defer mode '{mode}'; supported modes: :cpu"),
+            )]),
+            _ => Err(vec![self.error(
+                "E-FIBER-019",
+                "defer mode must be a symbol such as :cpu",
+            )]),
+        }
+    }
+
+    fn compile_cpu_task_operation(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+        join: bool,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let name = if join { "task-join" } else { "task-poll" };
+        if expressions.len() != 1 {
+            return Err(vec![self.error(
+                if join { "E-FIBER-010" } else { "E-FIBER-009" },
+                format!("{name} requires exactly one task<T>"),
+            )]);
+        }
+        let task_type = self.compile_expression(&expressions[0], builder)?;
+        let Type::Task(result) = task_type else {
+            return Err(vec![self.error(
+                if join { "E-FIBER-010" } else { "E-FIBER-009" },
+                format!("{name} requires task<T>"),
+            )]);
+        };
+        builder.stack.pop();
+        builder.emit(
+            if join {
+                Instruction::JoinCpuFiber
+            } else {
+                Instruction::PollCpuFiber
+            },
+            self.origin(name),
+        );
+        Ok(if join { *result } else { Type::Option(result) })
+    }
+
+    fn compile_cpu_task_cancel(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        if expressions.len() != 1 {
+            return Err(vec![self.error(
+                "E-FIBER-020",
+                "task-cancel requires exactly one task<T>",
+            )]);
+        }
+        let task_type = self.compile_expression(&expressions[0], builder)?;
+        if !matches!(task_type, Type::Task(_)) {
+            return Err(vec![self.error("E-FIBER-020", "task-cancel requires task<T>")]);
+        }
+        builder.stack.pop();
+        builder.emit(Instruction::CancelCpuFiber, self.origin("task-cancel"));
+        Ok(Type::Unit)
     }
 
     fn compile_list_value(
@@ -606,12 +761,166 @@ impl Compiler<'_> {
         Ok(builder.stack.pop().expect("if expression leaves value"))
     }
 
+    /// Compile a total option match without introducing dynamic values. The
+    /// `some` arm receives the unwrapped value through a lexical local; the
+    /// `none` arm receives no synthetic value. Both arms must therefore agree
+    /// on their ordinary expression type and stack row.
+    ///
+    /// ```lisp
+    /// (match-option next-line
+    ///   (some line (say line))
+    ///   (none (say "EOF")))
+    /// ```
+    fn compile_match_option(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [option_expression, some_arm, none_arm] = expressions else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-001",
+                "match-option requires an option expression, (some name body...), and (none body...)",
+            )]);
+        };
+        let Type::Option(inner) = self.compile_expression(option_expression, builder)? else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-002",
+                "match-option requires an option<T> expression",
+            )]);
+        };
+        builder.stack.pop();
+        let branch_stack = builder.stack.clone();
+
+        let Val::List(some_items) = some_arm else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-003",
+                "match-option's first arm must be (some name body...)",
+            )]);
+        };
+        let [Val::Symbol(marker), Val::Symbol(binding), some_body @ ..] = some_items.as_slice()
+        else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-003",
+                "match-option's first arm must be (some name body...)",
+            )]);
+        };
+        if marker != "some" || some_body.is_empty() {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-003",
+                "match-option's first arm must be (some name body...)",
+            )]);
+        }
+        let Val::List(none_items) = none_arm else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-004",
+                "match-option's second arm must be (none body...)",
+            )]);
+        };
+        let [Val::Symbol(marker), none_body @ ..] = none_items.as_slice() else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-004",
+                "match-option's second arm must be (none body...)",
+            )]);
+        };
+        if marker != "none" || none_body.is_empty() {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-004",
+                "match-option's second arm must be (none body...)",
+            )]);
+        }
+
+        // The runtime starts with the option on the stack. Keep one copy for
+        // the selected branch and branch on a second copy.
+        builder.emit(Instruction::Dup, self.origin("match-option/test"));
+        builder.emit(
+            Instruction::Call {
+                function: "is-some".into(),
+            },
+            self.origin("match-option/test"),
+        );
+        let then_block = builder.new_block();
+        let else_block = builder.new_block();
+        let merge_block = builder.new_block();
+        builder.emit(
+            Instruction::Branch {
+                then_block,
+                else_block,
+            },
+            self.origin("match-option/test"),
+        );
+
+        builder.switch_to(then_block, branch_stack.clone());
+        builder.emit(
+            Instruction::Call {
+                function: "unwrap".into(),
+            },
+            self.origin("match-option/some"),
+        );
+        builder.stack.push((*inner).clone());
+        let index = builder.allocate_local((*inner).clone());
+        builder.stack.pop();
+        builder.emit(
+            Instruction::LocalSet { index },
+            self.origin(binding.clone()),
+        );
+        builder.scopes.push(HashMap::from([(
+            binding.clone(),
+            Binding::Local {
+                index,
+                ty: (*inner).clone(),
+            },
+        )]));
+        let some_type = self.compile_begin(some_body, builder)?;
+        builder.scopes.pop();
+        builder.stack.push(some_type.clone());
+        let some_stack = builder.stack.clone();
+        builder.emit(
+            Instruction::Jump {
+                target: merge_block,
+            },
+            self.origin("match-option/some-end"),
+        );
+
+        builder.switch_to(else_block, branch_stack);
+        builder.emit(Instruction::Drop, self.origin("match-option/none"));
+        let none_type = self.compile_begin(none_body, builder)?;
+        builder.stack.push(none_type.clone());
+        let none_stack = builder.stack.clone();
+        if some_type != none_type || some_stack != none_stack {
+            return Err(vec![VmDiagnostic::type_mismatch(
+                some_type,
+                none_type,
+                Some(self.origin("match-option")),
+            )]);
+        }
+        builder.emit(
+            Instruction::Jump {
+                target: merge_block,
+            },
+            self.origin("match-option/none-end"),
+        );
+        builder.switch_to(merge_block, none_stack);
+        Ok(builder.stack.pop().expect("match-option leaves a value"))
+    }
+
     fn compile_while(
         &mut self,
         expressions: &[Val],
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
-        if expressions.len() < 2 {
+        let (label, condition_index) = match expressions {
+            [Val::Symbol(marker), Val::Symbol(label), rest @ ..] if marker == ":label" => {
+                if label.is_empty() || rest.len() < 2 {
+                    return Err(vec![self.error(
+                        "E-LISP-011",
+                        "while :label requires a name, condition, and at least one body expression",
+                    )]);
+                }
+                (Some(label.clone()), 2)
+            }
+            _ => (None, 0),
+        };
+        if expressions.len() < condition_index + 2 {
             return Err(vec![self.error(
                 "E-LISP-010",
                 "while requires a condition and at least one body expression",
@@ -629,7 +938,7 @@ impl Compiler<'_> {
         );
 
         builder.switch_to(condition_block, loop_stack.clone());
-        let condition = self.compile_expression(&expressions[0], builder)?;
+        let condition = self.compile_expression(&expressions[condition_index], builder)?;
         if condition != Type::Bool {
             return Err(vec![VmDiagnostic::type_mismatch(
                 Type::Bool,
@@ -653,7 +962,15 @@ impl Compiler<'_> {
         );
 
         builder.switch_to(body_block, loop_stack.clone());
-        self.compile_begin(&expressions[1..], builder)?;
+        builder.loops.push(LoopBinding {
+            label,
+            header: condition_block,
+            exit: exit_block,
+            stack: loop_stack.clone(),
+        });
+        let body = self.compile_begin(&expressions[condition_index + 1..], builder);
+        builder.loops.pop();
+        body?;
         builder.emit(Instruction::Drop, self.origin("while/body-result"));
         if builder.stack != loop_stack {
             return Err(vec![
@@ -677,6 +994,58 @@ impl Compiler<'_> {
         Ok(Type::Unit)
     }
 
+    fn compile_loop_exit(
+        &mut self,
+        kind: &str,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [Val::Symbol(label)] = expressions else {
+            return Err(vec![self.error(
+                "E-LISP-012",
+                format!("{kind} requires exactly one active loop label"),
+            )]);
+        };
+        let Some(loop_binding) = builder
+            .loops
+            .iter()
+            .rev()
+            .find(|loop_binding| loop_binding.label.as_deref() == Some(label.as_str()))
+            .cloned()
+        else {
+            return Err(vec![self.error(
+                "E-LISP-012",
+                format!("{kind} target '{label}' is not an active named loop"),
+            )]);
+        };
+        if builder.stack != loop_binding.stack {
+            let mut diagnostic = self.error(
+                "E-STACK-006",
+                format!("{kind} target '{label}' requires the loop's declared stack shape"),
+            );
+            diagnostic.expected_types = loop_binding.stack;
+            diagnostic.found_types = builder.stack.clone();
+            return Err(vec![diagnostic]);
+        }
+        let target = if kind == "break" {
+            loop_binding.exit
+        } else {
+            loop_binding.header
+        };
+        builder.emit(Instruction::Jump { target }, self.origin(kind));
+        // Lisp expressions must have a value even though the actual edge has
+        // already left this block.  The synthetic unit is compiler-only
+        // unreachable code; it lets enclosing `begin`/`if` type-check the
+        // alternate live path without changing the target loop row.
+        builder.emit(
+            Instruction::Constant {
+                value: TypedValue::Unit,
+            },
+            self.origin(format!("{kind}/unreachable")),
+        );
+        Ok(Type::Unit)
+    }
+
     fn compile_lambda(
         &mut self,
         expressions: &[Val],
@@ -687,10 +1056,18 @@ impl Compiler<'_> {
                 self.error("E-LISP-006", "lambda requires parameters and a body")
             ]);
         }
-        let Val::List(parameters) = &expressions[0] else {
-            return Err(vec![
-                self.error("E-LISP-007", "lambda parameters must be a list")
-            ]);
+        // The reader represents `()` as `nil`, so accept it as the natural
+        // zero-argument parameter list. Zero-argument closures are important
+        // for `defer`: captures supply their immutable environment and the
+        // worker receives no parent stack values.
+        let parameters: &[Val] = match &expressions[0] {
+            Val::List(parameters) => parameters,
+            Val::Nil => &[],
+            _ => {
+                return Err(vec![
+                    self.error("E-LISP-007", "lambda parameters must be a list")
+                ]);
+            }
         };
         let parameters = parameters
             .iter()
@@ -800,7 +1177,28 @@ impl Compiler<'_> {
         apply_signature_types(&signature, &mut builder.stack, &origin)
             .map_err(|diagnostic| vec![diagnostic])?;
         builder.effects = builder.effects.union(&signature.effects);
-        let instruction = if signature.effects.0.len() == 1 {
+        if word == "yield" {
+            // Lisp expressions always produce a value. The underlying
+            // control instruction has no stack effect, so expose it as unit
+            // while keeping Co-Forth's `yield` stack-neutral.
+            builder.emit(Instruction::Yield, origin.clone());
+            builder.emit(
+                Instruction::Constant {
+                    value: TypedValue::Unit,
+                },
+                origin,
+            );
+            return Ok(Type::Unit);
+        }
+        let instruction = if word == "output-open" {
+            Instruction::OutputOpen
+        } else if let Some(operation) = output_operation(word) {
+            Instruction::UiEffect {
+                operation,
+                input: signature.input.values.clone(),
+                output: signature.output.values.clone(),
+            }
+        } else if signature.effects.0.len() == 1 {
             Instruction::CapabilityRequest {
                 requirement: signature.effects.0.iter().next().unwrap().clone(),
                 input: signature.input.values.clone(),
@@ -881,6 +1279,18 @@ impl Compiler<'_> {
             message,
             Some(self.origin("lisp")),
         )
+    }
+}
+
+fn output_operation(word: &str) -> Option<UiOperation> {
+    match word {
+        "output-append" => Some(UiOperation::Append),
+        "output-replace" => Some(UiOperation::Replace),
+        "output-status" => Some(UiOperation::Status),
+        "output-progress" => Some(UiOperation::Progress),
+        "output-complete" => Some(UiOperation::Complete),
+        "output-fail" => Some(UiOperation::Fail),
+        _ => None,
     }
 }
 
@@ -1005,6 +1415,36 @@ mod tests {
     }
 
     #[test]
+    fn binds_lisp_parameters_from_the_shared_stack_in_reverse_pop_order() {
+        let module = compile_lisp(
+            "input.lisp",
+            "(define (subtract (left : int) (right : int)) (- left right))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let function = &module.module.functions["subtract"];
+        assert_eq!(function.signature.input.values, vec![Type::Int, Type::Int]);
+        let instructions = &function.blocks[&function.entry].instructions;
+        assert!(matches!(
+            instructions[0].instruction,
+            Instruction::LocalSet { index: 1 }
+        ));
+        assert!(matches!(
+            instructions[1].instruction,
+            Instruction::LocalSet { index: 0 }
+        ));
+        assert!(matches!(
+            instructions[2].instruction,
+            Instruction::LocalGet { index: 0 }
+        ));
+        assert!(matches!(
+            instructions[3].instruction,
+            Instruction::LocalGet { index: 1 }
+        ));
+    }
+
+    #[test]
     fn verifies_both_if_branches_before_execution() {
         let errors = compile_lisp(
             "input.lisp",
@@ -1044,5 +1484,55 @@ mod tests {
     fn quote_produces_a_typed_symbol_value() {
         assert_eq!(run("(quote bash)").unwrap(), vec![TypedValue::Symbol("bash".into())]);
         assert_eq!(run("'bash").unwrap(), vec![TypedValue::Symbol("bash".into())]);
+    }
+
+    #[test]
+    fn lowers_explicit_cpu_defer_mode_to_the_shared_instruction() {
+        let module = compile_lisp(
+            "input.lisp",
+            "(defer :cpu (lambda () 42))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+
+        let main = &module.module.functions["main"];
+        assert!(main.blocks[&main.entry]
+            .instructions
+            .iter()
+            .any(|operation| matches!(operation.instruction, Instruction::DeferCpu)));
+    }
+
+    #[test]
+    fn named_break_and_continue_lower_to_typed_loop_edges() {
+        assert_eq!(
+            run("(while :label outer true (break outer))").unwrap(),
+            vec![TypedValue::Unit]
+        );
+        let module = compile_lisp(
+            "continue.lisp",
+            "(while :label outer false (continue outer))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        assert!(module.module.functions["main"].blocks.values().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|located| matches!(located.instruction, Instruction::Jump { .. }))
+        }));
+    }
+
+    #[test]
+    fn named_lisp_loop_exits_require_an_active_label() {
+        let errors = compile_lisp(
+            "missing.lisp",
+            "(while :label outer true (break absent))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("break must name an active loop");
+        assert_eq!(errors[0].code, "E-LISP-012");
     }
 }

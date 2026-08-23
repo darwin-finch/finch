@@ -33,13 +33,21 @@ pub enum ConfirmationResult {
 #[allow(dead_code)]
 pub enum ReplEvent {
     /// User submitted input (query or command)
-    UserInput { input: String },
+    UserInput {
+        input: String,
+    },
 
     /// A query completed successfully with a response
-    QueryComplete { query_id: Uuid, response: String },
+    QueryComplete {
+        query_id: Uuid,
+        response: String,
+    },
 
     /// A query failed with an error
-    QueryFailed { query_id: Uuid, error: String },
+    QueryFailed {
+        query_id: Uuid,
+        error: String,
+    },
 
     /// A tool execution completed
     ToolResult {
@@ -56,7 +64,9 @@ pub enum ReplEvent {
     },
 
     /// Output is ready to display
-    OutputReady { message: String },
+    OutputReady {
+        message: String,
+    },
 
     /// Streaming response completed (used for non-streaming path)
     StreamingComplete {
@@ -116,10 +126,14 @@ pub enum ReplEvent {
     },
 
     /// Co-Forth poset execution finished.
-    PosetComplete { result: Result<String> },
+    PosetComplete {
+        result: Result<String>,
+    },
 
     /// Lisp evaluation finished (spawned by handle_user_input when input starts with `(`).
-    LispResult { result: Result<String> },
+    LispResult {
+        result: Result<String>,
+    },
 
     /// mDNS background boot scan found finch instances on the LAN.
     /// The event loop adds them to the Forth VM's peer list and shows a notice.
@@ -145,9 +159,6 @@ pub enum ReplEvent {
         error: String,
     },
 
-    /// Translations of a phrase arrived — update the corner ticker.
-    /// Each item is `(language_name, translated_text)`.
-    Translations { items: Vec<(String, String)> },
 }
 
 /// Requests sent from the TUI event loop to the LLM worker loop.
@@ -155,7 +166,11 @@ pub enum ReplEvent {
 pub enum LlmRequest {
     /// Dispatch an LLM turn.  `text = ""` for tool-continuation turns.
     /// `no_tools` suppresses tool definitions (used for conversational word-push responses).
-    Query { id: Uuid, text: String, no_tools: bool },
+    Query {
+        id: Uuid,
+        text: String,
+        no_tools: bool,
+    },
 }
 
 #[cfg(test)]

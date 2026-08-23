@@ -53,6 +53,25 @@ pub use autocomplete_widget::AutocompleteState;
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::visible_length;
+
+/// Best-effort terminal restoration for an exit path that cannot acquire the
+/// renderer lock.  This is intentionally independent of [`TuiRenderer`]:
+/// `/quit` and the IPC quit watcher may call `process::exit`, which skips Drop,
+/// while a render task is holding the renderer mutex.  In that case raw mode
+/// alone is insufficient — bracketed paste and kitty keyboard enhancement
+/// remain enabled and their escape sequences leak into the user's shell.
+pub fn emergency_restore_terminal() {
+    let mut stdout = io::stdout();
+    let _ = execute!(
+        stdout,
+        crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::event::DisableBracketedPaste,
+        cursor::Show,
+        ResetColor,
+    );
+    let _ = stdout.lock().flush();
+    let _ = disable_raw_mode();
+}
 pub use tabbed_dialog::{TabbedDialog, TabbedDialogResult};
 pub use tabbed_dialog_widget::TabbedDialogWidget;
 // Re-export ColorScheme so callers can use `crate::cli::tui::ColorScheme`.
@@ -551,10 +570,7 @@ impl TuiRenderer {
 
         // Panic hook: restore terminal state so the shell is usable after a crash.
         std::panic::set_hook(Box::new(|info| {
-            let _ = execute!(
-                io::stdout(),
-                crossterm::event::PopKeyboardEnhancementFlags
-            );
+            let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
             let _ = crossterm::terminal::disable_raw_mode();
             eprintln!("{info}");
         }));
@@ -757,7 +773,21 @@ impl TuiRenderer {
         if self.cursor_row_from_top > 0 {
             execute!(stdout, cursor::MoveUp(self.cursor_row_from_top as u16))?;
         }
-        execute!(stdout, Clear(ClearType::FromCursorDown))?;
+        // Never clear from the cursor to the bottom of the terminal here. A
+        // one-row accounting error (especially around a wrapping streamed
+        // program) would then erase committed scrollback above the live area.
+        // Clear only the rows this renderer previously owned. If accounting is
+        // ever short, a stale live row is recoverable; lost transcript is not.
+        for row in 0..self.active_rows {
+            execute!(stdout, Clear(ClearType::CurrentLine))?;
+            if row + 1 < self.active_rows {
+                execute!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
+            }
+        }
+        if self.active_rows > 1 {
+            execute!(stdout, cursor::MoveUp((self.active_rows - 1) as u16))?;
+            execute!(stdout, cursor::MoveToColumn(0))?;
+        }
         self.active_rows = 0;
         self.cursor_row_from_top = 0;
         Ok(())
@@ -775,10 +805,16 @@ impl TuiRenderer {
         let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
         let max_live_lines = (term_h / 3).max(5);
-        let live_msg = self.find_live_message();
-        if let Some(msg) = &live_msg {
-            let formatted = msg.format(&self.colors);
-            let all_lines: Vec<&str> = formatted.split('\n').collect();
+        let live_messages = self.find_live_messages();
+        if !live_messages.is_empty() {
+            // A Brain can have more than one live work unit (for example a
+            // streamed VM program alongside a child task or output handle).
+            // Rendering only the newest one made earlier source appear, then
+            // vanish on the next redraw. Keep the uncommitted suffix ordered.
+            let mut all_lines = Vec::new();
+            for message in live_messages {
+                all_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
+            }
             let start = all_lines.len().saturating_sub(max_live_lines);
             for line in &all_lines[start..] {
                 let line = line.trim_end_matches('\r');
@@ -836,15 +872,21 @@ impl TuiRenderer {
                 .map(|name| format!(" · {name}"))
                 .unwrap_or_default();
             let prefix_width = indent.chars().count() + 2;
-            let available = term_width.saturating_sub(prefix_width + model.chars().count() + tool.chars().count() + 3);
+            let available = term_width
+                .saturating_sub(prefix_width + model.chars().count() + tool.chars().count() + 3);
             let task_text = task.task.chars().take(available).collect::<String>();
             execute!(
                 stdout,
-                SetForegroundColor(if matches!(task.status, crate::runtime::scheduler::AgentTaskStatus::Running) {
-                    Color::Cyan
-                } else {
-                    Color::DarkGrey
-                }),
+                SetForegroundColor(
+                    if matches!(
+                        task.status,
+                        crate::runtime::scheduler::AgentTaskStatus::Running
+                    ) {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGrey
+                    }
+                ),
                 Print(&indent),
                 Print(symbol),
                 ResetColor,
@@ -891,6 +933,10 @@ impl TuiRenderer {
         // ── 3. Dialog or input ────────────────────────────────────────────────
         let cursor_row_from_top;
         if let Some(dialog) = &self.active_dialog {
+            // A dialog has no editable text cursor. Leaving the terminal cursor
+            // visible after its final `\r\n` produces a stray black cursor cell
+            // on the row below the modal on dark terminals.
+            execute!(stdout, cursor::Hide)?;
             let dialog_rows = Self::draw_dialog_inline_static(&mut stdout, dialog)?;
             rows += dialog_rows;
             // Dialog drawing ends each line with \r\n, so the cursor is one row
@@ -902,6 +948,7 @@ impl TuiRenderer {
             // cascading duplicate dialog boxes the user sees.
             cursor_row_from_top = rows;
         } else {
+            execute!(stdout, cursor::Show)?;
             // ── 4. Input area ─────────────────────────────────────────────────
             let (cursor_row, cursor_col) = self.input_textarea.cursor();
             let lines = self.input_textarea.lines().to_vec();
@@ -1062,14 +1109,14 @@ impl TuiRenderer {
         Ok(())
     }
 
-    /// Return the most recent InProgress message for the live area.
-    fn find_live_message(&self) -> Option<MessageRef> {
+    /// Return all uncommitted live messages in transcript order.
+    fn find_live_messages(&self) -> Vec<MessageRef> {
         self.output_manager
             .get_messages()
             .into_iter()
             .filter(|m| !self.printed_ids.contains(&m.id()))
-            .rev()
-            .find(|m| matches!(m.status(), MessageStatus::InProgress))
+            .filter(|m| matches!(m.status(), MessageStatus::InProgress))
+            .collect()
     }
 }
 
@@ -1081,6 +1128,21 @@ fn should_redraw_live_area(has_in_progress: bool, dirty: bool) -> bool {
     has_in_progress || dirty
 }
 
+/// A message may enter the buffer after an earlier WorkUnit has started but
+/// before it completes (for example, a user turn queued behind a provider
+/// turn).  Permanent scrollback must commit only the completed prefix; printing
+/// a later message above the live area reverses the visible event order.
+fn committable_prefix_len(statuses: impl IntoIterator<Item = MessageStatus>) -> usize {
+    let mut count = 0;
+    for status in statuses {
+        match status {
+            MessageStatus::Complete | MessageStatus::Failed => count += 1,
+            MessageStatus::InProgress => break,
+        }
+    }
+    count
+}
+
 // ─── flush_output_safe / render ───────────────────────────────────────────────
 
 impl TuiRenderer {
@@ -1089,18 +1151,22 @@ impl TuiRenderer {
     pub fn flush_output_safe(&mut self, _output_manager: &OutputManager) -> Result<()> {
         let messages = self.output_manager.get_messages();
 
+        let unprinted: Vec<MessageRef> = messages
+            .iter()
+            .filter(|msg| !self.printed_ids.contains(&msg.id()))
+            .cloned()
+            .collect();
+        let committable = committable_prefix_len(unprinted.iter().map(|msg| msg.status()));
+
         let mut to_commit: Vec<MessageRef> = Vec::new();
-        for msg in &messages {
+        for msg in unprinted.into_iter().take(committable) {
             let id = msg.id();
-            if self.printed_ids.contains(&id) {
-                continue;
-            }
             match msg.status() {
                 MessageStatus::Complete | MessageStatus::Failed => {
-                    to_commit.push(msg.clone());
+                    to_commit.push(msg);
                     self.printed_ids.insert(id);
                 }
-                MessageStatus::InProgress => {}
+                MessageStatus::InProgress => unreachable!("committable prefix excludes live messages"),
             }
         }
 
@@ -1265,81 +1331,8 @@ impl TuiRenderer {
             Print("\r\n"),
         )?;
 
-        // Dump all proofs on boot — shower them with it.
-        let (passed, total, proof_output) = crate::coforth::Library::prove_all();
-        if total > 0 {
-            use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
-            // Print each proof line.
-            for line in proof_output.lines() {
-                execute!(io::stdout(), Print(line), Print("\r\n"))?;
-            }
-            // Summary line.
-            execute!(
-                io::stdout(),
-                Print("  "),
-                SetForegroundColor(if passed == total {
-                    Color::Green
-                } else {
-                    Color::Red
-                }),
-                Print(format!("{}/{} ✓", passed, total)),
-                ResetColor,
-                Print("  co-forth proofs\r\n"),
-            )?;
-        }
-
-        // Suggestion line — one compact row of things to try.
-        print_suggestions()?;
-
         self.draw_live_area()
     }
-}
-
-/// Print a one-line hint row showing things worth trying.
-fn print_suggestions() -> std::io::Result<()> {
-    use crossterm::{
-        execute,
-        style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
-    };
-    use std::io;
-
-    // Pairs of (word, hint-colour).  The word is shown dim/grey; separator is dark-grey.
-    let items: &[(&str, Color)] = &[
-        ("2 3 +", Color::Cyan),
-        ("你好", Color::Yellow),
-        ("道", Color::Yellow),
-        ("words", Color::Cyan),
-        ("registry-list", Color::Cyan),
-        ("slowest", Color::Cyan),
-    ];
-
-    execute!(
-        io::stdout(),
-        Print("  "),
-        SetForegroundColor(Color::DarkGrey),
-        Print("try:  "),
-        ResetColor
-    )?;
-    for (i, (word, colour)) in items.iter().enumerate() {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(*colour),
-            SetAttribute(Attribute::Dim),
-            Print(word),
-            SetAttribute(Attribute::Reset),
-            ResetColor
-        )?;
-        if i + 1 < items.len() {
-            execute!(
-                io::stdout(),
-                SetForegroundColor(Color::DarkGrey),
-                Print("  ·  "),
-                ResetColor
-            )?;
-        }
-    }
-    execute!(io::stdout(), Print("\r\n"))?;
-    Ok(())
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
@@ -1398,10 +1391,7 @@ impl Drop for TuiRenderer {
         // shutdown() sets is_active = false before doing anything, so this is
         // idempotent — if shutdown() already ran, this is a no-op.
         if self.is_active {
-            let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), cursor::Show, ResetColor);
-            let _ = io::stdout().flush();
+            emergency_restore_terminal();
         }
     }
 }
@@ -1522,14 +1512,7 @@ impl TuiRenderer {
 /// This is extracted so it can be unit-tested without a real terminal.
 pub(crate) fn other_row_parts(is_selected: bool) -> (String, &'static str) {
     if is_selected {
-        (
-            format!(
-                "{}{}",
-                SetAttribute(Attribute::Bold),
-                CYAN
-            ),
-            "●",
-        )
+        (format!("{}{}", SetAttribute(Attribute::Bold), CYAN), "●")
     } else {
         (DIM_GRAY.to_string(), "◌")
     }
@@ -1553,16 +1536,64 @@ pub(crate) fn format_custom_input_content(input: &str, cursor: usize) -> String 
     )
 }
 
-/// Render the "Other (custom response)" row inline inside the dialog box.
+/// Print an indented dialog content line (two-space indent, trailing `\r\n`),
+/// optionally styled. Centralizes the borderless line format so every dialog
+/// row is rendered through crossterm rather than hand-written ANSI escapes.
+fn print_dialog_line(
+    out: &mut impl io::Write,
+    text: &str,
+    color: Option<Color>,
+    bold: bool,
+) -> Result<()> {
+    execute!(out, Print("  "))?;
+    if bold {
+        execute!(out, SetAttribute(Attribute::Bold))?;
+    }
+    if let Some(c) = color {
+        execute!(out, SetForegroundColor(c))?;
+    }
+    execute!(out, Print(text))?;
+    if bold || color.is_some() {
+        execute!(out, SetAttribute(Attribute::Reset))?;
+    }
+    execute!(out, Print("\r\n"))?;
+    Ok(())
+}
+
+/// Print a single inline token (a button or Yes/No choice) styled by focus:
+/// bold cyan when active, dim grey when not. Emits no newline.
+fn print_dialog_token(out: &mut impl io::Write, text: &str, active: bool) -> Result<()> {
+    if active {
+        execute!(
+            out,
+            SetAttribute(Attribute::Bold),
+            SetForegroundColor(Color::Cyan),
+            Print(text),
+            SetAttribute(Attribute::Reset),
+        )?;
+    } else {
+        execute!(
+            out,
+            SetForegroundColor(Color::DarkGrey),
+            Print(text),
+            SetAttribute(Attribute::Reset),
+        )?;
+    }
+    Ok(())
+}
+
+/// Render the "Other (custom response)" row inline within the dialog.
 ///
 /// When `is_on_other` is true the row shows an inline cursor with any typed
 /// text so the user can start typing immediately without a mode switch.
 /// When false it renders the normal hollow-marker label.
 ///
+/// Borderless: the row is indented two spaces with no right border or padding.
+///
 /// Returns the number of terminal rows consumed (always 1).
 fn render_other_row_inline(
     out: &mut impl io::Write,
-    inner: usize,
+    _inner: usize,
     is_on_other: bool,
     dialog: &Dialog,
 ) -> Result<usize> {
@@ -1570,78 +1601,62 @@ fn render_other_row_inline(
         // Inline input: "  ● Other: > {before}█{after}"
         let input_text = dialog.custom_input.as_deref().unwrap_or("");
         let cursor = dialog.custom_cursor_pos;
+        // format_custom_input_content carries the reverse-video cursor block.
         let content = format_custom_input_content(input_text, cursor);
-        // Prefix: "  ● Other: " = 11 visible chars
-        let prefix_vis = 11_usize;
-        // Content visible width: "> " (2) + input chars + cursor block (1)
-        let content_vis = 3 + input_text.chars().count();
-        let total_vis = prefix_vis + content_vis;
         execute!(
             out,
-            Print(format!(
-                "│  \x1b[1;36m  \u{25cf} Other: \x1b[0m{}{:<w$}\x1b[0m  │\r\n",
-                content,
-                "",
-                w = inner.saturating_sub(total_vis)
-            ))
+            Print("  "),
+            SetAttribute(Attribute::Bold),
+            SetForegroundColor(Color::Cyan),
+            Print("  \u{25cf} Other: "),
+            SetAttribute(Attribute::Reset),
+            Print(content),
+            Print("\r\n"),
         )?;
     } else {
-        let (on, marker) = other_row_parts(false);
+        // marker glyph comes from other_row_parts (tested); color via crossterm.
+        let (_, marker) = other_row_parts(false);
         let other_label = format!("  {} Other (custom response)", marker);
-        execute!(
-            out,
-            Print(format!(
-                "│  {}{:<w$}{}  │\r\n",
-                on,
-                other_label,
-                RESET,
-                w = inner
-            ))
-        )?;
+        print_dialog_line(out, &other_label, Some(Color::DarkGrey), false)?;
     }
     Ok(1)
 }
 
 impl TuiRenderer {
-    /// Draw a `Dialog` inline using crossterm box-drawing characters.
+    /// Draw a `Dialog` inline, borderless and spanning the full terminal width.
+    ///
+    /// Sections are separated by a full-width horizontal rule; content lines are
+    /// indented two spaces with no left/right border and no right padding, so the
+    /// dialog fills the available width instead of sitting inside a capped box.
     /// Returns the number of terminal rows consumed.
-    /// `box_width` is the total width including borders (max 72 recommended).
+    /// `box_width` is the total width the dialog spans (normally the terminal width).
     pub(crate) fn draw_dialog_inline_static_with_width(
         out: &mut impl io::Write,
         dialog: &Dialog,
         box_width: usize,
     ) -> Result<usize> {
-        let inner = box_width.saturating_sub(6); // │ + 2 spaces on each side + │ = 6
+        // Wrap width inside the 2-space left indent (no right border to reserve for).
+        let inner = box_width.saturating_sub(2).max(1);
 
         let mut rows = 0;
 
-        let top = format!("┌{}┐", "─".repeat(box_width - 2));
-        let div = format!("├{}┤", "─".repeat(box_width - 2));
-        let bot = format!("└{}┘", "─".repeat(box_width - 2));
+        // Full-width horizontal rule used to separate sections.
+        let rule = "─".repeat(box_width);
 
-        // Top border
-        execute!(out, Print(format!("{}\r\n", top)))?;
+        // Top rule
+        execute!(out, Print(&rule), Print("\r\n"))?;
         rows += 1;
 
         // Title
         for line in wrap_text(&dialog.title, inner) {
-            execute!(out, Print(format!("│  {:<w$}  │\r\n", line, w = inner)))?;
+            print_dialog_line(out, &line, None, false)?;
             rows += 1;
         }
 
         // Help message (from dialog field) — wrapped to avoid overflow
         if let Some(ref help) = dialog.help_message {
             for line in wrap_text(help, inner) {
-                execute!(
-                    out,
-                    Print(format!(
-                        "│  {}{:<w$}{}  │\r\n",
-                        DIM_GRAY,
-                        line,
-                        RESET,
-                        w = inner
-                    ))
-                )?;
+                print_dialog_line(out, &line, Some(Color::DarkGrey), false)?;
                 rows += 1;
             }
         }
@@ -1649,10 +1664,10 @@ impl TuiRenderer {
         // Body text (optional, shown above the options divider) with scroll support
         if let Some(ref body) = dialog.body {
             let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
-            // Reserve ~12 rows for title, help, both dividers, options, and bottom border.
+            // Reserve ~12 rows for title, help, both dividers, options, and the button row.
             let max_body_rows = term_h.saturating_sub(12).clamp(3, 15);
 
-            execute!(out, Print(format!("{}\r\n", div)))?;
+            execute!(out, Print(&rule), Print("\r\n"))?;
             rows += 1;
 
             // Collect all wrapped lines.
@@ -1670,11 +1685,7 @@ impl TuiRenderer {
             if total_lines <= max_body_rows {
                 // All lines fit — show them all without a scroll indicator.
                 for line in &all_body_lines {
-                    let pad = " ".repeat(inner.saturating_sub(line.chars().count()));
-                    execute!(
-                        out,
-                        Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, line, pad, RESET))
-                    )?;
+                    print_dialog_line(out, line, Some(Color::DarkGrey), false)?;
                     rows += 1;
                 }
             } else {
@@ -1684,11 +1695,7 @@ impl TuiRenderer {
                 let offset = dialog.body_scroll_offset.min(max_offset);
 
                 for line in &all_body_lines[offset..total_lines.min(offset + content_rows)] {
-                    let pad = " ".repeat(inner.saturating_sub(line.chars().count()));
-                    execute!(
-                        out,
-                        Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, line, pad, RESET))
-                    )?;
+                    print_dialog_line(out, line, Some(Color::DarkGrey), false)?;
                     rows += 1;
                 }
 
@@ -1697,25 +1704,21 @@ impl TuiRenderer {
                 let below = total_lines.saturating_sub(offset + content_rows);
                 let indicator = match (above > 0, below > 0) {
                     (true, true) => {
-                        format!("↑ {} above · ↓ {} below  (PgUp/PgDn)", above, below)
+                        format!("↑ {} above · ↓ {} below  (Ctrl-U/D or PgUp/PgDn)", above, below)
                     }
-                    (true, false) => format!("↑ {} lines above  (PgUp)", above),
-                    (false, true) => format!("↓ {} lines below  (PgDn)", below),
+                    (true, false) => format!("↑ {} lines above  (Ctrl-U or PgUp)", above),
+                    (false, true) => format!("↓ {} lines below  (Ctrl-D or PgDn)", below),
                     (false, false) => String::new(),
                 };
                 if !indicator.is_empty() {
                     let short: String = indicator.chars().take(inner).collect();
-                    let pad = " ".repeat(inner.saturating_sub(short.chars().count()));
-                    execute!(
-                        out,
-                        Print(format!("│  {}{}{}{}  │\r\n", DIM_GRAY, short, pad, RESET))
-                    )?;
+                    print_dialog_line(out, &short, Some(Color::DarkGrey), false)?;
                     rows += 1;
                 }
             }
         }
 
-        execute!(out, Print(format!("{}\r\n", div)))?;
+        execute!(out, Print(&rule), Print("\r\n"))?;
         rows += 1;
 
         // Options — always render the full option list inline.
@@ -1727,18 +1730,11 @@ impl TuiRenderer {
                 allow_custom,
             } => {
                 for (i, opt) in options.iter().enumerate() {
-                    let marker = if i == *selected_index { "●" } else { "○" };
-                    let on = if i == *selected_index {
-                        "\x1b[1;36m"
-                    } else {
-                        ""
-                    };
-                    let off = if i == *selected_index { RESET } else { "" };
+                    let selected = i == *selected_index;
+                    let marker = if selected { "●" } else { "○" };
                     let label = format!("  {} {}", marker, opt.label);
-                    execute!(
-                        out,
-                        Print(format!("│  {}{:<w$}{}  │\r\n", on, label, off, w = inner))
-                    )?;
+                    let color = if selected { Some(Color::Cyan) } else { None };
+                    print_dialog_line(out, &label, color, selected)?;
                     rows += 1;
                 }
                 if *allow_custom {
@@ -1758,13 +1754,10 @@ impl TuiRenderer {
                     } else {
                         "☐"
                     };
-                    let on = if i == *cursor_index { "\x1b[1;36m" } else { "" };
-                    let off = if i == *cursor_index { RESET } else { "" };
+                    let focused = i == *cursor_index;
                     let label = format!("  {} {}", checked, opt.label);
-                    execute!(
-                        out,
-                        Print(format!("│  {}{:<w$}{}  │\r\n", on, label, off, w = inner))
-                    )?;
+                    let color = if focused { Some(Color::Cyan) } else { None };
+                    print_dialog_line(out, &label, color, focused)?;
                     rows += 1;
                 }
                 if *allow_custom {
@@ -1775,46 +1768,31 @@ impl TuiRenderer {
             DialogType::Confirm {
                 prompt, selected, ..
             } => {
-                // Prompt may be multi-line — wrap each line inside the box borders.
+                // Prompt may be multi-line.
                 for line in wrap_text(prompt, inner) {
-                    execute!(out, Print(format!("│  {:<w$}  │\r\n", line, w = inner)))?;
+                    print_dialog_line(out, &line, None, false)?;
                     rows += 1;
                 }
-                let yes_style = if *selected { "\x1b[1;36m" } else { DIM_GRAY };
-                let no_style = if !selected { "\x1b[1;36m" } else { DIM_GRAY };
-                execute!(
-                    out,
-                    Print(format!(
-                        "│  {}Yes{}   {}No{}  {:<w$}  │\r\n",
-                        yes_style,
-                        RESET,
-                        no_style,
-                        RESET,
-                        "",
-                        w = inner.saturating_sub(10)
-                    ))
-                )?;
+                execute!(out, Print("  "))?;
+                print_dialog_token(out, "Yes", *selected)?;
+                execute!(out, Print("   "))?;
+                print_dialog_token(out, "No", !*selected)?;
+                execute!(out, Print("\r\n"))?;
                 rows += 1;
             }
             DialogType::TextInput { prompt, input, .. } => {
                 if !prompt.is_empty() {
-                    execute!(out, Print(format!("│  {:<w$}  │\r\n", prompt, w = inner)))?;
+                    print_dialog_line(out, prompt, None, false)?;
                     rows += 1;
                 }
-                execute!(
-                    out,
-                    Print(format!(
-                        "│  > {:<w$}  │\r\n",
-                        input,
-                        w = inner.saturating_sub(2)
-                    ))
-                )?;
+                let line = format!("> {}", input);
+                print_dialog_line(out, &line, None, false)?;
                 rows += 1;
             }
         }
 
         // ── Preview pane ─────────────────────────────────────────────────────
-        // If the focused option has a `markdown` field, render it in a bordered
+        // If the focused option has a `markdown` field, render it in a labeled
         // preview section between the options and the Submit/Cancel row.
         let focused_markdown: Option<&str> = match &dialog.dialog_type {
             DialogType::Select {
@@ -1857,42 +1835,35 @@ impl TuiRenderer {
                 .collect();
             let truncated = content_lines.len() > max_preview_lines;
 
-            let preview_div = format!("├─ Preview {}", "─".repeat(box_width.saturating_sub(12)));
-            execute!(out, Print(format!("{}\r\n", preview_div)))?;
+            // Labeled full-width rule: "─ Preview ─────…"
+            let label = "─ Preview ";
+            let pad = box_width.saturating_sub(label.chars().count());
+            let preview_div = format!("{}{}", label, "─".repeat(pad));
+            execute!(out, Print(&preview_div), Print("\r\n"))?;
             rows += 1;
 
             for line in &display_lines {
                 // Truncate to inner width using visible_length to handle ANSI codes
                 let vlen = shadow_buffer::visible_length(line);
-                let display = if vlen <= inner {
-                    format!("│  {:<w$}  │\r\n", line, w = inner)
+                if vlen <= inner {
+                    print_dialog_line(out, line, None, false)?;
                 } else {
                     // Truncate by chars (ANSI codes make byte slicing unsafe)
                     let truncated_line: String =
                         line.chars().take(inner.saturating_sub(1)).collect();
-                    format!("│  {}…  │\r\n", truncated_line)
-                };
-                execute!(out, Print(display))?;
+                    print_dialog_line(out, &format!("{}…", truncated_line), None, false)?;
+                }
                 rows += 1;
             }
 
             if truncated {
-                execute!(
-                    out,
-                    Print(format!(
-                        "│  {}{:<w$}{}  │\r\n",
-                        DIM_GRAY,
-                        "…",
-                        RESET,
-                        w = inner
-                    ))
-                )?;
+                print_dialog_line(out, "…", Some(Color::DarkGrey), false)?;
                 rows += 1;
             }
         }
         // ── End preview pane ─────────────────────────────────────────────────
 
-        execute!(out, Print(format!("{}\r\n", div)))?;
+        execute!(out, Print(&rule), Print("\r\n"))?;
         rows += 1;
 
         // ── Submit / Cancel buttons ───────────────────────────────────────────
@@ -1903,81 +1874,43 @@ impl TuiRenderer {
 
         if is_multiselect {
             // MultiSelect: [ Submit ]   [ Cancel ]
-            let submit_on = if cursor == submit_idx {
-                "\x1b[1;36m"
-            } else {
-                DIM_GRAY
-            };
-            let cancel_on = if cursor == cancel_idx {
-                "\x1b[1;36m"
-            } else {
-                DIM_GRAY
-            };
-            let btn_row = format!(
-                "  {}[ Submit ]{}   {}[ Cancel ]{}",
-                submit_on, RESET, cancel_on, RESET
-            );
-            // visible width: "  [ Submit ]   [ Cancel ]" = 25 chars
-            let btn_vis = 25_usize;
-            execute!(
-                out,
-                Print(format!(
-                    "│  {}{}  │\r\n",
-                    btn_row,
-                    " ".repeat(inner.saturating_sub(btn_vis))
-                ))
-            )?;
+            execute!(out, Print("  "))?;
+            print_dialog_token(out, "[ Submit ]", cursor == submit_idx)?;
+            execute!(out, Print("   "))?;
+            print_dialog_token(out, "[ Cancel ]", cursor == cancel_idx)?;
+            execute!(out, Print("\r\n"))?;
         } else if matches!(&dialog.dialog_type, DialogType::Select { .. }) {
             // Select: [ Cancel ]  (no Submit — Enter on an option submits directly)
-            let cancel_on = if cursor == cancel_idx {
-                "\x1b[1;36m"
-            } else {
-                DIM_GRAY
-            };
-            let btn_row = format!("  {}[ Cancel ]{}", cancel_on, RESET);
-            let btn_vis = 12_usize; // "  [ Cancel ]" = 12 chars
             let hint = if dialog.custom_mode_active {
                 "  Enter↵ submit · Esc clear"
             } else {
                 "  ↑↓ nav · Enter select · Esc cancel"
             };
-            let hint_vis = hint.chars().count();
-            let padding = " ".repeat(inner.saturating_sub(btn_vis + hint_vis));
+            execute!(out, Print("  "))?;
+            print_dialog_token(out, "[ Cancel ]", cursor == cancel_idx)?;
             execute!(
                 out,
-                Print(format!(
-                    "│  {}{}{}{}{}  │\r\n",
-                    btn_row, DIM_GRAY, hint, RESET, padding,
-                ))
+                SetForegroundColor(Color::DarkGrey),
+                Print(hint),
+                SetAttribute(Attribute::Reset),
+                Print("\r\n"),
             )?;
         } else {
             // Confirm / TextInput: just a keybinding hint
             let help = "↑/↓ Navigate  Enter Select  Esc Cancel";
-            execute!(
-                out,
-                Print(format!(
-                    "│  {}{:<w$}{}  │\r\n",
-                    DIM_GRAY,
-                    help,
-                    RESET,
-                    w = inner
-                ))
-            )?;
+            print_dialog_line(out, help, Some(Color::DarkGrey), false)?;
         }
-        execute!(out, Print(format!("{}\r\n", bot)))?;
-        rows += 2; // buttons row + bot border
+        execute!(out, Print(&rule), Print("\r\n"))?;
+        rows += 2; // buttons row + bottom rule
 
         Ok(rows)
     }
 
     fn draw_dialog_inline_static(out: &mut impl io::Write, dialog: &Dialog) -> Result<usize> {
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        // Leave at least 2 columns of breathing room on the right so the box
-        // border never touches the terminal edge (which causes auto-wrap artifacts
-        // on some terminals that emit an extra blank line when the cursor lands in
-        // the last column).  Also cap at 120 so very wide terminals don't produce
-        // comically wide dialogs.
-        let box_width = term_width.saturating_sub(2).min(120).max(72);
+        // Borderless dialogs span the full terminal width. Keep a sane floor for
+        // very narrow terminals so wrapping still has room to work.
+        let box_width = term_width.max(20);
         Self::draw_dialog_inline_static_with_width(out, dialog, box_width)
     }
 
@@ -2012,7 +1945,7 @@ impl TuiRenderer {
                         // input task is starved and can never deliver InputEvent::Submitted("/quit").
                         // This is the only reliable escape hatch when a blocking dialog is open.
                         (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                            let _ = crossterm::terminal::disable_raw_mode();
+                            emergency_restore_terminal();
                             std::process::exit(0);
                         }
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -2085,7 +2018,7 @@ impl TuiRenderer {
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL)
                     {
-                        let _ = crossterm::terminal::disable_raw_mode();
+                        emergency_restore_terminal();
                         std::process::exit(0);
                     }
                     if let Some(r) = dialog.handle_key_event(key) {
@@ -2124,8 +2057,7 @@ impl TuiRenderer {
         // grid_rows: Some(rows) for tabular files, None for text.
         let grid_rows: Option<Vec<Vec<String>>> = match ext.as_str() {
             "csv" => {
-                let raw = std::fs::read_to_string(path)
-                    .unwrap_or_else(|e| format!("error: {e}"));
+                let raw = std::fs::read_to_string(path).unwrap_or_else(|e| format!("error: {e}"));
                 let mut rows = Vec::new();
                 for line in raw.lines() {
                     let cols: Vec<String> = line
@@ -2137,8 +2069,7 @@ impl TuiRenderer {
                 Some(rows)
             }
             "tsv" => {
-                let raw = std::fs::read_to_string(path)
-                    .unwrap_or_else(|e| format!("error: {e}"));
+                let raw = std::fs::read_to_string(path).unwrap_or_else(|e| format!("error: {e}"));
                 let mut rows = Vec::new();
                 for line in raw.lines() {
                     let cols: Vec<String> = line.split('\t').map(|c| c.to_string()).collect();
@@ -2229,13 +2160,12 @@ impl TuiRenderer {
                         })
                         .collect();
 
-                    let table = Table::new(table_rows, constraints)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(border_style)
-                                .title(title),
-                        );
+                    let table = Table::new(table_rows, constraints).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(border_style)
+                            .title(title),
+                    );
                     frame.render_widget(table, chunks[0]);
                 } else {
                     // Text viewer.
@@ -2278,10 +2208,8 @@ impl TuiRenderer {
                     use crossterm::event::{KeyCode, KeyModifiers};
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('d')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            let _ = crossterm::terminal::disable_raw_mode();
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            emergency_restore_terminal();
                             std::process::exit(0);
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
@@ -2455,6 +2383,22 @@ mod tests {
     #[test]
     fn test_redraw_predicate_triggers_when_in_progress() {
         assert!(should_redraw_live_area(true, false));
+    }
+
+    #[test]
+    fn completed_messages_after_a_live_work_unit_wait_for_ordered_commit() {
+        assert_eq!(
+            committable_prefix_len([
+                MessageStatus::Complete,
+                MessageStatus::InProgress,
+                MessageStatus::Complete,
+            ]),
+            1
+        );
+        assert_eq!(
+            committable_prefix_len([MessageStatus::Complete, MessageStatus::Failed]),
+            2
+        );
     }
 
     #[test]
@@ -2759,7 +2703,8 @@ mod tests {
     fn other_row_unselected_uses_dim_gray_and_hollow_marker() {
         let (ansi, marker) = other_row_parts(false);
         assert_eq!(
-            ansi, DIM_GRAY.to_string(),
+            ansi,
+            DIM_GRAY.to_string(),
             "unselected Other row must use DIM_GRAY, got: {:?}",
             ansi
         );
@@ -2783,7 +2728,8 @@ mod tests {
         // Regression: the bug was using DIM_GRAY even when selected.
         let (ansi, _) = other_row_parts(true);
         assert_ne!(
-            ansi, DIM_GRAY.to_string(),
+            ansi,
+            DIM_GRAY.to_string(),
             "selected Other row must NOT use DIM_GRAY (regression guard)"
         );
     }
@@ -2818,11 +2764,11 @@ mod tests {
 
     #[test]
     fn custom_input_content_has_block_cursor() {
-        // Cursor is represented as reverse-video space: \x1b[7m \x1b[m
+        // Crossterm renders the reverse-video cursor as \x1b[7m \x1b[0m.
         let s = format_custom_input_content("ab", 1);
         assert!(
-            s.contains("\x1b[7m \x1b[m"),
-            "cursor block (\\x1b[7m \\x1b[m) must appear in formatted content, got: {:?}",
+            s.contains("\x1b[7m \x1b[0m"),
+            "cursor block (\\x1b[7m \\x1b[0m) must appear in formatted content, got: {:?}",
             s
         );
     }
@@ -2831,8 +2777,8 @@ mod tests {
     fn custom_input_content_cursor_at_start_puts_all_text_after_cursor() {
         let s = format_custom_input_content("abc", 0);
         // before = "", after = "abc"; expect "> █abc"
-        let idx = s.find("\x1b[7m \x1b[m").expect("cursor not found");
-        let after_cursor = &s[idx + "\x1b[7m \x1b[m".len()..];
+        let idx = s.find("\x1b[7m \x1b[0m").expect("cursor not found");
+        let after_cursor = &s[idx + "\x1b[7m \x1b[0m".len()..];
         assert_eq!(
             after_cursor, "abc",
             "text after cursor must be 'abc', got: {:?}",
@@ -2957,7 +2903,7 @@ mod tests {
     // ── other_row_content_visible_width regression tests ──────────────────────
     // Regression: render_other_row_inline used `2 + input_text.chars().count()`
     // for the content visible width, which omitted the cursor block character
-    // (one visible cell rendered by `\x1b[7m \x1b[m`).  The fix is `3 + count`.
+    // (one visible cell rendered by `\x1b[7m \x1b[0m`). The fix is `3 + count`.
     //
     // These tests verify the invariant by measuring the actual visible length of
     // the string returned by format_custom_input_content() and asserting it
@@ -3367,7 +3313,8 @@ mod draw_dialog_tests {
             .collect()
     }
 
-    /// Expected visual width of each content line: box_width chars.
+    /// Borderless invariant: no line exceeds `box_width`, and no line carries a
+    /// vertical box-border character (the dialog is full-width and borderless).
     fn check_widths(lines: &[String], box_width: usize) {
         for (i, line) in lines.iter().enumerate() {
             if line.is_empty() {
@@ -3375,17 +3322,59 @@ mod draw_dialog_tests {
             }
             let visible: String = strip_ansi(line);
             let w = visible.chars().count();
-            assert_eq!(
-                w, box_width,
-                "line {i} has visual width {w}, expected {box_width}:\n  raw:     {:?}\n  visible: {:?}",
+            assert!(
+                w <= box_width,
+                "line {i} has visual width {w}, exceeds box_width {box_width}:\n  raw:     {:?}\n  visible: {:?}",
                 line, visible
+            );
+            assert!(
+                !visible.contains('│') && !visible.contains('┌') && !visible.contains('┐'),
+                "line {i} must not contain a box border char (borderless dialog):\n  visible: {:?}",
+                visible
+            );
+        }
+    }
+
+    #[test]
+    fn test_dialog_is_borderless_and_full_width() {
+        // Regression: dialogs/prompts must span the full terminal width with no
+        // left/right borders. The top and bottom lines are full-width horizontal
+        // rules; no rendered line may contain a vertical border char.
+        let dialog = Dialog::select(
+            "Pick one",
+            vec![DialogOption::new("Alpha"), DialogOption::new("Beta")],
+        );
+        let lines = render_lines(&dialog);
+        assert!(!lines.is_empty());
+
+        // First line is a full-width rule of exactly box_width `─` chars.
+        let first = strip_ansi(&lines[0]);
+        assert_eq!(
+            first.chars().count(),
+            72,
+            "top rule must span the full width (72): {:?}",
+            first
+        );
+        assert!(
+            first.chars().all(|c| c == '─'),
+            "top line must be a pure horizontal rule, got: {:?}",
+            first
+        );
+
+        // No line may contain a vertical border character.
+        for line in &lines {
+            let visible = strip_ansi(line);
+            assert!(
+                !visible.contains('│'),
+                "no line may contain a side border │, got: {:?}",
+                visible
             );
         }
     }
 
     #[test]
     fn test_tool_approval_dialog_line_widths() {
-        let dialog = Dialog::tool_approval("Push", "Execute Push tool");
+        let dialog = Dialog::tool_approval("Read", "Read src/lib.rs");
         let lines = render_lines(&dialog);
         assert!(!lines.is_empty());
         check_widths(&lines, 72);

@@ -145,7 +145,6 @@ impl Persona {
             }
         }
 
-
         prompt
     }
 

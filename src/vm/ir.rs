@@ -2,6 +2,7 @@ use super::diagnostic::SourceOrigin;
 use super::effects::CapabilityRequirement;
 use super::signature::StackSignature;
 use super::types::{Type, TypedValue};
+use super::interpreter::UiOperation;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -96,6 +97,33 @@ pub enum Instruction {
         input: Vec<Type>,
         output: Vec<Type>,
     },
+    /// Allocate a host-owned opaque output handle.  This is an awaited host
+    /// call because only the presentation host may mint the handle.
+    OutputOpen,
+    /// Publish a portable mutation of an explicit output handle.  Unlike
+    /// `say`, this never relies on a process-global active WorkUnit.
+    UiEffect {
+        operation: UiOperation,
+        input: Vec<Type>,
+        output: Vec<Type>,
+    },
+    /// Cooperatively return the implicit VM continuation to the event-loop
+    /// trampoline. This is not a user-visible first-class continuation.
+    Yield,
+    /// Spawn a pure, zero-argument closure on the bounded CPU-fiber pool.
+    /// The closure is popped and the runtime resumes this continuation with a
+    /// typed task handle; it never shares the parent stack or frame.
+    DeferCpu,
+    /// Poll a local CPU-fiber task without blocking. It lowers to a runtime
+    /// scheduler boundary and resumes with `option<T>`.
+    PollCpuFiber,
+    /// Suspend until a local CPU-fiber task has a terminal result. The parent
+    /// continuation is persisted; no UI/event-loop thread blocks.
+    JoinCpuFiber,
+    /// Request cooperative cancellation of a local CPU-fiber task. This
+    /// consumes the handle and resumes with unit; cancellation is observed at
+    /// the worker's next VM boundary rather than forcefully killing a thread.
+    CancelCpuFiber,
     Jump {
         target: BlockId,
     },

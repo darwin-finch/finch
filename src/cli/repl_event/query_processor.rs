@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::claude::ContentBlock;
 use crate::cli::conversation::ConversationHistory;
-use crate::cli::output_manager::OutputManager;
+use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
 use crate::cli::tui::TuiRenderer;
@@ -18,6 +18,67 @@ use crate::generators::{Generator, StreamChunk};
 use crate::models::bootstrap::GeneratorState;
 use crate::router::Router;
 use crate::tools::types::{ToolDefinition, ToolUse};
+
+/// Recover exactly one Markdown-fenced program from a provider response.
+///
+/// The wire protocol remains raw source; the language package tells providers
+/// not to fence it.  This narrow recovery path handles the strongest general
+/// chat-model prior without turning arbitrary prose plus a code sample into an
+/// executable program.  Anything before or after the single fence remains a
+/// malformed wire response.
+fn recover_fenced_wire_program(source: &str) -> String {
+    let trimmed = source.trim();
+    let Some(after_open) = trimmed.strip_prefix("```") else {
+        return trimmed.to_string();
+    };
+    let Some((_, body_and_close)) = after_open.split_once('\n') else {
+        return trimmed.to_string();
+    };
+    let Some(body) = body_and_close.strip_suffix("\n```") else {
+        return trimmed.to_string();
+    };
+    body.trim().to_string()
+}
+
+/// Build the submission for a provider response carried on the VM wire rather
+/// than in a provider-native tool call.  The typed runtime derives authority
+/// from the program itself; `Pure` is only the coarse compatibility label and
+/// does not bypass typed capability checks.
+fn direct_wire_submission(
+    runtime: &crate::runtime::ProgramRuntime,
+    source: String,
+) -> anyhow::Result<crate::runtime::ProgramSubmission> {
+    let language = crate::programs::ProgramLanguage::infer_wire_source(&source)?;
+    Ok(crate::runtime::ProgramSubmission {
+        language,
+        source,
+        intent: "provider VM-wire response".to_string(),
+        effect: crate::programs::ExecutionEffect::Pure,
+        declared_capabilities: Vec::new(),
+        manifest_generation: runtime.manifest_generation(),
+        expected_revision: Some(runtime.revision()),
+        budget: None,
+    })
+}
+
+/// Execute a completed provider text response as Finch source.  This is the
+/// actual wire receiver: raw model text is no longer treated as prose merely
+/// because it did not arrive in a provider-native tool-call envelope.
+async fn execute_direct_wire_response(
+    runtime: &crate::runtime::ProgramRuntime,
+    output_manager: Arc<OutputManager>,
+    work_unit: Arc<crate::cli::messages::WorkUnit>,
+    source: String,
+) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    let submission = direct_wire_submission(runtime, source)?;
+    let projection = VmOutputProjection::new(output_manager, work_unit);
+    let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
+        projection.project(&envelope.effect);
+    });
+    runtime
+        .submit_with_deferred_program_effects(submission, sink)
+        .await
+}
 
 use super::events::ReplEvent;
 use super::query_state::{QueryState, QueryStateManager};
@@ -104,10 +165,7 @@ pub(super) async fn refresh_context_strip(
         _ => format!("finch · {} · {}", session_label, cwd),
     };
     {
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::SetTitle(title)
-        );
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(title));
     }
 }
 
@@ -198,7 +256,7 @@ pub(super) async fn dispatch_tool_uses(
             let error_msg = format!(
                 "Tool '{}' is not allowed in planning mode.\n\
                  Reason: This tool can modify system state.\n\
-                 Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
+                 Available tools: read, glob, grep, web_fetch, TodoRead, TodoWrite, present_plan, ask_user_question\n\
                  Type /approve to execute your plan with all tools enabled.",
                 tool_use.name
             );
@@ -306,6 +364,7 @@ pub(crate) async fn process_query_with_tools(
     conversation: Arc<RwLock<ConversationHistory>>,
     query_states: Arc<QueryStateManager>,
     tool_coordinator: ToolExecutionCoordinator,
+    program_runtime: Arc<crate::runtime::ProgramRuntime>,
     tui_renderer: Arc<tokio::sync::Mutex<TuiRenderer>>,
     mode: Arc<RwLock<ReplMode>>,
     output_manager: Arc<OutputManager>,
@@ -400,14 +459,19 @@ pub(crate) async fn process_query_with_tools(
                     );
                 }
             }
-            // The registry, not model memory, is the source of truth. Refresh a compact
-            // manifest on every fresh turn so model switches and compaction cannot leave
-            // the active model with stale vocabulary assumptions.
-            if !query.is_empty() {
-                if let Ok(manifest) = mem.vm_manifest(&query, 12).await {
-                    inject_vm_manifest(&mut msgs, &manifest);
-                }
-            }
+        }
+        // The bootstrap language contract must be present regardless of
+        // whether MemTree is configured. When it is available, its program
+        // registry enriches the same manifest with relevant vocabulary.
+        if !query.is_empty() {
+            let manifest = match memory_system.as_ref() {
+                Some(memory) => memory
+                    .vm_manifest(&query, 12)
+                    .await
+                    .unwrap_or_else(|_| fallback_vm_manifest()),
+                None => fallback_vm_manifest(),
+            };
+            inject_vm_manifest(&mut msgs, &manifest);
         }
         msgs
     };
@@ -460,6 +524,14 @@ pub(crate) async fn process_query_with_tools(
                             token_count += delta.split_whitespace().count();
                             // WorkUnit accumulates tokens for its own animated display
                             work_unit.add_tokens(&delta);
+                            // The streamed text is VM source, not provisional
+                            // assistant prose. As soon as its language can be
+                            // identified, project the partial program visibly
+                            // instead of hiding it behind the generic spinner.
+                            if !text.trim_start().is_empty() {
+                                let language = crate::programs::ProgramLanguage::infer_source(&text);
+                                work_unit.set_program_source(language.as_str());
+                            }
                             // Keep the shadow-buffer preview live. The program is
                             // still only parsed/executed at the explicit boundary.
                             work_unit.set_response(&text);
@@ -570,83 +642,54 @@ pub(crate) async fn process_query_with_tools(
                     return;
                 }
 
-                // No tools — mark WorkUnit complete so blit shows final response
+                // A text-only provider response is Finch source, not prose.
+                // Preserve the received program as one completed work unit,
+                // then route its `say`/UI events to a distinct output unit.
+                // This keeps agent activity inspectable without making source
+                // and user-visible output compete for the same mutable row.
+                let wire_source = recover_fenced_wire_program(&text);
+                let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
+                work_unit.set_program_source(wire_language.as_str());
+                work_unit.set_response(wire_source.clone());
                 work_unit.set_complete();
-
-                // Add assistant message to conversation
-                tracing::debug!(
-                    "[EVENT_LOOP] No tools found, adding assistant message to conversation"
-                );
-                conversation
-                    .write()
-                    .await
-                    .add_assistant_message(text.clone());
-
-                // Store to memory (fire-and-forget; never blocks the response path)
-                if let Some(ref mem) = memory_system {
-                    let model_name = generator.name().to_string();
-                    // Strip any [Context: ...] annotation appended for the AI — only
-                    // store the raw user text so the context strip stays clean.
-                    let query_for_memory = query
-                        .split_once("\n\n[Context:")
-                        .map(|(raw, _)| raw)
-                        .unwrap_or(&query);
-                    let _ = mem
-                        .insert_conversation(
-                            "user",
-                            query_for_memory,
-                            Some(&model_name),
-                            Some(&session_label),
-                        )
-                        .await;
-                    let _ = mem
-                        .insert_conversation(
-                            "assistant",
-                            &text,
-                            Some(&model_name),
-                            Some(&session_label),
-                        )
-                        .await;
-                    if let Ok(stats) = mem.stats().await {
-                        status_bar.update_line(
-                            crate::cli::status_bar::StatusLineType::MemoryContext,
-                            format!(
-                                "🧠 recalled {}  ·  {} memories",
-                                memory_recall_count, stats.conversation_count
-                            ),
-                        );
+                let output_unit = output_manager.start_work_unit("VM program output");
+                output_unit.set_program_output();
+                let wire_result = execute_direct_wire_response(
+                    program_runtime.as_ref(),
+                    Arc::clone(&output_manager),
+                    Arc::clone(&output_unit),
+                    wire_source.clone(),
+                )
+                .await;
+                let response = match wire_result {
+                    Ok(outcome) => {
+                        if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed {
+                            outcome.output
+                        } else {
+                            let detail = outcome
+                                .diagnostics
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+                            output_unit.append_response(&format!("VM wire error: {detail}"));
+                            detail
+                        }
                     }
-                    refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines)
-                        .await;
-                }
-
-                // Update context usage indicator (suppressed when auto-compact disabled)
-                if auto_compact_enabled {
-                    let conv = conversation.read().await;
-                    let pct = (conv.compaction_percent_remaining() * 100.0) as u8;
-                    status_bar.update_line(
-                        crate::cli::status_bar::StatusLineType::CompactionPercent,
-                        format!("Context left until auto-compact: {}%", pct),
-                    );
-                }
-
-                // Update query state
+                    Err(error) => {
+                        let detail = format!("VM wire error: {error}");
+                        output_unit.append_response(&detail);
+                        detail
+                    }
+                };
+                output_unit.set_complete();
+                conversation.write().await.add_assistant_message(wire_source);
                 query_states
-                    .update_state(
-                        query_id,
-                        QueryState::Completed {
-                            response: text.clone(),
-                        },
-                    )
+                    .update_state(query_id, QueryState::Completed { response: response.clone() })
                     .await;
-
-                // Signal the event loop to clear active_query_id (streaming path never sends this otherwise)
                 let _ = event_tx.send(ReplEvent::StreamingComplete {
                     query_id,
-                    full_response: text.clone(),
+                    full_response: response,
                 });
-
-                tracing::debug!("[EVENT_LOOP] Query complete, returning");
                 return;
             }
             Ok(None) | Err(_) => {
@@ -676,12 +719,6 @@ pub(crate) async fn process_query_with_tools(
                 input_tokens: response.metadata.input_tokens,
                 output_tokens: response.metadata.output_tokens,
                 latency_ms: response.metadata.latency_ms,
-            });
-
-            // Send response (StreamingComplete works for non-streaming too)
-            let _ = event_tx.send(ReplEvent::StreamingComplete {
-                query_id,
-                full_response: response.text.clone(),
             });
 
             // Convert GenToolUse to ToolUse
@@ -739,8 +776,55 @@ pub(crate) async fn process_query_with_tools(
                 return;
             }
 
-            // No tools — mark WorkUnit complete
+            // Non-streaming providers receive the same two-unit projection:
+            // source first, then the independently reactive program output.
+            let wire_source = recover_fenced_wire_program(&response.text);
+            let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
+            work_unit.set_program_source(wire_language.as_str());
+            work_unit.set_response(wire_source.clone());
             work_unit.set_complete();
+            let output_unit = output_manager.start_work_unit("VM program output");
+            output_unit.set_program_output();
+            let wire_result = execute_direct_wire_response(
+                program_runtime.as_ref(),
+                Arc::clone(&output_manager),
+                Arc::clone(&output_unit),
+                wire_source.clone(),
+            )
+            .await;
+            let rendered_response = match wire_result {
+                Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+                    outcome.output
+                }
+                Ok(outcome) => {
+                    let detail = outcome
+                        .diagnostics
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+                    output_unit.append_response(&format!("VM wire error: {detail}"));
+                    detail
+                }
+                Err(error) => {
+                    let detail = format!("VM wire error: {error}");
+                    output_unit.append_response(&detail);
+                    detail
+                }
+            };
+            output_unit.set_complete();
+            conversation.write().await.add_assistant_message(wire_source);
+            query_states
+                .update_state(
+                    query_id,
+                    QueryState::Completed {
+                        response: rendered_response.clone(),
+                    },
+                )
+                .await;
+            let _ = event_tx.send(ReplEvent::StreamingComplete {
+                query_id,
+                full_response: rendered_response,
+            });
             tracing::debug!("Query complete (no tools), non-streaming finished");
 
             // Store to memory (fire-and-forget)
@@ -809,6 +893,21 @@ fn inject_vm_manifest(
     true
 }
 
+fn fallback_vm_manifest() -> crate::programs::VmManifest {
+    crate::programs::VmManifest {
+        protocol_version: crate::programs::MANIFEST_PROTOCOL_VERSION,
+        registry_generation: 0,
+        environment_hash: "unavailable".to_string(),
+        languages: vec![
+            crate::programs::ProgramLanguage::Forth,
+            crate::programs::ProgramLanguage::Lisp,
+        ],
+        language_packages: crate::programs::language_package_identities(),
+        core_effects: vec!["session.emit".to_string(), "vm.read".to_string()],
+        relevant_programs: Vec::new(),
+    }
+}
+
 /// Apply a sliding window to the message list, keeping only the last `max` messages
 /// verbatim. If `max` is 0 or the list is shorter than `max`, returns all messages.
 ///
@@ -861,9 +960,9 @@ pub(crate) fn apply_sliding_window(
             break;
         }
         window.remove(0); // drop orphaned tool_result user turn
-        // If the window now starts with an assistant message (the next tool round),
-        // insert a placeholder user turn to satisfy the user-first invariant without
-        // cascading removal that would orphan every subsequent tool_result.
+                          // If the window now starts with an assistant message (the next tool round),
+                          // insert a placeholder user turn to satisfy the user-first invariant without
+                          // cascading removal that would orphan every subsequent tool_result.
         if window.first().map(|m| m.role.as_str()) == Some("assistant") {
             window.insert(
                 0,
@@ -916,7 +1015,9 @@ pub(crate) fn apply_sliding_window(
                         }
                     })
                     .collect();
-                tool_use_ids.iter().all(|id| result_ids.contains(id.as_str()))
+                tool_use_ids
+                    .iter()
+                    .all(|id| result_ids.contains(id.as_str()))
             });
 
             if next_covers_all == Some(true) {
@@ -957,4 +1058,58 @@ pub(crate) fn apply_sliding_window(
         }
     }
     window
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_manifest_injects_the_vm_bootstrap_without_memtree() {
+        let mut messages = vec![crate::claude::Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "add two numbers".to_string(),
+            }],
+        }];
+
+        assert!(inject_vm_manifest(&mut messages, &fallback_vm_manifest()));
+        let ContentBlock::Text { text } = &messages[0].content[0] else {
+            panic!("the user message must retain its text block");
+        };
+        assert!(text.contains("FINCH-VM-TYPED/1"));
+        assert!(text.contains("otherwise treats the source as Forth"));
+        assert!(text.contains("s\"response\" say"));
+        assert!(!text.contains(".\" response\""));
+        assert!(text.ends_with("add two numbers"));
+    }
+
+    #[tokio::test]
+    async fn direct_wire_text_is_a_lisp_or_forth_submission_not_display_prose() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+
+        let lisp = direct_wire_submission(&runtime, "(say \"hello\")".to_string()).unwrap();
+        assert_eq!(lisp.language, crate::programs::ProgramLanguage::Lisp);
+        let outcome = runtime.submit_typed_only(lisp).await.unwrap();
+        assert_eq!(outcome.status, crate::runtime::outcome::ExecutionStatus::Completed);
+        assert_eq!(outcome.output, "hello");
+
+        let forth = direct_wire_submission(&runtime, "s\"world\" say".to_string()).unwrap();
+        assert_eq!(forth.language, crate::programs::ProgramLanguage::Forth);
+        let outcome = runtime.submit_typed_only(forth).await.unwrap();
+        assert_eq!(outcome.status, crate::runtime::outcome::ExecutionStatus::Completed);
+        assert_eq!(outcome.output, "world");
+    }
+
+    #[test]
+    fn recovers_one_complete_fenced_program_but_not_mixed_prose() {
+        assert_eq!(
+            recover_fenced_wire_program("```lisp\n(say \"hello\")\n```"),
+            "(say \"hello\")"
+        );
+        assert_eq!(
+            recover_fenced_wire_program("intro\n```forth\ns\"hello\" say\n```"),
+            "intro\n```forth\ns\"hello\" say\n```"
+        );
+    }
 }

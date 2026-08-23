@@ -7,15 +7,76 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 
 ## Typed Lisp/Co-Forth VM — prerequisite for Brain convergence
 
+- [ ] Fix startup rendering ownership: direct stdout from the legacy banner/proof demo can overlap
+  the shadow-buffer live area and leave stale glyphs (for example a corrupted `258/258` proof
+  count). Startup diagnostics and suggestions must be projected through the same UI/event path or
+  remain opt-in commands; never interleave direct terminal writes with shadow-buffer redraws.
 - [ ] Finish both source frontends and their shared typed IR semantics: definitions/signatures,
   conditionals, metered loops, locals, quotations, closures, collections, bounded macros, and
   structured error/result forms.
+- [ ] Extend the implemented typed option branches—Co-Forth `if-some ... else ... then` and Lisp
+  `match-option`—to general structured `match`/`case` plus expression-valued named `break` after
+  the loop verifier is generalized to check each target's declared result stack row. Simple named
+  stack-preserving `break`/`continue` already lower to verified loop edges; do not add
+  unrestricted jumps or C-style fallthrough switches.
+- [ ] Specify and implement the provider wire discriminator: leading `(` selects Lisp and all other
+  valid program starts select Co-Forth; make the receiver incrementally tokenize Co-Forth while
+  retaining complete-program verification and clear malformed-wire diagnostics.
+- [ ] Publish the canonical source surface in the generated language package: `s"..."` strings,
+  exact escaping/comment rules, `say` composition, Lisp form examples, and no-free-prose protocol
+  rule. Include common stack-error corrections rather than only error codes.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
 - [ ] Finish the capability broker: bounded argument templates, availability, grants, attenuation,
-  revocation, audit, approval dialogs, runtime guards, and typed suspend/resume.
+  revocation, audit, approval dialogs, runtime guards, and typed suspend/resume. The base
+  `(execution_id, sequence)` resume path now validates the host's result row and acknowledges the
+  exact journaled effect without redispatch; durable approvals, denial policy, and complete host
+  adapters remain.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
+- [ ] Extend bounded `file-slice`/`file-size` and host-issued cursors with workbook cursors so large
+  Excel workbooks can be processed incrementally without whole-file/string loading. Line cursors
+  and bounded `csv-open`/`csv-next`/`csv-close` record cursors now cover UTF-8 CSV quoted-record
+  framing; workbook-specific opaque resources remain.
+- [ ] Replace the compatibility output adapter with portable output-handle effects: default response
+  port append (`say`), append/replace/status/progress/complete/fail operations, per-handle ownership
+  and generation checks, and journal-first projection into concurrent shadow-buffer WorkUnits.
+- [ ] Reimplement the existing model-facing `TodoRead`/`TodoWrite` tools over a typed, journaled
+  task-list projection owned by the Brain/runtime. Keep their useful visible-plan UX and stable tool
+  surface, but make task creation, status changes, hierarchy, progress, cancellation, and durable
+  recovery ordinary typed task events—not a second session-local JSON source of truth beside VM
+  `task<T>` handles.
+- [ ] Normalize model-facing naming and manifests. Provider/host tools use canonical `snake_case`
+  names (for example `todo_read`, `todo_write`, `get_vm_state`); typed Co-Forth words retain their
+  language-native hyphenated spelling (for example `output-append`); Lisp maps to the shared typed
+  vocabulary. Remove PascalCase legacy names such as `TodoWrite` from generated manifests after
+  adding explicit compatibility aliases and tests that no duplicate semantic operation is advertised.
+- [ ] Finish typed `proposal.open` as the explicit durable editor/proposal boundary. The current
+  `proposal-open` capability can now suspend an event-loop-bound ProgramRun on its portable
+  `(execution_id, sequence)` request and the frontend controller opens the language-aware editor,
+  resumes that exact handle with accepted/chat/cancel data, and emits only the final tool result.
+  Replace the compatibility projection with durable application-journaled
+  `created → awaiting-edit → accepted|chat|cancelled → submitted` events and reconnectable
+  proposal views. It must support Finch, Bash, Python, and other source artifacts without forcing
+  an editor for ordinary individually authorized VM calls.
+- [ ] Separate tool execution budgets from human/editor waits. The legacy universal 30-second
+  timeout currently wraps `$EDITOR` proposal review and reports “try restarting” while waiting for
+  a person. Model the lifecycle explicitly as `awaiting-approval|awaiting-edit → executing`;
+  apply a bounded timeout only to the actual subprocess/host execution, retain live output, and
+  report the true phase in the UI.
+- [ ] After the broker and durable task protocol pass their gate, expose opt-in local operator
+  bindings for accessibility, browser, mail, messaging, and credential-backed services as
+  parameterized capabilities with audit/event-journal projection; never treat broad shell access
+  as the integration contract.
+- [ ] Add a typed executable-script command that consumes the tested Finch shebang envelope through
+  `ProgramRuntime` (never the legacy interpreters), with explicit isolated-versus-named-Brain state,
+  structured/JSON output, and the ordinary capability broker.
+- [ ] Add package/import namespaces only after self-contained scripts and task/session/project/user
+  vocabulary lifetimes are reliable. Keep promotion to project/user/published vocabulary an
+  authority-bearing, reviewable operation.
+- [ ] Adapt discovered MCP client tools into versioned namespaced typed VM bindings with schema
+  validation, managed JSON fallback, parameter-bounded `mcp.call` capability grants, and normal
+  suspension/resume; keep MCP transport lifecycle host-owned rather than a VM subagent protocol.
 - [ ] Make `ProgramRuntime` and VM inspection use one persistent typed stack, dictionary, heap,
   transaction manager, and revision history for Lisp and Co-Forth.
 - [ ] Remove the Lisp-to-Forth text compiler, native Lisp fallback, source-text effect inference,
@@ -23,6 +84,26 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Do not require the later Cranelift JIT
   optimization tier to begin Brain convergence.
+- [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
+  verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
+  the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
+- [ ] Complete the fiber/task split: `(defer :cpu (lambda () ...))` / `defer-cpu` has private-stack
+  CPU work with poll/join/cancel; future repeatedly-yielding fibers remain separate from subagents
+  and their bidirectional resume design is deferred until a concrete need exists.
+- [ ] Design and implement a typed lazy sequence protocol separately from scheduler `yield`: an
+  opaque `stream<T>`/iterator handle with bounded `next -> option<T>`, cancellation, ownership,
+  capability propagation, and Lisp/Co-Forth lowering. Do not expose legacy Co-Forth generators as
+  typed-runtime vocabulary until their state, effects, and suspension semantics are verified.
+- [ ] Make resource roots first-class capability objects. Workspace/project paths remain safely
+  relative; an intentional full-machine grant is a separate audited host root, never ambient
+  authority inferred from an absolute path string. `host-path` and distinct
+  `host-file-read`/`host-file-write` now require an explicitly installed host binding and recheck
+  canonical containment at every call; keep workspace `path`/`file-read` structurally separate.
+  Still add project/task-output bindings, persisted approval/revocation lifecycle, and the host UI
+  for deliberately binding `/` as whole-machine scope.
+- [ ] Phase 0: route existing provider streaming through the portable VM side-effect journal and
+  per-ProgramRun output-handle bindings; test replay/reconnect and concurrent WorkUnit projection,
+  then replay the existing Co-Forth corpus in report-only verifier mode before requiring typed output.
 - [ ] Later: define a signed, content-addressed vocabulary package protocol for pushing reviewed
   `published` definitions between Finches; verify source/IR, dependencies, certificates, provenance,
   and local capability policy before installation.
@@ -35,12 +116,20 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   boundary; model interactive turns, speculative helpers, schedules, and subagents as `BrainRun`s;
   and make local, embedded, IPC, HTTP/WebSocket, and remote clients projections of one service.
 - [ ] Persist complete VM checkpoints or reversible VM deltas at committed program boundaries.
+- [ ] Make the daemon own schedule definitions/due-time delivery only. Coalesce missed ticks into one
+  pending event per schedule while the environment-owning frontend is unavailable; require explicit
+  bounded catch-up and idempotency policy before delivering every missed occurrence.
 - [ ] Split reducible VM state from the execute-once host-effect journal. Never replay file,
   process, dialog, or network effects while restoring VM state.
 - [ ] Add typed compensating actions for reversible effects. File undo must use preimage and
   postimage hashes plus a conflict-aware reverse changeset.
 - [ ] Finish remote named-brain attach/detach, live scrollback replacement, status display, and
   prompt/Forth/Lisp routing through the daemon-owned event stream.
+- [ ] After the VM gate, launch each local active Brain runner in a named `tmux` session by default
+  on Unix. Keep the daemon as a durable event-log/coordinator with no workspace, accessibility, or
+  credential handles; the master frontend runner is the only environment authority. Recover only
+  from validated checkpoints on that environment and never replay recorded external effects after
+  runner or `tmux` failure.
 - [ ] Add per-brain control ownership/leases and participant roles. Only the bound environment
   may execute workspace effects or reveal/rotate its credential.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an

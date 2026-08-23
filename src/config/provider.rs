@@ -301,6 +301,42 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_name_prefers_explicit_name() {
+        let entry = ProviderEntry::Claude {
+            api_key: "test-key".to_string(),
+            model: Some("claude-haiku".to_string()),
+            base_url: None,
+            name: Some("fast".to_string()),
+        };
+        assert_eq!(entry.profile_name(), "fast");
+    }
+
+    #[test]
+    fn test_profile_name_falls_back_to_model_for_legacy_config() {
+        let entry = ProviderEntry::Claude {
+            api_key: "test-key".to_string(),
+            model: Some("claude-haiku".to_string()),
+            base_url: None,
+            name: None,
+        };
+        assert_eq!(entry.profile_name(), "claude-haiku");
+    }
+
+    #[test]
+    fn test_openai_reasoning_effort_toml_roundtrip() {
+        let entry = ProviderEntry::Openai {
+            api_key: "test-key".to_string(),
+            model: Some("gpt-5.6-sol".to_string()),
+            base_url: None,
+            name: Some("deep".to_string()),
+            reasoning_effort: Some(ReasoningEffort::Xhigh),
+        };
+        let toml = toml::to_string(&entry).unwrap();
+        assert!(toml.contains("reasoning_effort = \"xhigh\""));
+        assert_eq!(toml::from_str::<ProviderEntry>(&toml).unwrap(), entry);
+    }
+
+    #[test]
     fn test_local_serde_roundtrip() {
         let entry = ProviderEntry::Local {
             inference_provider: InferenceProvider::Onnx,

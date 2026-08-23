@@ -25,9 +25,16 @@ pub use effects::{
     CapabilityKind, CapabilityRequirement, EffectSet, FileOperation, FileSelector,
     FileSelectorTemplate, FileSelectorTemplatePart, ResourceRoot, ResourceSelector, SelectorError,
 };
-pub use runtime::{TypedExecution, TypedExecutionStatus, TypedRuntime};
+pub use interpreter::{
+    HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame, VmSideEffect, VmStep,
+    VmTrampoline,
+};
+pub use runtime::{
+    EffectJournalEntry, EffectJournalState, PendingHostCall, TypedExecution, TypedExecutionStatus,
+    TypedRuntime, TypedSuspension,
+};
 pub use signature::{ControlEffect, StackRow, StackSignature};
-pub use types::{Type, TypedValue};
+pub use types::{TaskKind, Type, TypedValue};
 pub use verifier::{VerifiedFunction, VerifiedModule, Verifier, Vocabulary};
 pub use vocabulary::core_vocabulary;
 

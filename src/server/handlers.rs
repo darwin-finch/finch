@@ -7,11 +7,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use crossterm::style::Stylize as _;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
-use crossterm::style::Stylize as _;
 
 /// Check `X-Finch-Token` header against this daemon's token.
 /// Returns Ok(()) if valid, Err(StatusCode::FORBIDDEN) with a log entry if not.
@@ -109,9 +109,15 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/forth/coforth/:id/yield", post(handle_coforth_yield))
         .route("/v1/forth/coforth/:id/agree", post(handle_coforth_agree))
         // Channel contribution stacks
-        .route("/v1/forth/channel/:name/contribute", post(handle_channel_contribute))
+        .route(
+            "/v1/forth/channel/:name/contribute",
+            post(handle_channel_contribute),
+        )
         .route("/v1/forth/channel/:name", get(handle_channel_get))
-        .route("/v1/forth/channel/:name/execute", post(handle_channel_execute))
+        .route(
+            "/v1/forth/channel/:name/execute",
+            post(handle_channel_execute),
+        )
         .route("/v1/file/get", get(handle_file_get))
         .route("/v1/file/put", post(handle_file_put))
         // Peer registry
@@ -367,9 +373,7 @@ fn ensure_named_brain_environment(
 ) -> anyhow::Result<()> {
     let configured = server.shared_brains().environment();
     if &snapshot.environment != configured {
-        anyhow::bail!(
-            "brain environment generation does not match this execution host"
-        );
+        anyhow::bail!("brain environment generation does not match this execution host");
     }
     let process_workspace = std::env::current_dir()?;
     let process_workspace = process_workspace
@@ -1281,7 +1285,9 @@ async fn handle_forth_resume(
         .map_err(|e| AppError(e).into_response())
 }
 
-async fn handle_forth_resume_inner(req: ForthResumeRequest) -> anyhow::Result<Json<ForthEvalResponse>> {
+async fn handle_forth_resume_inner(
+    req: ForthResumeRequest,
+) -> anyhow::Result<Json<ForthEvalResponse>> {
     let base = LIVE_VM.read().await;
     let mut vm = base.clone_dict();
     drop(base);
@@ -1784,17 +1790,22 @@ async fn handle_session_ws(
         tokio::spawn(async move {
             while let Some(ev) = bus_rx.recv().await {
                 let entry = match ev {
-                    crate::session::SessionEvent::Chat { text } => {
-                        Some((lbl.clone(), text))
-                    }
-                    crate::session::SessionEvent::ChannelMessage { channel, sender, bundle } => {
+                    crate::session::SessionEvent::Chat { text } => Some((lbl.clone(), text)),
+                    crate::session::SessionEvent::ChannelMessage {
+                        channel,
+                        sender,
+                        bundle,
+                    } => {
                         let primary = bundle.primary();
                         let comment = if bundle.comments.is_empty() {
                             String::new()
                         } else {
                             format!("  \\ {}", bundle.comments.join("; "))
                         };
-                        Some((lbl.clone(), format!("{channel} {sender}: {}{comment}", primary.code)))
+                        Some((
+                            lbl.clone(),
+                            format!("{channel} {sender}: {}{comment}", primary.code),
+                        ))
                     }
                     _ => None,
                 };
@@ -1944,7 +1955,9 @@ struct CoForthCreateResponse {
 }
 
 /// POST /v1/forth/coforth — create a new co-forth session between two peers.
-async fn handle_coforth_create(Json(req): Json<CoForthCreateRequest>) -> Json<CoForthCreateResponse> {
+async fn handle_coforth_create(
+    Json(req): Json<CoForthCreateRequest>,
+) -> Json<CoForthCreateResponse> {
     let session = crate::coforth::co_session::CoForthSession::new(req.peer_a, req.peer_b);
     let id = session.id;
     CO_SESSION_STORE.lock().unwrap().insert(id, session);
@@ -2101,7 +2114,11 @@ async fn handle_channel_contribute(
     if check_peer_token(&headers, &ip, "/v1/forth/channel/contribute").is_err() {
         return StatusCode::FORBIDDEN;
     }
-    let chan = if name.starts_with('#') { name } else { format!("#{name}") };
+    let chan = if name.starts_with('#') {
+        name
+    } else {
+        format!("#{name}")
+    };
     use crate::coforth::irc_proto::{IrcMessage, OP_YIELD};
     crate::coforth::irc_proto::process_message(
         IrcMessage::new(OP_YIELD, &req.from, &chan, req.program.as_bytes().to_vec()),
@@ -2112,23 +2129,37 @@ async fn handle_channel_contribute(
 
 /// GET /v1/forth/channel/:name — list all contributions in a channel.
 async fn handle_channel_get(Path(name): Path<String>) -> Json<ChannelStateResponse> {
-    let chan = if name.starts_with('#') { name.clone() } else { format!("#{name}") };
+    let chan = if name.starts_with('#') {
+        name.clone()
+    } else {
+        format!("#{name}")
+    };
     let reg = CHANNEL_REGISTRY.lock().unwrap();
     let contributions = reg
         .get(&chan)
         .map(|s| {
             s.stack
                 .iter()
-                .map(|(f, p)| ChannelEntry { from: f.clone(), program: p.clone() })
+                .map(|(f, p)| ChannelEntry {
+                    from: f.clone(),
+                    program: p.clone(),
+                })
                 .collect()
         })
         .unwrap_or_default();
-    Json(ChannelStateResponse { channel: chan, contributions })
+    Json(ChannelStateResponse {
+        channel: chan,
+        contributions,
+    })
 }
 
 /// POST /v1/forth/channel/:name/execute — run all contributions in a channel on this peer.
 async fn handle_channel_execute(Path(name): Path<String>) -> Json<serde_json::Value> {
-    let chan = if name.starts_with('#') { name } else { format!("#{name}") };
+    let chan = if name.starts_with('#') {
+        name
+    } else {
+        format!("#{name}")
+    };
     use crate::coforth::irc_proto::{IrcMessage, OP_EXEC};
     let reply = crate::coforth::irc_proto::process_message(
         IrcMessage::new(OP_EXEC, "http", &chan, vec![]),
@@ -2162,7 +2193,11 @@ fn zip_add_to_writer<W: std::io::Write + std::io::Seek>(
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
     if path.is_file() {
-        let rel = path.strip_prefix(base).unwrap_or(path).to_string_lossy().to_string();
+        let rel = path
+            .strip_prefix(base)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
         zw.start_file(&rel, opts)?;
         zw.write_all(&std::fs::read(path)?)?;
     } else if path.is_dir() {
@@ -2173,7 +2208,11 @@ fn zip_add_to_writer<W: std::io::Write + std::io::Seek>(
                 if p.is_dir() {
                     stack.push(p);
                 } else {
-                    let rel = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().to_string();
+                    let rel = p
+                        .strip_prefix(base)
+                        .unwrap_or(&p)
+                        .to_string_lossy()
+                        .to_string();
                     zw.start_file(&rel, opts)?;
                     zw.write_all(&std::fs::read(&p)?)?;
                 }
@@ -2300,20 +2339,27 @@ pub async fn handle_file_put(
             let mut entry = archive.by_index(i)?;
             let out_path = dest_p.join(entry.name());
             // Zip-slip guard.
-            let out_norm = out_path.components().fold(
-                std::path::PathBuf::new(),
-                |mut acc, c| match c {
-                    std::path::Component::ParentDir => { acc.pop(); acc }
-                    _ => { acc.push(c); acc }
-                },
-            );
+            let out_norm = out_path
+                .components()
+                .fold(std::path::PathBuf::new(), |mut acc, c| match c {
+                    std::path::Component::ParentDir => {
+                        acc.pop();
+                        acc
+                    }
+                    _ => {
+                        acc.push(c);
+                        acc
+                    }
+                });
             if !out_norm.starts_with(&dest_canon) && !out_norm.starts_with(dest_p) {
                 anyhow::bail!("zip-slip detected in entry '{}'", entry.name());
             }
             if entry.is_dir() {
                 std::fs::create_dir_all(&out_path)?;
             } else {
-                if let Some(p) = out_path.parent() { std::fs::create_dir_all(p)?; }
+                if let Some(p) = out_path.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
                 let mut out = std::fs::File::create(&out_path)?;
                 std::io::copy(&mut entry, &mut out)?;
             }

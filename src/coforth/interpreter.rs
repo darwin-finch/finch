@@ -167,12 +167,11 @@ enum Builtin {
     GrammarCheck,  // ( str-idx -- str-idx )  AI: return grammar-corrected sentence
     ImproveStr,    // ( str-idx -- str-idx )  AI: return clearer/more fluent sentence
     // Integer math extras
-    Sqrt,      // ( n -- isqrt(n) )  integer square root
-    Floor,     // ( n d -- n/d*d )   floor division result
-    Ceil,      // ( n d -- ceil )    ceiling division
-    IsPrime,      // ( n -- flag )      -1 if n is prime, 0 otherwise
-    NextPrime,    // ( n -- p )         smallest prime >= n
-    AppleScript,  // ( script-idx -- result-idx )  run osascript, push stdout as string
+    Sqrt,                // ( n -- isqrt(n) )  integer square root
+    Floor,               // ( n d -- n/d*d )   floor division result
+    Ceil,                // ( n d -- ceil )    ceiling division
+    IsPrime,             // ( n -- flag )      -1 if n is prime, 0 otherwise
+    NextPrime,           // ( n -- p )         smallest prime >= n
     AutomationAvailable, // ( -- flag ) native automation enabled and authorized
     AutomationDisplays,  // ( -- json-idx ) structured display information
     AutomationWindows,   // ( -- json-idx ) structured window information
@@ -182,18 +181,19 @@ enum Builtin {
     AgentPoll,           // ( task-id-idx -- json-idx ) non-blocking task state
     AgentAwait,          // ( task-id-idx -- json-idx ) join a child agent
     AgentCancel,         // ( task-id-idx -- flag ) request child cancellation
+    AppleScript,         // ( script-idx -- result-idx )  run osascript, push stdout as string
     // ── xlsx native (pure Rust, no Excel app needed) ──────────────────────────
-    XlsxAt,       // ( file-idx addr-idx -- val-idx )      read one cell (first sheet)
-    XlsxAtSheet,  // ( file-idx sheet-idx addr-idx -- val-idx ) read cell from named sheet
-    XlsxSheets,   // ( file-idx -- names-idx )             newline-separated sheet names
+    XlsxAt,        // ( file-idx addr-idx -- val-idx )      read one cell (first sheet)
+    XlsxAtSheet,   // ( file-idx sheet-idx addr-idx -- val-idx ) read cell from named sheet
+    XlsxSheets,    // ( file-idx -- names-idx )             newline-separated sheet names
     XlsxWriteCell, // ( val-idx file-idx addr-idx -- )     write cell (load→patch→save)
     // ── polymorphic file loader ────────────────────────────────────────────────
-    Load,         // ( path-idx -- result-idx )  dispatch on extension; always returns a value
+    Load, // ( path-idx -- result-idx )  dispatch on extension; always returns a value
     // ── base64 ────────────────────────────────────────────────────────────────
-    FileToB64,    // ( path-idx -- b64-idx )   read file bytes → base64 string
-    B64ToFile,    // ( b64-idx path-idx -- )   decode base64 → write binary file
-    B64Encode,    // ( str-idx -- b64-idx )    base64-encode a string's UTF-8 bytes
-    B64Decode,    // ( b64-idx -- str-idx )    base64-decode → UTF-8 string (lossy)
+    FileToB64, // ( path-idx -- b64-idx )   read file bytes → base64 string
+    B64ToFile, // ( b64-idx path-idx -- )   decode base64 → write binary file
+    B64Encode, // ( str-idx -- b64-idx )    base64-encode a string's UTF-8 bytes
+    B64Decode, // ( b64-idx -- str-idx )    base64-decode → UTF-8 string (lossy)
     // Trig (scaled: input in degrees * 1000, output * 1000)
     Sin, // ( deg*1000 -- sin*1000 )
     Cos, // ( deg*1000 -- cos*1000 )
@@ -313,16 +313,16 @@ enum Builtin {
     ArgOk,      // ( str_name -- flag )      -1 if named argument passed, 0 if failed
     Versus,     // ( str1 str2 -- )  run both, show FULL stacks side by side, assert they agree
     BothWays,   // ( a b str -- )   run op(a,b) and op(b,a), show both, assert they agree
-    Gate,      // ( str1 str2 check -- result )  run both, apply check; if check passes leave result
+    Gate, // ( str1 str2 check -- result )  run both, apply check; if check passes leave result
     ClaimMake, // ( str-a str-b str-check -- str-claim )  pack a triple into a wire-ready string
-    ClaimRun,  // ( str-claim -- )                        unpack and run the triple via gate
-    ArmRun,    // ( str-asm -- n )   run ARM assembly; push top-of-stack onto Forth stack
-    Ergo,      // ( str-a str-b str-check str-conclusion -- )  quadruple proof: if check passes, state conclusion
-    WordDef,   // ( str-name str-a str-b -- )  prove a ≡ b on battery of seeds, then install `: name a ;`
-    QuadDef,   // ( str-name str-en str-zh str-forth str-arm -- )  two pairs: (en,zh) + prove forth≡arm, install
-    Page, // ( str -- )    run a multi-line proof page: each line is "left | right"
+    ClaimRun, // ( str-claim -- )                        unpack and run the triple via gate
+    ArmRun, // ( str-asm -- n )   run ARM assembly; push top-of-stack onto Forth stack
+    Ergo, // ( str-a str-b str-check str-conclusion -- )  quadruple proof: if check passes, state conclusion
+    WordDef, // ( str-name str-a str-b -- )  prove a ≡ b on battery of seeds, then install `: name a ;`
+    QuadDef, // ( str-name str-en str-zh str-forth str-arm -- )  two pairs: (en,zh) + prove forth≡arm, install
+    Page,    // ( str -- )    run a multi-line proof page: each line is "left | right"
     Resolve, // ( str -- )    many sentences, one truth: all lines must converge to same value
-    Infix, // ( str -- )    eval infix expression: "3 + 4", "10 * 5 - 2", etc.
+    Infix,   // ( str -- )    eval infix expression: "3 + 4", "10 * 5 - 2", etc.
     RegisterBoot, // ( str -- )    register a boot poem line; REPL persists to ~/.finch/boot.forth
     // Proof system
     Assert,         // ( flag -- )  bail "assertion failed" if flag == 0
@@ -333,23 +333,23 @@ enum Builtin {
     // Channel system
     ListChannels, // ( -- )  print joined channels
     // Collection operations
-    SortLines,     // ( idx -- idx' )  sort lines of strings[idx] alphabetically
-    UniqueLines,   // ( idx -- idx' )  deduplicate lines of strings[idx]
-    ReverseLines,  // ( idx -- idx' )  reverse line order of strings[idx]
+    SortLines,    // ( idx -- idx' )  sort lines of strings[idx] alphabetically
+    UniqueLines,  // ( idx -- idx' )  deduplicate lines of strings[idx]
+    ReverseLines, // ( idx -- idx' )  reverse line order of strings[idx]
     LineCount,
-    Solve,   // ( prog-idx target -- n )  fill _ with integers until prog produces target     // ( idx -- n )     number of lines in strings[idx]
-    GlobPool,      // ( pattern-idx -- result-idx )  glob into string pool (one path per line)
+    Solve, // ( prog-idx target -- n )  fill _ with integers until prog produces target     // ( idx -- n )     number of lines in strings[idx]
+    GlobPool, // ( pattern-idx -- result-idx )  glob into string pool (one path per line)
     CleanLines, // ( idx -- n )  quarantine each path in strings[idx] (one per line); return count
-    GlobCount,  // ( pattern-idx -- n )  count files matching glob pattern
+    GlobCount, // ( pattern-idx -- n )  count files matching glob pattern
     ExecCapture, // ( cmd-idx -- output-idx )  run shell command; push stdout as string pool entry
     BackAndForthQ, // ( n fwd-str back-str -- flag )  round-trip predicate; never aborts
     InvertibleQ, // ( n str -- flag )  apply str twice; -1 if f(f(n))=n (involution test)
-    Help,       // ( -- )  print the Co-Forth quick-reference guide
-    Describe,   // ( idx -- )  describe a word: stack signature, source, or builtin notice
-    Compute,    // ( str-idx -- )  evaluate as Forth; fall back to infix; print "= result"
+    Help,  // ( -- )  print the Co-Forth quick-reference guide
+    Describe, // ( idx -- )  describe a word: stack signature, source, or builtin notice
+    Compute, // ( str-idx -- )  evaluate as Forth; fall back to infix; print "= result"
     EquivQ, // ( str1 str2 -- flag )  -1 if programs agree on inputs -5..5; the equivalence probe
-    Fork,   // ( str-idx -- )  run code in a forked copy (current stack shared); discard copy
-    Boot,   // ( -- )  re-execute all boot=true vocabulary words
+    Fork,  // ( str-idx -- )  run code in a forked copy (current stack shared); discard copy
+    Boot,  // ( -- )  re-execute all boot=true vocabulary words
     PrintR, // ( n width -- )  print n right-aligned in field of width chars
     PrintPad, // ( n width char-idx -- )  print n padded with char to width
     // Fast integer hash operations
@@ -373,14 +373,14 @@ enum Builtin {
     // ── Vec4 — four lanes walking in lockstep ─────────────────────────────────
     // Values are fixed-point scaled by 1000 (i.e. 1.5 → 1500).
     // Layout on stack: x y z w  (w on top).
-    Vec4New,  // ( x y z w -- vec4:x vec4:y vec4:z vec4:w )  identity; names the 4-group
-    Vec4Add,  // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise add
-    Vec4Sub,  // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise subtract
-    Vec4Mul,  // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise multiply (fixed-point)
+    Vec4New,   // ( x y z w -- vec4:x vec4:y vec4:z vec4:w )  identity; names the 4-group
+    Vec4Add,   // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise add
+    Vec4Sub,   // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise subtract
+    Vec4Mul,   // ( ax ay az aw bx by bz bw -- rx ry rz rw )  lane-wise multiply (fixed-point)
     Vec4Scale, // ( x y z w s -- rx ry rz rw )               scale all lanes by scalar s
-    Vec4Dot,  // ( ax ay az aw bx by bz bw -- dot )          dot product (fixed-point)
-    Vec4Len,  // ( x y z w -- len )                          Euclidean length (fixed-point)
-    Vec4Norm, // ( x y z w -- rx ry rz rw )                  normalise to unit length
+    Vec4Dot,   // ( ax ay az aw bx by bz bw -- dot )          dot product (fixed-point)
+    Vec4Len,   // ( x y z w -- len )                          Euclidean length (fixed-point)
+    Vec4Norm,  // ( x y z w -- rx ry rz rw )                  normalise to unit length
     Vec4Print, // ( x y z w -- x y z w )  vprint — print without consuming
 }
 
@@ -478,43 +478,48 @@ fn builtin_effect(b: Builtin) -> Option<StackEffect> {
     use Builtin::*;
     Some(match b {
         // Arithmetic: 2→1
-        Plus | Minus | Star | Slash | Mod | Max | Min | And | Or | Xor
-        | Lshift | Rshift | StarSlash | FPMul => StackEffect::new(2, 1),
+        Plus | Minus | Star | Slash | Mod | Max | Min | And | Or | Xor | Lshift | Rshift
+        | StarSlash | FPMul => StackEffect::new(2, 1),
         // Comparison: 2→1
-        Eq | Lt | Gt | Ne | Le | Ge | ULt | AgreeQ | SameQ | EquivQ
-        | BackAndForthQ => StackEffect::new(2, 1),
+        Eq | Lt | Gt | Ne | Le | Ge | ULt | AgreeQ | SameQ | EquivQ | BackAndForthQ => {
+            StackEffect::new(2, 1)
+        }
         // Unary: 1→1
-        Negate | Abs | Invert | Inc | Dec | ZeroEq | ZeroLt | ZeroGt
-        | Capitalize | StrUpper | StrLower | StrTrim | Sqrt
-        | Sha256 | Hash | HashInt | NumToStr | InvertibleQ => StackEffect::new(1, 1),
+        Negate | Abs | Invert | Inc | Dec | ZeroEq | ZeroLt | ZeroGt | Capitalize | StrUpper
+        | StrLower | StrTrim | Sqrt | Sha256 | Hash | HashInt | NumToStr | InvertibleQ => {
+            StackEffect::new(1, 1)
+        }
         // 1→0 (consume, no push)
-        Drop | Print | PrintU | PrintS | PrintHex | Cr | Space | Emit | Type
-        | Store | FileWrite | FileAppend | Assert | Boot => StackEffect::new(1, 0),
+        Drop | Print | PrintU | PrintS | PrintHex | Cr | Space | Emit | Type | Store
+        | FileWrite | FileAppend | Assert | Boot => StackEffect::new(1, 0),
         // 1→2
         Dup => StackEffect::new(1, 2),
         // 2→2
-        Swap | Over | StrEq | StrCat | StrSplit | StrJoin | StrFind
-        | StrReplace | LabelPeer | TagPeer | BothWays => StackEffect::new(2, 2),
+        Swap | Over | StrEq | StrCat | StrSplit | StrJoin | StrFind | StrReplace | LabelPeer
+        | TagPeer | BothWays => StackEffect::new(2, 2),
         // 2→3
         Over => StackEffect::new(2, 3),
         // 3→3
         Rot => StackEffect::new(3, 3),
         // 2→0
-        TwoDrop | Store | FileWrite | FileAppend | EnsembleDef | HPut | HDel
-        | RecordDebit => StackEffect::new(2, 0),
+        TwoDrop | Store | FileWrite | FileAppend | EnsembleDef | HPut | HDel | RecordDebit => {
+            StackEffect::new(2, 0)
+        }
         // 0→1
-        Random | Time | Depth | Fuel | Nonce | Here | CellSz | RoomNew
-        | WordNames | Peers => StackEffect::new(0, 1),
+        Random | Time | Depth | Fuel | Nonce | Here | CellSz | RoomNew | WordNames | Peers => {
+            StackEffect::new(0, 1)
+        }
         // 0→0
-        Nop | Words | HotWords | PeersClear | PeersDiscover | TakeAll | Sync
-        | ProveAll | ProveEnglish | ProveLanguages | Help | Boot => StackEffect::new(0, 0),
+        Nop | Words | HotWords | PeersClear | PeersDiscover | TakeAll | Sync | ProveAll
+        | ProveEnglish | ProveLanguages | Help | Boot => StackEffect::new(0, 0),
         // 1→0 (side-effectful; no push)
-        Publish | EnsembleUse | EnsembleEnd | RoomUse | RoomAdd | RoomSub
-        | JoinRegistry | LeaveRegistry | RegisterBoot | RegistrySet => StackEffect::new(1, 0),
+        Publish | EnsembleUse | EnsembleEnd | RoomUse | RoomAdd | RoomSub | JoinRegistry
+        | LeaveRegistry | RegisterBoot | RegistrySet => StackEffect::new(1, 0),
         // Misc
-        StrLen | WordCount | SentenceCheck | WordDefined | IsPrime | Safe
-        | ArgOk | FileSize | GlobCount | ScanBytes | FileEntropy
-        | ZeroEq | ZeroLt | ZeroGt | HashInt | StrToNum => StackEffect::new(1, 1),
+        StrLen | WordCount | SentenceCheck | WordDefined | IsPrime | Safe | ArgOk | FileSize
+        | GlobCount | ScanBytes | FileEntropy | ZeroEq | ZeroLt | ZeroGt | HashInt | StrToNum => {
+            StackEffect::new(1, 1)
+        }
         StrSub => StackEffect::new(3, 1),
         NthLine => StackEffect::new(2, 1),
         SlashMod => StackEffect::new(2, 2),
@@ -1737,10 +1742,7 @@ impl Forth {
         self.automation = Some(broker);
     }
 
-    pub fn set_agent_binding(
-        &mut self,
-        binding: Option<crate::runtime::agent_vm::AgentVmBinding>,
-    ) {
+    pub fn set_agent_binding(&mut self, binding: Option<crate::runtime::agent_vm::AgentVmBinding>) {
         self.agent = binding;
     }
 
@@ -1787,7 +1789,11 @@ impl Forth {
         opts: zip::write::SimpleFileOptions,
     ) -> anyhow::Result<()> {
         if path.is_file() {
-            let name = path.strip_prefix(base).unwrap_or(path).to_string_lossy().to_string();
+            let name = path
+                .strip_prefix(base)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
             zip.start_file(&name, opts)?;
             let data = std::fs::read(path)?;
             use std::io::Write as _;
@@ -1801,7 +1807,11 @@ impl Forth {
                     if p.is_dir() {
                         stack.push(p);
                     } else {
-                        let rel = p.strip_prefix(base).unwrap_or(&p).to_string_lossy().to_string();
+                        let rel = p
+                            .strip_prefix(base)
+                            .unwrap_or(&p)
+                            .to_string_lossy()
+                            .to_string();
                         zip.start_file(&rel, opts)?;
                         let data = std::fs::read(&p)?;
                         use std::io::Write as _;
@@ -1862,12 +1872,48 @@ impl Forth {
         // Native words do not live in `name_index`; include the stable core
         // surface used by generated and Lisp-lowered programs explicitly.
         const CORE_BUILTINS: &[&str] = &[
-            "+", "-", "*", "/", "mod", "dup", "drop", "swap", "over", "rot", "nip",
-            "tuck", "2dup", "2drop", "=", "<", ">", "<=", ">=", "<>", "0=", "and",
-            "or", "xor", "invert", "negate", "abs", "max", "min", ".", ".s", "cr",
-            "depth", "agent-spawn", "agent-poll", "agent-await", "agent-cancel",
-            "automation-available?", "automation-displays", "automation-windows",
-            "automation-click", "automation-type",
+            "+",
+            "-",
+            "*",
+            "/",
+            "mod",
+            "dup",
+            "drop",
+            "swap",
+            "over",
+            "rot",
+            "nip",
+            "tuck",
+            "2dup",
+            "2drop",
+            "=",
+            "<",
+            ">",
+            "<=",
+            ">=",
+            "<>",
+            "0=",
+            "and",
+            "or",
+            "xor",
+            "invert",
+            "negate",
+            "abs",
+            "max",
+            "min",
+            ".",
+            ".s",
+            "cr",
+            "depth",
+            "agent-spawn",
+            "agent-poll",
+            "agent-await",
+            "agent-cancel",
+            "automation-available?",
+            "automation-displays",
+            "automation-windows",
+            "automation-click",
+            "automation-type",
         ];
         for name in CORE_BUILTINS {
             if !words.iter().any(|(existing, _)| existing == name) {
@@ -2122,13 +2168,14 @@ impl Forth {
             // toks[0] == ":", toks[1] == name, toks[2..] == body tokens (last is ";")
             let body_tokens: Vec<&str> = toks
                 .iter()
-                .skip(2)  // skip `:` and name
+                .skip(2) // skip `:` and name
                 .take_while(|t| t.as_str() != ";")
                 .map(String::as_str)
                 .collect();
             let body = body_tokens.join(" ");
             // Guard against recursion: insert identity temporarily
-            self.effect_cache.insert(token.to_string(), StackEffect::identity());
+            self.effect_cache
+                .insert(token.to_string(), StackEffect::identity());
             let result = self.infer_effect(&body);
             match result {
                 Ok(e) => {
@@ -4247,11 +4294,10 @@ impl Forth {
                 // Infer the stack effect of the program at strings[idx] and push
                 // the result as a new string like "( a b -- c )".
                 let idx = self.pop()? as usize;
-                let prog = self
-                    .strings
-                    .get(idx)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("prove-effect: invalid string index {idx}"))?;
+                let prog =
+                    self.strings.get(idx).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("prove-effect: invalid string index {idx}")
+                    })?;
                 let result = match self.infer_effect(&prog) {
                     Ok(e) => e.to_string(),
                     Err(msg) => format!("unknown: {msg}"),
@@ -4266,9 +4312,15 @@ impl Forth {
                 // -1 if both programs have the same proven stack effect, 0 otherwise.
                 let idx2 = self.pop()? as usize;
                 let idx1 = self.pop()? as usize;
-                let prog2 = self.strings.get(idx2).cloned()
+                let prog2 = self
+                    .strings
+                    .get(idx2)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("same-effect?: invalid index {idx2}"))?;
-                let prog1 = self.strings.get(idx1).cloned()
+                let prog1 = self
+                    .strings
+                    .get(idx1)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("same-effect?: invalid index {idx1}"))?;
                 let e1 = self.infer_effect(&prog1);
                 let e2 = self.infer_effect(&prog2);
@@ -4276,16 +4328,25 @@ impl Forth {
                     (Ok(a), Ok(b)) => {
                         self.out.push_str(&format!(
                             "  {} → {}\n  {} → {}\n",
-                            prog1.trim(), a, prog2.trim(), b
+                            prog1.trim(),
+                            a,
+                            prog2.trim(),
+                            b
                         ));
-                        if a == b { -1 } else { 0 }
+                        if a == b {
+                            -1
+                        } else {
+                            0
+                        }
                     }
                     (Err(e), _) => {
-                        self.out.push_str(&format!("  cannot prove '{}': {e}\n", prog1.trim()));
+                        self.out
+                            .push_str(&format!("  cannot prove '{}': {e}\n", prog1.trim()));
                         0
                     }
                     (_, Err(e)) => {
-                        self.out.push_str(&format!("  cannot prove '{}': {e}\n", prog2.trim()));
+                        self.out
+                            .push_str(&format!("  cannot prove '{}': {e}\n", prog2.trim()));
                         0
                     }
                 };
@@ -4295,7 +4356,6 @@ impl Forth {
             // ── Vec4 — four lanes walking in lockstep ─────────────────────────
             // Fixed-point scale: integers represent thousandths (1.5 → 1500).
             // Layout: x y z w  (w is top of stack).
-
             Builtin::Vec4New => {
                 // ( x y z w -- x y z w )  identity; documents intent
                 // No-op at runtime — the 4 values are already on the stack.
@@ -4303,10 +4363,14 @@ impl Forth {
 
             Builtin::Vec4Add => {
                 // ( ax ay az aw bx by bz bw -- rx ry rz rw )
-                let bw = self.pop()?; let bz = self.pop()?;
-                let by = self.pop()?; let bx = self.pop()?;
-                let aw = self.pop()?; let az = self.pop()?;
-                let ay = self.pop()?; let ax = self.pop()?;
+                let bw = self.pop()?;
+                let bz = self.pop()?;
+                let by = self.pop()?;
+                let bx = self.pop()?;
+                let aw = self.pop()?;
+                let az = self.pop()?;
+                let ay = self.pop()?;
+                let ax = self.pop()?;
                 self.data.push(ax + bx);
                 self.data.push(ay + by);
                 self.data.push(az + bz);
@@ -4315,10 +4379,14 @@ impl Forth {
 
             Builtin::Vec4Sub => {
                 // ( ax ay az aw bx by bz bw -- rx ry rz rw )
-                let bw = self.pop()?; let bz = self.pop()?;
-                let by = self.pop()?; let bx = self.pop()?;
-                let aw = self.pop()?; let az = self.pop()?;
-                let ay = self.pop()?; let ax = self.pop()?;
+                let bw = self.pop()?;
+                let bz = self.pop()?;
+                let by = self.pop()?;
+                let bx = self.pop()?;
+                let aw = self.pop()?;
+                let az = self.pop()?;
+                let ay = self.pop()?;
+                let ax = self.pop()?;
                 self.data.push(ax - bx);
                 self.data.push(ay - by);
                 self.data.push(az - bz);
@@ -4327,10 +4395,14 @@ impl Forth {
 
             Builtin::Vec4Mul => {
                 // ( ax ay az aw bx by bz bw -- rx ry rz rw )  fixed-point multiply
-                let bw = self.pop()?; let bz = self.pop()?;
-                let by = self.pop()?; let bx = self.pop()?;
-                let aw = self.pop()?; let az = self.pop()?;
-                let ay = self.pop()?; let ax = self.pop()?;
+                let bw = self.pop()?;
+                let bz = self.pop()?;
+                let by = self.pop()?;
+                let bx = self.pop()?;
+                let aw = self.pop()?;
+                let az = self.pop()?;
+                let ay = self.pop()?;
+                let ax = self.pop()?;
                 self.data.push(ax * bx / 1000);
                 self.data.push(ay * by / 1000);
                 self.data.push(az * bz / 1000);
@@ -4340,8 +4412,10 @@ impl Forth {
             Builtin::Vec4Scale => {
                 // ( x y z w s -- rx ry rz rw )  scale all lanes by scalar s (fixed-point)
                 let s = self.pop()?;
-                let w = self.pop()?; let z = self.pop()?;
-                let y = self.pop()?; let x = self.pop()?;
+                let w = self.pop()?;
+                let z = self.pop()?;
+                let y = self.pop()?;
+                let x = self.pop()?;
                 self.data.push(x * s / 1000);
                 self.data.push(y * s / 1000);
                 self.data.push(z * s / 1000);
@@ -4350,10 +4424,14 @@ impl Forth {
 
             Builtin::Vec4Dot => {
                 // ( ax ay az aw bx by bz bw -- dot )
-                let bw = self.pop()?; let bz = self.pop()?;
-                let by = self.pop()?; let bx = self.pop()?;
-                let aw = self.pop()?; let az = self.pop()?;
-                let ay = self.pop()?; let ax = self.pop()?;
+                let bw = self.pop()?;
+                let bz = self.pop()?;
+                let by = self.pop()?;
+                let bx = self.pop()?;
+                let aw = self.pop()?;
+                let az = self.pop()?;
+                let ay = self.pop()?;
+                let ax = self.pop()?;
                 let dot = (ax * bx + ay * by + az * bz + aw * bw) / 1000;
                 self.data.push(dot);
             }
@@ -4363,8 +4441,10 @@ impl Forth {
                 // Fixed-point: x_fp = x_real * 1000.
                 // len_real = sqrt(x_real^2 + ...) = sqrt(x_fp^2 + ...) / 1000
                 // len_fp   = len_real * 1000 = sqrt(x_fp^2 + y_fp^2 + z_fp^2 + w_fp^2)
-                let w = self.pop()?; let z = self.pop()?;
-                let y = self.pop()?; let x = self.pop()?;
+                let w = self.pop()?;
+                let z = self.pop()?;
+                let y = self.pop()?;
+                let x = self.pop()?;
                 let sum_sq = (x * x + y * y + z * z + w * w) as f64;
                 let len = sum_sq.sqrt() as i64;
                 self.data.push(x);
@@ -4378,8 +4458,10 @@ impl Forth {
                 // ( x y z w -- rx ry rz rw )  normalise to unit length (fixed-point).
                 // len_fp = sqrt(x_fp^2 + ...) ; norm_fp = x_fp * 1000 / len_fp
                 // (because norm_real = x_real/len_real = x_fp/len_fp, then *1000 for fp)
-                let w = self.pop()?; let z = self.pop()?;
-                let y = self.pop()?; let x = self.pop()?;
+                let w = self.pop()?;
+                let z = self.pop()?;
+                let y = self.pop()?;
+                let x = self.pop()?;
                 let sum_sq = (x * x + y * y + z * z + w * w) as f64;
                 let len = sum_sq.sqrt();
                 if len < 1e-9 {
@@ -4397,8 +4479,10 @@ impl Forth {
 
             Builtin::Vec4Print => {
                 // ( x y z w -- x y z w )  print without consuming
-                let w = self.pop()?; let z = self.pop()?;
-                let y = self.pop()?; let x = self.pop()?;
+                let w = self.pop()?;
+                let z = self.pop()?;
+                let y = self.pop()?;
+                let x = self.pop()?;
                 self.out.push_str(&format!(
                     "vec4( {:.3} {:.3} {:.3} {:.3} )\n",
                     x as f64 / 1000.0,
@@ -4599,16 +4683,14 @@ impl Forth {
                 // via arg-result, which bails when the named argument failed.
                 let idx_code = self.pop()? as usize;
                 let idx_name = self.pop()? as usize;
-                let code = self
-                    .strings
-                    .get(idx_code)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("argument: invalid code index {idx_code}"))?;
-                let name = self
-                    .strings
-                    .get(idx_name)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("argument: invalid name index {idx_name}"))?;
+                let code =
+                    self.strings.get(idx_code).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("argument: invalid code index {idx_code}")
+                    })?;
+                let name =
+                    self.strings.get(idx_name).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("argument: invalid name index {idx_name}")
+                    })?;
 
                 let saved = std::mem::take(&mut self.data);
                 let eval_result = self.eval(&code);
@@ -4629,13 +4711,11 @@ impl Forth {
                         "✓".green(),
                     ));
                 } else {
-                    self.out.push_str(&format!(
-                        "  argument {:?}  {}\n",
-                        name,
-                        "✗ (failed)".red(),
-                    ));
+                    self.out
+                        .push_str(&format!("  argument {:?}  {}\n", name, "✗ (failed)".red(),));
                 }
-                self.argument_stacks.insert(name, ArgumentResult { stack, passed });
+                self.argument_stacks
+                    .insert(name, ArgumentResult { stack, passed });
             }
             Builtin::ArgResult => {
                 // ( str_name -- val )
@@ -4654,11 +4734,9 @@ impl Forth {
                 if !res.passed {
                     anyhow::bail!("arg-result: argument {:?} failed — cannot propagate", name);
                 }
-                let val = res
-                    .stack
-                    .last()
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("arg-result: argument {:?} left empty stack", name))?;
+                let val = res.stack.last().copied().ok_or_else(|| {
+                    anyhow::anyhow!("arg-result: argument {:?} left empty stack", name)
+                })?;
                 self.push(val)?;
             }
             Builtin::ArgOk => {
@@ -4785,11 +4863,20 @@ impl Forth {
                 let idx_check = self.pop()? as usize;
                 let idx_b = self.pop()? as usize;
                 let idx_a = self.pop()? as usize;
-                let a = self.strings.get(idx_a).cloned()
+                let a = self
+                    .strings
+                    .get(idx_a)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("claim-make: invalid index {idx_a}"))?;
-                let b = self.strings.get(idx_b).cloned()
+                let b = self
+                    .strings
+                    .get(idx_b)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("claim-make: invalid index {idx_b}"))?;
-                let check = self.strings.get(idx_check).cloned()
+                let check = self
+                    .strings
+                    .get(idx_check)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("claim-make: invalid index {idx_check}"))?;
                 let claim = format!("CLAIM\x1f{a}\x1f{b}\x1f{check}");
                 let idx = self.strings.len();
@@ -4801,17 +4888,25 @@ impl Forth {
                 // Unpack a CLAIM triple and run it through gate.
                 // Leaves the gate's result on the stack if it passes; bails if it fails.
                 let idx = self.pop()? as usize;
-                let claim = self.strings.get(idx).cloned()
+                let claim = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("claim-run: invalid index {idx}"))?;
                 let parts: Vec<&str> = claim.splitn(4, '\x1f').collect();
                 if parts.len() != 4 || parts[0] != "CLAIM" {
-                    anyhow::bail!("claim-run: malformed claim (expected CLAIM\\x1fa\\x1fb\\x1fcheck)");
+                    anyhow::bail!(
+                        "claim-run: malformed claim (expected CLAIM\\x1fa\\x1fb\\x1fcheck)"
+                    );
                 }
                 let (a, b, check) = (parts[1], parts[2], parts[3]);
                 // Re-push as string indices and invoke gate logic inline.
-                let ia = self.strings.len(); self.strings.push(a.to_string());
-                let ib = self.strings.len(); self.strings.push(b.to_string());
-                let ic = self.strings.len(); self.strings.push(check.to_string());
+                let ia = self.strings.len();
+                self.strings.push(a.to_string());
+                let ib = self.strings.len();
+                self.strings.push(b.to_string());
+                let ic = self.strings.len();
+                self.strings.push(check.to_string());
                 self.data.push(ia as i64);
                 self.data.push(ib as i64);
                 self.data.push(ic as i64);
@@ -4823,7 +4918,10 @@ impl Forth {
                 // Pushes the top-of-stack result onto the Forth stack so ARM programs
                 // can participate in argue/gate/ergo proofs alongside Forth programs.
                 let idx = self.pop()? as usize;
-                let asm = self.strings.get(idx).cloned()
+                let asm = self
+                    .strings
+                    .get(idx)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("arm-run: invalid index {idx}"))?;
                 let top = crate::coforth::arm_vm::run_asm(&asm)
                     .map_err(|e| anyhow::anyhow!("arm-run: {e}"))?;
@@ -4839,17 +4937,29 @@ impl Forth {
                 //
                 // Either premise may be Forth code or ARM assembly (prefixed "ARM:").
                 // ARM premises are run through the ARM VM; results join the Forth stack.
-                let idx_conc  = self.pop()? as usize;
+                let idx_conc = self.pop()? as usize;
                 let idx_check = self.pop()? as usize;
-                let idx_b     = self.pop()? as usize;
-                let idx_a     = self.pop()? as usize;
-                let conclusion = self.strings.get(idx_conc).cloned()
+                let idx_b = self.pop()? as usize;
+                let idx_a = self.pop()? as usize;
+                let conclusion = self
+                    .strings
+                    .get(idx_conc)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("ergo: invalid conclusion index"))?;
-                let check = self.strings.get(idx_check).cloned()
+                let check = self
+                    .strings
+                    .get(idx_check)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("ergo: invalid check index"))?;
-                let code_a = self.strings.get(idx_a).cloned()
+                let code_a = self
+                    .strings
+                    .get(idx_a)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("ergo: invalid index a"))?;
-                let code_b = self.strings.get(idx_b).cloned()
+                let code_b = self
+                    .strings
+                    .get(idx_b)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("ergo: invalid index b"))?;
 
                 let run_premise = |code: &str, vm: &mut Self| -> anyhow::Result<i64> {
@@ -4861,8 +4971,9 @@ impl Forth {
                         Ok(top)
                     } else {
                         vm.eval(code)?;
-                        let top = vm.data.last().copied()
-                            .ok_or_else(|| anyhow::anyhow!("ergo: premise left empty stack: {code}"))?;
+                        let top = vm.data.last().copied().ok_or_else(|| {
+                            anyhow::anyhow!("ergo: premise left empty stack: {code}")
+                        })?;
                         vm.data = saved;
                         Ok(top)
                     }
@@ -4882,8 +4993,8 @@ impl Forth {
                 use crossterm::style::Stylize;
                 let fmt = |v: i64| match v {
                     -1 => "true".to_string(),
-                    0  => "false".to_string(),
-                    n  => n.to_string(),
+                    0 => "false".to_string(),
+                    n => n.to_string(),
                 };
                 if flag != 0 {
                     self.out.push_str(&format!(
@@ -4914,14 +5025,23 @@ impl Forth {
                 // Proves a ≡ b across a battery of seeds (equality is always the check).
                 // If every seed agrees, installs `: name a ;` into the dictionary.
                 // Bails if any seed disagrees — a word that isn't proven isn't installed.
-                let idx_b    = self.pop()? as usize;
-                let idx_a    = self.pop()? as usize;
+                let idx_b = self.pop()? as usize;
+                let idx_a = self.pop()? as usize;
                 let idx_name = self.pop()? as usize;
-                let name = self.strings.get(idx_name).cloned()
+                let name = self
+                    .strings
+                    .get(idx_name)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("word: invalid name index {idx_name}"))?;
-                let code_a = self.strings.get(idx_a).cloned()
+                let code_a = self
+                    .strings
+                    .get(idx_a)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("word: invalid index a {idx_a}"))?;
-                let code_b = self.strings.get(idx_b).cloned()
+                let code_b = self
+                    .strings
+                    .get(idx_b)
+                    .cloned()
                     .ok_or_else(|| anyhow::anyhow!("word: invalid index b {idx_b}"))?;
 
                 const SEEDS: &[i64] = &[0, 1, -1, 2, -2, 5, -5, 10, -10, 100, -100];
@@ -4954,13 +5074,17 @@ impl Forth {
                         (Some(a), Some(b)) => {
                             self.out.push_str(&format!(
                                 "  word: {}  seed {}  →  {} ≠ {}  {}\n",
-                                name.as_str().cyan(), seed,
-                                a.to_string().red(), b.to_string().red(),
+                                name.as_str().cyan(),
+                                seed,
+                                a.to_string().red(),
+                                b.to_string().red(),
                                 "✗".red(),
                             ));
                             failures += 1;
                         }
-                        _ => { failures += 1; }
+                        _ => {
+                            failures += 1;
+                        }
                     }
                 }
 
@@ -4969,15 +5093,23 @@ impl Forth {
                 if failures > 0 {
                     anyhow::bail!(
                         "word: {} — {} seed(s) disagree; word not installed",
-                        name, failures
+                        name,
+                        failures
                     );
                 }
 
                 // Install the word using the canonical (a) body.
                 // ARM: bodies are proof-only — pick whichever side is plain Forth.
-                let forth_body = if code_a.starts_with("ARM:") { &code_b } else { &code_a };
+                let forth_body = if code_a.starts_with("ARM:") {
+                    &code_b
+                } else {
+                    &code_a
+                };
                 if forth_body.starts_with("ARM:") {
-                    anyhow::bail!("word: {} — at least one body must be plain Forth for installation", name);
+                    anyhow::bail!(
+                        "word: {} — at least one body must be plain Forth for installation",
+                        name
+                    );
                 }
                 let def = format!(": {} {} ;", name, forth_body);
                 // Enqueue for deferred compilation: `word:` is often called inside
@@ -5006,17 +5138,17 @@ impl Forth {
                 // Proves forth ≡ js across a battery of integer seeds.
                 // Stores (en, zh) in quad_descriptions.
                 // Installs the Forth body.
-                let idx_js    = self.pop()? as usize;
+                let idx_js = self.pop()? as usize;
                 let idx_forth = self.pop()? as usize;
-                let idx_zh    = self.pop()? as usize;
-                let idx_en    = self.pop()? as usize;
-                let idx_name  = self.pop()? as usize;
+                let idx_zh = self.pop()? as usize;
+                let idx_en = self.pop()? as usize;
+                let idx_name = self.pop()? as usize;
 
-                let name  = self.strings.get(idx_name).cloned().unwrap_or_default();
-                let en    = self.strings.get(idx_en).cloned().unwrap_or_default();
-                let zh    = self.strings.get(idx_zh).cloned().unwrap_or_default();
+                let name = self.strings.get(idx_name).cloned().unwrap_or_default();
+                let en = self.strings.get(idx_en).cloned().unwrap_or_default();
+                let zh = self.strings.get(idx_zh).cloned().unwrap_or_default();
                 let forth = self.strings.get(idx_forth).cloned().unwrap_or_default();
-                let js    = self.strings.get(idx_js).cloned().unwrap_or_default();
+                let js = self.strings.get(idx_js).cloned().unwrap_or_default();
 
                 // ── Show the two human-language descriptions first ──────────
                 use crossterm::style::Stylize;
@@ -5045,16 +5177,28 @@ impl Forth {
                 // Run a JS expression where `n` is the seed; return integer result.
                 // Requires `node` on PATH; skips proof if node is unavailable.
                 let run_js = |expr: &str, seed: i64| -> Option<i64> {
-                    let script = format!("const n={}; process.stdout.write(String({}));", seed, expr);
+                    let script =
+                        format!("const n={}; process.stdout.write(String({}));", seed, expr);
                     let out = std::process::Command::new("node")
-                        .arg("-e").arg(&script)
-                        .output().ok()?;
-                    if !out.status.success() { return None; }
-                    std::str::from_utf8(&out.stdout).ok()?.trim().parse::<i64>().ok()
+                        .arg("-e")
+                        .arg(&script)
+                        .output()
+                        .ok()?;
+                    if !out.status.success() {
+                        return None;
+                    }
+                    std::str::from_utf8(&out.stdout)
+                        .ok()?
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
                 };
 
                 let node_available = std::process::Command::new("node")
-                    .arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+                    .arg("--version")
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
 
                 for &seed in SEEDS {
                     let rf = run_forth(&forth, seed, self);
@@ -5065,13 +5209,17 @@ impl Forth {
                             (Some(a), Some(b)) => {
                                 self.out.push_str(&format!(
                                     "  quad: {}  seed {}  →  forth={} js={}  {}\n",
-                                    name.as_str().cyan(), seed,
-                                    a.to_string().red(), b.to_string().red(),
+                                    name.as_str().cyan(),
+                                    seed,
+                                    a.to_string().red(),
+                                    b.to_string().red(),
                                     "✗".red(),
                                 ));
                                 failures += 1;
                             }
-                            _ => { failures += 1; }
+                            _ => {
+                                failures += 1;
+                            }
                         }
                     }
                 }
@@ -5081,7 +5229,8 @@ impl Forth {
                 if failures > 0 {
                     anyhow::bail!(
                         "quad: {} — {} seed(s) disagree; word not installed",
-                        name, failures
+                        name,
+                        failures
                     );
                 }
 
@@ -5089,7 +5238,8 @@ impl Forth {
                 self.deferred_defs.push(format!(": {} {} ;", name, forth));
 
                 // ── Store descriptions ──────────────────────────────────────
-                self.quad_descriptions.insert(name.clone(), (en.clone(), zh.clone()));
+                self.quad_descriptions
+                    .insert(name.clone(), (en.clone(), zh.clone()));
 
                 let proof_note = if node_available {
                     format!("({} seeds)", SEEDS.len())
@@ -5680,11 +5830,10 @@ impl Forth {
                 // them in sequence on the current stack.  Words with no Forth body are
                 // skipped silently — they are English, not code.
                 let idx = self.pop()? as usize;
-                let sentence = self
-                    .strings
-                    .get(idx)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("sentence-exec: index {} out of bounds", idx))?;
+                let sentence =
+                    self.strings.get(idx).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("sentence-exec: index {} out of bounds", idx)
+                    })?;
                 static LIB: std::sync::OnceLock<crate::coforth::Library> =
                     std::sync::OnceLock::new();
                 let lib = LIB.get_or_init(crate::coforth::Library::load);
@@ -5785,9 +5934,8 @@ impl Forth {
                     .automation
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("automation is disabled"))?;
-                let result = broker.execute(
-                    crate::runtime::automation::AutomationRequest::Displays,
-                )?;
+                let result =
+                    broker.execute(crate::runtime::automation::AutomationRequest::Displays)?;
                 let idx = self.intern_str(&serde_json::to_string(&result)?);
                 self.data.push(idx as i64);
             }
@@ -5796,9 +5944,8 @@ impl Forth {
                     .automation
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("automation is disabled"))?;
-                let result = broker.execute(
-                    crate::runtime::automation::AutomationRequest::Windows,
-                )?;
+                let result =
+                    broker.execute(crate::runtime::automation::AutomationRequest::Windows)?;
                 let idx = self.intern_str(&serde_json::to_string(&result)?);
                 self.data.push(idx as i64);
             }
@@ -5915,18 +6062,18 @@ impl Forth {
                 let file_idx = self.pop()? as usize;
                 let addr = self.strings.get(addr_idx).cloned().unwrap_or_default();
                 let path = self.strings.get(file_idx).cloned().unwrap_or_default();
-                let val = xlsx_read_cell(&path, None, &addr)
-                    .unwrap_or_else(|e| format!("error: {e}"));
+                let val =
+                    xlsx_read_cell(&path, None, &addr).unwrap_or_else(|e| format!("error: {e}"));
                 let idx = self.intern_str(&val);
                 self.data.push(idx as i64);
             }
             Builtin::XlsxAtSheet => {
-                let addr_idx   = self.pop()? as usize;
-                let sheet_idx  = self.pop()? as usize;
-                let file_idx   = self.pop()? as usize;
-                let addr  = self.strings.get(addr_idx).cloned().unwrap_or_default();
+                let addr_idx = self.pop()? as usize;
+                let sheet_idx = self.pop()? as usize;
+                let file_idx = self.pop()? as usize;
+                let addr = self.strings.get(addr_idx).cloned().unwrap_or_default();
                 let sheet = self.strings.get(sheet_idx).cloned().unwrap_or_default();
-                let path  = self.strings.get(file_idx).cloned().unwrap_or_default();
+                let path = self.strings.get(file_idx).cloned().unwrap_or_default();
                 let val = xlsx_read_cell(&path, Some(&sheet), &addr)
                     .unwrap_or_else(|e| format!("error: {e}"));
                 let idx = self.intern_str(&val);
@@ -5935,17 +6082,16 @@ impl Forth {
             Builtin::XlsxSheets => {
                 let file_idx = self.pop()? as usize;
                 let path = self.strings.get(file_idx).cloned().unwrap_or_default();
-                let names = xlsx_sheet_names(&path)
-                    .unwrap_or_else(|e| format!("error: {e}"));
+                let names = xlsx_sheet_names(&path).unwrap_or_else(|e| format!("error: {e}"));
                 let idx = self.intern_str(&names);
                 self.data.push(idx as i64);
             }
             Builtin::XlsxWriteCell => {
-                let addr_idx  = self.pop()? as usize;
-                let file_idx  = self.pop()? as usize;
-                let val_idx   = self.pop()? as usize;
-                let addr  = self.strings.get(addr_idx).cloned().unwrap_or_default();
-                let path  = self.strings.get(file_idx).cloned().unwrap_or_default();
+                let addr_idx = self.pop()? as usize;
+                let file_idx = self.pop()? as usize;
+                let val_idx = self.pop()? as usize;
+                let addr = self.strings.get(addr_idx).cloned().unwrap_or_default();
+                let path = self.strings.get(file_idx).cloned().unwrap_or_default();
                 let value = self.strings.get(val_idx).cloned().unwrap_or_default();
                 if let Err(e) = xlsx_write_cell(&path, &addr, &value) {
                     self.out.push_str(&format!("xlsx!: {e}\n"));
@@ -5973,9 +6119,9 @@ impl Forth {
             }
             Builtin::B64ToFile => {
                 let path_idx = self.pop()? as usize;
-                let b64_idx  = self.pop()? as usize;
+                let b64_idx = self.pop()? as usize;
                 let path = self.strings.get(path_idx).cloned().unwrap_or_default();
-                let b64  = self.strings.get(b64_idx).cloned().unwrap_or_default();
+                let b64 = self.strings.get(b64_idx).cloned().unwrap_or_default();
                 use base64::Engine as _;
                 match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
                     Ok(bytes) => {
@@ -6000,7 +6146,7 @@ impl Forth {
                 use base64::Engine as _;
                 let result = match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
                     Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                    Err(e)    => format!("error: {e}"),
+                    Err(e) => format!("error: {e}"),
                 };
                 let idx = self.intern_str(&result);
                 self.data.push(idx as i64);
@@ -7680,10 +7826,14 @@ impl Forth {
                 // Zip strings[path_idx] and POST the bytes to {peer}/v1/file/put.
                 let peer_idx = self.pop()? as usize;
                 let path_idx = self.pop()? as usize;
-                let local_path = self.strings.get(path_idx)
+                let local_path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-send: path index out of bounds"))?
                     .clone();
-                let peer = self.strings.get(peer_idx)
+                let peer = self
+                    .strings
+                    .get(peer_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-send: peer index out of bounds"))?
                     .clone();
 
@@ -7695,7 +7845,8 @@ impl Forth {
                     anyhow::bail!("zip-send: path '{}' not found", local_path);
                 }
                 let parent = src.parent().unwrap_or(std::path::Path::new("."));
-                let name = src.file_name()
+                let name = src
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("archive");
 
@@ -7707,7 +7858,8 @@ impl Forth {
                         .compression_method(zip::CompressionMethod::Deflated);
                     self.zip_add_path_to_writer(&mut zip, src, parent, opts)
                         .map_err(|e| anyhow::anyhow!("zip-send: {}", e))?;
-                    zip.finish().map_err(|e| anyhow::anyhow!("zip-send: finish: {}", e))?;
+                    zip.finish()
+                        .map_err(|e| anyhow::anyhow!("zip-send: finish: {}", e))?;
                 }
                 let zip_bytes = buf.into_inner();
 
@@ -7723,7 +7875,8 @@ impl Forth {
                         .timeout(std::time::Duration::from_secs(60))
                         .build()
                         .unwrap_or_default();
-                    let mut req = client.post(&url)
+                    let mut req = client
+                        .post(&url)
                         .header("Content-Type", "application/zip")
                         .body(zip_bytes);
                     if let Some(t) = token {
@@ -7732,7 +7885,11 @@ impl Forth {
                     req.send().await?.text().await
                 });
                 match result {
-                    Ok(body) => self.out.push_str(&format!("zip-send: sent to {} — {}\n", peer, body.trim())),
+                    Ok(body) => self.out.push_str(&format!(
+                        "zip-send: sent to {} — {}\n",
+                        peer,
+                        body.trim()
+                    )),
                     Err(e) => anyhow::bail!("zip-send: {}", e),
                 }
             }
@@ -7742,13 +7899,19 @@ impl Forth {
                 let dest_idx = self.pop()? as usize;
                 let peer_idx = self.pop()? as usize;
                 let path_idx = self.pop()? as usize;
-                let remote_path = self.strings.get(path_idx)
+                let remote_path = self
+                    .strings
+                    .get(path_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-recv: path index out of bounds"))?
                     .clone();
-                let peer = self.strings.get(peer_idx)
+                let peer = self
+                    .strings
+                    .get(peer_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-recv: peer index out of bounds"))?
                     .clone();
-                let dest = self.strings.get(dest_idx)
+                let dest = self
+                    .strings
+                    .get(dest_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-recv: dest index out of bounds"))?
                     .clone();
 
@@ -7760,8 +7923,11 @@ impl Forth {
                 } else {
                     format!("http://{}", peer)
                 };
-                let url = format!("{}/v1/file/get?path={}", base_url,
-                    urlencoding_encode(&remote_path));
+                let url = format!(
+                    "{}/v1/file/get?path={}",
+                    base_url,
+                    urlencoding_encode(&remote_path)
+                );
 
                 let zip_bytes = futures::executor::block_on(async {
                     let client = reqwest::Client::builder()
@@ -7776,7 +7942,11 @@ impl Forth {
                     if !resp.status().is_success() {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
-                        return Err(anyhow::anyhow!("zip-recv: peer returned {}: {}", status, body));
+                        return Err(anyhow::anyhow!(
+                            "zip-recv: peer returned {}: {}",
+                            status,
+                            body
+                        ));
                     }
                     let bytes = resp.bytes().await?;
                     Ok::<Vec<u8>, anyhow::Error>(bytes.to_vec())
@@ -7785,21 +7955,28 @@ impl Forth {
                 std::fs::create_dir_all(&dest)
                     .map_err(|e| anyhow::anyhow!("zip-recv: mkdir {}: {}", dest, e))?;
                 let dest_path = std::path::Path::new(&dest);
-                let dest_canon = std::fs::canonicalize(dest_path)
-                    .unwrap_or_else(|_| dest_path.to_path_buf());
+                let dest_canon =
+                    std::fs::canonicalize(dest_path).unwrap_or_else(|_| dest_path.to_path_buf());
                 let cursor = std::io::Cursor::new(zip_bytes);
                 let mut archive = zip::ZipArchive::new(cursor)
                     .map_err(|e| anyhow::anyhow!("zip-recv: bad zip: {}", e))?;
                 for i in 0..archive.len() {
-                    let mut entry = archive.by_index(i)
+                    let mut entry = archive
+                        .by_index(i)
                         .map_err(|e| anyhow::anyhow!("zip-recv: entry {}: {}", i, e))?;
                     let out_path = dest_path.join(entry.name());
                     // Zip-slip guard: normalize and verify stays inside dest.
                     let out_norm = out_path.components().fold(
                         std::path::PathBuf::new(),
                         |mut acc, c| match c {
-                            std::path::Component::ParentDir => { acc.pop(); acc }
-                            _ => { acc.push(c); acc }
+                            std::path::Component::ParentDir => {
+                                acc.pop();
+                                acc
+                            }
+                            _ => {
+                                acc.push(c);
+                                acc
+                            }
                         },
                     );
                     if !out_norm.starts_with(&dest_canon) && !out_norm.starts_with(dest_path) {
@@ -7808,20 +7985,29 @@ impl Forth {
                     if entry.is_dir() {
                         std::fs::create_dir_all(&out_path).ok();
                     } else {
-                        if let Some(p) = out_path.parent() { std::fs::create_dir_all(p).ok(); }
-                        let mut out = std::fs::File::create(&out_path)
-                            .map_err(|e| anyhow::anyhow!("zip-recv: create {}: {}", out_path.display(), e))?;
-                        std::io::copy(&mut entry, &mut out)
-                            .map_err(|e| anyhow::anyhow!("zip-recv: copy {}: {}", out_path.display(), e))?;
+                        if let Some(p) = out_path.parent() {
+                            std::fs::create_dir_all(p).ok();
+                        }
+                        let mut out = std::fs::File::create(&out_path).map_err(|e| {
+                            anyhow::anyhow!("zip-recv: create {}: {}", out_path.display(), e)
+                        })?;
+                        std::io::copy(&mut entry, &mut out).map_err(|e| {
+                            anyhow::anyhow!("zip-recv: copy {}: {}", out_path.display(), e)
+                        })?;
                     }
                 }
-                self.out.push_str(&format!("zip-recv: {} entries extracted to {}\n",
-                    archive.len(), dest));
+                self.out.push_str(&format!(
+                    "zip-recv: {} entries extracted to {}\n",
+                    archive.len(),
+                    dest
+                ));
             }
             Builtin::ZipList => {
                 // ( zip-idx -- )  print entry names, sizes, and compression methods.
                 let zip_idx = self.pop()? as usize;
-                let zip_path = self.strings.get(zip_idx)
+                let zip_path = self
+                    .strings
+                    .get(zip_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-list: index out of bounds"))?
                     .clone();
                 let file = std::fs::File::open(&zip_path)
@@ -7830,18 +8016,22 @@ impl Forth {
                     .map_err(|e| anyhow::anyhow!("zip-list: bad zip: {}", e))?;
                 let count = archive.len();
                 for i in 0..count {
-                    let entry = archive.by_index_raw(i)
+                    let entry = archive
+                        .by_index_raw(i)
                         .map_err(|e| anyhow::anyhow!("zip-list: entry {}: {}", i, e))?;
                     let method = match entry.compression() {
-                        zip::CompressionMethod::Stored   => "stored",
+                        zip::CompressionMethod::Stored => "stored",
                         zip::CompressionMethod::Deflated => "deflated",
-                        zip::CompressionMethod::Bzip2    => "bzip2",
-                        zip::CompressionMethod::Zstd     => "zstd",
-                        _                                => "?",
+                        zip::CompressionMethod::Bzip2 => "bzip2",
+                        zip::CompressionMethod::Zstd => "zstd",
+                        _ => "?",
                     };
                     self.out.push_str(&format!(
                         "{:>12}  {:>12}  {:8}  {}\n",
-                        entry.size(), entry.compressed_size(), method, entry.name()
+                        entry.size(),
+                        entry.compressed_size(),
+                        method,
+                        entry.name()
                     ));
                 }
                 self.out.push_str(&format!("{} entries\n", count));
@@ -7849,7 +8039,9 @@ impl Forth {
             Builtin::ZipCount => {
                 // ( zip-idx -- n )  push number of entries in the archive.
                 let zip_idx = self.pop()? as usize;
-                let zip_path = self.strings.get(zip_idx)
+                let zip_path = self
+                    .strings
+                    .get(zip_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-count: index out of bounds"))?
                     .clone();
                 let file = std::fs::File::open(&zip_path)
@@ -7863,14 +8055,20 @@ impl Forth {
                 // Extract the single entry whose name matches strings[name_idx] into dest dir.
                 let dest_idx = self.pop()? as usize;
                 let name_idx = self.pop()? as usize;
-                let zip_idx  = self.pop()? as usize;
-                let zip_path = self.strings.get(zip_idx)
+                let zip_idx = self.pop()? as usize;
+                let zip_path = self
+                    .strings
+                    .get(zip_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-entry: zip index out of bounds"))?
                     .clone();
-                let entry_name = self.strings.get(name_idx)
+                let entry_name = self
+                    .strings
+                    .get(name_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-entry: name index out of bounds"))?
                     .clone();
-                let dest = self.strings.get(dest_idx)
+                let dest = self
+                    .strings
+                    .get(dest_idx)
                     .ok_or_else(|| anyhow::anyhow!("zip-entry: dest index out of bounds"))?
                     .clone();
 
@@ -7878,8 +8076,9 @@ impl Forth {
                     .map_err(|e| anyhow::anyhow!("zip-entry: open {}: {}", zip_path, e))?;
                 let mut archive = zip::ZipArchive::new(file)
                     .map_err(|e| anyhow::anyhow!("zip-entry: bad zip: {}", e))?;
-                let mut entry = archive.by_name(&entry_name)
-                    .map_err(|_| anyhow::anyhow!("zip-entry: '{}' not found in archive", entry_name))?;
+                let mut entry = archive.by_name(&entry_name).map_err(|_| {
+                    anyhow::anyhow!("zip-entry: '{}' not found in archive", entry_name)
+                })?;
 
                 let dest_path = std::path::Path::new(&dest);
                 std::fs::create_dir_all(dest_path)
@@ -7891,20 +8090,28 @@ impl Forth {
                     .and_then(|n| n.to_str())
                     .unwrap_or(entry.name());
                 let out_path = dest_path.join(filename);
-                let mut out = std::fs::File::create(&out_path)
-                    .map_err(|e| anyhow::anyhow!("zip-entry: create {}: {}", out_path.display(), e))?;
+                let mut out = std::fs::File::create(&out_path).map_err(|e| {
+                    anyhow::anyhow!("zip-entry: create {}: {}", out_path.display(), e)
+                })?;
                 std::io::copy(&mut entry, &mut out)
                     .map_err(|e| anyhow::anyhow!("zip-entry: copy: {}", e))?;
-                self.out.push_str(&format!("extracted: {}\n", out_path.display()));
+                self.out
+                    .push_str(&format!("extracted: {}\n", out_path.display()));
             }
             Builtin::ZipStored => {
                 // ( src-idx dest-idx -- )  zip with no compression (fastest, largest).
                 let dest_idx = self.pop()? as usize;
-                let src_idx  = self.pop()? as usize;
-                let src_s = self.strings.get(src_idx)
-                    .ok_or_else(|| anyhow::anyhow!("zip-stored: src index out of bounds"))?.clone();
-                let dest_s = self.strings.get(dest_idx)
-                    .ok_or_else(|| anyhow::anyhow!("zip-stored: dest index out of bounds"))?.clone();
+                let src_idx = self.pop()? as usize;
+                let src_s = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("zip-stored: src index out of bounds"))?
+                    .clone();
+                let dest_s = self
+                    .strings
+                    .get(dest_idx)
+                    .ok_or_else(|| anyhow::anyhow!("zip-stored: dest index out of bounds"))?
+                    .clone();
                 let src = std::path::Path::new(&src_s);
                 let parent = src.parent().unwrap_or(std::path::Path::new("."));
                 let file = std::fs::File::create(&dest_s)
@@ -7914,16 +8121,23 @@ impl Forth {
                     .compression_method(zip::CompressionMethod::Stored);
                 self.zip_add_path_to_writer(&mut zip, src, parent, opts)
                     .map_err(|e| anyhow::anyhow!("zip-stored: {}", e))?;
-                zip.finish().map_err(|e| anyhow::anyhow!("zip-stored: finish: {}", e))?;
+                zip.finish()
+                    .map_err(|e| anyhow::anyhow!("zip-stored: finish: {}", e))?;
             }
             Builtin::ZipBzip2 => {
                 // ( src-idx dest-idx -- )  zip with Bzip2 compression (good ratio, slower).
                 let dest_idx = self.pop()? as usize;
-                let src_idx  = self.pop()? as usize;
-                let src_s = self.strings.get(src_idx)
-                    .ok_or_else(|| anyhow::anyhow!("zip-bzip2: src index out of bounds"))?.clone();
-                let dest_s = self.strings.get(dest_idx)
-                    .ok_or_else(|| anyhow::anyhow!("zip-bzip2: dest index out of bounds"))?.clone();
+                let src_idx = self.pop()? as usize;
+                let src_s = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("zip-bzip2: src index out of bounds"))?
+                    .clone();
+                let dest_s = self
+                    .strings
+                    .get(dest_idx)
+                    .ok_or_else(|| anyhow::anyhow!("zip-bzip2: dest index out of bounds"))?
+                    .clone();
                 let src = std::path::Path::new(&src_s);
                 let parent = src.parent().unwrap_or(std::path::Path::new("."));
                 let file = std::fs::File::create(&dest_s)
@@ -7933,16 +8147,23 @@ impl Forth {
                     .compression_method(zip::CompressionMethod::Bzip2);
                 self.zip_add_path_to_writer(&mut zip, src, parent, opts)
                     .map_err(|e| anyhow::anyhow!("zip-bzip2: {}", e))?;
-                zip.finish().map_err(|e| anyhow::anyhow!("zip-bzip2: finish: {}", e))?;
+                zip.finish()
+                    .map_err(|e| anyhow::anyhow!("zip-bzip2: finish: {}", e))?;
             }
             Builtin::ZipZstd => {
                 // ( src-idx dest-idx -- )  zip with Zstd compression (best ratio + speed).
                 let dest_idx = self.pop()? as usize;
-                let src_idx  = self.pop()? as usize;
-                let src_s = self.strings.get(src_idx)
-                    .ok_or_else(|| anyhow::anyhow!("zip-zstd: src index out of bounds"))?.clone();
-                let dest_s = self.strings.get(dest_idx)
-                    .ok_or_else(|| anyhow::anyhow!("zip-zstd: dest index out of bounds"))?.clone();
+                let src_idx = self.pop()? as usize;
+                let src_s = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("zip-zstd: src index out of bounds"))?
+                    .clone();
+                let dest_s = self
+                    .strings
+                    .get(dest_idx)
+                    .ok_or_else(|| anyhow::anyhow!("zip-zstd: dest index out of bounds"))?
+                    .clone();
                 let src = std::path::Path::new(&src_s);
                 let parent = src.parent().unwrap_or(std::path::Path::new("."));
                 let file = std::fs::File::create(&dest_s)
@@ -7952,18 +8173,25 @@ impl Forth {
                     .compression_method(zip::CompressionMethod::Zstd);
                 self.zip_add_path_to_writer(&mut zip, src, parent, opts)
                     .map_err(|e| anyhow::anyhow!("zip-zstd: {}", e))?;
-                zip.finish().map_err(|e| anyhow::anyhow!("zip-zstd: finish: {}", e))?;
+                zip.finish()
+                    .map_err(|e| anyhow::anyhow!("zip-zstd: finish: {}", e))?;
             }
             Builtin::ZipLevel => {
                 // ( src-idx dest-idx level -- )
                 // level 0 = Stored, 1-9 = Deflated at that level.
-                let level    = self.pop()?;
+                let level = self.pop()?;
                 let dest_idx = self.pop()? as usize;
-                let src_idx  = self.pop()? as usize;
-                let src_s = self.strings.get(src_idx)
-                    .ok_or_else(|| anyhow::anyhow!("zip-level: src index out of bounds"))?.clone();
-                let dest_s = self.strings.get(dest_idx)
-                    .ok_or_else(|| anyhow::anyhow!("zip-level: dest index out of bounds"))?.clone();
+                let src_idx = self.pop()? as usize;
+                let src_s = self
+                    .strings
+                    .get(src_idx)
+                    .ok_or_else(|| anyhow::anyhow!("zip-level: src index out of bounds"))?
+                    .clone();
+                let dest_s = self
+                    .strings
+                    .get(dest_idx)
+                    .ok_or_else(|| anyhow::anyhow!("zip-level: dest index out of bounds"))?
+                    .clone();
                 if !(0..=9).contains(&level) {
                     anyhow::bail!("zip-level: level must be 0–9, got {}", level);
                 }
@@ -7982,7 +8210,8 @@ impl Forth {
                 };
                 self.zip_add_path_to_writer(&mut zip, src, parent, opts)
                     .map_err(|e| anyhow::anyhow!("zip-level: {}", e))?;
-                zip.finish().map_err(|e| anyhow::anyhow!("zip-level: finish: {}", e))?;
+                zip.finish()
+                    .map_err(|e| anyhow::anyhow!("zip-level: finish: {}", e))?;
             }
             Builtin::Nonce => {
                 use rand::RngCore;
@@ -10495,9 +10724,20 @@ fn read_xlsx_file(path: &str) -> String {
 
 /// Parse a spreadsheet cell address like "B3", "$C$12", "AA100" → (row, col) 0-indexed.
 fn parse_cell_addr(addr: &str) -> Option<(u32, u32)> {
-    let stripped: String = addr.trim().to_uppercase().chars().filter(|&c| c != '$').collect();
-    let col_str: String = stripped.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-    let row_str: String = stripped.chars().skip_while(|c| c.is_ascii_alphabetic()).collect();
+    let stripped: String = addr
+        .trim()
+        .to_uppercase()
+        .chars()
+        .filter(|&c| c != '$')
+        .collect();
+    let col_str: String = stripped
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    let row_str: String = stripped
+        .chars()
+        .skip_while(|c| c.is_ascii_alphabetic())
+        .collect();
     if col_str.is_empty() || row_str.is_empty() {
         return None;
     }
@@ -10519,7 +10759,11 @@ fn data_to_string(cell: &calamine::Data) -> String {
         Data::Empty => String::new(),
         Data::String(s) => s.clone(),
         Data::Float(f) => {
-            if f.fract() == 0.0 { format!("{}", *f as i64) } else { format!("{f}") }
+            if f.fract() == 0.0 {
+                format!("{}", *f as i64)
+            } else {
+                format!("{f}")
+            }
         }
         Data::Int(i) => format!("{i}"),
         Data::Bool(b) => format!("{b}"),
@@ -10531,18 +10775,20 @@ fn data_to_string(cell: &calamine::Data) -> String {
 /// Read one cell from an xlsx/xls/ods file.  Sheet name `None` → first sheet.
 pub(crate) fn xlsx_read_cell(path: &str, sheet: Option<&str>, addr: &str) -> Result<String> {
     use calamine::{open_workbook_auto, Reader};
-    let (row, col) = parse_cell_addr(addr)
-        .ok_or_else(|| anyhow::anyhow!("invalid cell address: {addr}"))?;
-    let mut wb = open_workbook_auto(path)
-        .map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
+    let (row, col) =
+        parse_cell_addr(addr).ok_or_else(|| anyhow::anyhow!("invalid cell address: {addr}"))?;
+    let mut wb =
+        open_workbook_auto(path).map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
     let sheet_name = match sheet {
         Some(s) => s.to_string(),
-        None => wb.sheet_names()
+        None => wb
+            .sheet_names()
             .first()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("{path}: no sheets found"))?,
     };
-    let range = wb.worksheet_range(&sheet_name)
+    let range = wb
+        .worksheet_range(&sheet_name)
         .map_err(|e| anyhow::anyhow!("cannot read sheet '{sheet_name}': {e}"))?;
     let cell = range.get((row as usize, col as usize));
     Ok(cell.map(data_to_string).unwrap_or_default())
@@ -10551,8 +10797,7 @@ pub(crate) fn xlsx_read_cell(path: &str, sheet: Option<&str>, addr: &str) -> Res
 /// List sheet names in an xlsx/xls/ods file, newline-separated.
 fn xlsx_sheet_names(path: &str) -> Result<String> {
     use calamine::{open_workbook_auto, Reader};
-    let wb = open_workbook_auto(path)
-        .map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
+    let wb = open_workbook_auto(path).map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
     Ok(wb.sheet_names().join("\n"))
 }
 
@@ -10562,16 +10807,18 @@ fn xlsx_write_cell(path: &str, addr: &str, value: &str) -> Result<()> {
     use calamine::{open_workbook_auto, Reader};
     use rust_xlsxwriter::Workbook;
 
-    let (target_row, target_col) = parse_cell_addr(addr)
-        .ok_or_else(|| anyhow::anyhow!("invalid cell address: {addr}"))?;
+    let (target_row, target_col) =
+        parse_cell_addr(addr).ok_or_else(|| anyhow::anyhow!("invalid cell address: {addr}"))?;
 
-    let mut wb_in = open_workbook_auto(path)
-        .map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
-    let sheet_name = wb_in.sheet_names()
+    let mut wb_in =
+        open_workbook_auto(path).map_err(|e| anyhow::anyhow!("cannot open {path}: {e}"))?;
+    let sheet_name = wb_in
+        .sheet_names()
         .first()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("{path}: no sheets found"))?;
-    let range = wb_in.worksheet_range(&sheet_name)
+    let range = wb_in
+        .worksheet_range(&sheet_name)
         .map_err(|e| anyhow::anyhow!("cannot read sheet: {e}"))?;
 
     let mut workbook = Workbook::new();
@@ -10616,26 +10863,24 @@ pub(crate) fn load_file(path: &str) -> String {
 
     match ext.as_str() {
         "xlsx" | "xls" | "ods" => load_xlsx_as_csv(path),
-        "zip"                  => load_zip_listing(path),
-        "csv"                  => std::fs::read_to_string(path)
-                                    .unwrap_or_else(|e| format!("error: {e}")),
-        _                      => std::fs::read_to_string(path)
-                                    .unwrap_or_else(|e| format!("error: {e}")),
+        "zip" => load_zip_listing(path),
+        "csv" => std::fs::read_to_string(path).unwrap_or_else(|e| format!("error: {e}")),
+        _ => std::fs::read_to_string(path).unwrap_or_else(|e| format!("error: {e}")),
     }
 }
 
 fn load_xlsx_as_csv(path: &str) -> String {
     use calamine::{open_workbook_auto, Reader};
     let mut wb = match open_workbook_auto(path) {
-        Ok(w)  => w,
+        Ok(w) => w,
         Err(e) => return format!("error: cannot open {path}: {e}"),
     };
     let sheet_name = match wb.sheet_names().first().cloned() {
         Some(n) => n,
-        None    => return format!("error: {path}: no sheets found"),
+        None => return format!("error: {path}: no sheets found"),
     };
     let range = match wb.worksheet_range(&sheet_name) {
-        Ok(r)  => r,
+        Ok(r) => r,
         Err(e) => return format!("error: cannot read sheet: {e}"),
     };
     let mut out = String::new();
@@ -10649,11 +10894,11 @@ fn load_xlsx_as_csv(path: &str) -> String {
 
 fn load_zip_listing(path: &str) -> String {
     let file = match std::fs::File::open(path) {
-        Ok(f)  => f,
+        Ok(f) => f,
         Err(e) => return format!("error: cannot open {path}: {e}"),
     };
     let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a)  => a,
+        Ok(a) => a,
         Err(e) => return format!("error: not a valid zip: {e}"),
     };
     let mut out = String::new();
@@ -10920,12 +11165,20 @@ fn run_define_scatter(
 /// Returns true if `n` is a prime number.
 /// Handles n < 2, even numbers, and trial division up to sqrt(n).
 fn is_prime(n: i64) -> bool {
-    if n < 2 { return false; }
-    if n == 2 { return true; }
-    if n % 2 == 0 { return false; }
+    if n < 2 {
+        return false;
+    }
+    if n == 2 {
+        return true;
+    }
+    if n % 2 == 0 {
+        return false;
+    }
     let mut i = 3i64;
     while i * i <= n {
-        if n % i == 0 { return false; }
+        if n % i == 0 {
+            return false;
+        }
         i += 2;
     }
     true
@@ -11040,13 +11293,13 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "agent-await" => Builtin::AgentAwait,
         "agent-cancel" => Builtin::AgentCancel,
         "applescript" => Builtin::AppleScript,
-        "xlsx@"      => Builtin::XlsxAt,
-        "xlsx@/"     => Builtin::XlsxAtSheet,
+        "xlsx@" => Builtin::XlsxAt,
+        "xlsx@/" => Builtin::XlsxAtSheet,
         "xlsx-sheets" => Builtin::XlsxSheets,
-        "xlsx!"      => Builtin::XlsxWriteCell,
-        "load"       => Builtin::Load,
-        "file>b64"   => Builtin::FileToB64,
-        "b64>file"   => Builtin::B64ToFile,
+        "xlsx!" => Builtin::XlsxWriteCell,
+        "load" => Builtin::Load,
+        "file>b64" => Builtin::FileToB64,
+        "b64>file" => Builtin::B64ToFile,
         "b64-encode" => Builtin::B64Encode,
         "b64-decode" => Builtin::B64Decode,
         "sin" => Builtin::Sin,
@@ -11208,7 +11461,7 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "rooms" => Builtin::RoomList,
         "room-new" => Builtin::RoomNew,
         // Proof / solving
-        "solve" => Builtin::Solve,   // ( prog-idx target -- n )  find n s.t. prog[_:=n] leaves target on stack
+        "solve" => Builtin::Solve, // ( prog-idx target -- n )  find n s.t. prog[_:=n] leaves target on stack
         "sort" => Builtin::SortLines,
         "sort-lines" => Builtin::SortLines,
 
@@ -11221,15 +11474,15 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "prove-effect" => Builtin::ProveEffect,
         "same-effect?" => Builtin::SameEffect,
         // Vec4 — four lanes walking in lockstep
-        "vec4"      => Builtin::Vec4New,
-        "v+"        => Builtin::Vec4Add,
-        "v-"        => Builtin::Vec4Sub,
-        "v*"        => Builtin::Vec4Mul,
-        "vscale"    => Builtin::Vec4Scale,
-        "vdot"      => Builtin::Vec4Dot,
-        "vlen"      => Builtin::Vec4Len,
-        "vnorm"     => Builtin::Vec4Norm,
-        "vprint"    => Builtin::Vec4Print,
+        "vec4" => Builtin::Vec4New,
+        "v+" => Builtin::Vec4Add,
+        "v-" => Builtin::Vec4Sub,
+        "v*" => Builtin::Vec4Mul,
+        "vscale" => Builtin::Vec4Scale,
+        "vdot" => Builtin::Vec4Dot,
+        "vlen" => Builtin::Vec4Len,
+        "vnorm" => Builtin::Vec4Norm,
+        "vprint" => Builtin::Vec4Print,
         _ => return None,
     })
 }
@@ -11248,25 +11501,42 @@ pub fn extract_comments(src: &str) -> Vec<String> {
             chars.next();
             let mut comment = String::new();
             for c2 in chars.by_ref() {
-                if c2 == '\n' { break; }
+                if c2 == '\n' {
+                    break;
+                }
                 comment.push(c2);
             }
             let c = comment.trim().to_string();
-            if !c.is_empty() { comments.push(c); }
+            if !c.is_empty() {
+                comments.push(c);
+            }
         } else if c == '(' && tok.is_empty() {
             chars.next();
             let mut comment = String::new();
             let mut depth = 1;
             for c2 in chars.by_ref() {
-                if c2 == '(' { depth += 1; comment.push(c2); }
-                else if c2 == ')' { depth -= 1; if depth == 0 { break; } comment.push(c2); }
-                else { comment.push(c2); }
+                if c2 == '(' {
+                    depth += 1;
+                    comment.push(c2);
+                } else if c2 == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    comment.push(c2);
+                } else {
+                    comment.push(c2);
+                }
             }
             let c = comment.trim().to_string();
             // Skip pure stack-effect comments like "( a b -- c )"
-            if !c.is_empty() && !c.contains("--") { comments.push(c); }
+            if !c.is_empty() && !c.contains("--") {
+                comments.push(c);
+            }
         } else if c.is_whitespace() {
-            if !tok.is_empty() { tok.clear(); }
+            if !tok.is_empty() {
+                tok.clear();
+            }
             chars.next();
         } else {
             tok.push(c);
@@ -13034,13 +13304,18 @@ mod tests {
         // Simpler: define "double" as a Forth word, then verify sentence-exec runs it.
         // We test the core: after sentence-exec, the stack reflects each word's body.
         // Since the seed library may not have numeric words, test a word that IS defined.
-        let out = Forth::run(r#"
+        let out = Forth::run(
+            r#"
 : double  2 * ;
 s" double" sentence-exec
-"#);
+"#,
+        );
         // "double" is a user-defined Forth word but sentence-exec only runs library words.
         // Expect either silent skip or the no-executable-words note.
-        assert!(out.is_ok(), "sentence-exec must not crash on unknown library words");
+        assert!(
+            out.is_ok(),
+            "sentence-exec must not crash on unknown library words"
+        );
     }
 
     #[test]
@@ -13056,10 +13331,12 @@ s" double" sentence-exec
     fn test_word_def_installs_and_proves() {
         // word: proves two bodies agree on all seeds, then installs the word.
         // After word:, `4 double` must push 8.
-        let out = Forth::run(r#"
+        let out = Forth::run(
+            r#"
 s" double"  s" 2 *"  s" dup +"  word:
 4 double .
-"#)
+"#,
+        )
         .unwrap();
         assert!(out.contains("∴"), "word: must print proof line: {out}");
         assert!(out.contains("8"), "installed word must work: {out}");
@@ -13083,7 +13360,10 @@ s" double"  s" 2 *"  s" dup +"  word:
              5 dbl .",
         )
         .unwrap();
-        assert!(out.contains("10"), "installed word dbl must compute 5+5=10: {out}");
+        assert!(
+            out.contains("10"),
+            "installed word dbl must compute 5+5=10: {out}"
+        );
         assert!(out.contains("∴"), "word: must emit proof line: {out}");
     }
 
@@ -13101,7 +13381,10 @@ s" double"  s" 2 *"  s" dup +"  word:
         )
         .unwrap();
         assert!(out.contains("EN"), "quad: must show EN label: {out}");
-        assert!(out.contains("multiply by 3"), "quad: must show english: {out}");
+        assert!(
+            out.contains("multiply by 3"),
+            "quad: must show english: {out}"
+        );
         assert!(out.contains("三倍"), "quad: must show chinese: {out}");
         assert!(out.contains("12"), "installed word triple(4)=12: {out}");
     }
@@ -13119,9 +13402,16 @@ s" double"  s" 2 *"  s" dup +"  word:
              quad:",
         );
         let node_ok = std::process::Command::new("node")
-            .arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
         if node_ok {
-            assert!(result.is_err(), "quad: must fail when forth≠js: {:?}", result);
+            assert!(
+                result.is_err(),
+                "quad: must fail when forth≠js: {:?}",
+                result
+            );
         }
         // If node is absent, install succeeds (proof skipped gracefully).
     }
@@ -13155,7 +13445,10 @@ s" double"  s" 2 *"  s" dup +"  word:
         ];
         for (prog, expected) in cases {
             let out = Forth::run(prog).unwrap();
-            assert!(out.trim().contains(expected), "prime? {prog}: expected {expected}, got {out}");
+            assert!(
+                out.trim().contains(expected),
+                "prime? {prog}: expected {expected}, got {out}"
+            );
         }
     }
 
@@ -13163,13 +13456,16 @@ s" double"  s" 2 *"  s" dup +"  word:
     fn test_next_prime() {
         let cases = [
             ("10 next-prime .", "11"),
-            ("11 next-prime .", "11"),  // 11 is prime — returns itself
-            ("2 next-prime .", "2"),    // 2 is prime — returns itself
+            ("11 next-prime .", "11"), // 11 is prime — returns itself
+            ("2 next-prime .", "2"),   // 2 is prime — returns itself
             ("14 next-prime .", "17"),
         ];
         for (prog, expected) in cases {
             let out = Forth::run(prog).unwrap();
-            assert!(out.trim().contains(expected), "next-prime {prog}: expected {expected}, got {out}");
+            assert!(
+                out.trim().contains(expected),
+                "next-prime {prog}: expected {expected}, got {out}"
+            );
         }
     }
 
@@ -13907,35 +14203,48 @@ s" double"  s" 2 *"  s" dup +"  word:
     #[test]
     fn test_argument_result_feeds_successor() {
         // arg-result pushes the top of a named argument's stack.
-        let out = Forth::run(r#"
+        let out = Forth::run(
+            r#"
 s" square" s" 3 dup *" argument
 s" square" arg-result .
-"#)
+"#,
+        )
         .unwrap();
         // 3*3 = 9
-        assert!(out.contains("9"), "arg-result must yield predecessor top: {out}");
+        assert!(
+            out.contains("9"),
+            "arg-result must yield predecessor top: {out}"
+        );
     }
 
     #[test]
     fn test_argument_ok_true_when_passed() {
         let out = Forth::run(r#"s" a" s" 1 1 +" argument  s" a" arg-ok? ."#).unwrap();
-        assert!(out.contains("-1") || out.contains("true"), "arg-ok? must be -1 when passed: {out}");
+        assert!(
+            out.contains("-1") || out.contains("true"),
+            "arg-ok? must be -1 when passed: {out}"
+        );
     }
 
     #[test]
     fn test_argument_ok_false_when_unknown() {
         // arg-ok? returns 0 (false) for unknown names — does not bail.
         let out = Forth::run(r#"s" no-such-thing" arg-ok? ."#).unwrap();
-        assert!(out.contains("0") || out.contains("false"), "arg-ok? must be 0 for unknown: {out}");
+        assert!(
+            out.contains("0") || out.contains("false"),
+            "arg-ok? must be 0 for unknown: {out}"
+        );
     }
 
     #[test]
     fn test_argument_failure_poisons_dependent() {
         // arg-result on a failed argument must bail.
-        let result = Forth::run(r#"
+        let result = Forth::run(
+            r#"
 s" bad" s" 1 0 /" argument
 s" bad" arg-result .
-"#);
+"#,
+        );
         // Either the division fails (bail from eval) or arg-result bails — either way Err.
         // The top-level may catch the inner failure; what matters is arg-result bails.
         // Accept: either the whole run fails, OR arg-result outputs nothing useful.
@@ -13944,8 +14253,10 @@ s" bad" arg-result .
             Err(_) => {} // poisoned — correct
             Ok(out) => {
                 // If somehow the division didn't error, arg-result must still report failure
-                assert!(!out.contains("✗") || out.is_empty() || out.contains("failed"),
-                    "poisoned argument must not propagate a result: {out}");
+                assert!(
+                    !out.contains("✗") || out.is_empty() || out.contains("failed"),
+                    "poisoned argument must not propagate a result: {out}"
+                );
             }
         }
     }
@@ -13959,8 +14270,14 @@ s" bad" arg-result .
         // argument's stack (300 on top) must not bleed into the caller's `.` output.
         let dot_output: Vec<&str> = out.lines().filter(|l| !l.contains("argument")).collect();
         let joined = dot_output.join(" ");
-        assert!(joined.contains("42"), "caller stack must be 42 after argument: {out}");
-        assert!(!joined.contains("300"), "argument stack must not leak to caller: {out}");
+        assert!(
+            joined.contains("42"),
+            "caller stack must be 42 after argument: {out}"
+        );
+        assert!(
+            !joined.contains("300"),
+            "argument stack must not leak to caller: {out}"
+        );
     }
 
     #[test]
@@ -14297,20 +14614,30 @@ mod channel_tests {
     fn test_same_effect_proves_equivalence() {
         // `2 3 +` and `5` both have effect ( -- n )
         let out = Forth::run(r#"s" 2 3 +" s" 5" same-effect? ."#).unwrap();
-        assert!(out.trim().ends_with("-1"), "expected -1 (same effect): {out}");
+        assert!(
+            out.trim().ends_with("-1"),
+            "expected -1 (same effect): {out}"
+        );
     }
 
     #[test]
     fn test_same_effect_detects_difference() {
         // `dup` ( n -- n n ) vs `drop` ( n -- ) — different effects
         let out = Forth::run(r#"s" dup" s" drop" same-effect? ."#).unwrap();
-        assert!(out.trim().ends_with('0'), "expected 0 (different effect): {out}");
+        assert!(
+            out.trim().ends_with('0'),
+            "expected 0 (different effect): {out}"
+        );
     }
 
     #[test]
     fn test_prove_effect_word_formats_correctly() {
         let out = Forth::run(r#"s" 2 3 +" prove-effect type"#).unwrap();
-        assert!(out.contains("( -- a )") || out.contains("( -- "), "got: {out}");
+        let compact = out.split_whitespace().collect::<String>();
+        assert!(
+            compact == "(--a)",
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -14336,14 +14663,16 @@ mod channel_tests {
     fn test_vec4_add_lane_wise() {
         // 1.0 2.0 3.0 4.0  +  5.0 6.0 7.0 8.0  =  6.0 8.0 10.0 12.0
         let mut vm = Forth::new();
-        vm.exec("1000 2000 3000 4000 5000 6000 7000 8000 v+").unwrap();
+        vm.exec("1000 2000 3000 4000 5000 6000 7000 8000 v+")
+            .unwrap();
         assert_eq!(vm.data, vec![6000, 8000, 10000, 12000]);
     }
 
     #[test]
     fn test_vec4_sub_lane_wise() {
         let mut vm = Forth::new();
-        vm.exec("5000 5000 5000 5000 1000 2000 3000 4000 v-").unwrap();
+        vm.exec("5000 5000 5000 5000 1000 2000 3000 4000 v-")
+            .unwrap();
         assert_eq!(vm.data, vec![4000, 3000, 2000, 1000]);
     }
 
@@ -14408,7 +14737,8 @@ mod channel_tests {
     fn test_vec4_add_sub_roundtrip() {
         // a + b - b = a
         let mut vm = Forth::new();
-        vm.exec("1000 2000 3000 4000 500 600 700 800 v+  500 600 700 800 v-").unwrap();
+        vm.exec("1000 2000 3000 4000 500 600 700 800 v+  500 600 700 800 v-")
+            .unwrap();
         assert_eq!(vm.data, vec![1000, 2000, 3000, 4000]);
     }
 

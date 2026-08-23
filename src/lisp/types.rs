@@ -53,9 +53,7 @@ impl Type {
                 "any" => Ok(Type::Any),
                 other => anyhow::bail!("unknown type: {other}"),
             },
-            Val::List(parts)
-                if parts.first() == Some(&Val::Symbol("->".to_string())) =>
-            {
+            Val::List(parts) if parts.first() == Some(&Val::Symbol("->".to_string())) => {
                 if parts.len() < 2 {
                     anyhow::bail!("-> requires at least a return type");
                 }
@@ -66,10 +64,7 @@ impl Type {
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 Ok(Type::Fn(args, Box::new(ret)))
             }
-            other => anyhow::bail!(
-                "expected type annotation, got {}",
-                other.type_name()
-            ),
+            other => anyhow::bail!("expected type annotation, got {}", other.type_name()),
         }
     }
 
@@ -264,13 +259,17 @@ impl<'de> serde::Deserialize<'de> for Val {
                             .ok_or_else(|| de::Error::missing_field("v"))?;
                         let items: Result<Vec<Val>, _> = arr
                             .into_iter()
-                            .map(|item| serde_json::from_value::<Val>(item).map_err(de::Error::custom))
+                            .map(|item| {
+                                serde_json::from_value::<Val>(item).map_err(de::Error::custom)
+                            })
                             .collect();
                         Ok(Val::List(items?))
                     }
                     other => Err(de::Error::unknown_variant(
                         other,
-                        &["nil", "bool", "int", "float", "str", "symbol", "bytes", "list"],
+                        &[
+                            "nil", "bool", "int", "float", "str", "symbol", "bytes", "list",
+                        ],
                     )),
                 }
             }

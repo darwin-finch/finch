@@ -60,6 +60,16 @@ struct Args {
     #[arg(long = "forth", short = 'f')]
     forth: Option<String>,
 
+    /// Execute a self-contained Finch Lisp or Co-Forth script through the
+    /// shared typed runtime. This is the shebang target for `#!/path/to/finch
+    /// --exec` and never falls back to legacy language evaluators.
+    #[arg(long = "exec", value_name = "SCRIPT")]
+    exec_script: Option<PathBuf>,
+
+    /// Print the structured typed-runtime outcome for `--exec`.
+    #[arg(long, requires = "exec_script")]
+    json: bool,
+
     /// Join a named session (UUIDv5 derived from name).
     /// Two users with the same name arrive at the same session ID.
     /// Example: finch --session "battleground"
@@ -388,6 +398,141 @@ fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
     Ok(ClaudeClient::with_provider(provider))
 }
 
+/// Execute a Finch script using only the shared typed runtime. Script headers
+/// select syntax but never grant authority; non-pure operations therefore
+/// return the normal typed authorization outcome instead of using a shell or
+/// legacy interpreter as an escape hatch.
+async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("read Finch script '{}'", path.display()))?;
+    let script = finch::programs::parse_finch_script(&path, &contents)?;
+    let runtime = finch::runtime::ProgramRuntime::new();
+    // Executing a local script is the user's explicit request to receive its
+    // response.  Grant only that presentation capability here; every resource
+    // capability (files, processes, network, automation, and so on) remains
+    // subject to the ordinary typed broker.
+    runtime.grant_typed_capability(finch::vm::CapabilityRequirement {
+        capability: finch::vm::CapabilityKind::SessionEmit,
+        selector: finch::vm::ResourceSelector::None,
+    })?;
+    let outcome = runtime
+        .submit_typed_only(finch::runtime::ProgramSubmission {
+            language: script.language,
+            source: script.source,
+            intent: format!("execute Finch script {}", path.display()),
+            // The typed verifier and broker derive the concrete capabilities.
+            // This legacy coarse field is intentionally not used to authorize
+            // a typed-only script.
+            effect: finch::programs::ExecutionEffect::Unclassified,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: None,
+            budget: None,
+        })
+        .await?;
+
+    if json_output {
+        println!("{}", serde_json::to_string(&outcome)?);
+        return Ok(());
+    }
+
+    if let Some(presentation) = terminal_script_presentation(&outcome.output) {
+        // `say` is append-only at the VM boundary.  The command-line host,
+        // rather than the language primitive, owns the final terminal line
+        // break so an interactive shell prompt cannot join the last fragment.
+        print!("{presentation}");
+    }
+    if !matches!(
+        outcome.status,
+        finch::runtime::outcome::ExecutionStatus::Completed
+    ) {
+        let detail = if outcome.required_capabilities.is_empty() {
+            outcome
+                .diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "no diagnostic".to_string())
+        } else {
+            format!(
+                "requires capability grant(s): {:?}",
+                outcome.required_capabilities
+            )
+        };
+        anyhow::bail!(
+            "Finch script did not complete ({:?}): {}",
+            outcome.status,
+            detail
+        );
+    }
+    Ok(())
+}
+
+/// Adapt one completed script's append-only response stream to a terminal.
+/// Other hosts project the same `session.emit` events into output handles and
+/// must not inherit this terminal-only trailing newline rule.
+fn terminal_script_presentation(output: &str) -> Option<String> {
+    (!output.is_empty()).then(|| {
+        if output.ends_with('\n') {
+            output.to_owned()
+        } else {
+            format!("{output}\n")
+        }
+    })
+}
+
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+
+    #[test]
+    fn shebang_style_exec_arguments_parse_as_a_script_invocation() {
+        let args =
+            Args::try_parse_from(["finch", "--exec", "reply.lisp", "--json"]).unwrap();
+        assert_eq!(args.exec_script, Some(PathBuf::from("reply.lisp")));
+        assert!(args.json);
+    }
+
+    #[tokio::test]
+    async fn executable_script_uses_the_typed_runtime_and_rejects_legacy_only_forth() {
+        let script = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            script.path(),
+            "#!/usr/bin/env finch --exec --language=lisp\n(begin (say \"script ready\") (+ 20 22))\n",
+        )
+        .unwrap();
+        run_finch_script(script.path().to_path_buf(), false)
+            .await
+            .unwrap();
+
+        std::fs::write(
+            script.path(),
+            "#!/usr/bin/env finch --exec --language=forth\n: legacy-only 1 ;\n",
+        )
+        .unwrap();
+        let error = run_finch_script(script.path().to_path_buf(), false)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("E-FORTH-SIG-001"),
+            "expected typed-only rejection, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn terminal_script_adapter_terminates_only_a_nonempty_unfinished_response() {
+        assert_eq!(terminal_script_presentation(""), None);
+        assert_eq!(
+            terminal_script_presentation("The answer is 42"),
+            Some("The answer is 42\n".into())
+        );
+        assert_eq!(
+            terminal_script_presentation("already complete\n"),
+            Some("already complete\n".into())
+        );
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // Suppress ONNX Runtime verbose logs BEFORE any initialization
@@ -400,6 +545,10 @@ async fn main() -> Result<()> {
 
     // Parse command-line arguments
     let args = Args::parse();
+    // `Command::Query` is dispatched before the REPL setup below, so preserve
+    // this global flag explicitly rather than accidentally dropping it on the
+    // one-shot path.
+    let cloud_only = args.cloud_only;
 
     // Dispatch based on command
     match args.command {
@@ -422,7 +571,7 @@ async fn main() -> Result<()> {
             return run_train_command(train_command).await;
         }
         Some(Command::Query { query }) => {
-            return run_query(&query).await;
+            return run_query(&query, cloud_only).await;
         }
         Some(Command::Worker { bind, info }) => {
             return run_worker(bind, info).await;
@@ -464,6 +613,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(script) = args.exec_script {
+        return run_finch_script(script, args.json).await;
+    }
+
     // --forth: pure Forth eval, no AI, no TUI, no config needed
     if let Some(forth_expr) = &args.forth {
         match finch::coforth::Forth::run(forth_expr) {
@@ -485,7 +638,7 @@ async fn main() -> Result<()> {
         }
 
         // Run query via daemon
-        return run_query(input.trim()).await;
+        return run_query(input.trim(), cloud_only).await;
     }
 
     // CRITICAL: Create and configure OutputManager BEFORE initializing tracing
@@ -530,8 +683,16 @@ async fn main() -> Result<()> {
             if !auto_teachers.is_empty() {
                 let names: Vec<&str> = auto_teachers.iter().map(|t| t.provider.as_str()).collect();
                 use crossterm::style::Stylize as _;
-                eprintln!("\n{}", format!("✓ Auto-configured: {}", names.join(", ")).green().bold());
-                eprintln!("{}\n", "  Run `finch setup` any time to change settings.".yellow());
+                eprintln!(
+                    "\n{}",
+                    format!("✓ Auto-configured: {}", names.join(", "))
+                        .green()
+                        .bold()
+                );
+                eprintln!(
+                    "{}\n",
+                    "  Run `finch setup` any time to change settings.".yellow()
+                );
                 let cfg = Config::new(auto_teachers);
                 cfg.save().ok();
                 cfg
@@ -637,17 +798,27 @@ async fn main() -> Result<()> {
                     Err(wizard_err) if wizard_err.to_string().contains("Setup cancelled") => {
                         // User pressed Escape/Ctrl+C — don't crash, fall back gracefully
                         use crossterm::style::Stylize as _;
-                        eprintln!("\n{}", "Setup skipped. Detecting API keys from environment...".yellow());
+                        eprintln!(
+                            "\n{}",
+                            "Setup skipped. Detecting API keys from environment...".yellow()
+                        );
 
                         let teachers = build_teachers_from_env();
 
                         if teachers.is_empty() {
                             eprintln!("{}", "No API keys found. Set ANTHROPIC_API_KEY (or OPENAI_API_KEY / GROK_API_KEY)".yellow());
-                            eprintln!("{}\n", "and re-run, or run `finch setup` to configure interactively.".yellow());
+                            eprintln!(
+                                "{}\n",
+                                "and re-run, or run `finch setup` to configure interactively."
+                                    .yellow()
+                            );
                         } else {
                             let names: Vec<&str> =
                                 teachers.iter().map(|t| t.provider.as_str()).collect();
-                            eprintln!("{}\n", format!("✓ Auto-configured: {}", names.join(", ")).green());
+                            eprintln!(
+                                "{}\n",
+                                format!("✓ Auto-configured: {}", names.join(", ")).green()
+                            );
                         }
 
                         let cfg = Config::new(teachers);
@@ -832,7 +1003,11 @@ async fn main() -> Result<()> {
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
     let restore_session = args.restore_session.or_else(|| {
         args.resume.as_deref().and_then(|uuid| {
-            dirs::home_dir().map(|h| h.join(".finch").join("sessions").join(format!("{uuid}.json")))
+            dirs::home_dir().map(|h| {
+                h.join(".finch")
+                    .join("sessions")
+                    .join(format!("{uuid}.json"))
+            })
         })
     });
 
@@ -1093,7 +1268,12 @@ async fn run_train_setup() -> Result<()> {
     use std::process::Command;
 
     use crossterm::style::Stylize as _;
-    println!("{}\n", "🔧 Setting up Python environment for LoRA training".cyan().bold());
+    println!(
+        "{}\n",
+        "🔧 Setting up Python environment for LoRA training"
+            .cyan()
+            .bold()
+    );
 
     // Determine paths
     let home =
@@ -1192,7 +1372,12 @@ async fn run_train_setup() -> Result<()> {
         venv_dir.display().to_string().bold()
     );
     println!("\nTo use the training scripts:");
-    println!("  {}", "~/.finch/venv/bin/python scripts/train_lora.py".cyan().bold());
+    println!(
+        "  {}",
+        "~/.finch/venv/bin/python scripts/train_lora.py"
+            .cyan()
+            .bold()
+    );
     println!("\nTraining will run automatically when you provide feedback.");
 
     Ok(())
@@ -1580,9 +1765,31 @@ fn is_clearly_forth(s: &str) -> bool {
     }
     // Forth string-literal openers: keyword followed immediately by `"`
     const OPENERS: &[&str] = &[
-        "hash\"", "open\"", "eval\"", "space\"", "csv\"", "tsv\"", "xlsx\"", "read\"", "exec\"", "glob\"",
-        "gen\"", "confirm\"", "select\"", ".\"", "s\"", "boot\"", "call\"", "scatter\"",
-        "say\"", "join\"", "part\"", "contribute\"", "run-on\"", "require\"", "xlsx-into\"",
+        "hash\"",
+        "open\"",
+        "eval\"",
+        "space\"",
+        "csv\"",
+        "tsv\"",
+        "xlsx\"",
+        "read\"",
+        "exec\"",
+        "glob\"",
+        "gen\"",
+        "confirm\"",
+        "select\"",
+        ".\"",
+        "s\"",
+        "boot\"",
+        "call\"",
+        "scatter\"",
+        "say\"",
+        "join\"",
+        "part\"",
+        "contribute\"",
+        "run-on\"",
+        "require\"",
+        "xlsx-into\"",
     ];
     for opener in OPENERS {
         if t.contains(opener) {
@@ -1605,17 +1812,18 @@ fn is_clearly_forth(s: &str) -> bool {
     // Pure stack expression: every whitespace token is a number, a standalone `-`,
     // `/`, `.`, or `.s`, or a known Forth primitive word.
     const FORTH_PRIMITIVES: &[&str] = &[
-        ".", ".s", "cr", "space", "dup", "drop", "swap", "over", "rot", "nip", "tuck",
-        "2dup", "2drop", "mod", "abs", "max", "min", "negate", "and", "or", "xor",
-        "invert", "words", "help", "depth", "bye", "emit", "type", "i", "j",
-        "-", "/",
+        ".", ".s", "cr", "space", "dup", "drop", "swap", "over", "rot", "nip", "tuck", "2dup",
+        "2drop", "mod", "abs", "max", "min", "negate", "and", "or", "xor", "invert", "words",
+        "help", "depth", "bye", "emit", "type", "i", "j", "-", "/",
     ];
     let tokens: Vec<&str> = t.split_whitespace().collect();
     if !tokens.is_empty()
         && tokens.iter().all(|tok| {
             tok.parse::<f64>().is_ok()
                 || FORTH_PRIMITIVES.contains(tok)
-                || tok.chars().all(|c| matches!(c, '+' | '-' | '*' | '/' | '.' | '@' | '!' | '<' | '>' | '='))
+                || tok
+                    .chars()
+                    .all(|c| matches!(c, '+' | '-' | '*' | '/' | '.' | '@' | '!' | '<' | '>' | '='))
         })
     {
         return true;
@@ -1624,12 +1832,25 @@ fn is_clearly_forth(s: &str) -> bool {
 }
 
 /// Run a single query with full tool support (agentic mode)
-async fn run_query(query: &str) -> Result<()> {
+async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
     use finch::client::DaemonClient;
     use finch::daemon::ensure_daemon_running;
 
+    // Short-circuit: Lisp expressions (start with `(` or `$`) — before Forth check.
+    if query.trim_start().starts_with('(') || query.trim_start().starts_with('$') {
+        println!("{}", query);
+        let ctx = std::sync::Arc::new(finch::lisp::LispCtx::new());
+        let env = finch::lisp::make_env();
+        match finch::lisp::run_in(query, env, ctx).await {
+            Ok(val) => println!("{}", val),
+            Err(e) => eprintln!("lisp error: {}", e),
+        }
+        return Ok(());
+    }
+
     // Short-circuit: run Forth code directly in the VM, no AI involved.
     if is_clearly_forth(query) {
+        println!("{}", query);
         match finch::coforth::Forth::run(query) {
             Ok(out) => {
                 if !out.is_empty() {
@@ -1646,6 +1867,13 @@ async fn run_query(query: &str) -> Result<()> {
 
     // Build tool executor (same tools as the REPL)
     let (executor, tool_definitions) = build_query_tool_executor().await?;
+
+    // A one-shot cloud-only query must not first attempt the daemon. Besides
+    // defeating the flag, that startup attempt can consume the whole caller
+    // timeout and makes direct-provider smoke tests look hung.
+    if cloud_only {
+        return run_query_teacher_only(query, &config, executor, tool_definitions).await;
+    }
 
     // Ensure daemon is running (auto-spawn if needed)
     if let Err(e) = ensure_daemon_running(Some(&config.client.daemon_address)).await {
@@ -1685,6 +1913,15 @@ async fn run_query_teacher_only(
         .unwrap_or_else(|| finch::config::constants::DEFAULT_CLAUDE_MODEL.to_string());
 
     let mut messages = vec![Message::user(query)];
+    // Keep one-shot provider calls on the same wire contract as the REPL.
+    // Otherwise `finch --cloud-only query` is a misleading test surface: it
+    // asks the provider for ordinary prose and never validates a VM program.
+    const VM_WIRE_BOOT: &str = include_str!("../vocabulary/BOOT.md");
+    let system = format!(
+        "{}\n\n{}",
+        finch::generators::claude::CODING_SYSTEM_PROMPT,
+        VM_WIRE_BOOT
+    );
 
     const MAX_TURNS: usize = 25;
     for _ in 0..MAX_TURNS {
@@ -1692,15 +1929,39 @@ async fn run_query_teacher_only(
             model: model.clone(),
             max_tokens: finch::config::constants::DEFAULT_MAX_TOKENS,
             messages: messages.clone(),
-            system: Some(finch::generators::claude::CODING_SYSTEM_PROMPT.to_string()),
+            system: Some(system.clone()),
             tools: Some(tool_definitions.clone()),
         };
 
         let response = claude_client.send_message(&request).await?;
 
-        // If no tool use, print the final text and stop
+        // A text-only reply is the same raw Lisp/Co-Forth wire program used
+        // by the interactive client. Execute it rather than displaying source
+        // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
-            println!("{}", response.text());
+            let source = response.text();
+            let language = finch::programs::ProgramLanguage::infer_wire_source(&source)?;
+            let runtime = finch::runtime::ProgramRuntime::new();
+            let outcome = runtime
+                .submit_typed_only(finch::runtime::ProgramSubmission {
+                    language,
+                    source,
+                    intent: "one-shot provider VM-wire response".to_string(),
+                    effect: finch::programs::ExecutionEffect::Pure,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: Some(runtime.revision()),
+                    budget: None,
+                })
+                .await?;
+            if outcome.status != finch::runtime::outcome::ExecutionStatus::Completed {
+                anyhow::bail!(
+                    "provider VM-wire program ended as {:?}: {}",
+                    outcome.status,
+                    outcome.diagnostics.join("; ")
+                );
+            }
+            print!("{}", outcome.output);
             return Ok(());
         }
 
@@ -2412,13 +2673,24 @@ fn run_samples() -> Result<()> {
     finch::samples::generate_all(&dir)?;
 
     println!("Sample spreadsheets written to {}:", dir.display());
-    for name in &["grades.xlsx", "budget.xlsx", "contacts.xlsx", "times_table.xlsx"] {
+    for name in &[
+        "grades.xlsx",
+        "budget.xlsx",
+        "contacts.xlsx",
+        "times_table.xlsx",
+    ] {
         println!("  {}", dir.join(name).display());
     }
     println!();
     println!("Try in the REPL:");
-    println!("  s\" {}/grades.xlsx\" s\" A2\" xlsx@ type cr", dir.display());
-    println!("  s\" {}/times_table.xlsx\" s\" H8\" xlsx@ type cr", dir.display());
+    println!(
+        "  s\" {}/grades.xlsx\" s\" A2\" xlsx@ type cr",
+        dir.display()
+    );
+    println!(
+        "  s\" {}/times_table.xlsx\" s\" H8\" xlsx@ type cr",
+        dir.display()
+    );
     Ok(())
 }
 
@@ -2435,10 +2707,20 @@ async fn run_exchange_command(cmd: ExchangeCommand) -> Result<()> {
         .build()?;
 
     match cmd {
-        ExchangeCommand::Propose { name, code, channel, daemon } => {
-            let addr = daemon.as_deref()
+        ExchangeCommand::Propose {
+            name,
+            code,
+            channel,
+            daemon,
+        } => {
+            let addr = daemon
+                .as_deref()
                 .unwrap_or(finch::config::constants::DEFAULT_DAEMON_ADDR);
-            let chan = if channel.starts_with('#') { channel.clone() } else { format!("#{channel}") };
+            let chan = if channel.starts_with('#') {
+                channel.clone()
+            } else {
+                format!("#{channel}")
+            };
             let url = format!("http://{addr}/v1/forth/channel/{}/contribute", &chan[1..]);
 
             let body = serde_json::json!({
@@ -2446,35 +2728,61 @@ async fn run_exchange_command(cmd: ExchangeCommand) -> Result<()> {
                 "program": code,
             });
 
-            let resp = client.post(&url).json(&body).send().await
-                .with_context(|| format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start"))?;
+            let resp = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| {
+                    format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start")
+                })?;
 
             if resp.status().is_success() {
                 println!("✓ Proposed '{}' to {}", name, chan);
                 println!("  Peers can see it with:  finch exchange list");
                 println!("  Peers can run it with:  finch exchange run");
             } else {
-                anyhow::bail!("Daemon returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+                anyhow::bail!(
+                    "Daemon returned {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                );
             }
         }
 
         ExchangeCommand::List { channel, daemon } => {
-            let addr = daemon.as_deref()
+            let addr = daemon
+                .as_deref()
                 .unwrap_or(finch::config::constants::DEFAULT_DAEMON_ADDR);
-            let chan = if channel.starts_with('#') { channel.clone() } else { format!("#{channel}") };
+            let chan = if channel.starts_with('#') {
+                channel.clone()
+            } else {
+                format!("#{channel}")
+            };
             let url = format!("http://{addr}/v1/forth/channel/{}", &chan[1..]);
 
-            let resp = client.get(&url).send().await
-                .with_context(|| format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start"))?;
+            let resp = client.get(&url).send().await.with_context(|| {
+                format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start")
+            })?;
 
             if !resp.status().is_success() {
-                anyhow::bail!("Daemon returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+                anyhow::bail!(
+                    "Daemon returned {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                );
             }
 
             #[derive(serde::Deserialize)]
-            struct Entry { from: String, program: String }
+            struct Entry {
+                from: String,
+                program: String,
+            }
             #[derive(serde::Deserialize)]
-            struct State { channel: String, contributions: Vec<Entry> }
+            struct State {
+                channel: String,
+                contributions: Vec<Entry>,
+            }
 
             let state: State = resp.json().await.context("Failed to parse channel state")?;
 
@@ -2482,9 +2790,16 @@ async fn run_exchange_command(cmd: ExchangeCommand) -> Result<()> {
                 println!("{} is empty.", state.channel);
                 println!("  Propose a function with:  finch exchange propose <word> \"<code>\"");
             } else {
-                println!("{}  ({} contribution{})", state.channel,
+                println!(
+                    "{}  ({} contribution{})",
+                    state.channel,
                     state.contributions.len(),
-                    if state.contributions.len() == 1 { "" } else { "s" });
+                    if state.contributions.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                );
                 println!();
                 for (i, entry) in state.contributions.iter().enumerate() {
                     println!("  [{}] from: {}", i + 1, entry.from);
@@ -2498,24 +2813,45 @@ async fn run_exchange_command(cmd: ExchangeCommand) -> Result<()> {
         }
 
         ExchangeCommand::Run { channel, daemon } => {
-            let addr = daemon.as_deref()
+            let addr = daemon
+                .as_deref()
                 .unwrap_or(finch::config::constants::DEFAULT_DAEMON_ADDR);
-            let chan = if channel.starts_with('#') { channel.clone() } else { format!("#{channel}") };
+            let chan = if channel.starts_with('#') {
+                channel.clone()
+            } else {
+                format!("#{channel}")
+            };
             let url = format!("http://{addr}/v1/forth/channel/{}/execute", &chan[1..]);
 
-            let resp = client.post(&url).send().await
-                .with_context(|| format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start"))?;
+            let resp = client.post(&url).send().await.with_context(|| {
+                format!("Could not reach daemon at {addr}.\nStart it with: finch daemon-start")
+            })?;
 
             if !resp.status().is_success() {
-                anyhow::bail!("Daemon returned {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+                anyhow::bail!(
+                    "Daemon returned {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                );
             }
 
-            let result: serde_json::Value = resp.json().await.context("Failed to parse execute response")?;
+            let result: serde_json::Value = resp
+                .json()
+                .await
+                .context("Failed to parse execute response")?;
 
-            if let Some(err) = result.get("error").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(err) = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 eprintln!("error: {}", err);
             }
-            if let Some(out) = result.get("output").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(out) = result
+                .get("output")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 print!("{}", out);
             }
             if let Some(stack) = result.get("stack") {
@@ -2568,17 +2904,12 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
             println!("{}", "-".repeat(60));
             for entry in &entries {
                 let path = entry.path();
-                let uuid = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?");
+                let uuid = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
                 let mtime = entry
                     .metadata()
                     .and_then(|m| m.modified())
                     .ok()
-                    .and_then(|t| {
-                        t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()
-                    })
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
                     .map(|d| {
                         let secs = d.as_secs();
                         let dt = chrono::DateTime::<chrono::Local>::from(

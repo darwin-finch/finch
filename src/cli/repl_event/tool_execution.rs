@@ -16,11 +16,12 @@ use uuid::Uuid;
 use super::events::ConfirmationResult;
 use crate::cli::conversation::ConversationHistory;
 use crate::cli::messages::WorkUnit;
+use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
 use crate::tools::executor::{generate_tool_signature, ToolExecutor};
-use crate::tools::types::ToolUse;
+use crate::tools::types::{LiveOutput, LiveOutputSink, ToolUse};
 
 use super::events::ReplEvent;
 
@@ -32,6 +33,9 @@ pub struct ToolExecutionCoordinator {
 
     /// Tool executor (shared, thread-safe)
     tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
+
+    /// Reactive scrollback host for portable typed VM effects.
+    output_manager: Arc<OutputManager>,
 
     /// Conversation history (for tools that need context)
     conversation: Arc<RwLock<ConversationHistory>>,
@@ -55,11 +59,62 @@ pub struct ToolExecutionCoordinator {
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 }
 
+/// One tool's client-side presentation binding. It is intentionally created
+/// per invocation, so concurrent VM programs cannot share an ambient output
+/// target.
+struct WorkUnitPresentation {
+    work_unit: Arc<WorkUnit>,
+    row_idx: usize,
+    program: bool,
+    vm_output: Option<VmOutputProjection>,
+}
+
+impl LiveOutputSink for WorkUnitPresentation {
+    fn line(&self, text: String) {
+        if self.program {
+            self.work_unit.append_response(&text);
+        } else {
+            self.work_unit.append_row_body_line(self.row_idx, text);
+        }
+    }
+
+    fn vm_side_effect(&self, effect: crate::vm::VmSideEffect) {
+        if let Some(projection) = &self.vm_output {
+            projection.project(&effect);
+        }
+    }
+
+    fn vm_effect_envelope(&self, envelope: crate::runtime::VmEffectEnvelope) {
+        if envelope.effect.requirement.capability == crate::vm::CapabilityKind::ProgramInvoke {
+            let intent = match &envelope.effect.event {
+                crate::vm::HostSideEffect::Request { arguments } => arguments
+                    .get(1)
+                    .and_then(|value| match value {
+                        crate::vm::TypedValue::String(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("Review proposed program"),
+                _ => "Review proposed program",
+            };
+            self.work_unit.append_response(&format!(
+                "Proposal awaiting review: {intent} [run {}, effect {}]",
+                envelope.execution_id, envelope.effect.sequence
+            ));
+        }
+        self.vm_side_effect(envelope.effect);
+    }
+
+    fn defer_program_effects(&self) -> bool {
+        self.program
+    }
+}
+
 impl ToolExecutionCoordinator {
     /// Create a new tool execution coordinator
     pub fn new(
         event_tx: mpsc::UnboundedSender<ReplEvent>,
         tool_executor: Arc<tokio::sync::Mutex<ToolExecutor>>,
+        output_manager: Arc<OutputManager>,
         conversation: Arc<RwLock<ConversationHistory>>,
         local_generator: Arc<RwLock<LocalGenerator>>,
         tokenizer: Arc<TextTokenizer>,
@@ -69,6 +124,7 @@ impl ToolExecutionCoordinator {
         Self {
             event_tx,
             tool_executor,
+            output_manager,
             conversation,
             local_generator,
             tokenizer,
@@ -121,18 +177,24 @@ impl ToolExecutionCoordinator {
         let tokenizer = Arc::clone(&self.tokenizer);
         let repl_mode = Arc::clone(&self.repl_mode);
         let plan_content = Arc::clone(&self.plan_content);
+        let output_manager = Arc::clone(&self.output_manager);
         let stack = self.stack.clone();
         let poset = self.poset.clone();
 
-        // Build a live-output callback that streams stdout lines into the WorkUnit row.
-        // The format() method shows the last 3 body_lines for Running rows, so each
-        // new line automatically becomes visible on the next render tick (~100ms).
-        let live_output: Arc<dyn Fn(String) + Send + Sync> = {
-            let wu = Arc::clone(&work_unit);
-            Arc::new(move |line: String| {
-                wu.append_row_body_line(row_idx, line);
-            })
-        };
+        // Build a per-tool presentation binding. Ordinary streaming tools append
+        // their lines to their row; a typed VM program's portable `say` events
+        // append to the owning generation WorkUnit instead. Neither route uses a
+        // process-global "current output" target.
+        let program = tool_use.name == "submit_program";
+        let vm_output = program.then(|| {
+            VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&work_unit))
+        });
+        let live_output: LiveOutput = Arc::new(WorkUnitPresentation {
+            work_unit: Arc::clone(&work_unit),
+            row_idx,
+            program,
+            vm_output,
+        });
 
         tokio::spawn(async move {
             let mut tool_use = tool_use;
@@ -274,11 +336,11 @@ impl ToolExecutionCoordinator {
 
                     // Push tool result onto the Co-Forth stack so the user can
                     // see what the AI observed before deciding to /run.
-                    // Skip internal tools (Push, TodoWrite, etc.) — those manage
+                    // Skip internal tools (TodoWrite, etc.) — those manage
                     // their own stack interaction.
                     let skip_stack = matches!(
                         tool_use.name.as_str(),
-                        "Push" | "TodoWrite" | "TodoRead" | "EnterPlanMode" | "enter_plan_mode"
+                        "TodoWrite" | "TodoRead" | "EnterPlanMode" | "enter_plan_mode"
                     );
                     if !skip_stack {
                         if let Some(ref s) = stack {

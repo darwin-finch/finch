@@ -2,8 +2,8 @@
 
 use super::MemorySystem;
 use crate::programs::{
-    hash_text, ExecutionEffect, ProgramDefinition, ProgramLanguage, ProgramRef, ProgramScope,
-    ProgramSummary, TrustState, VmManifest, MANIFEST_PROTOCOL_VERSION,
+    hash_text, language_package_identities, ExecutionEffect, ProgramDefinition, ProgramLanguage,
+    ProgramRef, ProgramScope, ProgramSummary, TrustState, VmManifest, MANIFEST_PROTOCOL_VERSION,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Row, Transaction};
@@ -159,6 +159,7 @@ impl MemorySystem {
             registry_generation: generation,
             environment_hash: hash_text(&format!("finch-registry:{generation}")),
             languages: vec![ProgramLanguage::Forth, ProgramLanguage::Lisp],
+            language_packages: language_package_identities(),
             core_effects: vec![
                 "say".to_string(),
                 "show_dialog".to_string(),

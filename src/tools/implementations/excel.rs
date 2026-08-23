@@ -60,7 +60,11 @@ fn validate_cell(addr: &str) -> Result<()> {
     let mut chars = s.chars().peekable();
     // One or two letters
     let mut col_len = 0usize;
-    while chars.peek().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+    while chars
+        .peek()
+        .map(|c| c.is_ascii_alphabetic())
+        .unwrap_or(false)
+    {
         chars.next();
         col_len += 1;
     }
@@ -79,10 +83,7 @@ fn validate_cell(addr: &str) -> Result<()> {
 fn validate_range(range: &str) -> Result<()> {
     let parts: Vec<&str> = range.split(':').collect();
     if parts.len() != 2 {
-        anyhow::bail!(
-            "Invalid range '{}'. Expected format: A1:C5.",
-            range
-        );
+        anyhow::bail!("Invalid range '{}'. Expected format: A1:C5.", range);
     }
     validate_cell(parts[0])?;
     validate_cell(parts[1])?;
@@ -96,7 +97,9 @@ pub struct ExcelReadTool;
 
 #[async_trait]
 impl Tool for ExcelReadTool {
-    fn name(&self) -> &str { "excel_read" }
+    fn name(&self) -> &str {
+        "excel_read"
+    }
 
     fn description(&self) -> &str {
         "Read the displayed value of one Excel cell by address (e.g. \"B3\"). \
@@ -143,7 +146,11 @@ impl Tool for ExcelReadTool {
         };
 
         let result = osascript(&script)?;
-        Ok(if result.is_empty() { "(empty)".to_string() } else { result })
+        Ok(if result.is_empty() {
+            "(empty)".to_string()
+        } else {
+            result
+        })
     }
 }
 
@@ -154,7 +161,9 @@ pub struct ExcelWriteTool;
 
 #[async_trait]
 impl Tool for ExcelWriteTool {
-    fn name(&self) -> &str { "excel_write" }
+    fn name(&self) -> &str {
+        "excel_write"
+    }
 
     fn description(&self) -> &str {
         "Write a value into one Excel cell by address (e.g. \"B3\"). \
@@ -183,7 +192,7 @@ impl Tool for ExcelWriteTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext<'_>) -> Result<String> {
-        let cell  = input["cell"].as_str().context("Missing 'cell'")?;
+        let cell = input["cell"].as_str().context("Missing 'cell'")?;
         let value = input["value"].as_str().context("Missing 'value'")?;
         validate_cell(cell)?;
 
@@ -218,7 +227,9 @@ pub struct ExcelRangeTool;
 
 #[async_trait]
 impl Tool for ExcelRangeTool {
-    fn name(&self) -> &str { "excel_range" }
+    fn name(&self) -> &str {
+        "excel_range"
+    }
 
     fn description(&self) -> &str {
         "Read a rectangular range of Excel cells as CSV text (e.g. \"A1:C5\"). \
@@ -281,7 +292,11 @@ impl Tool for ExcelRangeTool {
         );
 
         let result = osascript(&script)?;
-        Ok(if result.is_empty() { "(empty range)".to_string() } else { result })
+        Ok(if result.is_empty() {
+            "(empty range)".to_string()
+        } else {
+            result
+        })
     }
 }
 
@@ -292,7 +307,9 @@ pub struct ExcelFormulaTool;
 
 #[async_trait]
 impl Tool for ExcelFormulaTool {
-    fn name(&self) -> &str { "excel_formula" }
+    fn name(&self) -> &str {
+        "excel_formula"
+    }
 
     fn description(&self) -> &str {
         "Get the formula stored in one Excel cell (e.g. \"=SUM(A1:A10)\"). \
@@ -336,7 +353,11 @@ impl Tool for ExcelFormulaTool {
         );
 
         let result = osascript(&script)?;
-        Ok(if result.is_empty() { "(no formula)".to_string() } else { result })
+        Ok(if result.is_empty() {
+            "(no formula)".to_string()
+        } else {
+            result
+        })
     }
 }
 
@@ -347,7 +368,9 @@ pub struct ExcelSheetsTool;
 
 #[async_trait]
 impl Tool for ExcelSheetsTool {
-    fn name(&self) -> &str { "excel_sheets" }
+    fn name(&self) -> &str {
+        "excel_sheets"
+    }
 
     fn description(&self) -> &str {
         "List all sheet names in the active Excel workbook, one per line. \
@@ -374,7 +397,11 @@ impl Tool for ExcelSheetsTool {
         end tell"#;
 
         let result = osascript(script)?;
-        Ok(if result.is_empty() { "(no sheets found)".to_string() } else { result })
+        Ok(if result.is_empty() {
+            "(no sheets found)".to_string()
+        } else {
+            result
+        })
     }
 }
 
@@ -385,7 +412,9 @@ pub struct ExcelActivateTool;
 
 #[async_trait]
 impl Tool for ExcelActivateTool {
-    fn name(&self) -> &str { "excel_activate" }
+    fn name(&self) -> &str {
+        "excel_activate"
+    }
 
     fn description(&self) -> &str {
         "Bring Microsoft Excel to the front. Optionally open a file by path. \
@@ -421,7 +450,7 @@ impl Tool for ExcelActivateTool {
                 activate
                 return name of active workbook
             end tell"#
-            .to_string()
+                .to_string()
         };
 
         let workbook = osascript(&script)?;

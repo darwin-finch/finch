@@ -17,6 +17,9 @@ pub enum ResourceRoot {
     Workspace,
     Project,
     TaskOutput,
+    /// An explicit whole-machine authority root. Constructing or granting this
+    /// root is host policy; it is never inferred from an absolute string.
+    HostMachine,
     Named(String),
 }
 
@@ -26,6 +29,7 @@ impl fmt::Display for ResourceRoot {
             Self::Workspace => f.write_str("workspace"),
             Self::Project => f.write_str("project"),
             Self::TaskOutput => f.write_str("task.output"),
+            Self::HostMachine => f.write_str("host-machine"),
             Self::Named(name) => f.write_str(name),
         }
     }
@@ -62,6 +66,18 @@ pub enum SelectorError {
     WildcardInRuntimePath,
     #[error("capability selectors must use '/' as the portable separator")]
     InvalidSeparator,
+    #[error("network selector template argument {0} is missing or has the wrong type")]
+    InvalidNetworkTemplateArgument(usize),
+    #[error("network selector template argument {0} exceeds its declared bound")]
+    NetworkTemplateArgumentOutOfBounds(usize),
+    #[error("process selector template argument {0} is missing or has the wrong type")]
+    InvalidProcessTemplateArgument(usize),
+    #[error("process selector template argument {0} exceeds its declared bound")]
+    ProcessTemplateArgumentOutOfBounds(usize),
+    #[error("program selector template argument {0} is missing or has the wrong type")]
+    InvalidProgramTemplateArgument(usize),
+    #[error("program selector template argument {0} exceeds its declared bound")]
+    ProgramTemplateArgumentOutOfBounds(usize),
 }
 
 /// A deliberately small expression language for argument-dependent file
@@ -79,6 +95,134 @@ pub struct FileSelectorTemplate {
 pub enum FileSelectorTemplatePart {
     Literal { relative: String },
     Argument { index: usize, bound: FileSelector },
+}
+
+/// Argument-dependent network authority.  The host and port are taken from
+/// typed call arguments, checked against the descriptor's upper bound, then
+/// materialized as a concrete `Network` selector before authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NetworkSelectorTemplate {
+    pub host_argument: usize,
+    pub port_argument: usize,
+    /// `*` means any hostname; an empty list also means any hostname so a
+    /// descriptor can express an intentionally broad but still concrete-at-
+    /// call-time request.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Empty means any valid TCP port.
+    #[serde(default)]
+    pub allowed_ports: Vec<u16>,
+}
+
+/// Argument-dependent process authority. The executable is materialized from
+/// a typed string argument before authorization; program arguments do not
+/// become authority selectors.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ProcessSelectorTemplate {
+    pub executable_argument: usize,
+    /// Empty means any executable. Production descriptors should prefer an
+    /// explicit allowlist, while a user can intentionally grant the broad
+    /// concrete request at an approval boundary.
+    #[serde(default)]
+    pub allowed_executables: Vec<String>,
+}
+
+/// Argument-dependent proposal authority. The artifact language is concrete
+/// at the host boundary, so one proposal language cannot authorize another.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ProgramSelectorTemplate {
+    pub language_argument: usize,
+    #[serde(default)]
+    pub allowed_languages: Vec<String>,
+}
+
+impl NetworkSelectorTemplate {
+    pub fn instantiate(
+        &self,
+        arguments: &[super::types::TypedValue],
+    ) -> Result<(String, u16), SelectorError> {
+        let Some(super::types::TypedValue::String(host)) = arguments.get(self.host_argument) else {
+            return Err(SelectorError::InvalidNetworkTemplateArgument(
+                self.host_argument,
+            ));
+        };
+        if host.is_empty()
+            || (!self.allowed_hosts.is_empty()
+                && !self
+                    .allowed_hosts
+                    .iter()
+                    .any(|allowed| allowed == "*" || allowed == host))
+        {
+            return Err(SelectorError::NetworkTemplateArgumentOutOfBounds(
+                self.host_argument,
+            ));
+        }
+        let Some(super::types::TypedValue::Int(port)) = arguments.get(self.port_argument) else {
+            return Err(SelectorError::InvalidNetworkTemplateArgument(
+                self.port_argument,
+            ));
+        };
+        let port = u16::try_from(*port)
+            .map_err(|_| SelectorError::NetworkTemplateArgumentOutOfBounds(self.port_argument))?;
+        if !self.allowed_ports.is_empty() && !self.allowed_ports.contains(&port) {
+            return Err(SelectorError::NetworkTemplateArgumentOutOfBounds(
+                self.port_argument,
+            ));
+        }
+        Ok((host.clone(), port))
+    }
+}
+
+impl ProcessSelectorTemplate {
+    pub fn instantiate(
+        &self,
+        arguments: &[super::types::TypedValue],
+    ) -> Result<String, SelectorError> {
+        let Some(super::types::TypedValue::String(executable)) =
+            arguments.get(self.executable_argument)
+        else {
+            return Err(SelectorError::InvalidProcessTemplateArgument(
+                self.executable_argument,
+            ));
+        };
+        if executable.is_empty()
+            || (!self.allowed_executables.is_empty()
+                && !self.allowed_executables.contains(executable))
+        {
+            return Err(SelectorError::ProcessTemplateArgumentOutOfBounds(
+                self.executable_argument,
+            ));
+        }
+        Ok(executable.clone())
+    }
+}
+
+impl ProgramSelectorTemplate {
+    pub fn instantiate(
+        &self,
+        arguments: &[super::types::TypedValue],
+    ) -> Result<String, SelectorError> {
+        let Some(super::types::TypedValue::String(language)) =
+            arguments.get(self.language_argument)
+        else {
+            return Err(SelectorError::InvalidProgramTemplateArgument(
+                self.language_argument,
+            ));
+        };
+        let language = language.trim().to_ascii_lowercase();
+        if language.is_empty()
+            || (!self.allowed_languages.is_empty()
+                && !self
+                    .allowed_languages
+                    .iter()
+                    .any(|allowed| allowed == &language))
+        {
+            return Err(SelectorError::ProgramTemplateArgumentOutOfBounds(
+                self.language_argument,
+            ));
+        }
+        Ok(language)
+    }
 }
 
 impl FileSelectorTemplate {
@@ -152,6 +296,7 @@ impl FileSelector {
                 "workspace" => ResourceRoot::Workspace,
                 "project" => ResourceRoot::Project,
                 "task.output" => ResourceRoot::TaskOutput,
+                "host" | "host-machine" => ResourceRoot::HostMachine,
                 name if !name.is_empty() => ResourceRoot::Named(name.to_string()),
                 _ => return Err(SelectorError::UnknownRoot(root.to_string())),
             };
@@ -328,6 +473,9 @@ pub enum ResourceSelector {
     FileTemplate {
         template: FileSelectorTemplate,
     },
+    NetworkTemplate {
+        template: NetworkSelectorTemplate,
+    },
     Network {
         host: String,
         ports: Vec<u16>,
@@ -342,6 +490,15 @@ pub enum ResourceSelector {
     },
     Process {
         executables: Vec<String>,
+    },
+    ProcessTemplate {
+        template: ProcessSelectorTemplate,
+    },
+    Program {
+        languages: Vec<String>,
+    },
+    ProgramTemplate {
+        template: ProgramSelectorTemplate,
     },
     Memory {
         tree: String,
@@ -376,6 +533,22 @@ impl CapabilityRequirement {
         }
         match (&self.selector, &requested.selector) {
             (ResourceSelector::None, ResourceSelector::None) => true,
+            // A file line or CSV record cursor can only be minted by its
+            // path-scoped open request. Once it exists, follow-up reads and
+            // close calls carry the unforgeable resource rather than a path
+            // string, so the originating FileRead grant safely covers their
+            // unscoped static selector.
+            (ResourceSelector::File { .. }, ResourceSelector::None)
+                if requested.capability == CapabilityKind::FileRead =>
+            {
+                true
+            }
+            // `network-send` is authorized by its opaque socket resource. A
+            // socket can only be obtained from an already-authorized concrete
+            // `network-connect`, and the host checks its generation/handle on
+            // every send. Its static signature therefore carries `None`
+            // rather than repeating an unforgeable endpoint inside source.
+            (ResourceSelector::Network { .. }, ResourceSelector::None) => true,
             (
                 ResourceSelector::File { selector: grant },
                 ResourceSelector::File { selector: request },
@@ -402,6 +575,30 @@ impl CapabilityRequirement {
                     && (grant_ports.is_empty()
                         || request_ports.iter().all(|port| grant_ports.contains(port)))
             }
+            (
+                ResourceSelector::Network {
+                    host: grant_host,
+                    ports: grant_ports,
+                },
+                ResourceSelector::NetworkTemplate { template },
+            ) => {
+                let hosts_covered = template.allowed_hosts.is_empty()
+                    || template
+                        .allowed_hosts
+                        .iter()
+                        .all(|host| grant_host == "*" || (host != "*" && grant_host == host));
+                let ports_covered = template.allowed_ports.is_empty()
+                    || grant_ports.is_empty()
+                    || template
+                        .allowed_ports
+                        .iter()
+                        .all(|port| grant_ports.contains(port));
+                hosts_covered && ports_covered
+            }
+            (
+                ResourceSelector::NetworkTemplate { template: grant },
+                ResourceSelector::NetworkTemplate { template: request },
+            ) => grant == request,
             (
                 ResourceSelector::Automation { application: grant },
                 ResourceSelector::Automation {
@@ -433,6 +630,46 @@ impl CapabilityRequirement {
                     executables: request,
                 },
             ) => grant.is_empty() || request.iter().all(|item| grant.contains(item)),
+            (
+                ResourceSelector::Process { executables: grant },
+                ResourceSelector::ProcessTemplate { template },
+            ) => template
+                .allowed_executables
+                .is_empty()
+                .then_some(grant.is_empty())
+                .unwrap_or_else(|| {
+                    grant.is_empty()
+                        || template
+                            .allowed_executables
+                            .iter()
+                            .all(|executable| grant.contains(executable))
+                }),
+            (
+                ResourceSelector::ProcessTemplate { template: grant },
+                ResourceSelector::ProcessTemplate { template: request },
+            ) => grant == request,
+            (
+                ResourceSelector::Program { languages: grant },
+                ResourceSelector::Program { languages: request },
+            ) => grant.is_empty() || request.iter().all(|language| grant.contains(language)),
+            (
+                ResourceSelector::Program { languages: grant },
+                ResourceSelector::ProgramTemplate { template },
+            ) => template
+                .allowed_languages
+                .is_empty()
+                .then_some(grant.is_empty())
+                .unwrap_or_else(|| {
+                    grant.is_empty()
+                        || template
+                            .allowed_languages
+                            .iter()
+                            .all(|language| grant.contains(language))
+                }),
+            (
+                ResourceSelector::ProgramTemplate { template: grant },
+                ResourceSelector::ProgramTemplate { template: request },
+            ) => grant == request,
             (
                 ResourceSelector::Memory {
                     tree: grant_tree,
@@ -537,6 +774,21 @@ mod tests {
     }
 
     #[test]
+    fn host_machine_root_is_explicit_and_never_inferred_from_an_absolute_path() {
+        let host = FileSelector::parse("${host-machine}/var/log/**").unwrap();
+        let workspace = FileSelector::parse("./var/log/**").unwrap();
+
+        assert_eq!(host.root, ResourceRoot::HostMachine);
+        assert_eq!(host.pattern, "var/log/**");
+        assert!(!workspace.contains_selector(&host));
+        assert!(!host.contains_selector(&workspace));
+        assert_eq!(
+            FileSelector::parse("/var/log/system.log").unwrap_err(),
+            SelectorError::AbsolutePath
+        );
+    }
+
+    #[test]
     fn capability_grants_attenuate_to_narrower_patterns() {
         let broad =
             CapabilityRequirement::file(FileOperation::Write, FileSelector::parse("./**").unwrap());
@@ -600,6 +852,68 @@ mod tests {
         assert_eq!(
             template.instantiate(&arguments).unwrap_err(),
             SelectorError::TemplateArgumentOutOfBounds(0)
+        );
+    }
+
+    #[test]
+    fn parameterized_network_and_process_selectors_require_typed_bounded_arguments() {
+        let network = NetworkSelectorTemplate {
+            host_argument: 0,
+            port_argument: 1,
+            allowed_hosts: vec!["api.example.test".into()],
+            allowed_ports: vec![443],
+        };
+        assert_eq!(
+            network
+                .instantiate(&[
+                    super::super::types::TypedValue::String("api.example.test".into()),
+                    super::super::types::TypedValue::Int(443),
+                ])
+                .unwrap(),
+            ("api.example.test".into(), 443)
+        );
+        assert_eq!(
+            network
+                .instantiate(&[
+                    super::super::types::TypedValue::String("other.example.test".into()),
+                    super::super::types::TypedValue::Int(443),
+                ])
+                .unwrap_err(),
+            SelectorError::NetworkTemplateArgumentOutOfBounds(0)
+        );
+
+        let process = ProcessSelectorTemplate {
+            executable_argument: 0,
+            allowed_executables: vec!["git".into()],
+        };
+        assert_eq!(
+            process
+                .instantiate(&[super::super::types::TypedValue::String("git".into())])
+                .unwrap(),
+            "git"
+        );
+        assert_eq!(
+            process
+                .instantiate(&[super::super::types::TypedValue::String("sh".into())])
+                .unwrap_err(),
+            SelectorError::ProcessTemplateArgumentOutOfBounds(0)
+        );
+
+        let program = ProgramSelectorTemplate {
+            language_argument: 0,
+            allowed_languages: vec!["python".into()],
+        };
+        assert_eq!(
+            program
+                .instantiate(&[super::super::types::TypedValue::String(" PYTHON ".into())])
+                .unwrap(),
+            "python"
+        );
+        assert_eq!(
+            program
+                .instantiate(&[super::super::types::TypedValue::String("bash".into())])
+                .unwrap_err(),
+            SelectorError::ProgramTemplateArgumentOutOfBounds(0)
         );
     }
 

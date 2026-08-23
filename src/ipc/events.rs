@@ -103,10 +103,8 @@ impl EventBus {
         F: Fn(QueuedEvent) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Option<QueuedEvent>> + Send + 'static,
     {
-        self.handlers.insert(
-            name.into(),
-            Arc::new(move |ev| Box::pin(handler(ev))),
-        );
+        self.handlers
+            .insert(name.into(), Arc::new(move |ev| Box::pin(handler(ev))));
     }
 
     /// Enqueue an event.

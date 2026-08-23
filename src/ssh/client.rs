@@ -53,7 +53,8 @@ impl SshSession {
     ) -> Result<Self> {
         let config = Arc::new(Config::default());
         let addr = format!("{host}:{port}");
-        let mut handle = client::connect(config, addr.as_str(), SshHandler).await
+        let mut handle = client::connect(config, addr.as_str(), SshHandler)
+            .await
             .map_err(|e| anyhow::anyhow!("ssh-connect: {e}"))?;
         let authenticated = handle
             .authenticate_password(user, password)
@@ -87,7 +88,8 @@ impl SshSession {
 
         let config = Arc::new(Config::default());
         let addr = format!("{host}:{port}");
-        let mut handle = client::connect(config, addr.as_str(), SshHandler).await
+        let mut handle = client::connect(config, addr.as_str(), SshHandler)
+            .await
             .map_err(|e| anyhow::anyhow!("ssh-connect: {e}"))?;
         let authenticated = handle
             .authenticate_publickey(user, Arc::new(keypair))
@@ -105,7 +107,8 @@ impl SshSession {
 
     /// Execute a command and return (stdout, stderr, exit_code).
     pub async fn exec(&mut self, cmd: &str) -> Result<(String, String, u32)> {
-        let mut channel = self.handle
+        let mut channel = self
+            .handle
             .channel_open_session()
             .await
             .map_err(|e| anyhow::anyhow!("ssh-exec: failed to open channel: {e}"))?;

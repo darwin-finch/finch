@@ -54,9 +54,13 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
                     | "PresentPlan"
                     | "ask_user_question"
                     | "AskUserQuestion"
+                    // Session-local plan visibility is not a workspace or
+                    // host mutation. Keep the familiar checklist usable
+                    // while the model is deliberately planning.
+                    | "TodoRead"
+                    | "TodoWrite"
                     | "EnterPlanMode"
                     | "ExitPlanMode"
-                    | "Push"
             )
         }
     }
@@ -145,7 +149,7 @@ pub(crate) async fn handle_present_plan(
     )
     .with_body(plan_content.to_string())
     .with_help(
-        "↑↓/jk: navigate · Enter: select · o: custom · PgUp/PgDn: scroll plan · Esc: cancel",
+        "↑↓/jk: navigate · Enter: select · o: custom · Ctrl-U/D or PgUp/PgDn: scroll plan · Esc: cancel",
     );
 
     // Stop the "Deliberating…" spinner before showing the dialog — the model
@@ -169,8 +173,7 @@ pub(crate) async fn handle_present_plan(
         let _ = tui.erase_live_area();
         let _ = tui.draw_live_area();
     }
-    let (dialog_tx, dialog_rx) =
-        tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
+    let (dialog_tx, dialog_rx) = tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
     if event_tx
         .send(ReplEvent::ShowDialog {
             dialog,
@@ -317,13 +320,10 @@ pub(crate) async fn handle_ask_user_question(
     // duration — this is a known limitation; single-question is the common case.
     if input.questions.len() > 1 {
         let mut tui = tui_renderer.lock().await;
-        let tabbed =
-            crate::cli::tui::TabbedDialog::new(input.questions.clone(), None);
+        let tabbed = crate::cli::tui::TabbedDialog::new(input.questions.clone(), None);
         let result = match tui.show_tabbed_dialog(tabbed) {
             Ok(r) => r,
-            Err(e) => {
-                return Some(Err(anyhow::anyhow!("Failed to show dialog: {}", e)))
-            }
+            Err(e) => return Some(Err(anyhow::anyhow!("Failed to show dialog: {}", e))),
         };
         drop(tui);
 
@@ -365,8 +365,7 @@ pub(crate) async fn handle_ask_user_question(
         let _ = tui.erase_live_area();
         let _ = tui.draw_live_area();
     }
-    let (dialog_tx, dialog_rx) =
-        tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
+    let (dialog_tx, dialog_rx) = tokio::sync::oneshot::channel::<crate::cli::tui::DialogResult>();
     if event_tx
         .send(ReplEvent::ShowDialog {
             dialog,
@@ -478,6 +477,17 @@ mod tests {
                 is_tool_allowed_in_mode(tool, &mode),
                 "{} must be allowed in planning mode",
                 tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_mode_allows_session_local_todo_projection() {
+        let mode = planning_mode();
+        for tool in ["TodoRead", "TodoWrite"] {
+            assert!(
+                is_tool_allowed_in_mode(tool, &mode),
+                "{tool} must remain available while planning"
             );
         }
     }

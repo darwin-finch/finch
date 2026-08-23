@@ -6,15 +6,132 @@
 // This enables terminal scrollback while maintaining TUI compatibility.
 
 use std::io::{self, Write};
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
     LiveToolMessage, MessageRef, OperationMessage, StaticMessage, StreamingResponseMessage,
     UserQueryMessage, WorkUnit,
 };
+use crate::vm::{HostSideEffect, TypedValue, UiOperation, VmSideEffect};
 
 /// Maximum number of messages to keep in the circular buffer
 const MAX_BUFFER_SIZE: usize = 1000;
+
+/// Host-side projection of portable VM output events into Finch's reactive
+/// scrollback. The VM itself never imports `WorkUnit` or terminal rendering;
+/// this adapter owns the handle-to-view mapping for one attached client.
+#[derive(Clone)]
+pub struct VmOutputProjection {
+    output: Arc<OutputManager>,
+    default_response: Arc<WorkUnit>,
+    handles: Arc<Mutex<HashMap<String, Arc<WorkUnit>>>>,
+}
+
+impl VmOutputProjection {
+    pub fn new(output: Arc<OutputManager>, default_response: Arc<WorkUnit>) -> Self {
+        Self {
+            output,
+            default_response,
+            handles: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Apply one ordered VM event. Unknown or already-closed handles are
+    /// ignored here: the typed runtime has already enforced ownership and
+    /// generation before an event reaches a host projection.
+    pub fn project(&self, effect: &VmSideEffect) {
+        match &effect.event {
+            HostSideEffect::Emit { text } => self.default_response.append_response(text),
+            HostSideEffect::Request { .. } => {}
+            HostSideEffect::Ui {
+                operation,
+                target,
+                text,
+                progress,
+            } => self.project_ui(*operation, target.as_ref(), text.as_deref(), progress.as_ref()),
+        }
+    }
+
+    fn project_ui(
+        &self,
+        operation: UiOperation,
+        target: Option<&TypedValue>,
+        text: Option<&str>,
+        progress: Option<&crate::vm::UiProgress>,
+    ) {
+        let Some(handle) = output_handle(target) else {
+            return;
+        };
+        match operation {
+            UiOperation::Create => {
+                let unit = self
+                    .output
+                    .start_work_unit(text.unwrap_or("Working"));
+                self.handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(handle.to_string(), unit);
+            }
+            UiOperation::Append => {
+                if let (Some(unit), Some(text)) = (self.unit(handle), text) {
+                    unit.append_response(text);
+                }
+            }
+            UiOperation::Replace | UiOperation::Status => {
+                if let (Some(unit), Some(text)) = (self.unit(handle), text) {
+                    unit.set_response(text);
+                }
+            }
+            UiOperation::Progress => {
+                if let (Some(unit), Some(progress)) = (self.unit(handle), progress) {
+                    let detail = match progress.total {
+                        Some(total) => format!("{} / {}", progress.completed, total),
+                        None => format!("{}", progress.completed),
+                    };
+                    unit.set_response(detail);
+                }
+            }
+            UiOperation::Complete => {
+                if let Some(unit) = self.remove_unit(handle) {
+                    unit.set_complete();
+                }
+            }
+            UiOperation::Fail => {
+                if let Some(unit) = self.remove_unit(handle) {
+                    if let Some(text) = text {
+                        unit.set_response(text);
+                    }
+                    unit.set_failed();
+                }
+            }
+        }
+    }
+
+    fn unit(&self, handle: &str) -> Option<Arc<WorkUnit>> {
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(handle)
+            .cloned()
+    }
+
+    fn remove_unit(&self, handle: &str) -> Option<Arc<WorkUnit>> {
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(handle)
+    }
+}
+
+fn output_handle(target: Option<&TypedValue>) -> Option<&str> {
+    match target {
+        Some(TypedValue::Resource { kind, handle, .. }) if kind == "output-handle" => {
+            Some(handle)
+        }
+        _ => None,
+    }
+}
 
 // OutputMessage enum removed - now using trait-based messages only
 
@@ -254,6 +371,7 @@ impl Clone for OutputManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::messages::Message;
 
     fn silent_manager() -> OutputManager {
         let m = OutputManager::new(crate::config::ColorScheme::default());
@@ -271,6 +389,85 @@ mod tests {
 
         assert_eq!(manager.len(), 3);
         assert_eq!(manager.get_messages().len(), 3);
+    }
+
+    fn output_effect(
+        operation: UiOperation,
+        handle: &str,
+        text: Option<&str>,
+        progress: Option<crate::vm::UiProgress>,
+    ) -> VmSideEffect {
+        VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 1,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Ui {
+                operation,
+                target: Some(TypedValue::Resource {
+                    kind: "output-handle".into(),
+                    handle: handle.into(),
+                    generation: 0,
+                }),
+                text: text.map(str::to_string),
+                progress,
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        }
+    }
+
+    #[test]
+    fn vm_output_projection_keeps_explicit_handles_independent() {
+        let manager = Arc::new(silent_manager());
+        let response = manager.start_work_unit("Response");
+        let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&response));
+
+        projection.project(&VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 0,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit {
+                text: "answer".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        });
+        projection.project(&VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 1,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+            event: HostSideEffect::Emit {
+                text: " next".into(),
+            },
+            output: Vec::new(),
+            origin: crate::vm::SourceOrigin::generated("test"),
+        });
+        projection.project(&output_effect(UiOperation::Create, "download", Some("Download"), None));
+        projection.project(&output_effect(
+            UiOperation::Progress,
+            "download",
+            None,
+            Some(crate::vm::UiProgress {
+                completed: 2,
+                total: Some(5),
+            }),
+        ));
+        projection.project(&output_effect(UiOperation::Complete, "download", None, None));
+
+        let messages = manager.get_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(response.content(), "answer next");
+        assert_eq!(messages[1].content(), "2 / 5");
+        assert_eq!(messages[1].status(), crate::cli::messages::MessageStatus::Complete);
     }
 
     #[test]
@@ -334,4 +531,5 @@ mod tests {
         let _wu = manager.start_work_unit("thinking");
         assert_eq!(manager.len(), 1);
     }
+
 }

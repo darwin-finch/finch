@@ -60,12 +60,18 @@ impl ProofBundle {
 
     /// Returns true if all proofs with known effects agree on `( pops -- pushes )`.
     pub fn effects_agree(&self) -> bool {
-        let effects: Vec<_> = self.proofs.iter().filter_map(|p| p.effect.as_ref()).collect();
+        let effects: Vec<_> = self
+            .proofs
+            .iter()
+            .filter_map(|p| p.effect.as_ref())
+            .collect();
         if effects.len() < 2 {
             return true; // nothing to disagree about yet
         }
         let first = effects[0];
-        effects.iter().all(|e| e.pops == first.pops && e.pushes == first.pushes)
+        effects
+            .iter()
+            .all(|e| e.pops == first.pops && e.pushes == first.pushes)
     }
 
     /// Primary promise — the first one added (the original source language).

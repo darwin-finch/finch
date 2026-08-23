@@ -375,7 +375,7 @@ impl ToolExecutor {
         tokenizer: Option<Arc<crate::models::tokenizer::TextTokenizer>>,
         repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
-        live_output: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        live_output: Option<crate::tools::types::LiveOutput>,
         stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
     ) -> Result<ToolResult>
     where

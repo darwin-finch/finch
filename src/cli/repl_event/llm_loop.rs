@@ -46,6 +46,8 @@ pub struct LlmLoop {
     generator_state: Arc<RwLock<GeneratorState>>,
     tool_definitions: Arc<Vec<ToolDefinition>>,
     tool_coordinator: ToolExecutionCoordinator,
+    /// Shared typed runtime that receives raw provider VM-wire programs.
+    program_runtime: Arc<crate::runtime::ProgramRuntime>,
     tool_call_history:
         Arc<RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>>,
 
@@ -85,6 +87,7 @@ impl LlmLoop {
         generator_state: Arc<RwLock<GeneratorState>>,
         tool_definitions: Arc<Vec<ToolDefinition>>,
         tool_coordinator: ToolExecutionCoordinator,
+        program_runtime: Arc<crate::runtime::ProgramRuntime>,
         tool_call_history: Arc<
             RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
         >,
@@ -115,6 +118,7 @@ impl LlmLoop {
             generator_state,
             tool_definitions,
             tool_coordinator,
+            program_runtime,
             tool_call_history,
             conversation,
             query_states,
@@ -178,6 +182,7 @@ impl LlmLoop {
         let conversation = Arc::clone(&self.conversation);
         let query_states = Arc::clone(&self.query_states);
         let tool_coordinator = self.tool_coordinator.clone();
+        let program_runtime = Arc::clone(&self.program_runtime);
         let tui_renderer = Arc::clone(&self.tui_renderer);
         let mode = Arc::clone(&self.mode);
         let output_manager = Arc::clone(&self.output_manager);
@@ -210,6 +215,7 @@ impl LlmLoop {
                 conversation,
                 query_states,
                 tool_coordinator,
+                program_runtime,
                 tui_renderer,
                 mode,
                 output_manager,

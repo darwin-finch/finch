@@ -4,10 +4,49 @@ Status: deferred until the typed Lisp/Co-Forth VM integration gate is complete.
 
 ## Goal
 
-Make `Brain` one daemon-authoritative logical entity. The daemon owns durable state and execution;
-clients maintain attachments and projections of that state. A speculative typing helper, normal
-model turn, scheduled callback, and subagent are `BrainRun` instances within a Brain rather than
-different kinds of Brain.
+Make `Brain` one daemon-authoritative logical entity. The daemon owns only durable coordination
+state and the event log; it has **no** workspace/environment authority. By default on Unix, one
+named master frontend runner lives in a supervised `tmux` session and exclusively owns the active
+VM, provider/task execution, workspace, accessibility, credentials, and host-effect capabilities.
+Other clients are attachments and projections. A speculative typing helper, normal model turn,
+scheduled callback, and subagent are `BrainRun` instances within a Brain rather than different kinds
+of Brain.
+
+The runner is the master frontend process, not an ordinary attached client. A consultant or another
+attached client appends a typed inbox/prompt event to the daemon log even when the master terminal is
+detached; the leased master frontend consumes that event according to Brain policy. Consultants
+never receive the workspace or credential handles merely by attaching. Attachments catch up by event
+cursor. If a runner is replaced on the same authorized environment, it restores the last committed VM
+checkpoint and consumes only the logged events not yet acknowledged by that runner, so “catching up”
+is a deterministic runtime operation rather than an LLM being asked to reconstruct missed
+instructions from prose.
+
+If that environment-owning frontend is genuinely unavailable, a consultant-originated workspace
+request becomes a durable `queued_for_environment` run state. The daemon and consultant must not
+invent a file/tool result or execute the request elsewhere. An explicit, authenticated control and
+environment-authority handoff is the only way another frontend may process it; otherwise it waits
+until the authorized master frontend reconnects.
+
+The daemon also owns schedule definitions, due-time calculation, and delivery bookkeeping, but never
+executes their workspace effects. Its default policy is coalescing: while the master frontend is
+unavailable, it retains one pending `ScheduleDue` event per schedule and updates its missed-count and
+time range. Reconnection delivers that one summarized event rather than an unbounded backlog. A
+schedule that genuinely requires each missed occurrence must explicitly opt into a bounded catch-up
+policy (`max_catch_up`, expiry, and idempotency key required); otherwise missed ticks are summarized
+or skipped according to its declared policy.
+
+A client exit, crash, update, or deliberate detach must never destroy a Brain. The daemon retains
+its event log, committed VM checkpoint/deltas, pending approvals, scheduled work, and resumable
+run metadata until explicit archival or retention-policy deletion. Reopening Finch attaches a new
+projection to the same named Brain and resumes its visible history; interrupted runs are surfaced
+as recoverable state rather than silently forgotten.
+
+`tmux` provides terminal-disconnect survival, not crash or reboot durability. The runner therefore
+checkpoints serializable VM state and execute-once host-effect records at committed boundaries. If
+the runner or `tmux` server dies, the daemon marks the run interrupted and a newly launched runner
+may resume only from a validated checkpoint; it never replays already-recorded external effects.
+`tmux` is a preferred Unix launcher, not a semantic dependency: headless/service runners remain a
+supported deployment option.
 
 This work must consolidate the existing implementations. It must not create another registry,
 session abstraction, or transport-specific lifecycle.
@@ -80,9 +119,10 @@ BrainAggregate (daemon-authoritative)
   event log                sole durable authority
   VM revisions             typed checkpoints/deltas
   memory namespace         references, not copied ambient context
-  grants/policies          revocable local authority
+  grants/policies          policy metadata only; no usable host handles
   runs                     active and historical BrainRun records
   attachments              authenticated client cursors
+  runner lease             current tmux/headless runner identity and liveness
 
 BrainRun
   RunId
@@ -93,17 +133,27 @@ BrainRun
   typed program/result stream
   status, budget, cancellation
   pending approvals/questions/plans
+  input cursor              last consumed durable inbox/prompt event
 
 BrainAttachment (client-side)
   BrainId + attachment identity
-  last applied event/revision
+  locally cached last-applied event cursor + revision
   shadow-buffer projection
   local input/draft state
   reconnect/resync state
 ```
 
-The client never owns an authoritative Brain. In a standalone build, an embedded in-process daemon
-implements the same service interface; only the deployment topology changes.
+The daemon persists the authoritative acknowledgement cursor for every attachment identity. A
+frontend may cache its last applied event for fast reconnect, but it resumes by asking the daemon for
+the acknowledged cursor, receiving a snapshot or the missing event range, and acknowledging forward
+only after its projection applies each event. Retention/pruning policy uses those durable cursors and
+explicit expiry rules; terminal exit never silently advances or discards an attachment's position.
+
+The master frontend owns the environment authority, while the daemon owns the authoritative history.
+The active runner obtains a leased service attachment before executing a run; it is replaceable after
+failure only on the same authorized environment, and cannot append events or commit VM state without
+that lease. In a standalone build, an embedded in-process daemon implements the same service interface;
+only the deployment topology changes.
 
 ## Canonical events
 
@@ -118,6 +168,7 @@ Extend the existing numbered Brain event envelope rather than maintaining parall
 - `CapabilityRequested`, `CapabilityDecided`, `EffectRecorded`;
 - `QuestionAsked`, `QuestionAnswered`, `PlanPresented`, `PlanResponded`;
 - `MemoryReferenced`, `ScheduleChanged`, `ChildLinked`;
+- `ScheduleDue { schedule_id, due_at, missed_count, first_missed_at, delivery_policy }`;
 - `ProjectionMoved`, `EventSuperseded`.
 
 Events store typed IDs, structured diagnostics, capability objects, and revision links. Display text
@@ -144,6 +195,12 @@ the service.
 
 Every mutating request includes `BrainId`, caller identity, expected Brain revision, environment
 generation, and an idempotency key. Names are aliases resolved to IDs, not durable identity.
+
+Workspace state is outside the event log and may change independently. A run/effect therefore records
+the environment generation plus any meaningful precondition available at the boundary (for example
+Git HEAD, a file identity/preimage hash, or a resource generation). A mismatch is a typed stale or
+conflict outcome for the master frontend to reconcile; Finch never claims that replaying a Brain log
+can reconstruct arbitrary external workspace mutation.
 
 ## Forks and process topology
 

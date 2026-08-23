@@ -3,10 +3,18 @@ use crate::vm::diagnostic::{
 };
 use crate::vm::effects::EffectSet;
 use crate::vm::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
+use crate::vm::interpreter::UiOperation;
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
 use crate::vm::types::{Type, TypedValue};
 use crate::vm::verifier::{apply_signature_types, VerifiedModule, Verifier, Vocabulary};
 use std::collections::BTreeMap;
+
+#[derive(Debug, Clone)]
+struct LocalBinding {
+    name: String,
+    ty: Type,
+    origin: SourceOrigin,
+}
 
 #[derive(Debug, Clone)]
 struct Token {
@@ -23,6 +31,7 @@ enum TokenValue {
 
 #[derive(Debug, Clone)]
 struct LoopFrame {
+    label: Option<String>,
     header: u32,
     exit: Option<u32>,
     stack: Vec<Type>,
@@ -33,8 +42,12 @@ struct LoopFrame {
 struct IfFrame {
     else_block: u32,
     merge_block: u32,
+    /// The stack supplied to the else branch.  Ordinary `if` uses the same
+    /// entry row for both branches; `if-some` consumes its option in each
+    /// branch and supplies the unwrapped value only to the then branch.
     entry_stack: Vec<Type>,
     then_stack: Option<Vec<Type>>,
+    option_condition: bool,
     origin: SourceOrigin,
 }
 
@@ -94,12 +107,13 @@ pub fn compile_forth_with_functions(
             )]);
         }
         local_vocabulary.insert(definition.name.clone(), definition.signature.clone());
-        let compiled = compile_forth_body_with_functions(
+        let compiled = compile_forth_body_with_locals(
             source_id,
             &definition.body,
             definition.signature.input.values.clone(),
             &local_vocabulary,
             &functions,
+            &definition.locals,
         )?;
         let verified = &compiled.functions[&compiled.module.entry];
         let mut function = compiled.module.functions[&compiled.module.entry].clone();
@@ -152,6 +166,24 @@ fn compile_forth_body_with_functions(
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
+    compile_forth_body_with_locals(
+        source_id,
+        source,
+        initial_stack,
+        vocabulary,
+        linked_functions,
+        &[],
+    )
+}
+
+fn compile_forth_body_with_locals(
+    source_id: &str,
+    source: &str,
+    initial_stack: Vec<Type>,
+    vocabulary: &Vocabulary,
+    linked_functions: &BTreeMap<String, Function>,
+    locals: &[LocalBinding],
+) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
     let tokens = tokenize(source_id, source)?;
     let mut stack = initial_stack.clone();
     let mut effects = EffectSet::pure();
@@ -167,22 +199,63 @@ fn compile_forth_body_with_functions(
     let mut loops: Vec<LoopFrame> = Vec::new();
     let mut conditionals: Vec<IfFrame> = Vec::new();
     let mut control = Vec::new();
+    let local_indexes = locals
+        .iter()
+        .enumerate()
+        .map(|(index, local)| (local.name.as_str(), (index as u32, local.ty.clone())))
+        .collect::<BTreeMap<_, _>>();
 
     let emit = |blocks: &mut BTreeMap<u32, BasicBlock>,
                 current: u32,
                 instruction: Instruction,
                 origin: SourceOrigin| {
-        blocks
-            .get_mut(&current)
-            .expect("current block exists")
+        let block = blocks.get_mut(&current).expect("current block exists");
+        // A structured `break`/`continue` is a terminator.  Parsing continues
+        // so enclosing `if`/loop forms can close their alternate reachable
+        // paths, but no synthetic merge/back-edge may be appended after that
+        // terminator in the same basic block.
+        if block
             .instructions
-            .push(LocatedInstruction {
-                instruction,
-                origin,
-            });
+            .last()
+            .is_some_and(|located| located.instruction.is_terminator())
+        {
+            return;
+        }
+        block.instructions.push(LocatedInstruction {
+            instruction,
+            origin,
+        });
     };
 
     let mut token_index = 0;
+    // A Co-Forth `locals| a b |` declaration names the declared inputs in
+    // bottom-to-top stack order. Store the top value first, exactly as a Lisp
+    // parameter prologue does, so the function body begins with a clean
+    // shared data stack and its values live only in this activation frame.
+    for (index, local) in locals.iter().enumerate().rev() {
+        let found = stack.pop().ok_or_else(|| {
+            vec![control_error(
+                "E-FORTH-LOCAL-003",
+                "locals declaration requires a corresponding typed input",
+                local.origin.clone(),
+            )]
+        })?;
+        if found != local.ty {
+            return Err(vec![VmDiagnostic::type_mismatch(
+                local.ty.clone(),
+                found,
+                Some(local.origin.clone()),
+            )]);
+        }
+        emit(
+            &mut blocks,
+            current,
+            Instruction::LocalSet {
+                index: index as u32,
+            },
+            local.origin.clone(),
+        );
+    }
     while token_index < tokens.len() {
         let token = tokens[token_index].clone();
         let origin = origin(source_id, source, token.start, token.end);
@@ -192,7 +265,7 @@ fn compile_forth_body_with_functions(
                     return Err(vec![control_error(
                         "E-FORTH-QUOTE-001",
                         "['] requires a persistent typed word name",
-                        origin,
+                        origin.clone(),
                     )]);
                 };
                 let TokenValue::Word(target_name) = &target.value else {
@@ -316,10 +389,85 @@ fn compile_forth_body_with_functions(
                         merge_block,
                         entry_stack: stack.clone(),
                         then_stack: None,
+                        option_condition: false,
                         origin,
                     });
                     control.push(ControlKind::If);
                     current = then_block;
+                    token_index += 1;
+                    continue;
+                }
+                "if-some" => {
+                    let option = stack.pop().ok_or_else(|| {
+                        vec![control_error(
+                            "E-STACK-001",
+                            "if-some requires an option<T> condition",
+                            origin.clone(),
+                        )]
+                    })?;
+                    let Type::Option(inner) = option else {
+                        return Err(vec![control_error(
+                            "E-TYPE-012",
+                            "if-some requires an option<T> condition",
+                            origin,
+                        )]);
+                    };
+
+                    // Keep one copy of the option live across the branch,
+                    // and branch on a second copy. Each branch consumes the
+                    // live option: the then edge receives T, the else edge
+                    // receives nothing. This is structured lowering to the
+                    // existing typed IR, not a dynamic type test.
+                    emit(&mut blocks, current, Instruction::Dup, origin.clone());
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::Call {
+                            function: "is-some".into(),
+                        },
+                        origin.clone(),
+                    );
+                    let then_block = next_block;
+                    let else_block = next_block + 1;
+                    let merge_block = next_block + 2;
+                    next_block += 3;
+                    for id in [then_block, else_block, merge_block] {
+                        blocks.insert(
+                            id,
+                            BasicBlock {
+                                id,
+                                instructions: Vec::new(),
+                            },
+                        );
+                    }
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::Branch {
+                            then_block,
+                            else_block,
+                        },
+                        origin.clone(),
+                    );
+                    conditionals.push(IfFrame {
+                        else_block,
+                        merge_block,
+                        entry_stack: stack.clone(),
+                        then_stack: None,
+                        option_condition: true,
+                        origin: origin.clone(),
+                    });
+                    control.push(ControlKind::If);
+                    current = then_block;
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::Call {
+                            function: "unwrap".into(),
+                        },
+                        origin,
+                    );
+                    stack.push(*inner);
                     token_index += 1;
                     continue;
                 }
@@ -352,10 +500,18 @@ fn compile_forth_body_with_functions(
                         Instruction::Jump {
                             target: frame.merge_block,
                         },
-                        origin,
+                        origin.clone(),
                     );
                     current = frame.else_block;
                     stack = frame.entry_stack.clone();
+                    if frame.option_condition {
+                        emit(
+                            &mut blocks,
+                            current,
+                            Instruction::Drop,
+                            origin.clone(),
+                        );
+                    }
                     token_index += 1;
                     continue;
                 }
@@ -385,6 +541,13 @@ fn compile_forth_body_with_functions(
                         }
                         stack.clone()
                     } else {
+                        if frame.option_condition {
+                            return Err(vec![control_error(
+                                "E-FORTH-IF-003",
+                                "if-some requires an else branch so the none option is consumed",
+                                frame.origin,
+                            )]);
+                        }
                         if stack != frame.entry_stack {
                             return Err(vec![control_error(
                                 "E-STACK-004",
@@ -415,7 +578,33 @@ fn compile_forth_body_with_functions(
                     token_index += 1;
                     continue;
                 }
-                "begin" => {
+                "begin" | "begin:" => {
+                    let label = if word == "begin:" {
+                        let Some(Token {
+                            value: TokenValue::Word(label),
+                            ..
+                        }) = tokens.get(token_index + 1)
+                        else {
+                            return Err(vec![control_error(
+                                "E-FORTH-LOOP-006",
+                                "begin: requires a loop label",
+                                origin,
+                            )]);
+                        };
+                        if label.is_empty()
+                            || matches!(label.as_str(), "if" | "else" | "then" | "while" | "repeat" | "until")
+                            || loops.iter().any(|frame| frame.label.as_deref() == Some(label))
+                        {
+                            return Err(vec![control_error(
+                                "E-FORTH-LOOP-006",
+                                format!("invalid or duplicate active loop label '{label}'"),
+                                origin,
+                            )]);
+                        }
+                        Some(label.clone())
+                    } else {
+                        None
+                    };
                     let header = next_block;
                     next_block += 1;
                     blocks.insert(
@@ -433,13 +622,72 @@ fn compile_forth_body_with_functions(
                     );
                     current = header;
                     loops.push(LoopFrame {
+                        label,
                         header,
                         exit: None,
                         stack: stack.clone(),
                         origin,
                     });
                     control.push(ControlKind::Loop);
-                    token_index += 1;
+                    token_index += if word == "begin:" { 2 } else { 1 };
+                    continue;
+                }
+                "break" | "continue" => {
+                    let Some(Token {
+                        value: TokenValue::Word(label),
+                        ..
+                    }) = tokens.get(token_index + 1)
+                    else {
+                        return Err(vec![control_error(
+                            "E-FORTH-LOOP-007",
+                            format!("{word} requires a named loop label"),
+                            origin,
+                        )]);
+                    };
+                    let Some(frame) = loops
+                        .iter()
+                        .rev()
+                        .find(|frame| frame.label.as_deref() == Some(label.as_str()))
+                    else {
+                        return Err(vec![control_error(
+                            "E-FORTH-LOOP-007",
+                            format!("{word} target '{label}' is not an active named loop"),
+                            origin,
+                        )]);
+                    };
+                    if stack != frame.stack {
+                        let mut diagnostic = control_error(
+                            "E-STACK-006",
+                            format!(
+                                "{word} target '{label}' requires the loop's declared stack shape"
+                            ),
+                            origin,
+                        );
+                        diagnostic.expected_types = frame.stack.clone();
+                        diagnostic.found_types = stack.clone();
+                        return Err(vec![diagnostic]);
+                    }
+                    let target = if word == "break" {
+                        let Some(exit) = frame.exit else {
+                            return Err(vec![control_error(
+                                "E-FORTH-LOOP-008",
+                                format!(
+                                    "break target '{label}' has no exit yet; place it after that loop's while"
+                                ),
+                                origin,
+                            )]);
+                        };
+                        exit
+                    } else {
+                        frame.header
+                    };
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::Jump { target },
+                        origin,
+                    );
+                    token_index += 2;
                     continue;
                 }
                 "while" => {
@@ -685,6 +933,106 @@ fn compile_forth_body_with_functions(
                     let len = stack.len();
                     stack.swap(len - 1, len - 2);
                     Instruction::Swap
+                } else if word == "defer-cpu" {
+                    let closure = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-FIBER-003",
+                            DiagnosticPhase::TypeInference,
+                            "defer-cpu requires a typed closure",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    let Type::Function {
+                        arguments,
+                        result,
+                        effects: closure_effects,
+                    } = closure
+                    else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-003",
+                            DiagnosticPhase::TypeInference,
+                            "defer-cpu requires a typed closure",
+                            Some(origin),
+                        )]);
+                    };
+                    if !arguments.is_empty() {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-004",
+                            DiagnosticPhase::TypeInference,
+                            "defer-cpu requires a zero-argument closure; capture its arguments first",
+                            Some(origin),
+                        )]);
+                    }
+                    if !closure_effects.is_pure() {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-005",
+                            DiagnosticPhase::TypeInference,
+                            "defer-cpu requires a pure closure",
+                            Some(origin),
+                        )]);
+                    }
+                    stack.push(Type::Task(result));
+                    Instruction::DeferCpu
+                } else if word == "task-poll" {
+                    let task = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-FIBER-009",
+                            DiagnosticPhase::TypeInference,
+                            "task-poll requires task<T>",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    let Type::Task(result) = task else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-009",
+                            DiagnosticPhase::TypeInference,
+                            "task-poll requires task<T>",
+                            Some(origin),
+                        )]);
+                    };
+                    stack.push(Type::Option(result));
+                    Instruction::PollCpuFiber
+                } else if word == "task-join" {
+                    let task = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-FIBER-010",
+                            DiagnosticPhase::TypeInference,
+                            "task-join requires task<T>",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    let Type::Task(result) = task else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-010",
+                            DiagnosticPhase::TypeInference,
+                            "task-join requires task<T>",
+                            Some(origin),
+                        )]);
+                    };
+                    stack.push(*result);
+                    Instruction::JoinCpuFiber
+                } else if word == "task-cancel" {
+                    let task = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-FIBER-020",
+                            DiagnosticPhase::TypeInference,
+                            "task-cancel requires task<T>",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    if !matches!(task, Type::Task(_)) {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-020",
+                            DiagnosticPhase::TypeInference,
+                            "task-cancel requires task<T>",
+                            Some(origin),
+                        )]);
+                    }
+                    stack.push(Type::Unit);
+                    Instruction::CancelCpuFiber
+                } else if let Some((index, ty)) = local_indexes.get(word.as_str()) {
+                    stack.push(ty.clone());
+                    Instruction::LocalGet { index: *index }
                 } else {
                     let Some(signature) = vocabulary.get(&word) else {
                         return Err(vec![VmDiagnostic::error(
@@ -697,7 +1045,17 @@ fn compile_forth_body_with_functions(
                     apply_signature_types(signature, &mut stack, &origin)
                         .map_err(|diagnostic| vec![diagnostic])?;
                     effects = effects.union(&signature.effects);
-                    if signature.effects.0.len() == 1 {
+                    if word == "yield" {
+                        Instruction::Yield
+                    } else if word == "output-open" {
+                        Instruction::OutputOpen
+                    } else if let Some(operation) = output_operation(&word) {
+                        Instruction::UiEffect {
+                            operation,
+                            input: signature.input.values.clone(),
+                            output: signature.output.values.clone(),
+                        }
+                    } else if signature.effects.0.len() == 1 {
                         Instruction::CapabilityRequest {
                             requirement: signature.effects.0.iter().next().unwrap().clone(),
                             input: signature.input.values.clone(),
@@ -747,7 +1105,7 @@ fn compile_forth_body_with_functions(
             effects,
             control: ControlEffect::Returns,
         },
-        locals: Vec::new(),
+        locals: locals.iter().map(|local| local.ty.clone()).collect(),
         captures: Vec::new(),
         entry: 0,
         blocks,
@@ -759,10 +1117,23 @@ fn compile_forth_body_with_functions(
     Verifier::new(vocabulary).verify(module)
 }
 
+fn output_operation(word: &str) -> Option<UiOperation> {
+    match word {
+        "output-append" => Some(UiOperation::Append),
+        "output-replace" => Some(UiOperation::Replace),
+        "output-status" => Some(UiOperation::Status),
+        "output-progress" => Some(UiOperation::Progress),
+        "output-complete" => Some(UiOperation::Complete),
+        "output-fail" => Some(UiOperation::Fail),
+        _ => None,
+    }
+}
+
 struct ParsedDefinition {
     name: String,
     signature: StackSignature,
     declares_pure: bool,
+    locals: Vec<LocalBinding>,
     body: String,
     origin: SourceOrigin,
 }
@@ -851,10 +1222,18 @@ fn extract_definitions(
             .map_or(tokens[end].start, |token| token.start);
         let body_end = tokens[end].start;
         let definition_end = tokens[end].end;
+        let (locals, body_start) = parse_definition_locals(
+            source_id,
+            source,
+            &tokens[body_start_index..end],
+            body_start,
+            &signature.input.values,
+        )?;
         definitions.push(ParsedDefinition {
             name: name.clone(),
             signature,
             declares_pure,
+            locals,
             body: source[body_start..body_end].to_string(),
             origin: origin(source_id, source, definition_start, definition_end),
         });
@@ -867,6 +1246,84 @@ fn extract_definitions(
     }
     let main = String::from_utf8(erased).expect("erasing source preserves UTF-8 bytes");
     Ok((definitions, main))
+}
+
+/// Parse the direct Co-Forth spelling for frame-local parameter names:
+///
+/// ```forth
+/// : area ( S int int -- S int ! {} ) locals| width height | width height * ;
+/// ```
+///
+/// This is intentionally not a macro. It lowers to one `LocalSet` per
+/// declared input at function entry, followed by `LocalGet` at each use.
+/// The declaration must name every typed input, in its bottom-to-top stack
+/// order, so it cannot conceal a stack rearrangement from the IR viewer.
+fn parse_definition_locals(
+    source_id: &str,
+    source: &str,
+    body_tokens: &[Token],
+    default_body_start: usize,
+    input_types: &[Type],
+) -> Result<(Vec<LocalBinding>, usize), Vec<VmDiagnostic>> {
+    let Some(first) = body_tokens.first() else {
+        return Ok((Vec::new(), default_body_start));
+    };
+    if !token_is(first, "locals|") {
+        return Ok((Vec::new(), default_body_start));
+    }
+    let close = body_tokens[1..]
+        .iter()
+        .position(|token| token_is(token, "|"))
+        .map(|index| index + 1)
+        .ok_or_else(|| {
+            vec![definition_error(
+                source_id,
+                source,
+                first,
+                "unterminated locals declaration; expected '|'",
+            )]
+        })?;
+    let names = &body_tokens[1..close];
+    if names.len() != input_types.len() {
+        return Err(vec![definition_error(
+            source_id,
+            source,
+            first,
+            format!(
+                "locals declaration names {} values but word signature has {} inputs",
+                names.len(),
+                input_types.len()
+            ),
+        )]);
+    }
+    let mut locals = Vec::with_capacity(names.len());
+    for (token, ty) in names.iter().zip(input_types) {
+        let TokenValue::Word(name) = &token.value else {
+            return Err(vec![definition_error(
+                source_id,
+                source,
+                token,
+                "local name must be an identifier",
+            )]);
+        };
+        if name == "|" || name == "locals|" || locals.iter().any(|local: &LocalBinding| local.name == *name) {
+            return Err(vec![definition_error(
+                source_id,
+                source,
+                token,
+                format!("invalid or duplicate local name '{name}'"),
+            )]);
+        }
+        locals.push(LocalBinding {
+            name: name.clone(),
+            ty: ty.clone(),
+            origin: origin(source_id, source, token.start, token.end),
+        });
+    }
+    let body_start = body_tokens
+        .get(close + 1)
+        .map_or(default_body_start, |token| token.start);
+    Ok((locals, body_start))
 }
 
 fn parse_definition_signature(
@@ -996,12 +1453,21 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             continue;
         }
         let start = cursor;
-        if source[start..].starts_with("s\"") {
-            cursor += 2;
-            if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-                cursor += 1;
-            }
-            let (value, end) = read_string(source_id, source, cursor, start, "E-READ-001", "unterminated Co-Forth string literal")?;
+        // Raw prose literal.  It deliberately comes before `s"` so the
+        // triple-quote opener is not mistaken for an empty escaped string.
+        // The contents are verbatim (including newlines and ordinary quotes)
+        // until the next `"""`; use it for model/user prose that would make
+        // ordinary escaping needlessly fragile.
+        if source[start..].starts_with("s\"\"\"") {
+            cursor += 4;
+            let (value, end) = read_raw_string(
+                source_id,
+                source,
+                cursor,
+                start,
+                "E-READ-004",
+                "unterminated Co-Forth raw string literal",
+            )?;
             tokens.push(Token {
                 value: TokenValue::String(value),
                 start,
@@ -1010,21 +1476,45 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             cursor = end;
             continue;
         }
-        // Standard Forth-style immediate output string. Lower it to the same
-        // typed string literal followed by `say` used by ordinary programs.
+        // Standard Forth output literal. In typed Co-Forth it is syntax sugar
+        // for `s\"...\" say`, so it remains familiar to Forth authors while
+        // preserving the same typed SessionEmit side effect as `say`.
         if source[start..].starts_with(".\"") {
             cursor += 2;
             if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
-            let (value, end) = read_string(source_id, source, cursor, start, "E-READ-003", "unterminated Co-Forth output string literal")?;
+            let (value, end) = read_string(
+                source_id,
+                source,
+                cursor,
+                start,
+                "E-READ-005",
+                "unterminated Co-Forth output string literal",
+            )?;
             tokens.push(Token {
                 value: TokenValue::String(value),
                 start,
-                end: cursor + 1,
+                end,
             });
+            // Attribute the implicit effect to the source literal, rather
+            // than inventing an unlocatable synthetic `say` token.
             tokens.push(Token {
-                value: TokenValue::Word("say".into()),
+                value: TokenValue::Word("say".to_string()),
+                start,
+                end,
+            });
+            cursor = end;
+            continue;
+        }
+        if source[start..].starts_with("s\"") {
+            cursor += 2;
+            if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            let (value, end) = read_string(source_id, source, cursor, start, "E-READ-001", "unterminated Co-Forth string literal")?;
+            tokens.push(Token {
+                value: TokenValue::String(value),
                 start,
                 end,
             });
@@ -1086,6 +1576,27 @@ fn read_string(
     )])
 }
 
+fn read_raw_string(
+    source_id: &str,
+    source: &str,
+    cursor: usize,
+    start: usize,
+    code: &str,
+    message: &str,
+) -> Result<(String, usize), Vec<VmDiagnostic>> {
+    let remainder = &source[cursor..];
+    if let Some(close) = remainder.find("\"\"\"") {
+        let end = cursor + close;
+        return Ok((source[cursor..end].to_string(), end + 3));
+    }
+    Err(vec![VmDiagnostic::error(
+        code,
+        DiagnosticPhase::Reader,
+        message,
+        Some(origin(source_id, source, start, source.len())),
+    )])
+}
+
 fn origin(source_id: &str, source: &str, start: usize, end: usize) -> SourceOrigin {
     SourceOrigin {
         language: SourceLanguage::Forth,
@@ -1138,10 +1649,10 @@ mod tests {
     }
 
     #[test]
-    fn direct_output_and_string_literals_are_streamable() {
+    fn string_literals_are_streamable_through_explicit_say() {
         let module = compile_forth(
             "input.forth",
-            ".\"Hello \\\"世界\\\"\" 3 5 + int-to-string say s\"! \" say",
+            "s\"Hello \\\"世界\\\"\" say drop 3 5 + int-to-string say drop s\"! \" say",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -1179,6 +1690,97 @@ mod tests {
     }
 
     #[test]
+    fn typed_frontend_lowers_standard_output_literal_to_say() {
+        let module = compile_forth(
+            "input.forth",
+            ".\" legacy output\"",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("typed Co-Forth accepts standard output literal");
+        #[derive(Default)]
+        struct EmitHandler(String);
+        impl crate::vm::interpreter::CapabilityHandler for EmitHandler {
+            fn request(
+                &mut self,
+                requirement: &CapabilityRequirement,
+                arguments: Vec<TypedValue>,
+                _origin: &SourceOrigin,
+            ) -> Result<Vec<TypedValue>, VmDiagnostic> {
+                assert_eq!(requirement.capability, CapabilityKind::SessionEmit);
+                let [TypedValue::String(text)] = arguments.as_slice() else {
+                    panic!("expected string emission");
+                };
+                self.0.push_str(text);
+                Ok(vec![TypedValue::Unit])
+            }
+            fn output(&self) -> String { self.0.clone() }
+        }
+        let mut stack = Vec::new();
+        let mut handler = EmitHandler::default();
+        Interpreter::new(&module, &mut handler, InterpreterConfig {
+            fuel: 100_000,
+            grants: EffectSet::from_requirement(CapabilityRequirement {
+                capability: CapabilityKind::SessionEmit,
+                selector: ResourceSelector::None,
+            }),
+        })
+        .execute(&mut stack)
+        .unwrap();
+        assert_eq!(handler.output(), "legacy output");
+    }
+
+    #[test]
+    fn named_break_and_continue_lower_to_typed_loop_edges() {
+        let break_module = compile_forth(
+            "break.forth",
+            "0 begin: search dup 3 < while 1 + dup 2 = if break search then repeat",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut break_stack = Vec::new();
+        Interpreter::new(&break_module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut break_stack)
+            .unwrap();
+        assert_eq!(break_stack, vec![TypedValue::Int(2)]);
+
+        let continue_module = compile_forth(
+            "continue.forth",
+            "0 begin: count dup 3 < while 1 + dup 2 = if continue count then repeat",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut continue_stack = Vec::new();
+        Interpreter::new(&continue_module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut continue_stack)
+            .unwrap();
+        assert_eq!(continue_stack, vec![TypedValue::Int(3)]);
+    }
+
+    #[test]
+    fn named_loop_exit_requires_an_active_label_and_preserved_stack() {
+        let missing = compile_forth(
+            "missing.forth",
+            "0 begin: outer true while break absent repeat",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("break must name an active loop");
+        assert_eq!(missing[0].code, "E-FORTH-LOOP-007");
+
+        let mismatch = compile_forth(
+            "mismatch.forth",
+            "0 begin: outer true while drop break outer repeat",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("break must preserve its target stack row");
+        assert_eq!(mismatch[0].code, "E-STACK-006");
+    }
+
+    #[test]
     fn compiles_against_preexisting_typed_stack() {
         let module =
             compile_forth("input.forth", "2 *", vec![Type::Int], &core_vocabulary()).unwrap();
@@ -1187,6 +1789,54 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Int(18)]);
+    }
+
+    #[test]
+    fn typed_forth_locals_lower_to_explicit_frame_operations() {
+        let module = compile_forth(
+            "locals.forth",
+            ": area ( S int int -- S int ! {} ) locals| width height | width height * ; 4 3 area",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let area = &module.module.functions["area"];
+        assert_eq!(area.locals, vec![Type::Int, Type::Int]);
+        let instructions = &area.blocks[&area.entry].instructions;
+        assert!(matches!(
+            instructions[0].instruction,
+            Instruction::LocalSet { index: 1 }
+        ));
+        assert!(matches!(
+            instructions[1].instruction,
+            Instruction::LocalSet { index: 0 }
+        ));
+        assert!(matches!(
+            instructions[2].instruction,
+            Instruction::LocalGet { index: 0 }
+        ));
+        assert!(matches!(
+            instructions[3].instruction,
+            Instruction::LocalGet { index: 1 }
+        ));
+
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(stack, vec![TypedValue::Int(12)]);
+    }
+
+    #[test]
+    fn locals_must_name_every_declared_input() {
+        let errors = compile_forth(
+            "locals.forth",
+            ": area ( S int int -- S int ! {} ) locals| width | width ;",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "E-FORTH-SIG-001"));
     }
 
     #[test]
@@ -1312,5 +1962,38 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Symbol("bash".into())]);
+    }
+
+    #[test]
+    fn raw_string_literal_preserves_quotes_and_newlines_without_escaping() {
+        let module = compile_forth(
+            "input.forth",
+            "s\"\"\"The user said \"hello\".\nSecond line.\"\"\"",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(
+            stack,
+            vec![TypedValue::String(
+                "The user said \"hello\".\nSecond line.".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn raw_string_literal_reports_an_unclosed_delimiter() {
+        let errors = compile_forth(
+            "input.forth",
+            "s\"\"\"unterminated",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].code, "E-READ-004");
     }
 }

@@ -26,15 +26,54 @@ quasiquote/template syntax may package those chunks together, but each embedded 
 lower to ordinary typed IR before execution; textual interpolation and implicit evaluation are
 not permitted.
 
+`say` appends to the response port bound to its ProgramRun. Rich presentation is intentionally
+separate: `output-open` receives a host-issued opaque output handle and `output-append`,
+`output-replace`, `output-status`, `output-progress`, `output-complete`, and `output-fail` emit
+ordered portable `Ui` effects targeting that handle. The VM never selects a global "active work
+unit". A shadow-buffer terminal, IDE, web client, or accessibility host maps the same handle events
+to its own rendering model and validates handle ownership/generation before projection.
+
+### Wire syntax and self-contained scripts
+
+The provider wire protocol has a deliberately cheap dispatch rule: a response whose first
+non-whitespace byte is `(` is Finch Lisp; every other response is Co-Forth. The dispatcher does
+not guess from prose and the provider prompt says that user-visible prose must be emitted by a VM
+operation such as `s"hello" say`, never written outside the program. Empty responses and Markdown
+fences are explicit malformed-wire diagnostics with corrective guidance, not accidental Co-Forth
+words. An explicit `language` field in a stored script/tool submission overrides this compact
+streaming discriminator. Co-Forth is therefore the natural streaming form: the receiver can parse
+and render complete tokens while waiting for later tokens, whereas Lisp remains preferable when
+nested structure makes the leading `(` worth it.
+
+`s"text"` is the short escaped-string literal in Co-Forth. It has no implicit leading space:
+both `s"text"` and conventional `s" text"` produce `text` because the one delimiter whitespace is
+consumed. Spacing belongs in the literal or is composed explicitly (for example `space`, `str-cat`,
+or separate `say` events). `s"""..."""` is the raw multiline/prose literal: it preserves its
+contents verbatim until the next triple quote, avoiding fragile quote escaping in user-visible
+text. Co-Forth uses `\\` line comments. Parenthesized Co-Forth comments are allowed only after a
+Co-Forth token: at the start of a wire response, `(` selects Lisp. The normative language definition
+must give exact escaping and raw-delimiter examples.
+
+Finch scripts are portable, self-contained source artifacts rather than shell wrappers. A script
+may begin with a normal Finch shebang such as `#!/usr/bin/env finch --exec`; `finch --exec` selects
+the strict typed frontend and must never silently fall back to the legacy Forth or Lisp
+interpreters. Scripts may choose Lisp or Co-Forth using the same first-token rule. Imports and
+namespaces are a later package feature: model-emitted one-off scripts should normally be complete
+and auditable in one file. Bash, Python, and other external scripts remain valid *proposal
+artifacts* when they are the appropriate user-editable delivery format; Finch scripts do not
+remove that capability.
+
 The repository now contains the first verified typed path: both frontends lower directly to typed
 IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scoped capability
-requirements, diagnostics carry stable codes, and host execution is transactional. The migration
-is not complete: the legacy Co-Forth interpreter and native Lisp evaluator still exist for
-compatibility, some production words are not yet generated exclusively from the typed registry,
-and the typed broker still needs true suspension/resumption and complete provider parity.
+requirements, diagnostics carry stable codes, and host execution is transactional. Ordinary
+`ProgramRuntime`, provider, scheduler, and script submission are typed-only. The legacy Co-Forth
+interpreter and native Lisp evaluator remain behind explicitly named migration-only APIs while
+historical programs are ported; they are not a fallback. Some production words are not yet
+generated exclusively from the typed registry, and the typed broker still needs true
+suspension/resumption and complete provider parity.
 
-The target removes those compatibility paths after conformance parity and gives interpreted and
-JIT execution the same verified IR, transaction, and error behavior.
+The target removes those explicit migration APIs after conformance parity and gives interpreted
+and JIT execution the same verified IR, transaction, and error behavior.
 
 ## Outcomes
 
@@ -54,6 +93,35 @@ JIT execution the same verified IR, transaction, and error behavior.
    second semantic VM.
 8. There is no process-wide GIL. Executions own their stacks and frames; shared state uses immutable
    versions, explicit transactions, concurrent handles, or narrowly scoped synchronization.
+
+### Product boundary: Finch Runtime and Finch application
+
+The design deliberately has two products with one protocol boundary, even while they ship from the
+same repository initially:
+
+```text
+Finch Runtime
+  typed IR + verifier + interpreter/JIT + capabilities + transactions
+  + serialized side effects/resumes + diagnostics + durable ProgramRun state
+
+Finch application
+  Brain/event log + provider loop + terminal/shadow-buffer UI
+  + workspace/OS/automation/MCP adapters + approval policy + scheduling
+```
+
+The Runtime is embedder-neutral. It never assumes a terminal, browser, daemon, MCP transport, or
+particular model provider; it yields a typed side effect and accepts an idempotently correlated
+typed resume. The Finch application is one host implementation of that ABI. It binds effects to
+its Brain, environment authority, UI handles, host integrations, and approval policy. Keeping this
+line explicit lets an IDE, web client, or another harness execute the same verified Finch program
+without reimplementing its language semantics or weakening its capability checks.
+
+The Runtime owns the typed word-registry mechanism, signature/effect validation, and standard
+portable event kinds. An embedder owns the concrete bindings it registers: `say`/`output.*` map to
+its presentation adapter, `proposal.open` maps to its artifact workflow, and MCP bindings map to
+its discovered transports. An application binding cannot smuggle semantics through a description:
+it supplies a typed descriptor, capability template, and host handler, all of which the Runtime
+verifies before publishing the word in a manifest.
 
 ## Non-goals
 
@@ -117,6 +185,7 @@ variant{...}     tagged sum type
 word<S,E>        callable word with stack signature S and effects E
 fn(A...)->R ! E  lexical closure
 task<T>          scheduler-owned child/task handle
+fiber<Y,R>       deferred computation that may yield Y repeatedly and returns R once
 resource<K>      generation-bound runtime handle
 capability<C>    unforgeable grant handle; never synthesized from text
 dynamic          explicitly tagged escape hatch
@@ -141,6 +210,7 @@ drop         forall A S. (S A -- S) ! {}
 +            forall S.   (S int int -- S int) ! {}
 file.read    forall R S. (S path<R> -- S bytes) ! {fs.read(R)}
 agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! {agent.await}
+yield        forall S.   (S -- S) ! {}  ; cooperative timeslice boundary
 ```
 
 The signature includes:
@@ -150,6 +220,55 @@ The signature includes:
 - control-flow behavior such as return, throw, or suspend;
 - a capability/effect row;
 - optional determinism, allocation, and numeric-overflow properties useful to optimization.
+
+### Fibers, deferred work, and repeated yields
+
+`task<T>` remains the existing opaque scheduler handle. Its await/join operation is terminal: it
+returns one final `T`. A future `fiber<Y,R>` separates the progress stream from the final return:
+
+```text
+defer f(args...) : fiber<Y,R>    schedule f and return immediately
+yield value      : unit          publish one Y and continue when rescheduled
+next fiber       : result<Y,end<R>>
+join fiber       : R             wait only for the terminal return
+```
+
+The source program never writes a continuation. `yield` may occur any number of times; the VM
+records the remaining frames as an internal thunk and the event loop schedules it later. The
+initial implementation keeps resumption one-way (`unit`) and uses explicit typed inbox/message
+operations for replies. If bidirectional generators become necessary, add `fiber<Y,Resume,R>` and
+give `yield` the stack/type effect `Y -> Resume`; do not silently use `dynamic` for resumed values.
+
+Fibers are not the subagent protocol. A subagent is a separate child `ProgramRun`/agent turn with
+its own private stack, verified module, capability attenuation, budget, ancestry, event journal,
+and durable `task<R>` handle. `agent.spawn`, `agent.poll`, `agent.await`, `agent.cancel`, and later
+typed child-message/event operations are the only parent/child communication boundary. A child may
+publish progress events to its scheduler-owned task stream, but the parent never resumes a child
+through `yield`, receives its continuation, or shares mutable frame/stack state. This keeps agent
+streaming, authority auditing, cancellation, and multi-turn orchestration independent from the
+language's optional bidirectional-generator feature.
+
+An agent task may be **detached**: its parent stores or returns the `task<R>` handle instead of
+awaiting it. The daemon then owns the child across provider calls, timer/I/O waits, approvals, and
+user input, publishing progress and a terminal result as ordered Brain events. This is autonomous
+long-running orchestration, not a periodic scheduled task: a timer is merely one awaitable event in
+the child run. A later user or program turn can poll, join, cancel, or send a typed message to the
+handle subject to ancestry and capability checks.
+
+A detached child never gains new authority while nobody is present to approve it. At detach time it
+receives only the explicitly attenuated grants, grant lifetimes, module hash, expected result type,
+budget, and ancestry recorded in its durable task record. A request outside that set enters a
+`pending-approval` state with one coalesced notification to an eligible owner; it neither retries
+nor widens itself. Policy chooses an explicit bounded expiry: on expiry it fails with an auditable
+`ApprovalUnavailable` result, or a human/daemon explicitly resumes it after grant. A disconnected
+frontend therefore cannot turn a parked host-machine request into unattended machine control.
+
+CPU-bound work has a more direct source form and is not an agent or a generator. Initially Lisp
+uses `(defer :cpu (lambda () ...))`; Co-Forth lowers the equivalent quotation through
+`defer-cpu`. It captures immutable typed values, starts with a private stack, and returns a
+`task<T>` whose `poll`, `join`, and `cancel` operations are terminal task operations. The scheduler
+may use OS worker threads for these tasks, but neither thread handles nor parent stacks are VM
+values. I/O waits and timer waits suspend a ProgramRun through the trampoline instead.
 
 Definitions may declare signatures, but the compiler derives and validates them. Inferred public
 signatures are stored in the vocabulary manifest. Unresolved calls, stack-dependent parsing, or
@@ -212,6 +331,12 @@ Filesystem enforcement must:
 Static paths can be proved during verification. Dynamic paths produce a runtime obligation. A
 refinement such as `path<workspace:"generated/**">` discharges that obligation statically.
 
+Network connections follow the same rule. `network.connect` instantiates a concrete host/port
+requirement from typed arguments and returns an opaque host-issued socket resource. A later send
+does not gain ambient network authority from that resource: the host retains the socket endpoint
+and rechecks it against the active grants on every operation, including after revocation or a
+resume. Source code cannot manufacture a socket handle or substitute a different endpoint.
+
 Function effects may contain a restricted selector expression over immutable typed arguments. The
 allowed expression nodes are root, literal relative path, refined path argument, join, and narrow;
 general string interpolation and user-defined evaluation are forbidden. Composition substitutes
@@ -235,6 +360,34 @@ demonstrated need.
 A word may type-check and be authorized while still returning `CapabilityUnavailable` because OS
 Accessibility permission was revoked or a provider disappeared. Availability changes increment the
 environment generation.
+
+### MCP adapters are host bindings, not a second VM
+
+Finch's MCP implementation is a client-side integration mechanism. It does not become the VM's
+subagent protocol, continuation protocol, or an untyped escape hatch. Server configuration,
+transport lifecycle, discovery, refresh, and trust of a stdio/SSE process remain host-owned. A
+connected server's discovered tools are converted into versioned, namespaced vocabulary bindings
+only after their JSON Schema is validated.
+
+Each admitted binding is generated from one descriptor containing its qualified name (for example
+`mcp.github.issue_get`), schema-derived input/output types or an explicit managed `json` boundary,
+documentation, capability requirement, selector template, availability state, and host handler.
+Calling it lowers to the normal typed host-request event and therefore follows the normal
+grant/approval/suspension/resume/audit path. The result is schema-checked before it re-enters the
+VM. An arbitrary MCP schema must never silently become `dynamic` values on the stack; unsupported
+schemas use the explicit `json` boundary or are not published.
+
+MCP names, descriptions, annotations, and examples are third-party untrusted data. They may be
+shown as quoted metadata to a user or provider, but never treated as Finch instructions, policy,
+capabilities, prompt text with authority, or documentation that overrides the BOOT capsule. Bound
+their length, preserve provenance, and escape/render them as data in every manifest and UI.
+
+MCP authority is distinct from the process authority used to start a local stdio server. A call
+requires an attenuable request such as `mcp.call(server="github", tool="issue_get", repo=...)`;
+the host can grant one server, one tool, or a bounded argument selector without granting all MCP
+tools. Provider manifests include only relevant, currently available bindings, with normal
+introspection for the remainder. This lets a repaired MCP client feed the common registry without
+duplicating Finch's authorization or agent orchestration logic.
 
 ## Typed Co-Forth language definition
 
@@ -279,11 +432,81 @@ Quotations are typed callable values:
 An escaping quotation is closure-converted into an immutable code reference plus a managed captured
 environment. Calls use `call`/`tail-call`; they do not create an untyped anonymous stack.
 
+### Closure conversion and capture ownership
+
+Closure conversion is a concrete lowering pass, not a second evaluator. The frontend resolves each
+free lexical name to the nearest immutable binding, orders captures deterministically by resolved
+binding identity, emits the capture loads in that order, and emits `MakeClosure(function,
+capture_count, signature)`. The generated function has a typed capture vector and reads it only
+through `CaptureGet`; parameters become frame locals in normal call order. A closure therefore
+captures values, never an alias to a caller operand stack, mutable frame, grant, or ambient host
+authority.
+
+For example, this Lisp:
+
+```lisp
+(let ((n 10))
+  ((lambda ((x : int)) (+ x n)) 5))
+```
+
+lowers conceptually to the following one shared IR module (the concrete block ids and source
+origins are omitted here):
+
+```text
+main:
+  const.int 10
+  make-closure lambda$0 captures=1 : (S int -- S int ! {})
+  const.int 5
+  call-closure (S int -- S int ! {})
+  return
+
+lambda$0 captures: [int], locals: [int] # n is capture[0], x is local[0]
+  local.set 0                 # pop x from the callee's private operand window
+  local.get 0
+  capture.get 0
+  call core.add
+  return
+```
+
+The runtime consumes the closure for `CallClosure`, creates a fresh frame with a private operand
+window above the caller boundary, copies the immutable captures into that frame, and destroys the
+frame on return. Only the signature-declared results cross back into the caller window. This is
+also why `(defer :cpu (lambda () ...))` is safe: it serializes/snapshots the closure's immutable
+captures into a separate CPU task and never shares the parent stack.
+
+**Initial representation and allocation rule.** Primitive captures (`int`, `bool`, `float`,
+`char`, symbols, small opaque handles) are copied inline in the closure value. Immutable structural
+values may be reference-counted/managed handles; copying the closure copies the handle, not a
+mutable payload. The initial interpreter may represent a short-lived closure as an owned
+`TypedValue::Closure` and needs no tracing heap. It must not manufacture a heap environment for a
+non-escaping direct call merely for frontend convenience. Later escape analysis may stack-allocate
+or inline a closure that is immediately called and never stored, returned, deferred, or passed to
+an unknown callee; that optimization is semantics-preserving and optional. A closure is treated as
+escaping, and its environment gets stable managed ownership, when it is returned, stored in a
+collection/record/dictionary, placed on the persistent VM stack, passed through `dynamic`, used by
+`defer`, or handed to a host boundary.
+
+Capability requirements compose from the generated function signature into `MakeClosure` and every
+call site. Capturing a string/path/resource does not capture authority; only the resulting verified
+call's inferred effect row can request a grant. Tests must cover capture ordering, lexical shadowing,
+direct invocation, escaping/persistent closure values, CPU-deferred capture snapshots, and an
+effectful closure that suspends before committing its parent transaction.
+
 ### Control flow
 
 `if/else/then`, loops, pattern matching, early returns, and exception/result operations must have
 explicit IR blocks. Every merge point requires compatible typed stacks. Loops require a stable
 stack invariant. Arbitrary jumps are not part of verified source.
+
+The initial named-loop form is implemented without arbitrary jumps: Lisp spells a label as
+`(while :label label condition body...)` and uses `(break label)` / `(continue label)`; Co-Forth
+uses `begin: label` with `break label` / `continue label`. Each exit must preserve exactly the
+target loop's header stack row. The next structured forms are `match`/`case` (not C-style
+fallthrough `switch`) and expression-valued named breaks, where a break target declares its
+result stack row and every reachable break must produce exactly that row. This permits nested-loop
+exits and useful expression-valued loops without allowing a branch to strand intermediate values
+on a caller stack. `for` may be added only as a bounded desugaring to these loop blocks. `try` handles
+typed `result`/diagnostic values; it is not an ambient exception escape hatch around effects.
 
 ### Dynamic and unsafe boundaries
 
@@ -430,6 +653,186 @@ send summaries for caching, but each receiver verifies the module independently.
 
 ## Runtime, memory, and concurrency
 
+### Trampolined execution and resumable waits
+
+The VM uses an internal continuation protocol; it does **not** implement general user-visible
+`call/cc`. A running program is represented by a typed frame stack (function/module identity,
+instruction position, locals/captures, data stack, effect journal, fuel, and source trace). Stepping
+that state returns exactly one of:
+
+```text
+Continue(thunk)                 execute the next bounded VM slice
+Emit(event, thunk)              publish one structured side-effect event, then continue
+Await(request, resume_thunk)    persist/schedule the request; do not block a VM or UI thread
+Complete(values, journal)       commit the transaction
+Fail(diagnostic)                discard uncommitted VM-local mutation
+```
+
+`thunk` is the runtime's implementation term for a zero-argument continuation. In memory it may
+be a compact frame object; for a durable Brain it must serialize as VM data rather than an opaque
+Rust closure. The event loop is the trampoline: it repeatedly invokes `Continue`/`Emit` thunks,
+projects emitted events to the shadow buffer, and stores `Await` continuations. Approval, timer,
+agent-completion, and host-I/O events resume the saved thunk with its typed result. They never
+resubmit source text or mutate an LLM prompt.
+
+This is also the streaming rule. `say` yields an `Emit(ResponseChunk(...), thunk)` event; it does
+not write the terminal directly. A program can therefore emit text, compute more values, emit
+again, and only later complete or await. The renderer owns coalescing/replay while the complete
+event stream remains testable and recoverable after reconnect.
+
+### Portable side-effect protocol and reactive output handles
+
+The VM is deliberately independent of Finch's terminal UI, providers, and host integrations. Its
+serialized execution protocol is the contract another harness can adopt:
+
+```text
+VmSideEffect {
+  protocol_version, sequence,
+  kind, typed_arguments, expected_output_row,
+  capability_requirement?, source_origin
+}
+VmResume { execution_id, sequence, typed_result | denial | cancellation }
+```
+
+`execution_id` belongs to the enclosing `ProgramRun`/transport envelope; together with `sequence`
+it is the idempotency key. The VM records an effect in its journal and yields its serialized continuation. It does **not** call
+a terminal, `OutputManager`, filesystem, browser, provider, or scheduler. A harness can render the
+event, queue it, reject it, execute it remotely, replay its already-recorded result, and resume the
+same continuation idempotently. `VmResume` is accepted only for the awaiting `(execution_id,
+sequence)` pair; its typed result must match the verifier-known output row, is recorded as the
+acknowledgement, and must not redispatch the host effect. `effect_id` and the journal make
+at-least-once transport safe while the host-effect adapter supplies exactly-once host execution.
+The per-run observer receives an awaited event when it enters the journal, before a local binding
+or approval decision, so an external event loop can own its presentation and later return the
+correlated result.
+
+UI output is a first-class family of these events, not an overloaded string channel. There is no
+global “active WorkUnit”: a `ProgramRun` receives a host-owned **default response port** when the
+interface submits it. `say` appends durable response text to that particular port, and the binding
+travels with a saved suspension. Therefore a download, a provider turn, and an autonomous task can
+remain visible and update independently. The UI event loop, not the VM, owns the map from a stable
+`(execution_id, output_handle)` to a shadow-buffer object.
+
+Explicit operations create or mutate host-issued typed output handles: append a response fragment,
+replace a handle's formatted content, append a live tool/log row, set transient working/progress
+state, complete, or fail it. Handles are opaque resources; their formatter and lifecycle remain
+host-owned. Finch maps the default response port to its existing `OutputManager`/`WorkUnit` message
+handles, whose shadow-buffer renderer can update an in-progress message repeatedly before committing
+it exactly once to terminal scrollback. Another harness may map the same events to a web DOM, IDE
+panel, voice UI, or an audit log without changing VM code.
+
+The initial portable output vocabulary is intentionally small: `say` appends to the run's default
+response port; explicit host-issued output resources support `output.append`, `output.replace`,
+`output.status`, `output.progress`, `output.complete`, and `output.fail`. These names describe
+event semantics, not terminal escape sequences or a global current work item. `output.progress`
+contains a bounded current/total or indeterminate state, so a download and a response can update
+concurrently. The host validates an output handle's ownership and generation before projecting an
+event. A handler that cannot render a richer operation preserves it in the journal rather than
+silently collapsing it into text.
+
+Finch's terminal host projects these events through a per-tool presentation binding: ordinary
+`say` appends to the generation response `WorkUnit`, while `output-open` creates an independent
+shadow-buffer `WorkUnit` keyed by its opaque handle. `append`, `replace`, `status`, `progress`,
+`complete`, and `fail` update that exact unit. This adapter belongs entirely to the application;
+an IDE, web client, or accessibility host can project the same event stream differently.
+
+Output resources are owned by the ProgramRun that opened them. They remain valid across that
+run's serialized yield or approval resumption, but a completed, failed, stale-generation, or
+different ProgramRun cannot update them. This is a host-validated resource boundary, not a
+convention for choosing an ambient work unit.
+
+Program proposals are another explicit host/UI effect, not an implicit consequence of Forth. A
+typed `proposal.open` capability creates an editable proposal handle for a Finch, Bash, Python, or
+other source artifact; the harness can open `$EDITOR`, show the shadow-buffer proposal surface,
+accept co-edits, request ordinary capability approval, or cancel. Simple typed operations run
+through their normal capability grants without opening an editor, so an agent does not produce one
+proposal dialog per command. A proposal can itself contain a Finch Lisp/Co-Forth program and is
+evaluated under the same verifier and broker after acceptance.
+
+The proposal lifecycle is a separate durable state machine, not a synchronous “editor call that
+executes a string”:
+
+```text
+proposal.open
+  -> proposal.created(handle, language, source_hash, generation=0)
+  -> proposal.awaiting_edit(handle, generation)
+  -> proposal.accepted(handle, generation, source_hash)
+   | proposal.chat(handle, generation, context)
+   | proposal.cancelled(handle, generation)
+
+proposal.submit(handle, expected_generation)
+  -> new verified Finch ProgramRun
+   | separately authorized external-script execution request
+```
+
+At the portable Runtime boundary, the pending `(execution_id, sequence)` effect is the stable
+correlation key while the proposal is awaiting a host result. A host with an event-loop binding
+does not block the VM runner in `$EDITOR`: after the `program.invoke(language=...)` grant, it
+projects the request, records its own `created → awaiting-edit → …` application events, and resumes
+the exact verified continuation with an accepted/chat/cancel value. The legacy synchronous editor
+adapter is only a compatibility projection for hosts that have not adopted this lifecycle yet.
+Runtime callback adapters receive this key in a `VmEffectEnvelope { execution_id, effect }` and
+may persist its named `VmEffectHandle { execution_id, sequence }`; the portable `VmSideEffect`
+remains independently serializable for other embedders.
+
+Finch's frontend controller treats a suspended `program.invoke` outcome as an unfinished tool
+call. It opens the language-aware editor on a separate frontend task, maps the editor directive to
+the verified option/result output row, resumes `VmEffectHandle`, and only then completes the
+original tool call to the provider. Thus a model never receives an intermediate “editor opened”
+result and cannot accidentally continue from stale proposal source. Durable Brain-journal replay
+of the presentation transitions remains a separate integration step.
+
+`proposal.open` and editor changes never execute source. `proposal.submit` is an explicit,
+idempotent `(handle, generation)` action after acceptance; it creates a new ProgramRun rather
+than resuming the opener’s VM continuation, so it cannot replay prior effects or inherit accidental
+stack state. A stale edit or submit fails with a structured generation diagnostic. The event journal
+records each transition, allowing reconnection to re-render an existing proposal without reopening
+an editor or re-running an external effect. Proposal language is a parameterized capability
+selector, so a grant for Python artifacts cannot open Bash or Finch artifacts.
+
+This does **not** require a separate proposal database: the durable Brain/event journal is the
+authoritative proposal record, and an editor or shadow-buffer client is only a projection of that
+record. A temporary editor file is an implementation detail, never the source of truth.
+
+Phase 0 is deliberately useful without model-authored control flow: project the existing provider
+stream into this same event journal and handle lifecycle, then test replay/reconnect and concurrent
+presentation bindings against real traffic. A report-only corpus replay of existing model-emitted
+Co-Forth follows it, classifying typed-verifier rejections before typed mode becomes mandatory.
+
+The current typed host handler is only a compatibility adapter over this boundary. It must be
+replaced progressively by the portable event journal/resume interface rather than becoming a
+second VM execution path.
+
+### Brain stack ownership and first-class task handles
+
+A user message is a Brain-turn event, model inference is a provider job, and a submitted Lisp or
+Co-Forth artifact becomes a `ProgramRun`; none of those objects is implicitly a mutable VM stack.
+One Brain owns the authoritative persistent typed stack/dictionary/heap revision. A ProgramRun
+starts from that revision, evaluates against a private transactional working state, and commits a
+delta only if its expected revision still matches.
+
+Deferred CPU fibers and child agents never receive the parent stack as shared mutable memory. They
+receive explicit typed arguments or immutable captured values and own private stacks. They return
+typed results/events through a daemon-owned handle; `join` resumes the parent run and places the
+returned value on its private working stack before it commits. This preserves no-GIL concurrency
+without turning positional Forth stack state into a data race.
+
+`fiber<Y,R>` and `task<R>` are first-class persistent values: their serialized form is a stable
+daemon task ID plus Brain/environment identity, owner/ancestry, expected types, creation revision,
+budget, and policy reference—not a Rust channel, OS thread handle, or child stack. A later program
+may keep such a handle on the persistent Brain stack, inspect/poll it, consume yielded values, join
+its terminal result, or cancel it subject to ownership and capability checks. The daemon owns the
+worker state, event queue, result/error, and cancellation record.
+
+The continuation is bound to the verified module hash, VM revision/checkpoint, capability-grant
+reference, budget, ancestry, and pending request ID. The first implementation now serializes the
+verified module, explicit frames, typed stack, fuel, and pending typed host call. The daemon keeps
+the resulting suspension under the UI execution ID, validates manifest and VM revision, and resumes
+that exact frame after a grant. Brain checkpoint persistence, grant-reference/ancestry validation,
+and pending request IDs remain the remaining integration work. Resumption must verify those
+bindings before executing. This prevents an approval, child result, or scheduled event from being
+replayed against a different program or state revision.
+
 Each execution owns:
 
 - a data stack;
@@ -516,6 +919,14 @@ reason, current matches where safe, and the difference between exact and wider s
 Broad selectors such as workspace `**`, wildcard network hosts, desktop mutation, credentials,
 process execution, and recursive agent spawning receive prominent warnings.
 
+Resource roots, rather than raw path strings, define the spatial boundary. The usual `path<R>` is
+relative to an immutable workspace/project root and rejects traversal or symlink escape at the
+call boundary. A user may deliberately grant whole-machine control, but that creates a distinct
+host-issued root resource (for example `root<host-machine>`) with a broad, auditable capability;
+it does not make arbitrary absolute strings ambient authority. The same type and selector rules
+then apply below that root. This preserves both the autonomous-workspace fast path and an
+intentional full-control mode without confusing either with a glob heuristic.
+
 Persisted decisions store a typed selector, root identity, operation, scope, source/policy binding,
 creator, timestamp, and revocation state. They never store only the display string. The UI provides
 searchable history and immediate revocation.
@@ -532,6 +943,16 @@ A persistent VM execution builds a delta. It commits stack/dictionary/heap chang
 External effects are journaled execute-once facts and are never claimed to roll back with VM state.
 Suspension preserves a typed continuation and transaction; resumption rechecks environment,
 manifest, grant, program, and resource generations before continuing.
+
+Every effect journal entry has one of the explicit states `proposed`, `awaiting_approval`,
+`acknowledged(result)`, `denied`, `cancelled`, or `failed(diagnostic)`. A host performs an external
+mutation only after the entry has a stable `(execution_id, sequence)` idempotency key; it records
+the acknowledgement before allowing the VM to advance. If a later instruction fails, the outcome
+contains both the VM rollback and the acknowledged-effect prefix. A host-binding failure is itself
+preserved as a journal state, since an adapter may have produced a partial external effect before
+it could return a resume value. Finch must never claim atomic success or silently retry that
+prefix. A future `commit-effects`/barrier form may make this boundary visible to source code;
+reversible operations require an explicitly typed compensator, not a rollback illusion.
 
 ## Structured error pipeline
 

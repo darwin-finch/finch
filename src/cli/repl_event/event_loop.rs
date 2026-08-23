@@ -119,35 +119,6 @@ struct PendingPosetRun {
     event_tx: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
 }
 
-/// Cycling translation display shown in the corner overlay.
-///
-/// Items are `(language_name, translated_text)` pairs.  The ticker advances
-/// once per second; the current item is written to `corner_output` so it
-/// rotates through languages while the user reads the code.
-#[derive(Default)]
-struct TranslationTicker {
-    items: Vec<(String, String)>,
-    index: usize,
-}
-
-impl TranslationTicker {
-    /// Replace the current set of translations and reset the index.
-    fn set(&mut self, items: Vec<(String, String)>) {
-        self.items = items;
-        self.index = 0;
-    }
-
-    /// Advance to the next translation; returns the current `(lang, text)` if any.
-    fn tick(&mut self) -> Option<(String, String)> {
-        if self.items.is_empty() {
-            return None;
-        }
-        let item = self.items[self.index].clone();
-        self.index = (self.index + 1) % self.items.len();
-        Some(item)
-    }
-}
-
 /// Main event loop for concurrent REPL
 #[allow(dead_code)]
 pub struct EventLoop {
@@ -201,11 +172,22 @@ pub struct EventLoop {
     /// Tool execution coordinator
     tool_coordinator: ToolExecutionCoordinator,
 
+    /// The frontend-owned VM runtime. It is used only to resume an existing,
+    /// verified portable effect; the daemon never acquires workspace authority
+    /// through this field.
+    program_runtime: Arc<crate::runtime::ProgramRuntime>,
+
     /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
     tool_results: ToolResultsMap,
 
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
+
+    /// User turns submitted while a provider/VM turn is active.  The legacy
+    /// code overwrote `active_query_id`, leaving the earlier turn unable to
+    /// clear itself and making the UI appear frozen.  Queue textual turns so
+    /// the single shared conversation and VM revision advance in order.
+    pending_queries: std::collections::VecDeque<(String, bool, bool)>,
 
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
@@ -248,9 +230,6 @@ pub struct EventLoop {
 
     /// Stable UUID for this session — assigned at startup, printed on exit.
     session_uuid: Uuid,
-
-    /// Cycling translations shown in the corner overlay.
-    translation_ticker: Arc<std::sync::Mutex<TranslationTicker>>,
 
     /// Working directory at startup (for terminal title)
     cwd: String,
@@ -1120,6 +1099,198 @@ fn save_joined_channels(channels: &std::collections::HashSet<String>) {
     }
 }
 
+/// Application-owned data extracted from one verified, suspended
+/// `proposal-open` effect. The effect handle—not source text—is the authority
+/// to resume this exact VM frame.
+struct DeferredProposal {
+    handle: crate::runtime::VmEffectHandle,
+    language: String,
+    intent: String,
+    source: String,
+}
+
+fn deferred_proposal_from_tool_result(
+    result: &anyhow::Result<String>,
+) -> Option<DeferredProposal> {
+    let content = result.as_ref().ok()?;
+    let outcome: crate::runtime::outcome::ExecutionOutcome = serde_json::from_str(content).ok()?;
+    if outcome.status != crate::runtime::outcome::ExecutionStatus::Suspended {
+        return None;
+    }
+    let effect = outcome.vm_side_effects.iter().rev().find(|effect| {
+        effect.requirement.capability == crate::vm::CapabilityKind::ProgramInvoke
+            && matches!(effect.event, crate::vm::HostSideEffect::Request { .. })
+    })?;
+    let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
+        return None;
+    };
+    let [
+        crate::vm::TypedValue::String(language),
+        crate::vm::TypedValue::String(intent),
+        crate::vm::TypedValue::String(source),
+    ] = arguments.as_slice()
+    else {
+        return None;
+    };
+    Some(DeferredProposal {
+        handle: crate::runtime::VmEffectHandle {
+            execution_id: outcome.execution_id,
+            sequence: effect.sequence,
+        },
+        language: language.clone(),
+        intent: intent.clone(),
+        source: source.clone(),
+    })
+}
+
+fn proposal_resume_values(
+    decision: crate::tools::implementations::propose::ProposalDecision,
+) -> Vec<crate::vm::TypedValue> {
+    let inner_type = crate::vm::Type::Result(
+        Box::new(crate::vm::Type::String),
+        Box::new(crate::vm::Type::String),
+    );
+    let value = match decision {
+        crate::tools::implementations::propose::ProposalDecision::Execute { source } => {
+            Some(Box::new(crate::vm::TypedValue::Result {
+                ok_type: crate::vm::Type::String,
+                error_type: crate::vm::Type::String,
+                is_ok: true,
+                value: Box::new(crate::vm::TypedValue::String(source)),
+            }))
+        }
+        crate::tools::implementations::propose::ProposalDecision::Chat { context } => {
+            Some(Box::new(crate::vm::TypedValue::Result {
+                ok_type: crate::vm::Type::String,
+                error_type: crate::vm::Type::String,
+                is_ok: false,
+                value: Box::new(crate::vm::TypedValue::String(context)),
+            }))
+        }
+        crate::tools::implementations::propose::ProposalDecision::Cancel => None,
+    };
+    vec![crate::vm::TypedValue::Option { inner_type, value }]
+}
+
+/// Complete one application-owned proposal decision by resuming the exact VM
+/// effect that opened it.  This deliberately accepts a decision rather than
+/// source text: editing is outside the VM, while the VM only observes the
+/// typed accepted/chat/cancel result correlated to its effect handle.
+async fn resume_deferred_proposal(
+    runtime: &crate::runtime::ProgramRuntime,
+    proposal: &DeferredProposal,
+    decision: crate::tools::implementations::propose::ProposalDecision,
+) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    runtime
+        .resume_typed_execution_with_effect_result(
+            proposal.handle.execution_id,
+            proposal.handle.sequence,
+            proposal_resume_values(decision),
+        )
+        .await
+}
+
+#[cfg(test)]
+mod deferred_proposal_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn extracts_the_exact_suspended_proposal_handle() {
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ProgramInvoke,
+                selector: crate::vm::ResourceSelector::Program {
+                    languages: vec!["python".into()],
+                },
+            })
+            .unwrap();
+        let outcome = runtime
+            .submit_with_deferred_program_effects(
+                crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source: "(proposal-open \"python\" \"inspect artifact\" \"print('ok')\")"
+                        .into(),
+                    intent: "proposal test".into(),
+                    effect: crate::programs::ExecutionEffect::ExternalWrite,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: None,
+                    budget: None,
+                },
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        let proposal = deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
+            .expect("suspended proposal effect");
+        assert_eq!(proposal.handle.execution_id, outcome.execution_id);
+        assert_eq!(proposal.handle.sequence, 0);
+        assert_eq!(proposal.language, "python");
+        assert_eq!(proposal.intent, "inspect artifact");
+        assert_eq!(proposal.source, "print('ok')");
+    }
+
+    #[tokio::test]
+    async fn proposal_decision_resumes_the_saved_effect_without_replaying_source() {
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ProgramInvoke,
+                selector: crate::vm::ResourceSelector::Program {
+                    languages: vec!["python".into()],
+                },
+            })
+            .unwrap();
+        let outcome = runtime
+            .submit_with_deferred_program_effects(
+                crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source: "(proposal-open \"python\" \"inspect artifact\" \"print('original')\")"
+                        .into(),
+                    intent: "proposal test".into(),
+                    effect: crate::programs::ExecutionEffect::ExternalWrite,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: None,
+                    budget: None,
+                },
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        let proposal = deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
+            .expect("suspended proposal effect");
+
+        let completed = resume_deferred_proposal(
+            runtime.as_ref(),
+            &proposal,
+            crate::tools::implementations::propose::ProposalDecision::Chat {
+                context: "Please explain the artifact first.".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            completed.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
+        assert_eq!(completed.vm_side_effects.len(), 1);
+        assert!(matches!(
+            completed.values.as_slice(),
+            [crate::programs::ProgramValue::Option(Some(value))]
+                if matches!(value.as_ref(), crate::programs::ProgramValue::Result { ok: false, value }
+                    if matches!(value.as_ref(), crate::programs::ProgramValue::String(context)
+                        if context == "Please explain the artifact first."))
+        ));
+        assert!(runtime
+            .pending_typed_execution(proposal.handle.execution_id)
+            .unwrap()
+            .is_none());
+    }
+}
+
 impl EventLoop {
     /// Create a new event loop with unified generators
     #[allow(clippy::too_many_arguments)]
@@ -1131,6 +1302,7 @@ impl EventLoop {
         generator_state: Arc<RwLock<GeneratorState>>,
         tool_definitions: Vec<ToolDefinition>,
         tool_executor: Arc<Mutex<ToolExecutor>>,
+        program_runtime: Arc<crate::runtime::ProgramRuntime>,
         tui_renderer: TuiRenderer,
         output_manager: Arc<OutputManager>,
         status_bar: Arc<StatusBar>,
@@ -1166,7 +1338,10 @@ impl EventLoop {
             loop {
                 match agent_events.recv().await {
                     Ok(event) => {
-                        if agent_event_tx.send(ReplEvent::AgentLifecycle(event)).is_err() {
+                        if agent_event_tx
+                            .send(ReplEvent::AgentLifecycle(event))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -1220,7 +1395,7 @@ impl EventLoop {
                 .unwrap_or(false);
 
                 if ok {
-                    let _ = crossterm::terminal::disable_raw_mode();
+                    crate::cli::tui::emergency_restore_terminal();
                     std::process::exit(0);
                 }
             }
@@ -1236,6 +1411,7 @@ impl EventLoop {
         let tool_coordinator = ToolExecutionCoordinator::new(
             event_tx.clone(),
             Arc::clone(&tool_executor),
+            Arc::clone(&output_manager),
             Arc::clone(&conversation),
             Arc::clone(&local_generator),
             Arc::clone(&tokenizer),
@@ -1285,8 +1461,10 @@ impl EventLoop {
             status_bar,
             streaming_enabled,
             tool_coordinator,
+            program_runtime,
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
+            pending_queries: std::collections::VecDeque::new(),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             ipc_client,
             mode,
@@ -1302,7 +1480,6 @@ impl EventLoop {
             memory_system,
             session_label,
             session_uuid: Uuid::new_v4(),
-            translation_ticker: Arc::new(std::sync::Mutex::new(TranslationTicker::default())),
             cwd: String::new(), // populated at the start of run()
             context_lines,
             max_verbatim_messages,
@@ -1377,6 +1554,23 @@ impl EventLoop {
         // the remote machine participates in this session's peer loop.
         self.bridge_remote_peers().await;
 
+        // ── Replay persisted Lisp defines ────────────────────────────────────
+        // Restore any `(define ...)` expressions saved in previous sessions so
+        // the Lisp env is identical to the one the user left behind.
+        if let Some(mem) = &self.memory_system {
+            if let Ok(defines) = mem.load_lisp_defines().await {
+                if !defines.is_empty() {
+                    let ctx = self.lisp_ctx.clone();
+                    let env = self.lisp_env.clone();
+                    for expr in defines {
+                        if let Err(e) = crate::lisp::run_in(&expr, env.clone(), ctx.clone()).await {
+                            tracing::warn!("lisp replay failed for {:?}: {}", expr, e);
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Startup header (Claude Code style) ───────────────────────────────
         // Clear accumulated startup noise from the output manager, then print a
         // clean header: finch version · primary model · working directory.
@@ -1408,12 +1602,6 @@ impl EventLoop {
             }
         }
         // ─────────────────────────────────────────────────────────────────────
-
-        // ── xlsx vocabulary notice ────────────────────────────────────────────
-        self.output_manager.write_info(
-            "xlsx   xlsx@  xlsx@/  xlsx-sheets  xlsx!\n\
-             Usage: s\" report.xlsx\" s\" B3\" xlsx@ type"
-        );
 
         // Show weekly license notice for non-commercial users (honor system)
         {
@@ -1476,10 +1664,7 @@ impl EventLoop {
         {
             let _ = crossterm::execute!(
                 std::io::stdout(),
-                crossterm::terminal::SetTitle(format!(
-                    "finch · {} · {}",
-                    self.session_label, cwd
-                ))
+                crossterm::terminal::SetTitle(format!("finch · {} · {}", self.session_label, cwd))
             );
         }
 
@@ -1495,40 +1680,16 @@ impl EventLoop {
             .await;
         }
 
-        // ── Translation ticker ────────────────────────────────────────────────
-        // Every second, advance the ticker and write the next translation to the
-        // corner overlay so languages cycle past while the user reads the code.
-        {
-            let ticker = Arc::clone(&self.translation_ticker);
-            let corner = Arc::clone(&self.corner_output);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
-                loop {
-                    interval.tick().await;
-                    let item = {
-                        let mut t = ticker.lock().unwrap();
-                        t.tick()
-                    };
-                    if let Ok(mut g) = corner.lock() {
-                        *g = item.map(|(lang, text)| format!("{lang}: {text}"));
-                    }
-                }
-            });
-        }
-
         // ── Boot JIT ──────────────────────────────────────────────────────────
         // Every boot: JIT-compile ALL vocabulary words with Forth code into the
         // VM dictionary as named colon definitions (`: word <code> ;`).
         // This makes every vocab word callable directly from Forth.
         //
-        // The scroll shows words being compiled — it runs fast, pausing every
-        // BATCH lines so the terminal actually has time to paint.
-        //
-        // After JIT, words marked `boot = true` have their code *executed*
-        // (not just compiled), producing their boot-time output.
+        // Definitions are loaded silently. Vocabulary is executable API, not
+        // startup presentation: verification, poems, and other `boot = true`
+        // definitions remain available as explicit words but must never write
+        // unexplained text into a user's conversational scrollback.
         {
-            use crossterm::style::Stylize;
-
             // Use the pre-built (cached) builtin defs — no TOML re-parse, no re-sort.
             // User vocabulary/*.toml files are merged on top at runtime.
             let builtin = crate::coforth::Library::builtin_defs();
@@ -1548,8 +1709,6 @@ impl EventLoop {
                 .collect();
             user_entries.sort_by(|a, b| a.word.cmp(&b.word));
 
-            let mut boot_codes: Vec<String> = Vec::new();
-
             // Compile user vocabulary extensions (builtins are already in the precompiled VM).
             let mut user_defs = String::new();
             for entry in &user_entries {
@@ -1568,60 +1727,13 @@ impl EventLoop {
                 user_defs.push_str(&jit_def);
                 user_defs.push('\n');
                 self.auto_compiled_word_names.insert(entry.word.clone());
-                if entry.boot {
-                    boot_codes.push(code.to_string());
-                }
             }
             if !user_defs.is_empty() {
                 let _ = self.forth_vm.exec_with_fuel(&user_defs, 0);
             }
 
-            // Execute boot=true words (they may produce output: poems, time, etc.)
-            for code in &boot_codes {
-                if let Ok(out) = self.forth_vm.exec(code) {
-                    if !out.is_empty() {
-                        self.output_manager.write_info(out.trim_end().to_string());
-                    }
-                }
-            }
-            if !boot_codes.is_empty() {
-                self.render_tui().await.ok();
-            }
-
             // Restore words learned in previous sessions (from daemon or file).
             self.load_user_words().await;
-
-            // Keep boot output compact. The registry/introspection tools are the source
-            // of truth; dumping every definition obscures actual conversation output.
-            {
-                let lib = crate::coforth::Library::load();
-                let entries = lib.all_entries();
-                if !entries.is_empty() {
-                    let executable = entries.iter().filter(|entry| entry.forth.is_some()).count();
-                    self.output_manager.write_info(format!(
-                        "vocabulary ready: {} words, {} executable",
-                        entries.len(),
-                        executable
-                    ));
-                }
-            }
-
-            // On boot: argue core proofs, then show how much of English holds.
-            {
-                let boot_argue = r#"
-s" we send forth"   s" we send -1"     argue
-s" between us"      s" we are real"    argue
-s" back and forth"  s" -1 and forth"   argue
-s" it is ours"      s" -1 is ours"     argue
-"#;
-                let argue_out = self.forth_vm.exec(boot_argue).unwrap_or_default();
-                let english_out = self.forth_vm.exec("prove-english").unwrap_or_default();
-                let combined = format!("{}{}", argue_out.trim_start(), english_out.trim_start());
-                let text = combined.trim().to_string();
-                if !text.is_empty() {
-                    self.output_manager.write_info(text);
-                }
-            }
 
             // Poll daemon every 4s for vocab changes from other concurrent terminals.
             self.spawn_vocab_poll();
@@ -1691,14 +1803,13 @@ s" it is ours"      s" -1 is ours"     argue
                 }));
 
             let tui_o = self.tui_renderer.clone();
-            self.forth_vm
-                .set_open_file_fn(Box::new(move |path: &str| {
-                    let path = path.to_string();
-                    let tui = tui_o.clone();
-                    futures::executor::block_on(async move {
-                        let _ = tui.lock().await.show_file_viewer(&path);
-                    });
-                }));
+            self.forth_vm.set_open_file_fn(Box::new(move |path: &str| {
+                let path = path.to_string();
+                let tui = tui_o.clone();
+                futures::executor::block_on(async move {
+                    let _ = tui.lock().await.show_file_viewer(&path);
+                });
+            }));
         }
 
         // ── Spawn LLM worker loop ─────────────────────────────────────────────
@@ -1715,6 +1826,7 @@ s" it is ours"      s" -1 is ours"     argue
                 Arc::clone(&self.generator_state),
                 Arc::clone(&self.tool_definitions),
                 self.tool_coordinator.clone(),
+                Arc::clone(&self.program_runtime),
                 Arc::clone(&self.tool_call_history),
                 Arc::clone(&self.conversation),
                 Arc::clone(&self.query_states),
@@ -1813,7 +1925,6 @@ s" it is ours"      s" -1 is ours"     argue
                         ReplEvent::PeersDiscovered(_) => "PeersDiscovered",
                         ReplEvent::VocabSync(_) => "VocabSync",
                         ReplEvent::PeerMessage { .. } => "PeerMessage",
-                        ReplEvent::Translations { .. } => "Translations",
                         ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
                     };
@@ -2238,9 +2349,11 @@ s" it is ours"      s" -1 is ours"     argue
                 let rest = rest.trim();
                 if rest.is_empty() {
                     if self.recent_channel_msgs.is_empty() {
-                        self.output_manager.write_info("no channel messages received yet".to_string());
+                        self.output_manager
+                            .write_info("no channel messages received yet".to_string());
                     } else {
-                        let lines: Vec<String> = self.recent_channel_msgs
+                        let lines: Vec<String> = self
+                            .recent_channel_msgs
                             .iter()
                             .enumerate()
                             .map(|(i, (ch, snd, txt))| format!("[{i}] {ch} {snd}: {txt}"))
@@ -2251,15 +2364,17 @@ s" it is ours"      s" -1 is ours"     argue
                     return Ok(());
                 }
                 if let Ok(idx) = rest.parse::<usize>() {
-                    if let Some((channel, sender, text)) = self.recent_channel_msgs.get(idx).cloned() {
-                        self.output_manager.write_info(
-                            format!("executing [{idx}] {channel} {sender}: {text}")
-                        );
+                    if let Some((channel, sender, text)) =
+                        self.recent_channel_msgs.get(idx).cloned()
+                    {
+                        self.output_manager
+                            .write_info(format!("executing [{idx}] {channel} {sender}: {text}"));
                         // Route through the stack/query path directly (no recursion).
                         self.output_manager.write_user(text.clone());
                         return self.handle_forth_or_query(text).await;
                     } else {
-                        self.output_manager.write_info(format!("no message at index {idx}"));
+                        self.output_manager
+                            .write_info(format!("no message at index {idx}"));
                         self.render_tui().await?;
                     }
                     return Ok(());
@@ -2274,8 +2389,9 @@ s" it is ours"      s" -1 is ours"     argue
                         if let Ok(mut tui) = self.tui_renderer.try_lock() {
                             let _ = tui.shutdown();
                         } else {
-                            // Lock is held; disable raw mode directly so the terminal is usable.
-                            let _ = crossterm::terminal::disable_raw_mode();
+                            // Lock is held; `process::exit` skips Drop, so restore
+                            // bracketed paste and keyboard enhancement flags too.
+                            crate::cli::tui::emergency_restore_terminal();
                         }
                         std::process::exit(0);
                     }
@@ -2786,13 +2902,15 @@ Rules:\n\
                         self.handle_forth_eval(format!("settle\" {addr}\"")).await?;
                     }
                     Command::RegistrySet(addr) => {
-                        self.handle_forth_eval(format!("registry\" {addr}\"")).await?;
+                        self.handle_forth_eval(format!("registry\" {addr}\""))
+                            .await?;
                     }
                     Command::JoinRegistry(addr) => {
                         self.handle_forth_eval(format!("join\" {addr}\"")).await?;
                     }
                     Command::GasSend(addr, ms) => {
-                        self.handle_forth_eval(format!("gas-send\" {addr}\" {ms}")).await?;
+                        self.handle_forth_eval(format!("gas-send\" {addr}\" {ms}"))
+                            .await?;
                     }
                     _ => {
                         // All other commands output to scrollback via write_info
@@ -2900,9 +3018,20 @@ Rules:\n\
             let ctx = self.lisp_ctx.clone();
             let env = self.lisp_env.clone();
             let event_tx = self.event_tx.clone();
+            let mem = self.memory_system.clone();
             tokio::spawn(async move {
-                let result = crate::lisp::run_in(&src, env, ctx).await
+                let result = crate::lisp::run_in(&src, env, ctx)
+                    .await
                     .map(|v| v.to_string());
+                // Persist successful defines for session replay.
+                if result.is_ok() {
+                    let trimmed = src.trim();
+                    if trimmed.starts_with("(define") || trimmed.starts_with("( define") {
+                        if let Some(m) = &mem {
+                            let _ = m.save_lisp_define(&src).await;
+                        }
+                    }
+                }
                 let _ = event_tx.send(super::events::ReplEvent::LispResult { result });
             });
             return Ok(());
@@ -2943,13 +3072,10 @@ Rules:\n\
         if is_nl {
             // Conversation is never partially executed. Explicit `/forth <program>`
             // remains available when the user intends VM evaluation.
-            self.spawn_translation(input.clone());
             return self.execute_query(input).await;
         }
 
         // ── Co-Forth: plain text pushes onto the stack (no AI trigger) ──────────
-        // Forth input may contain comments (\, ( ), //, #) — extract and translate them.
-        self.spawn_translation_from_forth(&input);
         self.output_manager.write_user(input.clone());
         self.handle_stack_push(input).await?;
         return Ok(());
@@ -2965,7 +3091,8 @@ Rules:\n\
             let env = self.lisp_env.clone();
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
-                let result = crate::lisp::run_in(&src, env, ctx).await
+                let result = crate::lisp::run_in(&src, env, ctx)
+                    .await
                     .map(|v| v.to_string());
                 let _ = event_tx.send(super::events::ReplEvent::LispResult { result });
             });
@@ -3008,6 +3135,18 @@ Rules:\n\
             return self
                 .push_remote_brain(crate::brain::shared::BrainEventKind::Prompt { text: input })
                 .await;
+        }
+
+        // One interactive Brain owns a single ordered conversation and VM
+        // revision. Queue later user turns rather than racing both through the
+        // same mutable state. Preserve the input's normal echo semantics now,
+        // then start it without a second echo after the active turn commits.
+        if self.active_query_id.read().await.is_some() {
+            if echo {
+                self.output_manager.write_user(input.clone());
+            }
+            self.pending_queries.push_back((input, false, chat_only));
+            return Ok(());
         }
 
         // Drain any pending images from TUI (pasted before sending)
@@ -3088,51 +3227,6 @@ Rules:\n\
             match shared_ctx {
                 Some(ctx) => format!("{enriched}\n\n---\n[Shared brain context:\n{ctx}]"),
                 None => enriched,
-            }
-        };
-
-        // Co-Forth mode: inject vocabulary context (library size + current stack).
-        let enriched = {
-            let lib = crate::coforth::Library::load();
-            let lib_count = lib.word_count();
-            let p = self.poset.lock().await;
-            let stack_count = p.nodes.len();
-
-            if lib_count > 0 || stack_count > 0 {
-                // Sample up to 12 library words alphabetically for flavour
-                let sample: Vec<String> = lib
-                    .word_list()
-                    .into_iter()
-                    .take(12)
-                    .map(|w| w.to_string())
-                    .collect();
-                let sample_str = if sample.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (e.g. {}…)", sample.join(", "))
-                };
-
-                let stack_note = if stack_count > 0 {
-                    format!(
-                        " The active program has {} items on the stack.",
-                        stack_count
-                    )
-                } else {
-                    String::new()
-                };
-
-                format!(
-                    "{}\n\n[Context: the user has a coforth vocabulary of {} defined words{}.{} \
-                     They can define, redefine, and compose these words. \
-                     Respond naturally about ideas and meaning. \
-                     Do NOT expose internal word IDs (W0/W1/etc.) or stack mechanics in your response.]",
-                    enriched,
-                    lib_count,
-                    sample_str,
-                    stack_note,
-                )
-            } else {
-                enriched
             }
         };
 
@@ -3594,8 +3688,14 @@ Rules:\n\
                     tracing::warn!("Failed to render TUI after query error: {}", e);
                 }
 
-                // DON'T clear active query - fallback might still be running
-                // It will be cleared on StreamingComplete or final failure
+                // A terminal provider failure has no later StreamingComplete.
+                // Release the turn so queued user input cannot wedge behind it.
+                if *self.active_query_id.read().await == Some(query_id) {
+                    *self.active_query_id.write().await = None;
+                    if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
+                        self.execute_query_inner(next, echo, chat_only).await?;
+                    }
+                }
             }
 
             ReplEvent::ToolResult {
@@ -3603,7 +3703,15 @@ Rules:\n\
                 tool_id,
                 result,
             } => {
-                self.handle_tool_result(query_id, tool_id, result).await?;
+                if let Some(proposal) = deferred_proposal_from_tool_result(&result) {
+                    self.output_manager.write_status(format!(
+                        "Proposal {} is awaiting editor review",
+                        proposal.handle.sequence
+                    ));
+                    self.spawn_deferred_proposal(query_id, tool_id, proposal);
+                } else {
+                    self.handle_tool_result(query_id, tool_id, result).await?;
+                }
             }
 
             ReplEvent::ToolApprovalNeeded {
@@ -3676,6 +3784,9 @@ Rules:\n\
                     if *active == Some(query_id) {
                         *active = None;
                     }
+                }
+                if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
+                    self.execute_query_inner(next, echo, chat_only).await?;
                 }
                 // Now that the user is idle, show any brain question that was deferred.
                 self.maybe_show_deferred_brain_question().await.ok();
@@ -3834,14 +3945,6 @@ Rules:\n\
                 self.render_tui().await?;
             }
 
-            ReplEvent::Translations { items } => {
-                // Load translations into the ticker; the ticker task will cycle
-                // through them in the corner overlay.
-                if let Ok(mut t) = self.translation_ticker.lock() {
-                    t.set(items);
-                }
-            }
-
             ReplEvent::LispResult { result } => {
                 match result {
                     Ok(text) if text != "()" && !text.is_empty() => {
@@ -3956,7 +4059,10 @@ Rules:\n\
                 }
             }
 
-            ReplEvent::ShowDialog { dialog: _, response_tx } => {
+            ReplEvent::ShowDialog {
+                dialog: _,
+                response_tx,
+            } => {
                 // active_dialog is already set by the caller (belt-and-suspenders in
                 // handle_present_plan / handle_ask_user_question), so the dialog is
                 // on-screen before the event is even enqueued — no race window.
@@ -3966,6 +4072,36 @@ Rules:\n\
         }
 
         Ok(())
+    }
+
+    /// The editor runs outside the VM; once it finishes, resume precisely the
+    /// saved effect rather than resubmitting source or replaying prior output.
+    fn spawn_deferred_proposal(
+        &self,
+        query_id: Uuid,
+        tool_id: String,
+        proposal: DeferredProposal,
+    ) {
+        let event_tx = self.event_tx.clone();
+        let runtime = Arc::clone(&self.program_runtime);
+        tokio::spawn(async move {
+            let result = async {
+                let decision = crate::tools::implementations::propose::propose_artifact_with_decision(
+                    &proposal.language,
+                    &proposal.intent,
+                    &proposal.source,
+                )
+                .await?;
+                let outcome = resume_deferred_proposal(runtime.as_ref(), &proposal, decision).await?;
+                Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
+            }
+            .await;
+            let _ = event_tx.send(ReplEvent::ToolResult {
+                query_id,
+                tool_id,
+                result,
+            });
+        });
     }
 
     // ── Diff proposal rendering ───────────────────────────────────────────────
@@ -5051,7 +5187,26 @@ Rules:\n\
         // Update the row in the WorkUnit with a semantic summary + optional body
         match &result {
             Ok(content) => {
-                let (summary, body) = tool_result_to_display(&tool_name, content);
+                let (summary, mut body) = tool_result_to_display(&tool_name, content);
+                // A provider-native VM submission is executable source, not an
+                // opaque tool argument.  Preserve the exact source in the
+                // scrollback row so a user can reconcile every `say` chunk and
+                // diagnostic with the program that caused it.
+                if tool_name == "submit_program" {
+                    let language = tool_input
+                        .get("language")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("inferred");
+                    if let Some(source) = tool_input
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let mut source_body = vec![format!("VM source ({language}):")];
+                        source_body.extend(source.lines().map(str::to_owned));
+                        source_body.append(&mut body);
+                        body = source_body;
+                    }
+                }
                 work_unit.complete_row_with_body(row_idx, summary, body);
             }
             Err(e) => {
@@ -6006,14 +6161,13 @@ Rules:\n\
             }));
 
         let tui_open = self.tui_renderer.clone();
-        self.forth_vm
-            .set_open_file_fn(Box::new(move |path: &str| {
-                let path = path.to_string();
-                let tui = tui_open.clone();
-                futures::executor::block_on(async move {
-                    let _ = tui.lock().await.show_file_viewer(&path);
-                });
-            }));
+        self.forth_vm.set_open_file_fn(Box::new(move |path: &str| {
+            let path = path.to_string();
+            let tui = tui_open.clone();
+            futures::executor::block_on(async move {
+                let _ = tui.lock().await.show_file_viewer(&path);
+            });
+        }));
 
         // Snapshot before eval so the user can undo it
         let snap = self.forth_vm.snapshot();
@@ -6123,9 +6277,8 @@ Rules:\n\
                         }
                         if let Some(err) = val["error"].as_str() {
                             if !err.is_empty() {
-                                self.output_manager.write_info(
-                                    format!("yield error: {err}")
-                                );
+                                self.output_manager
+                                    .write_info(format!("yield error: {err}"));
                             }
                         }
                     }
@@ -7476,68 +7629,6 @@ Rules:\n\
         self.output_manager
             .write_info(format!("📚 popped → \"{preview}\"   depth:{depth}"));
         self.render_tui().await
-    }
-
-    /// Handle `/run` — join all stack items and execute as one query (clears stack).
-    /// Returns `Some(query)` if the stack was non-empty, `None` otherwise.
-    /// Spawn an async task to translate `text` into several languages and send
-    /// a `ReplEvent::Translations` when done.  Only fires when `text` has at
-    /// least 3 words, to avoid wasting API calls on short fragments.
-    fn spawn_translation(&self, text: String) {
-        let words = text.split_whitespace().count();
-        if words < 3 {
-            return;
-        }
-        let provider = match self.brain_provider.clone() {
-            Some(p) => p,
-            None => return,
-        };
-        let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
-            let prompt = format!(
-                "Translate the following phrase into Spanish, French, Japanese, Arabic, \
-                 and Russian. Return exactly 5 lines in this format (no extra text):\n\
-                 Spanish: <translation>\n\
-                 French: <translation>\n\
-                 Japanese: <translation>\n\
-                 Arabic: <translation>\n\
-                 Russian: <translation>\n\n\
-                 Phrase: {text}"
-            );
-            let request = crate::providers::ProviderRequest::new(vec![
-                crate::claude::types::Message::user(&prompt),
-            ])
-            .with_max_tokens(300);
-            let Ok(response) = provider.send_message(&request).await else {
-                return;
-            };
-            let raw = response.content.iter()
-                .filter_map(|b| if let crate::claude::ContentBlock::Text { text } = b { Some(text.as_str()) } else { None })
-                .collect::<Vec<_>>()
-                .join("");
-            // Parse "Language: translation" lines.
-            let items: Vec<(String, String)> = raw
-                .lines()
-                .filter_map(|line| {
-                    let (lang, tr) = line.split_once(':')?;
-                    let lang = lang.trim().to_string();
-                    let tr = tr.trim().to_string();
-                    if lang.is_empty() || tr.is_empty() { None } else { Some((lang, tr)) }
-                })
-                .collect();
-            if !items.is_empty() {
-                let _ = event_tx.send(super::events::ReplEvent::Translations { items });
-            }
-        });
-    }
-
-    /// Like `spawn_translation` but uses the tokenizer's comment extractor to
-    /// pull `\` and `( )` comment text from a Forth program before translating.
-    fn spawn_translation_from_forth(&self, code: &str) {
-        let comments = crate::coforth::extract_comments(code);
-        if let Some(text) = comments.into_iter().find(|c| c.split_whitespace().count() >= 3) {
-            self.spawn_translation(text);
-        }
     }
 
     /// `/eval-each` — run each stack item independently in a fresh VM clone and
@@ -9109,13 +9200,13 @@ mod tests {
         };
 
         let msgs: Vec<Message> = vec![
-            user_msg("query"),          // [0] outside window
-            make_tool_use_msg("A"),     // [1] outside window
-            make_tool_result_msg("A"),  // [2] orphaned boundary
-            make_tool_use_msg("B"),     // [3] valid
-            make_tool_result_msg("B"),  // [4] valid
-            make_tool_use_msg("C"),     // [5] valid
-            make_tool_result_msg("C"),  // [6] valid
+            user_msg("query"),         // [0] outside window
+            make_tool_use_msg("A"),    // [1] outside window
+            make_tool_result_msg("A"), // [2] orphaned boundary
+            make_tool_use_msg("B"),    // [3] valid
+            make_tool_result_msg("B"), // [4] valid
+            make_tool_use_msg("C"),    // [5] valid
+            make_tool_result_msg("C"), // [6] valid
         ];
 
         let result = apply_sliding_window(msgs, 5);
@@ -9128,7 +9219,9 @@ mod tests {
         );
         // The first user message must NOT be a pure tool_result (no orphan).
         let first_is_tool_result_only = result.first().map(|m| {
-            m.content.iter().all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            m.content
+                .iter()
+                .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
         });
         assert_ne!(
             first_is_tool_result_only,
@@ -9199,7 +9292,10 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("I'll analyze")))
         });
-        assert!(has_text, "text content of orphaned assistant message must be preserved");
+        assert!(
+            has_text,
+            "text content of orphaned assistant message must be preserved"
+        );
 
         // Window must start with a user message.
         assert_eq!(result.first().unwrap().role, "user");
@@ -9740,12 +9836,18 @@ mod tests {
 
     #[test]
     fn test_is_magic_word_please() {
-        assert!(magic_word_response("please").is_some(), "please is a magic word");
+        assert!(
+            magic_word_response("please").is_some(),
+            "please is a magic word"
+        );
     }
 
     #[test]
     fn test_is_magic_word_unknown_is_not_magic() {
-        assert!(magic_word_response("xyzzy").is_none(), "unknown word must not be magic");
+        assert!(
+            magic_word_response("xyzzy").is_none(),
+            "unknown word must not be magic"
+        );
     }
 
     #[test]
@@ -10137,7 +10239,10 @@ mod filter_tests {
         // Definitions for unknown words are preserved unchanged.
         let code = ": new-word  1 2 + . ;";
         let result = skip_known_word_defs(code, |_| false);
-        assert!(result.contains(": new-word"), "unknown word def should be kept");
+        assert!(
+            result.contains(": new-word"),
+            "unknown word def should be kept"
+        );
     }
 
     #[test]

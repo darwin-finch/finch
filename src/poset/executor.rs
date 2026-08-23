@@ -288,7 +288,11 @@ async fn exec_node(
 
 /// Execute a compiled word natively — no LLM, no external processes.
 /// Words compile to Forth and run at CPU speed in the built-in interpreter.
-async fn run_compiled(_lang: &str, code: &str, predecessor_results: &[String]) -> anyhow::Result<String> {
+async fn run_compiled(
+    _lang: &str,
+    code: &str,
+    predecessor_results: &[String],
+) -> anyhow::Result<String> {
     // Predecessor top-of-stack values are prepended as literals so dependent
     // arguments receive their inputs naturally via the stack.
     let mut prelude = String::new();

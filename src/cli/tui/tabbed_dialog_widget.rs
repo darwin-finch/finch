@@ -284,8 +284,14 @@ mod tests {
             .map(|s| s.content.as_ref().to_string())
             .collect();
 
-        assert!(text.contains("First q"), "tab bar must show first header: {text}");
-        assert!(text.contains("Second q"), "tab bar must show second header: {text}");
+        assert!(
+            text.contains("First q"),
+            "tab bar must show first header: {text}"
+        );
+        assert!(
+            text.contains("Second q"),
+            "tab bar must show second header: {text}"
+        );
     }
 
     /// Only the active tab's question text appears in the content body.
@@ -304,8 +310,14 @@ mod tests {
         {
             let w = TabbedDialogWidget::new(&dialog, &colors);
             let text = lines_to_text(&w.render_content());
-            assert!(text.contains("First question?"), "active question body: {text}");
-            assert!(!text.contains("Second question?"), "inactive body should be hidden: {text}");
+            assert!(
+                text.contains("First question?"),
+                "active question body: {text}"
+            );
+            assert!(
+                !text.contains("Second question?"),
+                "inactive body should be hidden: {text}"
+            );
         }
 
         // Switch to tab 1
@@ -316,8 +328,14 @@ mod tests {
         {
             let w = TabbedDialogWidget::new(&dialog, &colors);
             let text = lines_to_text(&w.render_content());
-            assert!(text.contains("Second question?"), "new active question: {text}");
-            assert!(!text.contains("First question?"), "old active should be hidden: {text}");
+            assert!(
+                text.contains("Second question?"),
+                "new active question: {text}"
+            );
+            assert!(
+                !text.contains("First question?"),
+                "old active should be hidden: {text}"
+            );
         }
     }
 
@@ -328,7 +346,10 @@ mod tests {
         let w = TabbedDialogWidget::new(&dialog, &colors);
         let text = lines_to_text(&w.render_content());
 
-        assert!(text.contains("Alpha"), "Option Alpha must be visible: {text}");
+        assert!(
+            text.contains("Alpha"),
+            "Option Alpha must be visible: {text}"
+        );
         assert!(text.contains("Beta"), "Option Beta must be visible: {text}");
     }
 
@@ -340,7 +361,10 @@ mod tests {
         let w = TabbedDialogWidget::new(&dialog, &colors);
         let text = lines_to_text(&w.render_content());
 
-        assert!(text.contains("────"), "Separator must appear below tab bar: {text}");
+        assert!(
+            text.contains("────"),
+            "Separator must appear below tab bar: {text}"
+        );
     }
 }
 

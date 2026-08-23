@@ -27,12 +27,19 @@ edits. old_string must match exactly including whitespace. Include enough surrou
 make it unique. Use replace_all: true for multiple occurrences.
 - **write** — Write a complete file (new or full rewrite). Use for new files; for small changes \
 use edit instead.
-- **bash** — Run shell commands: builds, tests, git, formatters, etc.
+- **bash** — Run shell commands only when no structured tool exists: builds, tests, git,
+  formatters, or a purpose-built command. Never use `cat` to read, `grep` to search, `find` to
+  locate files, or shell redirection to write files; use `read`, `grep`, `glob`, `edit`, or `write`
+  instead. Shell stdout is not a Finch VM transport: never use bash/printf/echo/heredocs to emit
+  or test Lisp or Co-Forth source. Text-only provider responses are executed by Finch as VM wire
+  programs; communicate prose through Lisp/Forth `say`, not raw assistant text. For ordinary
+  replies and pure calculations, emit the wire program immediately—do not inspect the VM or search
+  the repository merely to learn how to call `say`.
 - **web_fetch** — Fetch documentation, crate pages, GitHub issues, etc.
 
 ## Approach
 
-Before editing: glob/grep to find the file, read the relevant section, understand the context.
+Before editing: glob/grep to find the file, use `read` for the relevant section, understand the context.
 Make the minimum change needed — don't touch code outside the task.
 After structural changes: run the build or tests to verify (cargo build, cargo test, npm test…).
 If tests fail: read the error carefully and diagnose the root cause before retrying.
@@ -157,7 +164,10 @@ impl ClaudeGenerator {
             content_blocks: response.content,
             tool_uses,
             metadata: ResponseMetadata {
-                generator: "claude".to_string(),
+                // `ClaudeClient` is a compatibility facade over every
+                // configured provider. Do not let its historical name leak
+                // into transcripts, logs, or provider-selection UI.
+                generator: self.client.provider_name().to_string(),
                 model: response.model,
                 confidence: None,
                 stop_reason: response.stop_reason,
@@ -205,5 +215,24 @@ impl Generator for ClaudeGenerator {
 
     fn name(&self) -> &str {
         self.client.provider_name()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coding_prompt_prefers_structured_file_tools_over_shell_equivalents() {
+        assert!(CODING_SYSTEM_PROMPT.contains("Never use `cat` to read"));
+        assert!(CODING_SYSTEM_PROMPT.contains("`grep` to search"));
+        assert!(CODING_SYSTEM_PROMPT.contains("`read`, `grep`, `glob`, `edit`, or `write`"));
+    }
+
+    #[test]
+    fn system_prompt_keeps_the_working_directory_outside_the_tool_contract() {
+        let prompt = build_system_prompt(Some("/workspace"), None);
+        assert!(prompt.contains("Working directory: /workspace"));
+        assert!(prompt.contains("Never use `cat` to read"));
     }
 }

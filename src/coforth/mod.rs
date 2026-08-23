@@ -14,8 +14,8 @@
 pub mod arm_vm;
 pub mod co_session;
 pub mod generator;
-pub mod irc_proto;
 pub mod interpreter;
+pub mod irc_proto;
 pub mod library;
 pub mod scatter;
 

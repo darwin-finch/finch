@@ -17,7 +17,6 @@
 ///   0x06  NAMES  — request member list; reply is SAY with comma-separated nicks
 ///   0x07  ACK    — acknowledgement; body is the original opcode as a single byte
 ///   0x08  ERR    — error; body is a UTF-8 error string
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -120,7 +119,15 @@ impl IrcMessage {
         let body = buf[pos..pos + body_len].to_vec();
         pos += body_len;
 
-        Some((Self { op, from, chan, body }, pos))
+        Some((
+            Self {
+                op,
+                from,
+                chan,
+                body,
+            },
+            pos,
+        ))
     }
 }
 
@@ -312,7 +319,10 @@ mod tests {
     #[test]
     fn test_channel_join_adds_member() {
         let reg = new_channel_registry();
-        process_message(IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()), &reg);
+        process_message(
+            IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()),
+            &reg,
+        );
         let chans = reg.lock().unwrap();
         assert!(chans["#test"].members.contains(&"alice".to_string()));
     }
@@ -320,17 +330,36 @@ mod tests {
     #[test]
     fn test_channel_join_idempotent() {
         let reg = new_channel_registry();
-        process_message(IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()), &reg);
-        process_message(IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()), &reg);
+        process_message(
+            IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()),
+            &reg,
+        );
+        process_message(
+            IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()),
+            &reg,
+        );
         let chans = reg.lock().unwrap();
-        assert_eq!(chans["#test"].members.iter().filter(|m| *m == "alice").count(), 1);
+        assert_eq!(
+            chans["#test"]
+                .members
+                .iter()
+                .filter(|m| *m == "alice")
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn test_channel_part_removes_member() {
         let reg = new_channel_registry();
-        process_message(IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()), &reg);
-        process_message(IrcMessage::new(OP_PART, "alice", "#test", b"".to_vec()), &reg);
+        process_message(
+            IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()),
+            &reg,
+        );
+        process_message(
+            IrcMessage::new(OP_PART, "alice", "#test", b"".to_vec()),
+            &reg,
+        );
         let chans = reg.lock().unwrap();
         assert!(!chans["#test"].members.contains(&"alice".to_string()));
     }
@@ -338,8 +367,14 @@ mod tests {
     #[test]
     fn test_channel_yield_accumulates() {
         let reg = new_channel_registry();
-        process_message(IrcMessage::new(OP_YIELD, "alice", "#test", b"1 2 +".to_vec()), &reg);
-        process_message(IrcMessage::new(OP_YIELD, "bob", "#test", b"3 *".to_vec()), &reg);
+        process_message(
+            IrcMessage::new(OP_YIELD, "alice", "#test", b"1 2 +".to_vec()),
+            &reg,
+        );
+        process_message(
+            IrcMessage::new(OP_YIELD, "bob", "#test", b"3 *".to_vec()),
+            &reg,
+        );
         let chans = reg.lock().unwrap();
         assert_eq!(chans["#test"].stack.len(), 2);
     }
@@ -347,7 +382,10 @@ mod tests {
     #[test]
     fn test_channel_exec_returns_combined_and_clears_stack() {
         let reg = new_channel_registry();
-        process_message(IrcMessage::new(OP_YIELD, "a", "#x", b"1 2 +".to_vec()), &reg);
+        process_message(
+            IrcMessage::new(OP_YIELD, "a", "#x", b"1 2 +".to_vec()),
+            &reg,
+        );
         process_message(IrcMessage::new(OP_YIELD, "b", "#x", b"dup".to_vec()), &reg);
         let reply =
             process_message(IrcMessage::new(OP_EXEC, "a", "#x", b"".to_vec()), &reg).unwrap();
@@ -369,7 +407,10 @@ mod tests {
     #[test]
     fn test_channel_names_lists_members() {
         let reg = new_channel_registry();
-        process_message(IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()), &reg);
+        process_message(
+            IrcMessage::new(OP_JOIN, "alice", "#test", b"".to_vec()),
+            &reg,
+        );
         process_message(IrcMessage::new(OP_JOIN, "bob", "#test", b"".to_vec()), &reg);
         let reply =
             process_message(IrcMessage::new(OP_NAMES, "", "#test", b"".to_vec()), &reg).unwrap();
@@ -398,11 +439,13 @@ mod tests {
     #[test]
     fn test_exec_last_pops_only_most_recent() {
         let reg = new_channel_registry();
-        process_message(IrcMessage::new(OP_YIELD, "a", "#x", b"first".to_vec()), &reg);
+        process_message(
+            IrcMessage::new(OP_YIELD, "a", "#x", b"first".to_vec()),
+            &reg,
+        );
         process_message(IrcMessage::new(OP_YIELD, "b", "#x", b"last".to_vec()), &reg);
         let reply =
-            process_message(IrcMessage::new(OP_EXEC_LAST, "a", "#x", b"".to_vec()), &reg)
-                .unwrap();
+            process_message(IrcMessage::new(OP_EXEC_LAST, "a", "#x", b"".to_vec()), &reg).unwrap();
         assert_eq!(reply.op, OP_EXEC_LAST);
         assert_eq!(String::from_utf8(reply.body).unwrap(), "last");
         // "first" must still be on the stack
@@ -414,9 +457,11 @@ mod tests {
     #[test]
     fn test_exec_last_on_empty_channel_returns_empty() {
         let reg = new_channel_registry();
-        let reply =
-            process_message(IrcMessage::new(OP_EXEC_LAST, "a", "#empty", b"".to_vec()), &reg)
-                .unwrap();
+        let reply = process_message(
+            IrcMessage::new(OP_EXEC_LAST, "a", "#empty", b"".to_vec()),
+            &reg,
+        )
+        .unwrap();
         assert_eq!(reply.op, OP_EXEC_LAST);
         assert!(reply.body.is_empty());
     }
@@ -424,8 +469,14 @@ mod tests {
     #[test]
     fn test_channel_independent_channels_dont_mix() {
         let reg = new_channel_registry();
-        process_message(IrcMessage::new(OP_YIELD, "a", "#chan1", b"code1".to_vec()), &reg);
-        process_message(IrcMessage::new(OP_YIELD, "b", "#chan2", b"code2".to_vec()), &reg);
+        process_message(
+            IrcMessage::new(OP_YIELD, "a", "#chan1", b"code1".to_vec()),
+            &reg,
+        );
+        process_message(
+            IrcMessage::new(OP_YIELD, "b", "#chan2", b"code2".to_vec()),
+            &reg,
+        );
         let chans = reg.lock().unwrap();
         assert_eq!(chans["#chan1"].stack.len(), 1);
         assert_eq!(chans["#chan2"].stack.len(), 1);

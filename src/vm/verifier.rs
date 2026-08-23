@@ -1,13 +1,14 @@
 use super::diagnostic::{DiagnosticPhase, SourceOrigin, VmDiagnostic};
-use super::effects::EffectSet;
+use super::effects::{CapabilityRequirement, EffectSet};
 use super::ir::{BlockId, Function, Instruction, Module};
 use super::signature::{StackRow, StackSignature};
 use super::types::Type;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 
 pub type Vocabulary = BTreeMap<String, StackSignature>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedFunction {
     pub name: String,
     pub inferred_effects: EffectSet,
@@ -15,7 +16,10 @@ pub struct VerifiedFunction {
     pub block_stacks: BTreeMap<BlockId, Vec<Type>>,
 }
 
-#[derive(Debug, Clone)]
+/// A verified module is immutable execution data. Keeping the verifier's
+/// facts with a suspended continuation lets the daemon resume exactly the
+/// program that was authorized rather than recompiling submitted source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedModule {
     pub module: Module,
     pub functions: BTreeMap<String, VerifiedFunction>,
@@ -295,6 +299,14 @@ impl<'a> Verifier<'a> {
                         Some(origin.clone()),
                     ));
                 }
+                if signature.output.values.len() != 1 {
+                    return Err(VmDiagnostic::error(
+                        "E-CLOSURE-001",
+                        DiagnosticPhase::Verification,
+                        "first-class closures must declare exactly one result; package multiple values in a record or list",
+                        Some(origin.clone()),
+                    ));
+                }
                 let count = *capture_count as usize;
                 if stack.len() < count {
                     return Err(underflow(origin, count, stack.len()));
@@ -364,6 +376,36 @@ impl<'a> Verifier<'a> {
                 apply_signature(signature, stack, origin)?;
                 *inferred_effects = inferred_effects.union(&signature.effects);
             }
+            Instruction::OutputOpen => {
+                let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                if !Type::String.accepts(&found) {
+                    return Err(VmDiagnostic::type_mismatch(
+                        Type::String,
+                        found,
+                        Some(origin.clone()),
+                    ));
+                }
+                stack.push(Type::Resource("output-handle".into()));
+                *inferred_effects = inferred_effects.union(&EffectSet::from_requirement(
+                    CapabilityRequirement {
+                        capability: super::effects::CapabilityKind::SessionEmit,
+                        selector: super::effects::ResourceSelector::None,
+                    },
+                ));
+            }
+            Instruction::UiEffect { input, output, .. } => {
+                let signature = StackSignature::pure(
+                    StackRow::polymorphic("S", input.clone()),
+                    StackRow::polymorphic("S", output.clone()),
+                );
+                apply_signature(&signature, stack, origin)?;
+                *inferred_effects = inferred_effects.union(&EffectSet::from_requirement(
+                    CapabilityRequirement {
+                        capability: super::effects::CapabilityKind::SessionEmit,
+                        selector: super::effects::ResourceSelector::None,
+                    },
+                ));
+            }
             Instruction::CapabilityRequest {
                 requirement,
                 input,
@@ -372,6 +414,76 @@ impl<'a> Verifier<'a> {
                 apply_stack_types(input, output, stack, origin)?;
                 *inferred_effects =
                     inferred_effects.union(&EffectSet::from_requirement(requirement.clone()));
+            }
+            Instruction::Yield => {}
+            Instruction::DeferCpu => {
+                let closure = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let Type::Function {
+                    arguments,
+                    result,
+                    effects,
+                } = closure
+                else {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-003",
+                        DiagnosticPhase::Verification,
+                        "defer-cpu requires a typed closure",
+                        Some(origin.clone()),
+                    ));
+                };
+                if !arguments.is_empty() {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-004",
+                        DiagnosticPhase::Verification,
+                        "defer-cpu requires a zero-argument closure; capture its arguments first",
+                        Some(origin.clone()),
+                    ));
+                }
+                if !effects.is_pure() {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-005",
+                        DiagnosticPhase::Verification,
+                        "defer-cpu requires a pure closure",
+                        Some(origin.clone()),
+                    ));
+                }
+                stack.push(Type::Task(result));
+            }
+            Instruction::PollCpuFiber => {
+                let task = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let Type::Task(result) = task else {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-009",
+                        DiagnosticPhase::Verification,
+                        "task-poll requires task<T>",
+                        Some(origin.clone()),
+                    ));
+                };
+                stack.push(Type::Option(result));
+            }
+            Instruction::JoinCpuFiber => {
+                let task = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let Type::Task(result) = task else {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-010",
+                        DiagnosticPhase::Verification,
+                        "task-join requires task<T>",
+                        Some(origin.clone()),
+                    ));
+                };
+                stack.push(*result);
+            }
+            Instruction::CancelCpuFiber => {
+                let task = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                if !matches!(task, Type::Task(_)) {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-020",
+                        DiagnosticPhase::Verification,
+                        "task-cancel requires task<T>",
+                        Some(origin.clone()),
+                    ));
+                }
+                stack.push(Type::Unit);
             }
             Instruction::Jump { target } => return Ok(vec![*target]),
             Instruction::Branch {

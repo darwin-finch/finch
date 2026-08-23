@@ -119,6 +119,17 @@ impl fmt::Display for Type {
 }
 
 /// Portable typed value used at VM, task, suspension, and wire boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    /// A separately orchestrated provider/agent ProgramRun.
+    #[default]
+    Agent,
+    /// A bounded pure closure executing on the local CPU-fiber pool.
+    CpuFiber,
+}
+
+/// Portable typed value used at VM, task, suspension, and wire boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum TypedValue {
@@ -159,7 +170,15 @@ pub enum TypedValue {
         captures: Vec<TypedValue>,
         signature: super::signature::StackSignature,
     },
-    Task(String),
+    /// A daemon-owned, serializable task reference. The id identifies the
+    /// durable task record; the result type lets a later turn inspect or join
+    /// it without falling back to `dynamic`.
+    Task {
+        id: String,
+        result_type: Type,
+        #[serde(default)]
+        kind: TaskKind,
+    },
     Resource {
         kind: String,
         handle: String,
@@ -213,7 +232,7 @@ impl TypedValue {
                 ),
                 effects: signature.effects.clone(),
             },
-            Self::Task(_) => Type::Task(Box::new(Type::Dynamic)),
+            Self::Task { result_type, .. } => Type::Task(Box::new(result_type.clone())),
             Self::Resource { kind, .. } => Type::Resource(kind.clone()),
             Self::Dynamic { .. } => Type::Dynamic,
         }
@@ -248,6 +267,15 @@ mod tests {
             }
             .value_type(),
             Type::Result(Box::new(Type::Int), Box::new(Type::String))
+        );
+        assert_eq!(
+            TypedValue::Task {
+                id: "task-1".into(),
+                result_type: Type::String,
+                kind: TaskKind::Agent,
+            }
+            .value_type(),
+            Type::Task(Box::new(Type::String))
         );
     }
 

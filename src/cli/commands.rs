@@ -106,12 +106,12 @@ pub enum Command {
     RoomList,             // /room list    — list all rooms + member counts
     SelfFix,              // /self-fix     — diagnose, fix, verify, restart
     // Peer registry / gas ledger
-    SelfPeer,                       // /self-peer            — register local daemon with itself
-    GasSend(String, u64),           // /gas-send <addr> <ms> — send gas to a peer
-    Balance,                        // /balance              — show my ledger balance
-    Settle(String),                 // /settle <addr>        — settle debt with peer
-    JoinRegistry(String),           // /join-registry <addr> — register with a remote registry
-    RegistrySet(String),            // /registry <addr>      — set registry address
+    SelfPeer,             // /self-peer            — register local daemon with itself
+    GasSend(String, u64), // /gas-send <addr> <ms> — send gas to a peer
+    Balance,              // /balance              — show my ledger balance
+    Settle(String),       // /settle <addr>        — settle debt with peer
+    JoinRegistry(String), // /join-registry <addr> — register with a remote registry
+    RegistrySet(String),  // /registry <addr>      — set registry address
     // Diff proposal flow
     Accept(Option<String>), // /accept [diff-id-prefix] — accept most-recent (or matched) pending diff
     Reject(Option<String>), // /reject [reason]         — reject most-recent pending diff
@@ -1188,8 +1188,14 @@ mod tests {
         }
 
         // Test empty ID — catch-all returns Help (unknown /command with no ID)
-        assert!(matches!(Command::parse("/patterns remove "), Some(Command::Help)));
-        assert!(matches!(Command::parse("/patterns rm "), Some(Command::Help)));
+        assert!(matches!(
+            Command::parse("/patterns remove "),
+            Some(Command::Help)
+        ));
+        assert!(matches!(
+            Command::parse("/patterns rm "),
+            Some(Command::Help)
+        ));
     }
 
     #[test]
@@ -1284,9 +1290,18 @@ mod tests {
     #[test]
     fn test_parse_invalid_patterns_command() {
         // Invalid/incomplete /commands → catch-all returns Help
-        assert!(matches!(Command::parse("/patterns invalid"), Some(Command::Help)));
-        assert!(matches!(Command::parse("/patterns remove"), Some(Command::Help))); // Missing ID
-        assert!(matches!(Command::parse("/patterns rm"), Some(Command::Help))); // Missing ID
+        assert!(matches!(
+            Command::parse("/patterns invalid"),
+            Some(Command::Help)
+        ));
+        assert!(matches!(
+            Command::parse("/patterns remove"),
+            Some(Command::Help)
+        )); // Missing ID
+        assert!(matches!(
+            Command::parse("/patterns rm"),
+            Some(Command::Help)
+        )); // Missing ID
     }
 
     // MCP Command Tests
@@ -1345,7 +1360,10 @@ mod tests {
     #[test]
     fn test_parse_mcp_invalid() {
         // Invalid subcommands → catch-all returns Help
-        assert!(matches!(Command::parse("/mcp invalid"), Some(Command::Help)));
+        assert!(matches!(
+            Command::parse("/mcp invalid"),
+            Some(Command::Help)
+        ));
         // Note: "/mcp " (with trailing space) is trimmed to "/mcp" which matches McpList
     }
 

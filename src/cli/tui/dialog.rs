@@ -4,7 +4,7 @@
 // with the TUI, avoiding the need for suspend/resume.
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashSet;
 
 /// Type of dialog to display
@@ -302,7 +302,9 @@ impl Dialog {
 
     /// Handle a key event and return a result if the dialog should close
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Option<DialogResult> {
-        // Priority 0: PageUp/PageDown scroll the body section (when not in custom mode).
+        // Priority 0: Scroll the body section (when not in custom mode). Laptop
+        // keyboards often have no PageUp/PageDown, so support the conventional
+        // terminal equivalents as well.
         if !self.custom_mode_active && self.body.is_some() {
             match key.code {
                 KeyCode::PageUp => {
@@ -310,6 +312,22 @@ impl Dialog {
                     return None;
                 }
                 KeyCode::PageDown => {
+                    self.body_scroll_offset = self.body_scroll_offset.saturating_add(5);
+                    return None;
+                }
+                KeyCode::Home => {
+                    self.body_scroll_offset = 0;
+                    return None;
+                }
+                KeyCode::End => {
+                    self.body_scroll_offset = usize::MAX;
+                    return None;
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.body_scroll_offset = self.body_scroll_offset.saturating_sub(5);
+                    return None;
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.body_scroll_offset = self.body_scroll_offset.saturating_add(5);
                     return None;
                 }
@@ -1508,7 +1526,7 @@ mod tests {
         // Navigate to Other row (index 2 for a 2-option multiselect).
         dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1
         dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 1→2 (Other)
-        // Press 'x' — must activate custom mode and insert the char.
+                                                                // Press 'x' — must activate custom mode and insert the char.
         let result = dialog.handle_key_event(KeyEvent::from(KeyCode::Char('x')));
         assert!(
             result.is_none(),
@@ -1528,10 +1546,7 @@ mod tests {
     /// Regression (#45): multiple chars typed on MultiSelect "Other" row accumulate.
     #[test]
     fn test_multiselect_other_row_char_accumulates_without_enter() {
-        let mut dialog = Dialog::multiselect_with_custom(
-            "T",
-            vec![DialogOption::new("A")],
-        );
+        let mut dialog = Dialog::multiselect_with_custom("T", vec![DialogOption::new("A")]);
         dialog.handle_key_event(KeyEvent::from(KeyCode::Down)); // 0→1 (Other)
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('h')));
         dialog.handle_key_event(KeyEvent::from(KeyCode::Char('i')));
@@ -1731,12 +1746,12 @@ mod tests {
 
     #[test]
     fn test_tool_approval_non_mutating_has_three_options() {
-        let dialog = Dialog::tool_approval("Push", "Execute Push tool");
+        let dialog = Dialog::tool_approval("Read", "Read src/lib.rs");
         if let DialogType::Select { options, .. } = &dialog.dialog_type {
             assert_eq!(options.len(), 3);
             assert!(options[0].label.contains("Yes"));
             assert!(options[1].label.contains("don't ask again"));
-            assert!(options[1].label.contains("Push:*"));
+            assert!(options[1].label.contains("Read:*"));
             assert!(options[2].label.contains("No"));
         } else {
             panic!("expected Select dialog");
@@ -1765,6 +1780,23 @@ mod tests {
         let dialog = Dialog::tool_approval("Bash", "run command");
         assert!(dialog.title.contains("Bash"));
         assert!(dialog.title.contains("run command"));
+    }
+
+    #[test]
+    fn body_scroll_supports_laptop_terminal_keys() {
+        let mut dialog = Dialog::select("Plan", vec![DialogOption::new("Approve")])
+            .with_body("one\ntwo\nthree\nfour\nfive\nsix");
+
+        dialog.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(dialog.body_scroll_offset, 5);
+        dialog.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(dialog.body_scroll_offset, 0);
+
+        dialog.body_scroll_offset = 3;
+        dialog.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(dialog.body_scroll_offset, 0);
+        dialog.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(dialog.body_scroll_offset, usize::MAX);
     }
 
     // ── random key input (fuzz-style) ─────────────────────────────────────────

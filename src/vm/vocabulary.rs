@@ -1,6 +1,7 @@
 use super::effects::{
-    CapabilityKind, CapabilityRequirement, EffectSet, FileSelector,
-    FileSelectorTemplate, FileSelectorTemplatePart, ResourceRoot, ResourceSelector,
+    CapabilityKind, CapabilityRequirement, EffectSet, FileSelector, FileSelectorTemplate,
+    FileSelectorTemplatePart, NetworkSelectorTemplate, ProcessSelectorTemplate,
+    ProgramSelectorTemplate, ResourceRoot, ResourceSelector,
 };
 use super::signature::{ControlEffect, StackRow, StackSignature};
 use super::types::Type;
@@ -47,6 +48,22 @@ fn path_template() -> FileSelectorTemplate {
     }
 }
 
+fn host_path_selector() -> FileSelector {
+    FileSelector::parse("${host-machine}/**").expect("valid host-machine root")
+}
+
+fn host_path_template() -> FileSelectorTemplate {
+    let upper_bound = host_path_selector();
+    FileSelectorTemplate {
+        root: ResourceRoot::HostMachine,
+        parts: vec![FileSelectorTemplatePart::Argument {
+            index: 0,
+            bound: upper_bound.clone(),
+        }],
+        upper_bound,
+    }
+}
+
 /// Canonical signatures for the first verified core. Runtime implementations,
 /// provider documentation, and tests consume this registry rather than keeping
 /// independent handwritten signature tables.
@@ -77,6 +94,13 @@ pub fn core_vocabulary() -> Vocabulary {
                 )],
             ),
         ),
+        // `host-path` is intentionally a different refined type from
+        // workspace `path`. It only identifies a child of the host-installed
+        // root; it neither installs that root nor grants filesystem access.
+        (
+            "host-path".into(),
+            pure(vec![Type::String], vec![Type::Path(host_path_selector())]),
+        ),
         (
             "dup".into(),
             pure(vec![a.clone()], vec![a.clone(), a.clone()]),
@@ -95,6 +119,9 @@ pub fn core_vocabulary() -> Vocabulary {
         ),
         ("bytes".into(), pure(vec![Type::String], vec![Type::Bytes])),
         ("space".into(), pure(Vec::new(), vec![Type::String])),
+        // A control-only cooperative scheduling point. The source frontends
+        // lower this word to `Instruction::Yield`, not a normal core call.
+        ("yield".into(), pure(Vec::new(), Vec::new())),
         (
             "int-to-string".into(),
             pure(vec![Type::Int], vec![Type::String]),
@@ -110,17 +137,11 @@ pub fn core_vocabulary() -> Vocabulary {
         ),
         (
             "is-some".into(),
-            pure(
-                vec![Type::Option(Box::new(a.clone()))],
-                vec![Type::Bool],
-            ),
+            pure(vec![Type::Option(Box::new(a.clone()))], vec![Type::Bool]),
         ),
         (
             "unwrap".into(),
-            pure(
-                vec![Type::Option(Box::new(a.clone()))],
-                vec![a.clone()],
-            ),
+            pure(vec![Type::Option(Box::new(a.clone()))], vec![a.clone()]),
         ),
         (
             "ok".into(),
@@ -139,7 +160,10 @@ pub fn core_vocabulary() -> Vocabulary {
         (
             "is-ok".into(),
             pure(
-                vec![Type::Result(Box::new(a.clone()), Box::new(Type::Variable("E".into())))],
+                vec![Type::Result(
+                    Box::new(a.clone()),
+                    Box::new(Type::Variable("E".into())),
+                )],
                 vec![Type::Bool],
             ),
         ),
@@ -178,6 +202,108 @@ pub fn core_vocabulary() -> Vocabulary {
                 },
             ),
         ),
+        // Bounded range reads keep large CSV/text processing out of the
+        // model context and avoid materializing an entire file in the VM.
+        // The path still determines the concrete `file.read` selector.
+        (
+            "file-size".into(),
+            capability(
+                vec![Type::Path(
+                    FileSelector::parse("./**").expect("valid workspace root"),
+                )],
+                vec![Type::Int],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "file-slice".into(),
+            capability(
+                vec![
+                    Type::Path(FileSelector::parse("./**").expect("valid workspace root")),
+                    Type::Int,
+                    Type::Int,
+                ],
+                vec![Type::Bytes],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
+            ),
+        ),
+        // Line cursors are host-issued resources. Only `file-lines-open`
+        // receives a path selector; `next`/`close` can operate under the
+        // already-authorized opaque resource and cannot fabricate a path.
+        (
+            "file-lines-open".into(),
+            capability(
+                vec![Type::Path(
+                    FileSelector::parse("./**").expect("valid workspace root"),
+                )],
+                vec![Type::Resource("file-line-cursor".into())],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "file-lines-next".into(),
+            capability(
+                vec![Type::Resource("file-line-cursor".into())],
+                vec![Type::Option(Box::new(Type::String))],
+                unscoped(CapabilityKind::FileRead),
+            ),
+        ),
+        (
+            "file-lines-close".into(),
+            capability(
+                vec![Type::Resource("file-line-cursor".into())],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::FileRead),
+            ),
+        ),
+        // CSV records need their own cursor: quoted fields may legally span
+        // physical lines, so a line cursor cannot safely model a CSV row.
+        (
+            "csv-open".into(),
+            capability(
+                vec![Type::Path(
+                    FileSelector::parse("./**").expect("valid workspace root"),
+                )],
+                vec![Type::Resource("csv-record-cursor".into())],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "csv-next".into(),
+            capability(
+                vec![Type::Resource("csv-record-cursor".into())],
+                vec![Type::Option(Box::new(Type::list(Type::String)))],
+                unscoped(CapabilityKind::FileRead),
+            ),
+        ),
+        (
+            "csv-close".into(),
+            capability(
+                vec![Type::Resource("csv-record-cursor".into())],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::FileRead),
+            ),
+        ),
         (
             "file-write".into(),
             capability(
@@ -190,6 +316,35 @@ pub fn core_vocabulary() -> Vocabulary {
                     capability: CapabilityKind::FileWrite,
                     selector: ResourceSelector::FileTemplate {
                         template: path_template(),
+                    },
+                },
+            ),
+        ),
+        // Whole-machine operations remain structurally distinct from their
+        // workspace counterparts. A host adapter must explicitly install the
+        // host root, and grants still have to cover the concrete selector.
+        (
+            "host-file-read".into(),
+            capability(
+                vec![Type::Path(host_path_selector())],
+                vec![Type::Bytes],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: host_path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "host-file-write".into(),
+            capability(
+                vec![Type::Path(host_path_selector()), Type::Bytes],
+                vec![Type::Unit],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileWrite,
+                    selector: ResourceSelector::FileTemplate {
+                        template: host_path_template(),
                     },
                 },
             ),
@@ -219,6 +374,62 @@ pub fn core_vocabulary() -> Vocabulary {
             ),
         ),
         (
+            "output-open".into(),
+            capability(
+                vec![Type::String],
+                vec![Type::Resource("output-handle".into())],
+                unscoped(CapabilityKind::SessionEmit),
+            ),
+        ),
+        (
+            "output-append".into(),
+            capability(
+                vec![Type::Resource("output-handle".into()), Type::String],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::SessionEmit),
+            ),
+        ),
+        (
+            "output-replace".into(),
+            capability(
+                vec![Type::Resource("output-handle".into()), Type::String],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::SessionEmit),
+            ),
+        ),
+        (
+            "output-status".into(),
+            capability(
+                vec![Type::Resource("output-handle".into()), Type::String],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::SessionEmit),
+            ),
+        ),
+        (
+            "output-progress".into(),
+            capability(
+                vec![Type::Resource("output-handle".into()), Type::Int, Type::Int],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::SessionEmit),
+            ),
+        ),
+        (
+            "output-complete".into(),
+            capability(
+                vec![Type::Resource("output-handle".into())],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::SessionEmit),
+            ),
+        ),
+        (
+            "output-fail".into(),
+            capability(
+                vec![Type::Resource("output-handle".into()), Type::String],
+                vec![Type::Unit],
+                unscoped(CapabilityKind::SessionEmit),
+            ),
+        ),
+        (
             "vm-vocabulary".into(),
             capability(
                 Vec::new(),
@@ -231,7 +442,51 @@ pub fn core_vocabulary() -> Vocabulary {
             capability(
                 vec![Type::String, Type::list(Type::String)],
                 vec![Type::String],
-                unscoped(CapabilityKind::ProcessRun),
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProcessRun,
+                    selector: ResourceSelector::ProcessTemplate {
+                        template: ProcessSelectorTemplate {
+                            executable_argument: 0,
+                            allowed_executables: Vec::new(),
+                        },
+                    },
+                },
+            ),
+        ),
+        // A proposal is an explicit, user-editable artifact boundary.  The
+        // source itself is just data here: accepting it never executes a
+        // shell, Python, or Finch program implicitly.  The host returns
+        // `none` for cancel, `some(ok source)` for execute, and
+        // `some(err context)` for a request to continue the conversation.
+        (
+            "proposal-open".into(),
+            capability(
+                vec![Type::String, Type::String, Type::String],
+                vec![Type::Option(Box::new(Type::Result(
+                    Box::new(Type::String),
+                    Box::new(Type::String),
+                )))],
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProgramInvoke,
+                    selector: ResourceSelector::ProgramTemplate {
+                        template: ProgramSelectorTemplate {
+                            language_argument: 0,
+                            allowed_languages: vec![
+                                "bash".into(),
+                                "sh".into(),
+                                "shell".into(),
+                                "python".into(),
+                                "py".into(),
+                                "lisp".into(),
+                                "finch".into(),
+                                "forth".into(),
+                                "coforth".into(),
+                                "co-forth".into(),
+                                "text".into(),
+                            ],
+                        },
+                    },
+                },
             ),
         ),
         (
@@ -239,7 +494,17 @@ pub fn core_vocabulary() -> Vocabulary {
             capability(
                 vec![Type::String, Type::Int],
                 vec![Type::Resource("network-socket".into())],
-                unscoped(CapabilityKind::NetworkConnect),
+                CapabilityRequirement {
+                    capability: CapabilityKind::NetworkConnect,
+                    selector: ResourceSelector::NetworkTemplate {
+                        template: NetworkSelectorTemplate {
+                            host_argument: 0,
+                            port_argument: 1,
+                            allowed_hosts: Vec::new(),
+                            allowed_ports: Vec::new(),
+                        },
+                    },
+                },
             ),
         ),
         (
@@ -392,10 +657,8 @@ mod tests {
 
     #[test]
     fn language_schema_advertises_every_core_capability_kind() {
-        let schema: serde_json::Value = serde_json::from_str(include_str!(
-            "../../vocabulary/language/schema.json"
-        ))
-        .unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../vocabulary/language/schema.json")).unwrap();
         let advertised = schema["$defs"]["capability"]["properties"]["capability"]["enum"]
             .as_array()
             .unwrap()

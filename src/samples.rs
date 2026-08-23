@@ -22,8 +22,7 @@ use std::path::Path;
 
 /// Generate all sample xlsx files into `dir`.
 pub fn generate_all(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
 
     generate_grades(&dir.join("grades.xlsx"))?;
     generate_budget(&dir.join("budget.xlsx"))?;
@@ -45,20 +44,22 @@ fn generate_grades(path: &Path) -> Result<()> {
     let ws = wb.add_worksheet();
     ws.set_name("Grades")?;
 
-    let headers = ["Name", "Test 1", "Test 2", "Test 3", "Test 4", "Average", "Grade"];
+    let headers = [
+        "Name", "Test 1", "Test 2", "Test 3", "Test 4", "Average", "Grade",
+    ];
     for (c, h) in headers.iter().enumerate() {
         ws.write_string(0, c as u16, *h)?;
     }
 
     let students: &[(&str, [f64; 4])] = &[
-        ("Alice Johnson",  [92.0, 88.0, 95.0, 90.0]),
-        ("Bob Martinez",   [78.0, 82.0, 75.0, 80.0]),
+        ("Alice Johnson", [92.0, 88.0, 95.0, 90.0]),
+        ("Bob Martinez", [78.0, 82.0, 75.0, 80.0]),
         ("Carol Williams", [95.0, 97.0, 93.0, 98.0]),
-        ("David Chen",     [65.0, 70.0, 68.0, 72.0]),
-        ("Eva Okonkwo",    [88.0, 85.0, 90.0, 87.0]),
-        ("Frank Rivera",   [55.0, 60.0, 58.0, 62.0]),
-        ("Grace Kim",      [100.0, 98.0, 99.0, 97.0]),
-        ("Henry Patel",    [73.0, 76.0, 71.0, 74.0]),
+        ("David Chen", [65.0, 70.0, 68.0, 72.0]),
+        ("Eva Okonkwo", [88.0, 85.0, 90.0, 87.0]),
+        ("Frank Rivera", [55.0, 60.0, 58.0, 62.0]),
+        ("Grace Kim", [100.0, 98.0, 99.0, 97.0]),
+        ("Henry Patel", [73.0, 76.0, 71.0, 74.0]),
     ];
 
     for (r, (name, scores)) in students.iter().enumerate() {
@@ -74,16 +75,17 @@ fn generate_grades(path: &Path) -> Result<()> {
         ws.write_string(row, 6, grade)?;
     }
 
-    wb.save(path).with_context(|| format!("cannot save {}", path.display()))
+    wb.save(path)
+        .with_context(|| format!("cannot save {}", path.display()))
 }
 
 fn letter_grade(avg: f64) -> &'static str {
     match avg as u32 {
         90..=100 => "A",
-        80..=89  => "B",
-        70..=79  => "C",
-        60..=69  => "D",
-        _        => "F",
+        80..=89 => "B",
+        70..=79 => "C",
+        60..=69 => "D",
+        _ => "F",
     }
 }
 
@@ -104,16 +106,16 @@ fn generate_budget(path: &Path) -> Result<()> {
     }
 
     let rows: &[(&str, f64, f64)] = &[
-        ("Rent",           1500.0, 1500.0),
-        ("Groceries",       400.0,  437.50),
-        ("Utilities",       150.0,  162.00),
-        ("Internet",         60.0,   60.00),
-        ("Transportation",  200.0,  185.00),
-        ("Healthcare",      100.0,   45.00),
-        ("Entertainment",    80.0,  112.00),
-        ("Clothing",         50.0,   78.00),
-        ("Savings",         300.0,  300.00),
-        ("Miscellaneous",   100.0,   93.25),
+        ("Rent", 1500.0, 1500.0),
+        ("Groceries", 400.0, 437.50),
+        ("Utilities", 150.0, 162.00),
+        ("Internet", 60.0, 60.00),
+        ("Transportation", 200.0, 185.00),
+        ("Healthcare", 100.0, 45.00),
+        ("Entertainment", 80.0, 112.00),
+        ("Clothing", 50.0, 78.00),
+        ("Savings", 300.0, 300.00),
+        ("Miscellaneous", 100.0, 93.25),
     ];
 
     for (r, (cat, budgeted, actual)) in rows.iter().enumerate() {
@@ -128,13 +130,18 @@ fn generate_budget(path: &Path) -> Result<()> {
     // Totals row
     let total_row = (rows.len() + 1) as u32;
     let total_budgeted: f64 = rows.iter().map(|r| r.1).sum();
-    let total_actual:   f64 = rows.iter().map(|r| r.2).sum();
+    let total_actual: f64 = rows.iter().map(|r| r.2).sum();
     ws.write_string(total_row, 0, "TOTAL")?;
     ws.write_number(total_row, 1, (total_budgeted * 100.0).round() / 100.0)?;
-    ws.write_number(total_row, 2, (total_actual   * 100.0).round() / 100.0)?;
-    ws.write_number(total_row, 3, ((total_actual - total_budgeted) * 100.0).round() / 100.0)?;
+    ws.write_number(total_row, 2, (total_actual * 100.0).round() / 100.0)?;
+    ws.write_number(
+        total_row,
+        3,
+        ((total_actual - total_budgeted) * 100.0).round() / 100.0,
+    )?;
 
-    wb.save(path).with_context(|| format!("cannot save {}", path.display()))
+    wb.save(path)
+        .with_context(|| format!("cannot save {}", path.display()))
 }
 
 // ── contacts.xlsx ─────────────────────────────────────────────────────────────
@@ -154,16 +161,76 @@ fn generate_contacts(path: &Path) -> Result<()> {
     }
 
     let contacts: &[(&str, &str, &str, &str, &str)] = &[
-        ("Alice Johnson",   "alice@example.com",  "555-0101", "Boston",      "School friend"),
-        ("Bob Martinez",    "bob@example.com",    "555-0102", "Chicago",     "Work colleague"),
-        ("Carol Williams",  "carol@example.com",  "555-0103", "Austin",      "Neighbor"),
-        ("David Chen",      "david@example.com",  "555-0104", "Seattle",     "Tech lead"),
-        ("Eva Okonkwo",     "eva@example.com",    "555-0105", "Atlanta",     "Book club"),
-        ("Frank Rivera",    "frank@example.com",  "555-0106", "Denver",      "Gym buddy"),
-        ("Grace Kim",       "grace@example.com",  "555-0107", "Portland",    "Teacher"),
-        ("Henry Patel",     "henry@example.com",  "555-0108", "Phoenix",     "Doctor"),
-        ("Iris Thompson",   "iris@example.com",   "555-0109", "Nashville",   "Sister"),
-        ("James Walker",    "james@example.com",  "555-0110", "Miami",       "Mentor"),
+        (
+            "Alice Johnson",
+            "alice@example.com",
+            "555-0101",
+            "Boston",
+            "School friend",
+        ),
+        (
+            "Bob Martinez",
+            "bob@example.com",
+            "555-0102",
+            "Chicago",
+            "Work colleague",
+        ),
+        (
+            "Carol Williams",
+            "carol@example.com",
+            "555-0103",
+            "Austin",
+            "Neighbor",
+        ),
+        (
+            "David Chen",
+            "david@example.com",
+            "555-0104",
+            "Seattle",
+            "Tech lead",
+        ),
+        (
+            "Eva Okonkwo",
+            "eva@example.com",
+            "555-0105",
+            "Atlanta",
+            "Book club",
+        ),
+        (
+            "Frank Rivera",
+            "frank@example.com",
+            "555-0106",
+            "Denver",
+            "Gym buddy",
+        ),
+        (
+            "Grace Kim",
+            "grace@example.com",
+            "555-0107",
+            "Portland",
+            "Teacher",
+        ),
+        (
+            "Henry Patel",
+            "henry@example.com",
+            "555-0108",
+            "Phoenix",
+            "Doctor",
+        ),
+        (
+            "Iris Thompson",
+            "iris@example.com",
+            "555-0109",
+            "Nashville",
+            "Sister",
+        ),
+        (
+            "James Walker",
+            "james@example.com",
+            "555-0110",
+            "Miami",
+            "Mentor",
+        ),
     ];
 
     for (r, (name, email, phone, city, notes)) in contacts.iter().enumerate() {
@@ -175,7 +242,8 @@ fn generate_contacts(path: &Path) -> Result<()> {
         ws.write_string(row, 4, *notes)?;
     }
 
-    wb.save(path).with_context(|| format!("cannot save {}", path.display()))
+    wb.save(path)
+        .with_context(|| format!("cannot save {}", path.display()))
 }
 
 // ── times_table.xlsx ──────────────────────────────────────────────────────────
@@ -206,7 +274,8 @@ fn generate_times_table(path: &Path) -> Result<()> {
         }
     }
 
-    wb.save(path).with_context(|| format!("cannot save {}", path.display()))
+    wb.save(path)
+        .with_context(|| format!("cannot save {}", path.display()))
 }
 
 #[cfg(test)]
@@ -218,7 +287,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         generate_all(dir.path()).unwrap();
 
-        for name in &["grades.xlsx", "budget.xlsx", "contacts.xlsx", "times_table.xlsx"] {
+        for name in &[
+            "grades.xlsx",
+            "budget.xlsx",
+            "contacts.xlsx",
+            "times_table.xlsx",
+        ] {
             assert!(dir.path().join(name).exists(), "{name} not generated");
         }
     }
@@ -227,7 +301,11 @@ mod tests {
     fn test_grades_cell_readable() {
         let dir = tempfile::tempdir().unwrap();
         generate_all(dir.path()).unwrap();
-        let path = dir.path().join("grades.xlsx").to_string_lossy().into_owned();
+        let path = dir
+            .path()
+            .join("grades.xlsx")
+            .to_string_lossy()
+            .into_owned();
 
         // A2 should be first student name
         let val = super::super::coforth::interpreter::xlsx_read_cell(&path, None, "A2").unwrap();
@@ -242,7 +320,11 @@ mod tests {
     fn test_times_table_cell_readable() {
         let dir = tempfile::tempdir().unwrap();
         generate_all(dir.path()).unwrap();
-        let path = dir.path().join("times_table.xlsx").to_string_lossy().into_owned();
+        let path = dir
+            .path()
+            .join("times_table.xlsx")
+            .to_string_lossy()
+            .into_owned();
 
         // Row 7 (×7), col 8 (×8) = 56 → cell I8 (col A=row-header, B=×1, …, I=×8; row 8 = ×7)
         let val = super::super::coforth::interpreter::xlsx_read_cell(&path, None, "I8").unwrap();
@@ -256,7 +338,11 @@ mod tests {
     fn test_budget_total_row() {
         let dir = tempfile::tempdir().unwrap();
         generate_all(dir.path()).unwrap();
-        let path = dir.path().join("budget.xlsx").to_string_lossy().into_owned();
+        let path = dir
+            .path()
+            .join("budget.xlsx")
+            .to_string_lossy()
+            .into_owned();
 
         // A12 = "TOTAL"
         let label = super::super::coforth::interpreter::xlsx_read_cell(&path, None, "A12").unwrap();

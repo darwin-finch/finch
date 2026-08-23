@@ -95,6 +95,20 @@ pub enum WorkRowStatus {
     Error(String),
 }
 
+/// How a completed unit is projected into the transcript.
+///
+/// Most units are ordinary assistant turns and retain the familiar `⏺` marker.
+/// VM wire source and its emitted output are separate artifacts: source is
+/// explicitly labelled and output is rendered as plain content so neither is
+/// mistaken for a second assistant turn.
+#[derive(Clone, Debug, Default)]
+pub enum WorkUnitPresentation {
+    #[default]
+    Assistant,
+    ProgramSource { language: String },
+    ProgramOutput,
+}
+
 /// A single tool-call sub-item rendered below the WorkUnit header
 #[derive(Clone, Debug)]
 pub struct WorkRow {
@@ -126,6 +140,7 @@ struct WorkUnitInner {
     status: MessageStatus,
     /// Elapsed time captured when the unit completed (stable for scrollback display)
     elapsed_at_finish: Option<std::time::Duration>,
+    presentation: WorkUnitPresentation,
 }
 
 // ============================================================================
@@ -160,6 +175,7 @@ impl WorkUnit {
                 rows: Vec::new(),
                 status: MessageStatus::InProgress,
                 elapsed_at_finish: None,
+                presentation: WorkUnitPresentation::Assistant,
             })),
         }
     }
@@ -198,6 +214,25 @@ impl WorkUnit {
             .unwrap_or_else(|p| p.into_inner())
             .response_text
             .push_str(text);
+    }
+
+    /// Render this unit as the exact program received from the provider.
+    pub fn set_program_source(&self, language: impl Into<String>) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .presentation = WorkUnitPresentation::ProgramSource {
+            language: language.into(),
+        };
+    }
+
+    /// Render this unit as output emitted by a VM program, not an assistant
+    /// message. `say` itself remains append-only; this only chooses UI chrome.
+    pub fn set_program_output(&self) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .presentation = WorkUnitPresentation::ProgramOutput;
     }
 
     /// Add a running tool-call sub-row; returns its index for later updates.
@@ -294,6 +329,27 @@ impl Message for WorkUnit {
 
         match inner.status {
             MessageStatus::InProgress => {
+                // Provider text is a VM wire program. Unlike ordinary prose
+                // streaming, its source is itself an inspectable artifact and
+                // must remain visible while tokens arrive; otherwise it looks
+                // as though Co-Forth/Lisp was eaten until the final frame.
+                if let WorkUnitPresentation::ProgramSource { language } = &inner.presentation {
+                    let secs = elapsed.as_secs();
+                    let mut out = format!(
+                        "{}→ program ({language}){} {}{}…{}",
+                        GRAY,
+                        RESET,
+                        GRAY_DIM,
+                        fmt_elapsed(secs),
+                        RESET
+                    );
+                    if !inner.response_text.is_empty() {
+                        out.push('\n');
+                        out.push_str(&inner.response_text);
+                    }
+                    return out;
+                }
+
                 // Time-driven throb: frame changes every 200 ms, no external counter
                 let frame_idx = (elapsed.as_millis() / 200) as usize % THROB_FRAMES.len();
                 let icon = THROB_FRAMES[frame_idx];
@@ -339,11 +395,26 @@ impl Message for WorkUnit {
                     String::new()
                 };
 
-                // Show final response (bare bullet if no text)
-                let mut out = if inner.response_text.is_empty() {
-                    format!("{}⏺{}{}", CYAN, RESET, timing)
-                } else {
-                    format!("{}⏺{} {}{}", CYAN, RESET, inner.response_text, timing)
+                let mut out = match &inner.presentation {
+                    WorkUnitPresentation::Assistant => {
+                        if inner.response_text.is_empty() {
+                            format!("{}⏺{}{}", CYAN, RESET, timing)
+                        } else {
+                            format!("{}⏺{} {}{}", CYAN, RESET, inner.response_text, timing)
+                        }
+                    }
+                    WorkUnitPresentation::ProgramSource { language } => {
+                        let mut source = format!("{}→ program ({language}){}", GRAY, RESET);
+                        if !inner.response_text.is_empty() {
+                            source.push('\n');
+                            source.push_str(&inner.response_text);
+                        }
+                        source.push_str(&timing);
+                        source
+                    }
+                    WorkUnitPresentation::ProgramOutput => {
+                        format!("{}{}", inner.response_text, timing)
+                    }
                 };
 
                 // Collapsed sub-rows: show what tools ran (label + summary + body lines)
@@ -579,6 +650,35 @@ mod tests {
         wu.set_response("Hello");
         wu.append_response(" world");
         assert_eq!(wu.content(), "Hello world");
+    }
+
+    #[test]
+    fn program_source_and_output_have_no_assistant_bullet() {
+        let source = WorkUnit::new("ignored");
+        source.set_program_source("lisp");
+        source.set_response("(say \"hello\")");
+        source.set_complete();
+        let source_rendered = source.format(&colors());
+        assert!(source_rendered.contains("→ program (lisp)"));
+        assert!(!source_rendered.contains('⏺'));
+
+        let output = WorkUnit::new("ignored");
+        output.set_program_output();
+        output.set_response("hello");
+        output.set_complete();
+        assert_eq!(output.format(&colors()), "hello");
+    }
+
+    #[test]
+    fn in_progress_program_source_keeps_received_wire_text_visible() {
+        let source = WorkUnit::new("ignored");
+        source.set_program_source("forth");
+        source.append_response("s\"hello\" say");
+
+        let rendered = source.format(&colors());
+        assert!(rendered.contains("→ program (forth)"));
+        assert!(rendered.contains("s\"hello\" say"));
+        assert!(!rendered.contains("⏺"));
     }
 
     // ── Rows ─────────────────────────────────────────────────────────────────

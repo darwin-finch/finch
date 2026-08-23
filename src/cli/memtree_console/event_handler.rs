@@ -94,7 +94,6 @@ impl EventHandler {
             ReplEvent::PeersDiscovered(_) => {}
             ReplEvent::VocabSync(_) => {}
             ReplEvent::PeerMessage { .. } => {}
-            ReplEvent::Translations { .. } => {}
             ReplEvent::RemoteBrainMessage { .. } => {}
             ReplEvent::RemoteBrainError { .. } | ReplEvent::AgentLifecycle(_) => {}
         }

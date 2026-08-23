@@ -4877,7 +4877,6 @@ mod tests {
         }
     }
 
-
     /// Verify the Rust↔Forth mix: every Builtin variant has a STDLIB wrapper
     /// (so it appears in `words` and is callable by name) and round-trips correctly.
     #[test]
@@ -5421,7 +5420,10 @@ mod completeness_tests {
             boot: false,
             remote: false,
         };
-        assert!(!e.is_complete(), "word with forth but no proof must be incomplete");
+        assert!(
+            !e.is_complete(),
+            "word with forth but no proof must be incomplete"
+        );
     }
 
     /// A pure English word (no Forth code) is always complete — no machine claim to prove.
@@ -5534,8 +5536,10 @@ mod completeness_tests {
     /// claim-make / claim-run round-trip in the VM.
     #[test]
     fn test_claim_make_run_roundtrip() {
-        let out = crate::coforth::interpreter::Forth::run(r#"s" 3 2 *" s" 3 dup +" s" =" claim-make claim-run"#)
-            .expect("claim round-trip must not error");
+        let out = crate::coforth::interpreter::Forth::run(
+            r#"s" 3 2 *" s" 3 dup +" s" =" claim-make claim-run"#,
+        )
+        .expect("claim round-trip must not error");
         // gate passes → result (6) is left on stack; output shows ✓
         assert!(out.contains("✓") || out.is_empty(), "gate must pass: {out}");
     }

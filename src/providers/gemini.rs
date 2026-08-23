@@ -268,7 +268,10 @@ impl GeminiProvider {
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
             let hint = gemini_error_hint(status.as_u16());
-            let msg = format!("Gemini API streaming error {}{}\n{}", status, hint, error_body);
+            let msg = format!(
+                "Gemini API streaming error {}{}\n{}",
+                status, hint, error_body
+            );
             if status.is_client_error() {
                 return Err(anyhow::Error::new(NonRetriableError(msg)));
             }

@@ -41,8 +41,9 @@ async fn eval_inner(expr: Val, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val> {
         | Val::SshSession(_) => Ok(expr),
 
         // ── Symbol lookup ─────────────────────────────────────────────────────
-        Val::Symbol(ref name) => Env::get(&env, name)
-            .ok_or_else(|| anyhow::anyhow!("undefined: {name}")),
+        Val::Symbol(ref name) => {
+            Env::get(&env, name).ok_or_else(|| anyhow::anyhow!("undefined: {name}"))
+        }
 
         // ── List ─────────────────────────────────────────────────────────────
         Val::List(ref list) if list.is_empty() => Ok(Val::Nil),
@@ -81,7 +82,9 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
                 return json_to_lisp(serde_json::to_value(
-                    binding.poll(crate::runtime::agent_vm::parse_task_id(&task_id)?).await?,
+                    binding
+                        .poll(crate::runtime::agent_vm::parse_task_id(&task_id)?)
+                        .await?,
                 )?);
             }
             "agent-await" => {
@@ -95,7 +98,9 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("agent scheduler is unavailable"))?;
                 return json_to_lisp(serde_json::to_value(
-                    binding.wait(crate::runtime::agent_vm::parse_task_id(&task_id)?).await?,
+                    binding
+                        .wait(crate::runtime::agent_vm::parse_task_id(&task_id)?)
+                        .await?,
                 )?);
             }
             "agent-cancel" => {
@@ -130,10 +135,9 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
             "automation-windows" => {
                 check_arity("automation-windows", &rest, 0, 0)?;
                 let broker = Arc::clone(&ctx.automation);
-                let value = tokio::task::spawn_blocking(move || {
-                    broker.execute(AutomationRequest::Windows)
-                })
-                .await??;
+                let value =
+                    tokio::task::spawn_blocking(move || broker.execute(AutomationRequest::Windows))
+                        .await??;
                 return json_to_lisp(value);
             }
             "automation-click" => {
@@ -236,8 +240,7 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
                         let (params, param_types): (Vec<_>, Vec<_>) =
                             typed_params.into_iter().unzip();
                         // Optional return-type annotation: (define (f ...) : ret body)
-                        let (body_start, return_type) =
-                            parse_return_type_annotation(&rest[1..])?;
+                        let (body_start, return_type) = parse_return_type_annotation(&rest[1..])?;
                         let body = make_begin(rest[1 + body_start..].to_vec());
                         let lambda = Val::Lambda(Arc::new(Lambda {
                             params,
@@ -275,10 +278,8 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
                 }
                 let typed_params = parse_typed_params(&rest[0])?;
                 let (typed_params, variadic) = split_variadic_typed(typed_params);
-                let (params, param_types): (Vec<_>, Vec<_>) =
-                    typed_params.into_iter().unzip();
-                let (body_start, return_type) =
-                    parse_return_type_annotation(&rest[1..])?;
+                let (params, param_types): (Vec<_>, Vec<_>) = typed_params.into_iter().unzip();
+                let (body_start, return_type) = parse_return_type_annotation(&rest[1..])?;
                 let body = make_begin(rest[1 + body_start..].to_vec());
                 return Ok(Val::Lambda(Arc::new(Lambda {
                     params,
@@ -354,6 +355,28 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
                 return Ok(Val::Bool(false));
             }
 
+            // ── (diff expr var) — symbolic differentiation ───────────────────
+            // Neither argument is evaluated — both are treated as symbolic
+            // expression trees.  Use $...$ syntax for convenience:
+            //   (diff $x^2 + 2*x$ $x$)  →  (+ (* 2 x) 2)
+            "diff" => {
+                check_arity("diff", &rest, 2, 2)?;
+                let expr = &rest[0];
+                let var = match &rest[1] {
+                    Val::Symbol(s) => s.clone(),
+                    other => bail!("diff: variable must be a symbol, got {other}"),
+                };
+                return Ok(sym_diff(expr, &var));
+            }
+
+            // ── (simplify expr) — algebraic simplification ────────────────────
+            "simplify" => {
+                check_arity("simplify", &rest, 1, 1)?;
+                // Evaluate the argument first (so (diff ...) runs), then simplify.
+                let val = eval(rest[0].clone(), env, ctx).await?;
+                return Ok(sym_simplify(&val));
+            }
+
             // ── (the type expr) — runtime type assertion ──────────────────────
             "the" => {
                 check_arity("the", &rest, 2, 2)?;
@@ -368,9 +391,21 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
                 return Ok(val);
             }
 
+            // ── (lisp-eval src) — parse and eval a Lisp string ───────────────
+            "lisp-eval" => {
+                check_arity("lisp-eval", &rest, 1, 1)?;
+                let src_val = eval(rest[0].clone(), env.clone(), ctx.clone()).await?;
+                let src = src_val
+                    .as_str()
+                    .map_err(|_| anyhow::anyhow!("lisp-eval: argument must be a string"))?;
+                return crate::lisp::run_in(src, env, ctx).await;
+            }
+
             // ── (when test body...) ───────────────────────────────────────────
             "when" => {
-                if rest.is_empty() { bail!("when: missing test"); }
+                if rest.is_empty() {
+                    bail!("when: missing test");
+                }
                 let cond = eval(rest[0].clone(), env.clone(), ctx.clone()).await?;
                 return if cond.is_truthy() {
                     eval(make_begin(rest[1..].to_vec()), env, ctx).await
@@ -381,7 +416,9 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
 
             // ── (unless test body...) ─────────────────────────────────────────
             "unless" => {
-                if rest.is_empty() { bail!("unless: missing test"); }
+                if rest.is_empty() {
+                    bail!("unless: missing test");
+                }
                 let cond = eval(rest[0].clone(), env.clone(), ctx.clone()).await?;
                 return if !cond.is_truthy() {
                     eval(make_begin(rest[1..].to_vec()), env, ctx).await
@@ -455,6 +492,25 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
                 return Ok(Val::List(out));
             }
 
+            // ── (filter fn list) ─────────────────────────────────────────────
+            "filter" => {
+                check_arity("filter", &rest, 2, 2)?;
+                let func = eval(rest[0].clone(), env.clone(), ctx.clone()).await?;
+                let items = eval(rest[1].clone(), env.clone(), ctx.clone()).await?;
+                let mut out = Vec::new();
+                for item in items.as_list()?.to_vec() {
+                    let keep = apply(func.clone(), vec![item.clone()], ctx.clone()).await?;
+                    if keep.is_truthy() {
+                        out.push(item);
+                    }
+                }
+                return Ok(if out.is_empty() {
+                    Val::Nil
+                } else {
+                    Val::List(out)
+                });
+            }
+
             // ── (for-each fn list) ────────────────────────────────────────────
             "for-each" => {
                 check_arity("for-each", &rest, 2, 2)?;
@@ -481,12 +537,14 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
             "ssh-connect" => {
                 check_arity("ssh-connect", &rest, 4, 4)?;
                 let host = eval_str(rest[0].clone(), env.clone(), ctx.clone()).await?;
-                let port = eval(rest[1].clone(), env.clone(), ctx.clone()).await?.as_int()? as u16;
+                let port = eval(rest[1].clone(), env.clone(), ctx.clone())
+                    .await?
+                    .as_int()? as u16;
                 let user = eval_str(rest[2].clone(), env.clone(), ctx.clone()).await?;
                 let pass = eval_str(rest[3].clone(), env.clone(), ctx.clone()).await?;
-                let session = crate::ssh::client::SshSession::connect_password(
-                    &host, port, &user, &pass,
-                ).await?;
+                let session =
+                    crate::ssh::client::SshSession::connect_password(&host, port, &user, &pass)
+                        .await?;
                 let id = ctx.ssh_sessions.insert(session).await;
                 return Ok(Val::SshSession(id));
             }
@@ -495,13 +553,15 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
             "ssh-auth-key" => {
                 check_arity("ssh-auth-key", &rest, 4, 4)?;
                 let host = eval_str(rest[0].clone(), env.clone(), ctx.clone()).await?;
-                let port = eval(rest[1].clone(), env.clone(), ctx.clone()).await?.as_int()? as u16;
+                let port = eval(rest[1].clone(), env.clone(), ctx.clone())
+                    .await?
+                    .as_int()? as u16;
                 let user = eval_str(rest[2].clone(), env.clone(), ctx.clone()).await?;
                 let key_val = eval(rest[3].clone(), env.clone(), ctx.clone()).await?;
                 let key_bytes = key_val.as_bytes()?.to_vec();
-                let session = crate::ssh::client::SshSession::connect_key(
-                    &host, port, &user, &key_bytes,
-                ).await?;
+                let session =
+                    crate::ssh::client::SshSession::connect_key(&host, port, &user, &key_bytes)
+                        .await?;
                 let id = ctx.ssh_sessions.insert(session).await;
                 return Ok(Val::SshSession(id));
             }
@@ -509,7 +569,9 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
             // (ssh-exec session cmd) → stdout string
             "ssh-exec" => {
                 check_arity("ssh-exec", &rest, 2, 2)?;
-                let id = eval(rest[0].clone(), env.clone(), ctx.clone()).await?.as_ssh_id()?;
+                let id = eval(rest[0].clone(), env.clone(), ctx.clone())
+                    .await?
+                    .as_ssh_id()?;
                 let cmd = eval_str(rest[1].clone(), env.clone(), ctx.clone()).await?;
                 let (stdout, stderr, code) = ctx.ssh_sessions.exec(id, &cmd).await?;
                 return Ok(Val::Str(if code != 0 && !stderr.is_empty() {
@@ -522,7 +584,9 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
             // (ssh-exec/all session cmd) → (stdout stderr exit-code)
             "ssh-exec/all" => {
                 check_arity("ssh-exec/all", &rest, 2, 2)?;
-                let id = eval(rest[0].clone(), env.clone(), ctx.clone()).await?.as_ssh_id()?;
+                let id = eval(rest[0].clone(), env.clone(), ctx.clone())
+                    .await?
+                    .as_ssh_id()?;
                 let cmd = eval_str(rest[1].clone(), env.clone(), ctx.clone()).await?;
                 let (stdout, stderr, code) = ctx.ssh_sessions.exec(id, &cmd).await?;
                 return Ok(Val::List(vec![
@@ -535,7 +599,9 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
             // (ssh-read-file session path) → bytes
             "ssh-read-file" => {
                 check_arity("ssh-read-file", &rest, 2, 2)?;
-                let id = eval(rest[0].clone(), env.clone(), ctx.clone()).await?.as_ssh_id()?;
+                let id = eval(rest[0].clone(), env.clone(), ctx.clone())
+                    .await?
+                    .as_ssh_id()?;
                 let path = eval_str(rest[1].clone(), env.clone(), ctx.clone()).await?;
                 let bytes = ctx.ssh_sessions.read_file(id, &path).await?;
                 return Ok(Val::Bytes(bytes));
@@ -544,7 +610,9 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
             // (ssh-write-file session path bytes-or-string)
             "ssh-write-file" => {
                 check_arity("ssh-write-file", &rest, 3, 3)?;
-                let id = eval(rest[0].clone(), env.clone(), ctx.clone()).await?.as_ssh_id()?;
+                let id = eval(rest[0].clone(), env.clone(), ctx.clone())
+                    .await?
+                    .as_ssh_id()?;
                 let path = eval_str(rest[1].clone(), env.clone(), ctx.clone()).await?;
                 let content = eval(rest[2].clone(), env.clone(), ctx.clone()).await?;
                 let bytes = content.as_bytes()?.to_vec();
@@ -555,14 +623,18 @@ async fn eval_list(list: Vec<Val>, env: EnvRef, ctx: Arc<LispCtx>) -> Result<Val
             // (ssh-info session) → "user@host"
             "ssh-info" => {
                 check_arity("ssh-info", &rest, 1, 1)?;
-                let id = eval(rest[0].clone(), env.clone(), ctx.clone()).await?.as_ssh_id()?;
+                let id = eval(rest[0].clone(), env.clone(), ctx.clone())
+                    .await?
+                    .as_ssh_id()?;
                 return Ok(Val::Str(ctx.ssh_sessions.info(id).await?));
             }
 
             // (ssh-close session)
             "ssh-close" => {
                 check_arity("ssh-close", &rest, 1, 1)?;
-                let id = eval(rest[0].clone(), env.clone(), ctx.clone()).await?.as_ssh_id()?;
+                let id = eval(rest[0].clone(), env.clone(), ctx.clone())
+                    .await?
+                    .as_ssh_id()?;
                 if let Some(session) = ctx.ssh_sessions.remove(id).await {
                     let _ = session.close().await;
                 }
@@ -702,7 +774,11 @@ fn bind_args(lambda: &Lambda, mut args: Vec<Val>, env: &EnvRef) -> Result<()> {
 
     if lambda.variadic {
         let rest_param = lambda.params.last().unwrap();
-        let rest_val = if rest_args.is_empty() { Val::Nil } else { Val::List(rest_args) };
+        let rest_val = if rest_args.is_empty() {
+            Val::Nil
+        } else {
+            Val::List(rest_args)
+        };
         Env::define(env, rest_param.clone(), rest_val);
     }
 
@@ -711,11 +787,7 @@ fn bind_args(lambda: &Lambda, mut args: Vec<Val>, env: &EnvRef) -> Result<()> {
 
 // ── Quasiquote ────────────────────────────────────────────────────────────────
 
-fn eval_quasiquote(
-    expr: Val,
-    env: EnvRef,
-    ctx: Arc<LispCtx>,
-) -> BoxFuture<'static, Result<Val>> {
+fn eval_quasiquote(expr: Val, env: EnvRef, ctx: Arc<LispCtx>) -> BoxFuture<'static, Result<Val>> {
     Box::pin(async move {
         match expr {
             Val::List(items) => {
@@ -725,30 +797,200 @@ fn eval_quasiquote(
                         Val::List(inner)
                             if inner.first() == Some(&Val::Symbol("unquote".to_string())) =>
                         {
-                            if inner.len() != 2 { bail!("unquote requires 1 sub-expression"); }
+                            if inner.len() != 2 {
+                                bail!("unquote requires 1 sub-expression");
+                            }
                             out.push(eval(inner[1].clone(), env.clone(), ctx.clone()).await?);
                         }
                         Val::List(inner)
                             if inner.first()
                                 == Some(&Val::Symbol("unquote-splicing".to_string())) =>
                         {
-                            if inner.len() != 2 { bail!("unquote-splicing requires 1 sub-expression"); }
+                            if inner.len() != 2 {
+                                bail!("unquote-splicing requires 1 sub-expression");
+                            }
                             match eval(inner[1].clone(), env.clone(), ctx.clone()).await? {
                                 Val::List(vs) => out.extend(vs),
                                 Val::Nil => {}
-                                other => bail!("unquote-splicing: expected list, got {}", other.type_name()),
+                                other => bail!(
+                                    "unquote-splicing: expected list, got {}",
+                                    other.type_name()
+                                ),
                             }
                         }
                         other => {
-                            out.push(eval_quasiquote(other.clone(), env.clone(), ctx.clone()).await?);
+                            out.push(
+                                eval_quasiquote(other.clone(), env.clone(), ctx.clone()).await?,
+                            );
                         }
                     }
                 }
-                Ok(if out.is_empty() { Val::Nil } else { Val::List(out) })
+                Ok(if out.is_empty() {
+                    Val::Nil
+                } else {
+                    Val::List(out)
+                })
             }
             other => Ok(other),
         }
     })
+}
+
+// ── Symbolic mathematics ──────────────────────────────────────────────────────
+
+fn s(name: &str) -> Val {
+    Val::Symbol(name.to_string())
+}
+fn slist(head: &str, args: Vec<Val>) -> Val {
+    let mut v = vec![s(head)];
+    v.extend(args);
+    Val::List(v)
+}
+
+/// Symbolically differentiate `expr` with respect to `var`.
+fn sym_diff(expr: &Val, var: &str) -> Val {
+    match expr {
+        // Constants → 0
+        Val::Int(_) | Val::Float(_) | Val::Nil | Val::Bool(_) => Val::Int(0),
+
+        // Variable
+        Val::Symbol(name) => {
+            if name == var {
+                Val::Int(1)
+            } else {
+                Val::Int(0)
+            }
+        }
+
+        Val::List(parts) if !parts.is_empty() => {
+            let head = match &parts[0] {
+                Val::Symbol(s) => s.as_str(),
+                _ => return Val::Int(0),
+            };
+            let args = &parts[1..];
+            match (head, args) {
+                // (+ u v) → (+ du dv)
+                ("+", [u, v]) => slist("+", vec![sym_diff(u, var), sym_diff(v, var)]),
+                // (- u v) → (- du dv)
+                ("-", [u, v]) => slist("-", vec![sym_diff(u, var), sym_diff(v, var)]),
+                // (* u v) → (+ (* du v) (* u dv))  product rule
+                ("*", [u, v]) => slist(
+                    "+",
+                    vec![
+                        slist("*", vec![sym_diff(u, var), v.clone()]),
+                        slist("*", vec![u.clone(), sym_diff(v, var)]),
+                    ],
+                ),
+                // (/ u v) → (/ (- (* du v) (* u dv)) (* v v))  quotient rule
+                ("/", [u, v]) => slist(
+                    "/",
+                    vec![
+                        slist(
+                            "-",
+                            vec![
+                                slist("*", vec![sym_diff(u, var), v.clone()]),
+                                slist("*", vec![u.clone(), sym_diff(v, var)]),
+                            ],
+                        ),
+                        slist("*", vec![v.clone(), v.clone()]),
+                    ],
+                ),
+                // (pow u n) → (* (* n (pow u (- n 1))) du)  power rule + chain rule
+                ("pow", [u, n]) => slist(
+                    "*",
+                    vec![
+                        slist(
+                            "*",
+                            vec![
+                                n.clone(),
+                                slist(
+                                    "pow",
+                                    vec![u.clone(), slist("-", vec![n.clone(), Val::Int(1)])],
+                                ),
+                            ],
+                        ),
+                        sym_diff(u, var),
+                    ],
+                ),
+                // (neg u) → (neg du)
+                ("neg", [u]) => slist("neg", vec![sym_diff(u, var)]),
+                // (sin u) → (* (cos u) du)
+                ("sin", [u]) => slist("*", vec![slist("cos", vec![u.clone()]), sym_diff(u, var)]),
+                // (cos u) → (* (neg (sin u)) du)
+                ("cos", [u]) => slist(
+                    "*",
+                    vec![
+                        slist("neg", vec![slist("sin", vec![u.clone()])]),
+                        sym_diff(u, var),
+                    ],
+                ),
+                // (exp u) → (* (exp u) du)
+                ("exp", [u]) => slist("*", vec![slist("exp", vec![u.clone()]), sym_diff(u, var)]),
+                // (ln u) → (/ du u)
+                ("ln", [u]) => slist("/", vec![sym_diff(u, var), u.clone()]),
+                _ => Val::Int(0),
+            }
+        }
+        _ => Val::Int(0),
+    }
+}
+
+/// Simplify an expression tree — constant folding + algebraic identities.
+fn sym_simplify(expr: &Val) -> Val {
+    match expr {
+        Val::List(parts) if !parts.is_empty() => {
+            let head = match &parts[0] {
+                Val::Symbol(s) => s.clone(),
+                _ => return expr.clone(),
+            };
+            // Simplify children first
+            let args: Vec<Val> = parts[1..].iter().map(sym_simplify).collect();
+
+            match (head.as_str(), args.as_slice()) {
+                // Constant folding
+                ("+", [Val::Int(a), Val::Int(b)]) => Val::Int(a + b),
+                ("-", [Val::Int(a), Val::Int(b)]) => Val::Int(a - b),
+                ("*", [Val::Int(a), Val::Int(b)]) => Val::Int(a * b),
+                ("/", [Val::Int(a), Val::Int(b)]) if *b != 0 => Val::Int(a / b),
+                ("+", [Val::Float(a), Val::Float(b)]) => Val::Float(a + b),
+                ("*", [Val::Float(a), Val::Float(b)]) => Val::Float(a * b),
+
+                // Identity: (+ 0 x) or (+ x 0) → x
+                ("+", [Val::Int(0), x]) | ("+", [x, Val::Int(0)]) => x.clone(),
+                // Identity: (- x 0) → x
+                ("-", [x, Val::Int(0)]) => x.clone(),
+                // Identity: (* 1 x) or (* x 1) → x
+                ("*", [Val::Int(1), x]) | ("*", [x, Val::Int(1)]) => x.clone(),
+                // Zero: (* 0 _) or (* _ 0) → 0
+                ("*", [Val::Int(0), _]) | ("*", [_, Val::Int(0)]) => Val::Int(0),
+                // (pow x 1) → x
+                ("pow", [x, Val::Int(1)]) => x.clone(),
+                // (pow x 0) → 1
+                ("pow", [_, Val::Int(0)]) => Val::Int(1),
+                // (pow 0 _) → 0
+                ("pow", [Val::Int(0), _]) => Val::Int(0),
+                // (pow 1 _) → 1
+                ("pow", [Val::Int(1), _]) => Val::Int(1),
+                // (neg (neg x)) → x
+                ("neg", [Val::List(inner)])
+                    if inner.first() == Some(&s("neg")) && inner.len() == 2 =>
+                {
+                    inner[1].clone()
+                }
+                // (neg 0) → 0
+                ("neg", [Val::Int(0)]) => Val::Int(0),
+                // (neg n) where n is int → -n
+                ("neg", [Val::Int(n)]) => Val::Int(-n),
+                // Default: rebuild with simplified children
+                _ => {
+                    let mut v = vec![Val::Symbol(head)];
+                    v.extend(args);
+                    Val::List(v)
+                }
+            }
+        }
+        other => other.clone(),
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -769,10 +1011,7 @@ fn check_arity(name: &str, args: &[Val], min: usize, max: usize) -> Result<()> {
 fn parse_one_typed_param(p: &Val) -> Result<(String, Option<Type>)> {
     match p {
         Val::Symbol(s) => Ok((s.clone(), None)),
-        Val::List(parts)
-            if parts.len() == 3
-                && parts[1] == Val::Symbol(":".to_string()) =>
-        {
+        Val::List(parts) if parts.len() == 3 && parts[1] == Val::Symbol(":".to_string()) => {
             let name = match &parts[0] {
                 Val::Symbol(s) => s.clone(),
                 _ => bail!("lambda: param name must be a symbol"),
@@ -915,7 +1154,9 @@ mod tests {
     #[tokio::test]
     async fn test_eval_lambda_call() {
         assert_eq!(
-            run("(define square (lambda (x) (* x x))) (square 7)").await.unwrap(),
+            run("(define square (lambda (x) (* x x))) (square 7)")
+                .await
+                .unwrap(),
             Val::Int(49)
         );
     }
@@ -946,14 +1187,19 @@ mod tests {
     #[tokio::test]
     async fn test_eval_cond() {
         assert_eq!(
-            run("(cond ((= 1 2) 10) ((= 2 2) 20) (else 30))").await.unwrap(),
+            run("(cond ((= 1 2) 10) ((= 2 2) 20) (else 30))")
+                .await
+                .unwrap(),
             Val::Int(20)
         );
     }
 
     #[tokio::test]
     async fn test_eval_let() {
-        assert_eq!(run("(let ((x 3) (y 4)) (+ x y))").await.unwrap(), Val::Int(7));
+        assert_eq!(
+            run("(let ((x 3) (y 4)) (+ x y))").await.unwrap(),
+            Val::Int(7)
+        );
     }
 
     #[tokio::test]
@@ -972,7 +1218,9 @@ mod tests {
                      (odd?  (lambda (n)
                               (if (= n 0) #f (even? (- n 1))))))
               (even? 10))
-        ").await.unwrap();
+        ")
+        .await
+        .unwrap();
         assert_eq!(result, Val::Bool(true));
     }
 
@@ -1004,7 +1252,10 @@ mod tests {
     #[tokio::test]
     async fn test_eval_map() {
         let result = run("(map (lambda (x) (* x 2)) '(1 2 3))").await.unwrap();
-        assert_eq!(result, Val::List(vec![Val::Int(2), Val::Int(4), Val::Int(6)]));
+        assert_eq!(
+            result,
+            Val::List(vec![Val::Int(2), Val::Int(4), Val::Int(6)])
+        );
     }
 
     #[tokio::test]
@@ -1047,7 +1298,9 @@ mod tests {
             (define (sum &args)
               (apply + args))
             (sum 1 2 3 4 5)
-        ").await.unwrap();
+        ")
+        .await
+        .unwrap();
         assert_eq!(result, Val::Int(15));
     }
 
@@ -1058,7 +1311,9 @@ mod tests {
               (lambda (x) (+ x n)))
             (define add10 (make-adder 10))
             (add10 5)
-        ").await.unwrap();
+        ")
+        .await
+        .unwrap();
         assert_eq!(result, Val::Int(15));
     }
 
@@ -1066,6 +1321,68 @@ mod tests {
     async fn test_eval_set_bang() {
         let result = run("(define x 1) (set! x 99) x").await.unwrap();
         assert_eq!(result, Val::Int(99));
+    }
+
+    // ── Symbolic math tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_diff_x_squared() {
+        // d/dx(x^2) = 2x  (before simplification: (* 2 (pow x 1) 1))
+        let result = run("(simplify (diff $x^2$ $x$))").await.unwrap();
+        // Simplified: (* 2 x)
+        assert_eq!(
+            result,
+            Val::List(vec![
+                Val::Symbol("*".into()),
+                Val::Int(2),
+                Val::Symbol("x".into()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_diff_constant() {
+        let result = run("(diff $5$ $x$)").await.unwrap();
+        assert_eq!(result, Val::Int(0));
+    }
+
+    #[tokio::test]
+    async fn test_diff_linear() {
+        // d/dx(3x) = 3
+        let result = run("(simplify (diff $3x$ $x$))").await.unwrap();
+        assert_eq!(result, Val::Int(3));
+    }
+
+    #[tokio::test]
+    async fn test_diff_sum() {
+        // d/dx(x^2 + x) = (+ (* 2 x) 1)  — simplified
+        let result = run("(simplify (diff $x^2 + x$ $x$))").await.unwrap();
+        assert_eq!(
+            result,
+            Val::List(vec![
+                Val::Symbol("+".into()),
+                Val::List(vec![
+                    Val::Symbol("*".into()),
+                    Val::Int(2),
+                    Val::Symbol("x".into())
+                ]),
+                Val::Int(1),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dollar_syntax_in_diff() {
+        // $d/dx(x^2)$ is the same as (diff (pow x 2) x)
+        let result = run("(simplify $d/dx(x^2)$)").await.unwrap();
+        assert_eq!(
+            result,
+            Val::List(vec![
+                Val::Symbol("*".into()),
+                Val::Int(2),
+                Val::Symbol("x".into()),
+            ])
+        );
     }
 
     #[tokio::test]
@@ -1078,7 +1395,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_typed_param_accepted() {
-        let result = run("(define (double (x : int)) (* x 2)) (double 5)").await.unwrap();
+        let result = run("(define (double (x : int)) (* x 2)) (double 5)")
+            .await
+            .unwrap();
         assert_eq!(result, Val::Int(10));
     }
 
@@ -1123,7 +1442,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_fn_type_annotation() {
-        let result = run("(the (-> int int) (lambda ((x : int)) : int (* x x))) ").await.unwrap();
+        let result = run("(the (-> int int) (lambda ((x : int)) : int (* x x))) ")
+            .await
+            .unwrap();
         assert!(matches!(result, Val::Lambda(_)));
     }
 }

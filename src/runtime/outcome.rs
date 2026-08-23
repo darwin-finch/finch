@@ -1,5 +1,8 @@
 use crate::programs::{ExecutionEffect, ProgramValue};
-use crate::vm::{interpreter::HostSideEffect, ApprovalPrompt, CapabilityRequirement, VmDiagnostic};
+use crate::vm::{
+    interpreter::{HostSideEffect, VmSideEffect},
+    ApprovalPrompt, CapabilityRequirement, EffectJournalEntry, VmDiagnostic,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -7,6 +10,7 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
     Completed,
+    Suspended,
     AuthorizationRequired,
     Failed,
     Cancelled,
@@ -32,6 +36,16 @@ pub struct ExecutionOutcome {
     pub output_chunks: Vec<String>,
     #[serde(default)]
     pub side_effects: Vec<HostSideEffect>,
+    /// Versioned, harness-neutral event envelopes emitted by the typed VM.
+    /// `side_effects` is Finch's legacy projection; consumers that need
+    /// sequence/capability/origin data should use this field.
+    #[serde(default)]
+    pub vm_side_effects: Vec<VmSideEffect>,
+    /// Durable state of each portable effect. This lets callers distinguish a
+    /// pending approval from an acknowledged prefix when the VM transaction
+    /// later fails.
+    #[serde(default)]
+    pub effect_journal: Vec<EffectJournalEntry>,
     pub diagnostics: Vec<String>,
     #[serde(default)]
     pub vm_diagnostics: Vec<VmDiagnostic>,
@@ -62,6 +76,8 @@ impl ExecutionOutcome {
             output: String::new(),
             output_chunks: Vec::new(),
             side_effects: Vec::new(),
+            vm_side_effects: Vec::new(),
+            effect_journal: Vec::new(),
             diagnostics: vec![diagnostic.into()],
             vm_diagnostics: Vec::new(),
             required_capabilities: Vec::new(),

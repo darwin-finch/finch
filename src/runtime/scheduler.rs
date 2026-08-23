@@ -609,7 +609,24 @@ mod tests {
     use super::*;
     use crate::generators::{GeneratorCapabilities, GeneratorResponse, ResponseMetadata};
     use crate::tools::types::ToolDefinition;
+    use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
     use async_trait::async_trait;
+
+    fn grant_agent_capabilities(runtime: &ProgramRuntime) {
+        for capability in [
+            CapabilityKind::AgentSpawn,
+            CapabilityKind::AgentAwait,
+            CapabilityKind::AgentPoll,
+            CapabilityKind::AgentCancel,
+        ] {
+            runtime
+                .grant_typed_capability(CapabilityRequirement {
+                    capability,
+                    selector: ResourceSelector::None,
+                })
+                .unwrap();
+        }
+    }
 
     struct EchoGenerator;
 
@@ -695,8 +712,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn installed_scheduler_does_not_implicitly_authorize_agent_words() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let _scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let outcome = runtime
+            .submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source: r#"s" inspect the VM" agent-spawn"#.to_string(),
+                intent: "attempt an ungranted child".to_string(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::AuthorizationRequired
+        );
+        assert!(outcome
+            .required_capabilities
+            .iter()
+            .any(|requirement| { requirement.capability == CapabilityKind::AgentSpawn }));
+    }
+
+    #[tokio::test]
     async fn forth_can_fork_and_join_without_shelling_out() {
         let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
         let scheduler = AgentScheduler::new(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
@@ -724,6 +772,7 @@ mod tests {
     #[tokio::test]
     async fn native_lisp_can_fork_and_join_without_shelling_out() {
         let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
         let scheduler = AgentScheduler::new(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
@@ -756,6 +805,7 @@ mod tests {
     #[tokio::test]
     async fn typed_task_handles_can_be_polled_across_submissions() {
         let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
         let scheduler = AgentScheduler::new(
             ProviderResolver::new(Arc::new(EchoGenerator)),
             Arc::clone(&runtime),
@@ -776,6 +826,11 @@ mod tests {
         assert!(matches!(
             spawn.values.first(),
             Some(crate::programs::ProgramValue::Task(_))
+        ));
+        let snapshot = runtime.inspect().await.unwrap();
+        assert!(matches!(
+            snapshot.typed_stack.last().map(|cell| &cell.value_type),
+            Some(crate::vm::Type::Task(result)) if **result == crate::vm::Type::String
         ));
         let poll = runtime
             .submit(crate::runtime::ProgramSubmission {

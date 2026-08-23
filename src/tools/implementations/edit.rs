@@ -42,7 +42,12 @@ const CONTEXT_LINES: usize = 3;
 
 /// Build a bash/python script that applies an edit to a file.
 /// Used by the propose-before-execute flow.
-fn build_edit_code(file_path: &str, old_string: &str, new_string: &str, replace_all: bool) -> String {
+fn build_edit_code(
+    file_path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> String {
     let old_b64 = base64::engine::general_purpose::STANDARD.encode(old_string);
     let new_b64 = base64::engine::general_purpose::STANDARD.encode(new_string);
     let path_py = format!("{:?}", file_path);
@@ -51,8 +56,14 @@ fn build_edit_code(file_path: &str, old_string: &str, new_string: &str, replace_
         "python3 << 'PYEOF'\n",
         "import base64, sys\n",
         &format!("path = {}\n", path_py),
-        &format!("old = base64.b64decode(b\"{}\").decode(\"utf-8\")\n", old_b64),
-        &format!("new_str = base64.b64decode(b\"{}\").decode(\"utf-8\")\n", new_b64),
+        &format!(
+            "old = base64.b64decode(b\"{}\").decode(\"utf-8\")\n",
+            old_b64
+        ),
+        &format!(
+            "new_str = base64.b64decode(b\"{}\").decode(\"utf-8\")\n",
+            new_b64
+        ),
         "with open(path, \"r\") as f:\n",
         "    content = f.read()\n",
         "if old not in content:\n",
