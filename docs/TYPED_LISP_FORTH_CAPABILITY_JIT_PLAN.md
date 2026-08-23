@@ -68,9 +68,11 @@ IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scope
 requirements, diagnostics carry stable codes, and host execution is transactional. Ordinary
 `ProgramRuntime`, provider, scheduler, and script submission are typed-only. The legacy Co-Forth
 interpreter and native Lisp evaluator remain behind explicitly named migration-only APIs while
-historical programs are ported; they are not a fallback. Some production words are not yet
-generated exclusively from the typed registry, and the typed broker still needs true
-suspension/resumption and complete provider parity.
+historical programs are ported; they are not a fallback. Core words are now generated through one
+immutable signature/documentation/implementation registry, and the broker has a real typed
+`(execution_id, sequence)` suspension/resumption boundary with an effect journal. Persisted and
+promoted vocabulary still needs the same registry migration, while durable approval policy,
+complete host adapters, and provider conformance remain unfinished.
 
 The target removes those explicit migration APIs after conformance parity and gives interpreted
 and JIT execution the same verified IR, transaction, and error behavior.
