@@ -185,7 +185,8 @@ variant{...}     tagged sum type
 word<S,E>        callable word with stack signature S and effects E
 fn(A...)->R ! E  lexical closure
 task<T>          scheduler-owned child/task handle
-fiber<Y,R>       deferred computation that may yield Y repeatedly and returns R once
+stream<T>        scheduler-owned lazy sequence/cursor handle
+fiber<Y,R>       deferred producer that may yield Y repeatedly and returns R once
 resource<K>      generation-bound runtime handle
 capability<C>    unforgeable grant handle; never synthesized from text
 dynamic          explicitly tagged escape hatch
@@ -221,10 +222,34 @@ The signature includes:
 - a capability/effect row;
 - optional determinism, allocation, and numeric-overflow properties useful to optimization.
 
-### Fibers, deferred work, and repeated yields
+### Shared scheduled-execution substrate
+
+CPU tasks, lazy streams, repeatedly-yielding fibers, and detached agents have overlapping
+implementation needs: stable IDs, ownership/ancestry, cancellation, budgets, lifecycle state,
+ordered event journals, and durable serialization. The daemon therefore owns one internal
+scheduled-execution registry. A record binds a stable ID to its verified module or cursor,
+environment/Brain identity, grants, budget, status, cancellation state, and terminal result or
+diagnostic.
+
+That registry is an implementation substrate, not a promise that these constructs have the same
+language semantics. A `task<T>` yields one terminal result, a `stream<T>` exposes a bounded cursor,
+a `fiber<Y,R>` exposes producer progress plus a terminal result, and an agent is a separate
+ProgramRun with its own authority and provider protocol. No construct shares a parent operand
+stack or Rust thread/channel handle merely because it shares lifecycle machinery.
+
+### Fibers, streams, deferred work, and repeated yields
 
 `task<T>` remains the existing opaque scheduler handle. Its await/join operation is terminal: it
-returns one final `T`. A future `fiber<Y,R>` separates the progress stream from the final return:
+returns one final `T`. A lazy `stream<T>` is the simpler multi-value abstraction; it owns a cursor
+and advances only when its consumer asks for the next value:
+
+```text
+stream-next stream : option<T>  ; bounded pull; none means exhausted
+stream-close stream : unit      ; release cursor/cancel its producer
+```
+
+A future `fiber<Y,R>` is a scheduled producer that separates a progress stream from a final
+return:
 
 ```text
 defer f(args...) : fiber<Y,R>    schedule f and return immediately
@@ -233,11 +258,13 @@ next fiber       : result<Y,end<R>>
 join fiber       : R             wait only for the terminal return
 ```
 
-The source program never writes a continuation. `yield` may occur any number of times; the VM
-records the remaining frames as an internal thunk and the event loop schedules it later. The
-initial implementation keeps resumption one-way (`unit`) and uses explicit typed inbox/message
-operations for replies. If bidirectional generators become necessary, add `fiber<Y,Resume,R>` and
-give `yield` the stack/type effect `Y -> Resume`; do not silently use `dynamic` for resumed values.
+The source program never writes a continuation. A fiber `yield value` may occur any number of
+times; the VM records remaining frames as an internal thunk and the event loop schedules it later.
+This is distinct from the existing stack-neutral `yield`, which is only a cooperative ProgramRun
+timeslice boundary and publishes no iterator item. The initial producer implementation keeps
+resumption one-way (`unit`) and uses explicit typed inbox/message operations for replies. If
+bidirectional generators become necessary, add `fiber<Y,Resume,R>` and give producer-yield the
+stack/type effect `Y -> Resume`; do not silently use `dynamic` for resumed values.
 
 Fibers are not the subagent protocol. A subagent is a separate child `ProgramRun`/agent turn with
 its own private stack, verified module, capability attenuation, budget, ancestry, event journal,
