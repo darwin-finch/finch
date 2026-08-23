@@ -211,7 +211,7 @@ s" {\"answer\":42}" json-parse result-unwrap
 s" answer" json-get unwrap json-as-int unwrap
 ```
 
-`json-as-string`, `json-as-int`, and `json-as-bool` return `none` for a mismatched JSON kind;
+`json-as-string`, `json-as-int`, `json-as-float`, and `json-as-bool` return `none` for a mismatched JSON kind;
 `json-index` returns `option<json>` for an array index, `json-keys` returns `list<string>` for an
 object (or an empty list otherwise), and `json-stringify` converts a managed JSON value back to
 compact text.

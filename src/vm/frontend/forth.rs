@@ -2509,5 +2509,18 @@ mod tests {
             .execute(&mut stack)
             .expect("typed Co-Forth executes JSON field access");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
+
+        let float = compile_forth(
+            "input.forth",
+            "s\" 3.5\" json-parse result-unwrap json-as-float unwrap",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("typed Co-Forth compiles JSON float access");
+        let mut stack = Vec::new();
+        Interpreter::new(&float, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("typed Co-Forth executes JSON float access");
+        assert_eq!(stack, vec![TypedValue::Float(3.5)]);
     }
 }

@@ -2425,6 +2425,10 @@ mod tests {
             vec![TypedValue::String("one".into())]
         );
         assert_eq!(
+            run("(unwrap (json-as-float (result-unwrap (json-parse \"3.5\"))))").unwrap(),
+            vec![TypedValue::Float(3.5)]
+        );
+        assert_eq!(
             run("(list-length (json-keys (result-unwrap (json-parse \"{\\\"a\\\":1,\\\"b\\\":2}\"))))")
                 .unwrap(),
             vec![TypedValue::Int(2)]

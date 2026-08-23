@@ -229,7 +229,7 @@ or ask for/add a typed stream primitive when lazy generated sequences are requir
 
 JSON values have an explicit typed boundary. `(json-parse text)` returns `result<json,string>`;
 `(json-get value field)` returns `option<json>` only for an object field, and `(json-as-string ...)`,
-`(json-as-int ...)`, and `(json-as-bool ...)` return an option instead of silently coercing. For
+`(json-as-int ...)`, `(json-as-float ...)`, and `(json-as-bool ...)` return an option instead of silently coercing. For
 example:
 
 ```lisp

@@ -1456,7 +1456,7 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                 values,
             });
         }
-        "json-as-string" | "json-as-int" | "json-as-bool" => {
+        "json-as-string" | "json-as-int" | "json-as-float" | "json-as-bool" => {
             let value = pop(stack)?;
             let TypedValue::Json(value) = value else {
                 return Err(VmDiagnostic::error(
@@ -1474,6 +1474,10 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                 "json-as-int" => (
                     Type::Int,
                     value.as_i64().map(TypedValue::Int),
+                ),
+                "json-as-float" => (
+                    Type::Float,
+                    value.as_f64().map(TypedValue::Float),
                 ),
                 "json-as-bool" => (
                     Type::Bool,
