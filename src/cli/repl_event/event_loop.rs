@@ -946,7 +946,8 @@ pub async fn find_peer(
 
 // ── Background peer event loop ────────────────────────────────────────────────
 //
-// Each peer owns its own Forth VM.  The user broadcasts code via a
+// Each peer owns a legacy Co-Forth compatibility VM plus an authoritative
+// typed ProgramRuntime for Lisp. The user broadcasts code via a
 // `broadcast::Sender<SessionEvent>`; each peer subscribes.  Results come back
 // through a shared `UnboundedSender<(Uuid, String, String)>` (id, name, text)
 // that funnels all peers into one inbox for the select! loop.
@@ -960,20 +961,41 @@ async fn run_peer_loop(
     use crate::session::SessionEvent;
     let mut vm = crate::coforth::Library::precompiled_vm();
     vm.remote_mode = true;
-
-    let lisp_ctx = std::sync::Arc::new(crate::lisp::LispCtx::new());
-    let lisp_env = crate::lisp::make_env();
+    let typed_runtime = crate::runtime::ProgramRuntime::new();
 
     loop {
         match rx.recv().await {
             Ok(SessionEvent::Chat { text }) => {
-                // Route by language: Lisp `(...)` or Forth.
+                // Lisp follows the same typed runtime path as local source and
+                // provider wire programs.  Co-Forth is still a compatibility
+                // peer surface while its richer legacy vocabulary is migrated.
                 let response = if text.trim_start().starts_with('(') {
-                    let ctx = lisp_ctx.clone();
-                    let env = lisp_env.clone();
-                    match crate::lisp::run_in(&text, env, ctx).await {
-                        Ok(val) => val.to_string(),
-                        Err(e) => format!("lisp error: {e}"),
+                    match typed_runtime
+                        .submit_typed_only(crate::runtime::ProgramSubmission {
+                            language: crate::programs::ProgramLanguage::Lisp,
+                            source: text.clone(),
+                            intent: "peer Lisp program".into(),
+                            effect: crate::programs::ExecutionEffect::Unclassified,
+                            declared_capabilities: Vec::new(),
+                            manifest_generation: typed_runtime.manifest_generation(),
+                            expected_revision: Some(typed_runtime.revision()),
+                            budget: None,
+                        })
+                        .await
+                    {
+                        Ok(outcome)
+                            if outcome.status
+                                == crate::runtime::outcome::ExecutionStatus::Completed =>
+                        {
+                            outcome.output
+                        }
+                        Ok(outcome) => format!(
+                            "typed Lisp error: {}",
+                            outcome.diagnostics.first().cloned().unwrap_or_else(|| {
+                                format!("program ended as {:?}", outcome.status)
+                            })
+                        ),
+                        Err(error) => format!("typed Lisp error: {error}"),
                     }
                 } else {
                     let depth_before = vm.data_stack().len();
@@ -10580,6 +10602,75 @@ mod peer_loop_tests {
         // The two peers must have different names.
         let names: Vec<&str> = replies.iter().map(|(_, n, _)| n.as_str()).collect();
         assert_ne!(names[0], names[1], "peers must have distinct names");
+    }
+
+    /// Peer Lisp must use the shared typed runtime rather than the legacy
+    /// evaluator. A typed definition and its call live in one verified source
+    /// submission and both peers return its `say` output.
+    #[tokio::test]
+    async fn test_peers_execute_typed_lisp_wire_programs() {
+        let (inbox_tx, mut inbox_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
+
+        bcast_tx
+            .send(SessionEvent::chat(
+                "(define (square (n : int)) (* n n)) (say (int-to-string (square 9)))",
+            ))
+            .unwrap();
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut replies = Vec::new();
+        loop {
+            tokio::select! {
+                Some(message) = inbox_rx.recv() => {
+                    replies.push(message);
+                    if replies.len() == 2 { break; }
+                }
+                _ = &mut deadline => break,
+            }
+        }
+
+        assert_eq!(replies.len(), 2, "both peers should execute typed Lisp");
+        for (_, name, text) in replies {
+            assert_eq!(text, "81", "peer {name} should return typed Lisp output");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peers_keep_typed_lisp_definitions_between_messages() {
+        let (inbox_tx, mut inbox_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
+        let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
+
+        bcast_tx
+            .send(SessionEvent::chat("(define (triple (n : int)) (* n 3))"))
+            .unwrap();
+        // Definitions have no user-visible output. Give both runtimes a chance
+        // to commit before the dependent program is sent.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        bcast_tx
+            .send(SessionEvent::chat("(say (int-to-string (triple 14)))"))
+            .unwrap();
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+        tokio::pin!(deadline);
+        let mut replies = Vec::new();
+        loop {
+            tokio::select! {
+                Some(message) = inbox_rx.recv() => {
+                    replies.push(message);
+                    if replies.len() == 2 { break; }
+                }
+                _ = &mut deadline => break,
+            }
+        }
+
+        assert_eq!(replies.len(), 2, "both peers should retain the definition");
+        for (_, name, text) in replies {
+            assert_eq!(text, "42", "peer {name} should use its retained Lisp word");
+        }
     }
 
     /// Peers are independent: a definition in the user's broadcast doesn't
