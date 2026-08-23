@@ -231,8 +231,12 @@ async fn propose_in_editor_with_suffix(
     comment_prefix: &'static str,
     executable: bool,
 ) -> Result<Option<String>> {
-    // Skip the editor when not running in an interactive terminal.
-    if !std::io::stdin().is_terminal() {
+    // Unit tests often run under a PTY, so `is_terminal()` alone would launch
+    // the developer's real $EDITOR and wedge the test runner. Test builds use
+    // the same noninteractive result as daemon/piped invocations; editor
+    // lifecycle behavior is covered through the explicit decision/resume
+    // tests rather than a human editor process.
+    if cfg!(test) || !std::io::stdin().is_terminal() {
         return Ok(Some(code.to_string()));
     }
 
