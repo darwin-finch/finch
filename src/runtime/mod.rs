@@ -4267,6 +4267,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_forth_output_handle_can_be_updated_in_its_creating_run() {
+        let runtime = ProgramRuntime::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink: TypedEffectSink = {
+            let events = Arc::clone(&events);
+            Arc::new(move |effect| events.lock().unwrap().push(effect))
+        };
+
+        let outcome = runtime
+            .submit_with_typed_effect_sink(
+                submission(
+                    ProgramLanguage::Forth,
+                    "s\"download\" output-open dup s\"starting\" output-status dup 2 5 output-progress output-complete",
+                    ExecutionEffect::VmRead,
+                ),
+                sink,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert!(outcome.output.is_empty());
+        let events = events.lock().unwrap();
+        assert!(matches!(
+            events.first().map(|effect| &effect.effect.event),
+            Some(crate::vm::interpreter::HostSideEffect::Request { .. })
+        ));
+        assert!(events.iter().any(|effect| matches!(
+            &effect.effect.event,
+            crate::vm::interpreter::HostSideEffect::Ui {
+                operation: crate::vm::interpreter::UiOperation::Create,
+                text: Some(title),
+                ..
+            } if title == "download"
+        )));
+        assert!(events.iter().any(|effect| matches!(
+            &effect.effect.event,
+            crate::vm::interpreter::HostSideEffect::Ui {
+                operation: crate::vm::interpreter::UiOperation::Status,
+                text: Some(text),
+                ..
+            } if text == "starting"
+        )));
+        assert!(events.iter().any(|effect| matches!(
+            &effect.effect.event,
+            crate::vm::interpreter::HostSideEffect::Ui {
+                operation: crate::vm::interpreter::UiOperation::Progress,
+                progress: Some(crate::vm::interpreter::UiProgress {
+                    completed: 2,
+                    total: Some(5),
+                }),
+                ..
+            }
+        )));
+        assert!(matches!(
+            events.last().map(|effect| &effect.effect.event),
+            Some(crate::vm::interpreter::HostSideEffect::Ui {
+                operation: crate::vm::interpreter::UiOperation::Complete,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn typed_schedule_create_persists_callback() {
         let database = tempfile::NamedTempFile::new().unwrap();
         let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
