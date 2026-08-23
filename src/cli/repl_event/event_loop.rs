@@ -1776,8 +1776,12 @@ impl EventLoop {
             // Poll daemon every 4s for vocab changes from other concurrent terminals.
             self.spawn_vocab_poll();
 
-            // Run user-authored boot poetry from ~/.finch/boot.forth.
-            self.run_boot_poems();
+            // Do not execute legacy Co-Forth `boot.forth` at interactive
+            // startup. A startup program can emit arbitrary terminal text,
+            // mutate the compatibility VM, and race the shadow-buffer's first
+            // render. Legacy boot material remains available through the
+            // explicit `finch coforth` maintenance command; typed scheduled
+            // work is the supported autonomous startup mechanism.
 
             self.render_tui().await.ok();
 
@@ -6587,26 +6591,6 @@ Rules:\n\
             for poem in poems {
                 let escaped = poem.replace('"', "\\\"");
                 let _ = writeln!(f, ".\" {}\" cr", escaped);
-            }
-        }
-    }
-
-    /// Run ~/.finch/boot.forth at startup — the user's boot poetry.
-    fn run_boot_poems(&mut self) {
-        let Some(mut path) = dirs::home_dir() else {
-            return;
-        };
-        path.push(".finch");
-        path.push("boot.forth");
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        if source.is_empty() {
-            return;
-        }
-        if let Ok(out) = self.forth_vm.exec_with_fuel(&source, 0) {
-            if !out.is_empty() {
-                self.output_manager.write_info(out.trim_end().to_string());
             }
         }
     }
