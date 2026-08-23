@@ -227,6 +227,12 @@ fn core_word_documentation(name: &str) -> CoreWordDocumentation {
             forth: "left right str-cat; text bytes; n int-to-string; text atoi; space",
             example: "s\"answer: \" 42 int-to-string str-cat say",
         },
+        "json-parse" | "json-stringify" | "json-get" | "json-as-string" | "json-as-int" | "json-as-bool" => CoreWordDocumentation {
+            summary: "Pure managed JSON operations. json-parse returns result<json,string>; json-get and scalar projections return options rather than coercing or treating text as authority.",
+            lisp: "(json-parse text), (json-get value field), (json-as-int value)",
+            forth: "text json-parse; json field json-get; json json-as-int",
+            example: "s\" {\\\"answer\\\":42}\" json-parse result-unwrap s\" answer\" json-get unwrap json-as-int unwrap",
+        },
         "dup" | "drop" | "swap" => CoreWordDocumentation {
             summary: "Pure stack shuffles. Prefer Lisp let bindings or Co-Forth locals for complex programs rather than deep positional juggling.",
             lisp: "Usually use let instead of stack shuffles.",
@@ -1144,7 +1150,11 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(result["matches"].as_array().unwrap().is_empty());
+        assert!(result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["name"] != "if"));
         assert!(result["syntax_matches"]
             .as_array()
             .unwrap()
@@ -1158,12 +1168,34 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(case_result["matches"].as_array().unwrap().is_empty());
+        assert!(case_result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["name"] != "case"));
         assert!(case_result["syntax_matches"]
             .as_array()
             .unwrap()
             .iter()
             .any(|entry| entry["name"] == "case"));
+
+        let json_result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "json-get"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let json_word = json_result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "json-get")
+            .expect("managed JSON field lookup must be discoverable");
+        assert!(json_word["summary"]
+            .as_str()
+            .unwrap()
+            .contains("managed JSON"));
     }
 
     #[tokio::test]

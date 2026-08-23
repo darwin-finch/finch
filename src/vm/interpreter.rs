@@ -1348,6 +1348,99 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             };
             stack.push(TypedValue::Bytes(value.into_bytes()));
         }
+        "json-parse" => {
+            let value = pop(stack)?;
+            let TypedValue::String(source) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-JSON-001",
+                    DiagnosticPhase::Interpretation,
+                    "json-parse requires a string",
+                    Some(origin),
+                ));
+            };
+            let result = match serde_json::from_str::<serde_json::Value>(&source) {
+                Ok(value) => TypedValue::Result {
+                    ok_type: Type::Json,
+                    error_type: Type::String,
+                    is_ok: true,
+                    value: Box::new(TypedValue::Json(value)),
+                },
+                Err(error) => TypedValue::Result {
+                    ok_type: Type::Json,
+                    error_type: Type::String,
+                    is_ok: false,
+                    value: Box::new(TypedValue::String(error.to_string())),
+                },
+            };
+            stack.push(result);
+        }
+        "json-stringify" => {
+            let value = pop(stack)?;
+            let TypedValue::Json(value) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-JSON-002",
+                    DiagnosticPhase::Interpretation,
+                    "json-stringify requires a JSON value",
+                    Some(origin),
+                ));
+            };
+            let text = serde_json::to_string(&value).map_err(|error| {
+                VmDiagnostic::error(
+                    "E-JSON-003",
+                    DiagnosticPhase::Interpretation,
+                    format!("could not serialize JSON: {error}"),
+                    Some(SourceOrigin::generated(name)),
+                )
+            })?;
+            stack.push(TypedValue::String(text));
+        }
+        "json-get" => {
+            let key = pop(stack)?;
+            let value = pop(stack)?;
+            let (TypedValue::Json(value), TypedValue::String(key)) = (value, key) else {
+                return Err(VmDiagnostic::error(
+                    "E-JSON-004",
+                    DiagnosticPhase::Interpretation,
+                    "json-get requires a JSON value and string field name",
+                    Some(origin),
+                ));
+            };
+            let found = value.as_object().and_then(|object| object.get(&key)).cloned();
+            stack.push(TypedValue::Option {
+                inner_type: Type::Json,
+                value: found.map(|value| Box::new(TypedValue::Json(value))),
+            });
+        }
+        "json-as-string" | "json-as-int" | "json-as-bool" => {
+            let value = pop(stack)?;
+            let TypedValue::Json(value) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-JSON-005",
+                    DiagnosticPhase::Interpretation,
+                    format!("{name} requires a JSON value"),
+                    Some(origin),
+                ));
+            };
+            let (inner_type, value) = match name {
+                "json-as-string" => (
+                    Type::String,
+                    value.as_str().map(|value| TypedValue::String(value.to_string())),
+                ),
+                "json-as-int" => (
+                    Type::Int,
+                    value.as_i64().map(TypedValue::Int),
+                ),
+                "json-as-bool" => (
+                    Type::Bool,
+                    value.as_bool().map(TypedValue::Bool),
+                ),
+                _ => unreachable!(),
+            };
+            stack.push(TypedValue::Option {
+                inner_type,
+                value: value.map(Box::new),
+            });
+        }
         "int-to-string" => {
             let value = pop(stack)?;
             let TypedValue::Int(value) = value else {

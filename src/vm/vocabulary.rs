@@ -119,6 +119,45 @@ pub fn core_vocabulary() -> Vocabulary {
         ),
         ("bytes".into(), pure(vec![Type::String], vec![Type::Bytes])),
         ("space".into(), pure(Vec::new(), vec![Type::String])),
+        (
+            "json-parse".into(),
+            pure(
+                vec![Type::String],
+                vec![Type::result(Type::Json, Type::String)],
+            ),
+        ),
+        (
+            "json-stringify".into(),
+            pure(vec![Type::Json], vec![Type::String]),
+        ),
+        (
+            "json-get".into(),
+            pure(
+                vec![Type::Json, Type::String],
+                vec![Type::Option(Box::new(Type::Json))],
+            ),
+        ),
+        (
+            "json-as-string".into(),
+            pure(
+                vec![Type::Json],
+                vec![Type::Option(Box::new(Type::String))],
+            ),
+        ),
+        (
+            "json-as-int".into(),
+            pure(
+                vec![Type::Json],
+                vec![Type::Option(Box::new(Type::Int))],
+            ),
+        ),
+        (
+            "json-as-bool".into(),
+            pure(
+                vec![Type::Json],
+                vec![Type::Option(Box::new(Type::Bool))],
+            ),
+        ),
         // A control-only cooperative scheduling point. The source frontends
         // lower this word to `Instruction::Yield`, not a normal core call.
         ("yield".into(), pure(Vec::new(), Vec::new())),

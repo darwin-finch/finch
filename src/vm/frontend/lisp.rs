@@ -2038,6 +2038,7 @@ pub(crate) fn parse_type_name(name: &str) -> Result<Type, Vec<VmDiagnostic>> {
         "char" => Ok(Type::Char),
         "string" | "str" => Ok(Type::String),
         "bytes" => Ok(Type::Bytes),
+        "json" => Ok(Type::Json),
         "dynamic" | "any" => Ok(Type::Dynamic),
         _ => parse_generic_type(name).ok_or_else(|| {
             vec![VmDiagnostic::error(
@@ -2399,6 +2400,22 @@ mod tests {
         assert_eq!(
             run("(list-length (list \"a\" \"b\"))").unwrap(),
             vec![TypedValue::Int(2)]
+        );
+    }
+
+    #[test]
+    fn reads_json_object_fields_through_typed_option_boundaries() {
+        assert_eq!(
+            run(
+                "(unwrap (json-as-int (unwrap (json-get (result-unwrap (json-parse \"{\\\"answer\\\":42}\")) \"answer\"))))"
+            )
+            .unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+        assert_eq!(
+            run("(is-some (json-get (result-unwrap (json-parse \"{}\")) \"missing\"))")
+                .unwrap(),
+            vec![TypedValue::Bool(false)]
         );
     }
 

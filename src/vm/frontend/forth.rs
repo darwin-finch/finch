@@ -2494,4 +2494,20 @@ mod tests {
         .unwrap_err();
         assert_eq!(errors[0].code, "E-READ-004");
     }
+
+    #[test]
+    fn reads_json_object_fields_through_the_shared_typed_vocabulary() {
+        let module = compile_forth(
+            "input.forth",
+            "s\" {\\\"answer\\\":42}\" json-parse result-unwrap s\" answer\" json-get unwrap json-as-int unwrap",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("typed Co-Forth compiles JSON field access");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("typed Co-Forth executes JSON field access");
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
+    }
 }

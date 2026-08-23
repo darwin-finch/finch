@@ -202,6 +202,18 @@ s" Finished." say
 
 `vm-vocabulary` returns the current serialized typed word manifest.
 
+JSON is a managed typed value, not a stringly authority channel. Parse untrusted text with
+`json-parse` (which returns `result<json,string>`), look up an object field with `json-get`
+(which returns `option<json>`), then project a scalar through an option-returning converter:
+
+```forth
+s" {\"answer\":42}" json-parse result-unwrap
+s" answer" json-get unwrap json-as-int unwrap
+```
+
+`json-as-string`, `json-as-int`, and `json-as-bool` return `none` for a mismatched JSON kind;
+`json-stringify` converts a managed JSON value back to compact text.
+
 `process-run` consumes a command string and a list of argument strings; it never invokes a shell.
 
 For progressive prose, emit multiple typed chunks with `say`. `s"..."` pushes a typed `string`

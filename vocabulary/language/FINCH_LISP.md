@@ -227,5 +227,22 @@ or ask for/add a typed stream primitive when lazy generated sequences are requir
 
 `(vm-vocabulary)` returns the current typed word manifest for programmatic introspection.
 
+JSON values have an explicit typed boundary. `(json-parse text)` returns `result<json,string>`;
+`(json-get value field)` returns `option<json>` only for an object field, and `(json-as-string ...)`,
+`(json-as-int ...)`, and `(json-as-bool ...)` return an option instead of silently coercing. For
+example:
+
+```lisp
+(unwrap
+  (json-as-int
+    (unwrap
+      (json-get
+        (result-unwrap (json-parse "{\"answer\":42}"))
+        "answer"))))
+```
+
+Use `(json-stringify value)` only when text serialization is actually needed. User text inside JSON
+never becomes a capability, path, or executable form merely by being parsed.
+
 `(process-run command (list arguments...))` runs an executable directly without shell parsing and
 is capability-bearing.

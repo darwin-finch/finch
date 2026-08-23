@@ -18,6 +18,9 @@ pub enum Type {
     Symbol,
     String,
     Bytes,
+    /// Managed JSON data, retained structurally so field access never needs
+    /// to parse or interpolate an untyped string at an effect boundary.
+    Json,
     Path(FileSelector),
     List(Box<Type>),
     Map(Box<Type>, Box<Type>),
@@ -67,6 +70,7 @@ impl fmt::Display for Type {
             Self::Symbol => f.write_str("symbol"),
             Self::String => f.write_str("string"),
             Self::Bytes => f.write_str("bytes"),
+            Self::Json => f.write_str("json"),
             Self::Path(selector) => write!(f, "path<{selector}>"),
             Self::List(element) => write!(f, "list<{element}>"),
             Self::Map(key, value) => write!(f, "map<{key},{value}>"),
@@ -142,6 +146,9 @@ pub enum TypedValue {
     Symbol(String),
     String(String),
     Bytes(Vec<u8>),
+    /// A managed JSON tree. Programs may only inspect it through typed JSON
+    /// words such as `json-get`; host authority never lives in JSON text.
+    Json(serde_json::Value),
     Path {
         selector: FileSelector,
         relative: String,
@@ -202,6 +209,7 @@ impl TypedValue {
             Self::Symbol(_) => Type::Symbol,
             Self::String(_) => Type::String,
             Self::Bytes(_) => Type::Bytes,
+            Self::Json(_) => Type::Json,
             Self::Path { selector, .. } => Type::Path(selector.clone()),
             Self::List { element_type, .. } => Type::list(element_type.clone()),
             Self::Option { inner_type, .. } => Type::Option(Box::new(inner_type.clone())),
