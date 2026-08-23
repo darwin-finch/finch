@@ -194,6 +194,11 @@ explicit handle with `(output-append handle text)`, `(output-replace handle text
 `(output-complete handle)`, or `(output-fail handle text)`. These are portable side-effect events,
 not direct terminal mutation or an implicit global WorkUnit.
 
+`output-append` and `output-replace` affect the handle body. `output-status` is separately
+rendered transient status text, and `output-progress` is independent progress metadata; neither
+operation erases body text. All handle updates are effect-only expressions and leave no public
+value on the shared stack.
+
 The handle is owned by its ProgramRun, survives that run's verified suspension/resumption, and is
 rejected if a different submission tries to reuse it.
 

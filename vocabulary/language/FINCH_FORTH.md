@@ -263,12 +263,16 @@ For concurrent/reactive presentation, `output-open` asks the host for an opaque
 `output-complete`, or `output-fail`. These produce portable ordered UI events; they do not mutate
 the terminal directly and never depend on a global active WorkUnit:
 
+`output-append` appends the handle body and `output-replace` replaces that body. `output-status`
+sets separately rendered transient status text; it does not erase the body. `output-progress` is
+separate bounded progress metadata. All of these effects are stack-neutral.
+
 An output handle belongs to the ProgramRun that opened it (including that run's verified
 yield/approval resumptions). A later submission cannot reuse it; the host rejects stale,
 completed, or cross-run handles.
 
 ```forth
-: download-status ( S -- S unit ! {session.emit} )
+: download-status ( S -- S ! {session.emit} )
   s" download" output-open locals| handle |
   handle s" starting" output-status
   handle 2 5 output-progress
