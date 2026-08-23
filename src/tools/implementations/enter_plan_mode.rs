@@ -124,7 +124,7 @@ mod tests {
         assert!(result.is_ok());
         let message = result.unwrap();
         assert!(message.contains("Entered planning mode"));
-        assert!(message.contains("Read"));
+        assert!(message.contains("read"));
     }
 
     #[test]
