@@ -946,8 +946,7 @@ pub async fn find_peer(
 
 // ── Background peer event loop ────────────────────────────────────────────────
 //
-// Each peer owns a legacy Co-Forth compatibility VM plus an authoritative
-// typed ProgramRuntime for Lisp. The user broadcasts code via a
+// Each peer owns one authoritative typed ProgramRuntime. The user broadcasts code via a
 // `broadcast::Sender<SessionEvent>`; each peer subscribes.  Results come back
 // through a shared `UnboundedSender<(Uuid, String, String)>` (id, name, text)
 // that funnels all peers into one inbox for the select! loop.
@@ -959,22 +958,26 @@ async fn run_peer_loop(
     inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
 ) {
     use crate::session::SessionEvent;
-    let mut vm = crate::coforth::Library::precompiled_vm();
-    vm.remote_mode = true;
     let typed_runtime = crate::runtime::ProgramRuntime::new();
 
     loop {
         match rx.recv().await {
             Ok(SessionEvent::Chat { text }) => {
-                // Lisp follows the same typed runtime path as local source and
-                // provider wire programs.  Co-Forth is still a compatibility
-                // peer surface while its richer legacy vocabulary is migrated.
-                let response = if text.trim_start().starts_with('(') {
+                // Both wire languages use the same typed runtime. A peer may
+                // never turn an unsupported typed program into a legacy
+                // evaluation: that would make channel execution disagree with
+                // provider and direct-source semantics.
+                let language = if text.trim_start().starts_with('(') {
+                    crate::programs::ProgramLanguage::Lisp
+                } else {
+                    crate::programs::ProgramLanguage::Forth
+                };
+                let response = {
                     match typed_runtime
                         .submit_typed_only(crate::runtime::ProgramSubmission {
-                            language: crate::programs::ProgramLanguage::Lisp,
+                            language,
                             source: text.clone(),
-                            intent: "peer Lisp program".into(),
+                            intent: "peer typed program".into(),
                             effect: crate::programs::ExecutionEffect::Unclassified,
                             declared_capabilities: Vec::new(),
                             manifest_generation: typed_runtime.manifest_generation(),
@@ -987,32 +990,15 @@ async fn run_peer_loop(
                             if outcome.status
                                 == crate::runtime::outcome::ExecutionStatus::Completed =>
                         {
-                            outcome.output
+                            peer_program_result(&outcome)
                         }
                         Ok(outcome) => format!(
-                            "typed Lisp error: {}",
+                            "typed program error: {}",
                             outcome.diagnostics.first().cloned().unwrap_or_else(|| {
                                 format!("program ended as {:?}", outcome.status)
                             })
                         ),
-                        Err(error) => format!("typed Lisp error: {error}"),
-                    }
-                } else {
-                    let depth_before = vm.data_stack().len();
-                    match vm.exec(&text) {
-                        Ok(out) => {
-                            let delta = vm.data_stack()[depth_before..].to_vec();
-                            if !out.is_empty() {
-                                out.trim_end().to_string()
-                            } else if !delta.is_empty() {
-                                let items: Vec<String> =
-                                    delta.iter().map(|n| n.to_string()).collect();
-                                format!("( {} )", items.join("  "))
-                            } else {
-                                String::new()
-                            }
-                        }
-                        Err(e) => format!("error: {e}"),
+                        Err(error) => format!("typed program error: {error}"),
                     }
                 };
                 if !response.is_empty() {
@@ -1031,6 +1017,36 @@ async fn run_peer_loop(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Ok(_) => {}
         }
+    }
+}
+
+/// Peer messages do not have a terminal projection. Preserve explicit VM
+/// output when present; otherwise report the typed final stack in the compact
+/// notation previously used by the peer inbox.
+fn peer_program_result(outcome: &crate::runtime::outcome::ExecutionOutcome) -> String {
+    if !outcome.output.is_empty() {
+        return outcome.output.trim_end().to_string();
+    }
+    if outcome.values.is_empty() {
+        return String::new();
+    }
+    let values = outcome
+        .values
+        .iter()
+        .map(peer_program_value)
+        .collect::<Vec<_>>();
+    format!("( {} )", values.join("  "))
+}
+
+fn peer_program_value(value: &crate::programs::ProgramValue) -> String {
+    match value {
+        crate::programs::ProgramValue::Nil => "()".to_string(),
+        crate::programs::ProgramValue::Bool(value) => value.to_string(),
+        crate::programs::ProgramValue::Int(value) => value.to_string(),
+        crate::programs::ProgramValue::Float(value) => value.to_string(),
+        crate::programs::ProgramValue::Symbol(value) => format!("'{value}"),
+        crate::programs::ProgramValue::String(value) => format!("{value:?}"),
+        other => format!("{other:?}"),
     }
 }
 
@@ -10685,7 +10701,9 @@ mod peer_loop_tests {
 
         // Broadcast a definition — both peers should compile it.
         bcast_tx
-            .send(SessionEvent::chat(": square  dup * ;"))
+            .send(SessionEvent::chat(
+                ": square ( int -- int ! {} ) dup * ;",
+            ))
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
