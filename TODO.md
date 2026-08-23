@@ -41,9 +41,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   records, not merely leading source comments. Preserve `; finch-doc:` / `\ finch-doc:` as a
   self-contained-script spelling, retain exact immutable version metadata, and converge provider
   discovery on `search_word` / `inspect_word`: compact search across core and persisted words,
-  followed by full contract/source inspection where source exists. Keep the current
-  `search_vm_vocabulary`, `inspect_vm_word`, `search_vocabulary`, and `inspect_program` spellings
-  as compatibility aliases until generated manifests and providers migrate.
+  followed by full contract/source inspection where source exists. Generated provider manifests now
+  advertise only `search_word` / `inspect_word`; keep `search_vm_vocabulary`, `inspect_vm_word`,
+  `search_vocabulary`, and `inspect_program` as dispatch-only compatibility aliases until external
+  clients migrate.
 - [ ] Finish the capability broker: bounded argument templates, availability, grants, attenuation,
   revocation, audit, approval dialogs, runtime guards, and typed suspend/resume. The base
   `(execution_id, sequence)` resume path now validates the host's result row and acknowledges the

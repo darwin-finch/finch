@@ -333,14 +333,6 @@ impl Repl {
             crate::tools::implementations::GetLanguageDefinitionTool,
         ));
         tool_registry.register(Box::new(
-            crate::tools::implementations::SearchVmVocabularyTool::new(Arc::clone(
-                &program_runtime,
-            )),
-        ));
-        tool_registry.register(Box::new(
-            crate::tools::implementations::InspectVmWordTool::new(Arc::clone(&program_runtime)),
-        ));
-        tool_registry.register(Box::new(
             crate::tools::implementations::SearchWordTool::new(
                 Arc::clone(&program_runtime),
                 memory_system.clone(),
@@ -352,6 +344,15 @@ impl Repl {
                 memory_system.clone(),
             ),
         ));
+        // Historical vocabulary spellings remain executable for persisted
+        // turns and external clients, but providers must see one coherent
+        // discovery surface. The old searches each covered only a subset
+        // (core VM or persisted programs), which led models to mistake an
+        // empty legacy search for an absent typed word or syntax form.
+        tool_registry.register_alias("search_vm_vocabulary", "search_word");
+        tool_registry.register_alias("inspect_vm_word", "inspect_word");
+        tool_registry.register_alias("search_vocabulary", "search_word");
+        tool_registry.register_alias("inspect_program", "inspect_word");
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()
@@ -421,14 +422,11 @@ impl Repl {
         // Phase 4: Register memory tools if memory system is enabled
         if let Some(ref memory) = memory_system {
             use crate::tools::implementations::{
-                CreateMemoryTool, InspectProgramTool, ListRecentTool, SearchMemoryTool,
-                SearchVocabularyTool,
+                CreateMemoryTool, ListRecentTool, SearchMemoryTool,
             };
             tool_registry.register(Box::new(SearchMemoryTool::new(memory.clone())));
             tool_registry.register(Box::new(CreateMemoryTool::new(memory.clone())));
             tool_registry.register(Box::new(ListRecentTool::new(memory.clone())));
-            tool_registry.register(Box::new(SearchVocabularyTool::new(memory.clone())));
-            tool_registry.register(Box::new(InspectProgramTool::new(memory.clone())));
         }
 
         // Session task list. Snake_case names are provider-facing; aliases
@@ -523,16 +521,6 @@ impl Repl {
                     crate::tools::implementations::GetLanguageDefinitionTool,
                 ));
                 fallback_registry.register(Box::new(
-                    crate::tools::implementations::SearchVmVocabularyTool::new(Arc::clone(
-                        &program_runtime,
-                    )),
-                ));
-                fallback_registry.register(Box::new(
-                    crate::tools::implementations::InspectVmWordTool::new(Arc::clone(
-                        &program_runtime,
-                    )),
-                ));
-                fallback_registry.register(Box::new(
                     crate::tools::implementations::SearchWordTool::new(
                         Arc::clone(&program_runtime),
                         memory_system.clone(),
@@ -544,6 +532,10 @@ impl Repl {
                         memory_system.clone(),
                     ),
                 ));
+                fallback_registry.register_alias("search_vm_vocabulary", "search_word");
+                fallback_registry.register_alias("inspect_vm_word", "inspect_word");
+                fallback_registry.register_alias("search_vocabulary", "search_word");
+                fallback_registry.register_alias("inspect_program", "inspect_word");
                 fallback_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
                 fallback_registry
                     .register(Box::new(SaveAndExecTool::new(session_state_file.clone())));

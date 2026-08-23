@@ -1937,8 +1937,8 @@ fn register_query_vm_tools(
     program_runtime: Arc<finch::runtime::ProgramRuntime>,
 ) {
     use finch::tools::implementations::{
-        GetLanguageDefinitionTool, GetVmStateTool, InspectVmWordTool, InspectWordTool,
-        SearchVmVocabularyTool, SearchWordTool, SubmitProgramTool,
+        GetLanguageDefinitionTool, GetVmStateTool, InspectWordTool, SearchWordTool,
+        SubmitProgramTool,
     };
 
     // Provider tool calls and the terminal VM-wire program must share this
@@ -1950,12 +1950,6 @@ fn register_query_vm_tools(
     ))));
     registry.register(Box::new(GetVmStateTool::new(Arc::clone(&program_runtime))));
     registry.register(Box::new(GetLanguageDefinitionTool));
-    registry.register(Box::new(SearchVmVocabularyTool::new(Arc::clone(
-        &program_runtime,
-    ))));
-    registry.register(Box::new(InspectVmWordTool::new(Arc::clone(
-        &program_runtime,
-    ))));
     // One-shot query mode has no loaded persisted-program index, but the
     // canonical tools still expose core words and report that limitation.
     registry.register(Box::new(SearchWordTool::new(
@@ -1963,6 +1957,10 @@ fn register_query_vm_tools(
         None,
     )));
     registry.register(Box::new(InspectWordTool::new(program_runtime, None)));
+    registry.register_alias("search_vm_vocabulary", "search_word");
+    registry.register_alias("inspect_vm_word", "inspect_word");
+    registry.register_alias("search_vocabulary", "search_word");
+    registry.register_alias("inspect_program", "inspect_word");
 }
 
 /// Returns true when the input is unambiguously Forth code that should bypass
@@ -3293,11 +3291,38 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::execute_coforth_code;
+    use super::{execute_coforth_code, register_query_vm_tools};
+    use std::sync::Arc;
 
     #[test]
     fn coforth_command_does_not_run_legacy_boot_entries_implicitly() {
         let output = execute_coforth_code("1 2 + .").expect("program executes");
         assert_eq!(output, "3 ");
+    }
+
+    #[test]
+    fn query_manifest_advertises_only_canonical_vm_discovery_tools() {
+        let mut registry = finch::tools::ToolRegistry::new();
+        register_query_vm_tools(
+            &mut registry,
+            Arc::new(finch::runtime::ProgramRuntime::new()),
+        );
+        let names = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(names.contains("search_word"));
+        assert!(names.contains("inspect_word"));
+        for legacy in [
+            "search_vm_vocabulary",
+            "inspect_vm_word",
+            "search_vocabulary",
+            "inspect_program",
+        ] {
+            assert!(!names.contains(legacy));
+            assert!(registry.has_tool(legacy));
+        }
     }
 }
