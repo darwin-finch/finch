@@ -5704,11 +5704,6 @@ Rules:\n\
              The code will be executed immediately and the user sees the output, not your reply. \
              After each word definition, add a \\ comment (same line) explaining what it does in plain English. \
              Example:  : greet  .\" hello\" cr ;  \\ prints hello \
-             After each word definition, write a test:word proof using assert (aborts if 0). \
-             Example after  : double  dup + ;  write  : test:double  4 double 8 = assert ; \
-             For side-effect-only words: assert depth is unchanged. \
-             After all definitions, write prove-all to verify before calling the main words. \
-             If prove-all fails, stop — do not call the main words. \
              When the user needs to choose between options, use \
              select\" title|opt1|opt2\" — leaves the chosen index (0-based) on the stack. \
              Forth word names can be in any language. \
@@ -6668,8 +6663,6 @@ Rules:\n\
              - Only define words that are not yet in the vocabulary. Do not redefine existing words.\n\
              - One `: name  ... ;` definition per word.\n\
              - After each definition, write a comment `\\ what it does` on the same line.\n\
-             - After each definition, write a minimal test: `: test:NAME  ... assert ;`\n\
-             - After all definitions and tests, write `prove-all` then call each new word.\n\
              - Word names must match the user's input exactly (case-sensitive).\n\
              - CRITICAL: Only use Forth primitives and words already in the vocabulary above. \
                Do NOT reference undefined words — the code runs immediately and undefined words \
