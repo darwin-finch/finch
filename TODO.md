@@ -168,8 +168,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   symbols acquire shared meaning. It may inform a provider manifest and be refined through
   explicit proposals, but it must never silently redefine core words or execute as ambient boot
   poetry.
-- [ ] Add per-brain control ownership/leases and participant roles. Only the bound environment
-  may execute workspace effects or reveal/rotate its credential.
+- [ ] Add per-brain control ownership/leases and participant roles. Make the current attachment
+  role explicit in every console status bar and permission/proposal view: `runner` (the one
+  environment-owning executor), `driver` (may queue prompts/programs), `consultant` (may push
+  bounded context/reviews), or `observer` (read-only). Approval/control scopes remain separate
+  from these roles. Only the bound environment may execute workspace effects or reveal/rotate its
+  credential.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an
   indivisible machine/workspace authority boundary.
 - [ ] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,

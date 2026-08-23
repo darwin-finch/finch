@@ -137,11 +137,39 @@ BrainRun
 
 BrainAttachment (client-side)
   BrainId + attachment identity
+  role                     runner | driver | consultant | observer
   locally cached last-applied event cursor + revision
   shadow-buffer projection
   local input/draft state
   reconnect/resync state
 ```
+
+### Attachment roles and visible console state
+
+Roles describe what an attached console may ask the authoritative service to
+do; they are not a second source of workspace authority.  The UI must render
+the active role in the status bar and on every permission/proposal prompt so a
+person can tell whether their input will execute now, queue for the runner, or
+merely become context.
+
+- **runner** — exactly one leased environment-owning console. It holds the
+  workspace, accessibility, credential, and typed host-effect bindings. This
+  is the only role that may execute a `BrainRun` with environment effects.
+- **driver** — an interactive collaborator. A driver can append prompts,
+  programs, drafts, and replies to the ordered Brain log, but has no direct
+  workspace authority. When the runner is available its requests become
+  queued runs; otherwise they are visibly `queued_for_environment`.
+- **consultant** — can read the projected history and contribute bounded
+  context, review comments, or suggested programs. It cannot start an
+  executable run or approve a capability by default.
+- **observer** — read-only projection access.
+
+Approval and control are separate scoped permissions, not substitute roles:
+an authorized driver may decide an approval, while a `brain:control` holder may
+request a runner-lease handoff. Neither action silently transfers workspace
+handles. A compact status form should make the live condition obvious, for
+example `brain: compiler-work · driver · runner online` or
+`brain: compiler-work · consultant · read-only`.
 
 The daemon persists the authoritative acknowledgement cursor for every attachment identity. A
 frontend may cache its last applied event for fast reconnect, but it resumes by asking the daemon for
