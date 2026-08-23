@@ -144,6 +144,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   credential handles; the master frontend runner is the only environment authority. Recover only
   from validated checkpoints on that environment and never replay recorded external effects after
   runner or `tmux` failure.
+- [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
+  budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
+  runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
+  must be separately scheduled/approved BrainRuns. Do not revive the legacy mutable
+  `boot = true` Co-Forth registry as an ambient startup hook.
 - [ ] Add per-brain control ownership/leases and participant roles. Only the bound environment
   may execute workspace effects or reveal/rotate its credential.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an
