@@ -115,6 +115,16 @@ pub struct VmStateSnapshot {
     pub granted_capabilities: Vec<CapabilityRequirement>,
 }
 
+/// An immutable in-memory checkpoint at a successful VM commit boundary.
+/// External effects stay in their per-run journals; this contains only
+/// reducible typed VM state for inspection and later durable persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmRevisionSnapshot {
+    pub revision: u64,
+    pub stack: Vec<TypedValue>,
+    pub vocabulary: Vec<String>,
+}
+
 /// One session's persistent language runtimes.
 pub struct ProgramRuntime {
     typed: Arc<Mutex<TypedRuntime>>,
@@ -144,6 +154,7 @@ pub struct ProgramRuntime {
     /// Daemon-owned typed continuations keyed by the execution id visible in
     /// the UI. Approval and resumption use this exact verified program state.
     pending_typed: Mutex<HashMap<uuid::Uuid, PendingTypedExecution>>,
+    revision_history: Mutex<Vec<VmRevisionSnapshot>>,
 }
 
 /// Host-owned socket metadata. Finch source sees only the opaque resource
@@ -252,6 +263,11 @@ impl ProgramRuntime {
             schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
             pending_typed: Mutex::new(HashMap::new()),
+            revision_history: Mutex::new(vec![VmRevisionSnapshot {
+                revision: 0,
+                stack: Vec::new(),
+                vocabulary: crate::vm::core_vocabulary().into_keys().collect(),
+            }]),
         }
     }
 
@@ -849,7 +865,25 @@ impl ProgramRuntime {
             .typed
             .lock()
             .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))? = working_runtime;
-        Ok(self.revision.fetch_add(1, Ordering::AcqRel) + 1)
+        let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let typed = self.typed.lock().map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?;
+        self.revision_history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))?
+            .push(VmRevisionSnapshot {
+                revision,
+                stack: typed.stack().to_vec(),
+                vocabulary: typed.vocabulary().keys().cloned().collect(),
+            });
+        Ok(revision)
+    }
+
+    pub fn revision_history(&self) -> Result<Vec<VmRevisionSnapshot>> {
+        Ok(self
+            .revision_history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))?
+            .clone())
     }
 
     pub async fn inspect(&self) -> Result<VmStateSnapshot> {
@@ -4502,6 +4536,26 @@ mod tests {
         assert_eq!(state.stack[1].value, ProgramValue::Int(20));
         assert!(state.vocabulary.iter().any(|word| word.name == "+"));
         assert_eq!(state.vocabulary, state.typed_vocabulary);
+    }
+
+    #[tokio::test]
+    async fn revision_history_records_only_successful_commit_boundaries() {
+        let runtime = ProgramRuntime::new();
+        assert_eq!(runtime.revision_history().unwrap().len(), 1);
+        runtime
+            .submit(submission(ProgramLanguage::Forth, "7", ExecutionEffect::Pure))
+            .await
+            .unwrap();
+        let suspended = runtime
+            .submit(submission(ProgramLanguage::Forth, "yield 9", ExecutionEffect::Pure))
+            .await
+            .unwrap();
+        assert_eq!(suspended.status, ExecutionStatus::Suspended);
+
+        let history = runtime.revision_history().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].revision, 1);
+        assert_eq!(history[1].stack, vec![TypedValue::Int(7)]);
     }
 
     #[tokio::test]
