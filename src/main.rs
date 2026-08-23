@@ -419,6 +419,7 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
     let outcome = runtime
         .submit_typed_only(finch::runtime::ProgramSubmission {
             language: script.language,
+            source_id: Some(path.display().to_string()),
             source: script.source,
             intent: format!("execute Finch script {}", path.display()),
             // The typed verifier and broker derive the concrete capabilities.
@@ -497,6 +498,7 @@ async fn run_direct_typed_source(
     let outcome = runtime
         .submit_typed_only(finch::runtime::ProgramSubmission {
             language,
+            source_id: Some(format!("direct-cli.{}", language.as_str())),
             source: source.to_string(),
             intent: "direct typed command-line program".to_string(),
             effect: finch::programs::ExecutionEffect::Unclassified,
@@ -2315,6 +2317,7 @@ async fn execute_one_shot_wire_source(
     program_runtime
         .submit_typed_only(finch::runtime::ProgramSubmission {
             language,
+            source_id: Some(format!("provider-response.{}", language.as_str())),
             source: source.to_string(),
             intent: "one-shot provider VM-wire response".to_string(),
             effect: finch::programs::ExecutionEffect::Pure,

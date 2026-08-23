@@ -40,6 +40,7 @@ fn direct_wire_submission(
     let language = crate::programs::ProgramLanguage::infer_wire_source(&source)?;
     Ok(crate::runtime::ProgramSubmission {
         language,
+        source_id: Some(format!("provider-response.{}", language.as_str())),
         source,
         intent: "provider VM-wire response".to_string(),
         effect: crate::programs::ExecutionEffect::Pure,

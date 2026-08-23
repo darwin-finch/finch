@@ -84,6 +84,12 @@ pub fn typed_effect_channel() -> (TypedEffectSink, mpsc::Receiver<VmEffectEnvelo
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramSubmission {
     pub language: ProgramLanguage,
+    /// Stable identity of the authored source used in diagnostics and the
+    /// effect journal. A provider response, file path, scheduler record, or
+    /// IDE buffer may supply its own identity; older callers use the
+    /// language-specific fallback in the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub source: String,
     pub intent: String,
     pub effect: ExecutionEffect,
@@ -422,6 +428,7 @@ impl ProgramRuntime {
                 let outcome = runtime
                     .submit_typed_only(ProgramSubmission {
                         language,
+                        source_id: Some(format!("scheduled-callback.{}", language.as_str())),
                         source: task.task,
                         intent: "scheduled callback".into(),
                         effect: ExecutionEffect::VmRead,
@@ -1190,11 +1197,16 @@ impl ProgramRuntime {
             (generation, input_revision, working_runtime)
         };
         let context = ExecutionContext::new(generation, submission.budget.unwrap_or_default());
+        let source_id = submission.source_id.clone().unwrap_or_else(|| match submission.language {
+            ProgramLanguage::Forth => "provider-response.forth".to_string(),
+            ProgramLanguage::Lisp => "provider-response.lisp".to_string(),
+        });
         let started = Instant::now();
         let (working_runtime, execution) = self
             .execute_typed_program(
                 working_runtime,
                 submission.language,
+                &source_id,
                 &submission.source,
                 &context,
                 &submission.declared_capabilities,
@@ -1357,6 +1369,7 @@ impl ProgramRuntime {
         &self,
         mut runtime: TypedRuntime,
         language: ProgramLanguage,
+        source_id: &str,
         source: &str,
         context: &ExecutionContext,
         declared_capabilities: &[CapabilityRequirement],
@@ -1392,6 +1405,7 @@ impl ProgramRuntime {
             .upgrade()
             .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, caller));
         let source = source.to_string();
+        let source_id = source_id.to_string();
         let declared = (!declared_capabilities.is_empty())
             .then(|| EffectSet(declared_capabilities.iter().cloned().collect()));
         let fuel = context.budget.forth_fuel.min(u64::MAX as usize) as u64;
@@ -1422,10 +1436,7 @@ impl ProgramRuntime {
                     );
                     let execution = runtime.execute_with_handler(
                         language,
-                        match language {
-                            ProgramLanguage::Forth => "provider-response.forth",
-                            ProgramLanguage::Lisp => "provider-response.lisp",
-                        },
+                        &source_id,
                         &source,
                         fuel,
                         declared.as_ref(),
@@ -3069,6 +3080,7 @@ mod tests {
     ) -> ProgramSubmission {
         ProgramSubmission {
             language,
+            source_id: None,
             source: source.to_string(),
             intent: "test".to_string(),
             effect,
@@ -4836,6 +4848,35 @@ mod tests {
         let state = runtime.inspect().await.unwrap();
         assert_eq!(state.typed_stack.len(), 1);
         assert_eq!(state.typed_stack[0].value, TypedValue::Int(10));
+    }
+
+    #[tokio::test]
+    async fn submission_source_id_is_preserved_in_effect_origins() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            })
+            .unwrap();
+        let outcome = runtime
+            .submit(ProgramSubmission {
+                source_id: Some("scripts/demo.lisp".into()),
+                ..submission(
+                    ProgramLanguage::Lisp,
+                    "(say \"source aware\")",
+                    ExecutionEffect::Pure,
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(outcome.vm_side_effects.len(), 1);
+        assert_eq!(
+            outcome.vm_side_effects[0].origin.span.as_ref().unwrap().source_id,
+            "scripts/demo.lisp"
+        );
     }
 
     #[tokio::test]

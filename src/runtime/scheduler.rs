@@ -726,6 +726,7 @@ mod tests {
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
                 language: crate::programs::ProgramLanguage::Forth,
+                source_id: None,
                 source: r#"s" inspect the VM" agent-spawn"#.to_string(),
                 intent: "attempt an ungranted child".to_string(),
                 effect: crate::programs::ExecutionEffect::VmWrite,
@@ -757,6 +758,7 @@ mod tests {
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
                 language: crate::programs::ProgramLanguage::Forth,
+                source_id: None,
                 source: r#"s" inspect the VM" agent-spawn agent-await"#.to_string(),
                 intent: "fork and join a child".to_string(),
                 effect: crate::programs::ExecutionEffect::VmWrite,
@@ -785,6 +787,7 @@ mod tests {
         let outcome = runtime
             .submit(crate::runtime::ProgramSubmission {
                 language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
                 source: r#"(let ((task-id (agent-spawn "inspect the VM"))) (agent-await task-id))"#
                     .to_string(),
                 intent: "fork and join a child".to_string(),
@@ -818,6 +821,7 @@ mod tests {
         let spawn = runtime
             .submit(crate::runtime::ProgramSubmission {
                 language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
                 source: r#"(agent-spawn "inspect the VM")"#.to_string(),
                 intent: "start a child for status polling".to_string(),
                 effect: crate::programs::ExecutionEffect::VmWrite,
@@ -840,6 +844,7 @@ mod tests {
         let poll = runtime
             .submit(crate::runtime::ProgramSubmission {
                 language: crate::programs::ProgramLanguage::Forth,
+                source_id: None,
                 source: "agent-poll".to_string(),
                 intent: "poll the child".to_string(),
                 effect: crate::programs::ExecutionEffect::VmRead,

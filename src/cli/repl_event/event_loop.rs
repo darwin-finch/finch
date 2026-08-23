@@ -976,6 +976,7 @@ async fn run_peer_loop(
                     match typed_runtime
                         .submit_typed_only(crate::runtime::ProgramSubmission {
                             language,
+                            source_id: Some(format!("peer-program.{}", language.as_str())),
                             source: text.clone(),
                             intent: "peer typed program".into(),
                             effect: crate::programs::ExecutionEffect::Unclassified,
@@ -1248,6 +1249,7 @@ mod deferred_proposal_tests {
             .submit_with_deferred_program_effects(
                 crate::runtime::ProgramSubmission {
                     language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("proposal-test.lisp".into()),
                     source: "(proposal-open \"python\" \"inspect artifact\" \"print('ok')\")"
                         .into(),
                     intent: "proposal test".into(),
@@ -1285,6 +1287,7 @@ mod deferred_proposal_tests {
             .submit_with_deferred_program_effects(
                 crate::runtime::ProgramSubmission {
                     language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("proposal-test.lisp".into()),
                     source: "(proposal-open \"python\" \"inspect artifact\" \"print('original')\")"
                         .into(),
                     intent: "proposal test".into(),
@@ -3174,6 +3177,7 @@ Rules:\n\
         });
         let submission = crate::runtime::ProgramSubmission {
             language,
+            source_id: Some(format!("interactive.{}", language.as_str())),
             source,
             intent: "interactive typed source".into(),
             effect: crate::programs::ExecutionEffect::Unclassified,

@@ -17,6 +17,11 @@ left-to-right, but executes only at an explicit program boundary.
 Lisp is buffered until its delimiters balance. Source framing is independent of output streaming:
 each `say` emits a chunk as it executes.
 
+The receiving host, not the model, attaches a stable source identity to every submission (for
+example a script path, provider response ID, scheduled callback, or editor buffer). Diagnostics and
+effect origins preserve that identity through lowering and suspension/resume; a program cannot
+forge its own provenance by placing a string in source text.
+
 The normal visible response is a Lisp program:
 
 ```lisp

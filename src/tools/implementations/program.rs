@@ -696,6 +696,7 @@ impl Tool for SubmitProgramTool {
 
         let submission = ProgramSubmission {
             language,
+            source_id: Some(format!("tool-submission.{}", language.as_str())),
             source,
             intent,
             effect,
