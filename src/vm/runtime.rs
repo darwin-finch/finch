@@ -2014,6 +2014,24 @@ mod tests {
     }
 
     #[test]
+    fn recursive_lisp_definition_persists_for_later_program_runs() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute(
+            ProgramLanguage::Lisp,
+            "words.lisp",
+            "(define (factorial (n : int)) : int \
+               (if (<= n 1) 1 (* n (factorial (- n 1)))))",
+            1_000,
+        );
+        assert_eq!(definition.status, TypedExecutionStatus::Completed);
+        assert!(runtime.functions().contains_key("factorial"));
+
+        let call = runtime.execute(ProgramLanguage::Forth, "call.forth", "6 factorial", 1_000);
+        assert_eq!(call.status, TypedExecutionStatus::Completed);
+        assert_eq!(call.values, vec![TypedValue::Int(720)]);
+    }
+
+    #[test]
     fn forth_quotation_references_a_typed_word_and_executes_it() {
         let mut runtime = TypedRuntime::new();
         let result = runtime.execute(
