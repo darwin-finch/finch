@@ -718,20 +718,17 @@ impl<'a> VmTrampoline<'a> {
                         UiOperation::Complete => (None, None),
                         UiOperation::Create => unreachable!("output-open is an awaited host call"),
                     };
-                    if !output.iter().all(|ty| *ty == Type::Unit) {
+                    if !output.is_empty() {
                         return VmStep::Failed(self.with_trace(
                             VmDiagnostic::error(
                                 "E-OUTPUT-008",
                                 DiagnosticPhase::Interpretation,
-                                "portable UI operations may return only unit",
+                                "portable UI operations must not return stack values",
                                 Some(located.origin),
                             ),
                             &continuation,
                         ));
                     }
-                    continuation
-                        .stack
-                        .extend(output.iter().map(|_| TypedValue::Unit));
                     let effect = VmSideEffect {
                         protocol_version: side_effect_protocol_version(),
                         sequence: continuation.next_effect_sequence,
@@ -794,7 +791,6 @@ impl<'a> VmTrampoline<'a> {
                                 ))
                             }
                         };
-                        continuation.stack.push(TypedValue::Unit);
                         let effect = VmSideEffect {
                             protocol_version: side_effect_protocol_version(),
                             sequence: continuation.next_effect_sequence,
@@ -1507,14 +1503,15 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             } else {
                 "./**"
             };
-            let selector = super::effects::FileSelector::parse(selector_source).map_err(|error| {
-                VmDiagnostic::error(
-                    "E-PATH-001",
-                    DiagnosticPhase::Interpretation,
-                    error.to_string(),
-                    Some(SourceOrigin::generated(name)),
-                )
-            })?;
+            let selector =
+                super::effects::FileSelector::parse(selector_source).map_err(|error| {
+                    VmDiagnostic::error(
+                        "E-PATH-001",
+                        DiagnosticPhase::Interpretation,
+                        error.to_string(),
+                        Some(SourceOrigin::generated(name)),
+                    )
+                })?;
             if !selector.matches(&relative) || relative.contains(['*', '?']) {
                 return Err(VmDiagnostic::error(
                     "E-PATH-002",
@@ -1741,9 +1738,7 @@ mod tests {
         assert_eq!(effect.sequence, 1);
         assert!(matches!(effect.event, HostSideEffect::Emit { ref text } if text == "5"));
         let complete = trampoline.run(continuation);
-        assert!(
-            matches!(complete, VmStep::Complete { stack } if stack == vec![TypedValue::Unit, TypedValue::Unit])
-        );
+        assert!(matches!(complete, VmStep::Complete { stack } if stack.is_empty()));
     }
 
     #[test]

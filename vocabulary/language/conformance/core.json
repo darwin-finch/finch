@@ -48,25 +48,25 @@
       "name": "named-loop-break",
       "forth": "begin: done true while break done repeat s\"\" say",
       "lisp": "(while :label done true (break done))",
-      "expected_values": [{ "type": "unit", "value": null }],
+      "expected_values": [],
       "expected_output": ""
     },
     {
       "name": "nested-named-loop-break",
       "forth": "begin: outer true while begin: inner true while break outer repeat repeat s\"\" say",
       "lisp": "(while :label outer true (while :label inner true (break outer)))",
-      "expected_values": [{ "type": "unit", "value": null }],
+      "expected_values": [],
       "expected_output": ""
     },
     {
       "name": "progressive-response",
-      "forth": "s\"Hello \" say drop 2 3 + int-to-string say",
+      "forth": "s\"Hello \" say 2 3 + int-to-string say",
       "lisp": "(begin (say \"Hello \") (say (int-to-string (+ 2 3))))",
       "expected_output": "Hello 5"
     },
     {
       "name": "progressive-computed-response-spacing",
-      "forth": "s\"the result of 2+3 is \" say drop 2 3 + int-to-string space str-cat say drop s\"is that correct?\" say",
+      "forth": "s\"the result of 2+3 is \" say 2 3 + int-to-string space str-cat say s\"is that correct?\" say",
       "lisp": "(begin (say \"the result of 2+3 is \") (say (str-cat (int-to-string (+ 2 3)) \" \")) (say \"is that correct?\"))",
       "expected_output": "the result of 2+3 is 5 is that correct?"
     },

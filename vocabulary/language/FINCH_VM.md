@@ -69,6 +69,11 @@ template has a conservative upper bound (for example `${workspace}/reports/**`);
 the actual argument at a call site and checks the canonical resolved path again at the host
 boundary. If it cannot prove the result remains within the bound, verification fails.
 
+Response/UI effects are stack-neutral in the shared IR. `say` and `output-*` consume their
+arguments and leave no synthetic `unit` on the persistent stack; consecutive calls compose without
+`drop`. The Lisp frontend represents effect-only forms as `unit` internally so they remain valid
+expressions, then removes that implementation detail at its top-level boundary.
+
 Capabilities do not appear as forgeable data-stack tokens. Pure means the inferred requirement set
 is empty. `session.emit` is granted by the active response session; memory, scheduling, agents,
 tools, files, processes, network, and automation require their own availability and grants.

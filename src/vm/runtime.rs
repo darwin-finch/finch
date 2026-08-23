@@ -34,13 +34,17 @@ pub enum EffectJournalState {
     /// awaits its correlated typed result. This is distinct from asking the
     /// user to grant a missing capability.
     AwaitingHostResult,
-    Acknowledged { values: Vec<TypedValue> },
+    Acknowledged {
+        values: Vec<TypedValue>,
+    },
     Denied,
     Cancelled,
     /// The host binding returned a structured fault before it supplied a
     /// resume value. The host may have performed a partial external effect;
     /// callers must surface this prefix rather than calling rollback atomic.
-    Failed { diagnostic: VmDiagnostic },
+    Failed {
+        diagnostic: VmDiagnostic,
+    },
 }
 
 /// Result of compiling and interpreting one source submission. Authorization
@@ -530,7 +534,14 @@ impl TypedRuntime {
             );
             trampoline.resume(continuation, values)
         };
-        self.drive_step(module, effects, step, event_journal, effect_journal, handler)
+        self.drive_step(
+            module,
+            effects,
+            step,
+            event_journal,
+            effect_journal,
+            handler,
+        )
     }
 
     fn authorization_required<H: CapabilityHandler>(
@@ -751,7 +762,7 @@ impl TypedRuntime {
                                 event_journal,
                                 effect_journal,
                                 handler,
-                            )
+                            );
                         }
                     };
                     let trampoline = VmTrampoline::new(
@@ -1076,14 +1087,16 @@ impl TypedRuntime {
                 }
                 Ok(Some(values))
             }
-            crate::runtime::fiber::CpuFiberStatus::Failed => Err(snapshot.diagnostic.unwrap_or_else(|| {
-                VmDiagnostic::error(
-                    "E-FIBER-016",
-                    DiagnosticPhase::HostCall,
-                    "CPU task failed without a diagnostic",
-                    Some(origin.clone()),
-                )
-            })),
+            crate::runtime::fiber::CpuFiberStatus::Failed => {
+                Err(snapshot.diagnostic.unwrap_or_else(|| {
+                    VmDiagnostic::error(
+                        "E-FIBER-016",
+                        DiagnosticPhase::HostCall,
+                        "CPU task failed without a diagnostic",
+                        Some(origin.clone()),
+                    )
+                }))
+            }
             crate::runtime::fiber::CpuFiberStatus::Cancelled => Err(VmDiagnostic::error(
                 "E-FIBER-017",
                 DiagnosticPhase::Cancellation,
@@ -1142,7 +1155,8 @@ impl TypedRuntime {
         for (name, function) in module.module.functions {
             if name != entry && !self.functions.contains_key(&name) {
                 if !name.starts_with("lambda$") {
-                    self.vocabulary.insert(name.clone(), function.signature.clone());
+                    self.vocabulary
+                        .insert(name.clone(), function.signature.clone());
                 }
                 self.functions.insert(name, function);
             }
@@ -1315,23 +1329,23 @@ mod tests {
             origin: &SourceOrigin,
         ) -> Result<Vec<TypedValue>, VmDiagnostic> {
             match requirement.capability {
-            CapabilityKind::SessionEmit => {
-                let [TypedValue::String(text)] = arguments.as_slice() else {
+                CapabilityKind::SessionEmit => {
+                    let [TypedValue::String(text)] = arguments.as_slice() else {
                         return Err(VmDiagnostic::error(
                             "E-HOST-001",
                             DiagnosticPhase::HostCall,
                             "session.emit requires one string",
                             Some(origin.clone()),
                         ));
-                };
-                if origin.word.as_deref() == Some("output-open") {
-                    return Ok(vec![TypedValue::Resource {
-                        kind: "output-handle".into(),
-                        handle: "test-output".into(),
-                        generation: 0,
-                    }]);
-                }
-                self.output.push_str(text);
+                    };
+                    if origin.word.as_deref() == Some("output-open") {
+                        return Ok(vec![TypedValue::Resource {
+                            kind: "output-handle".into(),
+                            handle: "test-output".into(),
+                            generation: 0,
+                        }]);
+                    }
+                    self.output.push_str(text);
                     Ok(vec![TypedValue::Unit])
                 }
                 CapabilityKind::FileRead => Ok(vec![TypedValue::Bytes(b"contents".to_vec())]),
@@ -1425,7 +1439,7 @@ mod tests {
         );
         assert_eq!(result.status, TypedExecutionStatus::Completed);
         assert_eq!(result.output, "hello");
-        assert_eq!(result.values, vec![TypedValue::Unit]);
+        assert!(result.values.is_empty());
     }
 
     #[test]
@@ -1460,7 +1474,12 @@ mod tests {
         ));
         assert!(matches!(
             host.ui_events[3].event,
-            HostSideEffect::Ui { operation: super::super::interpreter::UiOperation::Complete, text: None, progress: None, .. }
+            HostSideEffect::Ui {
+                operation: super::super::interpreter::UiOperation::Complete,
+                text: None,
+                progress: None,
+                ..
+            }
         ));
 
         let mut forth_runtime = TypedRuntime::new();
@@ -1468,7 +1487,7 @@ mod tests {
         let forth = forth_runtime.execute_with_handler(
             ProgramLanguage::Forth,
             "output.forth",
-            "s\"download\" output-open dup s\"starting\" output-append drop output-complete",
+            "s\"download\" output-open dup s\"starting\" output-append output-complete",
             1_000,
             None,
             &mut forth_host,
@@ -1477,8 +1496,20 @@ mod tests {
         assert!(matches!(
             forth_host.ui_events.as_slice(),
             [
-                VmSideEffect { event: HostSideEffect::Ui { operation: super::super::interpreter::UiOperation::Append, .. }, .. },
-                VmSideEffect { event: HostSideEffect::Ui { operation: super::super::interpreter::UiOperation::Complete, .. }, .. },
+                VmSideEffect {
+                    event: HostSideEffect::Ui {
+                        operation: super::super::interpreter::UiOperation::Append,
+                        ..
+                    },
+                    ..
+                },
+                VmSideEffect {
+                    event: HostSideEffect::Ui {
+                        operation: super::super::interpreter::UiOperation::Complete,
+                        ..
+                    },
+                    ..
+                },
             ]
         ));
     }
@@ -1535,7 +1566,11 @@ mod tests {
                 "frontends disagree on output for '{}'",
                 case.name
             );
-            assert_eq!(forth_result.output, case.expected_output, "case '{}'", case.name);
+            assert_eq!(
+                forth_result.output, case.expected_output,
+                "case '{}'",
+                case.name
+            );
             if let Some(expected_values) = case.expected_values {
                 assert_eq!(forth_result.values, expected_values, "case '{}'", case.name);
             }
@@ -1555,7 +1590,7 @@ mod tests {
         let result = runtime.execute(script.language, "reply.lisp", &script.source, 1_000);
         assert_eq!(result.status, TypedExecutionStatus::Completed);
         assert_eq!(result.output, "hello from script");
-        assert_eq!(result.values, vec![TypedValue::Unit]);
+        assert!(result.values.is_empty());
     }
 
     #[test]
@@ -1612,7 +1647,10 @@ mod tests {
         let completed = runtime.resume_with_handler(suspension, Vec::new(), &mut host);
         assert_eq!(completed.status, TypedExecutionStatus::Completed);
         assert_eq!(completed.output, "checking...");
-        assert_eq!(completed.values, vec![TypedValue::Bytes(b"contents".to_vec())]);
+        assert_eq!(
+            completed.values,
+            vec![TypedValue::Bytes(b"contents".to_vec())]
+        );
         assert!(matches!(
             completed.effect_journal.as_slice(),
             [
@@ -1707,7 +1745,8 @@ mod tests {
         assert_eq!(stale.status, TypedExecutionStatus::Failed);
         assert_eq!(stale.diagnostics[0].code, "E-RESUME-005");
 
-        let wrong_arity = runtime.resume_with_effect_result(suspension, sequence, Vec::new(), &mut host);
+        let wrong_arity =
+            runtime.resume_with_effect_result(suspension, sequence, Vec::new(), &mut host);
         assert_eq!(wrong_arity.status, TypedExecutionStatus::Failed);
         assert_eq!(wrong_arity.diagnostics[0].code, "E-RESUME-003");
     }
@@ -1739,7 +1778,9 @@ mod tests {
             },
         });
         let completed = runtime.resume_with_handler(
-            pending.suspension.expect("authorization must retain the module"),
+            pending
+                .suspension
+                .expect("authorization must retain the module"),
             Vec::new(),
             &mut host,
         );
@@ -1819,7 +1860,7 @@ mod tests {
         );
         assert_eq!(completed.status, TypedExecutionStatus::Completed);
         assert_eq!(completed.output, "beforeafter");
-        assert_eq!(completed.values, vec![TypedValue::Unit]);
+        assert!(completed.values.is_empty());
     }
 
     #[test]
@@ -1870,7 +1911,7 @@ mod tests {
         let execution = runtime.execute(
             ProgramLanguage::Forth,
             "partial-effect.forth",
-            "s\" visible before failure\" say drop 0 0 /",
+            "s\" visible before failure\" say 0 0 /",
             1_000,
         );
         assert_eq!(execution.status, TypedExecutionStatus::Failed);
@@ -1884,6 +1925,24 @@ mod tests {
     }
 
     #[test]
+    fn response_effects_do_not_leave_synthetic_units_on_the_shared_stack() {
+        for (language, source) in [
+            (ProgramLanguage::Forth, "s\"first\" say s\"second\" say"),
+            (
+                ProgramLanguage::Lisp,
+                "(begin (say \"first\") (say \"second\"))",
+            ),
+        ] {
+            let mut runtime = TypedRuntime::new();
+            let execution = runtime.execute(language, "output", source, 1_000);
+            assert_eq!(execution.status, TypedExecutionStatus::Completed);
+            assert_eq!(execution.output, "firstsecond");
+            assert!(execution.values.is_empty());
+            assert!(runtime.stack().is_empty());
+        }
+    }
+
+    #[test]
     fn explicit_cpu_defer_runs_a_captured_lisp_closure_on_a_private_worker_stack() {
         let mut runtime = TypedRuntime::new();
         let execution = runtime.execute(
@@ -1893,14 +1952,22 @@ mod tests {
             1_000,
         );
         assert_eq!(execution.status, TypedExecutionStatus::Completed);
-        let [TypedValue::Task { id, result_type, kind }] = execution.values.as_slice() else {
+        let [TypedValue::Task {
+            id,
+            result_type,
+            kind,
+        }] = execution.values.as_slice()
+        else {
             panic!("defer :cpu must leave exactly one typed task handle");
         };
         assert_eq!(*result_type, crate::vm::types::Type::Int);
         assert_eq!(*kind, crate::vm::types::TaskKind::CpuFiber);
         let id = uuid::Uuid::parse_str(id).expect("CPU task id must be a UUID");
         let result = runtime.cpu_fibers.join(id).unwrap();
-        assert_eq!(result.status, crate::runtime::fiber::CpuFiberStatus::Completed);
+        assert_eq!(
+            result.status,
+            crate::runtime::fiber::CpuFiberStatus::Completed
+        );
         assert_eq!(result.result, Some(vec![TypedValue::Int(42)]));
     }
 
@@ -1963,8 +2030,8 @@ mod tests {
             1_000,
         );
         assert_eq!(cancelled.status, TypedExecutionStatus::Completed);
-        assert_eq!(cancelled.values, vec![TypedValue::Unit]);
-        assert_eq!(runtime.stack(), &[TypedValue::Unit]);
+        assert!(cancelled.values.is_empty());
+        assert!(runtime.stack().is_empty());
     }
 
     #[test]
@@ -1989,7 +2056,7 @@ mod tests {
         let definition = runtime.execute(
             ProgramLanguage::Forth,
             "words.forth",
-            ": dishonest ( S string -- S unit ! {} ) say ;",
+            ": dishonest ( S string -- S ! {} ) say ;",
             1_000,
         );
         assert_eq!(definition.status, TypedExecutionStatus::Failed);
@@ -2179,8 +2246,10 @@ mod tests {
             1_000,
         );
         assert_eq!(result.status, TypedExecutionStatus::Completed);
-        assert!(result.effects.0.iter().any(|requirement| {
-            requirement.capability == CapabilityKind::MemoryWrite
-        }));
+        assert!(result
+            .effects
+            .0
+            .iter()
+            .any(|requirement| { requirement.capability == CapabilityKind::MemoryWrite }));
     }
 }

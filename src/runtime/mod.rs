@@ -391,14 +391,22 @@ impl ProgramRuntime {
                         .map(|effect| effect.sequence)
                 });
             let reason = match &pending.suspension.pending_host_call {
-                Some(call) if pending.suspension.effect_journal.last().is_some_and(|entry| {
-                    matches!(
-                        entry.state,
-                        crate::vm::EffectJournalState::AwaitingHostResult
-                    )
-                }) => PendingTypedReason::AwaitingHostEffect {
-                    requirement: call.requirement.clone(),
-                },
+                Some(call)
+                    if pending
+                        .suspension
+                        .effect_journal
+                        .last()
+                        .is_some_and(|entry| {
+                            matches!(
+                                entry.state,
+                                crate::vm::EffectJournalState::AwaitingHostResult
+                            )
+                        }) =>
+                {
+                    PendingTypedReason::AwaitingHostEffect {
+                        requirement: call.requirement.clone(),
+                    }
+                }
                 Some(call) => PendingTypedReason::AuthorizationRequired {
                     requirements: vec![call.requirement.clone()],
                 },
@@ -621,9 +629,9 @@ impl ProgramRuntime {
                     );
                 }
             }
-            pending_runs.remove(&execution_id).ok_or_else(|| {
-                anyhow::anyhow!("no resumable typed execution {execution_id}")
-            })?
+            pending_runs
+                .remove(&execution_id)
+                .ok_or_else(|| anyhow::anyhow!("no resumable typed execution {execution_id}"))?
         };
         if pending.context.manifest_generation != self.manifest_generation() {
             self.release_output_handles(execution_id)?;
@@ -986,121 +994,121 @@ impl ProgramRuntime {
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let suspension = execution.suspension.clone();
         if let Some(suspension) = suspension.clone() {
-                self.pending_typed
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?
-                    .insert(
-                        context.execution_id,
-                        PendingTypedExecution {
-                            suspension,
-                            context: context.clone(),
-                            input_revision,
-                            language: submission.language,
-                            source: submission.source.clone(),
-                            intent: submission.intent.clone(),
-                            effect: submission.effect,
-                            caller: caller.clone(),
-                            output: execution.output.clone(),
-                            output_chunks: execution.output_chunks.clone(),
-                            side_effects: execution.side_effects.clone(),
-                            effect_sink,
-                            defer_program_invocations,
-                        },
-                    );
+            self.pending_typed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?
+                .insert(
+                    context.execution_id,
+                    PendingTypedExecution {
+                        suspension,
+                        context: context.clone(),
+                        input_revision,
+                        language: submission.language,
+                        source: submission.source.clone(),
+                        intent: submission.intent.clone(),
+                        effect: submission.effect,
+                        caller: caller.clone(),
+                        output: execution.output.clone(),
+                        output_chunks: execution.output_chunks.clone(),
+                        side_effects: execution.side_effects.clone(),
+                        effect_sink,
+                        defer_program_invocations,
+                    },
+                );
         }
         if suspension.is_none() {
             self.release_output_handles(context.execution_id)?;
         }
         Ok(match execution.status {
-                TypedExecutionStatus::Completed => {
-                    let output_revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-                    ExecutionOutcome {
-                        execution_id: context.execution_id,
-                        status: ExecutionStatus::Completed,
-                        values: typed_values(execution.values)?,
-                        output: truncate_output(execution.output, context.budget.max_output_bytes),
-                        output_chunks: execution.output_chunks,
-                        side_effects: execution.side_effects,
-                        vm_side_effects: execution.vm_side_effects,
-                        effect_journal: execution.effect_journal,
-                        diagnostics: Vec::new(),
-                        vm_diagnostics: Vec::new(),
-                        required_capabilities: Vec::new(),
-                        approval_prompts: Vec::new(),
-                        input_revision,
-                        output_revision,
-                        effect: submission.effect,
-                        backend: ExecutionBackend::TypedVm,
-                        elapsed_ms,
-                    }
+            TypedExecutionStatus::Completed => {
+                let output_revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                ExecutionOutcome {
+                    execution_id: context.execution_id,
+                    status: ExecutionStatus::Completed,
+                    values: typed_values(execution.values)?,
+                    output: truncate_output(execution.output, context.budget.max_output_bytes),
+                    output_chunks: execution.output_chunks,
+                    side_effects: execution.side_effects,
+                    vm_side_effects: execution.vm_side_effects,
+                    effect_journal: execution.effect_journal,
+                    diagnostics: Vec::new(),
+                    vm_diagnostics: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    approval_prompts: Vec::new(),
+                    input_revision,
+                    output_revision,
+                    effect: submission.effect,
+                    backend: ExecutionBackend::TypedVm,
+                    elapsed_ms,
                 }
-                TypedExecutionStatus::Suspended => ExecutionOutcome {
-                    execution_id: context.execution_id,
-                    status: ExecutionStatus::Suspended,
-                    values: Vec::new(),
-                    output: truncate_output(execution.output, context.budget.max_output_bytes),
-                    output_chunks: execution.output_chunks,
-                    side_effects: execution.side_effects,
-                    vm_side_effects: execution.vm_side_effects,
-                    effect_journal: execution.effect_journal,
-                    diagnostics: Vec::new(),
-                    vm_diagnostics: execution.diagnostics,
-                    required_capabilities: Vec::new(),
-                    approval_prompts: Vec::new(),
-                    input_revision,
-                    output_revision: input_revision,
-                    effect: submission.effect,
-                    backend: ExecutionBackend::TypedVm,
-                    elapsed_ms,
-                },
-                TypedExecutionStatus::AuthorizationRequired { requirements } => ExecutionOutcome {
-                    execution_id: context.execution_id,
-                    status: ExecutionStatus::AuthorizationRequired,
-                    values: Vec::new(),
-                    output: truncate_output(execution.output, context.budget.max_output_bytes),
-                    output_chunks: execution.output_chunks,
-                    side_effects: execution.side_effects,
-                    vm_side_effects: execution.vm_side_effects,
-                    effect_journal: execution.effect_journal,
-                    diagnostics: Vec::new(),
-                    vm_diagnostics: execution.diagnostics,
-                    approval_prompts: approval_prompts(
-                        context.execution_id,
-                        &requirements,
-                        &submission.source,
-                        &submission.intent,
-                        suspension.as_ref(),
-                    ),
-                    required_capabilities: requirements,
-                    input_revision,
-                    output_revision: input_revision,
-                    effect: submission.effect,
-                    backend: ExecutionBackend::TypedVm,
-                    elapsed_ms,
-                },
-                TypedExecutionStatus::Failed => ExecutionOutcome {
-                    execution_id: context.execution_id,
-                    status: ExecutionStatus::Failed,
-                    values: Vec::new(),
-                    output: truncate_output(execution.output, context.budget.max_output_bytes),
-                    output_chunks: execution.output_chunks,
-                    side_effects: execution.side_effects,
-                    vm_side_effects: execution.vm_side_effects,
-                    effect_journal: execution.effect_journal,
-                    diagnostics: execution
-                        .diagnostics
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect(),
-                    vm_diagnostics: execution.diagnostics,
-                    required_capabilities: Vec::new(),
-                    approval_prompts: Vec::new(),
-                    input_revision,
-                    output_revision: input_revision,
-                    effect: submission.effect,
-                    backend: ExecutionBackend::TypedVm,
-                    elapsed_ms,
-                },
+            }
+            TypedExecutionStatus::Suspended => ExecutionOutcome {
+                execution_id: context.execution_id,
+                status: ExecutionStatus::Suspended,
+                values: Vec::new(),
+                output: truncate_output(execution.output, context.budget.max_output_bytes),
+                output_chunks: execution.output_chunks,
+                side_effects: execution.side_effects,
+                vm_side_effects: execution.vm_side_effects,
+                effect_journal: execution.effect_journal,
+                diagnostics: Vec::new(),
+                vm_diagnostics: execution.diagnostics,
+                required_capabilities: Vec::new(),
+                approval_prompts: Vec::new(),
+                input_revision,
+                output_revision: input_revision,
+                effect: submission.effect,
+                backend: ExecutionBackend::TypedVm,
+                elapsed_ms,
+            },
+            TypedExecutionStatus::AuthorizationRequired { requirements } => ExecutionOutcome {
+                execution_id: context.execution_id,
+                status: ExecutionStatus::AuthorizationRequired,
+                values: Vec::new(),
+                output: truncate_output(execution.output, context.budget.max_output_bytes),
+                output_chunks: execution.output_chunks,
+                side_effects: execution.side_effects,
+                vm_side_effects: execution.vm_side_effects,
+                effect_journal: execution.effect_journal,
+                diagnostics: Vec::new(),
+                vm_diagnostics: execution.diagnostics,
+                approval_prompts: approval_prompts(
+                    context.execution_id,
+                    &requirements,
+                    &submission.source,
+                    &submission.intent,
+                    suspension.as_ref(),
+                ),
+                required_capabilities: requirements,
+                input_revision,
+                output_revision: input_revision,
+                effect: submission.effect,
+                backend: ExecutionBackend::TypedVm,
+                elapsed_ms,
+            },
+            TypedExecutionStatus::Failed => ExecutionOutcome {
+                execution_id: context.execution_id,
+                status: ExecutionStatus::Failed,
+                values: Vec::new(),
+                output: truncate_output(execution.output, context.budget.max_output_bytes),
+                output_chunks: execution.output_chunks,
+                side_effects: execution.side_effects,
+                vm_side_effects: execution.vm_side_effects,
+                effect_journal: execution.effect_journal,
+                diagnostics: execution
+                    .diagnostics
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                vm_diagnostics: execution.diagnostics,
+                required_capabilities: Vec::new(),
+                approval_prompts: Vec::new(),
+                input_revision,
+                output_revision: input_revision,
+                effect: submission.effect,
+                backend: ExecutionBackend::TypedVm,
+                elapsed_ms,
+            },
         })
     }
 
@@ -1658,10 +1666,9 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     _ => {}
                 }
                 let path = match arguments.first() {
-                    Some(TypedValue::Path { relative, selector }) => {
-                        self.secure_file_path(selector, relative)
-                            .map_err(|message| host_binding_error(origin, message))?
-                    }
+                    Some(TypedValue::Path { relative, selector }) => self
+                        .secure_file_path(selector, relative)
+                        .map_err(|message| host_binding_error(origin, message))?,
                     _ => {
                         return Err(host_binding_error(
                             origin,
@@ -1679,7 +1686,9 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         let handle = uuid::Uuid::new_v4().to_string();
                         self.csv_record_cursors
                             .lock()
-                            .map_err(|_| host_binding_error(origin, "CSV cursor registry lock poisoned"))?
+                            .map_err(|_| {
+                                host_binding_error(origin, "CSV cursor registry lock poisoned")
+                            })?
                             .insert(
                                 handle.clone(),
                                 CsvRecordCursor {
@@ -1707,7 +1716,10 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         self.file_line_cursors
                             .lock()
                             .map_err(|_| {
-                                host_binding_error(origin, "file line cursor registry lock poisoned")
+                                host_binding_error(
+                                    origin,
+                                    "file line cursor registry lock poisoned",
+                                )
                             })?
                             .insert(
                                 handle.clone(),
@@ -1730,8 +1742,9 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         let size = std::fs::metadata(path)
                             .map_err(|error| host_binding_error(origin, error.to_string()))?
                             .len();
-                        let size = i64::try_from(size)
-                            .map_err(|_| host_binding_error(origin, "file is too large to represent"))?;
+                        let size = i64::try_from(size).map_err(|_| {
+                            host_binding_error(origin, "file is too large to represent")
+                        })?;
                         return Ok(vec![TypedValue::Int(size)]);
                     }
                     Some("file-slice") => {
@@ -2329,9 +2342,9 @@ fn read_bounded_utf8_line(
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return String::from_utf8(line)
-                .map(Some)
-                .map_err(|_| "file line is not valid UTF-8; use file-slice for binary data".into());
+            return String::from_utf8(line).map(Some).map_err(|_| {
+                "file line is not valid UTF-8; use file-slice for binary data".into()
+            });
         }
     }
 }
@@ -2621,9 +2634,18 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"first\r\nsecond\nlast").unwrap();
         let mut reader = BufReader::new(file.reopen().unwrap());
-        assert_eq!(read_bounded_utf8_line(&mut reader).unwrap(), Some("first".into()));
-        assert_eq!(read_bounded_utf8_line(&mut reader).unwrap(), Some("second".into()));
-        assert_eq!(read_bounded_utf8_line(&mut reader).unwrap(), Some("last".into()));
+        assert_eq!(
+            read_bounded_utf8_line(&mut reader).unwrap(),
+            Some("first".into())
+        );
+        assert_eq!(
+            read_bounded_utf8_line(&mut reader).unwrap(),
+            Some("second".into())
+        );
+        assert_eq!(
+            read_bounded_utf8_line(&mut reader).unwrap(),
+            Some("last".into())
+        );
         assert_eq!(read_bounded_utf8_line(&mut reader).unwrap(), None);
     }
 
@@ -2985,7 +3007,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completed.status, ExecutionStatus::Completed);
-        assert_eq!(completed.values, vec![ProgramValue::Bytes(b"[package]".to_vec())]);
+        assert_eq!(
+            completed.values,
+            vec![ProgramValue::Bytes(b"[package]".to_vec())]
+        );
     }
 
     #[tokio::test]
@@ -3052,9 +3077,9 @@ mod tests {
         assert_eq!(completed.status, ExecutionStatus::Completed);
         assert_eq!(
             completed.values,
-            vec![ProgramValue::Option(Some(Box::new(ProgramValue::List(vec![
-                ProgramValue::String("[package]".into()),
-            ]))))]
+            vec![ProgramValue::Option(Some(Box::new(ProgramValue::List(
+                vec![ProgramValue::String("[package]".into()),]
+            ))))]
         );
     }
 
@@ -3064,7 +3089,7 @@ mod tests {
         let pending = runtime
             .submit_typed_only(submission(
                 ProgramLanguage::Forth,
-                "s\"Cargo.toml\" path csv-open dup csv-next if-some 0 list-get say else s\"No records.\" say then drop csv-close",
+                "s\"Cargo.toml\" path csv-open dup csv-next if-some 0 list-get say else s\"No records.\" say then csv-close",
                 ExecutionEffect::WorkspaceRead,
             ))
             .await
@@ -3097,7 +3122,7 @@ mod tests {
                 "s\"Cargo.toml\" path file-lines-open \
                  begin: lines true while \
                    dup file-lines-next if-some \
-                     say drop \
+                     say \
                    else \
                      break lines \
                    then \
@@ -3162,7 +3187,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completed.status, ExecutionStatus::Completed);
-        assert_eq!(completed.values, vec![ProgramValue::Nil]);
+        assert!(completed.values.is_empty());
         assert!(completed.output.starts_with("[package]"));
     }
 
@@ -3622,7 +3647,10 @@ mod tests {
                 sequence: event.effect.sequence,
             }
         );
-        assert_eq!(event.effect.requirement.capability, crate::vm::CapabilityKind::ProgramInvoke);
+        assert_eq!(
+            event.effect.requirement.capability,
+            crate::vm::CapabilityKind::ProgramInvoke
+        );
         assert!(matches!(
             event.effect.event,
             crate::vm::interpreter::HostSideEffect::Request { ref arguments }
@@ -4025,9 +4053,9 @@ mod tests {
                     ExecutionEffect::VmRead,
                 ),
                 sink,
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap();
         assert_eq!(outcome.status, ExecutionStatus::Completed);
         let events = events.lock().unwrap();
         let create_index = events
@@ -4187,9 +4215,12 @@ mod tests {
         // Root selection happens in `TypedHostHandler`; the generic canonical
         // check only proves that a child remains under the root selected by
         // the host binding.
-        let path = secure_resource_path(&workspace.path().to_path_buf(), &selector, "etc/hosts")
-            .unwrap();
-        assert_eq!(path, workspace.path().canonicalize().unwrap().join("etc/hosts"));
+        let path =
+            secure_resource_path(&workspace.path().to_path_buf(), &selector, "etc/hosts").unwrap();
+        assert_eq!(
+            path,
+            workspace.path().canonicalize().unwrap().join("etc/hosts")
+        );
     }
 
     #[tokio::test]
@@ -4226,7 +4257,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(completed.status, ExecutionStatus::Completed);
-        assert_eq!(completed.values, vec![ProgramValue::Bytes(b"host-only".to_vec())]);
+        assert_eq!(
+            completed.values,
+            vec![ProgramValue::Bytes(b"host-only".to_vec())]
+        );
     }
 
     #[tokio::test]
@@ -4302,6 +4336,9 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, ExecutionStatus::Completed);
         assert_eq!(completed.values, vec![ProgramValue::Nil]);
-        assert_eq!(std::fs::read(root.path().join("created.txt")).unwrap(), b"host-write");
+        assert_eq!(
+            std::fs::read(root.path().join("created.txt")).unwrap(),
+            b"host-write"
+        );
     }
 }

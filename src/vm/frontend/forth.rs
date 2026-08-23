@@ -1715,7 +1715,7 @@ mod tests {
     fn string_literals_are_streamable_through_explicit_say() {
         let module = compile_forth(
             "input.forth",
-            "s\"Hello \\\"世界\\\"\" say drop 3 5 + int-to-string say drop s\"! \" say",
+            "s\"Hello \\\"世界\\\"\" say 3 5 + int-to-string say s\"! \" say",
             Vec::new(),
             &core_vocabulary(),
         )

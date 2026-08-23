@@ -361,7 +361,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "say".into(),
             capability(
                 vec![Type::String],
-                vec![Type::Unit],
+                Vec::new(),
                 unscoped(CapabilityKind::SessionEmit),
             ),
         ),
@@ -369,7 +369,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "emit".into(),
             capability(
                 vec![Type::String],
-                vec![Type::Unit],
+                Vec::new(),
                 unscoped(CapabilityKind::SessionEmit),
             ),
         ),
@@ -385,7 +385,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "output-append".into(),
             capability(
                 vec![Type::Resource("output-handle".into()), Type::String],
-                vec![Type::Unit],
+                Vec::new(),
                 unscoped(CapabilityKind::SessionEmit),
             ),
         ),
@@ -393,7 +393,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "output-replace".into(),
             capability(
                 vec![Type::Resource("output-handle".into()), Type::String],
-                vec![Type::Unit],
+                Vec::new(),
                 unscoped(CapabilityKind::SessionEmit),
             ),
         ),
@@ -401,7 +401,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "output-status".into(),
             capability(
                 vec![Type::Resource("output-handle".into()), Type::String],
-                vec![Type::Unit],
+                Vec::new(),
                 unscoped(CapabilityKind::SessionEmit),
             ),
         ),
@@ -409,7 +409,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "output-progress".into(),
             capability(
                 vec![Type::Resource("output-handle".into()), Type::Int, Type::Int],
-                vec![Type::Unit],
+                Vec::new(),
                 unscoped(CapabilityKind::SessionEmit),
             ),
         ),
@@ -417,7 +417,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "output-complete".into(),
             capability(
                 vec![Type::Resource("output-handle".into())],
-                vec![Type::Unit],
+                Vec::new(),
                 unscoped(CapabilityKind::SessionEmit),
             ),
         ),
@@ -425,7 +425,7 @@ pub fn core_vocabulary() -> Vocabulary {
             "output-fail".into(),
             capability(
                 vec![Type::Resource("output-handle".into()), Type::String],
-                vec![Type::Unit],
+                Vec::new(),
                 unscoped(CapabilityKind::SessionEmit),
             ),
         ),

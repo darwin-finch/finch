@@ -329,7 +329,7 @@ mod tests {
     fn cpu_fibers_reject_effectful_functions_before_spawning() {
         let module = compile_forth(
             "fiber.forth",
-            ": announce ( S -- S unit ! infer ) s\" no\" say ;",
+            ": announce ( S -- S ! infer ) s\" no\" say ;",
             Vec::new(),
             &core_vocabulary(),
         )

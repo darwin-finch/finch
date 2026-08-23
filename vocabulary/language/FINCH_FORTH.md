@@ -16,6 +16,11 @@ s" Hello from Finch" say
 Booleans are `true` and `false`. The stack manifest is ordered bottom-to-top. Never assume it is
 empty; inspect it and include `expected_revision` when manipulating existing values.
 
+`say` and every `output-*` operation are stack-neutral effects: they consume their arguments and
+leave no `unit` placeholder. Compose consecutive output directly—never add `drop` after them.
+Lisp keeps `unit` only as an internal expression value; at a program boundary it is likewise not
+persisted onto the shared stack.
+
 `\` starts a line comment outside a string and continues through the following newline. Comments
 are ignored by the compiler and never grant capability, change a signature, or affect provenance.
 
@@ -122,7 +127,7 @@ record without retaining it between iterations:
 s" data.csv" path file-lines-open
 begin: rows true while
   dup file-lines-next if-some
-    say drop                 \ replace with bounded row processing
+    say                      \ replace with bounded row processing
   else
     break rows
   then
@@ -201,7 +206,7 @@ string operations if it is needed.
 after a non-final `say` when its result should not remain available to subsequent positional code:
 
 ```forth
-s" Working…" say drop
+s" Working…" say
 2 3 + int-to-string say
 ```
 
@@ -222,8 +227,8 @@ completed, or cross-run handles.
 ```forth
 : download-status ( S -- S unit ! {session.emit} )
   s" download" output-open locals| handle |
-  handle s" starting" output-status drop
-  handle 2 5 output-progress drop
+  handle s" starting" output-status
+  handle 2 5 output-progress
   handle output-complete
 ;
 ```

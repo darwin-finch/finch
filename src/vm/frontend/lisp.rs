@@ -242,6 +242,15 @@ pub fn compile_lisp_with_functions(
             }
         }
     }
+    // Co-Forth effects and loops are stack-neutral. Lisp retains an internal
+    // `unit` expression so `(begin (say "a") ...)` remains well-formed, but
+    // a top-level unit must not become a synthetic persistent stack value.
+    // Drop it at the program boundary to preserve one shared runtime stack
+    // semantics across the two source forms.
+    if builder.stack.last() == Some(&Type::Unit) {
+        builder.stack.pop();
+        builder.emit(Instruction::Drop, compiler.origin("top-level-unit"));
+    }
     let output = builder.stack.clone();
     builder.emit(Instruction::Return, compiler.origin("<return>"));
     let main = builder.finish(output);
@@ -1423,6 +1432,19 @@ impl Compiler<'_> {
             }
         };
         builder.emit(instruction, origin);
+        if signature.output.values.is_empty() {
+            // Finch Lisp is expression-oriented even when its shared stack
+            // primitive is an effect with no value result. Keep the Lisp
+            // surface composable without leaking synthetic units into
+            // Co-Forth's operand stack.
+            builder.emit(
+                Instruction::Constant {
+                    value: TypedValue::Unit,
+                },
+                self.origin("effect-unit"),
+            );
+            return Ok(Type::Unit);
+        }
         Ok(builder.stack.pop().expect("call signature leaves result"))
     }
 
@@ -1960,7 +1982,7 @@ mod tests {
     fn named_break_and_continue_lower_to_typed_loop_edges() {
         assert_eq!(
             run("(while :label outer true (break outer))").unwrap(),
-            vec![TypedValue::Unit]
+            Vec::<TypedValue>::new()
         );
         let module = compile_lisp(
             "continue.lisp",
