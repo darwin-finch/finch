@@ -2032,6 +2032,24 @@ mod tests {
     }
 
     #[test]
+    fn pure_mutually_recursive_lisp_functions_are_visible_during_compilation() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute(
+            ProgramLanguage::Lisp,
+            "words.lisp",
+            "(define (even? (n : int)) : bool \
+               (if (= n 0) true (odd? (- n 1)))) \
+             (define (odd? (n : int)) : bool \
+               (if (= n 0) false (even? (- n 1))))",
+            1_000,
+        );
+        assert_eq!(definition.status, TypedExecutionStatus::Completed);
+        let call = runtime.execute(ProgramLanguage::Forth, "call.forth", "42 even?", 1_000);
+        assert_eq!(call.status, TypedExecutionStatus::Completed);
+        assert_eq!(call.values, vec![TypedValue::Bool(true)]);
+    }
+
+    #[test]
     fn recursive_forth_definition_persists_for_later_program_runs() {
         let mut runtime = TypedRuntime::new();
         let definition = runtime.execute(
