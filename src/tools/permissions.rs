@@ -153,6 +153,21 @@ impl PermissionManager {
             return PermissionCheck::Deny(reason);
         }
 
+        // These tools inspect Finch's own typed runtime metadata only. They
+        // neither access the workspace nor cross a host-effect boundary, so a
+        // provider must be able to use them to discover the VM protocol
+        // without interrupting the user for an approval dialog.
+        if matches!(
+            tool_name,
+            "get_vm_state"
+                | "get_language_definition"
+                | "search_vm_vocabulary"
+                | "search_vocabulary"
+                | "inspect_program"
+        ) {
+            return PermissionCheck::Allow;
+        }
+
         // Pure and VM-local programs do not cross a host-effect boundary. External
         // program effects continue through the configured/default approval rule.
         if tool_name == "submit_program"
@@ -849,6 +864,23 @@ mod tests {
                 legacy_tool_effect(tool, &serde_json::json!({})),
                 ExecutionEffect::VmRead,
                 "{tool} must not open a host-effect approval dialog"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_discovery_tools_do_not_prompt_in_a_local_session() {
+        let manager = PermissionManager::new();
+        for tool in [
+            "get_vm_state",
+            "get_language_definition",
+            "search_vm_vocabulary",
+            "search_vocabulary",
+            "inspect_program",
+        ] {
+            assert!(
+                matches!(manager.check_tool_use(tool, &serde_json::json!({})), PermissionCheck::Allow),
+                "{tool} must be available for protocol discovery without approval"
             );
         }
     }
