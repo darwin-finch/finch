@@ -490,13 +490,12 @@ fn builtin_effect(b: Builtin) -> Option<StackEffect> {
             StackEffect::new(1, 1)
         }
         // 1→0 (consume, no push)
-        Drop | Print | PrintU | PrintS | PrintHex | Cr | Space | Emit | Type | Store
-        | FileWrite | FileAppend | Assert | Boot => StackEffect::new(1, 0),
+        Drop | Print | PrintU | PrintHex | Emit | Type | Assert => StackEffect::new(1, 0),
         // 1→2
         Dup => StackEffect::new(1, 2),
         // 2→2
-        Swap | Over | StrEq | StrCat | StrSplit | StrJoin | StrFind | StrReplace | LabelPeer
-        | TagPeer | BothWays => StackEffect::new(2, 2),
+        Swap | StrEq | StrCat | StrSplit | StrJoin | StrFind | StrReplace | LabelPeer | TagPeer
+        | BothWays => StackEffect::new(2, 2),
         // 2→3
         Over => StackEffect::new(2, 3),
         // 3→3
@@ -511,22 +510,26 @@ fn builtin_effect(b: Builtin) -> Option<StackEffect> {
         }
         // 0→0
         Nop | Words | HotWords | PeersClear | PeersDiscover | TakeAll | Sync | ProveAll
-        | ProveEnglish | ProveLanguages | Help | Boot => StackEffect::new(0, 0),
+        | ProveEnglish | ProveLanguages | Help | Boot | Cr | Space | PrintS => {
+            StackEffect::new(0, 0)
+        }
         // 1→0 (side-effectful; no push)
         Publish | EnsembleUse | EnsembleEnd | RoomUse | RoomAdd | RoomSub | JoinRegistry
         | LeaveRegistry | RegisterBoot | RegistrySet => StackEffect::new(1, 0),
         // Misc
         StrLen | WordCount | SentenceCheck | WordDefined | IsPrime | Safe | ArgOk | FileSize
-        | GlobCount | ScanBytes | FileEntropy | ZeroEq | ZeroLt | ZeroGt | HashInt | StrToNum => {
+        | GlobCount | ScanBytes | FileEntropy | StrToNum => {
             StackEffect::new(1, 1)
         }
         StrSub => StackEffect::new(3, 1),
         NthLine => StackEffect::new(2, 1),
         SlashMod => StackEffect::new(2, 2),
         TwoDup => StackEffect::new(2, 4),
-        TwoSwap | TwoOver => StackEffect::new(4, 4),
+        TwoSwap => StackEffect::new(4, 4),
+        TwoOver => StackEffect::new(4, 6),
         TwoRot => StackEffect::new(6, 6),
-        Nip | Tuck => StackEffect::new(2, 1),
+        Nip => StackEffect::new(2, 1),
+        Tuck => StackEffect::new(2, 3),
         TermSize => StackEffect::new(0, 2),
         Keygen => StackEffect::new(0, 2),
         Sign => StackEffect::new(2, 1),
@@ -14596,6 +14599,17 @@ mod channel_tests {
         let mut vm = Forth::new();
         let e = vm.infer_effect("dup").unwrap();
         assert_eq!(e, StackEffect::new(1, 2));
+    }
+
+    #[test]
+    fn builtin_effects_match_stack_transforming_words() {
+        assert_eq!(builtin_effect(Builtin::Over), Some(StackEffect::new(2, 3)));
+        assert_eq!(builtin_effect(Builtin::Tuck), Some(StackEffect::new(2, 3)));
+        assert_eq!(builtin_effect(Builtin::TwoOver), Some(StackEffect::new(4, 6)));
+        assert_eq!(builtin_effect(Builtin::Store), Some(StackEffect::new(2, 0)));
+        assert_eq!(builtin_effect(Builtin::FileWrite), Some(StackEffect::new(2, 0)));
+        assert_eq!(builtin_effect(Builtin::Cr), Some(StackEffect::new(0, 0)));
+        assert_eq!(builtin_effect(Builtin::PrintS), Some(StackEffect::new(0, 0)));
     }
 
     #[test]
