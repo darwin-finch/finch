@@ -543,6 +543,15 @@ mod script_tests {
         assert!(request.contains("Hello!"));
         assert!(request.contains("E-LINK-002"));
     }
+
+    #[test]
+    fn prose_about_a_forth_string_opener_is_not_executed_as_forth() {
+        assert!(!is_clearly_forth(
+            "Return only a raw Co-Forth program that uses standard .\" output shorthand."
+        ));
+        assert!(is_clearly_forth(".\" Forth shorthand works\""));
+        assert!(is_clearly_forth("s\"Forth strings are data\" say"));
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -1806,7 +1815,7 @@ fn is_clearly_forth(s: &str) -> bool {
         "xlsx-into\"",
     ];
     for opener in OPENERS {
-        if t.contains(opener) {
+        if t.starts_with(opener) {
             return true;
         }
     }
