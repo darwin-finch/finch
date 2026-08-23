@@ -21,7 +21,11 @@ pub enum ExecutionStatus {
 pub enum ExecutionBackend {
     Forth,
     TypedVm,
+    /// Retained only so historical journals can deserialize. New submissions
+    /// are typed-only and never select either legacy Lisp backend.
     LispCompiledToForth,
+    /// Retained only so historical journals can deserialize. New submissions
+    /// are typed-only and never select either legacy Lisp backend.
     LispNative,
 }
 

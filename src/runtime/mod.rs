@@ -7,8 +7,6 @@ pub mod fiber;
 pub mod outcome;
 pub mod scheduler;
 
-use crate::coforth::{Forth, Library};
-use crate::lisp::{self, EnvRef, LispCtx, Val};
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
 use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
@@ -114,10 +112,7 @@ pub struct VmStateSnapshot {
 
 /// One session's persistent language runtimes.
 pub struct ProgramRuntime {
-    forth: Arc<Mutex<Forth>>,
     typed: Arc<Mutex<TypedRuntime>>,
-    lisp_env: EnvRef,
-    lisp_ctx: Arc<LispCtx>,
     revision: Arc<AtomicU64>,
     manifest_generation: AtomicU64,
     submission_gate: tokio::sync::Mutex<()>,
@@ -229,14 +224,8 @@ impl ProgramRuntime {
 
     pub fn with_automation(enabled: bool) -> Self {
         let automation = Arc::new(AutomationBroker::new(enabled));
-        let lisp_ctx = Arc::new(LispCtx::with_automation(Arc::clone(&automation)));
-        let mut forth = Library::precompiled_vm();
-        forth.set_automation_broker(Arc::clone(&automation));
         Self {
-            forth: Arc::new(Mutex::new(forth)),
             typed: Arc::new(Mutex::new(TypedRuntime::new())),
-            lisp_env: lisp::make_env(),
-            lisp_ctx,
             revision: Arc::new(AtomicU64::new(0)),
             manifest_generation: AtomicU64::new(1),
             submission_gate: tokio::sync::Mutex::new(()),
@@ -871,16 +860,6 @@ impl ProgramRuntime {
         self.submit_as_typed_only(submission, None).await
     }
 
-    /// Explicit migration-only entry point for historical programs. New
-    /// provider, script, scheduler, and ordinary runtime submissions must use
-    /// the shared typed VM instead.
-    pub async fn submit_legacy_compat(
-        &self,
-        submission: ProgramSubmission,
-    ) -> Result<ExecutionOutcome> {
-        self.submit_as_legacy_compat(submission, None).await
-    }
-
     /// Execute source through the shared typed runtime only. This is the entry
     /// point for executable Finch scripts: an unsupported typed construct is a
     /// diagnostic, never permission to silently run a legacy evaluator.
@@ -888,7 +867,7 @@ impl ProgramRuntime {
         &self,
         submission: ProgramSubmission,
     ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, None, None, false, false)
+        self.submit_as_with_optional_typed_effect_sink(submission, None, None, false)
             .await
     }
 
@@ -900,7 +879,7 @@ impl ProgramRuntime {
         submission: ProgramSubmission,
         caller: Option<scheduler::AgentIdentity>,
     ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, caller, None, false, false)
+        self.submit_as_with_optional_typed_effect_sink(submission, caller, None, false)
             .await
     }
 
@@ -912,7 +891,7 @@ impl ProgramRuntime {
         caller: Option<scheduler::AgentIdentity>,
         effect_sink: TypedEffectSink,
     ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, caller, Some(effect_sink), false, false)
+        self.submit_as_with_optional_typed_effect_sink(submission, caller, Some(effect_sink), false)
             .await
     }
 
@@ -938,7 +917,7 @@ impl ProgramRuntime {
         submission: ProgramSubmission,
         effect_sink: TypedEffectSink,
     ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, None, Some(effect_sink), false, true)
+        self.submit_as_with_optional_typed_effect_sink(submission, None, Some(effect_sink), true)
             .await
     }
 
@@ -962,24 +941,11 @@ impl ProgramRuntime {
         self.submit_as_typed_only(submission, caller).await
     }
 
-    /// Explicit migration-only counterpart to [`Self::submit_as`]. This is
-    /// intentionally named so new call sites cannot silently reach a legacy
-    /// evaluator when the typed frontend rejects their source.
-    pub async fn submit_as_legacy_compat(
-        &self,
-        submission: ProgramSubmission,
-        caller: Option<scheduler::AgentIdentity>,
-    ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, caller, None, true, false)
-            .await
-    }
-
     async fn submit_as_with_optional_typed_effect_sink(
         &self,
         submission: ProgramSubmission,
         caller: Option<scheduler::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
-        allow_legacy_fallback: bool,
         defer_program_invocations: bool,
     ) -> Result<ExecutionOutcome> {
         // This is a per-session state transaction, not a process-wide
@@ -1017,12 +983,9 @@ impl ProgramRuntime {
                 defer_program_invocations,
             )
             .await?;
-        let unsupported_typed_source = matches!(execution.status, TypedExecutionStatus::Failed)
-            && execution.diagnostics.iter().all(typed_frontend_unsupported);
-        if !unsupported_typed_source || !allow_legacy_fallback {
-            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-            let suspension = execution.suspension.clone();
-            if let Some(suspension) = suspension.clone() {
+        let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let suspension = execution.suspension.clone();
+        if let Some(suspension) = suspension.clone() {
                 self.pending_typed
                     .lock()
                     .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?
@@ -1044,11 +1007,11 @@ impl ProgramRuntime {
                             defer_program_invocations,
                         },
                     );
-            }
-            if suspension.is_none() {
-                self.release_output_handles(context.execution_id)?;
-            }
-            return Ok(match execution.status {
+        }
+        if suspension.is_none() {
+            self.release_output_handles(context.execution_id)?;
+        }
+        Ok(match execution.status {
                 TypedExecutionStatus::Completed => {
                     let output_revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
                     ExecutionOutcome {
@@ -1138,88 +1101,7 @@ impl ProgramRuntime {
                     backend: ExecutionBackend::TypedVm,
                     elapsed_ms,
                 },
-            });
-        }
-
-        // Legacy compatibility paths still need their coarse source-based
-        // gate. Typed submissions have already been compiled and authorized
-        // above, so their inferred capability set is authoritative.
-        let required_effect = required_effect(submission.language, &submission.source);
-        if !effect_allows(submission.effect, required_effect) {
-            bail!(
-                "declared effect '{}' does not cover derived effect '{}'",
-                submission.effect.as_str(),
-                required_effect.as_str()
-            );
-        }
-        let vm_local = matches!(
-            submission.effect,
-            ExecutionEffect::Pure | ExecutionEffect::VmRead | ExecutionEffect::VmWrite
-        );
-        let enabled_automation = self.automation.is_enabled()
-            && matches!(
-                submission.effect,
-                ExecutionEffect::ExternalRead | ExecutionEffect::ExternalWrite
-            )
-            && is_automation_only_source(submission.language, &submission.source);
-        let enabled_legacy = vm_local || enabled_automation;
-        if !enabled_legacy {
-            bail!(
-                "effect '{}' is not enabled in the legacy runtime",
-                submission.effect.as_str()
-            );
-        }
-        let result = match submission.language {
-            ProgramLanguage::Forth => self
-                .execute_forth(&submission.source, &context, caller.clone())
-                .await
-                .map(|(values, output)| (values, output, ExecutionBackend::Forth)),
-            ProgramLanguage::Lisp => {
-                self.execute_lisp(&submission.source, &context, caller)
-                    .await
-            }
-        };
-        let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-
-        match result {
-            Ok((values, output, backend)) => {
-                // Revision is an execution/state generation, conservatively
-                // incremented after every successful submission. This makes
-                // positional stack composition safe even for words whose stack
-                // mutation cannot yet be proven statically.
-                let output_revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-                Ok(ExecutionOutcome {
-                    execution_id: context.execution_id,
-                    status: ExecutionStatus::Completed,
-                    values,
-                    output,
-                    output_chunks: Vec::new(),
-                    side_effects: Vec::new(),
-                    vm_side_effects: Vec::new(),
-                    effect_journal: Vec::new(),
-                    diagnostics: Vec::new(),
-                    vm_diagnostics: Vec::new(),
-                    required_capabilities: Vec::new(),
-                    approval_prompts: Vec::new(),
-                    input_revision,
-                    output_revision,
-                    effect: submission.effect,
-                    backend,
-                    elapsed_ms,
-                })
-            }
-            Err(error) => Ok(ExecutionOutcome::failed(
-                context.execution_id,
-                input_revision,
-                submission.effect,
-                match submission.language {
-                    ProgramLanguage::Forth => ExecutionBackend::Forth,
-                    ProgramLanguage::Lisp => ExecutionBackend::LispNative,
-                },
-                error.to_string(),
-                elapsed_ms,
-            )),
-        }
+        })
     }
 
     async fn execute_typed_program(
@@ -2629,214 +2511,6 @@ fn secure_resource_path(
     Ok(check)
 }
 
-impl ProgramRuntime {
-    async fn execute_forth(
-        &self,
-        source: &str,
-        context: &ExecutionContext,
-        caller: Option<scheduler::AgentIdentity>,
-    ) -> Result<(Vec<ProgramValue>, String)> {
-        let vm = Arc::clone(&self.forth);
-        let source = source.to_string();
-        let budget = context.budget;
-        let binding = self
-            .agent_scheduler
-            .read()
-            .expect("agent scheduler lock poisoned")
-            .upgrade()
-            .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, caller));
-        tokio::task::spawn_blocking(move || {
-            let mut vm = vm
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Forth VM lock poisoned"))?;
-            vm.set_agent_binding(binding);
-            let before = vm.data_stack().len();
-            let output = vm.exec_with_fuel(&source, budget.forth_fuel)?;
-            let stack = vm.data_stack();
-            let produced = &stack[before.min(stack.len())..];
-            if produced.len() > budget.max_values {
-                bail!("execution produced too many values");
-            }
-            Ok((
-                produced.iter().copied().map(ProgramValue::Int).collect(),
-                truncate_output(output, budget.max_output_bytes),
-            ))
-        })
-        .await?
-    }
-
-    async fn execute_lisp(
-        &self,
-        source: &str,
-        context: &ExecutionContext,
-        caller: Option<scheduler::AgentIdentity>,
-    ) -> Result<(Vec<ProgramValue>, String, ExecutionBackend)> {
-        if let Ok(compiled) = crate::lisp::forth_compiler::compile_source(source) {
-            let (values, output) = self
-                .execute_forth(&compiled.forth_source, context, caller)
-                .await?;
-            return Ok((values, output, ExecutionBackend::LispCompiledToForth));
-        }
-        let binding = self
-            .agent_scheduler
-            .read()
-            .expect("agent scheduler lock poisoned")
-            .upgrade()
-            .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, caller));
-        let lisp_ctx = Arc::new(self.lisp_ctx.with_agent(binding));
-        let future = lisp::run_in(source, self.lisp_env.clone(), lisp_ctx);
-        let value = tokio::time::timeout(
-            std::time::Duration::from_millis(context.budget.timeout_ms),
-            future,
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Lisp execution timed out"))??;
-        Ok((
-            lisp_values(value)?,
-            String::new(),
-            ExecutionBackend::LispNative,
-        ))
-    }
-}
-
-fn is_automation_only_source(language: ProgramLanguage, source: &str) -> bool {
-    let normalized = source.to_ascii_lowercase();
-    let has_automation = normalized.contains("automation-");
-    if !has_automation {
-        return false;
-    }
-    let forbidden = match language {
-        ProgramLanguage::Forth => [
-            "file-write",
-            "file-append",
-            "exec-capture",
-            "applescript",
-            "scatter",
-            "publish",
-            "quarantine",
-        ]
-        .as_slice(),
-        ProgramLanguage::Lisp => {
-            ["ssh-connect", "ssh-exec", "ssh-write-file", "ssh-read-file"].as_slice()
-        }
-    };
-    !forbidden.iter().any(|word| normalized.contains(word))
-}
-
-fn effect_allows(declared: ExecutionEffect, required: ExecutionEffect) -> bool {
-    use ExecutionEffect::*;
-    matches!(
-        (declared, required),
-        (Pure, Pure)
-            | (VmRead, Pure | VmRead)
-            | (VmWrite, Pure | VmRead | VmWrite)
-            | (WorkspaceRead, Pure | VmRead | WorkspaceRead)
-            | (ExternalRead, Pure | VmRead | ExternalRead)
-            | (
-                WorkspaceWrite,
-                Pure | VmRead | VmWrite | WorkspaceRead | WorkspaceWrite
-            )
-            | (
-                ExternalWrite,
-                Pure | VmRead | VmWrite | ExternalRead | ExternalWrite
-            )
-            | (Destructive, _)
-            | (Unclassified, _)
-    )
-}
-
-fn required_effect(language: ProgramLanguage, source: &str) -> ExecutionEffect {
-    let uses_typed_host_word = source.to_ascii_lowercase().contains("file-read")
-        || source.to_ascii_lowercase().contains("file-write")
-        || source.to_ascii_lowercase().contains("automation-");
-    if language == ProgramLanguage::Lisp
-        && !uses_typed_host_word
-        && crate::lisp::forth_compiler::compile_source(source).is_ok()
-    {
-        return ExecutionEffect::Pure;
-    }
-    let normalized = source.to_ascii_lowercase();
-    let contains_any = |words: &[&str]| words.iter().any(|word| normalized.contains(word));
-
-    if contains_any(&[
-        "automation-click",
-        "automation-type",
-        "file-write",
-        "ssh-connect",
-        "ssh-auth-key",
-        "ssh-exec",
-        "ssh-write-file",
-        "file-append",
-        "b64>file",
-        "xlsx-write-cell",
-        "applescript",
-        "exec-capture",
-        "quarantine",
-        "zip-send",
-        "zip-recv",
-        "scatter",
-        "publish",
-        "join-registry",
-        "leave-registry",
-    ]) {
-        return ExecutionEffect::ExternalWrite;
-    }
-    if contains_any(&[
-        "automation-displays",
-        "automation-windows",
-        "ssh-read-file",
-        "ssh-info",
-        "scan-procs",
-        "scan-net",
-        "scan-startup",
-        "peers-discover",
-    ]) {
-        return ExecutionEffect::ExternalRead;
-    }
-    if contains_any(&["agent-spawn", "agent-cancel"]) {
-        return ExecutionEffect::VmWrite;
-    }
-    if contains_any(&["mem-store", "mem-consolidate"]) {
-        return ExecutionEffect::VmWrite;
-    }
-    if contains_any(&["schedule-create", "schedule-manage"]) {
-        return ExecutionEffect::VmWrite;
-    }
-    if contains_any(&["mem-recall", "mem-read"]) {
-        return ExecutionEffect::VmRead;
-    }
-    if contains_any(&["process-run"]) {
-        return ExecutionEffect::ExternalWrite;
-    }
-    if contains_any(&["network-connect", "network-send"]) {
-        return ExecutionEffect::ExternalWrite;
-    }
-    if contains_any(&["agent-poll", "agent-await"]) {
-        return ExecutionEffect::VmRead;
-    }
-    if contains_any(&[
-        "file-fetch",
-        "file-read",
-        "file-slice",
-        "file-size",
-        "file-sha256",
-        "glob-pool",
-        "glob-count",
-        "scan-file",
-        "scan-dir",
-        "scan-strings",
-        "xlsx@",
-        "xlsx-sheets",
-        "(load ",
-    ]) {
-        return ExecutionEffect::WorkspaceRead;
-    }
-    if contains_any(&["(define ", "(set! ", "variable ", "constant ", ": "]) {
-        return ExecutionEffect::VmWrite;
-    }
-    ExecutionEffect::Pure
-}
-
 impl Default for ProgramRuntime {
     fn default() -> Self {
         Self::new()
@@ -2854,33 +2528,6 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
     output.truncate(boundary);
     output.push_str("\n[output truncated]");
     output
-}
-
-fn lisp_values(value: Val) -> Result<Vec<ProgramValue>> {
-    match value {
-        Val::Nil => Ok(Vec::new()),
-        Val::List(values) => values.into_iter().map(lisp_value).collect(),
-        other => Ok(vec![lisp_value(other)?]),
-    }
-}
-
-fn lisp_value(value: Val) -> Result<ProgramValue> {
-    Ok(match value {
-        Val::Nil => ProgramValue::Nil,
-        Val::Bool(value) => ProgramValue::Bool(value),
-        Val::Int(value) => ProgramValue::Int(value),
-        Val::Float(value) => ProgramValue::Float(value),
-        Val::Str(value) => ProgramValue::String(value),
-        Val::Symbol(value) => ProgramValue::Symbol(value),
-        Val::Bytes(value) => ProgramValue::Bytes(value),
-        Val::List(values) => ProgramValue::List(
-            values
-                .into_iter()
-                .map(lisp_value)
-                .collect::<Result<Vec<_>>>()?,
-        ),
-        other => bail!("Lisp value is not portable: {other}"),
-    })
 }
 
 fn approval_prompts(
@@ -2925,18 +2572,6 @@ fn approval_prompts(
             })
         })
         .collect()
-}
-
-fn typed_frontend_unsupported(diagnostic: &VmDiagnostic) -> bool {
-    matches!(
-        diagnostic.code.as_str(),
-        "E-LINK-002"
-            | "E-NAME-001"
-            | "E-TYPE-005"
-            | "E-LISP-DEF-002"
-            | "E-FORTH-SIG-001"
-            | "E-FORTH-DEF-003"
-    )
 }
 
 fn typed_values(values: Vec<TypedValue>) -> Result<Vec<ProgramValue>> {
@@ -3058,29 +2693,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_legacy_forth_compatibility_persists_state() {
-        let runtime = ProgramRuntime::new();
-        let define = runtime
-            .submit_legacy_compat(submission(
-                ProgramLanguage::Forth,
-                ": runtime-double 2 * ;",
-                ExecutionEffect::VmWrite,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(define.status, ExecutionStatus::Completed);
-        let call = runtime
-            .submit_legacy_compat(submission(
-                ProgramLanguage::Forth,
-                "21 runtime-double",
-                ExecutionEffect::VmRead,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(call.values, vec![ProgramValue::Int(42)]);
-    }
-
-    #[tokio::test]
     async fn typed_only_submission_never_uses_the_legacy_forth_interpreter() {
         let runtime = ProgramRuntime::new();
         let outcome = runtime
@@ -3109,48 +2721,6 @@ mod tests {
             .vocabulary
             .iter()
             .all(|word| word.name != "legacy-double"));
-    }
-
-    #[tokio::test]
-    async fn ordinary_submission_is_typed_only_and_legacy_requires_an_explicit_api() {
-        let runtime = ProgramRuntime::new();
-        let legacy = submission(
-            ProgramLanguage::Forth,
-            ": compatibility-double 2 * ;",
-            ExecutionEffect::VmWrite,
-        );
-        let strict = runtime.submit(legacy.clone()).await.unwrap();
-        assert_eq!(strict.status, ExecutionStatus::Failed);
-        assert!(strict
-            .vm_diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "E-FORTH-SIG-001"));
-
-        let compatible = runtime.submit_legacy_compat(legacy).await.unwrap();
-        assert_eq!(compatible.backend, ExecutionBackend::Forth);
-        assert_eq!(compatible.status, ExecutionStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn explicit_legacy_lisp_compatibility_persists_state() {
-        let runtime = ProgramRuntime::new();
-        runtime
-            .submit_legacy_compat(submission(
-                ProgramLanguage::Lisp,
-                "(define runtime-n 40)",
-                ExecutionEffect::VmWrite,
-            ))
-            .await
-            .unwrap();
-        let outcome = runtime
-            .submit_legacy_compat(submission(
-                ProgramLanguage::Lisp,
-                "(+ runtime-n 2)",
-                ExecutionEffect::VmRead,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(outcome.values, vec![ProgramValue::Int(42)]);
     }
 
     #[tokio::test]
@@ -3193,20 +2763,6 @@ mod tests {
         request.manifest_generation = 0;
         let error = runtime.submit(request).await.unwrap_err();
         assert!(error.to_string().contains("stale VM manifest"));
-    }
-
-    #[tokio::test]
-    async fn legacy_compatibility_rejects_effects_not_yet_brokered() {
-        let runtime = ProgramRuntime::new();
-        let error = runtime
-            .submit_legacy_compat(submission(
-                ProgramLanguage::Forth,
-                "s\" x\" file-fetch",
-                ExecutionEffect::WorkspaceRead,
-            ))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("not enabled"));
     }
 
     #[tokio::test]
