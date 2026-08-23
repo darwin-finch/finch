@@ -2078,7 +2078,44 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
     // still Finch wire source, never user-facing prose to print verbatim.
     // Running it here keeps the daemon and --cloud-only paths semantically
     // identical without handing workspace/UI authority to the daemon.
-    let outcome = execute_one_shot_wire_source(&program_runtime, &response).await?;
+    let outcome = match execute_one_shot_wire_source(&program_runtime, &response).await {
+        Ok(outcome) if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed => {
+            print!("{}", outcome.output);
+            return Ok(());
+        }
+        Ok(outcome) if can_repair_one_shot_wire_outcome(&outcome) => {
+            let diagnostic = outcome
+                .diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+            // A correction is source-only.  Do not give it the tool manifest:
+            // a malformed, effect-free response must not turn into a new
+            // arbitrary host action merely because it is being repaired.
+            let repair = client
+                .query_with_tools_with_system(
+                    &one_shot_wire_repair_request(&response, &diagnostic),
+                    Some(vm_wire_system_prompt()),
+                    Vec::new(),
+                    &guard,
+                )
+                .await?;
+            execute_one_shot_wire_source(&program_runtime, &repair).await?
+        }
+        Ok(outcome) => outcome,
+        Err(error) if is_repairable_one_shot_wire_diagnostic(&error.to_string()) => {
+            let repair = client
+                .query_with_tools_with_system(
+                    &one_shot_wire_repair_request(&response, &error.to_string()),
+                    Some(vm_wire_system_prompt()),
+                    Vec::new(),
+                    &guard,
+                )
+                .await?;
+            execute_one_shot_wire_source(&program_runtime, &repair).await?
+        }
+        Err(error) => return Err(error),
+    };
     if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
         print!("{}", outcome.output);
     } else {
