@@ -78,6 +78,12 @@
       "expected_output": "Hello from standard Forth output literal"
     },
     {
+      "name": "forth-explicit-line-break",
+      "forth": "s\"first\" say cr s\"second\" say",
+      "lisp": "(begin (say \"first\") (say \"\\n\") (say \"second\"))",
+      "expected_output": "first\nsecond"
+    },
+    {
       "name": "progressive-computed-response-spacing",
       "forth": "s\"the result of 2+3 is \" say 2 3 + int-to-string space str-cat say s\"is that correct?\" say",
       "lisp": "(begin (say \"the result of 2+3 is \") (say (str-cat (int-to-string (+ 2 3)) \" \")) (say \"is that correct?\"))",
