@@ -622,6 +622,13 @@ mod script_tests {
         assert!(request.contains("E-LINK-002"));
     }
 
+    #[test]
+    fn daemon_and_teacher_one_shot_paths_share_the_vm_wire_contract() {
+        let prompt = vm_wire_system_prompt();
+        assert!(prompt.contains("Every text response is exactly one complete executable Finch program"));
+        assert!(prompt.contains("Default to Lisp"));
+    }
+
     #[tokio::test]
     async fn one_shot_wire_receiver_executes_a_daemon_style_final_response() {
         let runtime = finch::runtime::ProgramRuntime::new();
@@ -2059,7 +2066,12 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
 
     let guard = executor.lock().await;
     let response = client
-        .query_with_tools(query, tool_definitions, &guard)
+        .query_with_tools_with_system(
+            query,
+            Some(vm_wire_system_prompt()),
+            tool_definitions,
+            &guard,
+        )
         .await?;
     // The daemon owns model inference and tool-loop routing, but this CLI
     // process owns the local typed runtime.  A final text response is therefore
@@ -2107,12 +2119,7 @@ async fn run_query_teacher_only(
     // Keep one-shot provider calls on the same wire contract as the REPL.
     // Otherwise `finch --cloud-only query` is a misleading test surface: it
     // asks the provider for ordinary prose and never validates a VM program.
-    const VM_WIRE_BOOT: &str = include_str!("../vocabulary/BOOT.md");
-    let system = format!(
-        "{}\n\n{}",
-        finch::generators::claude::CODING_SYSTEM_PROMPT,
-        VM_WIRE_BOOT
-    );
+    let system = vm_wire_system_prompt();
 
     const MAX_TURNS: usize = 25;
     let mut wire_repair_requested = false;
@@ -2212,6 +2219,18 @@ async fn run_query_teacher_only(
 
     eprintln!("⚠️  Reached max tool turns without a final answer");
     Ok(())
+}
+
+/// The same provider-facing contract accompanies every one-shot transport.
+/// Keep it out of an ordinary user message so a user request cannot be
+/// confused with the wire protocol itself.
+fn vm_wire_system_prompt() -> String {
+    const VM_WIRE_BOOT: &str = include_str!("../vocabulary/BOOT.md");
+    format!(
+        "{}\n\n{}",
+        finch::generators::claude::CODING_SYSTEM_PROMPT,
+        VM_WIRE_BOOT
+    )
 }
 
 /// Submit one completed one-shot provider response through the same typed VM

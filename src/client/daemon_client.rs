@@ -342,13 +342,35 @@ impl DaemonClient {
         tools: Vec<ToolDefinition>,
         tool_executor: &ToolExecutor,
     ) -> Result<String> {
+        self.query_with_tools_with_system(initial_query, None, tools, tool_executor)
+            .await
+    }
+
+    /// Run the local tool loop with an optional provider system contract.
+    ///
+    /// The daemon remains responsible for inference, while the caller may
+    /// define a transport-neutral protocol such as Finch's typed VM wire.
+    pub async fn query_with_tools_with_system(
+        &self,
+        initial_query: &str,
+        system: Option<String>,
+        tools: Vec<ToolDefinition>,
+        tool_executor: &ToolExecutor,
+    ) -> Result<String> {
         let model = self.default_model_profile().await?;
-        let mut messages = vec![Message {
+        let mut messages = Vec::new();
+        if let Some(system) = system {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: vec![ContentBlock::Text { text: system }],
+            });
+        }
+        messages.push(Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
                 text: initial_query.to_string(),
             }],
-        }];
+        });
 
         const MAX_TURNS: usize = 30;
         let mut turn = 0;
