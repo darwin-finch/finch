@@ -106,7 +106,10 @@ pub enum WorkUnitPresentation {
     #[default]
     Assistant,
     ProgramSource { language: String },
-    ProgramOutput,
+    /// Plain `say` output has no title or conversational chrome. Explicit
+    /// VM output handles retain their title while independently tracking a
+    /// body, transient status, and progress.
+    ProgramOutput { title: Option<String> },
 }
 
 /// A single tool-call sub-item rendered below the WorkUnit header
@@ -141,6 +144,12 @@ struct WorkUnitInner {
     /// Elapsed time captured when the unit completed (stable for scrollback display)
     elapsed_at_finish: Option<std::time::Duration>,
     presentation: WorkUnitPresentation,
+    /// Host/UI state distinct from the output body. A VM `output-status`
+    /// must not erase prior `output-append`/`output-replace` content.
+    transient_status: Option<String>,
+    /// Bounded or indeterminate progress reported by an explicit output
+    /// handle. Plain `say` output never uses this field.
+    progress: Option<(u64, Option<u64>)>,
 }
 
 // ============================================================================
@@ -176,6 +185,8 @@ impl WorkUnit {
                 status: MessageStatus::InProgress,
                 elapsed_at_finish: None,
                 presentation: WorkUnitPresentation::Assistant,
+                transient_status: None,
+                progress: None,
             })),
         }
     }
@@ -232,7 +243,36 @@ impl WorkUnit {
         self.inner
             .write()
             .unwrap_or_else(|p| p.into_inner())
-            .presentation = WorkUnitPresentation::ProgramOutput;
+            .presentation = WorkUnitPresentation::ProgramOutput { title: None };
+    }
+
+    /// Render this unit as an independently addressable VM output handle.
+    /// The title is presentation metadata supplied by `output-open`, not an
+    /// emitted response fragment.
+    pub fn set_output_handle(&self, title: impl Into<String>) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .presentation = WorkUnitPresentation::ProgramOutput {
+            title: Some(title.into()),
+        };
+    }
+
+    /// Update transient status independently from the durable visible body.
+    pub fn set_transient_status(&self, status: Option<String>) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .transient_status = status;
+    }
+
+    /// Update an explicit output handle's progress independently from its
+    /// body and status. `None` represents indeterminate progress.
+    pub fn set_output_progress(&self, completed: u64, total: Option<u64>) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .progress = Some((completed, total));
     }
 
     /// Add a running tool-call sub-row; returns its index for later updates.
@@ -355,10 +395,10 @@ impl Message for WorkUnit {
                 // effect, not an assistant message or a spinner; hiding it
                 // until completion made `say` chunks appear and then vanish
                 // during longer programs.
-                if matches!(inner.presentation, WorkUnitPresentation::ProgramOutput)
-                    && !inner.response_text.is_empty()
+                if matches!(inner.presentation, WorkUnitPresentation::ProgramOutput { .. })
+                    && program_output_has_visible_state(&inner)
                 {
-                    return inner.response_text.clone();
+                    return format_program_output(&inner);
                 }
 
                 // Time-driven throb: frame changes every 200 ms, no external counter
@@ -423,12 +463,12 @@ impl Message for WorkUnit {
                         source.push_str(&timing);
                         source
                     }
-                    WorkUnitPresentation::ProgramOutput => {
+                    WorkUnitPresentation::ProgramOutput { .. } => {
                         // VM output is a portable side effect, not assistant
                         // prose. Preserve it exactly: timing belongs to the
                         // source/activity WorkUnit and must never become part
                         // of a `say`/output-handle payload.
-                        inner.response_text.clone()
+                        format_program_output(&inner)
                     }
                 };
 
@@ -459,6 +499,57 @@ impl Message for WorkUnit {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
+    !inner.response_text.is_empty()
+        || inner.transient_status.is_some()
+        || inner.progress.is_some()
+        || matches!(
+            &inner.presentation,
+            WorkUnitPresentation::ProgramOutput { title: Some(_) }
+        )
+}
+
+/// Keep reactive output-handle state structurally distinct from the emitted
+/// response body. Plain `say` output remains byte-for-byte unchanged, while
+/// an explicit handle gets a compact labelled view that can be updated in
+/// place by the shadow-buffer renderer.
+fn format_program_output(inner: &WorkUnitInner) -> String {
+    let WorkUnitPresentation::ProgramOutput { title } = &inner.presentation else {
+        return inner.response_text.clone();
+    };
+    let Some(title) = title else {
+        return inner.response_text.clone();
+    };
+
+    let mut lines = vec![title.clone()];
+    if !inner.response_text.is_empty() {
+        lines.push(inner.response_text.clone());
+    }
+    if let Some(status) = &inner.transient_status {
+        lines.push(status.clone());
+    }
+    if let Some((completed, total)) = inner.progress {
+        lines.push(format_progress(completed, total));
+    }
+    lines.join("\n")
+}
+
+fn format_progress(completed: u64, total: Option<u64>) -> String {
+    const WIDTH: usize = 20;
+    match total {
+        Some(total) if total > 0 => {
+            let filled = ((completed.saturating_mul(WIDTH as u64) / total) as usize).min(WIDTH);
+            format!(
+                "[{}{}] {completed} / {total}",
+                "█".repeat(filled),
+                "░".repeat(WIDTH - filled)
+            )
+        }
+        Some(total) => format!("[{}] {completed} / {total}", "░".repeat(WIDTH)),
+        None => format!("[{}] {completed}", "…".repeat(WIDTH)),
+    }
+}
 
 fn format_row(row: &WorkRow) -> String {
     match &row.status {
@@ -683,6 +774,29 @@ mod tests {
         output.add_tokens("one two");
         output.set_complete();
         assert_eq!(output.format(&colors()), "hello");
+    }
+
+    #[test]
+    fn explicit_output_handle_keeps_body_status_and_progress_separate() {
+        let output = WorkUnit::new("ignored");
+        output.set_output_handle("Download");
+        output.append_response("received metadata");
+        output.set_transient_status(Some("transferring".into()));
+        output.set_output_progress(2, Some(5));
+
+        let in_progress = output.format(&colors());
+        assert!(in_progress.contains("Download"));
+        assert!(in_progress.contains("received metadata"));
+        assert!(in_progress.contains("transferring"));
+        assert!(in_progress.contains("2 / 5"));
+
+        output.set_transient_status(None);
+        output.set_complete();
+        let completed = output.format(&colors());
+        assert!(completed.contains("received metadata"));
+        assert!(completed.contains("2 / 5"));
+        assert!(!completed.contains("transferring"));
+        assert!(!completed.contains('⏺'));
     }
 
     #[test]

@@ -70,7 +70,7 @@ impl VmOutputProjection {
                 // assistant reply.  Give it the same plain output chrome as
                 // `say` output so progress/status updates never acquire the
                 // conversational bullet merely because they are addressable.
-                unit.set_program_output();
+                unit.set_output_handle(text.unwrap_or("Working"));
                 self.handles
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -81,27 +81,30 @@ impl VmOutputProjection {
                     unit.append_response(text);
                 }
             }
-            UiOperation::Replace | UiOperation::Status => {
+            UiOperation::Replace => {
                 if let (Some(unit), Some(text)) = (self.unit(handle), text) {
                     unit.set_response(text);
                 }
             }
+            UiOperation::Status => {
+                if let (Some(unit), Some(text)) = (self.unit(handle), text) {
+                    unit.set_transient_status(Some(text.to_string()));
+                }
+            }
             UiOperation::Progress => {
                 if let (Some(unit), Some(progress)) = (self.unit(handle), progress) {
-                    let detail = match progress.total {
-                        Some(total) => format!("{} / {}", progress.completed, total),
-                        None => format!("{}", progress.completed),
-                    };
-                    unit.set_response(detail);
+                    unit.set_output_progress(progress.completed, progress.total);
                 }
             }
             UiOperation::Complete => {
                 if let Some(unit) = self.remove_unit(handle) {
+                    unit.set_transient_status(None);
                     unit.set_complete();
                 }
             }
             UiOperation::Fail => {
                 if let Some(unit) = self.remove_unit(handle) {
+                    unit.set_transient_status(None);
                     if let Some(text) = text {
                         unit.set_response(text);
                     }
@@ -456,6 +459,12 @@ mod tests {
         });
         projection.project(&output_effect(UiOperation::Create, "download", Some("Download"), None));
         projection.project(&output_effect(
+            UiOperation::Status,
+            "download",
+            Some("connecting"),
+            None,
+        ));
+        projection.project(&output_effect(
             UiOperation::Progress,
             "download",
             None,
@@ -469,11 +478,17 @@ mod tests {
         let messages = manager.get_messages();
         assert_eq!(messages.len(), 2);
         assert_eq!(response.content(), "answer next");
-        assert_eq!(messages[1].content(), "2 / 5");
+        assert!(messages[1].content().is_empty());
         assert_eq!(messages[1].status(), crate::cli::messages::MessageStatus::Complete);
-        assert_eq!(
-            messages[1].format(&crate::config::ColorScheme::default()),
-            "2 / 5",
+        let rendered = messages[1].format(&crate::config::ColorScheme::default());
+        assert!(rendered.contains("Download"));
+        assert!(rendered.contains("2 / 5"));
+        assert!(
+            !rendered.contains("connecting"),
+            "transient status must disappear after output-complete"
+        );
+        assert!(
+            !rendered.contains('⏺'),
             "explicit VM output handles must not render as assistant replies"
         );
     }
