@@ -561,6 +561,22 @@ mod script_tests {
     }
 
     #[tokio::test]
+    async fn executable_lisp_script_expands_bounded_typed_syntax_templates() {
+        let script = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            script.path(),
+            "#!/usr/bin/env finch --exec --language=lisp\n\
+             (define-syntax (answer value) (+ value 1))\n\
+             (say (int-to-string (answer 41)))\n",
+        )
+        .unwrap();
+
+        run_finch_script(script.path().to_path_buf(), false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn direct_forth_uses_the_typed_runtime_and_rejects_legacy_definitions() {
         run_direct_typed_source(
             finch::programs::ProgramLanguage::Forth,
