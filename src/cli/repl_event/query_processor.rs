@@ -80,6 +80,183 @@ async fn execute_direct_wire_response(
         .await
 }
 
+/// A rejected provider response may be repaired once only when the VM proved
+/// that it never began an external operation.  In particular, an approval,
+/// suspension, cancellation, timeout, or journaled host effect is an execution
+/// boundary rather than a syntax-editing opportunity.
+fn is_repairable_wire_outcome(outcome: &crate::runtime::outcome::ExecutionOutcome) -> bool {
+    use crate::runtime::outcome::ExecutionStatus;
+
+    if outcome.status != ExecutionStatus::Failed
+        || !outcome.side_effects.is_empty()
+        || !outcome.vm_side_effects.is_empty()
+        || !outcome.effect_journal.is_empty()
+    {
+        return false;
+    }
+
+    outcome
+        .vm_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .chain(outcome.diagnostics.iter().map(String::as_str))
+        .any(is_repairable_wire_diagnostic)
+}
+
+fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
+    matches!(
+        diagnostic,
+        value if value.starts_with("E-READ-")
+            || value.starts_with("E-TYPE-")
+            || value.starts_with("E-STACK-")
+            || value.starts_with("E-LISP-")
+            || value.starts_with("E-FORTH-")
+            || value.starts_with("E-LINK-")
+            || value.starts_with("E-CAP-")
+    )
+}
+
+fn wire_repair_messages(
+    messages: &[crate::claude::Message],
+    rejected_source: &str,
+    diagnostic: &str,
+) -> Vec<crate::claude::Message> {
+    let mut repair_messages = messages.to_vec();
+    repair_messages.push(crate::claude::Message::assistant(rejected_source));
+    repair_messages.push(crate::claude::Message::user(format!(
+        "The preceding Finch VM wire program was rejected before execution. \
+         Re-emit exactly one complete raw Finch Lisp or Co-Forth program; do not use Markdown, prose, or tools.\n\n\
+         Rejected source:\n---\n{rejected_source}\n---\n\
+         Diagnostic:\n{diagnostic}"
+    )));
+    repair_messages
+}
+
+struct WireExecution {
+    source_for_history: String,
+    response: String,
+}
+
+/// Execute one provider wire response and, for a safe rejected program, ask
+/// the same model for precisely one source-level correction.  Each source and
+/// each output owns a separate WorkUnit, so the failed program never vanishes
+/// from scrollback when the replacement succeeds.
+async fn execute_wire_with_single_repair(
+    runtime: &crate::runtime::ProgramRuntime,
+    output_manager: Arc<OutputManager>,
+    generator: Arc<dyn Generator>,
+    messages: &[crate::claude::Message],
+    source: String,
+) -> WireExecution {
+    let output_unit = output_manager.start_work_unit("VM program output");
+    output_unit.set_program_output();
+    let initial = execute_direct_wire_response(
+        runtime,
+        Arc::clone(&output_manager),
+        Arc::clone(&output_unit),
+        source.clone(),
+    )
+    .await;
+
+    let (diagnostic, repairable) = match initial {
+        Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+            output_unit.set_complete();
+            return WireExecution {
+                source_for_history: source,
+                response: outcome.output,
+            };
+        }
+        Ok(outcome) => {
+            let detail = outcome
+                .diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+            (detail, is_repairable_wire_outcome(&outcome))
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            (detail.clone(), is_repairable_wire_diagnostic(&detail))
+        }
+    };
+
+    output_unit.append_response(&format!("VM wire error: {diagnostic}"));
+    if !repairable {
+        output_unit.set_complete();
+        return WireExecution {
+            source_for_history: source,
+            response: diagnostic,
+        };
+    }
+
+    let repair_messages = wire_repair_messages(messages, &source, &diagnostic);
+    let repair = generator.generate(repair_messages, None).await;
+    let Ok(repair) = repair else {
+        output_unit.set_complete();
+        return WireExecution {
+            source_for_history: source,
+            response: diagnostic,
+        };
+    };
+    if !repair.tool_uses.is_empty() || repair.text.trim().is_empty() {
+        output_unit.set_complete();
+        return WireExecution {
+            source_for_history: source,
+            response: diagnostic,
+        };
+    }
+    output_unit.set_complete();
+
+    let repaired_source = recover_fenced_wire_program(&repair.text);
+    let repair_source_unit = output_manager.start_work_unit("VM program repair");
+    repair_source_unit.set_program_source(
+        crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
+    );
+    repair_source_unit.set_response(repaired_source.clone());
+    repair_source_unit.set_complete();
+
+    let repair_output_unit = output_manager.start_work_unit("VM repaired program output");
+    repair_output_unit.set_program_output();
+    match execute_direct_wire_response(
+        runtime,
+        output_manager,
+        Arc::clone(&repair_output_unit),
+        repaired_source.clone(),
+    )
+    .await
+    {
+        Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+            repair_output_unit.set_complete();
+            WireExecution {
+                source_for_history: repaired_source,
+                response: outcome.output,
+            }
+        }
+        Ok(outcome) => {
+            let detail = outcome
+                .diagnostics
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+            repair_output_unit.append_response(&format!("VM wire error: {detail}"));
+            repair_output_unit.set_complete();
+            WireExecution {
+                source_for_history: repaired_source,
+                response: detail,
+            }
+        }
+        Err(error) => {
+            let detail = format!("VM wire error: {error}");
+            repair_output_unit.append_response(&detail);
+            repair_output_unit.set_complete();
+            WireExecution {
+                source_for_history: repaired_source,
+                response: detail,
+            }
+        }
+    }
+}
+
 use super::events::ReplEvent;
 use super::query_state::{QueryState, QueryStateManager};
 use super::tool_execution::ToolExecutionCoordinator;
@@ -652,37 +829,19 @@ pub(crate) async fn process_query_with_tools(
                 work_unit.set_program_source(wire_language.as_str());
                 work_unit.set_response(wire_source.clone());
                 work_unit.set_complete();
-                let output_unit = output_manager.start_work_unit("VM program output");
-                output_unit.set_program_output();
-                let wire_result = execute_direct_wire_response(
+                let wire_execution = execute_wire_with_single_repair(
                     program_runtime.as_ref(),
                     Arc::clone(&output_manager),
-                    Arc::clone(&output_unit),
+                    Arc::clone(&generator),
+                    &messages,
                     wire_source.clone(),
                 )
                 .await;
-                let response = match wire_result {
-                    Ok(outcome) => {
-                        if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed {
-                            outcome.output
-                        } else {
-                            let detail = outcome
-                                .diagnostics
-                                .first()
-                                .cloned()
-                                .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-                            output_unit.append_response(&format!("VM wire error: {detail}"));
-                            detail
-                        }
-                    }
-                    Err(error) => {
-                        let detail = format!("VM wire error: {error}");
-                        output_unit.append_response(&detail);
-                        detail
-                    }
-                };
-                output_unit.set_complete();
-                conversation.write().await.add_assistant_message(wire_source);
+                let response = wire_execution.response;
+                conversation
+                    .write()
+                    .await
+                    .add_assistant_message(wire_execution.source_for_history);
                 query_states
                     .update_state(query_id, QueryState::Completed { response: response.clone() })
                     .await;
@@ -704,7 +863,7 @@ pub(crate) async fn process_query_with_tools(
     let verb = crate::cli::messages::random_spinner_verb();
     let work_unit = output_manager.start_work_unit(verb);
     match generator
-        .generate(messages, Some((*tool_definitions).clone()))
+        .generate(messages.clone(), Some((*tool_definitions).clone()))
         .await
     {
         Ok(response) => {
@@ -783,36 +942,19 @@ pub(crate) async fn process_query_with_tools(
             work_unit.set_program_source(wire_language.as_str());
             work_unit.set_response(wire_source.clone());
             work_unit.set_complete();
-            let output_unit = output_manager.start_work_unit("VM program output");
-            output_unit.set_program_output();
-            let wire_result = execute_direct_wire_response(
+            let wire_execution = execute_wire_with_single_repair(
                 program_runtime.as_ref(),
                 Arc::clone(&output_manager),
-                Arc::clone(&output_unit),
+                Arc::clone(&generator),
+                &messages,
                 wire_source.clone(),
             )
             .await;
-            let rendered_response = match wire_result {
-                Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
-                    outcome.output
-                }
-                Ok(outcome) => {
-                    let detail = outcome
-                        .diagnostics
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
-                    output_unit.append_response(&format!("VM wire error: {detail}"));
-                    detail
-                }
-                Err(error) => {
-                    let detail = format!("VM wire error: {error}");
-                    output_unit.append_response(&detail);
-                    detail
-                }
-            };
-            output_unit.set_complete();
-            conversation.write().await.add_assistant_message(wire_source);
+            let rendered_response = wire_execution.response;
+            conversation
+                .write()
+                .await
+                .add_assistant_message(wire_execution.source_for_history);
             query_states
                 .update_state(
                     query_id,
@@ -1113,5 +1255,39 @@ mod tests {
             recover_fenced_wire_program("intro\n```forth\ns\"hello\" say\n```"),
             "intro\n```forth\ns\"hello\" say\n```"
         );
+    }
+
+    #[test]
+    fn wire_repair_prompt_preserves_the_rejected_program_and_requires_raw_source() {
+        let messages = vec![crate::claude::Message::user("say hello")];
+        let repair = wire_repair_messages(&messages, "Hello!", "E-LINK-002: unknown word");
+        assert_eq!(repair.len(), 3);
+        assert_eq!(repair[1].role, "assistant");
+        assert_eq!(repair[1].content[0].as_text(), Some("Hello!"));
+        let prompt = repair[2].content[0].as_text().unwrap();
+        assert!(prompt.contains("exactly one complete raw Finch Lisp or Co-Forth program"));
+        assert!(prompt.contains("Hello!"));
+        assert!(prompt.contains("E-LINK-002"));
+    }
+
+    #[test]
+    fn wire_repair_classifier_excludes_runtime_and_external_boundaries() {
+        assert!(is_repairable_wire_diagnostic("E-READ-004: unterminated string"));
+        assert!(is_repairable_wire_diagnostic("E-LINK-002: unknown word"));
+        assert!(!is_repairable_wire_diagnostic("E-LIMIT-001: fuel exhausted"));
+
+        let mut outcome = crate::runtime::outcome::ExecutionOutcome::failed(
+            Uuid::nil(),
+            0,
+            crate::programs::ExecutionEffect::Pure,
+            crate::runtime::outcome::ExecutionBackend::TypedVm,
+            "E-TYPE-002: expected int",
+            0,
+        );
+        assert!(is_repairable_wire_outcome(&outcome));
+        outcome.side_effects.push(crate::vm::interpreter::HostSideEffect::Emit {
+            text: "partial".into(),
+        });
+        assert!(!is_repairable_wire_outcome(&outcome));
     }
 }
