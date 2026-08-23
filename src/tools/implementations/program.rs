@@ -959,7 +959,7 @@ impl Tool for GetVmStateTool {
     }
 
     fn description(&self) -> &str {
-        "Return the current Finch VM manifest generation and state revision."
+        "Return compact Finch VM manifest, revision, stack, and capability state. Use search_word or inspect_word to discover vocabulary contracts."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -977,10 +977,13 @@ impl Tool for GetVmStateTool {
             "revision": state.revision,
             "stack": state.stack,
             "stack_top": state.stack.last(),
-            "vocabulary": state.vocabulary,
+            "stack_depth": state.stack.len(),
+            "vocabulary_count": state.vocabulary.len(),
             "typed_vocabulary_count": state.typed_vocabulary.len(),
+            "granted_capabilities": state.granted_capabilities,
             "languages": ["forth", "lisp"],
             "effects": ["pure", "vm_read", "vm_write", "external_read", "external_write"],
+            "vocabulary_discovery": "Use search_word(query) followed by inspect_word(name) for targeted contracts.",
             "automation": self.runtime.automation().availability()
         })
         .to_string())
@@ -1032,6 +1035,36 @@ mod tests {
             .unwrap();
         assert!(shared.contains("otherwise treats the source as Forth"));
         assert!(shared.contains("s\"Your response to the human\" say"));
+    }
+
+    #[tokio::test]
+    async fn vm_state_is_compact_and_points_to_targeted_vocabulary_discovery() {
+        let tool = GetVmStateTool::new(Arc::new(ProgramRuntime::new()));
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            stack: None,
+            poset: None,
+        };
+        let result: Value = serde_json::from_str(
+            &tool.execute(json!({}), &context).await.unwrap(),
+        )
+        .unwrap();
+
+        assert!(result.get("vocabulary").is_none());
+        assert!(result["vocabulary_count"].as_u64().is_some_and(|count| count > 0));
+        assert!(result["typed_vocabulary_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0));
+        assert!(result["vocabulary_discovery"]
+            .as_str()
+            .is_some_and(|message| message.contains("search_word")));
     }
 
     #[tokio::test]
