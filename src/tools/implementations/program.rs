@@ -72,6 +72,17 @@ struct SourceSyntaxEntry {
     description: &'static str,
 }
 
+fn source_syntax_contract(entry: &SourceSyntaxEntry) -> Value {
+    json!({
+        "kind": "syntax",
+        "name": entry.name,
+        "languages": entry.languages,
+        "description": entry.description,
+        "source": null,
+        "source_note": "This is verified source syntax, not a callable runtime word and therefore has no independent stack signature. Retrieve get_language_definition for its complete grammar and worked examples.",
+    })
+}
+
 const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
     SourceSyntaxEntry {
         name: "if",
@@ -275,7 +286,7 @@ impl Tool for InspectVmWordTool {
     }
 
     fn description(&self) -> &str {
-        "Compatibility inspection for one built-in typed Finch VM word. Returns its exact signature, capability requirements, semantics, both source spellings, and a worked example. Prefer inspect_word for canonical core or persisted-definition inspection; inspect_program remains the legacy persisted-definition alias."
+        "Compatibility inspection for one built-in typed Finch VM word or verified Lisp/Co-Forth source form. Runtime words return signature/capability contracts; syntax forms return their language grammar role. Prefer inspect_word for canonical core, syntax, or persisted-definition inspection; inspect_program remains the legacy persisted-definition alias."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -296,21 +307,29 @@ impl Tool for InspectVmWordTool {
         let entry = state
             .typed_vocabulary
             .into_iter()
-            .find(|entry| entry.name == name)
-            .with_context(|| format!("unknown built-in typed VM word '{name}'"))?;
-        let documentation = vm_core_word_documentation(&entry.name);
-        Ok(json!({
-            "name": entry.name,
-            "signature": entry.signature,
-            "summary": documentation.summary,
-            "lisp": documentation.lisp,
-            "forth": documentation.forth,
-            "example": documentation.example,
-            "source": null,
-            "source_note": "Built-in VM words are host bindings, not mutable source definitions. Their signature, capability requirements, and protocol documentation are the inspectable contract.",
-            "manifest_generation": state.manifest_generation,
-        })
-        .to_string())
+            .find(|entry| entry.name == name);
+        if let Some(entry) = entry {
+            let documentation = vm_core_word_documentation(&entry.name);
+            return Ok(json!({
+                "kind": "core",
+                "name": entry.name,
+                "signature": entry.signature,
+                "summary": documentation.summary,
+                "lisp": documentation.lisp,
+                "forth": documentation.forth,
+                "example": documentation.example,
+                "source": null,
+                "source_note": "Built-in VM words are host bindings, not mutable source definitions. Their signature, capability requirements, and protocol documentation are the inspectable contract.",
+                "manifest_generation": state.manifest_generation,
+            })
+            .to_string());
+        }
+        if let Some(entry) = SOURCE_SYNTAX.iter().find(|entry| entry.name == name) {
+            let mut contract = source_syntax_contract(entry);
+            contract["manifest_generation"] = json!(state.manifest_generation);
+            return Ok(contract.to_string());
+        }
+        anyhow::bail!("unknown built-in typed VM word or source syntax '{name}'")
     }
 }
 
@@ -481,6 +500,11 @@ impl Tool for InspectWordTool {
                     "manifest_generation": state.manifest_generation,
                 })
                 .to_string());
+            }
+            if let Some(entry) = SOURCE_SYNTAX.iter().find(|entry| entry.name == name) {
+                let mut contract = source_syntax_contract(entry);
+                contract["manifest_generation"] = json!(state.manifest_generation);
+                return Ok(contract.to_string());
             }
             let memory = self.memory.as_ref().context(
                 "inspect_word: no persisted program registry is available; use an exact built-in word name",
@@ -873,6 +897,45 @@ mod tests {
         assert!(result["example"]
             .as_str()
             .is_some_and(|example| example.contains("data.csv")));
+    }
+
+    #[tokio::test]
+    async fn inspect_word_explains_source_syntax_without_claiming_a_word_signature() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let legacy = InspectVmWordTool::new(Arc::clone(&runtime));
+        let canonical = InspectWordTool::new(runtime, None);
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            stack: None,
+            poset: None,
+        };
+
+        for tool in [&legacy as &dyn Tool, &canonical as &dyn Tool] {
+            let result: Value = serde_json::from_str(
+                &tool.execute(json!({"name": "while"}), &context)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result["kind"], "syntax");
+            assert_eq!(result["name"], "while");
+            assert!(result["languages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|language| language == "lisp"));
+            assert!(result.get("signature").is_none());
+            assert!(result["source_note"]
+                .as_str()
+                .is_some_and(|note| note.contains("not a callable runtime word")));
+        }
     }
 
     #[tokio::test]

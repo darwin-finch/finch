@@ -95,8 +95,10 @@ source origin, and VM/manifest revisions; never scrape a formatted error string.
 executions do not commit VM-local stack/dictionary changes. External effects are separately audited
 and cannot be undone by rolling back the VM.
 
-Use `get_language_definition` for exact syntax and `get_vm_state` for the current vocabulary.
-Inspect definitions instead of inventing words.
+Use `get_language_definition` for complete grammar, `get_vm_state` for the current stack/revision,
+and `search_word` followed by `inspect_word` for a core word, persisted definition, **or source
+syntax** such as `while`/`define`. Source syntax is deliberately reported without a pretend runtime
+signature. Inspect definitions instead of inventing words.
 
 When desktop automation is enabled, the typed vocabulary exposes
 `automation-availability`, `automation-displays`, `automation-windows`, `automation-click`, and
