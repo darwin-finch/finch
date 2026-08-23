@@ -102,6 +102,7 @@ fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
             || value.starts_with("E-FORTH-")
             || value.starts_with("E-LINK-")
             || value.starts_with("E-CAP-")
+            || value.starts_with("E-WIRE-")
     )
 }
 
@@ -695,7 +696,8 @@ pub(crate) async fn process_query_with_tools(
                             // identified, project the partial program visibly
                             // instead of hiding it behind the generic spinner.
                             if !text.trim_start().is_empty() {
-                                let language = crate::programs::ProgramLanguage::infer_source(&text);
+                                let language =
+                                    crate::programs::ProgramLanguage::infer_source(&text);
                                 work_unit.set_program_source(language.as_str());
                             }
                             // Keep the shadow-buffer preview live. The program is
@@ -832,7 +834,12 @@ pub(crate) async fn process_query_with_tools(
                     .await
                     .add_assistant_message(wire_execution.source_for_history);
                 query_states
-                    .update_state(query_id, QueryState::Completed { response: response.clone() })
+                    .update_state(
+                        query_id,
+                        QueryState::Completed {
+                            response: response.clone(),
+                        },
+                    )
                     .await;
                 let _ = event_tx.send(ReplEvent::StreamingComplete {
                     query_id,
@@ -1194,6 +1201,66 @@ pub(crate) fn apply_sliding_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SingleRepairGenerator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for SingleRepairGenerator {
+        async fn generate(
+            &self,
+            messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let repair_request = messages
+                .last()
+                .and_then(|message| message.content.first())
+                .and_then(ContentBlock::as_text)
+                .expect("wire repair must carry a corrective user message");
+            assert!(repair_request.contains("E-WIRE-002"));
+            Ok(crate::generators::GeneratorResponse {
+                text: "(say \"repaired\")".to_string(),
+                content_blocks: vec![ContentBlock::text("(say \"repaired\")")],
+                tool_uses: Vec::new(),
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "test".to_string(),
+                    model: "test".to_string(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<Option<tokio::sync::mpsc::Receiver<anyhow::Result<StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: Some(8),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "single-repair"
+        }
+    }
 
     #[test]
     fn fallback_manifest_injects_the_vm_bootstrap_without_memtree() {
@@ -1224,13 +1291,19 @@ mod tests {
         let lisp = direct_wire_submission(&runtime, "(say \"hello\")".to_string()).unwrap();
         assert_eq!(lisp.language, crate::programs::ProgramLanguage::Lisp);
         let outcome = runtime.submit_typed_only(lisp).await.unwrap();
-        assert_eq!(outcome.status, crate::runtime::outcome::ExecutionStatus::Completed);
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
         assert_eq!(outcome.output, "hello");
 
         let forth = direct_wire_submission(&runtime, "s\"world\" say".to_string()).unwrap();
         assert_eq!(forth.language, crate::programs::ProgramLanguage::Forth);
         let outcome = runtime.submit_typed_only(forth).await.unwrap();
-        assert_eq!(outcome.status, crate::runtime::outcome::ExecutionStatus::Completed);
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
         assert_eq!(outcome.output, "world");
     }
 
@@ -1241,12 +1314,43 @@ mod tests {
             "```lisp\n(say \"hello\")\n```"
         );
         let runtime = crate::runtime::ProgramRuntime::new();
-        let error = direct_wire_submission(
+        let error =
+            direct_wire_submission(&runtime, raw_wire_source("```forth\ns\"hello\" say\n```"))
+                .unwrap_err();
+        assert!(error.to_string().contains("E-WIRE-002"));
+    }
+
+    #[tokio::test]
+    async fn fenced_wire_response_is_repaired_once_without_executing_its_body() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let generator = Arc::new(SingleRepairGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+
+        let execution = execute_wire_with_single_repair(
             &runtime,
-            raw_wire_source("```forth\ns\"hello\" say\n```"),
+            Arc::clone(&output),
+            generator.clone(),
+            &[crate::claude::Message::user("reply")],
+            source.clone(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("Markdown code fence"));
+        .await;
+
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(execution.source_for_history, "(say \"repaired\")");
+        assert_eq!(execution.response, "repaired");
+        let messages = output.get_messages();
+        assert_eq!(
+            messages.len(),
+            3,
+            "source, failed output, repaired source/output"
+        );
+        assert!(messages.iter().all(|message| !message
+            .format(&crate::config::ColorScheme::default())
+            .contains("must not run")));
     }
 
     #[test]
@@ -1264,9 +1368,16 @@ mod tests {
 
     #[test]
     fn wire_repair_classifier_excludes_runtime_and_external_boundaries() {
-        assert!(is_repairable_wire_diagnostic("E-READ-004: unterminated string"));
+        assert!(is_repairable_wire_diagnostic(
+            "E-READ-004: unterminated string"
+        ));
         assert!(is_repairable_wire_diagnostic("E-LINK-002: unknown word"));
-        assert!(!is_repairable_wire_diagnostic("E-LIMIT-001: fuel exhausted"));
+        assert!(is_repairable_wire_diagnostic(
+            "E-WIRE-002: Markdown code fence"
+        ));
+        assert!(!is_repairable_wire_diagnostic(
+            "E-LIMIT-001: fuel exhausted"
+        ));
 
         let mut outcome = crate::runtime::outcome::ExecutionOutcome::failed(
             Uuid::nil(),
@@ -1277,9 +1388,11 @@ mod tests {
             0,
         );
         assert!(is_repairable_wire_outcome(&outcome));
-        outcome.side_effects.push(crate::vm::interpreter::HostSideEffect::Emit {
-            text: "partial".into(),
-        });
+        outcome
+            .side_effects
+            .push(crate::vm::interpreter::HostSideEffect::Emit {
+                text: "partial".into(),
+            });
         assert!(!is_repairable_wire_outcome(&outcome));
     }
 }

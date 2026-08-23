@@ -281,11 +281,11 @@ impl ProgramLanguage {
     pub fn infer_wire_source(source: &str) -> Result<Self> {
         let trimmed = source.trim_start();
         if trimmed.is_empty() {
-            bail!("Finch wire response is empty; emit a Lisp or Co-Forth program")
+            bail!("E-WIRE-001: Finch wire response is empty; emit a Lisp or Co-Forth program")
         }
         if trimmed.starts_with("```") {
             bail!(
-                "Finch wire response must be raw Lisp/Co-Forth, not a Markdown code fence; \
+                "E-WIRE-002: Finch wire response must be raw Lisp/Co-Forth, not a Markdown code fence; \
                  emit s\"...\" say for user prose"
             )
         }
@@ -962,7 +962,9 @@ mod tests {
     #[test]
     fn compact_wire_inference_rejects_markdown_wrappers() {
         let error = ProgramLanguage::infer_wire_source("```forth\ns\"hi\" say\n```").unwrap_err();
-        assert!(error.to_string().contains("Markdown code fence"));
+        assert!(error.to_string().contains("E-WIRE-002"));
+        let error = ProgramLanguage::infer_wire_source("  \n").unwrap_err();
+        assert!(error.to_string().contains("E-WIRE-001"));
         assert_eq!(
             ProgramLanguage::infer_wire_source("  (say \"hi\")").unwrap(),
             ProgramLanguage::Lisp
@@ -1124,7 +1126,11 @@ mod tests {
 
         let mut unterminated = ForthWireBuffer::default();
         unterminated.push(".\" unfinished").unwrap();
-        assert!(unterminated.finish().unwrap_err().to_string().contains("unterminated"));
+        assert!(unterminated
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("unterminated"));
     }
 
     #[test]
@@ -1189,7 +1195,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(definition.documentation, "Emit text to the active response.");
+        assert_eq!(
+            definition.documentation,
+            "Emit text to the active response."
+        );
     }
 
     #[test]
@@ -1204,8 +1213,8 @@ mod tests {
         )
         .unwrap();
 
-        let definition = ProgramDefinition::from_source_file(&path, &root, ProgramScope::Project)
-            .unwrap();
+        let definition =
+            ProgramDefinition::from_source_file(&path, &root, ProgramScope::Project).unwrap();
         assert_eq!(definition.documentation, "Return twice an integer.");
     }
 }
