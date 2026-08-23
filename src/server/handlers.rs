@@ -2232,7 +2232,7 @@ struct FileGetParams {
 /// Zips `path` and returns the raw bytes as `application/zip`.
 /// The zip is created relative to the parent of `path` so the top-level entry
 /// inside the archive is just the basename, not the full absolute path.
-pub async fn handle_file_get(
+async fn handle_file_get(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(params): Query<FileGetParams>,
@@ -2301,7 +2301,7 @@ struct FilePutParams {
 ///
 /// Accepts raw zip bytes, saves to `dest` (default `~/.finch/received/`),
 /// and immediately unzips in place.
-pub async fn handle_file_put(
+async fn handle_file_put(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(params): Query<FilePutParams>,

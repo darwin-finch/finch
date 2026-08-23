@@ -17,8 +17,7 @@ pub use brain_registry::{
 };
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
-    create_router, handle_file_get, handle_file_put, handle_node_info, handle_node_stats,
-    health_check, metrics_endpoint,
+    create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
 };
 pub use middleware::{auth_middleware, DaemonAuth, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
