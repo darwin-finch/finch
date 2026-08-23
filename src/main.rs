@@ -432,11 +432,10 @@ async fn run_finch_script(path: PathBuf, json_output: bool) -> Result<()> {
         .await?;
 
     if json_output {
+        // Keep stdout machine-readable even for a failed/paused program, but
+        // do not turn a typed failure into a successful CI invocation.
         println!("{}", serde_json::to_string(&outcome)?);
-        return Ok(());
-    }
-
-    if let Some(presentation) = terminal_script_presentation(&outcome.output) {
+    } else if let Some(presentation) = terminal_script_presentation(&outcome.output) {
         // `say` is append-only at the VM boundary.  The command-line host,
         // rather than the language primitive, owns the final terminal line
         // break so an interactive shell prompt cannot join the last fragment.
@@ -557,6 +556,18 @@ mod script_tests {
             .to_string()
             .contains("E-FORTH-SIG-001"),
             "expected typed-only rejection, got: {error:#}"
+        );
+
+        // JSON is a presentation mode, not a success override: automation
+        // callers must receive a non-zero result when the typed program did
+        // not complete, while still being able to consume the JSON outcome.
+        let error = run_finch_script(script.path().to_path_buf(), true)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("E-FORTH-SIG-001"),
+            "expected JSON-mode typed rejection, got: {error:#}"
         );
     }
 
