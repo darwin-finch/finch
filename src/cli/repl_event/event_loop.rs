@@ -3830,6 +3830,14 @@ Rules:\n\
                 projection,
                 envelope,
             } => {
+                // A reconnecting application may deliver a journal suffix
+                // more than once. Let the client-local projection reject
+                // duplicates/gaps before rendering notices or mutating a
+                // WorkUnit; the durable acknowledgement belongs to the later
+                // Brain event-log layer.
+                if !projection.project_envelope(&envelope) {
+                    return Ok(());
+                }
                 if envelope.effect.requirement.capability
                     == crate::vm::CapabilityKind::ProgramInvoke
                 {
@@ -3848,7 +3856,6 @@ Rules:\n\
                         envelope.execution_id, envelope.effect.sequence
                     ));
                 }
-                projection.project(&envelope.effect);
                 self.render_tui().await?;
             }
 

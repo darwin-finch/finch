@@ -1401,8 +1401,9 @@ mod tests {
             envelope,
         }) = event_rx.try_recv()
         {
-            projection.project(&envelope.effect);
-            projected += 1;
+            if projection.project_envelope(&envelope) {
+                projected += 1;
+            }
         }
 
         assert_eq!(generator.calls.load(Ordering::SeqCst), 1);

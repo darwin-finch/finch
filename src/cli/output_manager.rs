@@ -13,6 +13,7 @@ use crate::cli::messages::{
     LiveToolMessage, MessageRef, OperationMessage, StaticMessage, StreamingResponseMessage,
     UserQueryMessage, WorkUnit,
 };
+use crate::runtime::VmEffectEnvelope;
 use crate::vm::{HostSideEffect, TypedValue, UiOperation, VmSideEffect};
 
 /// Maximum number of messages to keep in the circular buffer
@@ -26,6 +27,15 @@ pub struct VmOutputProjection {
     output: Arc<OutputManager>,
     default_response: Arc<WorkUnit>,
     handles: Arc<Mutex<HashMap<String, Arc<WorkUnit>>>>,
+    /// The portable effect protocol is at-least-once at the application
+    /// boundary: a reconnecting host may replay a journal suffix.  Keep the
+    /// per-run cursor with this client-local projection so a duplicate cannot
+    /// append a second response chunk or advance a progress display twice.
+    ///
+    /// This is intentionally not the durable cursor.  A Brain/application
+    /// event log will persist that acknowledgement; this guard protects a
+    /// live attached client while the runtime remains embedder-neutral.
+    next_effect_sequence: Arc<Mutex<HashMap<uuid::Uuid, u64>>>,
 }
 
 impl std::fmt::Debug for VmOutputProjection {
@@ -49,7 +59,32 @@ impl VmOutputProjection {
             output,
             default_response,
             handles: Arc::new(Mutex::new(HashMap::new())),
+            next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Project a portable, correlated VM effect exactly once and in its
+    /// journal order. Returns `true` when the event was applied. A `false`
+    /// result means this client has already projected the sequence, or it is
+    /// missing an earlier event and must wait for/replay the contiguous
+    /// journal prefix instead of rendering a misleading partial update.
+    pub fn project_envelope(&self, envelope: &VmEffectEnvelope) -> bool {
+        let mut cursors = self
+            .next_effect_sequence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expected = cursors.entry(envelope.execution_id).or_insert(0);
+        if envelope.effect.sequence != *expected {
+            return false;
+        }
+
+        // Keep the cursor lock while projecting. This makes the sequence
+        // guard meaningful even if a non-terminal embedder calls this adapter
+        // from several worker threads: later events cannot render ahead of an
+        // earlier event that has reserved its sequence.
+        self.project(&envelope.effect);
+        *expected += 1;
+        true
     }
 
     /// Apply one ordered VM event. Unknown or already-closed handles are
@@ -514,6 +549,45 @@ mod tests {
             !rendered.contains('⏺'),
             "explicit VM output handles must not render as assistant replies"
         );
+    }
+
+    #[test]
+    fn vm_output_projection_applies_envelopes_once_and_in_order() {
+        let manager = Arc::new(silent_manager());
+        let response = manager.start_work_unit("Response");
+        let projection = VmOutputProjection::new(Arc::clone(&manager), Arc::clone(&response));
+        let execution_id = uuid::Uuid::new_v4();
+        let emit = |sequence, text: &str| VmEffectEnvelope {
+            execution_id,
+            effect: VmSideEffect {
+                protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                sequence,
+                requirement: crate::vm::CapabilityRequirement {
+                    capability: crate::vm::CapabilityKind::SessionEmit,
+                    selector: crate::vm::ResourceSelector::None,
+                },
+                event: HostSideEffect::Emit { text: text.into() },
+                output: Vec::new(),
+                origin: crate::vm::SourceOrigin::generated("test"),
+            },
+        };
+
+        let first = emit(0, "first");
+        let third = emit(2, "third");
+        let second = emit(1, " second");
+
+        assert!(projection.project_envelope(&first));
+        assert!(
+            !projection.project_envelope(&first),
+            "a replayed journal effect must not duplicate output"
+        );
+        assert!(
+            !projection.project_envelope(&third),
+            "a gap must wait for the missing sequence rather than rendering ahead"
+        );
+        assert!(projection.project_envelope(&second));
+        assert!(projection.project_envelope(&third));
+        assert_eq!(response.content(), "first secondthird");
     }
 
     #[test]
