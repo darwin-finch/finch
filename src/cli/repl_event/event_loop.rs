@@ -6386,11 +6386,11 @@ Rules:\n\
             .peer_tx
             .send(crate::session::SessionEvent::chat(code.clone()));
 
-        // Drain any boot poems registered this exec.
-        let poems = self.forth_vm.take_boot_poems();
-        if !poems.is_empty() {
-            self.save_boot_poems(&poems);
-        }
+        // Drain and discard legacy `boot"` registrations. Interactive turns
+        // must not leave ambient executable startup hooks behind; a future
+        // Brain initialization module will make reviewed startup work an
+        // explicit, capability-bound event instead.
+        let _ = self.forth_vm.take_boot_poems();
 
         // Run `check` if the user has defined it; update the corner display.
         if self.forth_vm.word_exists("check") {
@@ -6571,28 +6571,6 @@ Rules:\n\
                 }
             }
         });
-    }
-
-    /// Append boot poem lines to ~/.finch/boot.forth (one `.\" text\" cr` per line).
-    /// Called after any exec that may have produced boot poems via `boot" text"`.
-    fn save_boot_poems(&self, poems: &[String]) {
-        let Some(mut path) = dirs::home_dir() else {
-            return;
-        };
-        path.push(".finch");
-        let _ = std::fs::create_dir_all(&path);
-        path.push("boot.forth");
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            for poem in poems {
-                let escaped = poem.replace('"', "\\\"");
-                let _ = writeln!(f, ".\" {}\" cr", escaped);
-            }
-        }
     }
 
     /// Grammar grows from use — unknown words trigger AI definition,
