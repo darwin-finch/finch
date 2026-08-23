@@ -548,7 +548,8 @@ mod tests {
         conv.add_user_message("Test message".to_string());
         conv.add_assistant_message("Test response".to_string());
 
-        let temp_path = "/tmp/test_conv_finch.json";
+        let temp_file = tempfile::NamedTempFile::new().expect("Failed to create temporary path");
+        let temp_path = temp_file.path();
         conv.save(temp_path).expect("Failed to save conversation");
 
         let loaded = ConversationHistory::load(temp_path).expect("Failed to load conversation");
@@ -559,8 +560,5 @@ mod tests {
         assert_eq!(messages[0].text_content(), "Test message");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text_content(), "Test response");
-
-        // Clean up
-        let _ = std::fs::remove_file(temp_path);
     }
 }
