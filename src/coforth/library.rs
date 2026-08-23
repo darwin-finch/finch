@@ -194,21 +194,8 @@ impl Library {
         let mut vm = Self::precompiled_vm();
         let _ = vm.exec_with_fuel("prove-all", 0);
         let out = vm.out.clone();
-        // Parse "N/M passed" from the output.
-        for line in out.lines() {
-            let clean: String = line
-                .chars()
-                .filter(|c| c.is_ascii_digit() || *c == '/')
-                .collect();
-            if let Some(slash) = clean.find('/') {
-                let passed = clean[..slash].parse::<usize>().unwrap_or(0);
-                let total = clean[slash + 1..].parse::<usize>().unwrap_or(0);
-                if total > 0 {
-                    return (passed, total, out);
-                }
-            }
-        }
-        (0, 0, out)
+        let (passed, total) = parse_prove_all_summary(&out).unwrap_or((0, 0));
+        (passed, total, out)
     }
 
     /// Force the LazyLock static VMs to initialize now (in the caller's thread/task).
@@ -391,6 +378,52 @@ impl Library {
         out.sort_unstable();
         out
     }
+}
+
+/// Extract the `N/M passed` token emitted by the legacy proof runner without
+/// letting ANSI SGR parameters become part of the count.  The prior parser
+/// retained every digit in a rendered line, so e.g. `\x1b[32m120/120\x1b[0m`
+/// could be misread as a much larger, impossible fraction.
+fn parse_prove_all_summary(output: &str) -> Option<(usize, usize)> {
+    let plain = strip_ansi_csi(output);
+    for token in plain.split_whitespace() {
+        let Some((passed, total)) = token.split_once('/') else {
+            continue;
+        };
+        if !passed.is_empty()
+            && !total.is_empty()
+            && passed.bytes().all(|byte| byte.is_ascii_digit())
+            && total.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            let passed = passed.parse().ok()?;
+            let total = total.parse().ok()?;
+            if total > 0 {
+                return Some((passed, total));
+            }
+        }
+    }
+    None
+}
+
+/// Strip terminal CSI sequences from a status line.  This deliberately does
+/// not interpret general terminal control language; it only removes the
+/// escape form used by the proof runner's color/style rendering.
+fn strip_ansi_csi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            while let Some(next) = chars.next() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn user_library_path() -> Option<std::path::PathBuf> {
@@ -4790,6 +4823,18 @@ forth = ".words"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prove_all_summary_ignores_ansi_style_parameters() {
+        let output = "\x1b[1m── \x1b[32m120/120\x1b[0m passed ──\n";
+        assert_eq!(parse_prove_all_summary(output), Some((120, 120)));
+    }
+
+    #[test]
+    fn prove_all_summary_skips_non_summary_numbers() {
+        let output = "test 9 failed previously\n── 12/13 passed ──\n";
+        assert_eq!(parse_prove_all_summary(output), Some((12, 13)));
+    }
 
     #[test]
     fn test_seed_loads() {
