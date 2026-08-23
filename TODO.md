@@ -118,8 +118,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Remove the Lisp-to-Forth text compiler, native Lisp fallback, source-text effect inference,
   and duplicate direct model-tool paths after conformance parity.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
-  tests, concurrency tests, and provider conformance tests. Do not require the later Cranelift JIT
-  optimization tier to begin Brain convergence.
+  tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
+  2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth
+  response programs through the raw wire receiver; this is useful integration evidence, not a
+  substitute for fixed multi-provider conformance fixtures or recovery-rate measurements. Do not
+  require the later Cranelift JIT optimization tier to begin Brain convergence.
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
