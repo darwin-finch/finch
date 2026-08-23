@@ -119,7 +119,8 @@ Control-flow merge points must have identical stack types, and loops require sta
 Checked arithmetic reports division-by-zero or overflow traps.
 
 Workspace file words use refined paths: `s" Cargo.toml" path file-read` leaves `bytes`, while
-`s" generated/result.bin" path data file-write` consumes the bytes and leaves `unit`. Paths are
+`s" generated/result.bin" path data file-write` consumes the bytes and leaves no stack value.
+Paths are
 workspace-relative and checked against their declared selector at both verification and host
 execution. Missing file grants pause for approval rather than being silently widened.
 
@@ -143,9 +144,9 @@ quoted fields may span physical lines; workbook cursors remain future resources.
 spreadsheet streaming by loading a whole workbook into a string.
 
 ```forth
-: first-line ( S -- S option<string> ! {file.read(./**)} )
-  s" data.csv" path file-lines-open locals| cursor |
-  cursor stream-next
+: first-line ( S -- S option<string> ! infer )
+  s" data.csv" path file-lines-open
+  stream-next
 ;
 ```
 
@@ -272,11 +273,11 @@ yield/approval resumptions). A later submission cannot reuse it; the host reject
 completed, or cross-run handles.
 
 ```forth
-: download-status ( S -- S ! {session.emit} )
-  s" download" output-open locals| handle |
-  handle s" starting" output-status
-  handle 2 5 output-progress
-  handle output-complete
+: download-status ( S -- S ! infer )
+  s" download" output-open
+  dup s" starting" output-status
+  dup 2 5 output-progress
+  output-complete
 ;
 ```
 
