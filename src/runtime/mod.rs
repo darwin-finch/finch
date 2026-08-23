@@ -58,6 +58,29 @@ impl VmEffectEnvelope {
     }
 }
 
+/// The portable, correlated reply to one awaited VM effect. An embedder keeps
+/// the `(execution_id, sequence)` pair from [`VmEffectEnvelope`] and sends
+/// exactly one of these records when its host-side operation finishes, is
+/// rejected, or is cancelled. The typed runtime verifies the saved output row
+/// before accepting a result and never redispatches the original effect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VmResume {
+    pub execution_id: uuid::Uuid,
+    pub sequence: u64,
+    pub response: VmResumeResponse,
+}
+
+/// Host outcome carried by [`VmResume`]. This is intentionally a typed value
+/// transport rather than a stringly status protocol: the verifier knows the
+/// output row expected at the suspended capability boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VmResumeResponse {
+    Result { values: Vec<TypedValue> },
+    Denied { reason: String },
+    Cancelled { reason: Option<String> },
+}
+
 /// Host-specific projection of one portable typed VM event. The projection is
 /// bound to one ProgramRun, never stored as a process- or Brain-global
 /// "active work unit".
@@ -535,6 +558,16 @@ impl ProgramRuntime {
             return Ok(None);
         };
 
+        self.cancel_pending_typed_execution(execution_id, pending, None)
+            .map(Some)
+    }
+
+    fn cancel_pending_typed_execution(
+        &self,
+        execution_id: uuid::Uuid,
+        pending: PendingTypedExecution,
+        reason: Option<String>,
+    ) -> Result<ExecutionOutcome> {
         let cpu_cancel_error = self
             .typed
             .lock()
@@ -549,13 +582,18 @@ impl ProgramRuntime {
                 entry.state = crate::vm::EffectJournalState::Cancelled;
             }
         }
-        let mut diagnostics = vec!["typed VM execution cancelled before completion".into()];
+        let mut diagnostics = vec![match reason {
+            Some(reason) if !reason.trim().is_empty() => {
+                format!("typed VM execution cancelled before completion: {reason}")
+            }
+            _ => "typed VM execution cancelled before completion".into(),
+        }];
         if let Some(error) = cpu_cancel_error {
             diagnostics.push(format!(
                 "CPU worker cancellation was not acknowledged: {error}"
             ));
         }
-        Ok(Some(ExecutionOutcome {
+        Ok(ExecutionOutcome {
             execution_id,
             status: ExecutionStatus::Cancelled,
             values: Vec::new(),
@@ -573,7 +611,7 @@ impl ProgramRuntime {
             effect: pending.effect,
             backend: ExecutionBackend::TypedVm,
             elapsed_ms: 0,
-        }))
+        })
     }
 
     /// Compatibility boolean form of [`Self::cancel_typed_execution_with_outcome`].
@@ -581,6 +619,48 @@ impl ProgramRuntime {
         Ok(self
             .cancel_typed_execution_with_outcome(execution_id)?
             .is_some())
+    }
+
+    /// Cancel an awaited portable effect only when it still owns the supplied
+    /// `(execution_id, sequence)` boundary. A stale external cancellation
+    /// cannot discard a newer suspension for the same ProgramRun.
+    pub async fn cancel_typed_execution_for_effect(
+        &self,
+        execution_id: uuid::Uuid,
+        effect_sequence: u64,
+        reason: Option<String>,
+    ) -> Result<ExecutionOutcome> {
+        let pending = {
+            let _submission = self.submission_gate.lock().await;
+            let mut pending_runs = self
+                .pending_typed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?;
+            let pending = pending_runs.get(&execution_id).ok_or_else(|| {
+                anyhow::anyhow!("no resumable typed execution {execution_id}")
+            })?;
+            let actual = pending
+                .suspension
+                .pending_host_call
+                .as_ref()
+                .and_then(|_| {
+                    pending
+                        .suspension
+                        .event_journal
+                        .last()
+                        .map(|effect| effect.sequence)
+                })
+                .ok_or_else(|| anyhow::anyhow!("typed execution is not awaiting a host effect"))?;
+            if actual != effect_sequence {
+                bail!(
+                    "stale typed effect cancellation: supplied sequence {effect_sequence}, pending sequence is {actual}"
+                );
+            }
+            pending_runs
+                .remove(&execution_id)
+                .expect("execution was checked while its pending lock was held")
+        };
+        self.cancel_pending_typed_execution(execution_id, pending, reason)
     }
 
     /// Record a deliberate denial for the exact awaited portable effect and
@@ -685,6 +765,35 @@ impl ProgramRuntime {
     ) -> Result<ExecutionOutcome> {
         self.resume_typed_execution_inner(execution_id, Some(effect_sequence), Some(values))
             .await
+    }
+
+    /// Apply one portable host reply. This is the complete embedder-facing
+    /// resume API: all paths are correlated to the original event handle and
+    /// retain an auditable effect-journal terminal state.
+    pub async fn resume_vm_effect(&self, resume: VmResume) -> Result<ExecutionOutcome> {
+        match resume.response {
+            VmResumeResponse::Result { values } => {
+                self.resume_typed_execution_with_effect_result(
+                    resume.execution_id,
+                    resume.sequence,
+                    values,
+                )
+                .await
+            }
+            VmResumeResponse::Denied { reason } => self.deny_typed_execution_for_effect(
+                resume.execution_id,
+                resume.sequence,
+                reason,
+            ),
+            VmResumeResponse::Cancelled { reason } => {
+                self.cancel_typed_execution_for_effect(
+                    resume.execution_id,
+                    resume.sequence,
+                    reason,
+                )
+                .await
+            }
+        }
     }
 
     async fn resume_typed_execution_inner(
@@ -3611,11 +3720,13 @@ mod tests {
             .unwrap();
 
         let completed = runtime
-            .resume_typed_execution_with_effect_result(
-                pending.execution_id,
+            .resume_vm_effect(VmResume {
+                execution_id: pending.execution_id,
                 sequence,
-                vec![TypedValue::Bytes(b"from external event loop".to_vec())],
-            )
+                response: VmResumeResponse::Result {
+                    values: vec![TypedValue::Bytes(b"from external event loop".to_vec())],
+                },
+            })
             .await
             .unwrap();
         assert_eq!(completed.status, ExecutionStatus::Completed);
@@ -3644,12 +3755,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        let sequence = pending.approval_prompts[0]
+            .request
+            .effect_sequence
+            .expect("pending request has a portable sequence");
 
         let cancelled = runtime
-            .cancel_typed_execution_with_outcome(pending.execution_id)
-            .unwrap()
+            .resume_vm_effect(VmResume {
+                execution_id: pending.execution_id,
+                sequence,
+                response: VmResumeResponse::Cancelled {
+                    reason: Some("host shut down".into()),
+                },
+            })
+            .await
             .expect("pending request should produce a cancelled outcome");
         assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+        assert!(cancelled.diagnostics[0].contains("host shut down"));
         assert!(matches!(
             cancelled.effect_journal.as_slice(),
             [crate::vm::EffectJournalEntry {
@@ -3657,6 +3779,46 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_portable_cancellation_keeps_the_current_continuation() {
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        let sequence = pending.approval_prompts[0]
+            .request
+            .effect_sequence
+            .expect("pending request has a portable sequence");
+
+        assert!(runtime
+            .resume_vm_effect(VmResume {
+                execution_id: pending.execution_id,
+                sequence: sequence + 1,
+                response: VmResumeResponse::Cancelled { reason: None },
+            })
+            .await
+            .is_err());
+        assert!(runtime
+            .pending_typed_execution(pending.execution_id)
+            .unwrap()
+            .is_some());
+
+        let cancelled = runtime
+            .resume_vm_effect(VmResume {
+                execution_id: pending.execution_id,
+                sequence,
+                response: VmResumeResponse::Cancelled { reason: None },
+            })
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     }
 
     #[tokio::test]

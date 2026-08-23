@@ -177,7 +177,11 @@ capability requirement, typed event payload, expected typed result row (empty fo
 and source origin. A harness pairs the sequence with
 its execution ID as an idempotency key, records the result in its effect journal, validates the
 typed result against the awaited output row, then resumes the serialized VM continuation. A
-`VmResume` acknowledges that exact event and does not dispatch the host operation a second time.
+`VmResume { execution_id, sequence, response }` acknowledges that exact event and does not
+dispatch the host operation a second time. Its response is exactly one of
+`result { values }`, `denied { reason }`, or `cancelled { reason? }`; a stale sequence is rejected
+without consuming a newer continuation. The terminal effect-journal state records the same choice
+as `acknowledged`, `denied`, or `cancelled`.
 Per-run effect observers receive an awaited request before authorization or local dispatch, so a
 host can persist or route that boundary without waiting for a synchronous adapter.
 Finch projects these events onto its reactive `WorkUnit`/shadow-buffer

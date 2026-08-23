@@ -47,9 +47,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   clients migrate.
 - [ ] Finish the capability broker: bounded argument templates, availability, grants, attenuation,
   revocation, audit, approval dialogs, runtime guards, and typed suspend/resume. The base
-  `(execution_id, sequence)` resume path now validates the host's result row and acknowledges the
-  exact journaled effect without redispatch; durable approvals, denial policy, and complete host
-  adapters remain.
+  serializable `VmResume { execution_id, sequence, response }` path now validates the host's
+  result row, records result/denial/cancellation against the exact journaled effect, and never
+  redispatches it; durable approvals, denial policy, and complete host adapters remain.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Extend bounded `file-slice`/`file-size` and host-issued cursors with workbook cursors so large
