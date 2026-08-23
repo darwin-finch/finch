@@ -31,6 +31,10 @@ impl Module {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Function {
     pub name: String,
+    /// Source-level documentation is immutable metadata on a typed function,
+    /// never an executable string literal or a capability-bearing value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
     pub signature: StackSignature,
     pub locals: Vec<Type>,
     pub captures: Vec<Type>,

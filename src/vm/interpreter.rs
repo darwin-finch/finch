@@ -1593,6 +1593,7 @@ mod tests {
     fn arithmetic_module(instructions: Vec<Instruction>) -> VerifiedModule {
         let function = Function {
             name: "main".into(),
+            documentation: None,
             signature: StackSignature::pure(
                 StackRow::closed(Vec::new()),
                 StackRow::closed(vec![Type::Int]),

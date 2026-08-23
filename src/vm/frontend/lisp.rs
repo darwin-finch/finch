@@ -142,6 +142,7 @@ impl FunctionBuilder {
     fn finish(self, output: Vec<Type>) -> Function {
         Function {
             name: self.name,
+            documentation: None,
             signature: StackSignature {
                 type_parameters: Vec::new(),
                 input: StackRow::polymorphic("S", self.input),
@@ -652,7 +653,8 @@ impl Compiler<'_> {
         child.stack.push(result_type);
         child.emit(Instruction::Return, self.origin("define-return"));
         let output = child.stack.clone();
-        let function = child.finish(output);
+        let mut function = child.finish(output);
+        function.documentation = definition.documentation.map(str::to_owned);
         self.vocabulary
             .insert(name.to_string(), function.signature.clone());
         self.functions.insert(name.to_string(), function);
@@ -1832,7 +1834,7 @@ struct Definition<'a> {
     /// The first body string is a Python-style docstring. It is protocol
     /// metadata, never a runtime stack value or an instruction in the typed
     /// function body.
-    _documentation: Option<&'a str>,
+    documentation: Option<&'a str>,
     body: &'a [Val],
 }
 
@@ -1912,7 +1914,7 @@ fn parse_definition(expression: &Val) -> Result<Definition<'_>, Vec<VmDiagnostic
         parameters,
         return_type,
         declared_effects,
-        _documentation: documentation,
+        documentation,
         body,
     })
 }
@@ -2267,12 +2269,24 @@ mod tests {
     }
 
     #[test]
-    fn strips_common_lisp_style_definition_docstrings_from_the_ir() {
+    fn retains_lisp_definition_docstrings_as_non_executable_ir_metadata() {
+        let module = compile_lisp(
+            "input.lisp",
+            "(define (double (n : int)) : int \"Return twice n.\" (* n 2)) (double 21)",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
         assert_eq!(
-            run("(define (double (n : int)) : int \"Return twice n.\" (* n 2)) (double 21)")
-                .unwrap(),
-            vec![TypedValue::Int(42)]
+            module.module.functions["double"].documentation.as_deref(),
+            Some("Return twice n.")
         );
+
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
     #[test]

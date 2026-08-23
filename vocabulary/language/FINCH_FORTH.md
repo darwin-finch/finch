@@ -103,6 +103,17 @@ mutually-recursive in one submission; `! infer` definitions remain sequential un
 effects can be represented in a forward signature. Typed definitions are persistent and immediately
 callable from Finch Lisp.
 
+Put a public doc comment immediately before a typed definition when it should be discoverable from
+the shared VM without reparsing source:
+
+```forth
+\ finch-doc: Double an integer.
+: double ( S int -- S int ! {} ) 2 * ;
+```
+
+Only the text after `finch-doc:` is retained on the immutable typed function contract. It is never
+placed on the operand stack or executed, and inspection may return it alongside the signature.
+
 `dup`, `drop`, and `swap` are polymorphic. Arithmetic does not coerce strings or dynamic values.
 Control-flow merge points must have identical stack types, and loops require stable invariants.
 Checked arithmetic reports division-by-zero or overflow traps.

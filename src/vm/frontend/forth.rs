@@ -181,6 +181,7 @@ pub fn compile_forth_with_functions(
             return Err(vec![diagnostic]);
         }
         function.name = definition.name.clone();
+        function.documentation = definition.documentation;
         function.signature = definition.signature;
         function.signature.effects = verified.inferred_effects.clone();
         local_vocabulary.insert(definition.name.clone(), function.signature.clone());
@@ -1422,6 +1423,7 @@ fn compile_forth_body_with_locals(
 
     let function = Function {
         name: "main".into(),
+        documentation: None,
         signature: StackSignature {
             type_parameters: Vec::new(),
             input: StackRow::closed(initial_stack),
@@ -1455,6 +1457,7 @@ fn output_operation(word: &str) -> Option<UiOperation> {
 
 struct ParsedDefinition {
     name: String,
+    documentation: Option<String>,
     signature: StackSignature,
     declares_pure: bool,
     locals: Vec<LocalBinding>,
@@ -1555,6 +1558,7 @@ fn extract_definitions(
         )?;
         definitions.push(ParsedDefinition {
             name: name.clone(),
+            documentation: forth_definition_documentation(source, definition_start),
             signature,
             declares_pure,
             locals,
@@ -1570,6 +1574,21 @@ fn extract_definitions(
     }
     let main = String::from_utf8(erased).expect("erasing source preserves UTF-8 bytes");
     Ok((definitions, main))
+}
+
+/// Read a single public documentation line immediately preceding a typed
+/// definition. `\\ finch-doc:` is deliberately source-only metadata: the
+/// tokenizer discards the comment and the string never reaches the operand
+/// stack. A blank or non-comment line breaks the association so a doc cannot
+/// accidentally attach across an unrelated form.
+fn forth_definition_documentation(source: &str, definition_start: usize) -> Option<String> {
+    let prefix = &source[..definition_start];
+    let line = prefix.lines().rev().find(|line| !line.trim().is_empty())?;
+    line.trim()
+        .strip_prefix("\\ finch-doc:")
+        .map(str::trim)
+        .filter(|documentation| !documentation.is_empty())
+        .map(str::to_owned)
 }
 
 /// Parse the direct Co-Forth spelling for frame-local parameter names:
@@ -2273,6 +2292,22 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Int(12)]);
+    }
+
+    #[test]
+    fn retains_finch_doc_comment_on_typed_definition() {
+        let module = compile_forth(
+            "documented.forth",
+            "\\ finch-doc: Double an integer.\n: double ( S int -- S int ! {} ) 2 * ; 21 double",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            module.module.functions["double"].documentation.as_deref(),
+            Some("Double an integer.")
+        );
     }
 
     #[test]

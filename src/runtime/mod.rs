@@ -87,6 +87,10 @@ pub struct VmStackCell {
 pub struct VmVocabularyEntry {
     pub name: String,
     pub signature: Option<String>,
+    /// Source-level documentation for a persisted typed definition, when the
+    /// word is not a host-bound core primitive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -831,6 +835,10 @@ impl ProgramRuntime {
                 .map(|(name, signature)| VmVocabularyEntry {
                     name: name.clone(),
                     signature: Some(signature.to_string()),
+                    documentation: typed
+                        .functions()
+                        .get(name)
+                        .and_then(|function| function.documentation.clone()),
                 })
                 .collect();
             // `stack` and `vocabulary` are retained for compatibility with
@@ -3501,6 +3509,28 @@ mod tests {
             .granted_capabilities
             .iter()
             .any(|grant| grant.capability == crate::vm::CapabilityKind::SessionEmit));
+    }
+
+    #[tokio::test]
+    async fn inspection_exposes_typed_definition_documentation() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(define (double (n : int)) : int \"Return twice n.\" (* n 2))",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+
+        let state = runtime.inspect().await.unwrap();
+        let double = state
+            .typed_vocabulary
+            .iter()
+            .find(|word| word.name == "double")
+            .expect("persisted typed definition");
+        assert_eq!(double.documentation.as_deref(), Some("Return twice n."));
     }
 
     #[tokio::test]

@@ -752,6 +752,7 @@ mod tests {
     fn function(signature: StackSignature, instructions: Vec<Instruction>) -> Function {
         Function {
             name: "main".into(),
+            documentation: None,
             signature,
             locals: Vec::new(),
             captures: Vec::new(),
@@ -918,6 +919,7 @@ mod tests {
         let effects = EffectSet::from_requirement(requirement.clone());
         let callee = Function {
             name: "save".into(),
+            documentation: None,
             signature: StackSignature {
                 type_parameters: Vec::new(),
                 input: StackRow::closed(vec![Type::String]),
@@ -948,6 +950,7 @@ mod tests {
         };
         let caller = Function {
             name: "main".into(),
+            documentation: None,
             signature: StackSignature {
                 type_parameters: Vec::new(),
                 input: StackRow::closed(Vec::new()),
