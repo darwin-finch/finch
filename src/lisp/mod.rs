@@ -36,7 +36,6 @@
 /// ```
 pub mod env;
 pub mod eval;
-pub mod forth_compiler;
 pub mod reader;
 pub mod stdlib;
 pub mod types;
