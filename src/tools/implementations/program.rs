@@ -227,10 +227,10 @@ fn core_word_documentation(name: &str) -> CoreWordDocumentation {
             forth: "left right str-cat; text bytes; n int-to-string; text atoi; space",
             example: "s\"answer: \" 42 int-to-string str-cat say",
         },
-        "json-parse" | "json-stringify" | "json-get" | "json-as-string" | "json-as-int" | "json-as-bool" => CoreWordDocumentation {
-            summary: "Pure managed JSON operations. json-parse returns result<json,string>; json-get and scalar projections return options rather than coercing or treating text as authority.",
-            lisp: "(json-parse text), (json-get value field), (json-as-int value)",
-            forth: "text json-parse; json field json-get; json json-as-int",
+        "json-parse" | "json-stringify" | "json-get" | "json-index" | "json-keys" | "json-as-string" | "json-as-int" | "json-as-bool" => CoreWordDocumentation {
+            summary: "Pure managed JSON operations. json-parse returns result<json,string>; field/index lookup and scalar projections return options rather than coercing or treating text as authority. json-keys returns an empty typed list for a non-object.",
+            lisp: "(json-parse text), (json-get value field), (json-index value index), (json-keys value), (json-as-int value)",
+            forth: "text json-parse; json field json-get; json index json-index; json json-keys; json json-as-int",
             example: "s\" {\\\"answer\\\":42}\" json-parse result-unwrap s\" answer\" json-get unwrap json-as-int unwrap",
         },
         "dup" | "drop" | "swap" => CoreWordDocumentation {

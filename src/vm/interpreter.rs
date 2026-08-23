@@ -1411,6 +1411,51 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                 value: found.map(|value| Box::new(TypedValue::Json(value))),
             });
         }
+        "json-index" => {
+            let index = pop(stack)?;
+            let value = pop(stack)?;
+            let (TypedValue::Json(value), TypedValue::Int(index)) = (value, index) else {
+                return Err(VmDiagnostic::error(
+                    "E-JSON-006",
+                    DiagnosticPhase::Interpretation,
+                    "json-index requires a JSON value and integer index",
+                    Some(origin),
+                ));
+            };
+            let found = usize::try_from(index)
+                .ok()
+                .and_then(|index| value.as_array().and_then(|array| array.get(index)))
+                .cloned();
+            stack.push(TypedValue::Option {
+                inner_type: Type::Json,
+                value: found.map(|value| Box::new(TypedValue::Json(value))),
+            });
+        }
+        "json-keys" => {
+            let value = pop(stack)?;
+            let TypedValue::Json(value) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-JSON-007",
+                    DiagnosticPhase::Interpretation,
+                    "json-keys requires a JSON value",
+                    Some(origin),
+                ));
+            };
+            let values = value
+                .as_object()
+                .map(|object| {
+                    object
+                        .keys()
+                        .cloned()
+                        .map(TypedValue::String)
+                        .collect()
+                })
+                .unwrap_or_default();
+            stack.push(TypedValue::List {
+                element_type: Type::String,
+                values,
+            });
+        }
         "json-as-string" | "json-as-int" | "json-as-bool" => {
             let value = pop(stack)?;
             let TypedValue::Json(value) = value else {

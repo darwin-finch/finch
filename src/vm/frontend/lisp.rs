@@ -2417,6 +2417,18 @@ mod tests {
                 .unwrap(),
             vec![TypedValue::Bool(false)]
         );
+        assert_eq!(
+            run(
+                "(unwrap (json-as-string (unwrap (json-index (result-unwrap (json-parse \"[0,\\\"one\\\"]\")) 1))))"
+            )
+            .unwrap(),
+            vec![TypedValue::String("one".into())]
+        );
+        assert_eq!(
+            run("(list-length (json-keys (result-unwrap (json-parse \"{\\\"a\\\":1,\\\"b\\\":2}\"))))")
+                .unwrap(),
+            vec![TypedValue::Int(2)]
+        );
     }
 
     #[test]

@@ -243,6 +243,8 @@ example:
 
 Use `(json-stringify value)` only when text serialization is actually needed. User text inside JSON
 never becomes a capability, path, or executable form merely by being parsed.
+`(json-index value index)` returns `option<json>` for array data, while `(json-keys value)` returns
+`list<string>` for an object and an empty list for any other JSON value.
 
 `(process-run command (list arguments...))` runs an executable directly without shell parsing and
 is capability-bearing.

@@ -141,7 +141,9 @@ are rendered to legacy Lisp callers as `(some value)`, `(none)`, `(ok value)`, o
 `json-get` takes a managed `json` value and a string field name, returning `option<json>`; it only
 looks up object fields and never treats a supplied string as code, a path, or authority. Convert a
 known scalar through `json-as-string`, `json-as-int`, or `json-as-bool`, each of which returns an
-`option` rather than coercing or guessing. `json-stringify` explicitly returns compact JSON text.
+`option` rather than coercing or guessing. `json-index` similarly returns an option for an array
+element, and `json-keys` returns a typed `list<string>` (empty for a non-object). `json-stringify`
+explicitly returns compact JSON text.
 Records and maps remain internal ABI types until construction, field naming, and pattern rules are
 specified for both source frontends.
 

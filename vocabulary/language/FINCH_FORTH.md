@@ -212,7 +212,9 @@ s" answer" json-get unwrap json-as-int unwrap
 ```
 
 `json-as-string`, `json-as-int`, and `json-as-bool` return `none` for a mismatched JSON kind;
-`json-stringify` converts a managed JSON value back to compact text.
+`json-index` returns `option<json>` for an array index, `json-keys` returns `list<string>` for an
+object (or an empty list otherwise), and `json-stringify` converts a managed JSON value back to
+compact text.
 
 `process-run` consumes a command string and a list of argument strings; it never invokes a shell.
 

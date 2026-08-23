@@ -138,6 +138,20 @@ pub fn core_vocabulary() -> Vocabulary {
             ),
         ),
         (
+            "json-index".into(),
+            pure(
+                vec![Type::Json, Type::Int],
+                vec![Type::Option(Box::new(Type::Json))],
+            ),
+        ),
+        (
+            "json-keys".into(),
+            pure(
+                vec![Type::Json],
+                vec![Type::list(Type::String)],
+            ),
+        ),
+        (
             "json-as-string".into(),
             pure(
                 vec![Type::Json],
