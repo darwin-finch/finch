@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock, Weak};
@@ -2499,7 +2499,7 @@ where
 }
 
 fn secure_resource_path(
-    root: &PathBuf,
+    root: &Path,
     selector: &crate::vm::FileSelector,
     relative: &str,
 ) -> std::result::Result<PathBuf, String> {
