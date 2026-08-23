@@ -4225,6 +4225,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_runtime_preserves_one_typed_stack_across_lisp_and_forth_turns() {
+        let runtime = ProgramRuntime::new();
+        let lisp = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(+ 2 3)",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(lisp.status, ExecutionStatus::Completed);
+        assert_eq!(lisp.output_revision, 1);
+
+        let forth = runtime
+            .submit(ProgramSubmission {
+                expected_revision: Some(lisp.output_revision),
+                ..submission(ProgramLanguage::Forth, "2 *", ExecutionEffect::Pure)
+            })
+            .await
+            .unwrap();
+        assert_eq!(forth.status, ExecutionStatus::Completed);
+        assert_eq!(forth.output_revision, 2);
+
+        let state = runtime.inspect().await.unwrap();
+        assert_eq!(state.typed_stack.len(), 1);
+        assert_eq!(state.typed_stack[0].value, TypedValue::Int(10));
+    }
+
+    #[tokio::test]
     async fn rejects_stale_vm_revision() {
         let runtime = ProgramRuntime::new();
         runtime
