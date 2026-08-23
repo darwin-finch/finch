@@ -655,19 +655,31 @@ impl ProgramRuntime {
                 .remove(&execution_id)
                 .ok_or_else(|| anyhow::anyhow!("no resumable typed execution {execution_id}"))?
         };
+        let started = Instant::now();
         if pending.context.manifest_generation != self.manifest_generation() {
             self.release_output_handles(execution_id)?;
-            bail!("resumable typed execution has a stale VM manifest generation");
+            return Ok(failed_pending_resume(
+                execution_id,
+                &pending,
+                self.revision(),
+                "resumable typed execution has a stale VM manifest generation".to_owned(),
+                started.elapsed(),
+            ));
         }
         if pending.input_revision != self.revision() {
             self.release_output_handles(execution_id)?;
-            bail!(
-                "resumable typed execution has input revision {}; current revision is {}",
-                pending.input_revision,
-                self.revision()
-            );
+            let current_revision = self.revision();
+            return Ok(failed_pending_resume(
+                execution_id,
+                &pending,
+                current_revision,
+                format!(
+                    "resumable typed execution has input revision {}; current revision is {current_revision}",
+                    pending.input_revision,
+                ),
+                started.elapsed(),
+            ));
         }
-        let started = Instant::now();
         let external_effect_result = match external_effect_result {
             Some(values) => Some((
                 expected_effect_sequence.expect("external result requires an effect sequence"),
@@ -736,11 +748,41 @@ impl ProgramRuntime {
             self.release_output_handles(execution_id)?;
         }
 
+        let completion_commit = if matches!(execution.status, TypedExecutionStatus::Completed) {
+            Some(
+                self.commit_working_runtime(pending.input_revision, working_runtime)
+                    .await,
+            )
+        } else {
+            None
+        };
+
         Ok(match execution.status {
             TypedExecutionStatus::Completed => {
-                let output_revision = self
-                    .commit_working_runtime(pending.input_revision, working_runtime)
-                    .await?;
+                let output_revision = match completion_commit.expect("completed run has commit") {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        return Ok(ExecutionOutcome {
+                            execution_id,
+                            status: ExecutionStatus::Failed,
+                            values: Vec::new(),
+                            output: truncate_output(output, pending.context.budget.max_output_bytes),
+                            output_chunks,
+                            side_effects,
+                            vm_side_effects,
+                            effect_journal,
+                            diagnostics: vec![error.to_string()],
+                            vm_diagnostics: Vec::new(),
+                            required_capabilities: Vec::new(),
+                            approval_prompts: Vec::new(),
+                            input_revision: pending.input_revision,
+                            output_revision: self.revision(),
+                            effect: pending.effect,
+                            backend: ExecutionBackend::TypedVm,
+                            elapsed_ms,
+                        });
+                    }
+                };
                 ExecutionOutcome {
                     execution_id,
                     status: ExecutionStatus::Completed,
@@ -2724,6 +2766,41 @@ fn truncate_output(mut output: String, max_bytes: usize) -> String {
     output
 }
 
+/// Convert a discarded private continuation into an ordinary VM result. A
+/// stale revision is a normal optimistic-concurrency outcome, not a host API
+/// failure: callers need its emitted output and effect journal to explain the
+/// conflict and must never be tempted to replay those effects.
+fn failed_pending_resume(
+    execution_id: uuid::Uuid,
+    pending: &PendingTypedExecution,
+    output_revision: u64,
+    diagnostic: String,
+    elapsed: std::time::Duration,
+) -> ExecutionOutcome {
+    ExecutionOutcome {
+        execution_id,
+        status: ExecutionStatus::Failed,
+        values: Vec::new(),
+        output: truncate_output(
+            pending.output.clone(),
+            pending.context.budget.max_output_bytes,
+        ),
+        output_chunks: pending.output_chunks.clone(),
+        side_effects: pending.side_effects.clone(),
+        vm_side_effects: pending.suspension.event_journal.clone(),
+        effect_journal: pending.suspension.effect_journal.clone(),
+        diagnostics: vec![diagnostic],
+        vm_diagnostics: Vec::new(),
+        required_capabilities: Vec::new(),
+        approval_prompts: Vec::new(),
+        input_revision: pending.input_revision,
+        output_revision,
+        effect: pending.effect,
+        backend: ExecutionBackend::TypedVm,
+        elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+    }
+}
+
 fn approval_prompts(
     execution_id: uuid::Uuid,
     requirements: &[CapabilityRequirement],
@@ -4610,7 +4687,7 @@ mod tests {
         let suspended = runtime
             .submit(submission(
                 ProgramLanguage::Forth,
-                "yield 1",
+                "s\" before conflict\" say yield 1",
                 ExecutionEffect::Pure,
             ))
             .await
@@ -4629,11 +4706,17 @@ mod tests {
         assert_eq!(winner.status, ExecutionStatus::Completed);
         assert_eq!(winner.output_revision, 1);
 
-        let error = runtime
+        let rejected = runtime
             .resume_typed_execution(suspended.execution_id)
             .await
-            .expect_err("a continuation based on an older snapshot must not commit");
-        assert!(error.to_string().contains("input revision 0; current revision is 1"));
+            .expect("a continuation conflict is reported as a typed outcome");
+        assert_eq!(rejected.status, ExecutionStatus::Failed);
+        assert!(rejected
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("input revision 0; current revision is 1")));
+        assert_eq!(rejected.output, "before conflict");
+        assert!(!rejected.effect_journal.is_empty());
         let state = runtime.inspect().await.unwrap();
         assert_eq!(state.revision, 1);
         assert_eq!(
