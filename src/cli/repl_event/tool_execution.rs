@@ -340,7 +340,7 @@ impl ToolExecutionCoordinator {
                     // their own stack interaction.
                     let skip_stack = matches!(
                         tool_use.name.as_str(),
-                        "TodoWrite" | "TodoRead" | "EnterPlanMode" | "enter_plan_mode"
+                        "todo_write" | "todo_read" | "TodoWrite" | "TodoRead" | "EnterPlanMode" | "enter_plan_mode"
                     );
                     if !skip_stack {
                         if let Some(ref s) = stack {

@@ -51,11 +51,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   surface, but make task creation, status changes, hierarchy, progress, cancellation, and durable
   recovery ordinary typed task events—not a second session-local JSON source of truth beside VM
   `task<T>` handles.
-- [ ] Normalize model-facing naming and manifests. Provider/host tools use canonical `snake_case`
-  names (for example `todo_read`, `todo_write`, `get_vm_state`); typed Co-Forth words retain their
+- [ ] Normalize model-facing naming and manifests. `todo_read`/`todo_write` now advertise canonical
+  snake_case names while dispatch-only `TodoRead`/`TodoWrite` aliases preserve compatibility;
+  extend that audited migration to every remaining provider/host tool. Typed Co-Forth words retain
   language-native hyphenated spelling (for example `output-append`); Lisp maps to the shared typed
-  vocabulary. Remove PascalCase legacy names such as `TodoWrite` from generated manifests after
-  adding explicit compatibility aliases and tests that no duplicate semantic operation is advertised.
+  vocabulary. Remove PascalCase legacy names from generated manifests only after explicit aliases
+  and tests establish that no duplicate semantic operation is advertised.
 - [ ] Finish typed `proposal.open` as the explicit durable editor/proposal boundary. The current
   `proposal-open` capability can now suspend an event-loop-bound ProgramRun on its portable
   `(execution_id, sequence)` request and the frontend controller opens the language-aware editor,

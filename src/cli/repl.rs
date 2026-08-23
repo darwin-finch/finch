@@ -419,7 +419,9 @@ impl Repl {
             }
         }
 
-        // Session task list (TodoWrite / TodoRead)
+        // Session task list. Snake_case names are provider-facing; aliases
+        // keep persisted/legacy provider turns executable without advertising
+        // two tools for the same operation.
         let todo_list = Arc::new(tokio::sync::RwLock::new(
             crate::tools::todo::TodoList::default(),
         ));
@@ -427,6 +429,8 @@ impl Repl {
             use crate::tools::implementations::{TodoReadTool, TodoWriteTool};
             tool_registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
             tool_registry.register(Box::new(TodoReadTool::new(Arc::clone(&todo_list))));
+            tool_registry.register_alias("TodoWrite", "todo_write");
+            tool_registry.register_alias("TodoRead", "todo_read");
         }
 
         // Create permission manager.

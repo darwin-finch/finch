@@ -36,6 +36,10 @@ pub trait Tool: Send + Sync {
 /// Registry of available tools
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+    /// Compatibility spellings accepted at dispatch time but deliberately
+    /// omitted from provider manifests. A provider should learn one canonical
+    /// operation name, not receive duplicate semantic tools.
+    aliases: HashMap<String, String>,
 }
 
 impl ToolRegistry {
@@ -43,6 +47,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            aliases: HashMap::new(),
         }
     }
 
@@ -52,14 +57,26 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
+    /// Accept a legacy spelling for a canonical registered tool. Aliases are
+    /// dispatch-only and never appear in [`Self::definitions`].
+    pub fn register_alias(&mut self, alias: impl Into<String>, canonical: impl Into<String>) {
+        self.aliases.insert(alias.into(), canonical.into());
+    }
+
+    fn canonical_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.aliases.get(name).map(String::as_str).unwrap_or(name)
+    }
+
     /// Get tool by name
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|b| b.as_ref())
+        self.tools
+            .get(self.canonical_name(name))
+            .map(|b| b.as_ref())
     }
 
     /// Check if tool exists
     pub fn has_tool(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools.contains_key(self.canonical_name(name))
     }
 
     /// List all tool names
@@ -146,6 +163,20 @@ mod tests {
         let retrieved = registry.get("test");
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().name(), "test");
+    }
+
+    #[test]
+    fn aliases_dispatch_without_duplicating_provider_definitions() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool {
+            name: "todo_read".to_string(),
+        }));
+        registry.register_alias("TodoRead", "todo_read");
+
+        assert!(registry.has_tool("TodoRead"));
+        assert_eq!(registry.get("TodoRead").unwrap().name(), "todo_read");
+        assert_eq!(registry.definitions().len(), 1);
+        assert_eq!(registry.definitions()[0].name, "todo_read");
     }
 
     #[test]

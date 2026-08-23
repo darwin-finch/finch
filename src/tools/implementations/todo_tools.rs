@@ -1,4 +1,4 @@
-// TodoWrite / TodoRead tool implementations
+// Canonical todo_write / todo_read tool implementations.
 //
 // The LLM uses these tools to manage a session-scoped task list that is
 // displayed in the TUI live area.  Both tools capture an
@@ -29,13 +29,13 @@ impl TodoWriteTool {
 #[async_trait]
 impl Tool for TodoWriteTool {
     fn name(&self) -> &str {
-        "TodoWrite"
+        "todo_write"
     }
 
     fn description(&self) -> &str {
         "Replace the entire session task list atomically. Use this to create, update, or mark tasks \
          as completed. Always include ALL tasks in each call — omitted tasks are deleted. \
-         Call TodoRead first if you need to preserve existing tasks."
+         Call todo_read first if you need to preserve existing tasks."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -126,12 +126,12 @@ impl TodoReadTool {
 #[async_trait]
 impl Tool for TodoReadTool {
     fn name(&self) -> &str {
-        "TodoRead"
+        "todo_read"
     }
 
     fn description(&self) -> &str {
         "Return the current session task list as a JSON array. \
-         Use this before TodoWrite when you want to update specific tasks \
+         Use this before todo_write when you want to update specific tasks \
          without losing the rest of the list."
     }
 

@@ -57,6 +57,8 @@ pub(crate) fn is_tool_allowed_in_mode(tool_name: &str, mode: &ReplMode) -> bool 
                     // Session-local plan visibility is not a workspace or
                     // host mutation. Keep the familiar checklist usable
                     // while the model is deliberately planning.
+                    | "todo_read"
+                    | "todo_write"
                     | "TodoRead"
                     | "TodoWrite"
                     | "EnterPlanMode"
@@ -484,7 +486,7 @@ mod tests {
     #[test]
     fn test_plan_mode_allows_session_local_todo_projection() {
         let mode = planning_mode();
-        for tool in ["TodoRead", "TodoWrite"] {
+        for tool in ["todo_read", "todo_write", "TodoRead", "TodoWrite"] {
             assert!(
                 is_tool_allowed_in_mode(tool, &mode),
                 "{tool} must remain available while planning"

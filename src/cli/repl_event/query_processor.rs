@@ -433,7 +433,7 @@ pub(super) async fn dispatch_tool_uses(
             let error_msg = format!(
                 "Tool '{}' is not allowed in planning mode.\n\
                  Reason: This tool can modify system state.\n\
-                 Available tools: read, glob, grep, web_fetch, TodoRead, TodoWrite, present_plan, ask_user_question\n\
+                 Available tools: read, glob, grep, web_fetch, todo_read, todo_write, present_plan, ask_user_question\n\
                  Type /approve to execute your plan with all tools enabled.",
                 tool_use.name
             );
