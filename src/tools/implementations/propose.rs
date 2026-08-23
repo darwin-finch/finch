@@ -385,7 +385,11 @@ pub async fn run_script_async(script: &str) -> Result<String> {
 /// In non-interactive environments the editor is skipped and the original
 /// code is returned immediately.
 pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Option<String>> {
-    if !std::io::stdin().is_terminal() {
+    // Keep the typed Forth proposal path consistent with every other
+    // artifact: integration tests can own a PTY, but must never launch the
+    // developer's real editor or receive generated comment headers as the
+    // accepted source.
+    if cfg!(test) || !std::io::stdin().is_terminal() {
         return Ok(Some(code.to_string()));
     }
 
