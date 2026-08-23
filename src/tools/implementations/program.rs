@@ -188,7 +188,7 @@ impl Tool for SearchVmVocabularyTool {
     }
 
     fn description(&self) -> &str {
-        "Search Finch's built-in typed VM words and return exact stack signatures, plus matching Lisp/Co-Forth source syntax. Use this for VM discovery; search_vocabulary only searches persisted user/project definitions."
+        "Compatibility search for Finch's built-in typed VM words and matching Lisp/Co-Forth source syntax. Prefer search_word for canonical cross-scope discovery; search_vocabulary only searches persisted user/project definitions."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -275,7 +275,7 @@ impl Tool for InspectVmWordTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect one built-in typed Finch VM word. Returns its exact signature, capability requirements, semantics, both source spellings, and a worked example. For persisted user/project words, use inspect_program with the immutable id/version returned by search_vocabulary."
+        "Compatibility inspection for one built-in typed Finch VM word. Returns its exact signature, capability requirements, semantics, both source spellings, and a worked example. Prefer inspect_word for canonical core or persisted-definition inspection; inspect_program remains the legacy persisted-definition alias."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
