@@ -252,8 +252,10 @@ impl Library {
             .unwrap_or(&[])
     }
 
-    /// Return all entries marked `boot = true` (across all words/senses), in
-    /// alphabetical order by word name.  Used to run boot-time poetry at startup.
+    /// Return entries marked `boot = true` (across all words/senses), in
+    /// alphabetical order by word name. This is retained solely for the
+    /// explicit legacy `boot` word; Finch startup and typed Brain creation
+    /// never invoke it implicitly.
     pub fn boot_entries(&self) -> Vec<&WordEntry> {
         let mut entries: Vec<&WordEntry> = self
             .words
