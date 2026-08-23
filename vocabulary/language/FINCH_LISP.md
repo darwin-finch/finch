@@ -24,6 +24,8 @@ The ordinary response is `(say "Hello")`. Pure and compound examples:
 (define (announce (n : int)) : unit ! (session.emit)
   (if (<= n 0) (say "done")
       (begin (say "tick") (announce (- n 1)))))
+(define-syntax (when-positive test value) (if test value 0))
+(when-positive (> 3 2) 42)
 (define (singleton (x : int)) : list<int> (list x))
 (list-get (list 4 8 15 16) 2)
 (file-read (path "Cargo.toml"))
@@ -31,9 +33,15 @@ The ordinary response is `(say "Hello")`. Pure and compound examples:
 ```
 
 Lambda parameters use `(name : type)`. A lambda evaluates to a closure containing immutable code
-plus explicit captured lexical values. Calling a closure is runtime behavior. A macro transforms
-syntax during bounded, capability-free compilation; expansion cannot hide runtime effects. Macro
-definitions are reserved for a later language revision and must not be emitted for version 1.
+plus explicit captured lexical values. Calling a closure is runtime behavior.
+
+`define-syntax` provides bounded, capture-free template macros:
+`(define-syntax (name parameter ...) template)`. A macro substitutes only its declared syntax
+parameters, performs no evaluation, has no capabilities, and its expanded result is compiled and
+verified normally. Expansion is capped at 128 forms per submission. To keep the version-1 system
+hygienic by construction, a template may not introduce `let`, `lambda`, `define`, or
+`define-syntax`; write a function for a new binding or accept the binding syntax from the caller.
+There is no ellipsis, quasiquote, evaluator fallback, or compile-time I/O in this revision.
 
 Core types include `unit`, `bool`, `int`, `uint`, `float`, `char`, `string`, `bytes`, and explicit
 `dynamic` values. Parameterized spellings compose directly: `list<int>`, `map<string,int>`,

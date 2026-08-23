@@ -523,7 +523,12 @@ mod tests {
             .relevant_programs
             .iter()
             .any(|program| program.name == "test-changes"));
-        assert!(!manifest.prompt_block().contains("(define"));
+        // The language bootstrap may legitimately document `define` forms;
+        // this assertion protects the program registry contract specifically:
+        // relevant definitions are listed by compact metadata, not source.
+        assert!(!manifest
+            .prompt_block()
+            .contains("(define (test-changes paths) (length paths))"));
     }
 
     #[tokio::test]

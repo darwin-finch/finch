@@ -74,6 +74,12 @@ non-pure recursive bound explicitly as `! (session.emit memory.read)` after the 
 names are capability identities, not grants; version 1 does not accept parameterized selectors in
 this annotation, so typed calls still infer the concrete resource requirement.
 
+Use Lisp `define-syntax` only for a small capture-free syntax template:
+`(define-syntax (name parameter ...) template)`. It cannot evaluate code, access host state, or
+introduce `let`/`lambda`/`define` bindings, and expansion is capped at 128 forms. The expanded
+ordinary Lisp is still type- and capability-checked; do not use the legacy Lisp evaluator or
+quasiquote as a macro escape hatch.
+
 Capabilities are not stack tokens. Pure means no requirements. The active response session grants
 `session.emit`, so `(say "...")` does not prompt. Parameterized resource requirements use typed,
 bounded selector expressions over immutable arguments, never interpolated strings.

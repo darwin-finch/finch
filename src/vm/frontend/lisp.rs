@@ -193,7 +193,7 @@ pub fn compile_lisp_with_functions(
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
-    let expressions = crate::lisp::reader::parse_str(source).map_err(|error| {
+    let parsed_expressions = crate::lisp::reader::parse_str(source).map_err(|error| {
         vec![VmDiagnostic::error(
             "E-READ-002",
             DiagnosticPhase::Reader,
@@ -201,6 +201,15 @@ pub fn compile_lisp_with_functions(
             Some(source_origin(source_id, source, "<reader>")),
         )]
     })?;
+    let macros = collect_template_macros(source_id, source, &parsed_expressions)?;
+    let mut expansion_budget = 128;
+    let expressions = parsed_expressions
+        .iter()
+        .filter(|expression| !is_macro_definition(expression))
+        .map(|expression| {
+            expand_template_macros(source_id, source, expression, &macros, &mut expansion_budget)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut compiler = Compiler {
         source_id,
         source,
@@ -266,6 +275,213 @@ pub fn compile_lisp_with_functions(
         },
     };
     Verifier::new(vocabulary).verify(module)
+}
+
+/// A deliberately restricted source macro.  It is syntax-only: expansion
+/// happens before type checking, cannot run code, cannot request a capability,
+/// and is bounded globally for one submission.  Templates are capture-free
+/// because they are forbidden from introducing a binding form; substituted
+/// caller syntax keeps its original lexical bindings.
+#[derive(Debug, Clone)]
+struct TemplateMacro {
+    parameters: Vec<String>,
+    template: Val,
+}
+
+fn is_macro_definition(expression: &Val) -> bool {
+    matches!(
+        expression,
+        Val::List(items) if matches!(items.first(), Some(Val::Symbol(name)) if name == "define-syntax")
+    )
+}
+
+fn collect_template_macros(
+    source_id: &str,
+    source: &str,
+    expressions: &[Val],
+) -> Result<HashMap<String, TemplateMacro>, Vec<VmDiagnostic>> {
+    let mut macros = HashMap::new();
+    for expression in expressions {
+        if !is_macro_definition(expression) {
+            continue;
+        }
+        let Val::List(items) = expression else {
+            unreachable!("macro predicate only accepts lists");
+        };
+        if items.len() != 3 {
+            return Err(vec![macro_error(
+                source_id,
+                source,
+                "E-LISP-MACRO-001",
+                "define-syntax requires exactly a header and one template",
+            )]);
+        }
+        let Val::List(header) = &items[1] else {
+            return Err(vec![macro_error(
+                source_id,
+                source,
+                "E-LISP-MACRO-002",
+                "define-syntax header must be (name parameter ...)",
+            )]);
+        };
+        let Some(Val::Symbol(name)) = header.first() else {
+            return Err(vec![macro_error(
+                source_id,
+                source,
+                "E-LISP-MACRO-002",
+                "define-syntax requires a macro name",
+            )]);
+        };
+        let mut parameters = Vec::with_capacity(header.len().saturating_sub(1));
+        for parameter in &header[1..] {
+            let Val::Symbol(parameter) = parameter else {
+                return Err(vec![macro_error(
+                    source_id,
+                    source,
+                    "E-LISP-MACRO-002",
+                    "define-syntax parameters must be symbols",
+                )]);
+            };
+            if parameters.iter().any(|existing| existing == parameter) {
+                return Err(vec![macro_error(
+                    source_id,
+                    source,
+                    "E-LISP-MACRO-002",
+                    format!("duplicate macro parameter '{parameter}'"),
+                )]);
+            }
+            parameters.push(parameter.clone());
+        }
+        reject_template_binding_forms(source_id, source, &items[2])?;
+        if macros
+            .insert(
+                name.clone(),
+                TemplateMacro {
+                    parameters,
+                    template: items[2].clone(),
+                },
+            )
+            .is_some()
+        {
+            return Err(vec![macro_error(
+                source_id,
+                source,
+                "E-LISP-MACRO-003",
+                format!("macro '{name}' is already defined"),
+            )]);
+        }
+    }
+    Ok(macros)
+}
+
+fn reject_template_binding_forms(
+    source_id: &str,
+    source: &str,
+    template: &Val,
+) -> Result<(), Vec<VmDiagnostic>> {
+    match template {
+        Val::List(items) => {
+            if matches!(items.first(), Some(Val::Symbol(name)) if matches!(name.as_str(), "let" | "lambda" | "define" | "define-syntax")) {
+                return Err(vec![macro_error(
+                    source_id,
+                    source,
+                    "E-LISP-MACRO-004",
+                    "bounded syntax templates cannot introduce lexical bindings; use a function or compose an existing binding form in caller syntax",
+                )]);
+            }
+            for item in items {
+                reject_template_binding_forms(source_id, source, item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn expand_template_macros(
+    source_id: &str,
+    source: &str,
+    expression: &Val,
+    macros: &HashMap<String, TemplateMacro>,
+    budget: &mut u16,
+) -> Result<Val, Vec<VmDiagnostic>> {
+    let Val::List(items) = expression else {
+        return Ok(expression.clone());
+    };
+    // Data is not syntax.  In particular, a quoted list that happens to
+    // start with a macro name must remain a literal symbol/list value.
+    if matches!(items.first(), Some(Val::Symbol(name)) if name == "quote") {
+        return Ok(expression.clone());
+    }
+    if let Some(Val::Symbol(name)) = items.first() {
+        if let Some(definition) = macros.get(name) {
+            if *budget == 0 {
+                return Err(vec![macro_error(
+                    source_id,
+                    source,
+                    "E-LISP-MACRO-005",
+                    "macro expansion exceeded the per-submission limit of 128 forms",
+                )]);
+            }
+            let arguments = &items[1..];
+            if arguments.len() != definition.parameters.len() {
+                return Err(vec![macro_error(
+                    source_id,
+                    source,
+                    "E-LISP-MACRO-006",
+                    format!(
+                        "macro '{name}' expects {} arguments, received {}",
+                        definition.parameters.len(),
+                        arguments.len()
+                    ),
+                )]);
+            }
+            *budget -= 1;
+            let bindings = definition
+                .parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            let expanded = substitute_macro_template(&definition.template, &bindings);
+            return expand_template_macros(source_id, source, &expanded, macros, budget);
+        }
+    }
+    items
+        .iter()
+        .map(|item| expand_template_macros(source_id, source, item, macros, budget))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Val::List)
+}
+
+fn substitute_macro_template(template: &Val, bindings: &HashMap<String, Val>) -> Val {
+    match template {
+        Val::Symbol(name) => bindings
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| template.clone()),
+        Val::List(items) => Val::List(
+            items
+                .iter()
+                .map(|item| substitute_macro_template(item, bindings))
+                .collect(),
+        ),
+        _ => template.clone(),
+    }
+}
+
+fn macro_error(
+    source_id: &str,
+    source: &str,
+    code: &'static str,
+    message: impl Into<String>,
+) -> VmDiagnostic {
+    VmDiagnostic::error(
+        code,
+        DiagnosticPhase::MacroExpansion,
+        message,
+        Some(source_origin(source_id, source, "define-syntax")),
+    )
 }
 
 impl Compiler<'_> {
@@ -1946,6 +2162,67 @@ mod tests {
             run("(let ((n 10)) ((lambda ((x : int)) (+ x n)) 5))").unwrap(),
             vec![TypedValue::Int(15)]
         );
+    }
+
+    #[test]
+    fn expands_bounded_capture_free_syntax_templates_before_type_checking() {
+        assert_eq!(
+            run("(define-syntax (when test body) (if test body 0)) (when true 42)").unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+    }
+
+    #[test]
+    fn syntax_templates_compose_with_a_bounded_expansion_budget() {
+        assert_eq!(
+            run("(define-syntax (inc value) (+ value 1)) \
+                 (define-syntax (twice value) (inc (inc value))) \
+                 (twice 40)")
+            .unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+    }
+
+    #[test]
+    fn syntax_templates_do_not_hide_expanded_capabilities() {
+        let module = compile_lisp(
+            "input.lisp",
+            "(define-syntax (announce text) (say text)) (announce \"hello\")",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let main = module.functions.get("main").unwrap();
+        assert!(main.inferred_effects.grants(&EffectSet::from_requirement(
+            CapabilityRequirement {
+                capability: CapabilityKind::SessionEmit,
+                selector: ResourceSelector::None,
+            },
+        )));
+    }
+
+    #[test]
+    fn rejects_template_macros_that_introduce_a_binding_form() {
+        let errors = compile_lisp(
+            "input.lisp",
+            "(define-syntax (bad value) (let ((temporary value)) temporary)) (bad 1)",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "E-LISP-MACRO-004"));
+    }
+
+    #[test]
+    fn rejects_unbounded_recursive_syntax_expansion() {
+        let errors = compile_lisp(
+            "input.lisp",
+            "(define-syntax (forever value) (forever value)) (forever 1)",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "E-LISP-MACRO-005"));
     }
 
     #[test]
