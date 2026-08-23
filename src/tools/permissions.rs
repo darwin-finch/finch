@@ -221,7 +221,10 @@ impl PermissionManager {
             | "get_language_definition"
             | "search_vm_vocabulary"
             | "inspect_vm_word"
+            | "search_word"
+            | "inspect_word"
             | "search_vocabulary"
+            | "inspect_program"
             | "spawn_agent"
             | "await_agent"
             | "poll_agent"
@@ -897,6 +900,20 @@ mod tests {
                     PermissionCheck::Allow
                 ),
                 "{tool} must be available for protocol discovery without approval"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_discovery_tools_do_not_prompt_for_a_peer() {
+        let manager = PermissionManager::for_peer();
+        for tool in ["search_word", "inspect_word", "inspect_program"] {
+            assert!(
+                matches!(
+                    manager.check_tool_use(tool, &serde_json::json!({})),
+                    PermissionCheck::Allow
+                ),
+                "{tool} must remain available for peer protocol discovery"
             );
         }
     }
