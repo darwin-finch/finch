@@ -202,17 +202,17 @@ Second line.""" say
 The delimiter `"""` itself cannot appear in a raw literal; split the text into ordinary typed
 string operations if it is needed.
 
-`say` returns typed `unit`, so ordinary Co-Forth preserves that value on the stack. Use `drop`
-after a non-final `say` when its result should not remain available to subsequent positional code:
+`say` is a stack-neutral response effect: it consumes its string and leaves no value on the
+stack. Consecutive `say` calls compose directly; do not add `drop` after one:
 
 ```forth
 s" Working…" say
 2 3 + int-to-string say
 ```
 
-This differs deliberately from Lisp `begin`, which discards the values of all but its final
-expression. Both forms emit the same ordered response chunks when written with the appropriate
-explicit stack operation.
+Lisp keeps an internal `unit` only while compiling an effect-only expression; at a program
+boundary it likewise leaves no synthetic value on the shared stack. Both forms emit the same
+ordered response chunks.
 
 For concurrent/reactive presentation, `output-open` asks the host for an opaque
 `resource<output-handle>`. Keep that handle explicitly (usually in a local), then use
