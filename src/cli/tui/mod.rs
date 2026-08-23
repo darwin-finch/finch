@@ -1112,14 +1112,15 @@ impl TuiRenderer {
         Ok(())
     }
 
-    /// Return all uncommitted live messages in transcript order.
+    /// Return the whole uncommitted transcript suffix in order.
+    ///
+    /// A completed message may still be waiting to enter permanent scrollback
+    /// behind an earlier live message.  It must remain in the redraw area in
+    /// that state: filtering this list to `InProgress` made a received VM
+    /// program disappear as soon as the provider stream ended, while its
+    /// program-output WorkUnit was still running.
     fn find_live_messages(&self) -> Vec<MessageRef> {
-        self.output_manager
-            .get_messages()
-            .into_iter()
-            .filter(|m| !self.printed_ids.contains(&m.id()))
-            .filter(|m| matches!(m.status(), MessageStatus::InProgress))
-            .collect()
+        uncommitted_suffix(self.output_manager.get_messages(), &self.printed_ids)
     }
 }
 
@@ -1144,6 +1145,19 @@ fn committable_prefix_len(statuses: impl IntoIterator<Item = MessageStatus>) -> 
         }
     }
     count
+}
+
+/// Preserve every message that has not yet been committed to terminal
+/// scrollback. Some may already be complete: ordering requires them to remain
+/// visible behind an older live message until they can be printed.
+fn uncommitted_suffix(
+    messages: impl IntoIterator<Item = MessageRef>,
+    printed_ids: &HashSet<MessageId>,
+) -> Vec<MessageRef> {
+    messages
+        .into_iter()
+        .filter(|message| !printed_ids.contains(&message.id()))
+        .collect()
 }
 
 // ─── flush_output_safe / render ───────────────────────────────────────────────
@@ -2372,6 +2386,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
+    use crate::cli::messages::WorkUnit;
 
     // ── count_status_lines ────────────────────────────────────────────────────
 
@@ -2402,6 +2417,34 @@ mod tests {
             committable_prefix_len([MessageStatus::Complete, MessageStatus::Failed]),
             2
         );
+    }
+
+    #[test]
+    fn completed_program_source_stays_live_behind_running_output() {
+        let source = Arc::new(WorkUnit::new("source"));
+        source.set_program_source("lisp");
+        source.set_response("(say \"hello\")");
+        source.set_complete();
+
+        let output = Arc::new(WorkUnit::new("output"));
+        output.set_program_output();
+        output.append_response("hello");
+
+        let source_ref: MessageRef = source.clone();
+        let output_ref: MessageRef = output.clone();
+        let messages = vec![source_ref.clone(), output_ref.clone()];
+        let live = uncommitted_suffix(messages, &HashSet::new());
+        assert_eq!(live.len(), 2);
+        assert!(live[0]
+            .format(&ColorScheme::default())
+            .contains("(say \"hello\")"));
+        assert_eq!(live[1].format(&ColorScheme::default()), "hello");
+
+        let mut printed = HashSet::new();
+        printed.insert(source_ref.id());
+        let live = uncommitted_suffix(vec![source_ref, output_ref], &printed);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].format(&ColorScheme::default()), "hello");
     }
 
     #[test]

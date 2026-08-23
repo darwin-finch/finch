@@ -350,6 +350,17 @@ impl Message for WorkUnit {
                     return out;
                 }
 
+                // A running VM program can emit progressive output long
+                // before it completes. This is already a portable side
+                // effect, not an assistant message or a spinner; hiding it
+                // until completion made `say` chunks appear and then vanish
+                // during longer programs.
+                if matches!(inner.presentation, WorkUnitPresentation::ProgramOutput)
+                    && !inner.response_text.is_empty()
+                {
+                    return inner.response_text.clone();
+                }
+
                 // Time-driven throb: frame changes every 200 ms, no external counter
                 let frame_idx = (elapsed.as_millis() / 200) as usize % THROB_FRAMES.len();
                 let icon = THROB_FRAMES[frame_idx];
