@@ -136,6 +136,7 @@ pub enum TypedExecutionStatus {
 }
 
 /// Persistent typed stack shared by Finch Lisp and Co-Forth source.
+#[derive(Clone)]
 pub struct TypedRuntime {
     stack: Vec<TypedValue>,
     vocabulary: Vocabulary,

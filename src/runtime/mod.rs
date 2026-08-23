@@ -180,6 +180,10 @@ enum HostStreamBackend {
 
 #[derive(Clone)]
 struct PendingTypedExecution {
+    /// Private transactional VM state captured at the run's input revision.
+    /// It is never installed into the shared runtime until this exact run
+    /// completes and wins the revision commit.
+    working_runtime: TypedRuntime,
     suspension: TypedSuspension,
     context: ExecutionContext,
     input_revision: u64,
@@ -597,11 +601,12 @@ impl ProgramRuntime {
         expected_effect_sequence: Option<u64>,
         external_effect_result: Option<Vec<TypedValue>>,
     ) -> Result<ExecutionOutcome> {
-        let _submission = self.submission_gate.lock().await;
-        // Keep the standard mutex guard in this lexical block. A resumed VM
-        // may run on a Tokio worker, so no non-Send guard may cross the host
-        // resume await below.
+        // Serialize only removal of this continuation from the pending table.
+        // The private working VM then resumes without blocking unrelated
+        // submissions; completion reacquires this gate for the optimistic
+        // revision commit.
         let pending = {
+            let _submission = self.submission_gate.lock().await;
             let mut pending_runs = self
                 .pending_typed
                 .lock()
@@ -654,8 +659,24 @@ impl ProgramRuntime {
             )),
             None => None,
         };
-        let execution = self
-            .resume_typed_program(&pending, external_effect_result)
+        // Grants are authority policy, not a speculative stack/dictionary
+        // mutation. An approval granted while this run was suspended must be
+        // visible to its private continuation without installing any of its
+        // uncommitted values into the shared runtime.
+        let mut resumed_runtime = pending.working_runtime.clone();
+        resumed_runtime.set_grants(
+            self.typed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
+                .grants()
+                .clone(),
+        );
+        let (working_runtime, execution) = self
+            .resume_typed_program(
+                resumed_runtime,
+                &pending,
+                external_effect_result,
+            )
             .await?;
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mut output = pending.output;
@@ -678,6 +699,7 @@ impl ProgramRuntime {
                 .insert(
                     execution_id,
                     PendingTypedExecution {
+                        working_runtime: working_runtime.clone(),
                         suspension,
                         context: pending.context.clone(),
                         input_revision: pending.input_revision,
@@ -700,7 +722,9 @@ impl ProgramRuntime {
 
         Ok(match execution.status {
             TypedExecutionStatus::Completed => {
-                let output_revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                let output_revision = self
+                    .commit_working_runtime(pending.input_revision, working_runtime)
+                    .await?;
                 ExecutionOutcome {
                     execution_id,
                     status: ExecutionStatus::Completed,
@@ -804,6 +828,28 @@ impl ProgramRuntime {
 
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+
+    /// Atomically install a private working VM only when the state it was
+    /// derived from is still current. Host effects have already been retained
+    /// in the caller's journal; a losing commit must never replay them.
+    async fn commit_working_runtime(
+        &self,
+        input_revision: u64,
+        working_runtime: TypedRuntime,
+    ) -> Result<u64> {
+        let _submission = self.submission_gate.lock().await;
+        let current = self.revision();
+        if current != input_revision {
+            bail!(
+                "stale VM transaction input revision {input_revision}; current revision is {current}"
+            );
+        }
+        *self
+            .typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))? = working_runtime;
+        Ok(self.revision.fetch_add(1, Ordering::AcqRel) + 1)
     }
 
     pub async fn inspect(&self) -> Result<VmStateSnapshot> {
@@ -964,29 +1010,42 @@ impl ProgramRuntime {
         // This is a per-session state transaction, not a process-wide
         // interpreter lock. Independent runtimes and child model loops remain
         // concurrent while revision checks and mutations of this VM are atomic.
-        let _submission = self.submission_gate.lock().await;
-        let generation = self.manifest_generation();
-        if submission.manifest_generation != generation {
-            bail!(
-                "stale VM manifest generation {}; current generation is {}",
-                submission.manifest_generation,
-                generation
-            );
-        }
-        let input_revision = self.revision();
-        if let Some(expected) = submission.expected_revision {
-            if expected != input_revision {
+        let (generation, input_revision, working_runtime) = {
+            // The gate protects only the snapshot/revision handshake and the
+            // eventual optimistic commit. Program execution owns this cloned
+            // state privately and therefore does not serialize unrelated
+            // ProgramRuns behind a persistent runtime mutex.
+            let _submission = self.submission_gate.lock().await;
+            let generation = self.manifest_generation();
+            if submission.manifest_generation != generation {
                 bail!(
-                    "stale VM revision {}; current revision is {}",
-                    expected,
-                    input_revision
+                    "stale VM manifest generation {}; current generation is {}",
+                    submission.manifest_generation,
+                    generation
                 );
             }
-        }
+            let input_revision = self.revision();
+            if let Some(expected) = submission.expected_revision {
+                if expected != input_revision {
+                    bail!(
+                        "stale VM revision {}; current revision is {}",
+                        expected,
+                        input_revision
+                    );
+                }
+            }
+            let working_runtime = self
+                .typed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
+                .clone();
+            (generation, input_revision, working_runtime)
+        };
         let context = ExecutionContext::new(generation, submission.budget.unwrap_or_default());
         let started = Instant::now();
-        let execution = self
+        let (working_runtime, execution) = self
             .execute_typed_program(
+                working_runtime,
                 submission.language,
                 &submission.source,
                 &context,
@@ -1005,6 +1064,7 @@ impl ProgramRuntime {
                 .insert(
                     context.execution_id,
                     PendingTypedExecution {
+                        working_runtime: working_runtime.clone(),
                         suspension,
                         context: context.clone(),
                         input_revision,
@@ -1024,9 +1084,37 @@ impl ProgramRuntime {
         if suspension.is_none() {
             self.release_output_handles(context.execution_id)?;
         }
+        let completion_commit = if matches!(execution.status, TypedExecutionStatus::Completed) {
+            Some(self.commit_working_runtime(input_revision, working_runtime).await)
+        } else {
+            None
+        };
         Ok(match execution.status {
             TypedExecutionStatus::Completed => {
-                let output_revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                let output_revision = match completion_commit.expect("completed run has commit") {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        return Ok(ExecutionOutcome {
+                            execution_id: context.execution_id,
+                            status: ExecutionStatus::Failed,
+                            values: Vec::new(),
+                            output: truncate_output(execution.output, context.budget.max_output_bytes),
+                            output_chunks: execution.output_chunks,
+                            side_effects: execution.side_effects,
+                            vm_side_effects: execution.vm_side_effects,
+                            effect_journal: execution.effect_journal,
+                            diagnostics: vec![error.to_string()],
+                            vm_diagnostics: Vec::new(),
+                            required_capabilities: Vec::new(),
+                            approval_prompts: Vec::new(),
+                            input_revision,
+                            output_revision: self.revision(),
+                            effect: submission.effect,
+                            backend: ExecutionBackend::TypedVm,
+                            elapsed_ms,
+                        });
+                    }
+                };
                 ExecutionOutcome {
                     execution_id: context.execution_id,
                     status: ExecutionStatus::Completed,
@@ -1119,6 +1207,7 @@ impl ProgramRuntime {
 
     async fn execute_typed_program(
         &self,
+        mut runtime: TypedRuntime,
         language: ProgramLanguage,
         source: &str,
         context: &ExecutionContext,
@@ -1126,8 +1215,7 @@ impl ProgramRuntime {
         caller: Option<scheduler::AgentIdentity>,
         typed_effect_sink: Option<TypedEffectSink>,
         defer_program_invocations: bool,
-    ) -> Result<crate::vm::TypedExecution> {
-        let runtime = Arc::clone(&self.typed);
+    ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
         let workspace_root = Arc::clone(&self.workspace_root);
         let host_machine_root = Arc::clone(&self.host_machine_root);
@@ -1160,11 +1248,7 @@ impl ProgramRuntime {
             .then(|| EffectSet(declared_capabilities.iter().cloned().collect()));
         let fuel = context.budget.forth_fuel.min(u64::MAX as usize) as u64;
         let execution_id = context.execution_id;
-        let execution = tokio::task::spawn_blocking(move || {
-            runtime
-                .lock()
-                .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))
-                .map(|mut runtime| {
+        let (runtime, execution) = tokio::task::spawn_blocking(move || {
                     let vocabulary = serde_json::to_string(runtime.vocabulary())
                         .unwrap_or_else(|_| "[]".to_string());
                     // A host binding being installed is availability, not
@@ -1188,7 +1272,7 @@ impl ProgramRuntime {
                         schedule_queue,
                         defer_program_invocations,
                     );
-                    runtime.execute_with_handler(
+                    let execution = runtime.execute_with_handler(
                         language,
                         match language {
                             ProgramLanguage::Forth => "provider-response.forth",
@@ -1198,19 +1282,19 @@ impl ProgramRuntime {
                         fuel,
                         declared.as_ref(),
                         &mut handler,
-                    )
-                })
+                    );
+                    (runtime, execution)
         })
-        .await??;
-        Ok(execution)
+        .await?;
+        Ok((runtime, execution))
     }
 
     async fn resume_typed_program(
         &self,
+        mut runtime: TypedRuntime,
         pending: &PendingTypedExecution,
         external_effect_result: Option<(u64, Vec<TypedValue>)>,
-    ) -> Result<crate::vm::TypedExecution> {
-        let runtime = Arc::clone(&self.typed);
+    ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
         let workspace_root = Arc::clone(&self.workspace_root);
         let host_machine_root = Arc::clone(&self.host_machine_root);
@@ -1242,11 +1326,7 @@ impl ProgramRuntime {
             .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, pending.caller.clone()));
         let suspension = pending.suspension.clone();
         let execution_id = pending.context.execution_id;
-        tokio::task::spawn_blocking(move || {
-            runtime
-                .lock()
-                .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))
-                .map(|mut runtime| {
+        let (runtime, execution) = tokio::task::spawn_blocking(move || {
                     let vocabulary = serde_json::to_string(runtime.vocabulary())
                         .unwrap_or_else(|_| "[]".to_string());
                     // Resumption has the same authority boundary as initial
@@ -1270,7 +1350,7 @@ impl ProgramRuntime {
                         schedule_queue,
                         defer_program_invocations,
                     );
-                    match external_effect_result {
+                    let execution = match external_effect_result {
                         Some((effect_sequence, values)) => runtime.resume_with_effect_result(
                             suspension,
                             effect_sequence,
@@ -1278,10 +1358,11 @@ impl ProgramRuntime {
                             &mut handler,
                         ),
                         None => runtime.resume_with_handler(suspension, Vec::new(), &mut handler),
-                    }
-                })
+                    };
+                    (runtime, execution)
         })
-        .await?
+        .await?;
+        Ok((runtime, execution))
     }
 }
 
@@ -4467,6 +4548,44 @@ mod tests {
         request.expected_revision = Some(0);
         let error = runtime.submit(request).await.unwrap_err();
         assert!(error.to_string().contains("stale VM revision"));
+    }
+
+    #[tokio::test]
+    async fn suspended_runs_keep_private_state_and_reject_a_losing_commit() {
+        let runtime = ProgramRuntime::new();
+        let suspended = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "yield 1",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(suspended.status, ExecutionStatus::Suspended);
+        assert!(runtime.inspect().await.unwrap().typed_stack.is_empty());
+
+        let winner = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "2",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(winner.status, ExecutionStatus::Completed);
+        assert_eq!(winner.output_revision, 1);
+
+        let error = runtime
+            .resume_typed_execution(suspended.execution_id)
+            .await
+            .expect_err("a continuation based on an older snapshot must not commit");
+        assert!(error.to_string().contains("input revision 0; current revision is 1"));
+        let state = runtime.inspect().await.unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(
+            state.typed_stack.iter().map(|cell| &cell.value).collect::<Vec<_>>(),
+            vec![&TypedValue::Int(2)]
+        );
     }
 
     #[cfg(unix)]
