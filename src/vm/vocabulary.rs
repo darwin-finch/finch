@@ -768,6 +768,20 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_core_word_has_a_specific_discovery_contract() {
+        for name in core_vocabulary().keys() {
+            let documentation = core_word_documentation(name);
+            assert!(
+                !documentation.summary.starts_with("Typed Finch core word."),
+                "core word '{name}' needs specific provider documentation"
+            );
+            assert!(!documentation.lisp.is_empty());
+            assert!(!documentation.forth.is_empty());
+            assert!(!documentation.example.is_empty());
+        }
+    }
+
+    #[test]
     fn language_schema_advertises_every_core_capability_kind() {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../vocabulary/language/schema.json")).unwrap();
