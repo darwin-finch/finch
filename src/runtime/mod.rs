@@ -28,7 +28,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::{Mutex, RwLock, Weak};
+use std::sync::{mpsc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 /// A portable VM event attached to its owning ProgramRun. The VM event itself
@@ -62,6 +62,24 @@ impl VmEffectEnvelope {
 /// bound to one ProgramRun, never stored as a process- or Brain-global
 /// "active work unit".
 pub type TypedEffectSink = Arc<dyn Fn(VmEffectEnvelope) + Send + Sync>;
+
+/// Create a thread-safe, single-consumer adapter for portable VM effects.
+///
+/// A `ProgramRuntime` may execute VM instructions on Tokio's blocking pool;
+/// the returned sink is therefore safe to install directly on a run while the
+/// receiver is owned by an application event loop, IDE bridge, or test
+/// harness. Sender order is preserved for one ProgramRun. The runtime still
+/// keeps its own effect journal: this channel is a live projection mechanism,
+/// not a durable event store or an acknowledgement protocol.
+pub fn typed_effect_channel() -> (TypedEffectSink, mpsc::Receiver<VmEffectEnvelope>) {
+    let (sender, receiver) = mpsc::channel();
+    let sink: TypedEffectSink = Arc::new(move |envelope| {
+        // A disconnected UI must not fail or alter a verified VM execution.
+        // Its full effect journal remains available in the eventual outcome.
+        let _ = sender.send(envelope);
+    });
+    (sink, receiver)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramSubmission {
@@ -3710,6 +3728,38 @@ mod tests {
             &vec!["first-before".to_string(), "first-after".to_string()]
         );
         assert_eq!(&*second_events.lock().unwrap(), &vec!["second".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn typed_effect_channel_preserves_one_run_event_order() {
+        let runtime = ProgramRuntime::new();
+        let (sink, receiver) = typed_effect_channel();
+        let outcome = runtime
+            .submit_with_typed_effect_sink(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(begin (say \"first\") (say \"second\"))",
+                    ExecutionEffect::Pure,
+                ),
+                sink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].execution_id, outcome.execution_id);
+        assert_eq!(events[0].effect.sequence, 0);
+        assert_eq!(events[1].effect.sequence, 1);
+        assert!(matches!(
+            &events[0].effect.event,
+            crate::vm::HostSideEffect::Emit { text } if text == "first"
+        ));
+        assert!(matches!(
+            &events[1].effect.event,
+            crate::vm::HostSideEffect::Emit { text } if text == "second"
+        ));
     }
 
     #[tokio::test]
