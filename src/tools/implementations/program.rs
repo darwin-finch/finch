@@ -5,6 +5,7 @@ use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramRef};
 use crate::runtime::{ProgramRuntime, ProgramSubmission, TypedEffectSink};
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
+use crate::vm::vocabulary::core_word_documentation as vm_core_word_documentation;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -12,11 +13,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Model-facing documentation for an executable core word.  This deliberately
-/// lives beside the provider adapter rather than in Rust doc comments: Rust
-/// comments are useful to Finch developers, but are not a stable part of the
-/// VM protocol a provider can discover at runtime.
-#[derive(Debug, Clone, Copy)]
+/// Historical provider-documentation table retained only as a migration
+/// oracle. Production discovery uses `vm_core_word_documentation`; the test
+/// below prevents the VM-owned contract from silently losing a provider-facing
+/// description while this fixture is removed in a later registry consolidation.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CoreWordDocumentation {
     summary: &'static str,
     lisp: &'static str,
@@ -24,7 +26,8 @@ struct CoreWordDocumentation {
     example: &'static str,
 }
 
-fn core_word_documentation(name: &str) -> CoreWordDocumentation {
+#[cfg(test)]
+fn legacy_core_word_documentation(name: &str) -> CoreWordDocumentation {
     // Keep this total.  A model should never infer that a valid core word has
     // no semantics merely because its detailed prose has not been expanded
     // yet; its exact signature remains the normative contract.
@@ -463,7 +466,7 @@ impl Tool for SearchVmVocabularyTool {
             .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
             .take(limit)
             .map(|entry| {
-                let documentation = core_word_documentation(&entry.name);
+                let documentation = vm_core_word_documentation(&entry.name);
                 json!({
                     "name": entry.name,
                     "signature": entry.signature,
@@ -541,7 +544,7 @@ impl Tool for InspectVmWordTool {
             .into_iter()
             .find(|entry| entry.name == name)
             .with_context(|| format!("unknown built-in typed VM word '{name}'"))?;
-        let documentation = core_word_documentation(&entry.name);
+        let documentation = vm_core_word_documentation(&entry.name);
         Ok(json!({
             "name": entry.name,
             "signature": entry.signature,
@@ -610,7 +613,7 @@ impl Tool for SearchWordTool {
             .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
             .take(limit)
             .map(|entry| {
-                let documentation = core_word_documentation(&entry.name);
+                let documentation = vm_core_word_documentation(&entry.name);
                 json!({
                     "kind": "core",
                     "name": entry.name,
@@ -710,7 +713,7 @@ impl Tool for InspectWordTool {
                 .into_iter()
                 .find(|entry| entry.name == name)
             {
-                let documentation = core_word_documentation(&entry.name);
+                let documentation = vm_core_word_documentation(&entry.name);
                 return Ok(json!({
                     "kind": "core",
                     "name": entry.name,
@@ -988,6 +991,18 @@ impl Tool for GetVmStateTool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn vm_owned_core_documentation_preserves_the_provider_contract() {
+        for name in crate::vm::vocabulary::core_vocabulary().keys() {
+            let legacy = legacy_core_word_documentation(name);
+            let current = vm_core_word_documentation(name);
+            assert_eq!(current.summary, legacy.summary, "summary for {name}");
+            assert_eq!(current.lisp, legacy.lisp, "Lisp spelling for {name}");
+            assert_eq!(current.forth, legacy.forth, "Forth spelling for {name}");
+            assert_eq!(current.example, legacy.example, "example for {name}");
+        }
+    }
 
     #[tokio::test]
     async fn language_definition_advertises_program_response_contract() {
