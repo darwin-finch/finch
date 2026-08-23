@@ -102,9 +102,10 @@ omitted from typed IR, so it neither pushes a runtime value nor changes the func
   (if (<= n 1) 1 (* n (factorial (- n 1)))))
 ```
 
-For a self-contained Co-Forth script, use leading `\\` comments (or `\\ finch-doc:` for an
-explicit documentation line). Comments remain non-executable metadata; they never grant authority
-or change a word signature.
+For a self-contained Co-Forth script, use leading `\\` comments. Use
+`\\ finch-doc: Return the report total.` when a line is deliberately public documentation: Finch
+stores only `Return the report total.` in immutable registry metadata, not the `finch-doc:` marker.
+Comments remain non-executable metadata; they never grant authority or change a word signature.
 
 Legacy variable definitions and other unsupported legacy forms are not part of the provider
 language. They require an explicitly named host migration API; ordinary program submission never

@@ -901,7 +901,19 @@ fn leading_documentation(source: &str, language: ProgramLanguage) -> String {
                 ProgramLanguage::Lisp => line.strip_prefix(';'),
             }?;
             let text = text.trim();
-            (!text.is_empty() && !text.starts_with("finch-effect:")).then(|| text.to_string())
+            if text.is_empty() || text.starts_with("finch-effect:") {
+                return None;
+            }
+            // `finch-doc:` is the explicit, portable comment spelling for a
+            // self-contained script.  Store its payload, not the protocol
+            // marker, so a registry/manifest consumer sees the same prose as
+            // it would for a Lisp definition docstring.
+            if let Some(documentation) = text.strip_prefix("finch-doc:") {
+                let documentation = documentation.trim();
+                (!documentation.is_empty()).then(|| documentation.to_string())
+            } else {
+                Some(text.to_string())
+            }
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -1139,5 +1151,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(definition.documentation, "Return twice n.");
+    }
+
+    #[test]
+    fn self_contained_forth_finch_doc_marker_is_not_part_of_metadata() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("programs");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("double.forth");
+        std::fs::write(
+            &path,
+            "\\ finch-doc: Return twice an integer.\n: double ( S int -- S int ! {} ) 2 * ;\n",
+        )
+        .unwrap();
+
+        let definition = ProgramDefinition::from_source_file(&path, &root, ProgramScope::Project)
+            .unwrap();
+        assert_eq!(definition.documentation, "Return twice an integer.");
     }
 }
