@@ -84,7 +84,7 @@ enum Cell {
 }
 
 #[derive(Clone, Debug, Copy)]
-enum Builtin {
+pub(crate) enum Builtin {
     Plus,
     Minus,
     Star,
@@ -11473,7 +11473,6 @@ pub(crate) fn name_to_builtin(name: &str) -> Option<Builtin> {
         "reverse" => Builtin::ReverseLines,
         "reverse-lines" => Builtin::ReverseLines,
         "line-count" => Builtin::LineCount,
-        "solve" => Builtin::Solve,
         "prove-effect" => Builtin::ProveEffect,
         "same-effect?" => Builtin::SameEffect,
         // Vec4 — four lanes walking in lockstep
