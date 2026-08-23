@@ -48,6 +48,22 @@ async fn daemon_is_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Return the bearer token used by the locally configured daemon, if model
+/// endpoint authentication is enabled. These tests intentionally exercise
+/// request parsing *after* authentication: rejecting an unauthenticated body
+/// before parsing it is the desired DoS-resistant server behavior.
+fn daemon_authorization() -> Option<Option<String>> {
+    let config = finch::config::load_config().ok()?;
+    if !config.server.auth_enabled {
+        return Some(None);
+    }
+    config
+        .server
+        .api_keys
+        .first()
+        .map(|key| Some(format!("Bearer {key}")))
+}
+
 /// Convenience wrapper: GET a path on the node_test_router via oneshot.
 async fn oneshot_get(path: &str) -> axum::response::Response {
     let req = Request::builder()
@@ -278,10 +294,22 @@ async fn test_malformed_json_rejected() {
         return;
     }
 
-    let resp = reqwest::Client::new()
+    let Some(authorization) = daemon_authorization() else {
+        // An authenticated daemon without a local configured key is not a
+        // usable test target. Do not weaken the endpoint just for this test.
+        println!("Skipping test_malformed_json_rejected: daemon API key unavailable");
+        return;
+    };
+
+    let client = reqwest::Client::new();
+    let mut request = client
         .post("http://127.0.0.1:11435/v1/messages")
         .header("Content-Type", "application/json")
-        .body(r#"{"bad": json"#) // deliberately broken JSON
+        .body(r#"{"bad": json"#); // deliberately broken JSON
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let resp = request
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -304,13 +332,23 @@ async fn test_oversized_payload_rejected() {
         return;
     }
 
+    let Some(authorization) = daemon_authorization() else {
+        println!("Skipping test_oversized_payload_rejected: daemon API key unavailable");
+        return;
+    };
+
     // 5 MB of ASCII zeroes — well above the 4 MB limit
     let oversized_body = "0".repeat(5 * 1024 * 1024);
 
-    let result = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let mut request = client
         .post("http://127.0.0.1:11435/v1/messages")
         .header("Content-Type", "application/json")
-        .body(oversized_body)
+        .body(oversized_body);
+    if let Some(authorization) = authorization {
+        request = request.header("Authorization", authorization);
+    }
+    let result = request
         .timeout(Duration::from_secs(10))
         .send()
         .await;

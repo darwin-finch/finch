@@ -1,4 +1,4 @@
-// Integration tests for TodoWrite / TodoRead tools
+// Integration tests for todo_write / todo_read tools.
 //
 // Verifies the cross-module interaction: both tools share the same
 // Arc<RwLock<TodoList>> and the list's active_items ordering is correct
@@ -35,8 +35,11 @@ fn dummy_ctx() -> ToolContext<'static> {
 #[test]
 fn test_tool_names() {
     let list = make_list();
-    assert_eq!(TodoWriteTool::new(Arc::clone(&list)).name(), "TodoWrite");
-    assert_eq!(TodoReadTool::new(Arc::clone(&list)).name(), "TodoRead");
+    // Provider manifests advertise canonical snake_case. The REPL registers
+    // legacy PascalCase aliases for backwards-compatible dispatch, but aliases
+    // must never create duplicate model-facing tool definitions.
+    assert_eq!(TodoWriteTool::new(Arc::clone(&list)).name(), "todo_write");
+    assert_eq!(TodoReadTool::new(Arc::clone(&list)).name(), "todo_read");
 }
 
 #[test]
