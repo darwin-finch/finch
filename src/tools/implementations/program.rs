@@ -83,6 +83,24 @@ fn source_syntax_contract(entry: &SourceSyntaxEntry) -> Value {
     })
 }
 
+fn source_syntax_matches(entry: &SourceSyntaxEntry, query: &str) -> bool {
+    entry.name.to_ascii_lowercase().contains(query)
+        || entry.description.to_ascii_lowercase().contains(query)
+        || entry
+            .languages
+            .iter()
+            .any(|language| language.to_ascii_lowercase().contains(query))
+}
+
+fn core_word_matches(name: &str, query: &str) -> bool {
+    let documentation = vm_core_word_documentation(name);
+    name.to_ascii_lowercase().contains(query)
+        || documentation.summary.to_ascii_lowercase().contains(query)
+        || documentation.lisp.to_ascii_lowercase().contains(query)
+        || documentation.forth.to_ascii_lowercase().contains(query)
+        || documentation.example.to_ascii_lowercase().contains(query)
+}
+
 const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
     SourceSyntaxEntry {
         name: "if",
@@ -206,7 +224,7 @@ impl Tool for SearchVmVocabularyTool {
         ToolInputSchema {
             schema_type: "object".to_string(),
             properties: json!({
-                "query": {"type": "string", "description": "Case-insensitive word-name fragment"},
+                "query": {"type": "string", "description": "Case-insensitive name, documentation, source-spelling, or grammar-role fragment"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Maximum matches (default 25)"}
             }),
             required: vec!["query".to_string()],
@@ -228,7 +246,7 @@ impl Tool for SearchVmVocabularyTool {
         let matches = state
             .typed_vocabulary
             .into_iter()
-            .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
+            .filter(|entry| core_word_matches(&entry.name, &query))
             .take(limit)
             .map(|entry| {
                 let documentation = vm_core_word_documentation(&entry.name);
@@ -243,7 +261,7 @@ impl Tool for SearchVmVocabularyTool {
             .collect::<Vec<_>>();
         let syntax_matches = SOURCE_SYNTAX
             .iter()
-            .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
+            .filter(|entry| source_syntax_matches(entry, &query))
             .take(limit)
             .map(|entry| {
                 json!({
@@ -383,7 +401,7 @@ impl Tool for SearchWordTool {
         let core_matches = state
             .typed_vocabulary
             .into_iter()
-            .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
+            .filter(|entry| core_word_matches(&entry.name, &query))
             .take(limit)
             .map(|entry| {
                 let documentation = vm_core_word_documentation(&entry.name);
@@ -399,7 +417,7 @@ impl Tool for SearchWordTool {
             .collect::<Vec<_>>();
         let syntax_matches = SOURCE_SYNTAX
             .iter()
-            .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
+            .filter(|entry| source_syntax_matches(entry, &query))
             .take(limit)
             .map(|entry| {
                 json!({
@@ -1031,6 +1049,32 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry["name"] == "case"));
+
+        let loop_result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "loop"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(loop_result["syntax_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "while"));
+
+        let function_result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "function"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(function_result["syntax_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "define"));
 
         let json_result: Value = serde_json::from_str(
             &tool
