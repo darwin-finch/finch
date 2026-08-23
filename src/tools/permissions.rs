@@ -482,6 +482,8 @@ pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
         | "get_language_definition"
         | "search_vm_vocabulary"
         | "inspect_vm_word"
+        | "search_word"
+        | "inspect_word"
         | "search_vocabulary"
         | "inspect_program"
         | "search_memory"
@@ -863,6 +865,8 @@ mod tests {
             "get_language_definition",
             "search_vm_vocabulary",
             "inspect_vm_word",
+            "search_word",
+            "inspect_word",
             "search_vocabulary",
             "inspect_program",
         ] {
@@ -882,6 +886,8 @@ mod tests {
             "get_language_definition",
             "search_vm_vocabulary",
             "inspect_vm_word",
+            "search_word",
+            "inspect_word",
             "search_vocabulary",
             "inspect_program",
         ] {
