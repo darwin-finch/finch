@@ -44,11 +44,10 @@ forth = '." finch — local-first AI, watching from nearby." cr'
 
 [[word]]
 word = "self-proof"
-definition = "the machine verifies its own definition — runs all proofs on boot, loud if something breaks"
+definition = "the machine verifies its own definition when explicitly asked, loud if something breaks"
 related = ["prove-all", "test", "boot", "verify"]
 kind = "observation"
 forth = 'prove-all'
-boot = true
 
 [[word]]
 word = "forth"
@@ -88,7 +87,6 @@ definition = "a perfect form — every point equidistant from a center it never 
 related = ["infinity", "return", "wholeness"]
 kind = "observation"
 forth = '." circle" cr gen" write a single short poem (3-5 lines) about a perfect circle. no title, no explanation. just the poem."'
-boot = true
 
 [[word]]
 word = "line"
