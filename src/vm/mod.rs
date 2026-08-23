@@ -31,7 +31,7 @@ pub use interpreter::{
 };
 pub use runtime::{
     EffectJournalEntry, EffectJournalState, PendingHostCall, TypedExecution, TypedExecutionStatus,
-    TypedRuntime, TypedSuspension,
+    TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension,
 };
 pub use signature::{ControlEffect, StackRow, StackSignature};
 pub use types::{TaskKind, Type, TypedValue};

@@ -5,9 +5,9 @@ use super::interpreter::{
     CapabilityHandler, HostSideEffect, InterpreterConfig, VmContinuation, VmSideEffect, VmStep,
     VmTrampoline,
 };
-use super::ir::Function;
+use super::ir::{Function, Module};
 use super::types::{Type, TypedValue};
-use super::{core_vocabulary, VerifiedModule, Vocabulary};
+use super::{core_vocabulary, VerifiedModule, Verifier, Vocabulary, VM_TYPE_SYSTEM_VERSION};
 use crate::programs::ProgramLanguage;
 use crate::runtime::fiber::CpuFiberScheduler;
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,22 @@ pub struct TypedSuspension {
     pub pending_host_call: Option<PendingHostCall>,
 }
 
+/// Serializable reducible state of a typed runtime at a successful commit
+/// boundary. Host-owned resources intentionally do not appear here: a stream,
+/// output handle, or local CPU worker needs its owning application to restore
+/// it before it can be used again. Keeping that boundary explicit prevents a
+/// restart from turning an opaque ID into accidental ambient authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypedRuntimeCheckpoint {
+    pub version: u32,
+    pub stack: Vec<TypedValue>,
+    /// User-defined functions include generated `lambda$` bodies needed by a
+    /// persisted closure. Core vocabulary is reconstructed from the runtime
+    /// version rather than copied into every checkpoint.
+    #[serde(default)]
+    pub functions: BTreeMap<String, Function>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingHostCall {
     pub requirement: CapabilityRequirement,
@@ -186,6 +202,72 @@ impl TypedRuntime {
 
     pub fn functions(&self) -> &BTreeMap<String, Function> {
         &self.functions
+    }
+
+    /// Capture only state that can safely survive outside this process. This
+    /// is the VM half of a future durable Brain checkpoint; application-owned
+    /// effects and handles stay in their own journal/registry.
+    pub fn checkpoint(&self) -> Result<TypedRuntimeCheckpoint, VmDiagnostic> {
+        for value in &self.stack {
+            ensure_checkpointable(value)?;
+        }
+        Ok(TypedRuntimeCheckpoint {
+            version: VM_TYPE_SYSTEM_VERSION,
+            stack: self.stack.clone(),
+            functions: self.functions.clone(),
+        })
+    }
+
+    /// Restore a checkpoint into a fresh typed runtime and reverify every
+    /// persisted definition against the current core vocabulary. Grants are
+    /// intentionally not restored: authority belongs to the host's current
+    /// approval policy, never to serialized program state.
+    pub fn from_checkpoint(checkpoint: TypedRuntimeCheckpoint) -> Result<Self, Vec<VmDiagnostic>> {
+        if checkpoint.version != VM_TYPE_SYSTEM_VERSION {
+            return Err(vec![VmDiagnostic::error(
+                "E-CHECKPOINT-001",
+                DiagnosticPhase::Linking,
+                format!(
+                    "unsupported typed runtime checkpoint version {}; expected {}",
+                    checkpoint.version, VM_TYPE_SYSTEM_VERSION
+                ),
+                None,
+            )]);
+        }
+        for value in &checkpoint.stack {
+            if let Err(diagnostic) = ensure_checkpointable(value) {
+                return Err(vec![diagnostic]);
+            }
+        }
+
+        let mut vocabulary = core_vocabulary();
+        for (name, function) in &checkpoint.functions {
+            if vocabulary.contains_key(name) {
+                return Err(vec![VmDiagnostic::error(
+                    "E-CHECKPOINT-004",
+                    DiagnosticPhase::Linking,
+                    format!("checkpoint definition '{name}' shadows an immutable core word"),
+                    None,
+                )]);
+            }
+            if !name.starts_with("lambda$") {
+                vocabulary.insert(name.clone(), function.signature.clone());
+            }
+        }
+        if let Some(entry) = checkpoint.functions.keys().next().cloned() {
+            Verifier::new(&vocabulary).verify(Module {
+                version: VM_TYPE_SYSTEM_VERSION,
+                name: "typed-runtime-checkpoint".to_owned(),
+                entry,
+                functions: checkpoint.functions.clone(),
+            })?;
+        }
+
+        let mut runtime = Self::new();
+        runtime.stack = checkpoint.stack;
+        runtime.vocabulary = vocabulary;
+        runtime.functions = checkpoint.functions;
+        Ok(runtime)
     }
 
     pub fn grants(&self) -> &EffectSet {
@@ -1200,6 +1282,69 @@ impl TypedRuntime {
     }
 }
 
+fn ensure_checkpointable(value: &TypedValue) -> Result<(), VmDiagnostic> {
+    match value {
+        TypedValue::List { values, .. } => {
+            for value in values {
+                ensure_checkpointable(value)?;
+            }
+        }
+        TypedValue::Option { value, .. } => {
+            if let Some(value) = value {
+                ensure_checkpointable(value)?;
+            }
+        }
+        TypedValue::Result { value, .. } | TypedValue::Dynamic { value, .. } => {
+            ensure_checkpointable(value)?;
+        }
+        TypedValue::Record(fields) => {
+            for (_, value) in fields {
+                ensure_checkpointable(value)?;
+            }
+        }
+        TypedValue::Variant { value, .. } => {
+            if let Some(value) = value {
+                ensure_checkpointable(value)?;
+            }
+        }
+        TypedValue::Closure { captures, .. } => {
+            for value in captures {
+                ensure_checkpointable(value)?;
+            }
+        }
+        TypedValue::Task { kind, .. } => {
+            return Err(VmDiagnostic::error(
+                "E-CHECKPOINT-002",
+                DiagnosticPhase::HostCall,
+                format!(
+                    "cannot checkpoint a {kind:?} task handle before its scheduler record is restored"
+                ),
+                None,
+            ));
+        }
+        TypedValue::Stream { .. } | TypedValue::Resource { .. } => {
+            return Err(VmDiagnostic::error(
+                "E-CHECKPOINT-003",
+                DiagnosticPhase::HostCall,
+                "cannot checkpoint a host-owned stream or resource handle",
+                None,
+            ));
+        }
+        TypedValue::Unit
+        | TypedValue::Bool(_)
+        | TypedValue::Int(_)
+        | TypedValue::UInt(_)
+        | TypedValue::Float(_)
+        | TypedValue::Char(_)
+        | TypedValue::Symbol(_)
+        | TypedValue::String(_)
+        | TypedValue::Bytes(_)
+        | TypedValue::Json(_)
+        | TypedValue::Path { .. } => {}
+    }
+    Ok(())
+}
+
 fn entry_effects(module: &VerifiedModule) -> EffectSet {
     module
         .functions
@@ -2192,6 +2337,60 @@ mod tests {
         let result = runtime.execute(ProgramLanguage::Forth, "b.forth", "0 /", 1_000);
         assert_eq!(result.status, TypedExecutionStatus::Failed);
         assert_eq!(runtime.stack(), before);
+    }
+
+    #[test]
+    fn checkpoint_round_trips_stack_and_verified_definitions() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute(
+            ProgramLanguage::Forth,
+            "definition.forth",
+            ": square ( S int -- S int ! {} ) dup * ;",
+            1_000,
+        );
+        assert_eq!(definition.status, TypedExecutionStatus::Completed);
+        runtime.execute(ProgramLanguage::Forth, "seed.forth", "6", 1_000);
+
+        let checkpoint = runtime.checkpoint().expect("pure VM state checkpoints");
+        assert!(serde_json::to_string(&checkpoint).is_ok());
+        let mut restored = TypedRuntime::from_checkpoint(checkpoint)
+            .expect("persisted definitions are reverified on restore");
+        let result = restored.execute(ProgramLanguage::Lisp, "call.lisp", "(square 6)", 1_000);
+
+        assert_eq!(result.status, TypedExecutionStatus::Completed);
+        assert_eq!(restored.stack(), &[TypedValue::Int(6), TypedValue::Int(36)]);
+    }
+
+    #[test]
+    fn checkpoint_rejects_host_owned_handles() {
+        let value = TypedValue::Stream {
+            id: "cursor-1".into(),
+            element_type: Type::String,
+            kind: "file-lines".into(),
+            generation: 1,
+        };
+        let diagnostic = ensure_checkpointable(&value).expect_err("stream needs a host restore");
+        assert_eq!(diagnostic.code, "E-CHECKPOINT-003");
+    }
+
+    #[test]
+    fn checkpoint_restore_refuses_to_shadow_a_core_word() {
+        let mut runtime = TypedRuntime::new();
+        runtime.execute(
+            ProgramLanguage::Forth,
+            "definition.forth",
+            ": square ( S int -- S int ! {} ) dup * ;",
+            1_000,
+        );
+        let mut checkpoint = runtime.checkpoint().unwrap();
+        let mut function = checkpoint.functions.remove("square").unwrap();
+        function.name = "+".into();
+        checkpoint.functions.insert("+".into(), function);
+
+        let Err(diagnostics) = TypedRuntime::from_checkpoint(checkpoint) else {
+            panic!("persisted state cannot redefine core semantics");
+        };
+        assert_eq!(diagnostics[0].code, "E-CHECKPOINT-004");
     }
 
     #[test]

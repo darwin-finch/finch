@@ -11,7 +11,8 @@ use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
 use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
     ApprovalPrompt, CapabilityRequest, CapabilityRequirement, EffectSet, SourceOrigin, Type,
-    TypedExecutionStatus, TypedRuntime, TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
+    TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension, TypedValue,
+    VmDiagnostic, VmSideEffect,
 };
 use crate::vm::vocabulary::{core_word_spec, CoreHostBinding, CoreWordImplementation};
 use anyhow::{bail, Result};
@@ -123,6 +124,14 @@ pub struct VmRevisionSnapshot {
     pub revision: u64,
     pub stack: Vec<TypedValue>,
     pub vocabulary: Vec<String>,
+    /// A serializable, restorable checkpoint when the stack contains no
+    /// application-owned handles. The ordinary live revision remains valid
+    /// even when this is absent; the host must persist/rebind those handles
+    /// before a future restart can recover the revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<TypedRuntimeCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_diagnostic: Option<String>,
 }
 
 /// One session's persistent language runtimes.
@@ -245,8 +254,12 @@ impl ProgramRuntime {
 
     pub fn with_automation(enabled: bool) -> Self {
         let automation = Arc::new(AutomationBroker::new(enabled));
+        let typed_runtime = TypedRuntime::new();
+        let checkpoint = typed_runtime
+            .checkpoint()
+            .expect("a fresh typed runtime is checkpointable");
         Self {
-            typed: Arc::new(Mutex::new(TypedRuntime::new())),
+            typed: Arc::new(Mutex::new(typed_runtime)),
             revision: Arc::new(AtomicU64::new(0)),
             manifest_generation: AtomicU64::new(1),
             submission_gate: tokio::sync::Mutex::new(()),
@@ -267,6 +280,8 @@ impl ProgramRuntime {
                 revision: 0,
                 stack: Vec::new(),
                 vocabulary: crate::vm::core_vocabulary().into_keys().collect(),
+                checkpoint: Some(checkpoint),
+                checkpoint_diagnostic: None,
             }]),
         }
     }
@@ -903,6 +918,7 @@ impl ProgramRuntime {
                 "stale VM transaction input revision {input_revision}; current revision is {current}"
             );
         }
+        let checkpoint = working_runtime.checkpoint();
         *self
             .typed
             .lock()
@@ -916,6 +932,8 @@ impl ProgramRuntime {
                 revision,
                 stack: typed.stack().to_vec(),
                 vocabulary: typed.vocabulary().keys().cloned().collect(),
+                checkpoint: checkpoint.as_ref().ok().cloned(),
+                checkpoint_diagnostic: checkpoint.err().map(|diagnostic| diagnostic.to_string()),
             });
         Ok(revision)
     }
@@ -4633,6 +4651,36 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].revision, 1);
         assert_eq!(history[1].stack, vec![TypedValue::Int(7)]);
+        assert!(history[1].checkpoint.is_some());
+    }
+
+    #[tokio::test]
+    async fn revision_history_checkpoint_restores_persisted_vocabulary() {
+        let runtime = ProgramRuntime::new();
+        let defined = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                ": square ( S int -- S int ! {} ) dup * ;",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(defined.status, ExecutionStatus::Completed);
+        runtime
+            .submit(submission(ProgramLanguage::Forth, "7", ExecutionEffect::Pure))
+            .await
+            .unwrap();
+
+        let history = runtime.revision_history().unwrap();
+        let checkpoint = history
+            .last()
+            .and_then(|snapshot| snapshot.checkpoint.clone())
+            .expect("pure revision exposes a restorable VM checkpoint");
+        let mut restored = TypedRuntime::from_checkpoint(checkpoint).unwrap();
+        let result = restored.execute(ProgramLanguage::Forth, "restore.forth", "square", 1_000);
+
+        assert_eq!(result.status, TypedExecutionStatus::Completed);
+        assert_eq!(restored.stack(), &[TypedValue::Int(49)]);
     }
 
     #[tokio::test]

@@ -99,8 +99,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   validation, managed JSON fallback, parameter-bounded `mcp.call` capability grants, and normal
   suspension/resume; keep MCP transport lifecycle host-owned rather than a VM subagent protocol.
 - [ ] Finish the persistent `ProgramRuntime` state model. Lisp and Co-Forth already share one
-  persistent typed stack and dictionary, exposed by one inspection/revision boundary; add the
-  managed heap, transaction manager, and durable revision history before treating it as a
+  persistent typed stack and dictionary, exposed by one inspection/revision boundary. Successful
+  revisions now retain a serializable, reverified stack-and-definition checkpoint whenever they
+  contain no host-owned handles; authority is intentionally not serialized. Add the managed heap,
+  durable storage, host-handle restoration, and transaction manager before treating it as a
   restartable Brain state.
 - [ ] Complete revisioned private working snapshots and conflict-aware commits. A `ProgramRuntime`
   now executes each ProgramRun on a cloned stack/dictionary snapshot and gates only snapshot/commit;
