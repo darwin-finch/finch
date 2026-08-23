@@ -4410,6 +4410,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portable_effect_channel_round_trips_a_deferred_proposal_resume() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ProgramInvoke,
+                selector: crate::vm::ResourceSelector::Program {
+                    languages: vec!["python".into()],
+                },
+            })
+            .unwrap();
+        let (sink, receiver) = typed_effect_channel();
+        let pending = runtime
+            .submit_with_deferred_program_effects(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(proposal-open \"python\" \"show an artifact\" \"print('original')\")",
+                    ExecutionEffect::ExternalWrite,
+                ),
+                sink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::Suspended);
+
+        let envelope = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("portable effect envelope");
+        assert_eq!(envelope.execution_id, pending.execution_id);
+        assert_eq!(
+            envelope.effect.requirement.capability,
+            crate::vm::CapabilityKind::ProgramInvoke
+        );
+
+        let outcome = runtime
+            .resume_vm_effect(VmResume {
+                execution_id: envelope.execution_id,
+                sequence: envelope.effect.sequence,
+                response: VmResumeResponse::Result {
+                    values: vec![TypedValue::Option {
+                        inner_type: Type::Result(Box::new(Type::String), Box::new(Type::String)),
+                        value: Some(Box::new(TypedValue::Result {
+                            ok_type: Type::String,
+                            error_type: Type::String,
+                            is_ok: true,
+                            value: Box::new(TypedValue::String("print('edited')".into())),
+                        })),
+                    }],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert!(matches!(
+            outcome.effect_journal.last().map(|entry| &entry.state),
+            Some(crate::vm::EffectJournalState::Acknowledged { values })
+                if matches!(values.as_slice(), [TypedValue::Option { .. }])
+        ));
+        assert!(receiver.try_recv().is_err(), "the VM must not redispatch the effect");
+    }
+
+    #[tokio::test]
     async fn ordinary_output_sink_keeps_legacy_proposal_projection_synchronous() {
         let runtime = ProgramRuntime::new();
         runtime
