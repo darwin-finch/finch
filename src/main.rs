@@ -622,6 +622,19 @@ mod script_tests {
         assert!(request.contains("E-LINK-002"));
     }
 
+    #[tokio::test]
+    async fn one_shot_wire_receiver_executes_a_daemon_style_final_response() {
+        let runtime = finch::runtime::ProgramRuntime::new();
+        let outcome = execute_one_shot_wire_source(&runtime, "(say \"daemon wire executed\")")
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            finch::runtime::outcome::ExecutionStatus::Completed
+        );
+        assert_eq!(outcome.output, "daemon wire executed");
+    }
+
     #[test]
     fn prose_about_a_forth_string_opener_is_not_executed_as_forth() {
         assert!(!is_clearly_forth(
@@ -2048,7 +2061,26 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
     let response = client
         .query_with_tools(query, tool_definitions, &guard)
         .await?;
-    println!("{}", response);
+    // The daemon owns model inference and tool-loop routing, but this CLI
+    // process owns the local typed runtime.  A final text response is therefore
+    // still Finch wire source, never user-facing prose to print verbatim.
+    // Running it here keeps the daemon and --cloud-only paths semantically
+    // identical without handing workspace/UI authority to the daemon.
+    let outcome = execute_one_shot_wire_source(&program_runtime, &response).await?;
+    if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
+        print!("{}", outcome.output);
+    } else {
+        let diagnostic = outcome
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+        anyhow::bail!(
+            "daemon provider VM-wire program ended as {:?}: {}",
+            outcome.status,
+            diagnostic
+        );
+    }
 
     Ok(())
 }
@@ -2100,8 +2132,8 @@ async fn run_query_teacher_only(
         // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
             let source = response.text();
-            let language = match finch::programs::ProgramLanguage::infer_wire_source(&source) {
-                Ok(language) => language,
+            let outcome = match execute_one_shot_wire_source(&program_runtime, &source).await {
+                Ok(outcome) => outcome,
                 Err(error) if !wire_repair_requested && is_repairable_one_shot_wire_diagnostic(&error.to_string()) => {
                     messages.push(response.to_message());
                     messages.push(Message::user(one_shot_wire_repair_request(&source, &error.to_string())));
@@ -2110,18 +2142,6 @@ async fn run_query_teacher_only(
                 }
                 Err(error) => return Err(error),
             };
-            let outcome = program_runtime
-                .submit_typed_only(finch::runtime::ProgramSubmission {
-                    language,
-                    source: source.clone(),
-                    intent: "one-shot provider VM-wire response".to_string(),
-                    effect: finch::programs::ExecutionEffect::Pure,
-                    declared_capabilities: Vec::new(),
-                    manifest_generation: program_runtime.manifest_generation(),
-                    expected_revision: Some(program_runtime.revision()),
-                    budget: None,
-                })
-                .await?;
             if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
                 print!("{}", outcome.output);
                 return Ok(());
@@ -2192,6 +2212,29 @@ async fn run_query_teacher_only(
 
     eprintln!("⚠️  Reached max tool turns without a final answer");
     Ok(())
+}
+
+/// Submit one completed one-shot provider response through the same typed VM
+/// receiver used by every CLI transport.  The caller decides whether a failed,
+/// effect-free program merits the single repair turn; this helper never retries
+/// or renders raw source as prose.
+async fn execute_one_shot_wire_source(
+    program_runtime: &finch::runtime::ProgramRuntime,
+    source: &str,
+) -> Result<finch::runtime::outcome::ExecutionOutcome> {
+    let language = finch::programs::ProgramLanguage::infer_wire_source(source)?;
+    program_runtime
+        .submit_typed_only(finch::runtime::ProgramSubmission {
+            language,
+            source: source.to_string(),
+            intent: "one-shot provider VM-wire response".to_string(),
+            effect: finch::programs::ExecutionEffect::Pure,
+            declared_capabilities: Vec::new(),
+            manifest_generation: program_runtime.manifest_generation(),
+            expected_revision: Some(program_runtime.revision()),
+            budget: None,
+        })
+        .await
 }
 
 /// One-shot provider calls use the same conservative repair boundary as the
