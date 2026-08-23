@@ -8,6 +8,8 @@
 //! * **Brain** — `BrainQuestion`, `BrainProposedAction`.
 //! * **Daemon** — `DaemonBrainQuestion`, `DaemonBrainProposedAction`.
 
+use crate::cli::output_manager::VmOutputProjection;
+use crate::runtime::VmEffectEnvelope;
 use crate::tools::executor::ToolSignature;
 use crate::tools::patterns::ToolPattern;
 use crate::tools::types::ToolUse;
@@ -66,6 +68,18 @@ pub enum ReplEvent {
     /// Output is ready to display
     OutputReady {
         message: String,
+    },
+
+    /// A portable typed-VM effect to project on the owning terminal client.
+    ///
+    /// The VM may run in Tokio's blocking pool. It therefore must not write
+    /// WorkUnits or drive terminal rendering directly: the client event loop
+    /// owns that mutable presentation state. Tokio's MPSC preserves send
+    /// order for this per-run sender, while the envelope retains the durable
+    /// `(execution_id, sequence)` identity for replay-capable hosts.
+    VmEffect {
+        projection: VmOutputProjection,
+        envelope: VmEffectEnvelope,
     },
 
     /// Streaming response completed (used for non-streaming path)

@@ -1961,6 +1961,7 @@ impl EventLoop {
                         ReplEvent::ToolResult { .. } => "ToolResult",
                         ReplEvent::ToolApprovalNeeded { .. } => "ToolApprovalNeeded",
                         ReplEvent::OutputReady { .. } => "OutputReady",
+                        ReplEvent::VmEffect { .. } => "VmEffect",
                         ReplEvent::UserInput { .. } => "UserInput",
                         ReplEvent::StatsUpdate { .. } => "StatsUpdate",
                         ReplEvent::AgentLifecycle(_) => "AgentLifecycle",
@@ -3820,6 +3821,14 @@ Rules:\n\
 
             ReplEvent::OutputReady { message } => {
                 self.output_manager.write_status(message);
+            }
+
+            ReplEvent::VmEffect {
+                projection,
+                envelope,
+            } => {
+                projection.project(&envelope.effect);
+                self.render_tui().await?;
             }
 
             ReplEvent::StreamingComplete {

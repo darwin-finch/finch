@@ -28,6 +28,21 @@ pub struct VmOutputProjection {
     handles: Arc<Mutex<HashMap<String, Arc<WorkUnit>>>>,
 }
 
+impl std::fmt::Debug for VmOutputProjection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Projections deliberately contain client-local UI state. Do not leak
+        // a WorkUnit or OutputManager through debug logs merely because an
+        // effect is travelling over the event-loop bus.
+        formatter
+            .debug_struct("VmOutputProjection")
+            .field(
+                "open_handles",
+                &self.handles.lock().map(|handles| handles.len()).unwrap_or(0),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl VmOutputProjection {
     pub fn new(output: Arc<OutputManager>, default_response: Arc<WorkUnit>) -> Self {
         Self {

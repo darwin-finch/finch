@@ -57,12 +57,19 @@ async fn execute_direct_wire_response(
     runtime: &crate::runtime::ProgramRuntime,
     output_manager: Arc<OutputManager>,
     work_unit: Arc<crate::cli::messages::WorkUnit>,
+    event_tx: mpsc::UnboundedSender<ReplEvent>,
     source: String,
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
     let projection = VmOutputProjection::new(output_manager, work_unit);
     let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
-        projection.project(&envelope.effect);
+        // The typed VM executes on a blocking worker. Projection belongs on
+        // the event-loop task so shadow-buffer mutations and rendering remain
+        // serialized with all other client events.
+        let _ = event_tx.send(ReplEvent::VmEffect {
+            projection: projection.clone(),
+            envelope,
+        });
     });
     runtime
         .submit_with_deferred_program_effects(submission, sink)
@@ -134,6 +141,7 @@ struct WireExecution {
 async fn execute_wire_with_single_repair(
     runtime: &crate::runtime::ProgramRuntime,
     output_manager: Arc<OutputManager>,
+    event_tx: mpsc::UnboundedSender<ReplEvent>,
     generator: Arc<dyn Generator>,
     messages: &[crate::claude::Message],
     source: String,
@@ -144,6 +152,7 @@ async fn execute_wire_with_single_repair(
         runtime,
         Arc::clone(&output_manager),
         Arc::clone(&output_unit),
+        event_tx.clone(),
         source.clone(),
     )
     .await;
@@ -211,6 +220,7 @@ async fn execute_wire_with_single_repair(
         runtime,
         output_manager,
         Arc::clone(&repair_output_unit),
+        event_tx,
         repaired_source.clone(),
     )
     .await
@@ -823,6 +833,7 @@ pub(crate) async fn process_query_with_tools(
                 let wire_execution = execute_wire_with_single_repair(
                     program_runtime.as_ref(),
                     Arc::clone(&output_manager),
+                    event_tx.clone(),
                     Arc::clone(&generator),
                     &messages,
                     wire_source.clone(),
@@ -941,6 +952,7 @@ pub(crate) async fn process_query_with_tools(
             let wire_execution = execute_wire_with_single_repair(
                 program_runtime.as_ref(),
                 Arc::clone(&output_manager),
+                event_tx.clone(),
                 Arc::clone(&generator),
                 &messages,
                 wire_source.clone(),
@@ -1329,17 +1341,33 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         let execution = execute_wire_with_single_repair(
             &runtime,
             Arc::clone(&output),
+            event_tx,
             generator.clone(),
             &[crate::claude::Message::user("reply")],
             source.clone(),
         )
         .await;
 
+        // The worker only emits portable effects. The client event loop owns
+        // the WorkUnit mutation, so apply the queued projection exactly as it
+        // would on the live REPL task.
+        let mut projected = 0;
+        while let Ok(ReplEvent::VmEffect {
+            projection,
+            envelope,
+        }) = event_rx.try_recv()
+        {
+            projection.project(&envelope.effect);
+            projected += 1;
+        }
+
         assert_eq!(generator.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(projected, 1, "the repaired say must cross the event bus");
         assert_eq!(execution.source_for_history, "(say \"repaired\")");
         assert_eq!(execution.response, "repaired");
         let messages = output.get_messages();
