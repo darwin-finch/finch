@@ -65,9 +65,12 @@ impl VmOutputProjection {
         };
         match operation {
             UiOperation::Create => {
-                let unit = self
-                    .output
-                    .start_work_unit(text.unwrap_or("Working"));
+                let unit = self.output.start_work_unit(text.unwrap_or("Working"));
+                // A handle is a VM-owned reactive artifact, not a second
+                // assistant reply.  Give it the same plain output chrome as
+                // `say` output so progress/status updates never acquire the
+                // conversational bullet merely because they are addressable.
+                unit.set_program_output();
                 self.handles
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -468,6 +471,11 @@ mod tests {
         assert_eq!(response.content(), "answer next");
         assert_eq!(messages[1].content(), "2 / 5");
         assert_eq!(messages[1].status(), crate::cli::messages::MessageStatus::Complete);
+        assert_eq!(
+            messages[1].format(&crate::config::ColorScheme::default()),
+            "2 / 5",
+            "explicit VM output handles must not render as assistant replies"
+        );
     }
 
     #[test]
