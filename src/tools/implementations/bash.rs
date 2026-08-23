@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -43,13 +44,19 @@ impl Tool for BashTool {
             Some(s) => s,
         };
 
-        let mut child = Command::new("bash")
+        let mut command = Command::new("bash");
+        command
             .arg("-c")
             .arg(&script)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // The outer coordinator deliberately does not time the editor
+            // review. Once a script is accepted, however, the actual process
+            // remains bounded and is terminated if this future is dropped.
+            .kill_on_drop(true);
+        let mut child = command
             .spawn()
-            .with_context(|| format!("Failed to spawn command: {}", command))?;
+            .with_context(|| format!("Failed to spawn command: {}", script))?;
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -57,30 +64,38 @@ impl Tool for BashTool {
         // Clone the live output callback for the stdout reader
         let live_cb = context.live_output.clone();
 
-        // Drain stderr in a background task so it doesn't block stdout reading
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = String::new();
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-            buf
-        });
+        let (stdout_buf, stderr_buf, exit_status) = tokio::time::timeout(
+            Duration::from_secs(30),
+            async {
+                // Drain stderr in a background task so it doesn't block stdout reading.
+                let stderr_task = tokio::spawn(async move {
+                    let mut buf = String::new();
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                    buf
+                });
 
-        // Drain stdout on this task, calling the live-output callback per line
-        let mut stdout_buf = String::new();
-        let mut stdout_lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = stdout_lines.next_line().await {
-            if let Some(ref cb) = live_cb {
-                cb.line(line.clone());
-            }
-            stdout_buf.push_str(&line);
-            stdout_buf.push('\n');
-        }
+                // Drain stdout on this task, calling the live-output callback per line.
+                let mut stdout_buf = String::new();
+                let mut stdout_lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = stdout_lines.next_line().await {
+                    if let Some(ref cb) = live_cb {
+                        cb.line(line.clone());
+                    }
+                    stdout_buf.push_str(&line);
+                    stdout_buf.push('\n');
+                }
 
-        let stderr_buf = stderr_task.await.unwrap_or_default();
-        let exit_status = child.wait().await?;
+                let stderr_buf = stderr_task.await.unwrap_or_default();
+                let exit_status = child.wait().await?;
+                Ok::<_, anyhow::Error>((stdout_buf, stderr_buf, exit_status))
+            },
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("approved command timed out after 30 seconds"))??;
         let exit_code = exit_status.code().unwrap_or(-1);
 
         let mut result = stdout_buf;

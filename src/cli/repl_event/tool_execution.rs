@@ -6,8 +6,8 @@
 //! 1. Checks whether the tool needs user approval (via `ToolExecutor::is_approved`).
 //! 2. If needed, sends a `ReplEvent::ToolApprovalNeeded` and waits on a oneshot
 //!    channel — only *this* task blocks; other tool tasks proceed independently.
-//! 3. Executes the tool (with a 30-second timeout) and sends the result back as
-//!    `ReplEvent::ToolResult`.
+//! 3. Executes the tool (with a bounded subprocess timeout, but never timing a
+//!    human editor review) and sends the result back as `ReplEvent::ToolResult`.
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -302,27 +302,27 @@ impl ToolExecutionCoordinator {
             // Wire the poset into the executor so tool calls auto-record trace nodes.
             tool_executor.lock().await.poset = poset.clone();
 
-            // Execute with timeout to prevent system freezing (especially for CPU-heavy operations)
+            // Editor-backed proposal tools explicitly suspend on a human review;
+            // that wait is not a process timeout. Those adapters enforce their
+            // own timeout only after they have an accepted script to execute.
             let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
-            let result = tokio::time::timeout(
-                timeout_duration,
-                tool_executor
-                    .lock()
-                    .await
-                    .execute_tool::<fn() -> anyhow::Result<()>>(
-                        &tool_use,
-                        Some(&conversation_snapshot),
-                        None, // save_fn (not needed in event loop)
-                        None, // router (for training)
-                        Some(Arc::clone(&local_generator)),
-                        Some(Arc::clone(&tokenizer)),
-                        Some(Arc::clone(&repl_mode)),
-                        Some(Arc::clone(&plan_content)),
-                        Some(Arc::clone(&live_output)),
-                        stack.clone(), // Co-Forth shared stack
-                    ),
-            )
-            .await;
+            let executor = tool_executor.lock().await;
+            let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
+                    &tool_use,
+                    Some(&conversation_snapshot),
+                    None, // save_fn (not needed in event loop)
+                    None, // router (for training)
+                    Some(Arc::clone(&local_generator)),
+                    Some(Arc::clone(&tokenizer)),
+                    Some(Arc::clone(&repl_mode)),
+                    Some(Arc::clone(&plan_content)),
+                    Some(Arc::clone(&live_output)),
+                    stack.clone(), // Co-Forth shared stack
+                );
+            let result = match timeout_duration {
+                Some(timeout) => tokio::time::timeout(timeout, execute).await,
+                None => Ok(execute.await),
+            };
 
             // Send result back to event loop
             match result {
@@ -367,10 +367,13 @@ impl ToolExecutionCoordinator {
                 }
                 Err(_) => {
                     // Timeout elapsed
+                    let seconds = timeout_duration
+                        .map(|duration| duration.as_secs())
+                        .unwrap_or_default();
                     tracing::error!(
                         "[tool_exec] Tool {} timed out after {} seconds",
                         tool_use.name,
-                        timeout_duration.as_secs()
+                        seconds
                     );
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,
@@ -378,7 +381,7 @@ impl ToolExecutionCoordinator {
                         result: Err(anyhow::anyhow!(
                             "Tool execution timed out after {} seconds. \
                              Try restarting or check daemon logs for errors.",
-                            timeout_duration.as_secs()
+                            seconds
                         )),
                     });
                 }

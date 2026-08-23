@@ -354,26 +354,24 @@ fn build_artifact(description: &str, code: &str, comment_prefix: &str, executabl
 ///
 /// Returns `Ok(stdout+stderr)` on success, `Err` if the script exits non-zero.
 pub async fn run_script_async(script: &str) -> Result<String> {
-    let script = script.to_string();
-    spawn_blocking(move || {
-        let output = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .output()?;
-        let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if !stderr.is_empty() {
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(&stderr);
+    const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
+    let mut command = tokio::process::Command::new("bash");
+    command.arg("-c").arg(script).kill_on_drop(true);
+    let output = tokio::time::timeout(SCRIPT_TIMEOUT, command.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("approved script timed out after 30 seconds"))??;
+    let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !stderr.is_empty() {
+        if !result.is_empty() {
+            result.push('\n');
         }
-        if !output.status.success() {
-            return Err(anyhow::anyhow!("{}", result.trim()));
-        }
-        Ok(result)
-    })
-    .await?
+        result.push_str(&stderr);
+    }
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("{}", result.trim()));
+    }
+    Ok(result)
 }
 
 /// Open `$EDITOR` with Forth source, return the (possibly edited) content.

@@ -286,13 +286,22 @@ impl ToolExecutor {
         self.mcp_client.as_ref()
     }
 
-    /// Maximum execution time for a tool call. MCP servers can configure longer
-    /// operations than Finch's built-in-tool default.
-    pub fn execution_timeout(&self, tool_name: &str) -> std::time::Duration {
+    /// Maximum execution time for a tool call. `None` means the adapter may
+    /// first wait for a human in `$EDITOR`; the adapter itself must separately
+    /// bound the subprocess it eventually launches.
+    ///
+    /// MCP servers can configure longer operations than Finch's built-in-tool
+    /// default. The editor-backed compatibility tools are the one exception:
+    /// timing a human review as though it were a subprocess made ordinary
+    /// proposal review fail after thirty seconds.
+    pub fn execution_timeout(&self, tool_name: &str) -> Option<std::time::Duration> {
+        if matches!(tool_name, "bash" | "edit" | "write") {
+            return None;
+        }
         self.mcp_client
             .as_ref()
             .and_then(|client| client.timeout_for_tool(tool_name))
-            .unwrap_or_else(|| std::time::Duration::from_secs(30))
+            .or_else(|| Some(std::time::Duration::from_secs(30)))
     }
 
     /// Get list of all available tools (built-in + MCP)
@@ -834,6 +843,18 @@ mod tests {
         // Use temp path for tests
         let temp_path = std::env::temp_dir().join("finch_test_patterns.json");
         ToolExecutor::new(registry, permissions, temp_path).expect("Failed to create test executor")
+    }
+
+    #[test]
+    fn editor_backed_tools_do_not_time_out_human_review() {
+        let executor = create_test_executor(true, false);
+        assert!(executor.execution_timeout("bash").is_none());
+        assert!(executor.execution_timeout("edit").is_none());
+        assert!(executor.execution_timeout("write").is_none());
+        assert_eq!(
+            executor.execution_timeout("mock").map(|duration| duration.as_secs()),
+            Some(30)
+        );
     }
 
     #[tokio::test]
