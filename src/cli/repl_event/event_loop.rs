@@ -3002,7 +3002,6 @@ Rules:\n\
                     })
                     .await;
             }
-            self.output_manager.write_user(input.clone());
             // Broadcast to channels so peers can see (and /exec) it.
             for chan in &self.joined_channels {
                 let promise = crate::session::Promise::lisp(input.clone());
@@ -3014,27 +3013,12 @@ Rules:\n\
                 };
                 let _ = self.peer_tx.send(ev);
             }
-            let src = input.clone();
-            let ctx = self.lisp_ctx.clone();
-            let env = self.lisp_env.clone();
-            let event_tx = self.event_tx.clone();
-            let mem = self.memory_system.clone();
-            tokio::spawn(async move {
-                let result = crate::lisp::run_in(&src, env, ctx)
-                    .await
-                    .map(|v| v.to_string());
-                // Persist successful defines for session replay.
-                if result.is_ok() {
-                    let trimmed = src.trim();
-                    if trimmed.starts_with("(define") || trimmed.starts_with("( define") {
-                        if let Some(m) = &mem {
-                            let _ = m.save_lisp_define(&src).await;
-                        }
-                    }
-                }
-                let _ = event_tx.send(super::events::ReplEvent::LispResult { result });
-            });
-            return Ok(());
+            return self
+                .execute_interactive_typed_program(
+                    crate::programs::ProgramLanguage::Lisp,
+                    input,
+                )
+                .await;
         }
 
         // Broadcast to all joined channels (slash-commands are excluded above).
