@@ -64,10 +64,13 @@ pub fn emergency_restore_terminal() {
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
         crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::event::DisableBracketedPaste,
         cursor::Show,
         ResetColor,
+        Print("\r\n"),
     );
     let _ = stdout.lock().flush();
     let _ = disable_raw_mode();
