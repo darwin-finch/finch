@@ -6,6 +6,7 @@ use super::effects::{
 use super::signature::{ControlEffect, StackRow, StackSignature};
 use super::types::Type;
 use super::verifier::Vocabulary;
+use once_cell::sync::Lazy;
 use std::collections::BTreeMap;
 
 /// Provider-facing protocol documentation for an executable core word.
@@ -853,11 +854,10 @@ fn core_signatures() -> Vocabulary {
     ])
 }
 
-/// Build the production registry from the signature declarations and attach
-/// the corresponding provider contract and executable destination exactly
-/// once.  Callers should consume this instead of keeping their own list of
-/// built-ins.
-pub fn core_word_registry() -> BTreeMap<String, CoreWordSpec> {
+/// The immutable production registry. It is initialized once so every
+/// verifier, provider-discovery call, and interpreter dispatch in this
+/// process observes the identical versioned core contract.
+static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
     core_signatures()
         .into_iter()
         .map(|(name, signature)| {
@@ -914,12 +914,19 @@ pub fn core_word_registry() -> BTreeMap<String, CoreWordSpec> {
             })
         })
         .collect()
+});
+
+/// Return the immutable production registry. Callers that need to extend a
+/// vocabulary for a module must first copy the relevant signatures; core
+/// contracts themselves are never mutable runtime state.
+pub fn core_word_registry() -> &'static BTreeMap<String, CoreWordSpec> {
+    &CORE_WORD_REGISTRY
 }
 
 /// Return the complete contract for one core word.  This is the canonical
 /// lookup used by execution and provider discovery.
 pub fn core_word_spec(name: &str) -> Option<CoreWordSpec> {
-    core_word_registry().remove(name)
+    core_word_registry().get(name).cloned()
 }
 
 /// Return provider-neutral documentation for a registered core word.
@@ -937,8 +944,8 @@ pub fn core_word_documentation(name: &str) -> CoreWordDocumentation {
 /// from documentation or execution ownership.
 pub fn core_vocabulary() -> Vocabulary {
     core_word_registry()
-        .into_iter()
-        .map(|(name, spec)| (name, spec.signature))
+        .iter()
+        .map(|(name, spec)| (name.clone(), spec.signature.clone()))
         .collect()
 }
 
@@ -974,8 +981,8 @@ mod tests {
         );
 
         let signatures: Vocabulary = registry
-            .into_iter()
-            .map(|(name, spec)| (name, spec.signature))
+            .iter()
+            .map(|(name, spec)| (name.clone(), spec.signature.clone()))
             .collect();
         assert_eq!(signatures, core_vocabulary());
     }
