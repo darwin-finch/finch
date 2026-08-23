@@ -19,25 +19,14 @@ use crate::models::bootstrap::GeneratorState;
 use crate::router::Router;
 use crate::tools::types::{ToolDefinition, ToolUse};
 
-/// Recover exactly one Markdown-fenced program from a provider response.
+/// Preserve a provider response as submitted wire source.
 ///
-/// The wire protocol remains raw source; the language package tells providers
-/// not to fence it.  This narrow recovery path handles the strongest general
-/// chat-model prior without turning arbitrary prose plus a code sample into an
-/// executable program.  Anything before or after the single fence remains a
-/// malformed wire response.
-fn recover_fenced_wire_program(source: &str) -> String {
-    let trimmed = source.trim();
-    let Some(after_open) = trimmed.strip_prefix("```") else {
-        return trimmed.to_string();
-    };
-    let Some((_, body_and_close)) = after_open.split_once('\n') else {
-        return trimmed.to_string();
-    };
-    let Some(body) = body_and_close.strip_suffix("\n```") else {
-        return trimmed.to_string();
-    };
-    body.trim().to_string()
+/// Markdown fences are deliberately *not* unwrapped. The wire protocol makes
+/// them malformed input so the model receives a structured correction instead
+/// of silently learning that an undocumented wrapper is accepted. Trimming
+/// only outer framing whitespace never changes literal contents.
+fn raw_wire_source(source: &str) -> String {
+    source.trim().to_string()
 }
 
 /// Build the submission for a provider response carried on the VM wire rather
@@ -207,7 +196,7 @@ async fn execute_wire_with_single_repair(
     }
     output_unit.set_complete();
 
-    let repaired_source = recover_fenced_wire_program(&repair.text);
+    let repaired_source = raw_wire_source(&repair.text);
     let repair_source_unit = output_manager.start_work_unit("VM program repair");
     repair_source_unit.set_program_source(
         crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),
@@ -824,7 +813,7 @@ pub(crate) async fn process_query_with_tools(
                 // then route its `say`/UI events to a distinct output unit.
                 // This keeps agent activity inspectable without making source
                 // and user-visible output compete for the same mutable row.
-                let wire_source = recover_fenced_wire_program(&text);
+                let wire_source = raw_wire_source(&text);
                 let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
                 work_unit.set_program_source(wire_language.as_str());
                 work_unit.set_response(wire_source.clone());
@@ -937,7 +926,7 @@ pub(crate) async fn process_query_with_tools(
 
             // Non-streaming providers receive the same two-unit projection:
             // source first, then the independently reactive program output.
-            let wire_source = recover_fenced_wire_program(&response.text);
+            let wire_source = raw_wire_source(&response.text);
             let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
             work_unit.set_program_source(wire_language.as_str());
             work_unit.set_response(wire_source.clone());
@@ -1246,15 +1235,18 @@ mod tests {
     }
 
     #[test]
-    fn recovers_one_complete_fenced_program_but_not_mixed_prose() {
+    fn preserves_fenced_source_for_a_structured_wire_diagnostic() {
         assert_eq!(
-            recover_fenced_wire_program("```lisp\n(say \"hello\")\n```"),
-            "(say \"hello\")"
+            raw_wire_source("```lisp\n(say \"hello\")\n```"),
+            "```lisp\n(say \"hello\")\n```"
         );
-        assert_eq!(
-            recover_fenced_wire_program("intro\n```forth\ns\"hello\" say\n```"),
-            "intro\n```forth\ns\"hello\" say\n```"
-        );
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let error = direct_wire_submission(
+            &runtime,
+            raw_wire_source("```forth\ns\"hello\" say\n```"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Markdown code fence"));
     }
 
     #[test]
