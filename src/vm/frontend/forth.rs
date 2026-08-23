@@ -1874,6 +1874,23 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
+        // Keep the conventional Forth line-break word available without
+        // changing `say`'s exact-chunk contract. It lowers to the same typed
+        // session-emission path as `s\"\\n\" say`, so it is capability
+        // checked, journaled, and streamable rather than a terminal escape.
+        if &source[start..cursor] == "cr" {
+            tokens.push(Token {
+                value: TokenValue::String("\n".to_string()),
+                start,
+                end: cursor,
+            });
+            tokens.push(Token {
+                value: TokenValue::Word("say".to_string()),
+                start,
+                end: cursor,
+            });
+            continue;
+        }
         tokens.push(Token {
             value: TokenValue::Word(source[start..cursor].to_string()),
             start,

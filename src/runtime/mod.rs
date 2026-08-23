@@ -4152,6 +4152,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_forth_cr_is_an_explicit_session_emit_newline() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "s\" first\" say cr s\" second\" say",
+                ExecutionEffect::VmRead,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(outcome.output, "first\nsecond");
+        assert_eq!(
+            outcome.output_chunks,
+            vec!["first".to_string(), "\n".to_string(), "second".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn typed_forth_can_say_computed_values_progressively() {
         let runtime = ProgramRuntime::new();
         let outcome = runtime

@@ -21,6 +21,9 @@ leave no `unit` placeholder. Compose consecutive output directly—never add `dr
 Lisp keeps `unit` only as an internal expression value; at a program boundary it is likewise not
 persisted onto the shared stack.
 
+`cr` is the conventional explicit line break, exactly equivalent to `s"\n" say`. It does not
+change the exact-chunk behavior of `say`.
+
 `\` starts a line comment outside a string and continues through the following newline. Comments
 are ignored by the compiler and never grant capability, change a signature, or affect provenance.
 
