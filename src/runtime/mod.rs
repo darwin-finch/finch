@@ -132,13 +132,11 @@ pub struct ProgramRuntime {
     /// Output handles are opaque, per-execution presentation resources.  They
     /// intentionally do not name an ambient "current work unit".
     output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
-    /// Bounded line cursors are opaque, per-ProgramRun resources. The host
-    /// retains the open descriptor and source code never gets a raw path back
-    /// after opening it.
-    file_line_cursors: Arc<Mutex<HashMap<String, FileLineCursor>>>,
-    /// CSV cursors model RFC-style records rather than physical lines, so
-    /// quoted fields can contain newlines without forcing whole-file reads.
-    csv_record_cursors: Arc<Mutex<HashMap<String, CsvRecordCursor>>>,
+    /// Opaque, per-ProgramRun streams. The host retains their backing state
+    /// and source code never gets a raw path or producer capability back after
+    /// opening one. New stream backends belong in `HostStreamBackend`, not in
+    /// a parallel registry with a second ownership lifecycle.
+    streams: Arc<Mutex<HashMap<String, HostStream>>>,
     output_sink: RwLock<Option<Arc<dyn Fn(String) + Send + Sync>>>,
     schedule_queue: RwLock<Option<Arc<TaskQueue>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
@@ -164,16 +162,19 @@ struct OutputHandleRecord {
     generation: u64,
 }
 
-struct FileLineCursor {
+struct HostStream {
     owner: uuid::Uuid,
     generation: u64,
-    reader: BufReader<std::fs::File>,
+    backend: HostStreamBackend,
 }
 
-struct CsvRecordCursor {
-    owner: uuid::Uuid,
-    generation: u64,
-    reader: BufReader<std::fs::File>,
+/// Private implementations of host-issued `stream<T>` values.  The public
+/// type and capability contract live in the typed VM; this enum is merely the
+/// host adapter's resource table.  A future workbook or producer stream gets
+/// the exact same ownership, close, and ProgramRun-release behavior.
+enum HostStreamBackend {
+    FileLines(BufReader<std::fs::File>),
+    CsvRecords(BufReader<std::fs::File>),
 }
 
 #[derive(Clone)]
@@ -241,8 +242,7 @@ impl ProgramRuntime {
             memory: RwLock::new(None),
             network: Arc::new(Mutex::new(HashMap::new())),
             output_handles: Arc::new(Mutex::new(HashMap::new())),
-            file_line_cursors: Arc::new(Mutex::new(HashMap::new())),
-            csv_record_cursors: Arc::new(Mutex::new(HashMap::new())),
+            streams: Arc::new(Mutex::new(HashMap::new())),
             output_sink: RwLock::new(None),
             schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
@@ -364,14 +364,10 @@ impl ProgramRuntime {
             .lock()
             .map_err(|_| anyhow::anyhow!("output handle registry lock poisoned"))?
             .retain(|_, record| record.owner != execution_id);
-        self.file_line_cursors
+        self.streams
             .lock()
-            .map_err(|_| anyhow::anyhow!("file line cursor registry lock poisoned"))?
-            .retain(|_, cursor| cursor.owner != execution_id);
-        self.csv_record_cursors
-            .lock()
-            .map_err(|_| anyhow::anyhow!("CSV cursor registry lock poisoned"))?
-            .retain(|_, cursor| cursor.owner != execution_id);
+            .map_err(|_| anyhow::anyhow!("stream registry lock poisoned"))?
+            .retain(|_, stream| stream.owner != execution_id);
         Ok(())
     }
 
@@ -1141,8 +1137,7 @@ impl ProgramRuntime {
             .clone();
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
-        let file_line_cursors = Arc::clone(&self.file_line_cursors);
-        let csv_record_cursors = Arc::clone(&self.csv_record_cursors);
+        let streams = Arc::clone(&self.streams);
         let output_sink = self
             .output_sink
             .read()
@@ -1184,8 +1179,7 @@ impl ProgramRuntime {
                         vocabulary,
                         network,
                         output_handles,
-                        file_line_cursors,
-                        csv_record_cursors,
+                        streams,
                         execution_id,
                         grants,
                         output_sink,
@@ -1226,8 +1220,7 @@ impl ProgramRuntime {
             .clone();
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
-        let file_line_cursors = Arc::clone(&self.file_line_cursors);
-        let csv_record_cursors = Arc::clone(&self.csv_record_cursors);
+        let streams = Arc::clone(&self.streams);
         let output_sink = self
             .output_sink
             .read()
@@ -1268,8 +1261,7 @@ impl ProgramRuntime {
                         vocabulary,
                         network,
                         output_handles,
-                        file_line_cursors,
-                        csv_record_cursors,
+                        streams,
                         execution_id,
                         grants,
                         output_sink,
@@ -1304,8 +1296,7 @@ struct TypedHostHandler {
     vocabulary: String,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
     output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
-    file_line_cursors: Arc<Mutex<HashMap<String, FileLineCursor>>>,
-    csv_record_cursors: Arc<Mutex<HashMap<String, CsvRecordCursor>>>,
+    streams: Arc<Mutex<HashMap<String, HostStream>>>,
     execution_id: uuid::Uuid,
     network_grants: EffectSet,
     output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
@@ -1324,8 +1315,7 @@ impl TypedHostHandler {
         vocabulary: String,
         network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
         output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
-        file_line_cursors: Arc<Mutex<HashMap<String, FileLineCursor>>>,
-        csv_record_cursors: Arc<Mutex<HashMap<String, CsvRecordCursor>>>,
+        streams: Arc<Mutex<HashMap<String, HostStream>>>,
         execution_id: uuid::Uuid,
         network_grants: EffectSet,
         output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
@@ -1345,8 +1335,7 @@ impl TypedHostHandler {
             vocabulary,
             network,
             output_handles,
-            file_line_cursors,
-            csv_record_cursors,
+            streams,
             execution_id,
             network_grants,
             output_sink,
@@ -1371,23 +1360,33 @@ impl TypedHostHandler {
             generation,
         }] = arguments
         else {
-            return Err(host_binding_error(origin, "stream-next requires one stream<T>"));
+            return Err(host_binding_error(
+                origin,
+                "stream-next requires one stream<T>",
+            ));
         };
         match kind.as_str() {
             "csv-records" if *element_type == Type::list(Type::String) => {
-                let mut cursors = self.csv_record_cursors.lock().map_err(|_| {
-                    host_binding_error(origin, "CSV stream registry lock poisoned")
-                })?;
-                let cursor = cursors.get_mut(id).ok_or_else(|| {
-                    host_binding_error(origin, "CSV stream is unknown or closed")
-                })?;
-                if cursor.owner != self.execution_id || cursor.generation != *generation {
+                let mut streams = self
+                    .streams
+                    .lock()
+                    .map_err(|_| host_binding_error(origin, "stream registry lock poisoned"))?;
+                let stream = streams
+                    .get_mut(id)
+                    .ok_or_else(|| host_binding_error(origin, "CSV stream is unknown or closed"))?;
+                if stream.owner != self.execution_id || stream.generation != *generation {
                     return Err(host_binding_error(
                         origin,
                         "CSV stream does not belong to this ProgramRun",
                     ));
                 }
-                let record = read_bounded_csv_record(&mut cursor.reader)
+                let HostStreamBackend::CsvRecords(reader) = &mut stream.backend else {
+                    return Err(host_binding_error(
+                        origin,
+                        "CSV stream backend is malformed",
+                    ));
+                };
+                let record = read_bounded_csv_record(reader)
                     .map_err(|message| host_binding_error(origin, message))?;
                 Ok(vec![TypedValue::Option {
                     inner_type: Type::list(Type::String),
@@ -1400,19 +1399,26 @@ impl TypedHostHandler {
                 }])
             }
             "file-lines" if *element_type == Type::String => {
-                let mut cursors = self.file_line_cursors.lock().map_err(|_| {
-                    host_binding_error(origin, "file line stream registry lock poisoned")
-                })?;
-                let cursor = cursors.get_mut(id).ok_or_else(|| {
+                let mut streams = self
+                    .streams
+                    .lock()
+                    .map_err(|_| host_binding_error(origin, "stream registry lock poisoned"))?;
+                let stream = streams.get_mut(id).ok_or_else(|| {
                     host_binding_error(origin, "file line stream is unknown or closed")
                 })?;
-                if cursor.owner != self.execution_id || cursor.generation != *generation {
+                if stream.owner != self.execution_id || stream.generation != *generation {
                     return Err(host_binding_error(
                         origin,
                         "file line stream does not belong to this ProgramRun",
                     ));
                 }
-                let line = read_bounded_utf8_line(&mut cursor.reader)
+                let HostStreamBackend::FileLines(reader) = &mut stream.backend else {
+                    return Err(host_binding_error(
+                        origin,
+                        "file line stream backend is malformed",
+                    ));
+                };
+                let line = read_bounded_utf8_line(reader)
                     .map_err(|message| host_binding_error(origin, message))?;
                 Ok(vec![TypedValue::Option {
                     inner_type: Type::String,
@@ -1440,41 +1446,14 @@ impl TypedHostHandler {
             generation,
         }] = arguments
         else {
-            return Err(host_binding_error(origin, "stream-close requires one stream<T>"));
+            return Err(host_binding_error(
+                origin,
+                "stream-close requires one stream<T>",
+            ));
         };
-        let remove = match kind.as_str() {
-            "csv-records" if *element_type == Type::list(Type::String) => {
-                let mut cursors = self.csv_record_cursors.lock().map_err(|_| {
-                    host_binding_error(origin, "CSV stream registry lock poisoned")
-                })?;
-                let cursor = cursors.get(id).ok_or_else(|| {
-                    host_binding_error(origin, "CSV stream is unknown or closed")
-                })?;
-                if cursor.owner != self.execution_id || cursor.generation != *generation {
-                    return Err(host_binding_error(
-                        origin,
-                        "CSV stream does not belong to this ProgramRun",
-                    ));
-                }
-                cursors.remove(id);
-                true
-            }
-            "file-lines" if *element_type == Type::String => {
-                let mut cursors = self.file_line_cursors.lock().map_err(|_| {
-                    host_binding_error(origin, "file line stream registry lock poisoned")
-                })?;
-                let cursor = cursors.get(id).ok_or_else(|| {
-                    host_binding_error(origin, "file line stream is unknown or closed")
-                })?;
-                if cursor.owner != self.execution_id || cursor.generation != *generation {
-                    return Err(host_binding_error(
-                        origin,
-                        "file line stream does not belong to this ProgramRun",
-                    ));
-                }
-                cursors.remove(id);
-                true
-            }
+        let expected_backend = match kind.as_str() {
+            "csv-records" if *element_type == Type::list(Type::String) => "csv",
+            "file-lines" if *element_type == Type::String => "lines",
             _ => {
                 return Err(host_binding_error(
                     origin,
@@ -1482,7 +1461,27 @@ impl TypedHostHandler {
                 ))
             }
         };
-        debug_assert!(remove);
+        let mut streams = self
+            .streams
+            .lock()
+            .map_err(|_| host_binding_error(origin, "stream registry lock poisoned"))?;
+        let stream = streams
+            .get(id)
+            .ok_or_else(|| host_binding_error(origin, "stream is unknown or closed"))?;
+        if stream.owner != self.execution_id || stream.generation != *generation {
+            return Err(host_binding_error(
+                origin,
+                "stream does not belong to this ProgramRun",
+            ));
+        }
+        let backend_matches = matches!(
+            (&stream.backend, expected_backend),
+            (HostStreamBackend::CsvRecords(_), "csv") | (HostStreamBackend::FileLines(_), "lines")
+        );
+        if !backend_matches {
+            return Err(host_binding_error(origin, "stream backend is malformed"));
+        }
+        streams.remove(id);
         Ok(vec![TypedValue::Unit])
     }
 }
@@ -1683,17 +1682,17 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         let file = std::fs::File::open(path)
                             .map_err(|error| host_binding_error(origin, error.to_string()))?;
                         let handle = uuid::Uuid::new_v4().to_string();
-                        self.csv_record_cursors
+                        self.streams
                             .lock()
                             .map_err(|_| {
-                                host_binding_error(origin, "CSV cursor registry lock poisoned")
+                                host_binding_error(origin, "stream registry lock poisoned")
                             })?
                             .insert(
                                 handle.clone(),
-                                CsvRecordCursor {
+                                HostStream {
                                     owner: self.execution_id,
                                     generation: 0,
-                                    reader: BufReader::new(file),
+                                    backend: HostStreamBackend::CsvRecords(BufReader::new(file)),
                                 },
                             );
                         return Ok(vec![TypedValue::Stream {
@@ -1713,20 +1712,17 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         let file = std::fs::File::open(path)
                             .map_err(|error| host_binding_error(origin, error.to_string()))?;
                         let handle = uuid::Uuid::new_v4().to_string();
-                        self.file_line_cursors
+                        self.streams
                             .lock()
                             .map_err(|_| {
-                                host_binding_error(
-                                    origin,
-                                    "file line cursor registry lock poisoned",
-                                )
+                                host_binding_error(origin, "stream registry lock poisoned")
                             })?
                             .insert(
                                 handle.clone(),
-                                FileLineCursor {
+                                HostStream {
                                     owner: self.execution_id,
                                     generation: 0,
-                                    reader: BufReader::new(file),
+                                    backend: HostStreamBackend::FileLines(BufReader::new(file)),
                                 },
                             );
                         return Ok(vec![TypedValue::Stream {
