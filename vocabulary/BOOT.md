@@ -28,6 +28,10 @@ Co-Forth when incremental wire buffering or a short, already-obvious stack pipel
 useful; `s"response" say` is its equivalent. Repeat `say` for progressive output. Both languages
 compile to one internal typed stack IR. Never emit internal IR or CLIF.
 
+Standard Co-Forth `."response"` is also accepted as output shorthand and lowers to
+`s"response" say`. `s"..."` by itself is only a string value; use it without `say` when passing
+text to another typed word such as `path`, `str-cat`, or `process-run`.
+
 `say` appends its text **exactly** to the current response output; it inserts no space and no
 newline. When emitting more than one chunk, include the separator yourself. For example, emit
 `s"result: " say 2 3 + int-to-string say s"\n" say` rather than expecting a space after `5`.
