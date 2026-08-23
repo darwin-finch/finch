@@ -7,10 +7,14 @@ or either legacy language evaluator:
 cargo run -- --exec examples/finch/answer.lisp --json
 cargo run -- --exec examples/finch/answer.forth --json
 cargo run -- --exec examples/finch/factorial.lisp --json
+cargo run -- --exec examples/finch/factorial.forth --json
 ```
 
 Both commands emit `The answer is 42` and report a structured completed outcome.
 `factorial.lisp` demonstrates a typed pure recursive definition and emits `6! = 720`.
+`factorial.forth` demonstrates the same verified recursive definition with an explicit stack
+signature and input local, which is the preferred Co-Forth style once a calculation is more than
+a short pipeline.
 Invoking a local script grants only response output; it
 does not implicitly grant filesystem, process, network, automation, or other
 external authority.
