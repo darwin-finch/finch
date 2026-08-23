@@ -15,6 +15,13 @@ Both commands emit `The answer is 42` and report a structured completed outcome.
 `factorial.forth` demonstrates the same verified recursive definition with an explicit stack
 signature and input local, which is the preferred Co-Forth style once a calculation is more than
 a short pipeline.
+
+`--json` prints the complete machine-readable `ExecutionOutcome`: status, returned values,
+append-only output chunks, ordered side effects/effect-journal records, diagnostics, capability
+requests, revisions, backend, and timing. It does not convert a failed or suspended program into a
+successful process exit; automation can inspect the JSON outcome while still receiving a non-zero
+status.
+
 Invoking a local script grants only response output; it
 does not implicitly grant filesystem, process, network, automation, or other
 external authority.
