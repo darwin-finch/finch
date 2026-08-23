@@ -1656,10 +1656,15 @@ impl EventLoop {
                         .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
                     let should_show = suppress_until.is_none_or(|d| today > d);
                     if should_show {
-                        self.output_manager.write_info(
-                            "Using Finch commercially? $10/yr supports development.\n  \
-                             Purchase: https://polar.sh/darwin-finch\n  \
-                             Activate: finch license activate --key <key>",
+                        // Startup notices are application status, not a
+                        // conversation artifact. Keeping this out of the
+                        // output manager prevents it from becoming stale
+                        // scrollback or racing the first shadow-buffer frame.
+                        self.status_bar.update_line(
+                            crate::cli::status_bar::StatusLineType::Custom(
+                                "license-notice".to_string(),
+                            ),
+                            "Using Finch commercially? $10/yr · finch license activate --key <key>",
                         );
                         let new_date = (today + chrono::Duration::days(7))
                             .format("%Y-%m-%d")
