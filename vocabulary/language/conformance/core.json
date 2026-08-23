@@ -31,6 +31,13 @@
       "expected_output": ""
     },
     {
+      "name": "recursive-typed-definition",
+      "forth": ": factorial ( S int -- S int ! {} ) locals| n | n 1 <= if 1 else n n 1 - factorial * then ; 6 factorial",
+      "lisp": "(define (factorial (n : int)) : int (if (<= n 1) 1 (* n (factorial (- n 1))))) (factorial 6)",
+      "expected_values": [{ "type": "int", "value": 720 }],
+      "expected_output": ""
+    },
+    {
       "name": "typed-closure-and-quotation",
       "forth": ": add-two ( S int -- S int ! {} ) 2 + ; 5 ['] add-two execute",
       "lisp": "(let ((add-two (lambda ((n : int)) (+ n 2)))) (add-two 5))",
@@ -63,6 +70,12 @@
       "forth": "s\"Hello \" say 2 3 + int-to-string say",
       "lisp": "(begin (say \"Hello \") (say (int-to-string (+ 2 3))))",
       "expected_output": "Hello 5"
+    },
+    {
+      "name": "forth-output-literal-shorthand",
+      "forth": ".\" Hello from standard Forth output literal\"",
+      "lisp": "(say \"Hello from standard Forth output literal\")",
+      "expected_output": "Hello from standard Forth output literal"
     },
     {
       "name": "progressive-computed-response-spacing",
