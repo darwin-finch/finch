@@ -4,7 +4,8 @@ use crate::claude::{ContentBlock, Message};
 use crate::generators::Generator;
 use crate::runtime::ProgramRuntime;
 use crate::tools::implementations::{
-    GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, ReadTool, SubmitProgramTool,
+    GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, InspectVmWordTool, ReadTool,
+    SearchVmVocabularyTool, SubmitProgramTool,
 };
 use crate::tools::permissions::{PermissionCheck, PermissionManager};
 use crate::tools::registry::Tool;
@@ -534,6 +535,8 @@ impl AgentScheduler {
             )),
             Box::new(GetVmStateTool::new(Arc::clone(&self.runtime))),
             Box::new(GetLanguageDefinitionTool),
+            Box::new(SearchVmVocabularyTool::new(Arc::clone(&self.runtime))),
+            Box::new(InspectVmWordTool::new(Arc::clone(&self.runtime))),
         ];
         if identity.depth < MAX_DEPTH {
             tools.push(Box::new(

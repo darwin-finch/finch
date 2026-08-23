@@ -340,6 +340,9 @@ impl Repl {
                 &program_runtime,
             )),
         ));
+        tool_registry.register(Box::new(
+            crate::tools::implementations::InspectVmWordTool::new(Arc::clone(&program_runtime)),
+        ));
 
         // Self-improvement tools
         let session_state_file = dirs::home_dir()
@@ -510,6 +513,11 @@ impl Repl {
                 ));
                 fallback_registry.register(Box::new(
                     crate::tools::implementations::SearchVmVocabularyTool::new(Arc::clone(
+                        &program_runtime,
+                    )),
+                ));
+                fallback_registry.register(Box::new(
+                    crate::tools::implementations::InspectVmWordTool::new(Arc::clone(
                         &program_runtime,
                     )),
                 ));

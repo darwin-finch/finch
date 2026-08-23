@@ -162,6 +162,7 @@ impl PermissionManager {
             "get_vm_state"
                 | "get_language_definition"
                 | "search_vm_vocabulary"
+                | "inspect_vm_word"
                 | "search_vocabulary"
                 | "inspect_program"
         ) {
@@ -217,6 +218,7 @@ impl PermissionManager {
             | "get_vm_state"
             | "get_language_definition"
             | "search_vm_vocabulary"
+            | "inspect_vm_word"
             | "search_vocabulary"
             | "spawn_agent"
             | "await_agent"
@@ -477,6 +479,7 @@ pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
         "get_vm_state"
         | "get_language_definition"
         | "search_vm_vocabulary"
+        | "inspect_vm_word"
         | "search_vocabulary"
         | "inspect_program"
         | "search_memory"
@@ -857,6 +860,7 @@ mod tests {
             "get_vm_state",
             "get_language_definition",
             "search_vm_vocabulary",
+            "inspect_vm_word",
             "search_vocabulary",
             "inspect_program",
         ] {
@@ -875,11 +879,15 @@ mod tests {
             "get_vm_state",
             "get_language_definition",
             "search_vm_vocabulary",
+            "inspect_vm_word",
             "search_vocabulary",
             "inspect_program",
         ] {
             assert!(
-                matches!(manager.check_tool_use(tool, &serde_json::json!({})), PermissionCheck::Allow),
+                matches!(
+                    manager.check_tool_use(tool, &serde_json::json!({})),
+                    PermissionCheck::Allow
+                ),
                 "{tool} must be available for protocol discovery without approval"
             );
         }
