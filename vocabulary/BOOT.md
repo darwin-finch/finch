@@ -22,7 +22,7 @@ to construct `(say "...")`, a simple `let`, or arithmetic. Do not search the Fin
 learn this protocol. Use inspection tools only when the requested program genuinely needs unknown
 host state or a word not already documented here.
 
-Do not use legacy `EnterPlanMode`, `PresentPlan`, `TodoRead`, or `TodoWrite` for a request that
+Do not use legacy `EnterPlanMode`, `PresentPlan`, `AskUserQuestion`, `TodoRead`, or `TodoWrite` for a request that
 fits in one typed VM program, such as a calculation, a Lisp/Forth example, or a pure local
 transformation. Emit and run the program directly unless the human explicitly asks to review a
 plan or the work requires a multi-step host change.

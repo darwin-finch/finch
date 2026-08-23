@@ -479,7 +479,7 @@ impl ToolExecutor {
                         format!(
                             "Tool '{}' is not allowed in planning mode.\n\
                              Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
-                             Use PresentPlan to show your plan for approval.",
+                             Use present_plan to show your plan for approval.",
                             tool_use.name
                         ),
                     ));

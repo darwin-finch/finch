@@ -352,9 +352,12 @@ impl Repl {
         // Plan mode tools
         tool_registry.register(Box::new(EnterPlanModeTool));
         tool_registry.register(Box::new(PresentPlanTool));
+        tool_registry.register_alias("EnterPlanMode", "enter_plan_mode");
+        tool_registry.register_alias("PresentPlan", "present_plan");
 
         // User interaction tools
         tool_registry.register(Box::new(AskUserQuestionTool));
+        tool_registry.register_alias("AskUserQuestion", "ask_user_question");
 
         // Phase 1: Initialize LLM registry (before ToolExecutor creation)
         let llm_registry = if config.teachers.len() > 1 {
@@ -516,8 +519,11 @@ impl Repl {
                 // Plan mode tools
                 fallback_registry.register(Box::new(EnterPlanModeTool));
                 fallback_registry.register(Box::new(PresentPlanTool));
+                fallback_registry.register_alias("EnterPlanMode", "enter_plan_mode");
+                fallback_registry.register_alias("PresentPlan", "present_plan");
                 // User interaction tools
                 fallback_registry.register(Box::new(AskUserQuestionTool));
+                fallback_registry.register_alias("AskUserQuestion", "ask_user_question");
                 ToolExecutor::new(
                     fallback_registry,
                     PermissionManager::new().with_default_rule(PermissionRule::Allow),

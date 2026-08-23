@@ -14,7 +14,7 @@ pub struct AskUserQuestionTool;
 #[async_trait]
 impl Tool for AskUserQuestionTool {
     fn name(&self) -> &str {
-        "AskUserQuestion"
+        "ask_user_question"
     }
 
     fn description(&self) -> &str {
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn test_tool_name() {
         let tool = AskUserQuestionTool;
-        assert_eq!(tool.name(), "AskUserQuestion");
+        assert_eq!(tool.name(), "ask_user_question");
     }
 
     #[test]

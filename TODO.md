@@ -51,9 +51,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   surface, but make task creation, status changes, hierarchy, progress, cancellation, and durable
   recovery ordinary typed task events—not a second session-local JSON source of truth beside VM
   `task<T>` handles.
-- [ ] Normalize model-facing naming and manifests. `todo_read`/`todo_write` now advertise canonical
-  snake_case names while dispatch-only `TodoRead`/`TodoWrite` aliases preserve compatibility;
-  extend that audited migration to every remaining provider/host tool. Typed Co-Forth words retain
+- [ ] Normalize model-facing naming and manifests. `todo_read`/`todo_write`, `enter_plan_mode`,
+  `present_plan`, and `ask_user_question` now advertise canonical snake_case names while
+  dispatch-only PascalCase aliases preserve compatibility; extend that audited migration to every
+  remaining provider/host tool. Typed Co-Forth words retain
   language-native hyphenated spelling (for example `output-append`); Lisp maps to the shared typed
   vocabulary. Remove PascalCase legacy names from generated manifests only after explicit aliases
   and tests establish that no duplicate semantic operation is advertised.

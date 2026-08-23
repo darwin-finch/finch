@@ -11,7 +11,7 @@ pub struct PresentPlanTool;
 #[async_trait]
 impl Tool for PresentPlanTool {
     fn name(&self) -> &str {
-        "PresentPlan"
+        "present_plan"
     }
 
     fn description(&self) -> &str {
@@ -52,7 +52,7 @@ impl Tool for PresentPlanTool {
             match &*current_mode {
                 crate::cli::ReplMode::Planning { plan_path, .. } => plan_path.clone(),
                 crate::cli::ReplMode::Normal => {
-                    return Ok("⚠️  Not in planning mode. Use EnterPlanMode first.".to_string());
+                    return Ok("⚠️  Not in planning mode. Use enter_plan_mode first.".to_string());
                 }
                 crate::cli::ReplMode::Executing { .. } => {
                     return Ok(
@@ -84,7 +84,7 @@ impl Tool for PresentPlanTool {
              • **Reject** it to exit plan mode\n\n\
              ⏸️  You are in **read-only planning mode** until the user approves.\n\
              Only exploration tools (Read, Glob, Grep, WebFetch) are available.\n\n\
-             If the user requests changes, revise the plan and call PresentPlan again with the updated version.",
+             If the user requests changes, revise the plan and call present_plan again with the updated version.",
             plan_content,
             plan_path.display()
         ))
@@ -188,6 +188,6 @@ mod tests {
     #[test]
     fn test_name() {
         let tool = PresentPlanTool;
-        assert_eq!(tool.name(), "PresentPlan");
+        assert_eq!(tool.name(), "present_plan");
     }
 }

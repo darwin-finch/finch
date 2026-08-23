@@ -8516,7 +8516,7 @@ pub(crate) fn tool_approval_summary(tool_use: &crate::tools::types::ToolUse) -> 
                 "Find files".to_string()
             }
         }
-        "EnterPlanMode" => {
+        "enter_plan_mode" | "EnterPlanMode" => {
             if let Some(reason) = tool_use.input.get("reason").and_then(|v| v.as_str()) {
                 format!(
                     "Reason: {}",

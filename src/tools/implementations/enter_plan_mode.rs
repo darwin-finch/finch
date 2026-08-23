@@ -11,15 +11,15 @@ pub struct EnterPlanModeTool;
 #[async_trait]
 impl Tool for EnterPlanModeTool {
     fn name(&self) -> &str {
-        "EnterPlanMode"
+        "enter_plan_mode"
     }
 
     fn description(&self) -> &str {
         "Enter read-only planning mode to explore the codebase before making changes. \
          Use this when you need to research and develop an implementation plan. \
          In plan mode, only read-only tools (Read, Glob, Grep, WebFetch) and \
-         AskUserQuestion are available. Use AskUserQuestion to clarify requirements \
-         with the user. When ready, use PresentPlan to show your plan."
+         ask_user_question is available. Use it to clarify requirements \
+         with the user. When ready, use present_plan to show your plan."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -54,7 +54,7 @@ impl Tool for EnterPlanModeTool {
                 };
                 return Ok(format!(
                     "⚠️  Already in {} mode. Finish current task first.\n\
-                     Use PresentPlan to show your plan, or ask the user to exit plan mode.",
+                     Use present_plan to show your plan, or ask the user to exit plan mode.",
                     mode_name
                 ));
             }
@@ -82,11 +82,11 @@ impl Tool for EnterPlanModeTool {
             "✅ Entered planning mode.\n\n\
              📋 Task: {}\n\
              📁 Plan file: {}\n\n\
-             Available tools: Read, Glob, Grep, WebFetch, AskUserQuestion\n\
+             Available tools: read, glob, grep, web_fetch, ask_user_question\n\
              Blocked: Bash, Write, Edit\n\n\
              ⚡ Be efficient: use the MINIMUM number of tool calls needed.\n\
              For simple tasks, 1-3 reads is enough. Do not read files speculatively.\n\
-             When you have enough information, call PresentPlan immediately.",
+             When you have enough information, call present_plan immediately.",
             reason,
             plan_path.display()
         ))
@@ -130,6 +130,6 @@ mod tests {
     #[test]
     fn test_name() {
         let tool = EnterPlanModeTool;
-        assert_eq!(tool.name(), "EnterPlanMode");
+        assert_eq!(tool.name(), "enter_plan_mode");
     }
 }

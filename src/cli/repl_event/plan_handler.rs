@@ -87,8 +87,8 @@ pub(crate) async fn handle_present_plan(
     use chrono::Utc;
     use crossterm::style::Stylize;
 
-    // Only handle PresentPlan calls
-    if tool_use.name != "PresentPlan" {
+    // Accept the canonical wire name and the dispatch-only legacy spelling.
+    if !matches!(tool_use.name.as_str(), "present_plan" | "PresentPlan") {
         return None;
     }
 
@@ -295,8 +295,8 @@ pub(crate) async fn handle_ask_user_question(
     cancel: CancellationToken,
     event_tx: &mpsc::UnboundedSender<ReplEvent>,
 ) -> Option<Result<String>> {
-    // Only handle AskUserQuestion calls
-    if tool_use.name != "AskUserQuestion" {
+    // Accept the canonical wire name and the dispatch-only legacy spelling.
+    if !matches!(tool_use.name.as_str(), "ask_user_question" | "AskUserQuestion") {
         return None;
     }
 
