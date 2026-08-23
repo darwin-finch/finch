@@ -513,6 +513,7 @@ impl Compiler<'_> {
             "begin" => self.compile_begin(&items[1..], builder),
             "let" => self.compile_let(&items[1..], builder),
             "if" => self.compile_if(&items[1..], builder),
+            "match" => self.compile_match(&items[1..], builder),
             "match-option" => self.compile_match_option(&items[1..], builder),
             "match-result" => self.compile_match_result(&items[1..], builder),
             "while" => self.compile_while(&items[1..], builder),
@@ -973,6 +974,42 @@ impl Compiler<'_> {
         );
         builder.switch_to(merge_block, none_stack);
         Ok(builder.stack.pop().expect("match-option leaves a value"))
+    }
+
+    /// Type-directed surface form for the finite tagged values supported by
+    /// Finch Lisp version 1. This is deliberately only syntax selection: the
+    /// chosen lowering remains `match-option` or `match-result`, so both
+    /// frontends still share the same typed branch IR and verifier rules.
+    fn compile_match(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [_, first_arm, second_arm] = expressions else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-009",
+                "match requires a value and exactly two exhaustive tagged arms",
+            )]);
+        };
+        let arm_marker = |arm: &Val| match arm {
+            Val::List(items) => match items.first() {
+                Some(Val::Symbol(marker)) => Some(marker.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (arm_marker(first_arm), arm_marker(second_arm)) {
+            (Some(first), Some(second)) if first == "some" && second == "none" => {
+                self.compile_match_option(expressions, builder)
+            }
+            (Some(first), Some(second)) if first == "ok" && second == "err" => {
+                self.compile_match_result(expressions, builder)
+            }
+            _ => Err(vec![self.error(
+                "E-LISP-MATCH-009",
+                "match supports exhaustive (some name ...)/(none ...) or (ok name ...)/(err name ...) arms",
+            )]),
+        }
     }
 
     /// Compile a total result match. Both edges consume the result and bind
@@ -1913,6 +1950,19 @@ mod tests {
         );
         assert_eq!(
             run("(match-result (err \"bad\") (ok value (begin value 0)) (err problem (begin problem 3)))").unwrap(),
+            vec![TypedValue::Int(3)]
+        );
+    }
+
+    #[test]
+    fn generic_match_selects_the_existing_typed_tagged_lowering() {
+        assert_eq!(
+            run("(match (some 5) (some value (+ value 1)) (none 0))").unwrap(),
+            vec![TypedValue::Int(6)]
+        );
+        assert_eq!(
+            run("(match (err \"bad\") (ok value (begin value 0)) (err problem (begin problem 3)))")
+                .unwrap(),
             vec![TypedValue::Int(3)]
         );
     }

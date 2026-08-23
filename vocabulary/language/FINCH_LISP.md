@@ -59,6 +59,16 @@ payload in each required arm:
   (err problem (begin problem 0)))
 ```
 
+`match` is the preferred type-directed spelling when the arm tags make the value kind clear. In
+version 1 it accepts exactly the exhaustive `some`/`none` and `ok`/`err` pairs and lowers to the
+same branch IR as the explicit forms; it does not perform dynamic dispatch:
+
+```lisp
+(match (some 5)
+  (some value (+ value 1))
+  (none 0))
+```
+
 MemTree and scheduling are explicit effects. Scheduled work stores an immutable program reference,
 typed arguments, budgets, context references, and a revocable policy reference—not raw authority or
 an unvalidated Lisp string. A callback starts a fresh audited task and revalidates its environment

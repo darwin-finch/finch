@@ -51,6 +51,8 @@ Structured result branches use the same typed control-flow rule: Co-Forth
 `if-ok ... else ... then` gives the `ok` payload to its then edge and the `err` payload to its
 else edge; Lisp `(match-result result (ok name ...) (err name ...))` binds the corresponding
 payload lexically. Both arms are required and must merge with the same verified stack/value type.
+Lisp may use the type-directed `(match value arms...)` spelling for these two exhaustive tagged
+forms; it selects the same lowering and never falls back to dynamic pattern dispatch.
 
 Capabilities are positive, scoped grants such as:
 
