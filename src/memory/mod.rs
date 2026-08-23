@@ -132,7 +132,7 @@ impl MemorySystem {
             [],
         );
 
-        tracing::info!("Memory system initialized: {}", config.db_path.display());
+        tracing::debug!("Memory system initialized: {}", config.db_path.display());
 
         // Select embedding engine: try neural if enabled and cached, else TF-IDF.
         let embedding_engine: Arc<dyn EmbeddingEngine> = if config.use_neural_embeddings {
@@ -140,11 +140,11 @@ impl MemorySystem {
                 .and_then(|dir| NeuralEmbeddingEngine::load(&dir).ok())
             {
                 Some(neural) => {
-                    tracing::info!("Using neural ONNX embeddings (all-MiniLM-L6-v2)");
+                    tracing::debug!("Using neural ONNX embeddings (all-MiniLM-L6-v2)");
                     Arc::new(neural)
                 }
                 None => {
-                    tracing::warn!(
+                    tracing::debug!(
                         "Neural embedding model not in cache — using TF-IDF fallback. \
                          Run `finch memory download` or call MemorySystem::new_async() \
                          to download."
@@ -171,7 +171,7 @@ impl MemorySystem {
                     tracing::warn!("Failed to load MemTree from DB (will start fresh): {}", e);
                     tree = MemTree::new_with_dim(dim);
                 } else {
-                    tracing::info!("Loaded MemTree with {} nodes from disk", tree.size());
+                    tracing::debug!("Loaded MemTree with {} nodes from disk", tree.size());
                 }
             }
         }

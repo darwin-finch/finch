@@ -11,7 +11,7 @@
 // When multiple files exist in the same directory, all are loaded in order.
 
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Filenames we look for, in the order they are loaded within a single directory.
 const CONTEXT_FILENAMES: &[&str] = &["CLAUDE.md", "FINCH.md", "CONTEXT.md", "README.md"];
@@ -32,14 +32,14 @@ pub fn collect_claude_md_context(cwd: &Path) -> Option<String> {
     if let Some(home) = dirs::home_dir() {
         let user_claude_md = home.join(".claude").join("CLAUDE.md");
         if let Some(content) = read_non_empty(&user_claude_md) {
-            info!("Loaded user CLAUDE.md: {}", user_claude_md.display());
+            debug!("Loaded user CLAUDE.md: {}", user_claude_md.display());
             sections.push(content);
         }
 
         // 2. User-level: ~/.finch/FINCH.md  (Finch convention)
         let user_finch_md = home.join(".finch").join("FINCH.md");
         if let Some(content) = read_non_empty(&user_finch_md) {
-            info!("Loaded user FINCH.md: {}", user_finch_md.display());
+            debug!("Loaded user FINCH.md: {}", user_finch_md.display());
             sections.push(content);
         }
     }
@@ -56,7 +56,7 @@ pub fn collect_claude_md_context(cwd: &Path) -> Option<String> {
         for &filename in CONTEXT_FILENAMES {
             let path = dir.join(filename);
             if let Some(content) = read_non_empty(&path) {
-                info!("Loaded project {}: {}", filename, path.display());
+                debug!("Loaded project {}: {}", filename, path.display());
                 sections.push(content);
             }
         }
@@ -67,7 +67,7 @@ pub fn collect_claude_md_context(cwd: &Path) -> Option<String> {
         return None;
     }
 
-    info!(
+    debug!(
         "Loaded {} context file(s) into system prompt",
         sections.len()
     );

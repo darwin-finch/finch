@@ -289,9 +289,6 @@ impl Repl {
                     {
                         tracing::warn!("Failed to index personal program vocabulary: {error}");
                     }
-                    if is_interactive && !daemon_mode {
-                        output_status!("✓ Memory system enabled");
-                    }
                     Some(system)
                 }
                 Err(e) => {
@@ -420,9 +417,6 @@ impl Repl {
             tool_registry.register(Box::new(ListRecentTool::new(memory.clone())));
             tool_registry.register(Box::new(SearchVocabularyTool::new(memory.clone())));
             tool_registry.register(Box::new(InspectProgramTool::new(memory.clone())));
-            if is_interactive && !daemon_mode {
-                output_status!("✓ Memory tools registered (search_memory, create_memory, list_recent_memories)");
-            }
         }
 
         // Session task list. Snake_case names are provider-facing; aliases
@@ -545,14 +539,6 @@ impl Repl {
 
         let tool_executor = Arc::new(tokio::sync::Mutex::new(executor));
 
-        // Only show tool execution log in standalone mode (not daemon mode)
-        if is_interactive && !daemon_mode {
-            output_status!(
-                "✓ Tool execution enabled ({} built-in tools)",
-                tool_executor.lock().await.registry().len()
-            );
-        }
-
         let streaming_enabled = config.features.streaming_enabled;
         let memory_context_lines = config.features.memory_context_lines;
         let max_verbatim_messages = config.features.max_verbatim_messages;
@@ -617,10 +603,10 @@ impl Repl {
         let sampling_config = SamplingConfig::default(); // 5% baseline, 3x arch, 5x security
         let sampler = Arc::new(RwLock::new(Sampler::new(sampling_config)));
 
-        // Only show LoRA log in standalone mode (daemon handles training)
-        if is_interactive && !daemon_mode {
-            output_status!("✓ LoRA fine-tuning enabled (weighted training)");
-        }
+        // This is ordinary runtime configuration, not user-facing progress.  In
+        // particular, do not enqueue it before the first TUI frame: pre-frame
+        // work units are not part of the terminal history and look like boot
+        // noise when the alternate screen is restored.
 
         // Initialize TUI renderer if enabled (Phase 2: Ratatui interface)
         // Moved to global for Phase 5 native ratatui dialogs
@@ -631,8 +617,6 @@ impl Repl {
                 config.colors.clone(),
             ) {
                 Ok(renderer) => {
-                    output_status!("✓ TUI mode enabled (Ratatui)");
-
                     // Set global TUI renderer for Menu dialogs (Phase 5)
                     use crate::cli::global_output::set_global_tui_renderer;
                     set_global_tui_renderer(renderer);
@@ -675,16 +659,8 @@ impl Repl {
             teacher_config,
         )));
 
-        // Only show teacher optimization log in standalone mode
-        if is_interactive && !daemon_mode {
-            output_status!("✓ Teacher context optimization enabled (Level 3)");
-        }
-
-        // daemon_client is now passed as a parameter (checked in main.rs)
-        // Show warning only if in standalone mode and interactive
-        if daemon_client.is_none() && is_interactive && !daemon_mode {
-            output_status!("⚠️  Daemon not available, using teacher API directly");
-        }
+        // The direct-provider fallback is normal standalone operation.  Do not
+        // render configuration chatter before the first user-visible turn.
 
         // Phase 1: Initialize conversation logger
         let log_path = dirs::home_dir()
@@ -696,18 +672,10 @@ impl Repl {
                 panic!("Cannot create conversation logger")
             }),
         ));
-        if is_interactive && !daemon_mode {
-            output_status!("✓ Conversation logging enabled (for future LoRA training)");
-        }
 
         // Phase 2: Load active persona
         let active_persona = match crate::config::Persona::load_builtin(&config.active_persona) {
-            Ok(persona) => {
-                if is_interactive && !daemon_mode {
-                    output_status!("✓ Persona loaded: {}", persona.name());
-                }
-                Arc::new(RwLock::new(persona))
-            }
+            Ok(persona) => Arc::new(RwLock::new(persona)),
             Err(e) => {
                 output_status!(
                     "⚠️  Failed to load persona '{}': {}",

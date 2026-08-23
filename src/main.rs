@@ -1006,24 +1006,13 @@ async fn main() -> Result<()> {
             api_key: config.server.api_keys.first().cloned(),
         };
         match DaemonClient::connect(daemon_config).await {
-            Ok(client) => {
-                output_manager.write_status("✓ Connected to daemon");
-                Some(Arc::new(client))
-            }
+            Ok(client) => Some(Arc::new(client)),
             Err(_e) => {
                 tracing::debug!("Failed to connect to daemon: {}", _e);
-                output_manager.write_status(
-                    "⚠️  No daemon — running in direct mode. Start one with `finch daemon-start`.",
-                );
                 None
             }
         }
     } else {
-        if args.cloud_only && io::stdout().is_terminal() {
-            output_manager.write_status("☁️  Cloud-only mode - using teacher API (no local model)");
-        } else if args.direct && io::stdout().is_terminal() {
-            output_manager.write_status("⚠️  Direct mode - bypassing daemon, using teacher API");
-        }
         None
     };
 
@@ -1031,7 +1020,7 @@ async fn main() -> Result<()> {
     // Pass daemon_client so Repl knows whether to suppress local model logs
     // Session name and ID.
     // --session <name>: join that named session (deterministic UUIDv5 from name).
-    // default: generate a cute name (quiet-hill etc.), derive a UUID, print it.
+    // default: generate a cute name (quiet-hill etc.) and derive a UUID.
     // Suppressed for pipe / non-interactive use.
     let (session_name, session_id) = {
         use finch::session::names;
@@ -1047,17 +1036,6 @@ async fn main() -> Result<()> {
                 (name, id)
             }
         };
-
-        if io::stdout().is_terminal() {
-            if args.session.is_some() {
-                output_manager.write_status(format!("  session: {}  (id: {})", name, id));
-            } else {
-                output_manager.write_status(format!(
-                    "  session: {}  (finch --session {} to join)",
-                    name, name
-                ));
-            }
-        }
 
         // If a daemon is running, register / join the session so other terminals
         // with the same name can share the broadcast channel.
