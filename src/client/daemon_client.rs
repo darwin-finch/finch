@@ -1267,4 +1267,20 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn preserves_system_contract_when_converting_messages() {
+        let messages = vec![
+            Message::with_content("system", vec![ContentBlock::text("VM wire contract")]),
+            Message::user("hello"),
+        ];
+
+        let converted = DaemonClient::convert_to_openai_messages(&messages);
+
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].role, "system");
+        assert_eq!(converted[0].content.as_deref(), Some("VM wire contract"));
+        assert_eq!(converted[1].role, "user");
+        assert_eq!(converted[1].content.as_deref(), Some("hello"));
+    }
 }
