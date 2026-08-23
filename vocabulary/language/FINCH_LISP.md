@@ -21,6 +21,9 @@ The ordinary response is `(say "Hello")`. Pure and compound examples:
 (define (square (x : int)) (* x x))
 (define (factorial (n : int)) : int
   (if (<= n 1) 1 (* n (factorial (- n 1)))))
+(define (announce (n : int)) : unit ! (session.emit)
+  (if (<= n 0) (say "done")
+      (begin (say "tick") (announce (- n 1)))))
 (define (singleton (x : int)) : list<int> (list x))
 (list-get (list 4 8 15 16) 2)
 (file-read (path "Cargo.toml"))
@@ -86,13 +89,19 @@ extra result values; it is not an arbitrary jump.
 The version-1 typed frontend currently accepts literals, homogeneous non-empty lists, core
 vocabulary calls, `begin`, lexical `let`, typed `if`, typed `while`, typed `lambda`, closure calls,
 and typed function definitions using `(define (name (arg : type) ...) body...)`. For self- or
-mutually-recursive pure functions, put a return type after the header:
+mutually-recursive functions, put a return type after the header:
 `(define (name (arg : type) ...) : result-type body...)`. Finch predeclares that signature before
-compiling bodies, so recursive calls remain type-checked. Return-annotated definitions must be pure
-until effect annotations are added. Definitions enter the persistent shared dictionary only if the
-entire submission verifies, is authorized, and commits.
+compiling bodies, so recursive calls remain type-checked. A return-annotated definition defaults to
+the pure effect bound. An effectful recursive definition must declare the upper bound explicitly,
+for example `(define (announce (n : int)) : unit ! (session.emit) ...)`. In version 1 the list
+contains only named, unscoped capability identities such as `session.emit`, `memory.read`, or
+`schedule.create`; it is a bound on inferred effects, not an authority grant. Parameterized
+resource selectors remain inferred from typed calls and require a later selector-annotation syntax.
+Definitions enter the persistent shared dictionary only if the entire submission verifies, is
+authorized, and commits.
 
-The first string immediately after a `define` header and optional return annotation is a docstring,
+The first string immediately after a `define` header, optional return annotation, and optional
+effect annotation is a docstring,
 following Common Lisp/Python practice. It is retained in the immutable definition metadata and
 omitted from typed IR, so it neither pushes a runtime value nor changes the function's cost:
 

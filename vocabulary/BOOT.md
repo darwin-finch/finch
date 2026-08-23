@@ -69,6 +69,11 @@ runs autonomously. Observable operations such as `say`, files, memory, schedulin
 processes, network, and agents cross the capability broker. Static checking does not replace runtime
 resource, availability, revocation, or stale-handle checks.
 
+For a return-annotated recursive Lisp definition, the omitted effect bound is pure. Declare a
+non-pure recursive bound explicitly as `! (session.emit memory.read)` after the return type. The
+names are capability identities, not grants; version 1 does not accept parameterized selectors in
+this annotation, so typed calls still infer the concrete resource requirement.
+
 Capabilities are not stack tokens. Pure means no requirements. The active response session grants
 `session.emit`, so `(say "...")` does not prompt. Parameterized resource requirements use typed,
 bounded selector expressions over immutable arguments, never interpolated strings.

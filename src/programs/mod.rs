@@ -863,11 +863,14 @@ fn lisp_definition_documentation(source: &str) -> Option<String> {
     if parts.first() != Some(&Val::Symbol("define".to_string())) {
         return None;
     }
-    let body_start = if parts.get(2) == Some(&Val::Symbol(":".to_string())) {
+    let mut body_start = if parts.get(2) == Some(&Val::Symbol(":".to_string())) {
         4
     } else {
         2
     };
+    if parts.get(body_start) == Some(&Val::Symbol("!".to_string())) {
+        body_start += 2;
+    }
     match parts.get(body_start) {
         Some(Val::Str(documentation)) => Some(documentation.clone()),
         _ => None,
@@ -1172,6 +1175,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(definition.documentation, "Return twice n.");
+    }
+
+    #[test]
+    fn persisted_lisp_definition_skips_effect_annotation_before_docstring() {
+        let definition = ProgramDefinition::from_lisp_define(
+            "(define (announce (text : string)) : unit ! (session.emit) \
+                \"Emit text to the active response.\" (say text))",
+            None,
+        )
+        .unwrap();
+        assert_eq!(definition.documentation, "Emit text to the active response.");
     }
 
     #[test]

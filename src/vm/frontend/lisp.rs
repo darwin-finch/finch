@@ -2,7 +2,7 @@ use crate::lisp::Val;
 use crate::vm::diagnostic::{
     DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
 };
-use crate::vm::effects::EffectSet;
+use crate::vm::effects::{CapabilityKind, CapabilityRequirement, EffectSet, ResourceSelector};
 use crate::vm::interpreter::UiOperation;
 use crate::vm::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
@@ -405,8 +405,8 @@ impl Compiler<'_> {
             );
         }
         let result_type = self.compile_begin(definition.body, &mut child)?;
-        if let Some(expected) = definition.return_type {
-            if result_type != expected {
+        if let Some(expected) = &definition.return_type {
+            if result_type != *expected {
                 return Err(vec![self.error(
                     "E-LISP-DEF-005",
                     format!(
@@ -414,11 +414,21 @@ impl Compiler<'_> {
                     ),
                 )]);
             }
-            if !child.effects.is_pure() {
+        }
+        // A return annotation is also the marker that this definition was
+        // predeclared for recursive calls.  An omitted `! (...)` therefore
+        // means an explicit pure bound, preserving the old safe default.
+        if definition.return_type.is_some() {
+            let declared_effects = definition
+                .declared_effects
+                .clone()
+                .unwrap_or_else(EffectSet::pure);
+            if !declared_effects.grants(&child.effects) {
                 return Err(vec![self.error(
                     "E-LISP-DEF-007",
                     format!(
-                        "function '{name}' has a predeclared recursive signature and must be pure; effect annotations are not implemented yet"
+                        "function '{name}' declares effects {declared_effects}, but requires {}",
+                        child.effects
                     ),
                 )]);
             }
@@ -476,7 +486,10 @@ impl Compiler<'_> {
                     .collect(),
             ),
             output: StackRow::polymorphic("S", vec![result]),
-            effects: EffectSet::pure(),
+            effects: definition
+                .declared_effects
+                .clone()
+                .unwrap_or_else(EffectSet::pure),
             control: ControlEffect::Returns,
         };
         self.vocabulary
@@ -1593,6 +1606,13 @@ struct Definition<'a> {
     name: &'a str,
     parameters: Vec<(String, Type)>,
     return_type: Option<Type>,
+    /// An explicit upper bound for effects used by a return-annotated
+    /// definition.  This makes recursive calls checkable before the body has
+    /// been compiled: inferred effects must be covered by this declaration.
+    /// Version 1 deliberately accepts only unscoped named capabilities here;
+    /// parameterized selectors need their own typed syntax rather than an
+    /// ambiguous string convention.
+    declared_effects: Option<EffectSet>,
     /// The first body string is a Python-style docstring. It is protocol
     /// metadata, never a runtime stack value or an instruction in the typed
     /// function body.
@@ -1632,7 +1652,7 @@ fn parse_definition(expression: &Val) -> Result<Definition<'_>, Vec<VmDiagnostic
         .iter()
         .map(parse_parameter)
         .collect::<Result<Vec<_>, _>>()?;
-    let (return_type, body) = if items.get(2) == Some(&Val::Symbol(":".into())) {
+    let (return_type, mut body) = if items.get(2) == Some(&Val::Symbol(":".into())) {
         let Some(annotation) = items.get(3) else {
             return Err(vec![VmDiagnostic::error(
                 "E-LISP-DEF-006",
@@ -1644,6 +1664,20 @@ fn parse_definition(expression: &Val) -> Result<Definition<'_>, Vec<VmDiagnostic
         (Some(parse_type(annotation)?), &items[4..])
     } else {
         (None, &items[2..])
+    };
+    let declared_effects = if body.first() == Some(&Val::Symbol("!".into())) {
+        let Some(annotation) = body.get(1) else {
+            return Err(vec![VmDiagnostic::error(
+                "E-LISP-DEF-009",
+                DiagnosticPhase::TypeInference,
+                "function effect annotation requires a capability list after '!'",
+                None,
+            )]);
+        };
+        body = &body[2..];
+        Some(parse_definition_effects(annotation)?)
+    } else {
+        None
     };
     let (documentation, body) = match body.split_first() {
         Some((Val::Str(documentation), body)) => (Some(documentation.as_str()), body),
@@ -1661,8 +1695,76 @@ fn parse_definition(expression: &Val) -> Result<Definition<'_>, Vec<VmDiagnostic
         name,
         parameters,
         return_type,
+        declared_effects,
         _documentation: documentation,
         body,
+    })
+}
+
+/// Parse a definition-level effect bound such as `! (session.emit memory.read)`.
+/// These are capability identities, not authority grants.  Parameterized file,
+/// process, network, and agent selectors still come from calls and must be
+/// inferred precisely by the shared typed IR.
+fn parse_definition_effects(value: &Val) -> Result<EffectSet, Vec<VmDiagnostic>> {
+    let Val::List(capabilities) = value else {
+        return Err(vec![VmDiagnostic::error(
+            "E-LISP-DEF-009",
+            DiagnosticPhase::TypeInference,
+            "function effect annotation must be a list such as ! (session.emit)",
+            None,
+        )]);
+    };
+    let mut effects = EffectSet::pure();
+    for capability in capabilities {
+        let Val::Symbol(name) = capability else {
+            return Err(vec![VmDiagnostic::error(
+                "E-LISP-DEF-009",
+                DiagnosticPhase::TypeInference,
+                "function effect annotations must contain capability names",
+                None,
+            )]);
+        };
+        let Some(capability) = parse_unscoped_capability(name) else {
+            return Err(vec![VmDiagnostic::error(
+                "E-LISP-DEF-009",
+                DiagnosticPhase::TypeInference,
+                format!("unknown or parameterized definition effect '{name}'"),
+                None,
+            )]);
+        };
+        effects = effects.union(&EffectSet::from_requirement(CapabilityRequirement {
+            capability,
+            selector: ResourceSelector::None,
+        }));
+    }
+    Ok(effects)
+}
+
+fn parse_unscoped_capability(name: &str) -> Option<CapabilityKind> {
+    let normalized = name.replace(['.', '-'], "_");
+    Some(match normalized.as_str() {
+        "vm_read" => CapabilityKind::VmRead,
+        "vm_write" => CapabilityKind::VmWrite,
+        "file_read" => CapabilityKind::FileRead,
+        "file_write" => CapabilityKind::FileWrite,
+        "network_connect" => CapabilityKind::NetworkConnect,
+        "automation_inspect" => CapabilityKind::AutomationInspect,
+        "automation_write" => CapabilityKind::AutomationWrite,
+        "agent_spawn" => CapabilityKind::AgentSpawn,
+        "agent_await" => CapabilityKind::AgentAwait,
+        "agent_poll" => CapabilityKind::AgentPoll,
+        "agent_cancel" => CapabilityKind::AgentCancel,
+        "process_run" => CapabilityKind::ProcessRun,
+        "session_emit" => CapabilityKind::SessionEmit,
+        "memory_read" => CapabilityKind::MemoryRead,
+        "memory_write" => CapabilityKind::MemoryWrite,
+        "memory_consolidate" => CapabilityKind::MemoryConsolidate,
+        "schedule_create" => CapabilityKind::ScheduleCreate,
+        "schedule_read" => CapabilityKind::ScheduleRead,
+        "schedule_manage" => CapabilityKind::ScheduleManage,
+        "program_invoke" => CapabilityKind::ProgramInvoke,
+        "unsafe_memory" => CapabilityKind::UnsafeMemory,
+        _ => return None,
     })
 }
 
@@ -1924,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_effectful_predeclared_definition_until_effect_annotations_exist() {
+    fn rejects_an_effectful_predeclared_definition_without_an_effect_bound() {
         let errors = compile_lisp(
             "input.lisp",
             "(define (announce (text : string)) : unit (say text))",
@@ -1933,6 +2035,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(errors.iter().any(|error| error.code == "E-LISP-DEF-007"));
+    }
+
+    #[test]
+    fn predeclares_recursive_effectful_definitions_from_their_effect_bound() {
+        let module = compile_lisp(
+            "input.lisp",
+            "(define (announce (n : int)) : unit ! (session.emit) \
+                (if (<= n 0) (say \"done\") \
+                    (begin (say \"tick\") (announce (- n 1)))))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+
+        let announce = module.functions.get("announce").unwrap();
+        assert!(announce.inferred_effects.grants(&EffectSet::from_requirement(
+            CapabilityRequirement {
+                capability: CapabilityKind::SessionEmit,
+                selector: ResourceSelector::None,
+            },
+        )));
+    }
+
+    #[test]
+    fn predeclares_mutually_recursive_effectful_definitions_from_effect_bounds() {
+        let module = compile_lisp(
+            "input.lisp",
+            "(define (even-report (n : int)) : unit ! (session.emit) \
+                (if (<= n 0) (say \"even\") (odd-report (- n 1)))) \
+             (define (odd-report (n : int)) : unit ! (session.emit) \
+                (if (<= n 0) (say \"odd\") (even-report (- n 1))))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+
+        assert!(module.functions.contains_key("even-report"));
+        assert!(module.functions.contains_key("odd-report"));
+    }
+
+    #[test]
+    fn rejects_unknown_definition_effects() {
+        let errors = compile_lisp(
+            "input.lisp",
+            "(define (announce (text : string)) : unit ! (filesystem.everything) (say text))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "E-LISP-DEF-009"));
     }
 
     #[test]
