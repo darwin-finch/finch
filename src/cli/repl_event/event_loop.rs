@@ -344,17 +344,16 @@ pub struct EventLoop {
     /// Stored so the user can re-plan without losing the word.
     plan_word: Option<String>,
 
-    /// Persistent Forth interpreter for the session.
-    /// Word definitions typed via `: word ... ;` or `/forth` accumulate here.
+    /// Explicit legacy semiotic-Forth interpreter for compatibility commands
+    /// and the old stack/poset subsystem. Typed `: word ... ;` and `/forth`
+    /// source execute through ProgramRuntime and never enter this dictionary.
     /// Stack state is cleared between evals; only the dictionary persists.
     forth_vm: crate::coforth::Forth,
 
     /// Shared with TUI corner — updated after each eval if `check` is defined.
     corner_output: Arc<std::sync::Mutex<Option<String>>>,
 
-    /// Undo history for Forth definitions.
-    /// Each entry is a snapshot taken just before an eval (or /define).
-    /// `/undefine` (or Ctrl+Z in Forth context) pops and restores.
+    /// Internal rollback history for the legacy stack/poset interpreter.
     forth_undo: Vec<crate::coforth::DictionarySnapshot>,
 
     /// Incoming push messages from peers (via POST /v1/forth/push).
@@ -1609,9 +1608,9 @@ impl EventLoop {
         // ─────────────────────────────────────────────────────────────────────
 
         // Wire TUI callbacks into the VM so words that call confirm" or select"
-        // work when typed directly — not just when called via handle_forth_eval_inner.
+        // work in the explicit legacy subsystem as well as its internal calls.
         // These callbacks are stable for the lifetime of the session; gen_fn is
-        // re-wired per-call in handle_forth_eval_inner because it reads the active provider.
+        // re-wired per-call in handle_legacy_forth_eval_inner because it reads the active provider.
         {
             let tui_c = self.tui_renderer.clone();
             self.forth_vm.set_confirm_fn(Box::new(move |msg: &str| {
@@ -2626,11 +2625,12 @@ Rules:\n\
                             })
                             .await?;
                         } else {
-                            self.handle_forth_eval(code).await?;
+                            self.execute_interactive_typed_program(
+                                crate::programs::ProgramLanguage::Forth,
+                                code,
+                            )
+                            .await?;
                         }
-                    }
-                    Command::ForthUndo => {
-                        self.handle_forth_undo().await?;
                     }
                     Command::VmDump => {
                         self.handle_vm_dump().await?;
@@ -2709,24 +2709,31 @@ Rules:\n\
                     }
                     // Registry / gas ledger — translate to Forth eval
                     Command::SelfPeer => {
-                        self.handle_forth_eval("self-peer".to_string()).await?;
+                        self.handle_legacy_forth_eval_inner("self-peer".to_string(), true)
+                            .await?;
                     }
                     Command::Balance => {
-                        self.handle_forth_eval("balance".to_string()).await?;
+                        self.handle_legacy_forth_eval_inner("balance".to_string(), true)
+                            .await?;
                     }
                     Command::Settle(addr) => {
-                        self.handle_forth_eval(format!("settle\" {addr}\"")).await?;
+                        self.handle_legacy_forth_eval_inner(format!("settle\" {addr}\""), true)
+                            .await?;
                     }
                     Command::RegistrySet(addr) => {
-                        self.handle_forth_eval(format!("registry\" {addr}\""))
+                        self.handle_legacy_forth_eval_inner(format!("registry\" {addr}\""), true)
                             .await?;
                     }
                     Command::JoinRegistry(addr) => {
-                        self.handle_forth_eval(format!("join\" {addr}\"")).await?;
+                        self.handle_legacy_forth_eval_inner(format!("join\" {addr}\""), true)
+                            .await?;
                     }
                     Command::GasSend(addr, ms) => {
-                        self.handle_forth_eval(format!("gas-send\" {addr}\" {ms}"))
-                            .await?;
+                        self.handle_legacy_forth_eval_inner(
+                            format!("gas-send\" {addr}\" {ms}"),
+                            true,
+                        )
+                        .await?;
                     }
                     _ => {
                         // All other commands output to scrollback via write_info
@@ -2782,7 +2789,12 @@ Rules:\n\
                     .await;
             }
             self.output_manager.write_user(input.clone());
-            return self.handle_forth_eval(input.trim().to_string()).await;
+            return self
+                .execute_interactive_typed_program(
+                    crate::programs::ProgramLanguage::Forth,
+                    input.trim().to_string(),
+                )
+                .await;
         }
 
         // Foreign code block: ``` lang ... ``` (or bare ```)
@@ -5698,7 +5710,7 @@ Rules:\n\
         }
 
         // Run it. The user sees the result, not the implementation.
-        self.handle_forth_eval_inner(forth_code, false).await
+        self.handle_legacy_forth_eval_inner(forth_code, false).await
     }
 
     /// Handle `push <message>` — send plain text to all peers.
@@ -5772,7 +5784,7 @@ Rules:\n\
             if !forth.is_empty() {
                 self.output_manager
                     .write_info(format!("→  {}", forth.as_str().cyan()));
-                self.handle_forth_eval_inner(forth, false).await?;
+                self.handle_legacy_forth_eval_inner(forth, false).await?;
             }
         } else {
             // Not Forth — just show the better machine as-is.
@@ -6052,20 +6064,20 @@ Rules:\n\
         self.render_tui().await
     }
 
-    /// Evaluate a Forth expression or definition in the session-persistent VM.
+    /// Evaluate source in the explicitly isolated legacy semiotic-Forth VM.
     ///
     /// Triggered by:
-    ///  - `: word ... ;`  (typed directly — Forth word definition)
-    ///  - `/forth <expr>` (explicit eval command)
+    /// This has no public source-evaluation entry point; only legacy
+    /// stack/poset/peer operations may call it while that subsystem remains.
     ///
     /// The VM persists across calls so words defined in one input are available
     /// in subsequent inputs.  `show_define` controls whether silent definitions
     /// echo "defined: name" — false for AI-generated Forth (output only, no noise).
-    async fn handle_forth_eval(&mut self, code: String) -> Result<()> {
-        self.handle_forth_eval_inner(code, true).await
-    }
-
-    async fn handle_forth_eval_inner(&mut self, code: String, show_define: bool) -> Result<()> {
+    async fn handle_legacy_forth_eval_inner(
+        &mut self,
+        code: String,
+        show_define: bool,
+    ) -> Result<()> {
         use crossterm::style::Stylize;
 
         // FIREBALL — clears conversation context immediately, like /clear
@@ -6541,7 +6553,9 @@ Rules:\n\
 
         // If all unknowns were library words or prose, re-run the original input.
         if remaining.is_empty() {
-            return self.handle_forth_eval_inner(original_input, false).await;
+            return self
+                .handle_legacy_forth_eval_inner(original_input, false)
+                .await;
         }
 
         // Only show user-authored words in the vocab context (not auto-compiled library words).
@@ -6657,10 +6671,12 @@ Rules:\n\
         self.render_tui().await.ok();
 
         // Compile the definitions.
-        self.handle_forth_eval_inner(forth_defs, false).await?;
+        self.handle_legacy_forth_eval_inner(forth_defs, false)
+            .await?;
 
         // Re-run the original input — words are now defined.
-        self.handle_forth_eval_inner(original_input, false).await
+        self.handle_legacy_forth_eval_inner(original_input, false)
+            .await
     }
 
     /// `/vm` — dump the VM's user-defined words as Forth source.
@@ -6973,21 +6989,6 @@ Rules:\n\
             })
             .collect();
         self.output_manager.write_info(styled.join("\n"));
-        self.render_tui().await
-    }
-
-    /// `/undefine` — undo the last Forth definition.
-    async fn handle_forth_undo(&mut self) -> Result<()> {
-        match self.forth_undo.pop() {
-            Some(snap) => {
-                self.forth_vm.restore(&snap);
-                self.output_manager.write_info("undone".to_string());
-            }
-            None => {
-                self.output_manager
-                    .write_info("nothing to undo".to_string());
-            }
-        }
         self.render_tui().await
     }
 

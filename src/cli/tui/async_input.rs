@@ -319,8 +319,9 @@ pub fn spawn_input_task(
                                     (KeyCode::Char('z'), m)
                                         if m.contains(KeyModifiers::CONTROL) =>
                                     {
-                                        // Ctrl+Z: Undo last Forth definition
-                                        Ok(Some("/undefine".to_string()))
+                                        // Typed VM definitions are revisioned; do not route
+                                        // Ctrl+Z into the removed legacy-Forth undo path.
+                                        Ok(None)
                                     }
                                     (KeyCode::Char('p'), m)
                                         if m.contains(KeyModifiers::CONTROL) =>

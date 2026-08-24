@@ -82,8 +82,7 @@ pub enum Command {
     StackDescribe(String),         // /describe <word>  — show library entry for a word
     StackDefine(String, String),   // /define <word> <def> — add word to repo vocabulary
     StackOverride(String, String), // /override <word> <def> — machine-local override (~/.finch/library.toml)
-    ForthEval(String),             // : word ... ; or /forth <expr> — eval in Forth interpreter
-    ForthUndo,                     // /undefine — undo last Forth definition
+    ForthEval(String),             // : word ... ; or /forth <expr> — execute in the typed VM
     VmDump,                        // /vm — dump VM source to scrollback + clipboard
     LibraryUndefine(String),       // /undefine <word> — remove last user library entry for word
     LibraryRun(String),            // /run <word> — execute the Forth snippet for a library word
@@ -350,9 +349,6 @@ impl Command {
             return Some(Command::ForthEval(trimmed.to_string()));
         }
         // Forth / library undo
-        if trimmed == "/undefine" {
-            return Some(Command::ForthUndo);
-        }
         if let Some(rest) = trimmed.strip_prefix("/undefine ") {
             let word = rest.trim().to_string();
             if !word.is_empty() {
@@ -365,7 +361,8 @@ impl Command {
                 return Some(Command::LibraryRun(word));
             }
         }
-        // Forth eval via /forth
+        // Typed Co-Forth eval via /forth. The former semiotic interpreter has
+        // no public evaluation command.
         if let Some(rest) = trimmed.strip_prefix("/forth ") {
             let expr = rest.trim();
             if !expr.is_empty() {
@@ -751,7 +748,6 @@ pub fn handle_command(
         | Command::StackDefine(_, _)
         | Command::StackOverride(_, _)
         | Command::ForthEval(_)
-        | Command::ForthUndo
         | Command::VmDump
         | Command::LibraryUndefine(_)
         | Command::LibraryRun(_) => Ok(CommandOutput::Status(
@@ -896,7 +892,6 @@ pub fn format_help() -> String {
          {cyan}  Ctrl+D{reset}             Exit REPL (same as /quit)\n\
          {cyan}  Ctrl+G{reset}             Mark last response as {green}good{reset} (1x training weight)\n\
          {cyan}  Ctrl+B{reset}             Mark last response as {red}bad{reset} (10x training weight)\n\
-         {cyan}  Ctrl+Z{reset}             Undo last Forth definition (/undefine)\n\
          {cyan}  Ctrl+P{reset}             Pop top word off vocabulary stack (/pop)\n\
          {cyan}  Tab{reset}                Complete /command (accepts ghost text)\n\
          {cyan}  Shift+Tab{reset}          Toggle plan mode on/off\n\
@@ -913,6 +908,7 @@ pub fn format_help() -> String {
          {red}  • Deny{reset}                     Reject the action\n\n\
          Available tools: Read, Glob, Grep, WebFetch, Bash, Restart\n\n\
          {yellow_bold}📚 Co-Forth VM:{reset}\n\
+         {cyan}  /forth <source>{reset}    Execute typed Co-Forth in ProgramRuntime\n\
          {cyan}  /push <text>{reset}       Push a word onto the stack (silent)\n\
          {cyan}  /pop{reset}               Remove top item (undo last push)\n\
          {cyan}  /run{reset}               Execute the program (shows approval dialog)\n\
@@ -1155,6 +1151,25 @@ pub fn format_training(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forth_commands_have_only_the_typed_public_entry_point() {
+        assert!(matches!(
+            Command::parse(": square ( S n:int -- S int ! pure ) n n * ;"),
+            Some(Command::ForthEval(source)) if source.starts_with(": square")
+        ));
+        assert!(matches!(
+            Command::parse("/forth 6 square"),
+            Some(Command::ForthEval(source)) if source == "6 square"
+        ));
+        assert!(matches!(
+            Command::parse("/legacy-forth 2 3 + ."),
+            Some(Command::Help)
+        ));
+        let help = format_help();
+        assert!(help.contains("/forth <source>"));
+        assert!(!help.contains("legacy-forth"));
+    }
 
     #[test]
     fn parses_named_brain_attachment_commands() {
