@@ -378,6 +378,7 @@ struct HostStream {
 enum HostStreamBackend {
     FileLines(BufReader<std::fs::File>),
     CsvRecords(BufReader<std::fs::File>),
+    WorkbookRows(std::vec::IntoIter<Vec<String>>),
 }
 
 #[derive(Clone)]
@@ -3028,6 +3029,36 @@ impl TypedHostHandler {
                     value: line.map(|line| Box::new(TypedValue::String(line))),
                 }])
             }
+            "workbook-rows" if *element_type == Type::list(Type::String) => {
+                let mut streams = self
+                    .streams
+                    .lock()
+                    .map_err(|_| host_binding_error(origin, "stream registry lock poisoned"))?;
+                let stream = streams.get_mut(id).ok_or_else(|| {
+                    host_binding_error(origin, "workbook stream is unknown or closed")
+                })?;
+                if stream.owner != self.execution_id || stream.generation != *generation {
+                    return Err(host_binding_error(
+                        origin,
+                        "workbook stream does not belong to this ProgramRun",
+                    ));
+                }
+                let HostStreamBackend::WorkbookRows(rows) = &mut stream.backend else {
+                    return Err(host_binding_error(
+                        origin,
+                        "workbook stream backend is malformed",
+                    ));
+                };
+                Ok(vec![TypedValue::Option {
+                    inner_type: Type::list(Type::String),
+                    value: rows.next().map(|row| {
+                        Box::new(TypedValue::List {
+                            element_type: Type::String,
+                            values: row.into_iter().map(TypedValue::String).collect(),
+                        })
+                    }),
+                }])
+            }
             _ => Err(host_binding_error(
                 origin,
                 "stream-next received an unknown or malformed stream",
@@ -3057,6 +3088,7 @@ impl TypedHostHandler {
         let expected_backend = match kind.as_str() {
             "csv-records" if *element_type == Type::list(Type::String) => "csv",
             "file-lines" if *element_type == Type::String => "lines",
+            "workbook-rows" if *element_type == Type::list(Type::String) => "workbook",
             _ => {
                 return Err(host_binding_error(
                     origin,
@@ -3079,7 +3111,9 @@ impl TypedHostHandler {
         }
         let backend_matches = matches!(
             (&stream.backend, expected_backend),
-            (HostStreamBackend::CsvRecords(_), "csv") | (HostStreamBackend::FileLines(_), "lines")
+            (HostStreamBackend::CsvRecords(_), "csv")
+                | (HostStreamBackend::FileLines(_), "lines")
+                | (HostStreamBackend::WorkbookRows(_), "workbook")
         );
         if !backend_matches {
             return Err(host_binding_error(origin, "stream backend is malformed"));
@@ -3684,6 +3718,58 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     }
                 };
                 match origin.word.as_deref() {
+                    Some("workbook-open") | Some("workbook-sheet-open") => {
+                        let sheet = match arguments.as_slice() {
+                            [_] if origin.word.as_deref() == Some("workbook-open") => None,
+                            [_, TypedValue::String(sheet)]
+                                if origin.word.as_deref() == Some("workbook-sheet-open") =>
+                            {
+                                Some(sheet.as_str())
+                            }
+                            _ => {
+                                return Err(host_binding_error(
+                                    origin,
+                                    "workbook-open requires a path; workbook-sheet-open requires a path and sheet name",
+                                ))
+                            }
+                        };
+                        let rows = read_workbook_rows(&path, sheet)
+                            .map_err(|message| host_binding_error(origin, message))?;
+                        let handle = uuid::Uuid::new_v4().to_string();
+                        self.streams
+                            .lock()
+                            .map_err(|_| {
+                                host_binding_error(origin, "stream registry lock poisoned")
+                            })?
+                            .insert(
+                                handle.clone(),
+                                HostStream {
+                                    owner: self.execution_id,
+                                    generation: 0,
+                                    backend: HostStreamBackend::WorkbookRows(rows.into_iter()),
+                                },
+                            );
+                        return Ok(vec![TypedValue::Stream {
+                            id: handle,
+                            element_type: Type::list(Type::String),
+                            kind: "workbook-rows".into(),
+                            generation: 0,
+                        }]);
+                    }
+                    Some("workbook-sheets") => {
+                        if arguments.len() != 1 {
+                            return Err(host_binding_error(
+                                origin,
+                                "workbook-sheets requires one path",
+                            ));
+                        }
+                        let sheets = read_workbook_sheet_names(&path)
+                            .map_err(|message| host_binding_error(origin, message))?;
+                        return Ok(vec![TypedValue::List {
+                            element_type: Type::String,
+                            values: sheets.into_iter().map(TypedValue::String).collect(),
+                        }]);
+                    }
                     Some("csv-open") => {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(origin, "csv-open requires one path"));
@@ -4648,6 +4734,71 @@ fn merkle_walk(
         }
     }
     Ok(())
+}
+
+/// Open one workbook sheet behind the ordinary host-issued stream lifecycle.
+/// Calamine owns format decoding; only one row crosses into the VM on each
+/// `stream-next`. The initial backend retains decoded rows because calamine's
+/// stable public API exposes an owned worksheet range rather than a streaming
+/// XML reader. The explicit cell bound prevents that host projection from
+/// becoming an unbounded second copy.
+fn read_workbook_rows(
+    path: &Path,
+    requested_sheet: Option<&str>,
+) -> std::result::Result<Vec<Vec<String>>, String> {
+    use calamine::{open_workbook_auto, Data, Reader};
+
+    const MAX_WORKBOOK_CELLS: usize = 10_000_000;
+    let mut workbook = open_workbook_auto(path)
+        .map_err(|error| format!("cannot open workbook '{}': {error}", path.display()))?;
+    let sheet = requested_sheet
+        .map(str::to_owned)
+        .or_else(|| workbook.sheet_names().first().cloned())
+        .ok_or_else(|| format!("workbook '{}' has no sheets", path.display()))?;
+    let range = workbook.worksheet_range(&sheet).map_err(|error| {
+        format!(
+            "cannot read workbook sheet '{}' from '{}': {error}",
+            sheet,
+            path.display()
+        )
+    })?;
+    let mut cell_count = 0usize;
+    let mut rows = Vec::new();
+    for row in range.rows() {
+        cell_count = cell_count
+            .checked_add(row.len())
+            .ok_or_else(|| "workbook cell count overflowed".to_string())?;
+        if cell_count > MAX_WORKBOOK_CELLS {
+            return Err(format!(
+                "workbook sheet exceeds the {MAX_WORKBOOK_CELLS}-cell host cursor limit"
+            ));
+        }
+        rows.push(
+            row.iter()
+                .map(|cell| match cell {
+                    Data::Empty => String::new(),
+                    Data::String(value) => value.clone(),
+                    Data::Float(value) if value.fract() == 0.0 => {
+                        format!("{}", *value as i64)
+                    }
+                    Data::Float(value) => value.to_string(),
+                    Data::Int(value) => value.to_string(),
+                    Data::Bool(value) => value.to_string(),
+                    Data::Error(value) => format!("#ERR:{value:?}"),
+                    other => other.to_string(),
+                })
+                .collect(),
+        );
+    }
+    Ok(rows)
+}
+
+fn read_workbook_sheet_names(path: &Path) -> std::result::Result<Vec<String>, String> {
+    use calamine::{open_workbook_auto, Reader};
+
+    let workbook = open_workbook_auto(path)
+        .map_err(|error| format!("cannot open workbook '{}': {error}", path.display()))?;
+    Ok(workbook.sheet_names().to_vec())
 }
 
 /// Read one UTF-8 line without allowing a malformed/hostile record to grow
@@ -6230,6 +6381,96 @@ mod tests {
             vec![ProgramValue::Option(Some(Box::new(ProgramValue::List(
                 vec![ProgramValue::String("[package]".into()),]
             ))))]
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_workbook_cursor_and_sheet_listing_match_across_frontends() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let workbook_path = directory.path().join("typed-workbook.xlsx");
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        {
+            let sheet = workbook.add_worksheet();
+            sheet.set_name("First").unwrap();
+            sheet.write_string(0, 0, "first").unwrap();
+        }
+        {
+            let sheet = workbook.add_worksheet();
+            sheet.set_name("Data").unwrap();
+            sheet.write_string(0, 0, "answer").unwrap();
+            sheet.write_number(0, 1, 42).unwrap();
+        }
+        workbook.save(&workbook_path).unwrap();
+        let canonical_workbook = workbook_path.canonicalize().unwrap();
+        let canonical_workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let relative = canonical_workbook
+            .strip_prefix(canonical_workspace)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        for (language, source) in [
+            (
+                ProgramLanguage::Lisp,
+                format!(
+                    "(let ((rows (workbook-sheet-open (path \"{relative}\") \"Data\"))) \
+                       (let ((row (unwrap (stream-next rows)))) \
+                         (begin (stream-close rows) (list-get row 1))))"
+                ),
+            ),
+            (
+                ProgramLanguage::Forth,
+                format!(
+                    "\"{relative}\" path \"Data\" workbook-sheet-open \
+                     dup stream-next unwrap 1 list-get swap stream-close drop"
+                ),
+            ),
+        ] {
+            let runtime = ProgramRuntime::new();
+            runtime
+                .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Read,
+                    crate::vm::FileSelector::parse("./**").unwrap(),
+                ))
+                .unwrap();
+            let outcome = runtime
+                .submit_typed_only(submission(language, &source, ExecutionEffect::WorkspaceRead))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.status,
+                ExecutionStatus::Completed,
+                "{language:?} workbook execution failed: {outcome:#?}"
+            );
+            assert_eq!(
+                outcome.values,
+                vec![ProgramValue::String("42".into())],
+                "{language:?} did not read the named workbook row"
+            );
+        }
+
+        let runtime = ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
+        let outcome = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Lisp,
+                &format!("(workbook-sheets (path \"{relative}\"))"),
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(
+            outcome.values,
+            vec![ProgramValue::List(vec![
+                ProgramValue::String("First".into()),
+                ProgramValue::String("Data".into()),
+            ])]
         );
     }
 
