@@ -45,6 +45,7 @@ struct ForthBodyAst {
 #[derive(Debug, Clone)]
 enum ForthBodyNode {
     Atom(Token),
+    Literal(ForthLiteralAst),
     Quotation(ForthQuotationAst),
 }
 
@@ -52,9 +53,16 @@ impl ForthBodyNode {
     fn leading_token(&self) -> &Token {
         match self {
             Self::Atom(token) => token,
+            Self::Literal(literal) => &literal.token,
             Self::Quotation(quotation) => &quotation.open,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ForthLiteralAst {
+    token: Token,
+    value: TypedValue,
 }
 
 #[derive(Debug, Clone)]
@@ -609,6 +617,20 @@ fn lower_forth_ast_body_with_locals(
                     function: quote_name,
                     capture_count: visible.len() as u32,
                     signature,
+                },
+                origin,
+            );
+            token_index += 1;
+            continue;
+        }
+        if let ForthBodyNode::Literal(literal) = &body.nodes[token_index] {
+            let origin = origin(source_id, source, literal.token.start, literal.token.end);
+            stack.push(literal.value.value_type());
+            emit(
+                &mut blocks,
+                current,
+                Instruction::Constant {
+                    value: literal.value.clone(),
                 },
                 origin,
             );
@@ -1984,35 +2006,8 @@ fn lower_forth_ast_body_with_locals(
             }
         }
         let instruction = match token.value {
-            TokenValue::Json(value) => {
-                stack.push(Type::Json);
-                Instruction::Constant {
-                    value: TypedValue::Json(value),
-                }
-            }
-            TokenValue::String(value) => {
-                stack.push(Type::String);
-                Instruction::Constant {
-                    value: TypedValue::String(value),
-                }
-            }
             TokenValue::Word(word) => {
-                if let Some(symbol) = word.strip_prefix('\'').filter(|symbol| !symbol.is_empty()) {
-                    stack.push(Type::Symbol);
-                    Instruction::Constant {
-                        value: TypedValue::Symbol(symbol.to_string()),
-                    }
-                } else if let Ok(value) = word.parse::<i64>() {
-                    stack.push(Type::Int);
-                    Instruction::Constant {
-                        value: TypedValue::Int(value),
-                    }
-                } else if word == "true" || word == "false" {
-                    stack.push(Type::Bool);
-                    Instruction::Constant {
-                        value: TypedValue::Bool(word == "true"),
-                    }
-                } else if word == "dup" {
+                if word == "dup" {
                     let value = stack.last().cloned().ok_or_else(|| {
                         vec![VmDiagnostic::error(
                             "E-STACK-001",
@@ -2350,6 +2345,9 @@ fn lower_forth_ast_body_with_locals(
                     }
                 }
             }
+            TokenValue::String(_) | TokenValue::Json(_) => {
+                unreachable!("body parser retains string and JSON values as literal nodes")
+            }
         };
         emit(&mut blocks, current, instruction, origin);
         token_index += 1;
@@ -2605,10 +2603,34 @@ fn parse_forth_body(atoms: &[Token]) -> ForthBodyAst {
                 continue;
             }
         }
-        nodes.push(ForthBodyNode::Atom(atoms[cursor].clone()));
+        if let Some(value) = forth_literal_value(&atoms[cursor]) {
+            nodes.push(ForthBodyNode::Literal(ForthLiteralAst {
+                token: atoms[cursor].clone(),
+                value,
+            }));
+        } else {
+            nodes.push(ForthBodyNode::Atom(atoms[cursor].clone()));
+        }
         cursor += 1;
     }
     ForthBodyAst { nodes }
+}
+
+fn forth_literal_value(token: &Token) -> Option<TypedValue> {
+    match &token.value {
+        TokenValue::String(value) => Some(TypedValue::String(value.clone())),
+        TokenValue::Json(value) => Some(TypedValue::Json(value.clone())),
+        TokenValue::Word(word) => word
+            .strip_prefix('\'')
+            .filter(|symbol| !symbol.is_empty())
+            .map(|symbol| TypedValue::Symbol(symbol.to_string()))
+            .or_else(|| word.parse::<i64>().ok().map(TypedValue::Int))
+            .or_else(|| match word.as_str() {
+                "true" => Some(TypedValue::Bool(true)),
+                "false" => Some(TypedValue::Bool(false)),
+                _ => None,
+            }),
+    }
 }
 
 /// Read a single public documentation line immediately preceding a typed
@@ -3800,10 +3822,11 @@ mod tests {
         let ForthBodyNode::Quotation(inner) = &outer.body.nodes[0] else {
             panic!("inner quotation should be a recursive body node");
         };
-        let ForthBodyNode::Atom(value) = &inner.body.nodes[0] else {
-            panic!("quotation body should own its literal atom");
+        let ForthBodyNode::Literal(value) = &inner.body.nodes[0] else {
+            panic!("quotation body should own its literal node");
         };
-        assert_eq!(&source[value.start..value.end], "42");
+        assert_eq!(&source[value.token.start..value.token.end], "42");
+        assert_eq!(value.value, TypedValue::Int(42));
     }
 
     #[test]
@@ -3817,6 +3840,34 @@ mod tests {
             panic!("the word after a quotation should remain the adjacent body node");
         };
         assert_eq!(&source[execute.start..execute.end], "execute");
+    }
+
+    #[test]
+    fn parser_classifies_literals_before_semantic_lowering() {
+        let source = "42 true 'answer \"hello\" {\"ok\":true} dup";
+        let ast = parse_forth_module("literal-nodes.forth", source)
+            .expect("literal syntax should parse before semantic lowering");
+        let values = ast
+            .body
+            .nodes
+            .iter()
+            .take(5)
+            .map(|node| match node {
+                ForthBodyNode::Literal(literal) => literal.value.clone(),
+                _ => panic!("the parser should classify every literal node"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                TypedValue::Int(42),
+                TypedValue::Bool(true),
+                TypedValue::Symbol("answer".into()),
+                TypedValue::String("hello".into()),
+                TypedValue::Json(serde_json::json!({"ok": true})),
+            ]
+        );
+        assert!(matches!(ast.body.nodes[5], ForthBodyNode::Atom(_)));
     }
 
     #[test]
