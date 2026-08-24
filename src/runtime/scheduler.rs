@@ -775,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_lisp_can_fork_and_join_without_shelling_out() {
+    async fn typed_lisp_can_fork_and_join_without_shelling_out() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
         let scheduler = AgentScheduler::new(

@@ -109,6 +109,13 @@ HTTP handlers, the Cap'n Proto IPC server, daemon clients, remote HTTP/WebSocket
 in-process callers currently duplicate parts of spawn/list/get/respond/cancel behavior. They should
 be adapters over one service.
 
+The legacy named-Brain HTTP `Program` handler additionally replays the accumulated program stack
+through the old Co-Forth or native Lisp evaluators. It is an explicitly quarantined compatibility
+path, not evidence that a Brain has a shared typed VM. Do not extend it with capabilities, provider
+wire handling, or new Brain behavior. During the gated convergence phase it must either become a
+typed `ProgramRuntime` adapter with the ordinary broker/effect journal, or remain a separately
+versioned legacy endpoint until it can be removed.
+
 ## Target model
 
 ```text
