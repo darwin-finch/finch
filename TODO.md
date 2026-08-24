@@ -146,9 +146,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   now persist a versioned creation-time grant ceiling and cannot acquire approvals granted later.
   Global runtime grants now receive stable IDs in a serializable host-owned `CapabilityLedger`;
   grant/revoke audit events are ordered, revocation and expiry rebuild the VM's active authority at
-  submission/resume boundaries, and VM checkpoints still contain no authority. Scoped approval
-  issuance/authorization audit, durable application storage, policy-driven revocation, and complete
-  host adapters remain.
+  submission/resume boundaries, and VM checkpoints still contain no authority. The ledger now
+  validates issuance for every declared scope, records source-free authorization decisions in the
+  same total order, and atomically consumes a matching `once` grant after its first successful
+  decision. Wire those scoped decisions into each ProgramRun's host-owned identity/effect boundary;
+  durable application storage, policy-driven revocation, and complete host adapters remain.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their

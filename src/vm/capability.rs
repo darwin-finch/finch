@@ -24,11 +24,17 @@ pub struct CapabilityGrant {
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: Option<u64>,
     pub revoked_at_unix_ms: Option<u64>,
+    /// Set only for a successfully authorized `once` grant. Consumption is
+    /// distinct from revocation so audit consumers can tell normal use from a
+    /// policy withdrawal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_at_unix_ms: Option<u64>,
 }
 
 impl CapabilityGrant {
     pub fn is_active(&self, now_unix_ms: u64) -> bool {
         self.revoked_at_unix_ms.is_none()
+            && self.consumed_at_unix_ms.is_none()
             && self
                 .expires_at_unix_ms
                 .is_none_or(|expires| now_unix_ms < expires)
@@ -71,7 +77,8 @@ pub enum CapabilityAvailability {
     Degraded { reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
 pub enum AuthorizationDecision {
     Allowed { grant_id: Uuid },
     ApprovalRequired,
@@ -126,6 +133,7 @@ impl GrantSet {
 pub enum CapabilityAuditAction {
     Granted,
     Revoked,
+    Consumed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +146,23 @@ pub struct CapabilityAuditEntry {
     pub actor: String,
 }
 
+/// Source-free record of one authorization decision. Request arguments and
+/// source text remain in the effect/program journal; this ledger retains only
+/// the stable correlation and structured requirement needed for security
+/// review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityAuthorizationAuditEntry {
+    pub sequence: u64,
+    pub request_id: Uuid,
+    pub execution_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_sequence: Option<u64>,
+    pub requirement: CapabilityRequirement,
+    pub decision: AuthorizationDecision,
+    pub at_unix_ms: u64,
+    pub actor: String,
+}
+
 /// Application-owned authority records. This ledger is serializable beside a
 /// Brain or session event log, but deliberately never enters a VM checkpoint.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,10 +170,54 @@ pub struct CapabilityLedger {
     pub grants: GrantSet,
     pub audit: Vec<CapabilityAuditEntry>,
     #[serde(default)]
+    pub authorization_audit: Vec<CapabilityAuthorizationAuditEntry>,
+    #[serde(default)]
     next_sequence: u64,
 }
 
 impl CapabilityLedger {
+    pub fn issue(
+        &mut self,
+        requirement: CapabilityRequirement,
+        scope: GrantScope,
+        policy_hash: impl Into<String>,
+        actor: impl Into<String>,
+        now_unix_ms: u64,
+        expires_at_unix_ms: Option<u64>,
+    ) -> Result<Uuid, String> {
+        if expires_at_unix_ms.is_some_and(|expires| expires <= now_unix_ms) {
+            return Err("capability grant expiry must be after its creation time".into());
+        }
+        if matches!(&scope, GrantScope::Project { project_id } if project_id.trim().is_empty()) {
+            return Err("project-scoped capability grant requires a project identity".into());
+        }
+        let policy_hash = policy_hash.into();
+        if policy_hash.trim().is_empty() {
+            return Err("capability grant requires a policy hash".into());
+        }
+        let id = Uuid::new_v4();
+        let actor = actor.into();
+        self.grants.grants.push(CapabilityGrant {
+            id,
+            requirement: requirement.clone(),
+            scope,
+            policy_hash,
+            created_by: actor.clone(),
+            created_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms,
+            revoked_at_unix_ms: None,
+            consumed_at_unix_ms: None,
+        });
+        self.record(
+            id,
+            CapabilityAuditAction::Granted,
+            requirement,
+            now_unix_ms,
+            actor,
+        );
+        Ok(id)
+    }
+
     pub fn grant_global(
         &mut self,
         requirement: CapabilityRequirement,
@@ -156,20 +225,62 @@ impl CapabilityLedger {
         actor: impl Into<String>,
         now_unix_ms: u64,
     ) -> Uuid {
-        let id = Uuid::new_v4();
+        self.issue(
+            requirement,
+            GrantScope::Global,
+            policy_hash,
+            actor,
+            now_unix_ms,
+            None,
+        )
+        .expect("a global grant with a non-empty built-in policy is valid")
+    }
+
+    /// Authorize and audit one concrete request. A matching `once` grant is
+    /// consumed atomically with this decision, so it cannot authorize a later
+    /// effect even when the selector is identical.
+    pub fn authorize(
+        &mut self,
+        request: &CapabilityRequest,
+        context: &AuthorizationContext,
+        actor: impl Into<String>,
+    ) -> AuthorizationDecision {
         let actor = actor.into();
-        self.grants.grants.push(CapabilityGrant {
-            id,
-            requirement: requirement.clone(),
-            scope: GrantScope::Global,
-            policy_hash: policy_hash.into(),
-            created_by: actor.clone(),
-            created_at_unix_ms: now_unix_ms,
-            expires_at_unix_ms: None,
-            revoked_at_unix_ms: None,
-        });
-        self.record(id, CapabilityAuditAction::Granted, requirement, now_unix_ms, actor);
-        id
+        let decision = self.grants.authorize(request, context);
+        if let AuthorizationDecision::Allowed { grant_id } = decision {
+            let consumed_requirement = self
+                .grants
+                .grants
+                .iter_mut()
+                .find(|grant| grant.id == grant_id)
+                .filter(|grant| matches!(grant.scope, GrantScope::Once { .. }))
+                .map(|grant| {
+                    grant.consumed_at_unix_ms = Some(context.now_unix_ms);
+                    grant.requirement.clone()
+                });
+            if let Some(requirement) = consumed_requirement {
+                self.record(
+                    grant_id,
+                    CapabilityAuditAction::Consumed,
+                    requirement,
+                    context.now_unix_ms,
+                    actor.clone(),
+                );
+            }
+        }
+        let sequence = self.take_sequence();
+        self.authorization_audit
+            .push(CapabilityAuthorizationAuditEntry {
+                sequence,
+                request_id: request.id,
+                execution_id: request.execution_id,
+                effect_sequence: request.effect_sequence,
+                requirement: request.requirement.clone(),
+                decision: decision.clone(),
+                at_unix_ms: context.now_unix_ms,
+                actor,
+            });
+        decision
     }
 
     pub fn revoke(&mut self, grant_id: Uuid, actor: impl Into<String>, now_unix_ms: u64) -> bool {
@@ -200,15 +311,21 @@ impl CapabilityLedger {
         at_unix_ms: u64,
         actor: String,
     ) {
+        let sequence = self.take_sequence();
         self.audit.push(CapabilityAuditEntry {
-            sequence: self.next_sequence,
+            sequence,
             grant_id,
             action,
             requirement,
             at_unix_ms,
             actor,
         });
+    }
+
+    fn take_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
         self.next_sequence += 1;
+        sequence
     }
 }
 
@@ -320,6 +437,7 @@ mod tests {
                 created_at_unix_ms: 0,
                 expires_at_unix_ms: None,
                 revoked_at_unix_ms: None,
+                consumed_at_unix_ms: None,
             }],
         };
         let context = AuthorizationContext {
@@ -354,6 +472,7 @@ mod tests {
                 created_at_unix_ms: 0,
                 expires_at_unix_ms: None,
                 revoked_at_unix_ms: None,
+                consumed_at_unix_ms: None,
             }],
         };
         let context = AuthorizationContext {
@@ -407,6 +526,7 @@ mod tests {
             created_at_unix_ms: 10,
             expires_at_unix_ms: None,
             revoked_at_unix_ms: None,
+            consumed_at_unix_ms: None,
         });
         assert_eq!(
             ledger
@@ -428,6 +548,114 @@ mod tests {
         assert_eq!(ledger.audit[1].action, CapabilityAuditAction::Revoked);
 
         let encoded = serde_json::to_string(&ledger).unwrap();
-        assert_eq!(serde_json::from_str::<CapabilityLedger>(&encoded).unwrap(), ledger);
+        assert_eq!(
+            serde_json::from_str::<CapabilityLedger>(&encoded).unwrap(),
+            ledger
+        );
+    }
+
+    #[test]
+    fn ledger_issues_validated_scoped_and_expiring_grants() {
+        let requirement = CapabilityRequirement::file(
+            FileOperation::Read,
+            FileSelector::parse("./reports/**").unwrap(),
+        );
+        let mut ledger = CapabilityLedger::default();
+        let session_id = Uuid::new_v4();
+        let grant_id = ledger
+            .issue(
+                requirement.clone(),
+                GrantScope::Session { session_id },
+                "policy-v1",
+                "user",
+                10,
+                Some(20),
+            )
+            .unwrap();
+        let grant = ledger
+            .grants
+            .grants
+            .iter()
+            .find(|grant| grant.id == grant_id)
+            .unwrap();
+        assert_eq!(grant.scope, GrantScope::Session { session_id });
+        assert!(grant.is_active(19));
+        assert!(!grant.is_active(20));
+        assert!(ledger
+            .issue(
+                requirement.clone(),
+                GrantScope::Project {
+                    project_id: " ".into(),
+                },
+                "policy-v1",
+                "user",
+                10,
+                None,
+            )
+            .unwrap_err()
+            .contains("project identity"));
+        assert!(ledger
+            .issue(
+                requirement,
+                GrantScope::Global,
+                "policy-v1",
+                "user",
+                10,
+                Some(10),
+            )
+            .unwrap_err()
+            .contains("expiry"));
+    }
+
+    #[test]
+    fn authorization_audit_consumes_allow_once_exactly_once() {
+        let requirement = CapabilityRequirement::file(
+            FileOperation::Write,
+            FileSelector::parse("./generated/report.md").unwrap(),
+        );
+        let request = request(requirement.clone());
+        let mut ledger = CapabilityLedger::default();
+        let grant_id = ledger
+            .issue(
+                requirement,
+                GrantScope::Once {
+                    request_id: request.id,
+                },
+                "policy-v1",
+                "user",
+                10,
+                None,
+            )
+            .unwrap();
+        let context = AuthorizationContext {
+            now_unix_ms: 11,
+            task_id: None,
+            session_id: Uuid::new_v4(),
+            project_id: None,
+            policy_hash: "policy-v1".into(),
+        };
+        assert_eq!(
+            ledger.authorize(&request, &context, "runtime"),
+            AuthorizationDecision::Allowed { grant_id }
+        );
+        assert_eq!(
+            ledger.authorize(&request, &context, "runtime"),
+            AuthorizationDecision::ApprovalRequired
+        );
+        assert_eq!(ledger.audit.len(), 2);
+        assert_eq!(ledger.audit[1].action, CapabilityAuditAction::Consumed);
+        assert_eq!(ledger.authorization_audit.len(), 2);
+        assert_eq!(ledger.authorization_audit[0].sequence, 2);
+        assert_eq!(ledger.authorization_audit[1].sequence, 3);
+        assert_eq!(
+            ledger.authorization_audit[1].decision,
+            AuthorizationDecision::ApprovalRequired
+        );
+
+        let encoded = serde_json::to_string(&ledger).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CapabilityLedger>(&encoded).unwrap(),
+            ledger
+        );
     }
 }
