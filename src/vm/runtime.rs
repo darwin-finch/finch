@@ -181,15 +181,83 @@ pub enum TypedExecutionStatus {
     Failed,
 }
 
+struct CpuFiberLease {
+    scheduler: Arc<CpuFiberScheduler>,
+    owner: Uuid,
+    roots: BTreeSet<Uuid>,
+}
+
+impl CpuFiberLease {
+    fn new(scheduler: Arc<CpuFiberScheduler>) -> Self {
+        Self {
+            scheduler,
+            owner: Uuid::new_v4(),
+            roots: BTreeSet::new(),
+        }
+    }
+
+    fn adopt_spawned(&mut self, id: Uuid) {
+        self.roots.insert(id);
+    }
+
+    fn replace_roots(&mut self, roots: BTreeSet<Uuid>) {
+        for id in roots.difference(&self.roots) {
+            self.scheduler
+                .attach_owner(*id, self.owner)
+                .expect("reachable CPU task must have a scheduler record");
+        }
+        for id in self.roots.difference(&roots) {
+            let _ = self.scheduler.release_owner(*id, self.owner);
+        }
+        self.roots = roots;
+    }
+}
+
+impl Clone for CpuFiberLease {
+    fn clone(&self) -> Self {
+        let owner = Uuid::new_v4();
+        for id in &self.roots {
+            self.scheduler
+                .attach_owner(*id, owner)
+                .expect("cloned CPU task lease must reference a scheduler record");
+        }
+        Self {
+            scheduler: Arc::clone(&self.scheduler),
+            owner,
+            roots: self.roots.clone(),
+        }
+    }
+}
+
+impl Drop for CpuFiberLease {
+    fn drop(&mut self) {
+        for id in &self.roots {
+            let _ = self.scheduler.release_owner(*id, self.owner);
+        }
+    }
+}
+
 /// Persistent typed stack shared by Finch Lisp and Co-Forth source.
-#[derive(Clone)]
 pub struct TypedRuntime {
     stack: Vec<TypedValue>,
     vocabulary: Vocabulary,
     functions: BTreeMap<String, Function>,
     grants: EffectSet,
-    cpu_fibers: Arc<CpuFiberScheduler>,
+    cpu_fibers: CpuFiberLease,
     producer_fibers: BTreeMap<String, ProducerFiberRecord>,
+}
+
+impl Clone for TypedRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            stack: self.stack.clone(),
+            vocabulary: self.vocabulary.clone(),
+            functions: self.functions.clone(),
+            grants: self.grants.clone(),
+            cpu_fibers: self.cpu_fibers.clone(),
+            producer_fibers: self.producer_fibers.clone(),
+        }
+    }
 }
 
 impl Default for TypedRuntime {
@@ -200,6 +268,10 @@ impl Default for TypedRuntime {
 
 impl TypedRuntime {
     pub fn new() -> Self {
+        let cpu_fibers = Arc::new(CpuFiberScheduler::new(
+            std::thread::available_parallelism()
+                .map_or(1, |parallelism| parallelism.get().saturating_sub(1).max(1)),
+        ));
         Self {
             stack: Vec::new(),
             vocabulary: core_vocabulary(),
@@ -207,10 +279,7 @@ impl TypedRuntime {
             // Producing the requested assistant response is part of the
             // session contract, not an ambient host permission.
             grants: Self::intrinsic_grants(),
-            cpu_fibers: Arc::new(CpuFiberScheduler::new(
-                std::thread::available_parallelism()
-                    .map_or(1, |parallelism| parallelism.get().saturating_sub(1).max(1)),
-            )),
+            cpu_fibers: CpuFiberLease::new(cpu_fibers),
             producer_fibers: BTreeMap::new(),
         }
     }
@@ -264,6 +333,36 @@ impl TypedRuntime {
         }
         self.producer_fibers
             .retain(|id, _| reachable.contains(id));
+    }
+
+    /// Reconcile this private runtime snapshot's CPU-task leases with every
+    /// task handle that remains language-reachable after a successful commit.
+    /// Producer continuations are durable roots too, even though their values
+    /// are not currently visible on the public operand stack.
+    fn collect_reachable_cpu_fibers(&mut self) {
+        let mut reachable = BTreeSet::new();
+        for value in &self.stack {
+            collect_cpu_fiber_ids(value, &mut reachable);
+        }
+        for record in self.producer_fibers.values() {
+            match &record.state {
+                ProducerFiberState::Ready { continuation } => {
+                    for value in &continuation.stack {
+                        collect_cpu_fiber_ids(value, &mut reachable);
+                    }
+                    for frame in &continuation.frames {
+                        for value in frame.locals.iter().chain(&frame.captures) {
+                            collect_cpu_fiber_ids(value, &mut reachable);
+                        }
+                    }
+                }
+                ProducerFiberState::Completed { result } => {
+                    collect_cpu_fiber_ids(result, &mut reachable);
+                }
+                ProducerFiberState::Failed { .. } | ProducerFiberState::Cancelled => {}
+            }
+        }
+        self.cpu_fibers.replace_roots(reachable);
     }
 
     /// Capture only state that can safely survive outside this process. This
@@ -487,8 +586,10 @@ impl TypedRuntime {
             Err(diagnostic) => return TypedExecution::failed(vec![diagnostic]),
         };
         let baseline = self.producer_fibers.clone();
+        let cpu_baseline = self.cpu_fibers.roots.clone();
         let execution = self.drive(module, continuation, handler);
-        self.finish_producer_transaction(execution, baseline)
+        let execution = self.finish_producer_transaction(execution, baseline);
+        self.finish_cpu_task_transaction(execution, cpu_baseline)
     }
 
     /// Continue a previously returned VM boundary. Callers retain this token
@@ -543,6 +644,7 @@ impl TypedRuntime {
         handler: &mut H,
     ) -> TypedExecution {
         let baseline = self.producer_fibers.clone();
+        let cpu_baseline = self.cpu_fibers.roots.clone();
         self.producer_fibers = suspension.producer_fibers.clone();
         let execution = self.resume_with_handler_working(
             suspension,
@@ -551,7 +653,8 @@ impl TypedRuntime {
             authorize_pending_host_call,
             handler,
         );
-        self.finish_producer_transaction(execution, baseline)
+        let execution = self.finish_producer_transaction(execution, baseline);
+        self.finish_cpu_task_transaction(execution, cpu_baseline)
     }
 
     fn resume_with_handler_working<H: CapabilityHandler>(
@@ -1200,10 +1303,13 @@ impl TypedRuntime {
                         .last()
                         .cloned()
                         .unwrap_or(super::types::Type::Unit);
-                    let id = match self.cpu_fibers.spawn_closure(
+                    let scheduler = Arc::clone(&self.cpu_fibers.scheduler);
+                    let owner = self.cpu_fibers.owner;
+                    let id = match scheduler.spawn_closure_owned(
                         module.clone(),
                         closure,
                         continuation.fuel,
+                        owner,
                     ) {
                         Ok(id) => id,
                         Err(error) => {
@@ -1221,6 +1327,7 @@ impl TypedRuntime {
                             );
                         }
                     };
+                    self.cpu_fibers.adopt_spawned(id);
                     let trampoline = VmTrampoline::new(
                         &module,
                         &InterpreterConfig {
@@ -1439,6 +1546,17 @@ impl TypedRuntime {
         let working = std::mem::replace(&mut self.producer_fibers, baseline);
         if let Some(suspension) = execution.suspension.as_mut() {
             suspension.producer_fibers = working;
+        }
+        execution
+    }
+
+    fn finish_cpu_task_transaction(
+        &mut self,
+        execution: TypedExecution,
+        baseline: BTreeSet<Uuid>,
+    ) -> TypedExecution {
+        if execution.status == TypedExecutionStatus::Failed {
+            self.cpu_fibers.replace_roots(baseline);
         }
         execution
     }
@@ -1738,7 +1856,7 @@ impl TypedRuntime {
                 Some(origin.clone()),
             )
         })?;
-        let snapshot = self.cpu_fibers.poll(id).map_err(|error| {
+        let snapshot = self.cpu_fibers.scheduler.poll(id).map_err(|error| {
             VmDiagnostic::error(
                 "E-FIBER-013",
                 DiagnosticPhase::HostCall,
@@ -1819,7 +1937,7 @@ impl TypedRuntime {
                 Some(origin.clone()),
             )
         })?;
-        self.cpu_fibers.cancel(id).map_err(|error| {
+        self.cpu_fibers.scheduler.cancel(id).map_err(|error| {
             VmDiagnostic::error(
                 "E-FIBER-013",
                 DiagnosticPhase::HostCall,
@@ -1850,6 +1968,7 @@ impl TypedRuntime {
         }
         self.stack = stack;
         self.collect_unreachable_producer_fibers();
+        self.collect_reachable_cpu_fibers();
         TypedExecution {
             status: TypedExecutionStatus::Completed,
             values: self.stack.clone(),
@@ -2017,6 +2136,67 @@ fn collect_producer_fiber_ids(value: &TypedValue, ids: &mut VecDeque<String>) {
         | TypedValue::Json(_)
         | TypedValue::Path { .. }
         | TypedValue::Task { .. }
+        | TypedValue::Stream { .. }
+        | TypedValue::Resource { .. } => {}
+    }
+}
+
+fn collect_cpu_fiber_ids(value: &TypedValue, ids: &mut BTreeSet<Uuid>) {
+    match value {
+        TypedValue::Task {
+            id,
+            kind: super::types::TaskKind::CpuFiber,
+            ..
+        } => {
+            if let Ok(id) = Uuid::parse_str(id) {
+                ids.insert(id);
+            }
+        }
+        TypedValue::List { values, .. } => {
+            for value in values {
+                collect_cpu_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Map { entries, .. } => {
+            for (key, value) in entries {
+                collect_cpu_fiber_ids(key, ids);
+                collect_cpu_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Option { value, .. } | TypedValue::Variant { value, .. } => {
+            if let Some(value) = value {
+                collect_cpu_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Result { value, .. } | TypedValue::Dynamic { value, .. } => {
+            collect_cpu_fiber_ids(value, ids);
+        }
+        TypedValue::Record(fields) => {
+            for (_, value) in fields {
+                collect_cpu_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Closure { captures, .. } => {
+            for value in captures {
+                collect_cpu_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Unit
+        | TypedValue::Bool(_)
+        | TypedValue::Int(_)
+        | TypedValue::UInt(_)
+        | TypedValue::Float(_)
+        | TypedValue::Char(_)
+        | TypedValue::Symbol(_)
+        | TypedValue::String(_)
+        | TypedValue::Bytes(_)
+        | TypedValue::Json(_)
+        | TypedValue::Path { .. }
+        | TypedValue::Task {
+            kind: super::types::TaskKind::Agent,
+            ..
+        }
+        | TypedValue::Fiber { .. }
         | TypedValue::Stream { .. }
         | TypedValue::Resource { .. } => {}
     }
@@ -2970,7 +3150,7 @@ mod tests {
         assert_eq!(*result_type, crate::vm::types::Type::Int);
         assert_eq!(*kind, crate::vm::types::TaskKind::CpuFiber);
         let id = uuid::Uuid::parse_str(id).expect("CPU task id must be a UUID");
-        let result = runtime.cpu_fibers.join(id).unwrap();
+        let result = runtime.cpu_fibers.scheduler.join(id).unwrap();
         assert_eq!(
             result.status,
             crate::runtime::fiber::CpuFiberStatus::Completed
@@ -3280,12 +3460,16 @@ mod tests {
         };
         assert_eq!(*kind, crate::vm::types::TaskKind::CpuFiber);
         let id = uuid::Uuid::parse_str(id).unwrap();
-        runtime.cpu_fibers.join(id).unwrap();
+        runtime.cpu_fibers.scheduler.join(id).unwrap();
+        let concurrent_snapshot = runtime.clone();
 
         let joined = runtime.execute(ProgramLanguage::Forth, "join.forth", "task-join", 1_000);
         assert_eq!(joined.status, TypedExecutionStatus::Completed);
         assert_eq!(joined.values, vec![TypedValue::Int(42)]);
         assert_eq!(runtime.stack(), &[TypedValue::Int(42)]);
+        assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 1);
+        drop(concurrent_snapshot);
+        assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 0);
     }
 
     #[test]
@@ -3302,6 +3486,7 @@ mod tests {
         };
         runtime
             .cpu_fibers
+            .scheduler
             .join(uuid::Uuid::parse_str(id).unwrap())
             .unwrap();
         let polled = runtime.execute(ProgramLanguage::Forth, "poll.forth", "task-poll", 1_000);
@@ -3313,6 +3498,7 @@ mod tests {
                 value: Some(Box::new(TypedValue::Int(9))),
             }]
         );
+        assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 0);
     }
 
     #[test]
@@ -3327,6 +3513,43 @@ mod tests {
         assert_eq!(cancelled.status, TypedExecutionStatus::Completed);
         assert!(cancelled.values.is_empty());
         assert!(runtime.stack().is_empty());
+        assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 0);
+    }
+
+    #[test]
+    fn failed_program_releases_cpu_tasks_spawned_only_in_its_working_state() {
+        let mut runtime = TypedRuntime::new();
+        let failed = runtime.execute(
+            ProgramLanguage::Lisp,
+            "failed-cpu-task.lisp",
+            "(begin (defer :cpu (lambda () 9)) (/ 1 0))",
+            1_000,
+        );
+        assert_eq!(failed.status, TypedExecutionStatus::Failed);
+        assert!(runtime.stack().is_empty());
+        assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 0);
+    }
+
+    #[test]
+    fn cpu_task_leases_trace_duplicate_handles_nested_in_typed_values() {
+        let mut runtime = TypedRuntime::new();
+        let deferred = runtime.execute(
+            ProgramLanguage::Lisp,
+            "nested-cpu-task.lisp",
+            "(let ((task (defer :cpu (lambda () 9)))) (list task task))",
+            1_000,
+        );
+        assert_eq!(
+            deferred.status,
+            TypedExecutionStatus::Completed,
+            "{:?}",
+            deferred.diagnostics
+        );
+        assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 1);
+
+        let dropped = runtime.execute(ProgramLanguage::Forth, "drop-task-list.forth", "drop", 10);
+        assert_eq!(dropped.status, TypedExecutionStatus::Completed);
+        assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 0);
     }
 
     #[test]

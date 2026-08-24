@@ -9,7 +9,7 @@
 use crate::vm::interpreter::InterpreterConfig;
 use crate::vm::{EffectSet, TypedValue, VerifiedModule, VmDiagnostic, VmStep, VmTrampoline};
 use anyhow::{bail, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use uuid::Uuid;
@@ -34,6 +34,7 @@ struct CpuFiberRecord {
     state: Mutex<CpuFiberSnapshot>,
     ready: Condvar,
     cancelled: AtomicBool,
+    owners: Mutex<HashSet<Uuid>>,
 }
 
 /// A bounded scheduler for CPU-heavy, capability-free VM work. It creates at
@@ -65,6 +66,18 @@ impl CpuFiberScheduler {
         arguments: Vec<TypedValue>,
         fuel: u64,
     ) -> Result<Uuid> {
+        self.spawn_with_owner(module, function, captures, arguments, fuel, None)
+    }
+
+    fn spawn_with_owner(
+        self: &Arc<Self>,
+        module: VerifiedModule,
+        function: impl Into<String>,
+        captures: Vec<TypedValue>,
+        arguments: Vec<TypedValue>,
+        fuel: u64,
+        owner: Option<Uuid>,
+    ) -> Result<Uuid> {
         let function = function.into();
         let definition = module
             .module
@@ -90,6 +103,7 @@ impl CpuFiberScheduler {
             }),
             ready: Condvar::new(),
             cancelled: AtomicBool::new(false),
+            owners: Mutex::new(owner.into_iter().collect()),
         });
         self.fibers
             .lock()
@@ -141,6 +155,81 @@ impl CpuFiberScheduler {
             );
         }
         self.spawn(module, function, captures, Vec::new(), fuel)
+    }
+
+    /// Spawn a closure while atomically attaching its first private-runtime
+    /// lease. This prevents another snapshot's cleanup from observing a new
+    /// worker in the registry before its language handle has an owner.
+    pub fn spawn_closure_owned(
+        self: &Arc<Self>,
+        module: VerifiedModule,
+        closure: TypedValue,
+        fuel: u64,
+        owner: Uuid,
+    ) -> Result<Uuid> {
+        let TypedValue::Closure {
+            function,
+            captures,
+            signature,
+        } = closure
+        else {
+            bail!("CPU fiber requires a typed closure");
+        };
+        if !signature.input.values.is_empty() {
+            bail!(
+                "CPU fiber closure '{}' requires {} positional arguments; capture them in a zero-argument closure before deferring",
+                function,
+                signature.input.values.len()
+            );
+        }
+        self.spawn_with_owner(module, function, captures, Vec::new(), fuel, Some(owner))
+    }
+
+    /// Attach one cloned/private runtime snapshot to an existing task record.
+    pub fn attach_owner(&self, id: Uuid, owner: Uuid) -> Result<()> {
+        let fibers = self
+            .fibers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CPU fiber registry lock poisoned"))?;
+        let record = fibers
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("unknown CPU fiber {id}"))?;
+        record
+            .owners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CPU fiber owner lock poisoned"))?
+            .insert(owner);
+        Ok(())
+    }
+
+    /// Release one runtime snapshot's reference. The final release removes
+    /// the deterministic tombstone; an unobserved running worker is also
+    /// cooperatively cancelled while its thread-owned record finishes safely.
+    pub fn release_owner(&self, id: Uuid, owner: Uuid) -> Result<bool> {
+        let mut fibers = self
+            .fibers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CPU fiber registry lock poisoned"))?;
+        let Some(record) = fibers.get(&id).cloned() else {
+            return Ok(false);
+        };
+        let mut owners = record
+            .owners
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CPU fiber owner lock poisoned"))?;
+        owners.remove(&owner);
+        if !owners.is_empty() {
+            return Ok(false);
+        }
+        record.cancelled.store(true, Ordering::Release);
+        drop(owners);
+        fibers.remove(&id);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_count(&self) -> usize {
+        self.fibers.lock().expect("CPU fiber registry lock poisoned").len()
     }
 
     pub fn poll(&self, id: Uuid) -> Result<CpuFiberSnapshot> {
