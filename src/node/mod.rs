@@ -17,6 +17,29 @@ pub use stats::{WorkStats, WorkTracker};
 use crate::models::model_selector::{ModelSelection, ModelSelector};
 use serde::{Deserialize, Serialize};
 
+/// Collect basic machine specs for registry metadata.
+///
+/// Returns `(cpu_cores, ram_mb, bench_ms)`, where `bench_ms` is the time for
+/// ten million wrapping integer additions. This belongs to node discovery,
+/// not either Finch language runtime.
+pub fn collect_machine_specs() -> (u32, u64, u64) {
+    use sysinfo::System;
+
+    let mut system = System::new();
+    system.refresh_memory();
+    system.refresh_cpu_all();
+    let cpu_cores = system.cpus().len() as u32;
+    let ram_mb = system.total_memory() / (1024 * 1024);
+    let start = std::time::Instant::now();
+    let mut accumulator = 0_u64;
+    for value in 0_u64..10_000_000 {
+        accumulator = accumulator.wrapping_add(value);
+    }
+    let bench_ms = start.elapsed().as_millis() as u64;
+    std::hint::black_box(accumulator);
+    (cpu_cores, ram_mb, bench_ms)
+}
+
 /// Full description of this node's capabilities — advertised via mDNS
 /// and returned by the /v1/node/info endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,5 +132,12 @@ mod tests {
             os: "test".to_string(),
         };
         assert!(caps.is_cloud_only());
+    }
+
+    #[test]
+    fn machine_specs_are_available_without_a_language_runtime() {
+        let (cpu_cores, ram_mb, _bench_ms) = collect_machine_specs();
+        assert!(cpu_cores > 0);
+        assert!(ram_mb > 0);
     }
 }

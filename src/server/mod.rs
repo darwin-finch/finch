@@ -212,7 +212,7 @@ impl AgentServer {
         // Auto-register this daemon in its own registry.
         // Every finch node is a registry by default — it accepts peers and is itself a peer.
         let self_addr = self.config.bind_address.clone();
-        let specs = crate::coforth::interpreter::collect_machine_specs();
+        let specs = crate::node::collect_machine_specs();
         let self_entry = crate::registry::PeerEntry {
             addr: self_addr.clone(),
             label: Some(hostname_or_default()),
