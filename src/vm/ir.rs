@@ -73,6 +73,14 @@ pub enum Instruction {
         element_type: Type,
         count: u32,
     },
+    /// Pop `count` key/value pairs and construct an immutable typed map.
+    /// This keeps collection construction in the shared IR instead of making
+    /// one frontend call a host helper or synthesize an untyped JSON object.
+    MakeMap {
+        key_type: Type,
+        value_type: Type,
+        count: u32,
+    },
     Dup,
     Drop,
     Swap,

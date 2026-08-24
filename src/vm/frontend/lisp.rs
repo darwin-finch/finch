@@ -791,6 +791,7 @@ impl Compiler<'_> {
             "task-join" => self.compile_cpu_task_operation(&items[1..], builder, true),
             "task-cancel" => self.compile_cpu_task_cancel(&items[1..], builder),
             "list" => self.compile_list_value(&items[1..], builder),
+            "map" => self.compile_map_value(&items[1..], builder),
             _ if builder.resolve(operator).is_some() => {
                 self.compile_closure_call(&items[0], &items[1..], builder)
             }
@@ -982,6 +983,51 @@ impl Compiler<'_> {
             self.origin("list"),
         );
         Ok(Type::list(element_type))
+    }
+
+    fn compile_map_value(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        if expressions.is_empty() || expressions.len() % 2 != 0 {
+            return Err(vec![self.error(
+                "E-MAP-001",
+                "map requires one or more key/value pairs",
+            )]);
+        }
+        let key_type = self.compile_expression(&expressions[0], builder)?;
+        let value_type = self.compile_expression(&expressions[1], builder)?;
+        for pair in expressions[2..].chunks_exact(2) {
+            let found_key = self.compile_expression(&pair[0], builder)?;
+            if !key_type.accepts(&found_key) {
+                return Err(vec![VmDiagnostic::type_mismatch(
+                    key_type.clone(),
+                    found_key,
+                    Some(self.origin("map")),
+                )]);
+            }
+            let found_value = self.compile_expression(&pair[1], builder)?;
+            if !value_type.accepts(&found_value) {
+                return Err(vec![VmDiagnostic::type_mismatch(
+                    value_type.clone(),
+                    found_value,
+                    Some(self.origin("map")),
+                )]);
+            }
+        }
+        for _ in expressions {
+            builder.stack.pop();
+        }
+        builder.emit(
+            Instruction::MakeMap {
+                key_type: key_type.clone(),
+                value_type: value_type.clone(),
+                count: (expressions.len() / 2) as u32,
+            },
+            self.origin("map"),
+        );
+        Ok(Type::Map(Box::new(key_type), Box::new(value_type)))
     }
 
     fn compile_let(
@@ -2569,6 +2615,23 @@ mod tests {
         assert_eq!(
             run("(list-length (list \"a\" \"b\"))").unwrap(),
             vec![TypedValue::Int(2)]
+        );
+    }
+
+    #[test]
+    fn constructs_and_uses_immutable_typed_maps() {
+        assert_eq!(
+            run("(unwrap (map-get (map \"answer\" 42 \"other\" 7) \"answer\"))").unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+        assert_eq!(
+            run("(unwrap (map-get (map-set (map \"answer\" 42) \"answer\" 99) \"answer\"))")
+                .unwrap(),
+            vec![TypedValue::Int(99)]
+        );
+        assert_eq!(
+            run("(map-length (map \"a\" 1 \"a\" 2))").unwrap(),
+            vec![TypedValue::Int(1)]
         );
     }
 

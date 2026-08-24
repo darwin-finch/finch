@@ -14,11 +14,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Finish both source frontends and their shared typed IR semantics: definitions/signatures,
   conditionals, metered loops, locals, quotations, closures, collections, bounded macros, and
   structured error/result forms.
-- [ ] Generalize the managed JSON boundary into first-class typed records/maps only after both
-  frontends share construction, field/key lookup, pattern matching, serialization, and row-type
-  rules. `json-parse`/`json-get`/scalar option projections now provide safe object-field access;
-  do not expose the existing internal `TypedValue::Record` ABI representation as an ad-hoc source
-  language feature first.
+- [ ] Generalize the managed JSON boundary into first-class typed records/maps. Both frontends now
+  share immutable typed-map construction, key lookup/update, keys/length, serialization across the
+  public runtime boundary, and map-type unification; still add records, structured patterns,
+  map iteration, and row-polymorphic record rules. `json-parse`/`json-get`/scalar option
+  projections remain the safe boundary for arbitrary JSON objects; do not expose the existing
+  internal `TypedValue::Record` ABI representation as an ad-hoc source language feature first.
 - [ ] Extend the implemented typed option/result branches, type-directed Lisp `match`, and
   no-fallthrough integer Co-Forth `case` to richer structured patterns plus expression-valued
   named `break` after the loop verifier is generalized to check each target's declared result

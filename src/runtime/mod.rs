@@ -3363,6 +3363,12 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
         TypedValue::Bytes(value) => ProgramValue::Bytes(value),
         TypedValue::Json(value) => ProgramValue::Json(value),
         TypedValue::List { values, .. } => ProgramValue::List(typed_values(values)?),
+        TypedValue::Map { entries, .. } => ProgramValue::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| Ok((typed_value(key)?, typed_value(value)?)))
+                .collect::<Result<Vec<_>>>()?,
+        ),
         TypedValue::Option { value, .. } => ProgramValue::Option(
             value
                 .map(|value| typed_value(*value))
@@ -3674,6 +3680,28 @@ mod tests {
         assert_eq!(outcome.status, ExecutionStatus::Completed);
         assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
         assert_eq!(outcome.output, "hello from Lisp");
+    }
+
+    #[tokio::test]
+    async fn typed_maps_cross_the_public_program_runtime_boundary_structurally() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(map \"answer\" 42 \"other\" 7)",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(
+            outcome.values,
+            vec![ProgramValue::Map(vec![
+                (ProgramValue::String("answer".into()), ProgramValue::Int(42)),
+                (ProgramValue::String("other".into()), ProgramValue::Int(7)),
+            ])]
+        );
     }
 
     #[tokio::test]

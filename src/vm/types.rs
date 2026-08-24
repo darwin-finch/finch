@@ -162,6 +162,15 @@ pub enum TypedValue {
         element_type: Type,
         values: Vec<TypedValue>,
     },
+    /// An immutable, insertion-ordered typed map. Keys are compared by their
+    /// full typed value; source construction and `map-set` reject duplicate
+    /// keys by replacing the previous value rather than silently widening the
+    /// value type.
+    Map {
+        key_type: Type,
+        value_type: Type,
+        entries: Vec<(TypedValue, TypedValue)>,
+    },
     Option {
         inner_type: Type,
         value: Option<Box<TypedValue>>,
@@ -225,6 +234,11 @@ impl TypedValue {
             Self::Json(_) => Type::Json,
             Self::Path { selector, .. } => Type::Path(selector.clone()),
             Self::List { element_type, .. } => Type::list(element_type.clone()),
+            Self::Map {
+                key_type,
+                value_type,
+                ..
+            } => Type::Map(Box::new(key_type.clone()), Box::new(value_type.clone())),
             Self::Option { inner_type, .. } => Type::Option(Box::new(inner_type.clone())),
             Self::Result {
                 ok_type,

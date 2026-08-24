@@ -253,5 +253,15 @@ never becomes a capability, path, or executable form merely by being parsed.
 `(json-index value index)` returns `option<json>` for array data, while `(json-keys value)` returns
 `list<string>` for an object and an empty list for any other JSON value.
 
+Typed maps are immutable shared-language collections, separate from JSON. Construct one with
+alternating key/value forms: `(map "answer" 42 "other" 7)`. All keys must share one type and all
+values must share one type. `(map-get table key)` returns `option<V>`; `(map-set table key value)`
+returns a replacement map; `(map-keys table)` returns `list<K>`; and `(map-length table)` returns
+an integer. Later duplicate keys replace the earlier value:
+
+```lisp
+(unwrap (map-get (map-set (map "answer" 42) "answer" 99) "answer"))
+```
+
 `(process-run command (list arguments...))` runs an executable directly without shell parsing and
 is capability-bearing.

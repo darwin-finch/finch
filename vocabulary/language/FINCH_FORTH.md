@@ -250,6 +250,16 @@ Second line.""" say
 The delimiter `"""` itself cannot appear in a raw literal; split the text into ordinary typed
 string operations if it is needed.
 
+Typed maps are immutable shared-language collections. Co-Forth uses `map{` / `}map` around an
+even sequence of key/value expressions; the closing delimiter lowers the suffix directly to typed
+IR. `map-get` returns `option<V>`, `map-set` returns a replacement map, `map-keys` returns
+`list<K>`, and `map-length` returns an integer. Later duplicate keys replace earlier values:
+
+```forth
+map{ s" answer" 42 s" other" 7 }map
+s" answer" map-get unwrap
+```
+
 `say` is a stack-neutral response effect: it consumes its string and leaves no value on the
 stack. Consecutive `say` calls compose directly; do not add `drop` after one:
 

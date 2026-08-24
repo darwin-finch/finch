@@ -1289,6 +1289,12 @@ fn ensure_checkpointable(value: &TypedValue) -> Result<(), VmDiagnostic> {
                 ensure_checkpointable(value)?;
             }
         }
+        TypedValue::Map { entries, .. } => {
+            for (key, value) in entries {
+                ensure_checkpointable(key)?;
+                ensure_checkpointable(value)?;
+            }
+        }
         TypedValue::Option { value, .. } => {
             if let Some(value) = value {
                 ensure_checkpointable(value)?;

@@ -71,6 +71,15 @@ struct CaseFrame {
     origin: SourceOrigin,
 }
 
+/// A typed `map{ key value ... }map` literal records the pre-literal stack
+/// depth while ordinary Forth tokens compile its pair expressions.  The close
+/// delimiter lowers the resulting typed suffix to the shared `MakeMap` IR.
+#[derive(Debug, Clone)]
+struct MapLiteralFrame {
+    stack_start: usize,
+    origin: SourceOrigin,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchCondition {
     Option,
@@ -239,6 +248,7 @@ fn compile_forth_body_with_locals(
     let mut loops: Vec<LoopFrame> = Vec::new();
     let mut conditionals: Vec<IfFrame> = Vec::new();
     let mut cases: Vec<CaseFrame> = Vec::new();
+    let mut map_literals: Vec<MapLiteralFrame> = Vec::new();
     let mut control = Vec::new();
     let local_indexes = locals
         .iter()
@@ -388,6 +398,60 @@ fn compile_forth_body_with_locals(
                 continue;
             }
             match word.as_str() {
+                "map{" => {
+                    map_literals.push(MapLiteralFrame {
+                        stack_start: stack.len(),
+                        origin,
+                    });
+                    token_index += 1;
+                    continue;
+                }
+                "}map" => {
+                    let Some(frame) = map_literals.pop() else {
+                        return Err(vec![control_error(
+                            "E-MAP-002",
+                            "}map has no matching map{",
+                            origin,
+                        )]);
+                    };
+                    let values = &stack[frame.stack_start..];
+                    if values.is_empty() || values.len() % 2 != 0 {
+                        return Err(vec![control_error(
+                            "E-MAP-001",
+                            "map{ requires one or more key/value pairs",
+                            frame.origin,
+                        )]);
+                    }
+                    let key_type = values[0].clone();
+                    let value_type = values[1].clone();
+                    for pair in values.chunks_exact(2) {
+                        if !key_type.accepts(&pair[0]) || !value_type.accepts(&pair[1]) {
+                            return Err(vec![control_error(
+                                "E-MAP-003",
+                                "every map literal key and value must have one consistent type",
+                                origin,
+                            )]);
+                        }
+                    }
+                    let count = (values.len() / 2) as u32;
+                    stack.truncate(frame.stack_start);
+                    stack.push(Type::Map(
+                        Box::new(key_type.clone()),
+                        Box::new(value_type.clone()),
+                    ));
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::MakeMap {
+                            key_type,
+                            value_type,
+                            count,
+                        },
+                        origin,
+                    );
+                    token_index += 1;
+                    continue;
+                }
                 "case" => {
                     let selector = stack.last().cloned().ok_or_else(|| {
                         vec![control_error(
@@ -1410,6 +1474,13 @@ fn compile_forth_body_with_locals(
         return Err(vec![control_error(
             "E-FORTH-CASE-011",
             "unterminated case",
+            frame.origin.clone(),
+        )]);
+    }
+    if let Some(frame) = map_literals.last() {
+        return Err(vec![control_error(
+            "E-MAP-004",
+            "unterminated map{ literal",
             frame.origin.clone(),
         )]);
     }
@@ -2522,6 +2593,22 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Symbol("bash".into())]);
+    }
+
+    #[test]
+    fn constructs_and_uses_typed_map_literals() {
+        let module = compile_forth(
+            "input.forth",
+            "map{ s\" answer\" 42 s\" other\" 7 }map s\" answer\" map-get unwrap",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
     #[test]

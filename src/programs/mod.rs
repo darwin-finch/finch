@@ -497,6 +497,7 @@ pub enum ProgramValue {
     /// degrading it to an untyped string.
     Json(serde_json::Value),
     List(Vec<ProgramValue>),
+    Map(Vec<(ProgramValue, ProgramValue)>),
     Option(Option<Box<ProgramValue>>),
     Result {
         ok: bool,

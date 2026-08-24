@@ -209,6 +209,38 @@ impl<'a> Verifier<'a> {
                 stack.truncate(start);
                 stack.push(Type::list(element_type.clone()));
             }
+            Instruction::MakeMap {
+                key_type,
+                value_type,
+                count,
+            } => {
+                let value_count = (*count as usize).saturating_mul(2);
+                if stack.len() < value_count {
+                    return Err(underflow(origin, value_count, stack.len()));
+                }
+                let start = stack.len() - value_count;
+                for pair in stack[start..].chunks_exact(2) {
+                    if !key_type.accepts(&pair[0]) {
+                        return Err(VmDiagnostic::type_mismatch(
+                            key_type.clone(),
+                            pair[0].clone(),
+                            Some(origin.clone()),
+                        ));
+                    }
+                    if !value_type.accepts(&pair[1]) {
+                        return Err(VmDiagnostic::type_mismatch(
+                            value_type.clone(),
+                            pair[1].clone(),
+                            Some(origin.clone()),
+                        ));
+                    }
+                }
+                stack.truncate(start);
+                stack.push(Type::Map(
+                    Box::new(key_type.clone()),
+                    Box::new(value_type.clone()),
+                ));
+            }
             Instruction::Dup => {
                 let value = stack
                     .last()

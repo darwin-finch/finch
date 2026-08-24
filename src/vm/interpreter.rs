@@ -461,6 +461,38 @@ impl<'a> VmTrampoline<'a> {
                     });
                     Ok(None)
                 }
+                Instruction::MakeMap {
+                    key_type,
+                    value_type,
+                    count,
+                } => {
+                    let Some(start) = continuation
+                        .stack
+                        .len()
+                        .checked_sub((count as usize).saturating_mul(2))
+                    else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    let values = continuation.stack.drain(start..).collect::<Vec<_>>();
+                    let mut entries = Vec::new();
+                    for pair in values.chunks_exact(2) {
+                        let key = pair[0].clone();
+                        let value = pair[1].clone();
+                        if let Some((_, existing)) =
+                            entries.iter_mut().find(|(candidate, _)| *candidate == key)
+                        {
+                            *existing = value;
+                        } else {
+                            entries.push((key, value));
+                        }
+                    }
+                    continuation.stack.push(TypedValue::Map {
+                        key_type,
+                        value_type,
+                        entries,
+                    });
+                    Ok(None)
+                }
                 Instruction::Dup => {
                     let Some(value) = continuation.stack.last().cloned() else {
                         return VmStep::Failed(self.underflow(&located.origin, &continuation));
@@ -1727,6 +1759,89 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                     )
                 })?;
             stack.push(value);
+        }
+        "map-get" => {
+            let key = pop(stack)?;
+            let map = pop(stack)?;
+            let TypedValue::Map {
+                key_type,
+                value_type,
+                entries,
+            } = map
+            else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-024",
+                    DiagnosticPhase::Interpretation,
+                    "map-get requires a typed map and key",
+                    Some(origin),
+                ));
+            };
+            let value = entries
+                .into_iter()
+                .find_map(|(candidate, value)| (candidate == key).then_some(value));
+            stack.push(TypedValue::Option {
+                inner_type: value_type,
+                value: value.map(Box::new),
+            });
+            let _ = key_type;
+        }
+        "map-set" => {
+            let value = pop(stack)?;
+            let key = pop(stack)?;
+            let map = pop(stack)?;
+            let TypedValue::Map {
+                key_type,
+                value_type,
+                mut entries,
+            } = map
+            else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-025",
+                    DiagnosticPhase::Interpretation,
+                    "map-set requires a typed map, key, and value",
+                    Some(origin),
+                ));
+            };
+            if let Some((_, existing)) = entries.iter_mut().find(|(candidate, _)| *candidate == key) {
+                *existing = value;
+            } else {
+                entries.push((key, value));
+            }
+            stack.push(TypedValue::Map {
+                key_type,
+                value_type,
+                entries,
+            });
+        }
+        "map-keys" => {
+            let map = pop(stack)?;
+            let TypedValue::Map {
+                key_type, entries, ..
+            } = map
+            else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-026",
+                    DiagnosticPhase::Interpretation,
+                    "map-keys requires a typed map",
+                    Some(origin),
+                ));
+            };
+            stack.push(TypedValue::List {
+                element_type: key_type,
+                values: entries.into_iter().map(|(key, _)| key).collect(),
+            });
+        }
+        "map-length" => {
+            let map = pop(stack)?;
+            let TypedValue::Map { entries, .. } = map else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-027",
+                    DiagnosticPhase::Interpretation,
+                    "map-length requires a typed map",
+                    Some(origin),
+                ));
+            };
+            stack.push(TypedValue::Int(entries.len() as i64));
         }
         _ => {
             return Err(VmDiagnostic::error(
