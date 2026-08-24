@@ -277,6 +277,11 @@ pub struct VmRevisionSnapshot {
 
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
 pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 1;
+/// Hard per-runtime bound for private transactional continuations. Existing
+/// approvals/yields are never silently evicted: once full, the newly
+/// suspending run is cancelled with a structured outcome so the application
+/// can journal and present that terminal state.
+pub const MAX_PENDING_TYPED_EXECUTIONS: usize = 256;
 
 /// Application-owned persistence hook for host authority. The callback is
 /// supplied a complete immutable snapshot and must not call back into the
@@ -1378,6 +1383,54 @@ impl ProgramRuntime {
         }))
     }
 
+    /// Number of private continuations retained by this runtime. This is
+    /// exposed for application diagnostics and long-running lifecycle tests;
+    /// source programs cannot use it to enumerate another run's frames.
+    pub fn pending_typed_execution_count(&self) -> Result<usize> {
+        Ok(self
+            .pending_typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?
+            .len())
+    }
+
+    /// Retain a newly suspended run without evicting an existing approval or
+    /// yield. If the hard bound is already occupied, cancel this new private
+    /// snapshot and return its auditable terminal outcome.
+    fn retain_pending_typed_execution(
+        &self,
+        execution_id: uuid::Uuid,
+        pending: PendingTypedExecution,
+    ) -> Result<Option<ExecutionOutcome>> {
+        let mut retained = self
+            .pending_typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?;
+        if retained.contains_key(&execution_id) {
+            drop(retained);
+            return self
+                .cancel_pending_typed_execution(
+                    execution_id,
+                    pending,
+                    Some("execution id is already retained".into()),
+                )
+                .map(Some);
+        }
+        if retained.len() < MAX_PENDING_TYPED_EXECUTIONS {
+            retained.insert(execution_id, pending);
+            return Ok(None);
+        }
+        drop(retained);
+        self.cancel_pending_typed_execution(
+            execution_id,
+            pending,
+            Some(format!(
+                "pending execution capacity {MAX_PENDING_TYPED_EXECUTIONS} is exhausted"
+            )),
+        )
+        .map(Some)
+    }
+
     /// Cancel a suspended VM execution and return its durable audit outcome.
     /// This discards only uncommitted VM-local state; it never attempts to undo
     /// an acknowledged external-effect prefix.
@@ -1998,29 +2051,28 @@ impl ProgramRuntime {
 
         let suspension = execution.suspension.clone();
         if let Some(suspension) = suspension.clone() {
-            self.pending_typed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?
-                .insert(
-                    execution_id,
-                    PendingTypedExecution {
-                        working_runtime: working_runtime.clone(),
-                        suspension,
-                        context: pending.context.clone(),
-                        input_revision: pending.input_revision,
-                        language: pending.language,
-                        source: pending.source.clone(),
-                        intent: pending.intent.clone(),
-                        effect: pending.effect,
-                        caller: pending.caller.clone(),
-                        output: output.clone(),
-                        output_chunks: output_chunks.clone(),
-                        side_effects: side_effects.clone(),
-                        effect_sink: pending.effect_sink.clone(),
-                        deferred_host_effects: pending.deferred_host_effects,
-                        grant_ceiling: pending.grant_ceiling.clone(),
-                    },
-                );
+            if let Some(cancelled) = self.retain_pending_typed_execution(
+                execution_id,
+                PendingTypedExecution {
+                    working_runtime: working_runtime.clone(),
+                    suspension,
+                    context: pending.context.clone(),
+                    input_revision: pending.input_revision,
+                    language: pending.language,
+                    source: pending.source.clone(),
+                    intent: pending.intent.clone(),
+                    effect: pending.effect,
+                    caller: pending.caller.clone(),
+                    output: output.clone(),
+                    output_chunks: output_chunks.clone(),
+                    side_effects: side_effects.clone(),
+                    effect_sink: pending.effect_sink.clone(),
+                    deferred_host_effects: pending.deferred_host_effects,
+                    grant_ceiling: pending.grant_ceiling.clone(),
+                },
+            )? {
+                return Ok(cancelled);
+            }
         }
         if suspension.is_none() {
             self.release_output_handles(execution_id)?;
@@ -2543,29 +2595,28 @@ impl ProgramRuntime {
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let suspension = execution.suspension.clone();
         if let Some(suspension) = suspension.clone() {
-            self.pending_typed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?
-                .insert(
-                    context.execution_id,
-                    PendingTypedExecution {
-                        working_runtime: working_runtime.clone(),
-                        suspension,
-                        context: context.clone(),
-                        input_revision,
-                        language: submission.language,
-                        source: submission.source.clone(),
-                        intent: submission.intent.clone(),
-                        effect: submission.effect,
-                        caller: caller.clone(),
-                        output: execution.output.clone(),
-                        output_chunks: execution.output_chunks.clone(),
-                        side_effects: execution.side_effects.clone(),
-                        effect_sink,
-                        deferred_host_effects,
-                        grant_ceiling: grant_ceiling.clone(),
-                    },
-                );
+            if let Some(cancelled) = self.retain_pending_typed_execution(
+                context.execution_id,
+                PendingTypedExecution {
+                    working_runtime: working_runtime.clone(),
+                    suspension,
+                    context: context.clone(),
+                    input_revision,
+                    language: submission.language,
+                    source: submission.source.clone(),
+                    intent: submission.intent.clone(),
+                    effect: submission.effect,
+                    caller: caller.clone(),
+                    output: execution.output.clone(),
+                    output_chunks: execution.output_chunks.clone(),
+                    side_effects: execution.side_effects.clone(),
+                    effect_sink,
+                    deferred_host_effects,
+                    grant_ceiling: grant_ceiling.clone(),
+                },
+            )? {
+                return Ok(cancelled);
+            }
         }
         if suspension.is_none() {
             self.release_output_handles(context.execution_id)?;
@@ -7273,6 +7324,58 @@ mod tests {
             .await
             .is_err());
         assert_eq!(runtime.revision(), yielded.input_revision);
+    }
+
+    #[tokio::test]
+    async fn pending_execution_capacity_cancels_the_new_run_without_eviction() {
+        let runtime = ProgramRuntime::new();
+        let mut retained_ids = Vec::with_capacity(MAX_PENDING_TYPED_EXECUTIONS);
+        for _ in 0..MAX_PENDING_TYPED_EXECUTIONS {
+            let yielded = runtime
+                .submit(submission(
+                    ProgramLanguage::Lisp,
+                    "(yield)",
+                    ExecutionEffect::Pure,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(yielded.status, ExecutionStatus::Suspended);
+            retained_ids.push(yielded.execution_id);
+        }
+        assert_eq!(
+            runtime.pending_typed_execution_count().unwrap(),
+            MAX_PENDING_TYPED_EXECUTIONS
+        );
+
+        let rejected = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(yield)",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status, ExecutionStatus::Cancelled);
+        assert!(rejected.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("pending execution capacity 256 is exhausted")
+        }));
+        assert_eq!(
+            runtime.pending_typed_execution_count().unwrap(),
+            MAX_PENDING_TYPED_EXECUTIONS
+        );
+        assert!(runtime
+            .pending_typed_execution(retained_ids[0])
+            .unwrap()
+            .is_some());
+        assert!(runtime
+            .pending_typed_execution(rejected.execution_id)
+            .unwrap()
+            .is_none());
+
+        for execution_id in retained_ids {
+            assert!(runtime.cancel_typed_execution(execution_id).unwrap());
+        }
+        assert_eq!(runtime.pending_typed_execution_count().unwrap(), 0);
     }
 
     #[tokio::test]
