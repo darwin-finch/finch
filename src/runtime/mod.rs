@@ -786,6 +786,7 @@ impl ProgramRuntime {
                 "CPU worker cancellation was not acknowledged: {error}"
             ));
         }
+        let inferred_capabilities = pending.suspension.effects.0.iter().cloned().collect();
         Ok(ExecutionOutcome {
             execution_id,
             status: ExecutionStatus::Cancelled,
@@ -797,6 +798,7 @@ impl ProgramRuntime {
             effect_journal,
             diagnostics,
             vm_diagnostics: Vec::new(),
+            inferred_capabilities,
             required_capabilities: Vec::new(),
             approval_prompts: Vec::new(),
             input_revision: pending.input_revision,
@@ -910,6 +912,7 @@ impl ProgramRuntime {
         if let Some(entry) = effect_journal.last_mut() {
             entry.state = crate::vm::EffectJournalState::Denied;
         }
+        let inferred_capabilities = pending.suspension.effects.0.iter().cloned().collect();
         Ok(ExecutionOutcome {
             execution_id,
             status: ExecutionStatus::Failed,
@@ -921,6 +924,7 @@ impl ProgramRuntime {
             effect_journal,
             diagnostics: vec![format!("typed VM host effect denied: {reason}")],
             vm_diagnostics: Vec::new(),
+            inferred_capabilities,
             required_capabilities: Vec::new(),
             approval_prompts: Vec::new(),
             input_revision: pending.input_revision,
@@ -1168,6 +1172,7 @@ impl ProgramRuntime {
         // prior projection here or a resumed run would duplicate events.
         let vm_side_effects = execution.vm_side_effects.clone();
         let effect_journal = execution.effect_journal.clone();
+        let inferred_capabilities = execution.effects.0.iter().cloned().collect::<Vec<_>>();
 
         let suspension = execution.suspension.clone();
         if let Some(suspension) = suspension.clone() {
@@ -1224,6 +1229,7 @@ impl ProgramRuntime {
                             effect_journal,
                             diagnostics: vec![error.to_string()],
                             vm_diagnostics: Vec::new(),
+                            inferred_capabilities: inferred_capabilities.clone(),
                             required_capabilities: Vec::new(),
                             approval_prompts: Vec::new(),
                             input_revision: pending.input_revision,
@@ -1245,6 +1251,7 @@ impl ProgramRuntime {
                     effect_journal,
                     diagnostics: Vec::new(),
                     vm_diagnostics: Vec::new(),
+                    inferred_capabilities: inferred_capabilities.clone(),
                     required_capabilities: Vec::new(),
                     approval_prompts: Vec::new(),
                     input_revision: pending.input_revision,
@@ -1265,6 +1272,7 @@ impl ProgramRuntime {
                 effect_journal,
                 diagnostics: Vec::new(),
                 vm_diagnostics: execution.diagnostics,
+                inferred_capabilities: inferred_capabilities.clone(),
                 required_capabilities: Vec::new(),
                 approval_prompts: Vec::new(),
                 input_revision: pending.input_revision,
@@ -1291,6 +1299,7 @@ impl ProgramRuntime {
                     &pending.intent,
                     suspension.as_ref(),
                 ),
+                inferred_capabilities: inferred_capabilities.clone(),
                 required_capabilities: requirements,
                 input_revision: pending.input_revision,
                 output_revision: pending.input_revision,
@@ -1313,6 +1322,7 @@ impl ProgramRuntime {
                     .map(ToString::to_string)
                     .collect(),
                 vm_diagnostics: execution.diagnostics,
+                inferred_capabilities,
                 required_capabilities: Vec::new(),
                 approval_prompts: Vec::new(),
                 input_revision: pending.input_revision,
@@ -1695,6 +1705,7 @@ impl ProgramRuntime {
         } else {
             None
         };
+        let inferred_capabilities = execution.effects.0.iter().cloned().collect::<Vec<_>>();
         Ok(match execution.status {
             TypedExecutionStatus::Completed => {
                 let output_revision = match completion_commit.expect("completed run has commit") {
@@ -1711,6 +1722,7 @@ impl ProgramRuntime {
                             effect_journal: execution.effect_journal,
                             diagnostics: vec![error.to_string()],
                             vm_diagnostics: Vec::new(),
+                            inferred_capabilities: inferred_capabilities.clone(),
                             required_capabilities: Vec::new(),
                             approval_prompts: Vec::new(),
                             input_revision,
@@ -1732,6 +1744,7 @@ impl ProgramRuntime {
                     effect_journal: execution.effect_journal,
                     diagnostics: Vec::new(),
                     vm_diagnostics: Vec::new(),
+                    inferred_capabilities: inferred_capabilities.clone(),
                     required_capabilities: Vec::new(),
                     approval_prompts: Vec::new(),
                     input_revision,
@@ -1752,6 +1765,7 @@ impl ProgramRuntime {
                 effect_journal: execution.effect_journal,
                 diagnostics: Vec::new(),
                 vm_diagnostics: execution.diagnostics,
+                inferred_capabilities: inferred_capabilities.clone(),
                 required_capabilities: Vec::new(),
                 approval_prompts: Vec::new(),
                 input_revision,
@@ -1778,6 +1792,7 @@ impl ProgramRuntime {
                     &submission.intent,
                     suspension.as_ref(),
                 ),
+                inferred_capabilities: inferred_capabilities.clone(),
                 required_capabilities: requirements,
                 input_revision,
                 output_revision: input_revision,
@@ -1800,6 +1815,7 @@ impl ProgramRuntime {
                     .map(ToString::to_string)
                     .collect(),
                 vm_diagnostics: execution.diagnostics,
+                inferred_capabilities,
                 required_capabilities: Vec::new(),
                 approval_prompts: Vec::new(),
                 input_revision,
@@ -3558,6 +3574,13 @@ fn failed_pending_resume(
         effect_journal: pending.suspension.effect_journal.clone(),
         diagnostics: vec![diagnostic],
         vm_diagnostics: Vec::new(),
+        inferred_capabilities: pending
+            .suspension
+            .effects
+            .0
+            .iter()
+            .cloned()
+            .collect(),
         required_capabilities: Vec::new(),
         approval_prompts: Vec::new(),
         input_revision: pending.input_revision,
@@ -3892,6 +3915,36 @@ mod tests {
             .required_capabilities
             .iter()
             .any(|requirement| requirement.capability == crate::vm::CapabilityKind::FileWrite));
+        assert!(outcome
+            .inferred_capabilities
+            .iter()
+            .any(|requirement| requirement.capability == crate::vm::CapabilityKind::FileWrite));
+        assert!(matches!(
+            outcome.inferred_capabilities[0].selector,
+            crate::vm::ResourceSelector::FileTemplate { .. }
+        ));
+        assert!(matches!(
+            outcome.required_capabilities[0].selector,
+            crate::vm::ResourceSelector::File { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_outcome_retains_effects_from_an_untaken_branch() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "false if s\" missing.txt\" path file-read else s\" local\" bytes then",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert!(outcome.required_capabilities.is_empty());
+        assert!(outcome.inferred_capabilities.iter().any(|requirement| {
+            requirement.capability == crate::vm::CapabilityKind::FileRead
+        }));
     }
 
     #[tokio::test]

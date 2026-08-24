@@ -53,6 +53,12 @@ pub struct ExecutionOutcome {
     pub diagnostics: Vec<String>,
     #[serde(default)]
     pub vm_diagnostics: Vec<VmDiagnostic>,
+    /// Complete statically inferred capability envelope for the submitted
+    /// program, including effects on branches not taken at runtime.
+    #[serde(default)]
+    pub inferred_capabilities: Vec<CapabilityRequirement>,
+    /// The subset of inferred capabilities currently missing from the run's
+    /// grants. This is empty for an authorized completed execution.
     #[serde(default)]
     pub required_capabilities: Vec<CapabilityRequirement>,
     #[serde(default)]
@@ -84,6 +90,7 @@ impl ExecutionOutcome {
             effect_journal: Vec::new(),
             diagnostics: vec![diagnostic.into()],
             vm_diagnostics: Vec::new(),
+            inferred_capabilities: Vec::new(),
             required_capabilities: Vec::new(),
             approval_prompts: Vec::new(),
             input_revision: revision,

@@ -116,7 +116,10 @@ is empty. `session.emit` is granted by the active response session; memory, sche
 tools, files, processes, network, and automation require their own availability and grants.
 
 Static requirements are inferred and exposed before execution for declaration checks and permission
-preview. A missing grant pauses only when execution reaches the concrete capability boundary, so
+preview. Every structured execution outcome retains this complete set as `inferred_capabilities`;
+`required_capabilities` is only the currently missing, concretely instantiated subset (for example,
+a static path-argument template versus the actual requested path). A missing grant pauses only when
+execution reaches the concrete capability boundary, so
 earlier pure work and streamed `say` output are not discarded because an unreachable branch has an
 effect. Dynamic resources are checked again at that boundary. Grants may be once, task, session,
 project, or global and may be revoked. Child agents receive only an explicitly attenuated subset.

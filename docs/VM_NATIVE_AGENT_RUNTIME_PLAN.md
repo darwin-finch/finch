@@ -61,7 +61,7 @@ values: [ProgramValue]
 stdout/stderr/events
 diagnostics with source locations
 input_revision and output_revision
-derived_effects and effect outcomes
+inferred_capabilities, currently required capabilities, and effect outcomes
 spawned task handles
 resource usage
 ```

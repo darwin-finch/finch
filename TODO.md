@@ -108,7 +108,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   revocation, audit, approval dialogs, runtime guards, and typed suspend/resume. The base
   serializable `VmResume { execution_id, sequence, response }` path now validates the host's
   result row, records result/denial/cancellation against the exact journaled effect, and never
-  redispatches it. The portable-host submission policy can now suspend every approved awaited
+  redispatches it. Every outcome now retains the complete statically inferred capability envelope,
+  separately from its currently missing `required_capabilities`, so completed and untaken branches
+  remain previewable/auditable. The portable-host submission policy can now suspend every approved awaited
   capability (not just editor proposals) for an external implementation; typed scheduled callbacks
   now persist a versioned creation-time grant ceiling and cannot acquire approvals granted later.
   Durable approvals, revocation policy, and complete host adapters remain.
