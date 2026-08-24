@@ -43,10 +43,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Put an explicit span-preserving AST boundary between both source readers and typed stack IR.
   Formalize Lisp's existing `Val`/`SpannedVal` tree as its frontend AST. Co-Forth now tokenizes a
   module once into a span-preserving `ForthModuleAst` containing definitions and retained body
-  atoms; definition and anonymous-quotation bodies lower from those retained nodes without source
+  nodes; definition and anonymous-quotation bodies lower from those nodes without source
   copying, masking, or re-tokenization, and nested diagnostics retain original module coordinates.
-  Anonymous quotations and their signatures/bodies are now recursive parser-owned AST nodes, so
-  lowering does not rediscover their delimiters. Finish replacing the remaining flat body atoms
+  Anonymous quotations and their signatures/bodies are now recursive nodes directly in each body
+  sequence—there is no byte-offset quotation side table, and lowering does not rediscover or skip
+  their delimiters. Finish replacing the remaining atom nodes
   with structured Co-Forth AST nodes for definitions' signatures, control flow, literals, and
   calls. Then perform one post-order semantic lowering into
   the shared IR; lower syntactic sugar and bounded macro rewrites over AST nodes without serializing
