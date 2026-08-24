@@ -277,6 +277,12 @@ enum LibraryCommand {
         #[arg(long)]
         verbose: bool,
     },
+    /// Compile stored Co-Forth through the typed frontend without executing it
+    AuditTyped {
+        /// Show each accepted, missing, and rejected source
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Generate Forth for words that are missing snippets or have broken ones
     Heal {
         /// Words per API batch
@@ -2825,6 +2831,51 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
 
             if !broken.is_empty() || missing > 0 {
                 std::process::exit(1);
+            }
+        }
+
+        LibraryCommand::AuditTyped { verbose } => {
+            let lib = Library::load();
+            let entries = lib.all_entries();
+            let sources: Vec<(String, Option<&str>)> = entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let sense = entry.sense.as_deref().unwrap_or("default");
+                    (
+                        format!("library:{}:{sense}:{index}", entry.word),
+                        entry.forth.as_deref(),
+                    )
+                })
+                .collect();
+            let audit = finch::vm::migration::audit_forth_sources(
+                sources
+                    .iter()
+                    .map(|(source_id, source)| (source_id.as_str(), *source)),
+                &finch::vm::core_vocabulary(),
+            );
+
+            println!("Typed Co-Forth migration audit");
+            println!("  report only: nothing executed or persisted");
+            println!("  total:       {}", audit.total);
+            println!("  accepted:    {}", audit.accepted);
+            println!("  missing:     {}", audit.missing);
+            println!("  rejected:    {}", audit.rejected.len());
+
+            if !audit.rejection_codes.is_empty() {
+                println!();
+                println!("Rejections by diagnostic code:");
+                for (code, count) in &audit.rejection_codes {
+                    println!("  {code}: {count}");
+                }
+            }
+
+            if verbose {
+                println!();
+                println!("Rejected sources:");
+                for rejection in &audit.rejected {
+                    println!("  {}: {}", rejection.source_id, rejection.diagnostic);
+                }
             }
         }
 

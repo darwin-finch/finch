@@ -8,6 +8,7 @@ pub mod effects;
 pub mod frontend;
 pub mod interpreter;
 pub mod ir;
+pub mod migration;
 pub mod runtime;
 pub mod signature;
 pub mod types;

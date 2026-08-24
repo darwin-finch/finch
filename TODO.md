@@ -274,7 +274,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   for deliberately binding `/` as whole-machine scope.
 - [ ] Phase 0: route existing provider streaming through the portable VM side-effect journal and
   per-ProgramRun output-handle bindings; test replay/reconnect and concurrent WorkUnit projection,
-  then replay the existing Co-Forth corpus in report-only verifier mode before requiring typed output.
+  then publish the incompatibilities found by the non-executing `finch library audit-typed`
+  report before requiring typed output. The audit command and diagnostic-code grouping are now in
+  place, and the first machine-local library baseline is recorded in
+  `docs/TYPED_VM_MIGRATION_AUDIT.md`; still run it against representative project/session corpora
+  and retain those reports as migration evidence.
 - [ ] Later: define a signed, content-addressed vocabulary package protocol for pushing reviewed
   `published` definitions between Finches; verify source/IR, dependencies, certificates, provenance,
   and local capability policy before installation.
