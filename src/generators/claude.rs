@@ -73,8 +73,6 @@ Co-Forth VM: /push <text>  /pop  /run  /program  /stack  /stack clear
   /describe <word>  /define <word> [def]  /vm  /forth <expr>  /undefine [word]
   /chain W1 W2  /forget W1  /dup W1  /swap W1 W2  /share  /box-diff
 
-Registry/Gas: /self-peer  /registry <addr>  /join-registry <addr>
-  /balance  /settle <addr>  /gas-send <addr> <ms>
 
 Channels: /join #channel  /part #channel  /say #channel <msg>
 

@@ -2707,34 +2707,6 @@ Rules:\n\
                     Command::Reject(reason) => {
                         self.handle_reject(reason).await?;
                     }
-                    // Registry / gas ledger — translate to Forth eval
-                    Command::SelfPeer => {
-                        self.handle_legacy_forth_eval_inner("self-peer".to_string(), true)
-                            .await?;
-                    }
-                    Command::Balance => {
-                        self.handle_legacy_forth_eval_inner("balance".to_string(), true)
-                            .await?;
-                    }
-                    Command::Settle(addr) => {
-                        self.handle_legacy_forth_eval_inner(format!("settle\" {addr}\""), true)
-                            .await?;
-                    }
-                    Command::RegistrySet(addr) => {
-                        self.handle_legacy_forth_eval_inner(format!("registry\" {addr}\""), true)
-                            .await?;
-                    }
-                    Command::JoinRegistry(addr) => {
-                        self.handle_legacy_forth_eval_inner(format!("join\" {addr}\""), true)
-                            .await?;
-                    }
-                    Command::GasSend(addr, ms) => {
-                        self.handle_legacy_forth_eval_inner(
-                            format!("gas-send\" {addr}\" {ms}"),
-                            true,
-                        )
-                        .await?;
-                    }
                     _ => {
                         // All other commands output to scrollback via write_info
                         self.output_manager.write_info(format!(
