@@ -310,6 +310,23 @@ Definitions may declare signatures, but the compiler derives and validates them.
 signatures are stored in the vocabulary manifest. Unresolved calls, stack-dependent parsing, or
 unsafe reflection prevent proof and require an explicit dynamic/unsafe boundary.
 
+### No privileged collection or iteration overloads
+
+Surface convenience must never create a standard-library-only fast path. A future `for` form is a
+macro/template over a public structural range contract, conceptually `empty?`, `front`, and
+`pop-front` (or the equivalent `next` contract). A user-defined range supplies the same visible,
+typed words and is resolved to the same concrete word IDs as a built-in range. The optimizer may
+inline, specialize, fuse, or eliminate allocations after that resolution, but it may not recognize
+only `list`, `map`, or a compiler-owned iterator type while treating an equivalent user definition
+as dynamic dispatch. This makes a custom `foreach`, traversal, or adapter eligible for the same
+performance as syntax supplied by Finch.
+
+The exception is the deliberately small execution substrate: verified branch/suspend instructions,
+managed allocation, and authorized host calls. Those are represented by public typed words and
+their contracts in the registry; user source cannot manufacture arbitrary IR or host authority.
+Everything above that substrate—including collection algorithms and range iteration—remains
+ordinary vocabulary that can be inspected, replaced, composed, and optimized.
+
 ### Effects are capability requirements
 
 A type describes values. An effect describes an observable action or authority requirement.

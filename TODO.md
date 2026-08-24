@@ -64,7 +64,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   vocabulary, diagnostics, capability inference, and closure serialization are stable. Concepts
   must be structural requirements over explicitly imported, visible typed words—not nominal
   Rust-style trait implementations—and resolution must select one coherent candidate or diagnose
-  ambiguity rather than escape through `dynamic`.
+  ambiguity rather than escape through `dynamic`. No surface construct may receive privileged
+  overload resolution or optimization unavailable to a normal typed definition: `for`, range
+  adapters, and collection traversal must desugar through public structural contracts and resolved
+  word IDs, so a user-defined traversal can be specialized/inlined exactly like a built-in one.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
 - [x] Finish Lisp source maps: the reader retains structural spans and typed lowering preserves
