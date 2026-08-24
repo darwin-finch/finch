@@ -240,8 +240,10 @@ For UTF-8 line-oriented files, `file-lines-open` returns a host-issued `stream<s
 `stream-close` releases it early. The stream is owned by its ProgramRun and cannot be forged or
 reused by another run. `file-lines-next` / `file-lines-close` remain compatibility aliases.
 CSV-record streams are distinct because
-quoted fields may span physical lines; workbook cursors remain future resources. Do not fake
-spreadsheet streaming by loading a whole workbook into a string.
+quoted fields may span physical lines. `path workbook-open` opens the first XLSX/XLS/ODS sheet and
+`path sheet workbook-sheet-open` opens a named sheet as `stream<list<string>>`; use ordinary
+`stream-next` and `stream-close`. The host currently caps a decoded sheet at 10 million cells while
+passing only one row into the VM at a time; it is not yet a true streaming ZIP/XML decoder.
 
 ```forth
 : first-line ( S -- S option<string> ! infer )
@@ -276,6 +278,12 @@ When the model needs column shape and basic statistics rather than individual ro
 records, and returns managed `json` containing `headers`, `sampled_rows`, `truncated`, and per-column
 `empty`, `non_empty`, `numeric`, `min`, `max`, and `mean` fields. It reads one additional record only
 to determine `truncated` and rejects rows wider than the header.
+
+Use `path workbook-sheets` to discover sheet names. For bounded cell inspection, use
+`path sheet start-row start-column row-count column-count workbook-range`; offsets are zero-based
+and the result may contain at most 10,000 cells. For aggregate inspection, use
+`path sheet max-rows workbook-summary`; the first row supplies headers and the result is managed
+`json` with the same per-column facts as `csv-summary` plus the selected sheet name.
 
 ```forth
 s" data.csv" path csv-open

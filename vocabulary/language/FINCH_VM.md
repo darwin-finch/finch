@@ -349,9 +349,15 @@ compatibility aliases.
 `option<list<string>>` CSV records and `stream-close` releases it. It parses quoted,
 comma-containing, and multiline fields rather than treating physical lines as records; malformed
 quote boundaries fail with a host diagnostic. Both stream kinds use the same opaque-handle pattern;
-workbook resources must follow it too and must not smuggle an ambient filesystem path back into VM
-values.
+`workbook-open(path)` and `workbook-sheet-open(path, sheet)` use it for XLSX/XLS/ODS rows too and
+must not smuggle an ambient filesystem path back into VM values. The current workbook adapter caps
+the decoded host sheet at 10 million cells; only one row crosses through `stream-next`, but this is
+not yet a true streaming ZIP/XML decoder.
 `csv-summary(path, max_rows)` is the bounded aggregate path for model inspection. It consumes no
 stream handle and returns managed `json` describing the header and per-column empty/non-empty and
 numeric min/max/mean statistics for at most 100,000 data records. The concrete path still determines
 the `file.read` request; the row bound is work policy, not authority.
+`workbook-range(path, sheet, start_row, start_column, row_count, column_count)` returns at most
+10,000 selected cells as `list<list<string>>`, using zero-based offsets. `workbook-summary(path,
+sheet, max_rows)` treats the first row as headers and returns the same bounded column facts plus the
+sheet name. Use `workbook-sheets(path)` to discover valid names without reading cell contents.

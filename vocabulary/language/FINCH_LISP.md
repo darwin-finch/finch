@@ -294,8 +294,10 @@ returns `option<string>` one bounded line at a time (1 MiB maximum line); `(stre
 releases it early. The stream is owned by its ProgramRun and cannot be forged or reused by another
 run. `file-lines-next` / `file-lines-close` remain compatibility aliases. CSV record streams are
 distinct because quoted fields
-may span physical lines; workbook cursors remain future resources. An Excel document must not be
-treated as a single text string.
+may span physical lines. `(workbook-open path)` opens the first XLSX/XLS/ODS sheet and
+`(workbook-sheet-open path sheet)` opens a named sheet as `stream<list<string>>`; use ordinary
+`stream-next` and `stream-close`. The host currently caps a decoded sheet at 10 million cells while
+passing only one row into the VM at a time; it is not yet a true streaming ZIP/XML decoder.
 
 ```lisp
 (let ((stream (file-lines-open (path "data.csv"))))
@@ -326,6 +328,11 @@ For bounded schema discovery and column statistics, prefer `(csv-summary path ma
 materializing records. It treats the first record as headers, scans at most 100,000 data records,
 and returns managed `json` containing `headers`, `sampled_rows`, `truncated`, and per-column `empty`,
 `non_empty`, `numeric`, `min`, `max`, and `mean` fields. A row wider than its header is rejected.
+
+Use `(workbook-sheets path)` to discover sheet names. `(workbook-range path sheet start-row
+start-column row-count column-count)` returns a zero-based rectangular slice of at most 10,000
+cells as `list<list<string>>`. `(workbook-summary path sheet max-rows)` treats the first sheet row
+as headers and returns the same bounded per-column facts as `csv-summary` plus the sheet name.
 
 ```lisp
 (let ((cursor (csv-open (path "data.csv"))))
