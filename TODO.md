@@ -379,14 +379,18 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   Fetch/cache and verify packages before compilation; prevent dependency confusion, reject
   undeclared mutable resolution, do not run ambient install scripts, and do not grant runtime
   capabilities merely because a module was imported.
-- [ ] Adapt discovered MCP client tools into versioned namespaced typed VM bindings with schema
+- [x] Adapt discovered MCP client tools into versioned namespaced typed VM bindings with schema
   validation, managed JSON fallback, parameter-bounded `mcp.call` capability grants, and normal
   suspension/resume; keep MCP transport lifecycle host-owned rather than a VM subagent protocol.
-  The generic Lisp/Co-Forth `mcp-call` boundary now consumes `(server, tool, json)`, derives and
-  rechecks an exact server/tool selector, dispatches through the application-owned MCP client, and
-  returns managed `json`; a deterministic stdio fixture covers the real transport path. Still
-  generate versioned namespaced words from supported schemas, validate their results, bound and
-  provenance-tag third-party discovery metadata, and expose the same binding in named-Brain hosts.
+  The generic Lisp/Co-Forth `mcp-call` boundary and generated `mcp.<server>.<tool>` words derive and
+  recheck exact server/tool selectors, dispatch through the application-owned MCP client, and
+  return managed raw MCP JSON. Supported input schemas become typed records; unsupported valid
+  schemas fall back conservatively to `json`; admitted output schemas validate
+  `structuredContent`. Schema hashes version each binding, unsafe or excessive names/schema shapes
+  are rejected, and third-party descriptions remain explicitly bounded untrusted metadata.
+  Startup, `/mcp refresh`, `/mcp reload`, and daemon-owned named-Brain runtimes all install the same
+  discovered vocabulary without manufacturing grants. A deterministic stdio fixture covers generic
+  Lisp, typed namespaced Lisp, typed namespaced Co-Forth, raw results, and concrete authority.
 - [ ] Finish the persistent `ProgramRuntime` state model. Lisp and Co-Forth already share one
   persistent typed stack and dictionary, exposed by one inspection/revision boundary. Successful
   revisions now retain a serializable, reverified stack-and-definition checkpoint whenever they
