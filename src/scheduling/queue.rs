@@ -13,6 +13,7 @@ pub enum TaskStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
 }
 
 /// A scheduled task
@@ -115,6 +116,47 @@ impl TaskQueue {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub async fn get_task(&self, task_id: i64) -> Result<Option<ScheduledTask>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, scheduled_time, task, context, recurring, status, created_at, last_run, retries
+             FROM scheduled_tasks WHERE id = ?1",
+        )?;
+        let task = statement
+            .query_row(params![task_id], scheduled_task_from_row)
+            .optional()?;
+        Ok(task)
+    }
+
+    /// Cancel a pending scheduled task without deleting its audit record.
+    /// Returns false for an unknown or already-started/completed task.
+    pub async fn cancel(&self, task_id: i64) -> Result<bool> {
+        let changed = self.connection()?.execute(
+            "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2 AND status = ?3",
+            params![
+                serde_json::to_string(&TaskStatus::Cancelled)?,
+                task_id,
+                serde_json::to_string(&TaskStatus::Pending)?,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Atomically claim a pending task for execution. This is the queue's
+    /// cancellation race boundary: exactly one of claim or cancel may change
+    /// the row from Pending.
+    pub async fn claim(&self, task_id: i64) -> Result<bool> {
+        let changed = self.connection()?.execute(
+            "UPDATE scheduled_tasks SET status = ?1 WHERE id = ?2 AND status = ?3",
+            params![
+                serde_json::to_string(&TaskStatus::Running)?,
+                task_id,
+                serde_json::to_string(&TaskStatus::Pending)?,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub async fn mark_completed(&self, task_id: i64) -> Result<()> {
         self.connection()?.execute(
             "UPDATE scheduled_tasks SET status = ?1, last_run = ?2 WHERE id = ?3",
@@ -154,6 +196,30 @@ fn parse_time(value: String) -> rusqlite::Result<DateTime<Utc>> {
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
+fn scheduled_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask> {
+    let status: String = row.get(5)?;
+    Ok(ScheduledTask {
+        id: row.get(0)?,
+        scheduled_time: parse_time(row.get(1)?)?,
+        task: row.get(2)?,
+        context: row.get(3)?,
+        recurring: row.get(4)?,
+        status: serde_json::from_str(&status).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        created_at: parse_time(row.get(6)?)?,
+        last_run: row
+            .get::<_, Option<String>>(7)?
+            .map(parse_time)
+            .transpose()?,
+        retries: row.get(8)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +253,7 @@ mod tests {
             TaskStatus::Running,
             TaskStatus::Completed,
             TaskStatus::Failed,
+            TaskStatus::Cancelled,
         ] {
             let json = serde_json::to_string(&status).unwrap();
             let decoded: TaskStatus = serde_json::from_str(&json).unwrap();
@@ -239,6 +306,44 @@ mod tests {
         let queue = TaskQueue::new(PathBuf::from("/tmp/test_finch_q3.db")).unwrap();
         let tasks = queue.get_ready_tasks().await.unwrap();
         assert!(tasks.is_empty()); // Stub returns empty
+    }
+
+    #[tokio::test]
+    async fn get_and_cancel_preserve_the_schedule_record() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = TaskQueue::new(database.path().to_path_buf()).unwrap();
+        let id = queue.enqueue(make_task("cancel-me")).await.unwrap();
+
+        let task = queue.get_task(id).await.unwrap().unwrap();
+        assert_eq!(task.task, "cancel-me");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert!(queue.cancel(id).await.unwrap());
+        assert!(!queue.cancel(id).await.unwrap());
+
+        let cancelled = queue.get_task(id).await.unwrap().unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert!(queue.get_ready_tasks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_and_cancel_are_mutually_exclusive() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = TaskQueue::new(database.path().to_path_buf()).unwrap();
+        let claimed = queue.enqueue(make_task("claimed")).await.unwrap();
+        let cancelled = queue.enqueue(make_task("cancelled")).await.unwrap();
+
+        assert!(queue.claim(claimed).await.unwrap());
+        assert!(!queue.cancel(claimed).await.unwrap());
+        assert!(queue.cancel(cancelled).await.unwrap());
+        assert!(!queue.claim(cancelled).await.unwrap());
+        assert_eq!(
+            queue.get_task(claimed).await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            queue.get_task(cancelled).await.unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
     }
 
     #[tokio::test]

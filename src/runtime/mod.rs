@@ -645,7 +645,9 @@ impl ProgramRuntime {
                     reason: "memory binding lock poisoned".into(),
                 },
             },
-            CapabilityKind::ScheduleCreate => match self.schedule_queue.read() {
+            CapabilityKind::ScheduleCreate
+            | CapabilityKind::ScheduleRead
+            | CapabilityKind::ScheduleManage => match self.schedule_queue.read() {
                 Ok(queue) if queue.is_some() => CapabilityAvailability::Available,
                 Ok(_) => CapabilityAvailability::Disabled,
                 Err(_) => CapabilityAvailability::Degraded {
@@ -657,8 +659,6 @@ impl ProgramRuntime {
             | CapabilityKind::ProgramInvoke => CapabilityAvailability::Available,
             CapabilityKind::VmWrite
             | CapabilityKind::MemoryConsolidate
-            | CapabilityKind::ScheduleRead
-            | CapabilityKind::ScheduleManage
             | CapabilityKind::UnsafeMemory => CapabilityAvailability::Unsupported,
         }
     }
@@ -3603,6 +3603,47 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 response.truncate(size);
                 return Ok(vec![TypedValue::Bytes(response)]);
+            }
+            crate::vm::CapabilityKind::ScheduleRead
+            | crate::vm::CapabilityKind::ScheduleManage => {
+                let [TypedValue::Resource { kind, handle, .. }] = arguments.as_slice() else {
+                    return Err(host_binding_error(
+                        origin,
+                        "schedule operation requires one schedule resource",
+                    ));
+                };
+                if kind != "schedule" {
+                    return Err(host_binding_error(origin, "resource is not a schedule"));
+                }
+                let task_id = handle.parse::<i64>().map_err(|_| {
+                    host_binding_error(origin, "schedule resource has an invalid host handle")
+                })?;
+                let Some(queue) = self.schedule_queue.clone() else {
+                    return Err(host_binding_error(origin, "schedule queue is unavailable"));
+                };
+                if requirement.capability == crate::vm::CapabilityKind::ScheduleRead {
+                    let task = block_on_host(async move { queue.get_task(task_id).await })
+                        .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                    let value = task.map(|task| {
+                        serde_json::json!({
+                            "id": task.id,
+                            "scheduled_time": task.scheduled_time,
+                            "task": task.task,
+                            "recurring": task.recurring,
+                            "status": task.status,
+                            "created_at": task.created_at,
+                            "last_run": task.last_run,
+                            "retries": task.retries,
+                        })
+                    });
+                    return Ok(vec![TypedValue::Option {
+                        inner_type: Type::Json,
+                        value: value.map(|value| Box::new(TypedValue::Json(value))),
+                    }]);
+                }
+                let cancelled = block_on_host(async move { queue.cancel(task_id).await })
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                return Ok(vec![TypedValue::Bool(cancelled)]);
             }
             crate::vm::CapabilityKind::ScheduleCreate => {
                 let [TypedValue::String(callback), TypedValue::Int(timestamp)] =
@@ -7335,6 +7376,45 @@ mod tests {
                 selector: crate::vm::ResourceSelector::None,
             },
         )));
+    }
+
+    #[tokio::test]
+    async fn typed_schedule_handle_can_be_inspected_and_cancelled() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
+        let runtime = ProgramRuntime::new();
+        runtime.attach_schedule_queue(Arc::clone(&queue));
+        for capability in [
+            crate::vm::CapabilityKind::ScheduleCreate,
+            crate::vm::CapabilityKind::ScheduleRead,
+            crate::vm::CapabilityKind::ScheduleManage,
+        ] {
+            runtime
+                .grant_typed_capability(crate::vm::CapabilityRequirement {
+                    capability,
+                    selector: crate::vm::ResourceSelector::Schedule { policy: None },
+                })
+                .unwrap();
+        }
+        let timestamp = chrono::Utc::now().timestamp();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                &format!(
+                    "s\" inspect-me\" {timestamp} schedule-create dup schedule-get swap schedule-cancel"
+                ),
+                ExecutionEffect::VmWrite,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome.values.as_slice(),
+            [ProgramValue::Option(Some(task)), ProgramValue::Bool(true)]
+                if matches!(task.as_ref(), ProgramValue::Json(value)
+                    if value["task"] == "inspect-me" && value["status"] == "Pending")
+        ));
+        let stored = queue.get_task(1).await.unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Cancelled);
     }
 
     #[tokio::test]

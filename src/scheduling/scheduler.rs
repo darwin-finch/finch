@@ -67,7 +67,16 @@ impl TaskScheduler {
             return Ok(());
         }
         info!("Found {} ready tasks", ready_tasks.len());
-        for task in ready_tasks {
+        for mut task in ready_tasks {
+            let Some(task_id) = task.id else {
+                continue;
+            };
+            if !self.queue.claim(task_id).await? {
+                // Cancellation or another scheduler won the Pending-row
+                // transition after this worker read its ready snapshot.
+                continue;
+            }
+            task.status = crate::scheduling::TaskStatus::Running;
             info!("Executing task: {}", task.task);
 
             // TODO: Execute task
@@ -77,18 +86,14 @@ impl TaskScheduler {
             match self.execute_task(&task).await {
                 Ok(_) => {
                     info!("Task completed: {}", task.task);
-                    if let Some(task_id) = task.id {
-                        self.queue.mark_completed(task_id).await?;
-                    }
+                    self.queue.mark_completed(task_id).await?;
                 }
                 Err(e) => {
                     error!("Task failed: {} (error: {})", task.task, e);
-                    if let Some(task_id) = task.id {
-                        if task.retries < 3 {
-                            self.queue.increment_retry(task_id).await?;
-                        } else {
-                            self.queue.mark_failed(task_id, &e.to_string()).await?;
-                        }
+                    if task.retries < 3 {
+                        self.queue.increment_retry(task_id).await?;
+                    } else {
+                        self.queue.mark_failed(task_id, &e.to_string()).await?;
                     }
                 }
             }
@@ -167,5 +172,9 @@ mod tests {
         scheduler.run_once().await.unwrap();
         assert!(queue.get_ready_tasks().await.unwrap().is_empty());
         assert!(id > 0);
+        assert_eq!(
+            queue.get_task(id).await.unwrap().unwrap().status,
+            crate::scheduling::TaskStatus::Completed
+        );
     }
 }
