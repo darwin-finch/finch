@@ -963,6 +963,8 @@ pub fn format_help() -> String {
 
 pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
     let summary = metrics_logger.get_today_summary()?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let wire_metrics = metrics_logger.read_wire_metrics(&today)?;
 
     let local_pct = if summary.total > 0 {
         (summary.local_count as f64 / summary.total as f64) * 100.0
@@ -988,7 +990,7 @@ pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
         0.0
     };
 
-    Ok(format!(
+    let mut output = format!(
         "Metrics (last 24 hours):\n\
         Total requests: {}\n\
         Local: {} ({:.1}%)\n\
@@ -1008,7 +1010,51 @@ pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
         no_match_pct,
         summary.avg_local_time,
         summary.avg_forward_time
-    ))
+    );
+
+    #[derive(Default)]
+    struct WireCounts {
+        total: usize,
+        first_pass: usize,
+        repaired: usize,
+        terminal: usize,
+        failures: std::collections::BTreeMap<String, usize>,
+    }
+    let mut grouped = std::collections::BTreeMap::<(String, String), WireCounts>::new();
+    for metric in wire_metrics {
+        let counts = grouped
+            .entry((metric.provider, metric.model))
+            .or_default();
+        counts.total += 1;
+        counts.first_pass += usize::from(metric.first_pass_valid);
+        counts.repaired += usize::from(metric.repaired_successfully);
+        counts.terminal += usize::from(metric.terminal_failure);
+        if let Some(class) = metric.failure_class {
+            *counts.failures.entry(format!("{class:?}")).or_default() += 1;
+        }
+    }
+    output.push_str("\nFinch VM wire adherence (today):\n");
+    if grouped.is_empty() {
+        output.push_str("  No recorded ProgramSubmissions.\n");
+    } else {
+        for ((provider, model), counts) in grouped {
+            let first_pass_pct = counts.first_pass as f64 / counts.total as f64 * 100.0;
+            output.push_str(&format!(
+                "  {provider}/{model}: {} total, {} first-pass ({first_pass_pct:.1}%), {} repaired, {} terminal\n",
+                counts.total, counts.first_pass, counts.repaired, counts.terminal
+            ));
+            if !counts.failures.is_empty() {
+                let failures = counts
+                    .failures
+                    .into_iter()
+                    .map(|(class, count)| format!("{class}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("    failures: {failures}\n"));
+            }
+        }
+    }
+    Ok(output)
 }
 
 pub fn format_training(
@@ -1420,5 +1466,33 @@ mod tests {
             }
             _ => panic!("Expected McpTools with server name"),
         }
+    }
+
+    #[test]
+    fn metrics_report_groups_wire_adherence_by_provider_and_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = crate::metrics::MetricsLogger::new(dir.path().to_path_buf()).unwrap();
+        let mut repaired = crate::metrics::WireAdherenceMetric::first_pass(
+            "xai",
+            "grok-code-fast-1",
+            "interactive",
+        );
+        repaired.first_pass_valid = false;
+        repaired.failure_class = Some(crate::metrics::WireFailureClass::RawProse);
+        repaired.repair_attempted = true;
+        repaired.repaired_successfully = true;
+        logger.log_wire(&repaired).unwrap();
+        logger
+            .log_wire(&crate::metrics::WireAdherenceMetric::first_pass(
+                "xai",
+                "grok-code-fast-1",
+                "one_shot",
+            ))
+            .unwrap();
+
+        let text = format_metrics(&logger).unwrap();
+        assert!(text.contains("xai/grok-code-fast-1: 2 total, 1 first-pass (50.0%)"));
+        assert!(text.contains("1 repaired, 0 terminal"));
+        assert!(text.contains("RawProse=1"));
     }
 }
