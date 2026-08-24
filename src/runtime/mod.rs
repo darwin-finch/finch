@@ -12,9 +12,9 @@ pub mod scheduler;
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
 use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
-    ApprovalPrompt, CapabilityRequest, CapabilityRequirement, EffectSet, SourceOrigin, Type,
-    CapabilityLedger, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension,
-    TypedValue, VmDiagnostic, VmSideEffect,
+    ApprovalPrompt, AuthorizationContext, CapabilityLedger, CapabilityRequest,
+    CapabilityRequirement, EffectSet, GrantScope, SourceOrigin, Type, TypedExecutionStatus,
+    TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
 use crate::vm::vocabulary::{core_word_spec, CoreHostBinding, CoreWordImplementation};
 use anyhow::{bail, Result};
@@ -33,6 +33,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{mpsc, Mutex, RwLock, Weak};
 use std::time::Instant;
+
+const LOCAL_CAPABILITY_POLICY_HASH: &str = "finch-local-runtime-v1";
 
 /// A portable VM event attached to its owning ProgramRun. The VM event itself
 /// remains embedder-neutral; the envelope provides the other half of its
@@ -270,6 +272,10 @@ pub struct ProgramRuntime {
     submission_gate: tokio::sync::Mutex<()>,
     automation: Arc<AutomationBroker>,
     workspace_root: Arc<PathBuf>,
+    /// Identity used to evaluate reusable capability scopes. It is host-owned
+    /// policy state, not part of reducible VM checkpoints.
+    session_id: uuid::Uuid,
+    project_id: String,
     /// Optional host-wide resource root. Installing this binding makes
     /// `path<host-machine>` calls available to the host adapter, but conveys
     /// no authority by itself: typed `file.read`/`file.write` grants are
@@ -504,15 +510,21 @@ impl ProgramRuntime {
         let checkpoint = typed_runtime
             .checkpoint()
             .expect("a fresh typed runtime is checkpointable");
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project_id = workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.clone())
+            .to_string_lossy()
+            .into_owned();
         Self {
             typed: Arc::new(Mutex::new(typed_runtime)),
             revision: Arc::new(AtomicU64::new(0)),
             manifest_generation: AtomicU64::new(1),
             submission_gate: tokio::sync::Mutex::new(()),
             automation,
-            workspace_root: Arc::new(
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            ),
+            workspace_root: Arc::new(workspace_root),
+            session_id: uuid::Uuid::new_v4(),
+            project_id,
             host_machine_root: Arc::new(RwLock::new(None)),
             memory: RwLock::new(None),
             network: Arc::new(Mutex::new(HashMap::new())),
@@ -660,17 +672,48 @@ impl ProgramRuntime {
     /// Grant a typed capability after an approval decision. A saved typed
     /// execution rechecks this structured grant when it is resumed.
     pub fn grant_typed_capability(&self, requirement: CapabilityRequirement) -> Result<uuid::Uuid> {
-        let now = unix_time_ms();
+        self.issue_typed_capability(
+            requirement,
+            GrantScope::Global,
+            "local-user",
+            None,
+        )
+    }
+
+    /// Record reusable or exact authority without placing it in ambient VM
+    /// state. Each ProgramRun derives its effective grants from its own task,
+    /// session, and project identity. Exact `once` grants are consumed only
+    /// by the correlated pending request.
+    pub fn issue_typed_capability(
+        &self,
+        requirement: CapabilityRequirement,
+        scope: GrantScope,
+        actor: impl Into<String>,
+        expires_at_unix_ms: Option<u64>,
+    ) -> Result<uuid::Uuid> {
         let grant_id = self
             .capability_ledger
             .lock()
             .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
-            .grant_global(requirement.clone(), "local-runtime", "local-user", now);
-        self.typed
-            .lock()
-            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
-            .grant(requirement);
+            .issue(
+                requirement,
+                scope,
+                LOCAL_CAPABILITY_POLICY_HASH,
+                actor,
+                unix_time_ms(),
+                expires_at_unix_ms,
+            )
+            .map_err(anyhow::Error::msg)?;
+        self.refresh_active_grants()?;
         Ok(grant_id)
+    }
+
+    pub fn capability_session_id(&self) -> uuid::Uuid {
+        self.session_id
+    }
+
+    pub fn capability_project_id(&self) -> &str {
+        &self.project_id
     }
 
     /// Revoke one recorded grant by stable identity. Pending and future runs
@@ -712,7 +755,13 @@ impl ProgramRuntime {
             .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
         let grants = ledger
             .grants
-            .active_global_requirements(now)
+            .active_requirements_for(&AuthorizationContext {
+                now_unix_ms: now,
+                task_id: None,
+                session_id: self.session_id,
+                project_id: Some(self.project_id.clone()),
+                policy_hash: LOCAL_CAPABILITY_POLICY_HASH.into(),
+            })
             .cloned()
             .fold(TypedRuntime::intrinsic_grants(), |grants, requirement| {
                 grants.union(&EffectSet::from_requirement(requirement))
@@ -722,6 +771,30 @@ impl ProgramRuntime {
             .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
             .set_grants(grants);
         Ok(())
+    }
+
+    fn effective_grants_for(
+        &self,
+        caller: Option<&scheduler::AgentIdentity>,
+    ) -> Result<EffectSet> {
+        let context = AuthorizationContext {
+            now_unix_ms: unix_time_ms(),
+            task_id: caller.map(|caller| caller.task_id),
+            session_id: self.session_id,
+            project_id: Some(self.project_id.clone()),
+            policy_hash: LOCAL_CAPABILITY_POLICY_HASH.into(),
+        };
+        let ledger = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
+        Ok(ledger
+            .grants
+            .active_requirements_for(&context)
+            .cloned()
+            .fold(TypedRuntime::intrinsic_grants(), |grants, requirement| {
+                grants.union(&EffectSet::from_requirement(requirement))
+            }))
     }
 
     fn release_output_handles(&self, execution_id: uuid::Uuid) -> Result<()> {
@@ -1264,13 +1337,7 @@ impl ProgramRuntime {
         if let Some(grant_ceiling) = &pending.grant_ceiling {
             resumed_runtime.set_grants(grant_ceiling.clone());
         } else {
-            resumed_runtime.set_grants(
-                self.typed
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
-                    .grants()
-                    .clone(),
-            );
+            resumed_runtime.set_grants(self.effective_grants_for(pending.caller.as_ref())?);
         }
         let (working_runtime, execution) = self
             .resume_typed_program(
@@ -1800,6 +1867,8 @@ impl ProgramRuntime {
         };
         if let Some(grant_ceiling) = &grant_ceiling {
             working_runtime.set_grants(grant_ceiling.clone());
+        } else {
+            working_runtime.set_grants(self.effective_grants_for(caller.as_ref())?);
         }
         let context = ExecutionContext::new(generation, submission.budget.unwrap_or_default());
         let source_id = submission.source_id.clone().unwrap_or_else(|| match submission.language {
@@ -4374,6 +4443,86 @@ mod tests {
             rendered_again[0].request.effect_sequence,
             prompt.request.effect_sequence
         );
+    }
+
+    #[tokio::test]
+    async fn task_scoped_grants_apply_only_to_the_matching_program_run() {
+        let runtime = ProgramRuntime::new();
+        let allowed_task = uuid::Uuid::new_v4();
+        let requirement = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        );
+        runtime
+            .issue_typed_capability(
+                requirement,
+                GrantScope::Task {
+                    task_id: allowed_task,
+                },
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let identity = |task_id| scheduler::AgentIdentity {
+            agent_id: uuid::Uuid::new_v4(),
+            task_id,
+            parent_agent_id: None,
+            root_agent_id: uuid::Uuid::new_v4(),
+            depth: 0,
+            provider_model: "test-provider".into(),
+            vm_revision: runtime.revision(),
+            manifest_generation: runtime.manifest_generation(),
+        };
+        let source = || {
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            )
+        };
+
+        let allowed = runtime
+            .submit_as(source(), Some(identity(allowed_task)))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status, ExecutionStatus::Completed);
+
+        let unrelated = runtime
+            .submit_as(source(), Some(identity(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        assert_eq!(
+            unrelated.status,
+            ExecutionStatus::AuthorizationRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_once_grants_never_enter_ambient_program_run_authority() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .issue_typed_capability(
+                crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Read,
+                    crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+                ),
+                GrantScope::Once {
+                    request_id: uuid::Uuid::new_v4(),
+                },
+                "test-user",
+                None,
+            )
+            .unwrap();
+
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::AuthorizationRequired);
     }
 
     #[tokio::test]

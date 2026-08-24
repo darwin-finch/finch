@@ -103,6 +103,31 @@ impl GrantSet {
             .map(|grant| &grant.requirement)
     }
 
+    /// Active reusable authority applicable to one ProgramRun. Exact
+    /// `once` grants are deliberately excluded: they are consumed against a
+    /// concrete request ID and resume only that already-pending host call.
+    pub fn active_requirements_for<'a>(
+        &'a self,
+        context: &'a AuthorizationContext,
+    ) -> impl Iterator<Item = &'a CapabilityRequirement> + 'a {
+        self.grants
+            .iter()
+            .filter(move |grant| {
+                grant.is_active(context.now_unix_ms)
+                    && grant.policy_hash == context.policy_hash
+                    && match &grant.scope {
+                        GrantScope::Once { .. } => false,
+                        GrantScope::Task { task_id } => context.task_id == Some(*task_id),
+                        GrantScope::Session { session_id } => *session_id == context.session_id,
+                        GrantScope::Project { project_id } => {
+                            context.project_id.as_ref() == Some(project_id)
+                        }
+                        GrantScope::Global => true,
+                    }
+            })
+            .map(|grant| &grant.requirement)
+    }
+
     pub fn authorize(
         &self,
         request: &CapabilityRequest,
