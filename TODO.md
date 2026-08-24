@@ -447,10 +447,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   appends locked, source-hashed version-1 JSONL records for both first-pass and repair attempts,
   separately from the source-free aggregate metrics. `finch wire-corpus audit <file> [--json]`
   validates record hashes and compiles/verifies every retained Lisp/Co-Forth source without
-  creating a `ProgramRuntime` or executing effects. Still collect and freeze a representative
-  multi-provider corpus, retain exact provider/model rather than only an interactive profile name,
-  preserve the relevant vocabulary/module context for submissions that call promoted words, add
-  token/latency metadata, and expand the reproducible reports. The first source-free checked-in
+  creating a `ProgramRuntime` or executing effects. Captures now retain the exact provider/model
+  and a reducible compiler context containing promoted typed functions, while excluding operand
+  stacks, grants, pending effects, and host resources; a regression test verifies replay of a
+  program that calls a previously promoted word. Still collect and freeze a representative
+  multi-provider corpus, extend that compiler context to future module/import/package identities,
+  add token/latency metadata, and expand the reproducible reports. The first source-free checked-in
   smoke artifact is `docs/conformance/2026-08-24-grok-code-fast-1.json`: its private captured
   corpus replayed 6/6 programs successfully under manifest 1 / VM type system 5. Its six tasks
   and one provider are deliberately documented as insufficient to close this gate.
