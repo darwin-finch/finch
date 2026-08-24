@@ -157,7 +157,7 @@ requirements, diagnostics carry stable codes, and host execution is transactiona
 evaluator and its effectful standard library have been removed; the retained Lisp reader lowers
 only into shared typed IR. Public `: ... ;` and `/forth` source execution also enter only the typed
 runtime. The old semiotic Co-Forth interpreter is not a supported compatibility language: it remains
-temporarily internal to the historical proof/library, stack/poset, channel, and peer-demo subsystems
+temporarily internal to the historical proof/library, stack-console, channel, and peer-demo subsystems
 only until useful behavior is ported and the implementation is deleted. It is never a fallback. Core words are now generated through one
 immutable signature/documentation/implementation registry, and the broker has a real typed
 `(execution_id, sequence)` suspension/resumption boundary with an effect journal. Persisted and

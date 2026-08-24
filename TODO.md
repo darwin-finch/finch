@@ -290,6 +290,16 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   `PendingTypedReason::Yielded` continuation. General daemon/frontend scheduling still needs
   fairness, timer/I/O/message wakeups, cancellation, and durable replay before treating `yield` as
   autonomous background execution.
+- [ ] Preserve the useful poset idea as a typed ephemeral execution-plan artifact, independent of
+  the deleted semiotic stack language. A plan contains immutable node IDs, typed Finch
+  `ProgramSubmission` or host-operation specs, declared input/output rows, dependency edges,
+  inferred capability envelopes, budgets, and source origins. Present the whole DAG for human
+  review/edit/approval before scheduling; hash the approved form so execution cannot substitute
+  nodes afterward. Ready nodes may run concurrently as ordinary ProgramRuns/fibers, and their typed
+  results satisfy successor inputs without an LLM-only `Call` convention. The current executor now
+  runs reviewed Lisp/Co-Forth nodes only through `ProgramRuntime` and no longer receives the legacy
+  shared stack; replace its remaining string labels/results and direct tool registry with this typed
+  plan contract. Keep plans ephemeral unless an explicit promotion persists a reusable procedure.
 - [ ] Reimplement the existing model-facing `TodoRead`/`TodoWrite` tools over a typed, journaled
   task-list projection owned by the Brain/runtime. Keep their useful visible-plan UX and stable tool
   surface, but make task creation, status changes, hierarchy, progress, cancellation, and durable
