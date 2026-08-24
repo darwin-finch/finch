@@ -71,6 +71,15 @@ a literal string, and the replacement must have the field's statically known typ
 `record-get:<name>` remains accepted as compatibility syntax, but new programs should use the
 ordinary stack spelling `"name" record-get`.
 
+Records may also hold typed quotations. This lets a record carry data and a reusable operation
+without introducing a separate object runtime; invocation remains explicit and receives its inputs
+on the ordinary stack:
+
+```forth
+: increment ( S int -- S int ! {} ) 1 + ;
+{ run: ['] increment } "run" record-get unwrap 41 swap execute  \ leaves 42
+```
+
 `case` is a typed integer switch with no fallthrough. Each `of ... endof` arm and the optional
 `otherwise` arm must leave the same stack row. The selector is removed before an arm begins;
 `otherwise` is required whenever an unmatched case must produce values. This is structured branch

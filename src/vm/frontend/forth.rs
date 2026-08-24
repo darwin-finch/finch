@@ -2649,6 +2649,19 @@ mod tests {
             .execute(&mut stack)
             .expect("record update should execute");
         assert_eq!(stack, vec![TypedValue::Int(38)]);
+
+        let closure_field = compile_forth(
+            "record-closure.forth",
+            ": increment ( S int -- S int ! {} ) 1 + ; { run: ['] increment } \"run\" record-get unwrap 41 swap execute",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("record closure should compile");
+        let mut stack = Vec::new();
+        Interpreter::new(&closure_field, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("record closure should execute");
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
     #[test]
