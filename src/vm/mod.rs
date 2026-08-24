@@ -39,5 +39,9 @@ pub use verifier::{VerifiedFunction, VerifiedModule, Verifier, Vocabulary};
 pub use vocabulary::core_vocabulary;
 
 /// Version of the typed VM contract and serialized IR family.
-pub const VM_TYPE_SYSTEM_VERSION: u32 = 1;
+///
+/// Version 2 adds `MakeMap` and its portable immutable typed-map value form.
+/// Old modules/checkpoints must be rejected and recompiled rather than being
+/// decoded under the new collection semantics.
+pub const VM_TYPE_SYSTEM_VERSION: u32 = 2;
 pub mod capability;
