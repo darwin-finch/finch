@@ -454,8 +454,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   multi-provider corpus, extend that compiler context to future module/import/package identities,
   add token/latency metadata, and expand the reproducible reports. The first source-free checked-in
   smoke artifact is `docs/conformance/2026-08-24-grok-code-fast-1.json`: its private captured
-  corpus replayed 6/6 programs successfully under manifest 1 / VM type system 5. Its six tasks
-  and one provider are deliberately documented as insufficient to close this gate.
+  corpus replayed 9/9 programs successfully under manifest 1 / VM type system 5. That includes six
+  isolated language tasks, two turns sharing a committed typed word, and one deterministic repair
+  from raw prose plus the real structured diagnostic. Its nine submissions and one provider are
+  deliberately documented as insufficient to close this gate.
 
 ### Separate language/compiler research track — not a Brain convergence prerequisite
 

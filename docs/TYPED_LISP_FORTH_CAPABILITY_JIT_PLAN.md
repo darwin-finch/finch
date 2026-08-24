@@ -1553,10 +1553,11 @@ Current evidence (2026-08-24): opt-in versioned source-bearing capture and non-e
 implemented for interactive, one-shot, and named-Brain provider responses. Captures retain exact
 provider/model identity and the reducible promoted-function compiler context, but not operand
 stacks, grants, pending effects, or host resources. The first checked-in source-free report records
-6/6 first-pass verified programs from `grok-code-fast-1` when given the bounded canonical language
-package. This is a smoke baseline, not representative corpus completion: additional providers,
-natural multi-turn traffic, repairs, module/import context, and annotation/source-order cases remain
-required.
+9/9 verified programs from `grok-code-fast-1` when given the bounded canonical language package:
+six isolated language tasks, two stateful turns sharing a committed typed word, and one deterministic
+repair from raw prose plus the real structured diagnostic. This is a smoke baseline, not
+representative corpus completion: additional providers, broader natural multi-turn traffic,
+module/import context, and annotation/source-order cases remain required.
 
 Exit: reviewers can answer what any core word consumes, produces, and may do.
 
