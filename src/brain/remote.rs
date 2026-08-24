@@ -51,6 +51,19 @@ impl RemoteBrainTarget {
         format!("{}@{}", self.brain, self.machine)
     }
 
+    /// Resolve a bare Brain name through the already-connected local daemon.
+    pub fn local(brain: &str, daemon_base_url: &str) -> Result<Self> {
+        let address = daemon_base_url
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/');
+        if address.is_empty() || address.contains('/') {
+            anyhow::bail!("local daemon address is invalid");
+        }
+        Self::parse(&format!("{brain}@{address}"))
+    }
+
     fn http_url(&self) -> String {
         format!("http://{}/v1/brains/named/{}", self.address, self.brain)
     }
@@ -160,6 +173,13 @@ mod tests {
         let target = RemoteBrainTarget::parse("review@10.0.0.4:9000").unwrap();
         assert_eq!(target.machine, "10.0.0.4");
         assert_eq!(target.address, "10.0.0.4:9000");
+    }
+
+    #[test]
+    fn bare_name_can_resolve_through_the_local_daemon() {
+        let target = RemoteBrainTarget::local("review", "http://127.0.0.1:11435").unwrap();
+        assert_eq!(target.brain, "review");
+        assert_eq!(target.address, "127.0.0.1:11435");
     }
 
     #[test]

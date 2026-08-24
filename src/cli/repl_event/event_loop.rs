@@ -387,14 +387,11 @@ pub struct EventLoop {
     /// Broadcast sender — pushes code to ALL peer event loops simultaneously.
     peer_tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
 
-    /// Sender half of the peer inbox — cloned into boot_peers() at run() time.
+    /// Sender half of the explicit remote-peer inbox.
     peer_inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
 
     /// Shared inbox — receives `(id, name, text)` replies from all peers.
     peer_inbox_rx: tokio::sync::mpsc::UnboundedReceiver<(Uuid, String, String)>,
-
-    /// Active peers: (UUID, display-name) for each forked loop.
-    peer_sessions: Vec<(Uuid, String)>,
 
     /// In-memory store of pending diff proposals in the room.
     diff_store: DiffStore,
@@ -721,7 +718,7 @@ fn is_forth_primitive_word(w: &str) -> bool {
 /// phrase is routed to the AI rather than executed as Forth.
 fn looks_like_natural_language(
     s: &str,
-    word_exists: impl Fn(&str) -> bool,
+    _word_exists: impl Fn(&str) -> bool,
     session_word: impl Fn(&str) -> bool,
 ) -> bool {
     let trimmed = s.trim();
@@ -804,8 +801,10 @@ fn looks_like_natural_language(
     // Single unknown word with only alphabetic characters → AI.
     if tokens.len() == 1 && !trimmed.starts_with(':') {
         let word = tokens[0];
-        // Known to the VM (library or session) → Forth.
-        if word_exists(word) {
+        // Only an explicit session definition or a primitive makes a bare
+        // word executable. Ambient poetry/library vocabulary must not capture
+        // ordinary greetings such as `hello` from the chat path.
+        if session_word(word) || is_forth_primitive_word(word) {
             return false;
         }
         if !is_forth_primitive_word(word)
@@ -890,227 +889,6 @@ fn extract_scatter_exec_commands(code: &str) -> Vec<String> {
         }
     }
     cmds
-}
-
-// ── Peer registry ─────────────────────────────────────────────────────────────
-//
-// Maps UUID → sender-end of a peer's inbox so callers can attach to an
-// existing peer by name or UUID instead of forking a fresh one.
-
-use once_cell::sync::Lazy;
-use std::collections::HashMap as PeerMap;
-
-static PEER_REGISTRY: Lazy<
-    tokio::sync::Mutex<
-        PeerMap<
-            Uuid,
-            (
-                String,
-                tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
-            ),
-        >,
-    >,
-> = Lazy::new(|| tokio::sync::Mutex::new(PeerMap::new()));
-
-/// Register a newly-forked peer so it can be attached to later.
-async fn register_peer(
-    id: Uuid,
-    name: String,
-    tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
-) {
-    PEER_REGISTRY.lock().await.insert(id, (name, tx));
-}
-
-/// Look up a peer by name or UUID prefix.  Returns `(id, broadcast_tx)`.
-pub async fn find_peer(
-    needle: &str,
-) -> Option<(
-    Uuid,
-    tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
-)> {
-    let reg = PEER_REGISTRY.lock().await;
-    // Exact UUID match first
-    if let Ok(id) = needle.parse::<Uuid>() {
-        if let Some((_, tx)) = reg.get(&id) {
-            return Some((id, tx.clone()));
-        }
-    }
-    // Name match
-    for (id, (name, tx)) in reg.iter() {
-        if name == needle || id.to_string().starts_with(needle) {
-            return Some((*id, tx.clone()));
-        }
-    }
-    None
-}
-
-// ── Background peer event loop ────────────────────────────────────────────────
-//
-// Each peer owns one authoritative typed ProgramRuntime. The user broadcasts code via a
-// `broadcast::Sender<SessionEvent>`; each peer subscribes.  Results come back
-// through a shared `UnboundedSender<(Uuid, String, String)>` (id, name, text)
-// that funnels all peers into one inbox for the select! loop.
-
-async fn run_peer_loop(
-    id: Uuid,
-    name: String,
-    mut rx: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
-    inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
-) {
-    use crate::session::SessionEvent;
-    let typed_runtime = crate::runtime::ProgramRuntime::new();
-
-    loop {
-        match rx.recv().await {
-            Ok(SessionEvent::Chat { text }) => {
-                // Both wire languages use the same typed runtime. A peer may
-                // never turn an unsupported typed program into a legacy
-                // evaluation: that would make channel execution disagree with
-                // provider and direct-source semantics.
-                let language = if text.trim_start().starts_with('(') {
-                    crate::programs::ProgramLanguage::Lisp
-                } else {
-                    crate::programs::ProgramLanguage::Forth
-                };
-                let response = {
-                    match typed_runtime
-                        .submit_typed_only(crate::runtime::ProgramSubmission {
-                            language,
-                            source_id: Some(format!("peer-program.{}", language.as_str())),
-                            source: text.clone(),
-                            intent: "peer typed program".into(),
-                            effect: crate::programs::ExecutionEffect::Unclassified,
-                            declared_capabilities: Vec::new(),
-                            manifest_generation: typed_runtime.manifest_generation(),
-                            expected_revision: Some(typed_runtime.revision()),
-                            budget: None,
-                        })
-                        .await
-                    {
-                        Ok(outcome)
-                            if outcome.status
-                                == crate::runtime::outcome::ExecutionStatus::Completed =>
-                        {
-                            peer_program_result(&outcome)
-                        }
-                        Ok(outcome) => format!(
-                            "typed program error: {}",
-                            outcome.diagnostics.first().cloned().unwrap_or_else(|| {
-                                format!("program ended as {:?}", outcome.status)
-                            })
-                        ),
-                        Err(error) => format!("typed program error: {error}"),
-                    }
-                };
-                if !response.is_empty() {
-                    let _ = inbox_tx.send((id, name.clone(), response));
-                }
-            }
-            Ok(SessionEvent::ChannelMessage { .. }) => {
-                // Local peer loops must not echo channel messages back.
-                // ChannelMessage events originate from the local session; echoing
-                // them here produces one duplicate per peer loop.
-                // Remote peers receive and display these through a separate path.
-            }
-            Ok(SessionEvent::Close) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                break
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Ok(_) => {}
-        }
-    }
-}
-
-/// Peer messages do not have a terminal projection. Preserve explicit VM
-/// output when present; otherwise report the typed final stack in the compact
-/// notation previously used by the peer inbox.
-fn peer_program_result(outcome: &crate::runtime::outcome::ExecutionOutcome) -> String {
-    if !outcome.output.is_empty() {
-        return outcome.output.trim_end().to_string();
-    }
-    if outcome.values.is_empty() {
-        return String::new();
-    }
-    let values = outcome
-        .values
-        .iter()
-        .map(peer_program_value)
-        .collect::<Vec<_>>();
-    format!("( {} )", values.join("  "))
-}
-
-fn peer_program_value(value: &crate::programs::ProgramValue) -> String {
-    match value {
-        crate::programs::ProgramValue::Nil => "()".to_string(),
-        crate::programs::ProgramValue::Bool(value) => value.to_string(),
-        crate::programs::ProgramValue::Int(value) => value.to_string(),
-        crate::programs::ProgramValue::Float(value) => value.to_string(),
-        crate::programs::ProgramValue::Symbol(value) => format!("'{value}"),
-        crate::programs::ProgramValue::String(value) => format!("{value:?}"),
-        crate::programs::ProgramValue::Json(value) => value.to_string(),
-        other => format!("{other:?}"),
-    }
-}
-
-/// Fork two independent peer loops that share a broadcast channel.
-///
-/// Returns the broadcast sender (write to reach all peers) and a list of
-/// `(id, name)` pairs for every peer that was started.
-///
-/// If `attach` is `Some(name_or_uuid)`, the first slot re-uses an existing
-/// registry peer (bridging its broadcast into the new channel) instead of
-/// forking a fresh one.  The second peer is always fresh.
-async fn boot_peers(
-    inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
-    attach: Option<&str>,
-) -> (
-    tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
-    Vec<(Uuid, String)>,
-) {
-    let (bcast_tx, _) = tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
-
-    /// Spawn a fresh peer loop, register it, and return its `(id, name)`.
-    async fn spawn_fresh(
-        bcast_tx: &tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
-        inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
-    ) -> (Uuid, String) {
-        let id = Uuid::new_v4();
-        let name = format!("peer-{}", &id.to_string()[..8]);
-        let rx = bcast_tx.subscribe();
-        let (n, i) = (name.clone(), id);
-        tokio::spawn(async move { run_peer_loop(i, n, rx, inbox_tx).await });
-        register_peer(id, name.clone(), bcast_tx.clone()).await;
-        (id, name)
-    }
-
-    // ── First peer: re-attach to existing OR fork fresh ───────────────────────
-    let first = if let Some(needle) = attach {
-        if let Some((id, existing_tx)) = find_peer(needle).await {
-            let mut bridge_rx = existing_tx.subscribe();
-            let bcast_clone = bcast_tx.clone();
-            tokio::spawn(async move {
-                while let Ok(ev) = bridge_rx.recv().await {
-                    let _ = bcast_clone.send(ev);
-                }
-            });
-            let name = PEER_REGISTRY
-                .lock()
-                .await
-                .get(&id)
-                .map(|(n, _)| n.clone())
-                .unwrap_or_else(|| id.to_string());
-            (id, name)
-        } else {
-            spawn_fresh(&bcast_tx, inbox_tx.clone()).await
-        }
-    } else {
-        spawn_fresh(&bcast_tx, inbox_tx.clone()).await
-    };
-
-    // ── Second peer: always fresh ─────────────────────────────────────────────
-    let second = spawn_fresh(&bcast_tx, inbox_tx.clone()).await;
-
-    (bcast_tx, vec![first, second])
 }
 
 fn channels_path() -> Option<std::path::PathBuf> {
@@ -1474,12 +1252,11 @@ impl EventLoop {
             )
         };
 
-        // Peer channels — boot_peers() finishes wiring in run() (async context).
+        // Peer channels remain idle until an explicit remote peer is connected.
         let (peer_inbox_tx, peer_inbox_rx) =
             tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
         let (peer_tx, peer_session_rx) =
             tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
-        let peer_sessions: Vec<(Uuid, String)> = Vec::new();
         let (peer_inbox_mirror_tx, _) = tokio::sync::broadcast::channel::<(String, String)>(128);
 
         Self {
@@ -1562,7 +1339,6 @@ impl EventLoop {
             peer_tx,
             peer_inbox_tx,
             peer_inbox_rx,
-            peer_sessions,
             diff_store: DiffStore::new(),
             peer_session_rx,
             joined_channels: load_joined_channels(),
@@ -1582,14 +1358,6 @@ impl EventLoop {
         // Signal that the TUI owns the terminal so proposal editors perform a
         // complete terminal-protocol handoff before launching $VISUAL/$EDITOR.
         crate::set_tui_active(true);
-
-        // ── Fork two peer event loops ─────────────────────────────────────────
-        // boot_peers needs an async context, so we call it here rather than new().
-        {
-            let (real_tx, sessions) = boot_peers(self.peer_inbox_tx.clone(), None).await;
-            self.peer_tx = real_tx;
-            self.peer_sessions = sessions;
-        }
 
         // ── Connect to remote peers (--peer flag) ────────────────────────────
         // For each remote daemon address: establish a bidirectional WS bridge so
@@ -4548,7 +4316,16 @@ Rules:\n\
     /// Attach this TUI to one daemon-owned brain. All prompts and explicit
     /// Forth/Lisp programs are routed to that host until `/brain detach`.
     async fn handle_brain_attach(&mut self, value: String) -> Result<()> {
-        let target = match crate::brain::remote::RemoteBrainTarget::parse(&value) {
+        let parsed = if value.contains('@') {
+            crate::brain::remote::RemoteBrainTarget::parse(&value)
+        } else if let Some(base) = self.daemon_base_url.as_deref() {
+            crate::brain::remote::RemoteBrainTarget::local(&value, base)
+        } else {
+            Err(anyhow::anyhow!(
+                "a bare Brain name requires a connected local daemon; use NAME@MACHINE[:PORT]"
+            ))
+        };
+        let target = match parsed {
             Ok(target) => target,
             Err(error) => {
                 self.output_manager
@@ -10324,6 +10101,11 @@ mod nl_routing_tests {
             word_exists,
             session_word
         ));
+        assert!(looks_like_natural_language(
+            "hello",
+            word_exists,
+            session_word
+        ));
     }
 
     // "dup swap drop" — primitives; even with session_word=false they stay Forth.
@@ -10637,226 +10419,5 @@ mod filter_tests {
             result.contains(": good"),
             "valid definition after malformed one should be kept"
         );
-    }
-}
-
-// ── Peer event loop tests ──────────────────────────────────────────────────────
-#[cfg(test)]
-mod peer_loop_tests {
-    use super::*;
-    use crate::session::SessionEvent;
-
-    /// Both peer loops receive the broadcast and each sends back an independent result.
-    #[tokio::test]
-    async fn test_two_peers_both_reply_to_broadcast() {
-        let (inbox_tx, mut inbox_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
-        let (bcast_tx, sessions) = boot_peers(inbox_tx, None).await;
-
-        assert_eq!(sessions.len(), 2, "boot_peers must fork exactly two peers");
-
-        // Give each peer a moment to initialise their VMs.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // Broadcast: push two values and add them.
-        bcast_tx.send(SessionEvent::chat("3 4 +")).unwrap();
-
-        // Collect replies with a timeout — both peers should respond.
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
-        tokio::pin!(deadline);
-        let mut replies: Vec<(Uuid, String, String)> = Vec::new();
-        loop {
-            tokio::select! {
-                Some(msg) = inbox_rx.recv() => {
-                    replies.push(msg);
-                    if replies.len() == 2 { break; }
-                }
-                _ = &mut deadline => { break; }
-            }
-        }
-
-        assert_eq!(
-            replies.len(),
-            2,
-            "expected two replies (one per peer), got {}",
-            replies.len()
-        );
-
-        // Both peers should have computed 7.
-        for (_, name, text) in &replies {
-            assert!(
-                text.contains('7'),
-                "peer {name} should reply with ( 7 ), got: {text}"
-            );
-        }
-
-        // The two peers must have different names.
-        let names: Vec<&str> = replies.iter().map(|(_, n, _)| n.as_str()).collect();
-        assert_ne!(names[0], names[1], "peers must have distinct names");
-    }
-
-    /// Peer Lisp must use the shared typed runtime rather than the legacy
-    /// evaluator. A typed definition and its call live in one verified source
-    /// submission and both peers return its `say` output.
-    #[tokio::test]
-    async fn test_peers_execute_typed_lisp_wire_programs() {
-        let (inbox_tx, mut inbox_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
-        let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
-
-        bcast_tx
-            .send(SessionEvent::chat(
-                "(define (square (n : int)) (* n n)) (say (int-to-string (square 9)))",
-            ))
-            .unwrap();
-
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
-        tokio::pin!(deadline);
-        let mut replies = Vec::new();
-        loop {
-            tokio::select! {
-                Some(message) = inbox_rx.recv() => {
-                    replies.push(message);
-                    if replies.len() == 2 { break; }
-                }
-                _ = &mut deadline => break,
-            }
-        }
-
-        assert_eq!(replies.len(), 2, "both peers should execute typed Lisp");
-        for (_, name, text) in replies {
-            assert_eq!(text, "81", "peer {name} should return typed Lisp output");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_peers_keep_typed_lisp_definitions_between_messages() {
-        let (inbox_tx, mut inbox_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
-        let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
-
-        bcast_tx
-            .send(SessionEvent::chat("(define (triple (n : int)) (* n 3))"))
-            .unwrap();
-        // Definitions have no user-visible output. Give both runtimes a chance
-        // to commit before the dependent program is sent.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        bcast_tx
-            .send(SessionEvent::chat("(say (int-to-string (triple 14)))"))
-            .unwrap();
-
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
-        tokio::pin!(deadline);
-        let mut replies = Vec::new();
-        loop {
-            tokio::select! {
-                Some(message) = inbox_rx.recv() => {
-                    replies.push(message);
-                    if replies.len() == 2 { break; }
-                }
-                _ = &mut deadline => break,
-            }
-        }
-
-        assert_eq!(replies.len(), 2, "both peers should retain the definition");
-        for (_, name, text) in replies {
-            assert_eq!(text, "42", "peer {name} should use its retained Lisp word");
-        }
-    }
-
-    /// Peers are independent: a definition in the user's broadcast doesn't
-    /// bleed between peers (each has its own VM snapshot).
-    #[tokio::test]
-    async fn test_peers_have_independent_vms() {
-        let (inbox_tx, mut inbox_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
-        let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // Broadcast a definition — both peers should compile it.
-        bcast_tx
-            .send(SessionEvent::chat(
-                ": square ( S int -- S int ! pure ) dup * ;",
-            ))
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Now evaluate the word — both VMs should have it.
-        bcast_tx.send(SessionEvent::chat("5 square")).unwrap();
-
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
-        tokio::pin!(deadline);
-        let mut replies: Vec<(Uuid, String, String)> = Vec::new();
-        loop {
-            tokio::select! {
-                Some(msg) = inbox_rx.recv() => {
-                    replies.push(msg);
-                    if replies.len() == 2 { break; }
-                }
-                _ = &mut deadline => { break; }
-            }
-        }
-
-        assert_eq!(replies.len(), 2, "expected both peers to reply");
-        for (_, name, text) in &replies {
-            assert!(
-                text.contains("25"),
-                "peer {name} should know `square` and reply with ( 25 ), got: {text}"
-            );
-        }
-    }
-
-    /// ChannelMessage events must NOT be echoed back to the local inbox by peer
-    /// loops.  Before the fix, both peer loops would each send the message back,
-    /// causing N_peers × N_channels echoes per send.
-    #[tokio::test]
-    async fn test_channel_message_not_echoed_by_peer_loops() {
-        use crate::session::{Promise, ProofBundle};
-
-        let (inbox_tx, mut inbox_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
-        let (bcast_tx, _sessions) = boot_peers(inbox_tx, None).await;
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let promise = Promise::natural("hello world".to_string());
-        let bundle = ProofBundle::new(promise, vec![]);
-        let ev = crate::session::SessionEvent::ChannelMessage {
-            channel: "#test".into(),
-            sender: "lush-hill".into(),
-            bundle,
-        };
-        bcast_tx.send(ev).unwrap();
-
-        // Wait briefly — if the peer loops echo the message, it will arrive here.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // Drain everything that arrived.
-        let mut count = 0usize;
-        while inbox_rx.try_recv().is_ok() {
-            count += 1;
-        }
-
-        assert_eq!(
-            count, 0,
-            "peer loops must not echo ChannelMessage events back to the inbox (got {count})"
-        );
-    }
-
-    /// Registry contains both peers after boot.
-    #[tokio::test]
-    async fn test_registry_populated_after_boot() {
-        let (inbox_tx, _inbox_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
-        let (_bcast_tx, sessions) = boot_peers(inbox_tx, None).await;
-
-        for (id, name) in &sessions {
-            let found = find_peer(&id.to_string()).await;
-            assert!(found.is_some(), "peer {name} ({id}) should be in registry");
-
-            let by_name = find_peer(name).await;
-            assert!(by_name.is_some(), "should be findable by name {name}");
-        }
     }
 }

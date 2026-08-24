@@ -269,16 +269,19 @@ impl EventLoop {
                 let mut lines = vec!["Named Brains:".to_string()];
                 for b in &brains {
                     let current = if b.name == current_name {
-                        " · current runner"
+                        if self.active_remote_brain.is_some() {
+                            " · current driver"
+                        } else {
+                            " · current runner"
+                        }
                     } else {
                         ""
                     };
                     lines.push(format!(
-                        "  {:30}  rev {:<5}  {:<3} programs  {}:{}{}",
-                        b.name,
+                        "  {:55}  rev {:<5}  {:<3} programs  {}{}",
+                        format!("{}@{}", b.name, b.environment.machine),
                         b.revision,
                         b.programs,
-                        b.environment.machine,
                         b.environment.workspace.display(),
                         current,
                     ));

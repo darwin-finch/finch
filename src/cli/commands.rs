@@ -934,7 +934,7 @@ pub fn format_help() -> String {
          {reset}\n\
          {yellow_bold}🧠 Detachable Brains:{reset}\n\
          {cyan}  /brain list{reset}        List named Brain sessions ({gray}/brains{reset} also works)\n\
-         {cyan}  /brain attach <brain@machine>{reset}  Attach to a named remote brain\n\
+         {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
          {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
          {cyan}  /brain password [new]{reset} Show or rotate the local brain credential\n\
          {reset}\n\
