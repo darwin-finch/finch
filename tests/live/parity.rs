@@ -8,10 +8,14 @@
 // Run: FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_parity
 
 use finch::claude::Message;
-use finch::programs::{wire_repair_request, ExecutionEffect, ProgramLanguage, BOOT_CAPSULE};
+use finch::programs::{
+    wire_repair_request, ExecutionEffect, ProgramLanguage, BOOT_CAPSULE,
+    FORTH_LANGUAGE_DEFINITION, LISP_LANGUAGE_DEFINITION, VM_LANGUAGE_DEFINITION,
+};
 use finch::providers::ProviderRequest;
 use finch::runtime::outcome::ExecutionStatus;
 use finch::runtime::{ProgramRuntime, ProgramSubmission};
+use std::time::Duration;
 
 use crate::{all_available_providers, live_tests_enabled};
 
@@ -170,12 +174,20 @@ async fn live_parity_finch_wire_programs() {
     }
 
     let system = format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n\nNo introspection tools are attached to this source-only conformance request. \
+         The complete canonical language package follows; use it directly.\n\n{}\n\n{}\n\n{}",
         finch::generators::claude::CODING_SYSTEM_PROMPT,
-        BOOT_CAPSULE
+        BOOT_CAPSULE,
+        VM_LANGUAGE_DEFINITION,
+        LISP_LANGUAGE_DEFINITION,
+        FORTH_LANGUAGE_DEFINITION,
     );
     let cases = [
         ("Emit exactly `ready` to the user.", "ready"),
+        (
+            "Emit exactly two lines. The first line is `alpha`; the second line is the quoted word `\"beta\"`. Emit no other text.",
+            "alpha\n\"beta\"",
+        ),
         (
             "Compute 2 multiplied by 144 locally in the Finch VM and emit only the decimal result.",
             "288",
@@ -184,6 +196,14 @@ async fn live_parity_finch_wire_programs() {
             "In one Finch program, define a recursive factorial function, compute factorial 6, and emit only the decimal result.",
             "720",
         ),
+        (
+            "In one Finch program, create a closure that captures integer 10, apply it to integer 32 by adding the captured value, and emit only the decimal result.",
+            "42",
+        ),
+        (
+            "In one Finch program, create a producer fiber that yields integers 2 and 3 before returning integer 5, join it, and emit only its decimal terminal result.",
+            "5",
+        ),
     ];
 
     for (name, provider) in providers {
@@ -191,15 +211,28 @@ async fn live_parity_finch_wire_programs() {
         let mut repaired = 0usize;
         let mut terminal = 0usize;
         for (request, expected) in cases {
-            let initial = provider
-                .send_message(
+            let initial = match tokio::time::timeout(
+                Duration::from_secs(60),
+                provider.send_message(
                     &ProviderRequest::new(vec![Message::user(request)])
                         .with_system(system.clone())
                         .with_max_tokens(512),
-                )
-                .await
-                .unwrap_or_else(|error| panic!("{name} wire request failed: {error}"))
-                .text();
+                ),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response.text(),
+                Ok(Err(error)) => {
+                    terminal += 1;
+                    eprintln!("{name}: wire request failed: {error}");
+                    continue;
+                }
+                Err(_) => {
+                    terminal += 1;
+                    eprintln!("{name}: wire request exceeded 60 seconds");
+                    continue;
+                }
+            };
             finch::programs::corpus::capture_from_env(
                 name,
                 provider.default_model(),
@@ -219,8 +252,9 @@ async fn live_parity_finch_wire_programs() {
                 }
                 Err(diagnostic) => {
                     let repair = wire_repair_request(&initial, &diagnostic);
-                    let replacement = provider
-                        .send_message(
+                    let replacement = match tokio::time::timeout(
+                        Duration::from_secs(60),
+                        provider.send_message(
                             &ProviderRequest::new(vec![
                                 Message::user(request),
                                 Message::assistant(initial),
@@ -228,10 +262,22 @@ async fn live_parity_finch_wire_programs() {
                             ])
                             .with_system(system.clone())
                             .with_max_tokens(512),
-                        )
-                        .await
-                        .unwrap_or_else(|error| panic!("{name} wire repair failed: {error}"))
-                        .text();
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) => response.text(),
+                        Ok(Err(error)) => {
+                            terminal += 1;
+                            eprintln!("{name}: wire repair failed: {error}");
+                            continue;
+                        }
+                        Err(_) => {
+                            terminal += 1;
+                            eprintln!("{name}: wire repair exceeded 60 seconds");
+                            continue;
+                        }
+                    };
                     finch::programs::corpus::capture_from_env(
                         name,
                         provider.default_model(),
