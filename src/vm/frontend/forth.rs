@@ -28,9 +28,9 @@ struct Token {
 
 /// The source-preserving Co-Forth module syntax tree. This is deliberately a
 /// frontend representation rather than typed IR: definition boundaries and
-/// body atoms are retained with their original byte spans, and lowering never
+/// body nodes are retained with their original byte spans, and lowering never
 /// serializes or reparses a definition body. Structured control/literal nodes
-/// can replace atoms incrementally without changing the IR boundary.
+/// can replace unresolved words incrementally without changing the IR boundary.
 #[derive(Debug, Clone)]
 struct ForthModuleAst {
     definitions: Vec<ForthDefinitionAst>,
@@ -44,7 +44,7 @@ struct ForthBodyAst {
 
 #[derive(Debug, Clone)]
 enum ForthBodyNode {
-    Atom(Token),
+    Word(ForthWordAst),
     Literal(ForthLiteralAst),
     Quotation(ForthQuotationAst),
 }
@@ -52,11 +52,17 @@ enum ForthBodyNode {
 impl ForthBodyNode {
     fn leading_token(&self) -> &Token {
         match self {
-            Self::Atom(token) => token,
+            Self::Word(word) => &word.token,
             Self::Literal(literal) => &literal.token,
             Self::Quotation(quotation) => &quotation.open,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ForthWordAst {
+    token: Token,
+    name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -638,7 +644,8 @@ fn lower_forth_ast_body_with_locals(
             continue;
         }
         let origin = origin(source_id, source, token.start, token.end);
-        if let TokenValue::Word(word) = &token.value {
+        if let ForthBodyNode::Word(word_node) = &body.nodes[token_index] {
+            let word = &word_node.name;
             if word == "[']" {
                 let Some(target) = tokens.get(token_index + 1) else {
                     return Err(vec![control_error(
@@ -2586,7 +2593,7 @@ fn parse_forth_module(
 
 /// Structure quotation ownership during parsing rather than rediscovering it
 /// while emitting IR. Incomplete or list-shaped brackets deliberately remain
-/// ordinary atoms so the existing typed-list diagnostics stay authoritative.
+/// unresolved words so the existing typed-list diagnostics stay authoritative.
 fn parse_forth_body(atoms: &[Token]) -> ForthBodyAst {
     let mut nodes = Vec::new();
     let mut cursor = 0;
@@ -2609,7 +2616,13 @@ fn parse_forth_body(atoms: &[Token]) -> ForthBodyAst {
                 value,
             }));
         } else {
-            nodes.push(ForthBodyNode::Atom(atoms[cursor].clone()));
+            let TokenValue::Word(name) = &atoms[cursor].value else {
+                unreachable!("all non-word token values are parser-owned literals");
+            };
+            nodes.push(ForthBodyNode::Word(ForthWordAst {
+                token: atoms[cursor].clone(),
+                name: name.clone(),
+            }));
         }
         cursor += 1;
     }
@@ -3836,10 +3849,11 @@ mod tests {
             .expect("quotation syntax should parse before semantic lowering");
         assert_eq!(ast.body.nodes.len(), 2);
         assert!(matches!(ast.body.nodes[0], ForthBodyNode::Quotation(_)));
-        let ForthBodyNode::Atom(execute) = &ast.body.nodes[1] else {
+        let ForthBodyNode::Word(execute) = &ast.body.nodes[1] else {
             panic!("the word after a quotation should remain the adjacent body node");
         };
-        assert_eq!(&source[execute.start..execute.end], "execute");
+        assert_eq!(&source[execute.token.start..execute.token.end], "execute");
+        assert_eq!(execute.name, "execute");
     }
 
     #[test]
@@ -3867,7 +3881,10 @@ mod tests {
                 TypedValue::Json(serde_json::json!({"ok": true})),
             ]
         );
-        assert!(matches!(ast.body.nodes[5], ForthBodyNode::Atom(_)));
+        let ForthBodyNode::Word(dup) = &ast.body.nodes[5] else {
+            panic!("non-literal words should remain explicit unresolved word nodes");
+        };
+        assert_eq!(dup.name, "dup");
     }
 
     #[test]
