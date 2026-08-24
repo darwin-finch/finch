@@ -520,7 +520,7 @@ impl ProgramRuntime {
             Box::pin(async move {
                 let grant_ceiling = scheduled_vm_grants(&task.context)?;
                 let language = ProgramLanguage::infer_source(&task.task);
-                let outcome = runtime
+                let mut outcome = runtime
                     .submit_typed_only_with_grant_ceiling(ProgramSubmission {
                         language,
                         source_id: Some(format!("scheduled-callback.{}", language.as_str())),
@@ -533,8 +533,34 @@ impl ProgramRuntime {
                         budget: None,
                     }, grant_ceiling)
                     .await?;
+                // A stack-neutral yield is a local scheduling boundary, so a
+                // callback can cooperatively slice CPU work without becoming
+                // a permanently parked task. Any other suspension needs the
+                // future daemon approval/I/O/message lifecycle; do not leave
+                // an invisible continuation behind while TaskScheduler
+                // retries the source text.
+                while outcome.status == ExecutionStatus::Suspended
+                    && matches!(
+                        runtime.pending_typed_execution(outcome.execution_id)?.map(|pending| pending.reason),
+                        Some(PendingTypedReason::Yielded)
+                    )
+                {
+                    tokio::task::yield_now().await;
+                    outcome = runtime.resume_typed_execution(outcome.execution_id).await?;
+                }
                 if !matches!(outcome.status, ExecutionStatus::Completed) {
-                    anyhow::bail!("scheduled callback did not complete: {:?}", outcome.status);
+                    let pending = runtime
+                        .cancel_typed_execution_with_outcome(outcome.execution_id)?;
+                    let diagnostic = pending
+                        .as_ref()
+                        .and_then(|cancelled| cancelled.diagnostics.first())
+                        .cloned()
+                        .or_else(|| outcome.diagnostics.first().cloned())
+                        .unwrap_or_else(|| format!("scheduled callback ended as {:?}", outcome.status));
+                    anyhow::bail!(
+                        "scheduled callback did not complete: {:?}: {diagnostic}",
+                        outcome.status
+                    );
                 }
                 Ok(outcome.output)
             })
@@ -5516,6 +5542,36 @@ mod tests {
         runtime.attach_schedule_queue(Arc::clone(&queue));
         let scheduler = runtime.task_scheduler().expect("scheduler is attached");
         scheduler.run_once().await.unwrap();
+        assert!(queue.get_ready_tasks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_scheduler_reenters_cooperative_yielded_callbacks() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
+        queue
+            .enqueue(ScheduledTask {
+                id: None,
+                scheduled_time: chrono::Utc::now(),
+                task: "yield 42".into(),
+                context: scheduled_vm_context(TypedRuntime::new().grants().clone()).unwrap(),
+                recurring: None,
+                status: TaskStatus::Pending,
+                created_at: chrono::Utc::now(),
+                last_run: None,
+                retries: 0,
+            })
+            .await
+            .unwrap();
+        let runtime = Arc::new(ProgramRuntime::new());
+        runtime.attach_schedule_queue(Arc::clone(&queue));
+
+        runtime
+            .task_scheduler()
+            .expect("scheduler is attached")
+            .run_once()
+            .await
+            .unwrap();
         assert!(queue.get_ready_tasks().await.unwrap().is_empty());
     }
 
