@@ -169,6 +169,10 @@ pub struct SharedBrainStore {
     runtimes: Arc<RwLock<HashMap<String, Arc<crate::runtime::ProgramRuntime>>>>,
     runtime_checkpoints:
         Arc<RwLock<HashMap<String, crate::vm::TypedRuntimeCheckpoint>>>,
+    /// One ordered turn lane per Brain. HTTP/WebSocket clients may submit
+    /// concurrently, but accepted input, VM commit, and its Result event must
+    /// remain an indivisible sequence against the authoritative revision.
+    execution_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl SharedBrainStore {
@@ -199,11 +203,33 @@ impl SharedBrainStore {
             brains: Arc::new(RwLock::new(HashMap::new())),
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
+            execution_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn environment(&self) -> &BrainEnvironment {
         &self.environment
+    }
+
+    pub(crate) fn execution_lock(&self, name: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        let name = Self::validate_name(name)?;
+        if let Some(lock) = self
+            .execution_locks
+            .read()
+            .expect("shared brain execution-lock map poisoned")
+            .get(name)
+            .cloned()
+        {
+            return Ok(lock);
+        }
+        let mut locks = self
+            .execution_locks
+            .write()
+            .expect("shared brain execution-lock map poisoned");
+        Ok(locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone())
     }
 
     pub fn validate_name(name: &str) -> Result<&str> {
@@ -592,6 +618,29 @@ mod tests {
             .unwrap();
         assert_eq!(first.try_recv().unwrap(), event);
         assert_eq!(second.try_recv().unwrap(), event);
+    }
+
+    #[tokio::test]
+    async fn attached_clients_share_one_ordered_turn_lane_per_brain() {
+        let store = SharedBrainStore::with_root("box.local", None);
+        let first = store.execution_lock("brain").unwrap();
+        let same_brain = store.execution_lock("brain").unwrap();
+        let other_brain = store.execution_lock("other").unwrap();
+        assert!(Arc::ptr_eq(&first, &same_brain));
+        assert!(!Arc::ptr_eq(&first, &other_brain));
+
+        let first_turn = first.lock_owned().await;
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let waiting = tokio::spawn(async move {
+            let _second_turn = same_brain.lock_owned().await;
+            entered_tx.send(()).unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(entered_rx.try_recv().is_err());
+
+        drop(first_turn);
+        entered_rx.recv().await.unwrap();
+        waiting.await.unwrap();
     }
 
     #[tokio::test]

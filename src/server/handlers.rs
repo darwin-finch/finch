@@ -244,6 +244,14 @@ async fn push_named_brain_event(
     use crate::brain::shared::BrainEventKind;
 
     check_brain_access(&server, addr, &headers).await?;
+    // A Brain is one ordered conversation and one authoritative VM revision.
+    // Hold its lane from input acceptance through the corresponding result so
+    // two attached consoles cannot race commits or interleave turn events.
+    let execution_lock = server
+        .shared_brains()
+        .execution_lock(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let _turn = execution_lock.lock_owned().await;
     let accepted = server
         .shared_brains()
         .push(&name, &request.sender, request.kind.clone())
