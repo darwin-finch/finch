@@ -887,11 +887,33 @@ impl Compiler<'_> {
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
             ),
-            "defer" => self.compile_defer(&items[1..], builder),
-            "defer-cpu" => self.compile_defer_cpu(&items[1..], builder),
-            "task-poll" => self.compile_cpu_task_operation(&items[1..], builder, false),
-            "task-join" => self.compile_cpu_task_operation(&items[1..], builder, true),
-            "task-cancel" => self.compile_cpu_task_cancel(&items[1..], builder),
+            "defer" => self.compile_defer(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
+            "defer-cpu" => self.compile_defer_cpu(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
+            "task-poll" => self.compile_cpu_task_operation(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+                false,
+            ),
+            "task-join" => self.compile_cpu_task_operation(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+                true,
+            ),
+            "task-cancel" => self.compile_cpu_task_cancel(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             "list" => self.compile_list_value(&items[1..], builder),
             "map" => self.compile_map_value(&items[1..], builder),
             "empty-map" => self.compile_empty_map(&items[1..], builder),
@@ -957,6 +979,7 @@ impl Compiler<'_> {
     fn compile_defer_cpu(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 1 {
@@ -965,7 +988,11 @@ impl Compiler<'_> {
                 "defer-cpu requires exactly one zero-argument closure",
             )]);
         }
-        let closure_type = self.compile_expression(&expressions[0], builder)?;
+        let closure_type = self.compile_expression_at(
+            &expressions[0],
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?;
         let Type::Function {
             arguments,
             result,
@@ -999,6 +1026,7 @@ impl Compiler<'_> {
     fn compile_defer(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 2 {
@@ -1009,7 +1037,11 @@ impl Compiler<'_> {
         }
         match &expressions[0] {
             Val::Symbol(mode) if mode == ":cpu" => {
-                self.compile_defer_cpu(&expressions[1..], builder)
+                self.compile_defer_cpu(
+                    &expressions[1..],
+                    expression_sources.and_then(|sources| sources.get(1..)),
+                    builder,
+                )
             }
             Val::Symbol(mode) => Err(vec![self.error(
                 "E-FIBER-019",
@@ -1025,6 +1057,7 @@ impl Compiler<'_> {
     fn compile_cpu_task_operation(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
         join: bool,
     ) -> Result<Type, Vec<VmDiagnostic>> {
@@ -1035,7 +1068,11 @@ impl Compiler<'_> {
                 format!("{name} requires exactly one task<T>"),
             )]);
         }
-        let task_type = self.compile_expression(&expressions[0], builder)?;
+        let task_type = self.compile_expression_at(
+            &expressions[0],
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?;
         let Type::Task(result) = task_type else {
             return Err(vec![self.error(
                 if join { "E-FIBER-010" } else { "E-FIBER-009" },
@@ -1057,6 +1094,7 @@ impl Compiler<'_> {
     fn compile_cpu_task_cancel(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 1 {
@@ -1064,7 +1102,11 @@ impl Compiler<'_> {
                 self.error("E-FIBER-020", "task-cancel requires exactly one task<T>")
             ]);
         }
-        let task_type = self.compile_expression(&expressions[0], builder)?;
+        let task_type = self.compile_expression_at(
+            &expressions[0],
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?;
         if !matches!(task_type, Type::Task(_)) {
             return Err(vec![
                 self.error("E-FIBER-020", "task-cancel requires task<T>")
@@ -3040,6 +3082,23 @@ mod tests {
                 .expect("exact source span");
             assert_eq!(&source[span.start_byte..span.end_byte], "missing");
         }
+    }
+
+    #[test]
+    fn deferred_closure_diagnostics_keep_nested_source_spans() {
+        let source = "(defer :cpu (lambda () missing))";
+        let errors = compile_lisp("defer.lisp", source, Vec::new(), &core_vocabulary())
+            .expect_err("deferred closure contains an unbound name");
+        let missing = errors
+            .iter()
+            .find(|error| error.code == "E-NAME-001")
+            .expect("unbound deferred-closure diagnostic");
+        let span = missing
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("exact source span");
+        assert_eq!(&source[span.start_byte..span.end_byte], "missing");
     }
 
     #[test]
