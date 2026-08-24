@@ -83,11 +83,6 @@ struct Args {
     #[arg(long = "session", short = 's')]
     session: Option<String>,
 
-    /// Connect to a remote finch peer at host:port and join their session.
-    /// This machine's peer loops will exchange messages with the remote.
-    /// Example: finch --peer 192.168.1.42:8000
-    #[arg(long = "peer")]
-    peer: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -1188,10 +1183,6 @@ async fn main() -> Result<()> {
     let _ = (session_name, session_id); // available for future use (daemon routing, shared stacks)
 
     let mut repl = Repl::new(config, claude_client, router, metrics_logger, daemon_client).await;
-
-    if !args.peer.is_empty() {
-        repl.set_peers(args.peer.clone());
-    }
 
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
     let restore_session = args.restore_session.or_else(|| {
@@ -3290,6 +3281,7 @@ mod tests {
         assert!(Args::try_parse_from(["finch", "coforth", "run", "--code", "1 2 +"])
             .is_err());
         assert!(Args::try_parse_from(["finch", "exchange", "list"]).is_err());
+        assert!(Args::try_parse_from(["finch", "--peer", "peer.example:8000"]).is_err());
     }
 
     #[test]

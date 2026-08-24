@@ -94,7 +94,6 @@ impl EventHandler {
             ReplEvent::ShowDialog { .. } => {}
             ReplEvent::PosetComplete { .. } => {}
             ReplEvent::LispResult { .. } => {}
-            ReplEvent::PeerMessage { .. } => {}
             ReplEvent::RemoteBrainMessage { .. } => {}
             ReplEvent::RemoteBrainError { .. }
             | ReplEvent::RemoteBrainDisconnected { .. }

@@ -171,10 +171,6 @@ pub enum ReplEvent {
     /// The event loop adds them to the Forth VM's peer list and shows a notice.
     /// (host, port, friendly_name, token)
     /// A message arrived from the peer event loop (the AI's own loop).
-    PeerMessage {
-        text: String,
-    },
-
     /// Snapshot or live event from the currently attached named brain.
     RemoteBrainMessage {
         target: String,

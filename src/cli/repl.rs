@@ -185,8 +185,6 @@ pub struct Repl {
     // Enable mDNS peer auto-discovery at startup
     auto_discover: bool,
 
-    // Remote peer daemon addresses from --peer flag (host:port).
-    peer_hosts: Vec<String>,
 }
 
 /// Adjectives used for session labels
@@ -761,13 +759,7 @@ impl Repl {
             auto_compact_enabled,
             brain_enabled,
             auto_discover,
-            peer_hosts: Vec::new(),
         }
-    }
-
-    /// Set remote peer addresses to connect to at REPL startup.
-    pub fn set_peers(&mut self, hosts: Vec<String>) {
-        self.peer_hosts = hosts;
     }
 
     /// Set the IPC client for daemon communication (must be called inside a LocalSet).
@@ -1815,7 +1807,6 @@ impl Repl {
             } else {
                 None
             },
-            self.peer_hosts.clone(),
             self.daemon_client
                 .as_ref()
                 .map(|c| c.base_url().to_string()),

@@ -265,9 +265,6 @@ pub struct EventLoop {
     /// From config.features.auto_compact_enabled. Default: true.
     auto_compact_enabled: bool,
 
-    /// Remote peer daemon addresses (host:port) from --peer flag.
-    remote_peers: Vec<String>,
-
     /// Explicit destination for prompts and VM programs while attached.
     /// This is singular by design: host effects are never broadcast.
     active_remote_brain: Option<crate::brain::remote::RemoteBrainClient>,
@@ -275,10 +272,6 @@ pub struct EventLoop {
     /// Base URL of the local daemon (e.g. "http://127.0.0.1:8000").
     /// Used by the cross-machine relay poller.
     daemon_base_url: Option<String>,
-
-    /// Mirror of peer_inbox — cloned into remote-peer bridge tasks so they can
-    /// forward local peer responses back to the remote machine.
-    peer_inbox_mirror_tx: tokio::sync::broadcast::Sender<(String, String)>,
 
     /// Provider used by the brain (background context-gathering agent).
     /// `None` when the brain is disabled (config flag) or no cloud provider is available.
@@ -333,21 +326,13 @@ pub struct EventLoop {
     /// Stored so the user can re-plan without losing the word.
     plan_word: Option<String>,
 
-    /// Broadcast sender — pushes code to ALL peer event loops simultaneously.
+    /// Local transport for the legacy diff-review event store.
     peer_tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
 
-    /// Sender half of the explicit remote-peer inbox.
-    peer_inbox_tx: tokio::sync::mpsc::UnboundedSender<(Uuid, String, String)>,
-
-    /// Shared inbox — receives `(id, name, text)` replies from all peers.
-    peer_inbox_rx: tokio::sync::mpsc::UnboundedReceiver<(Uuid, String, String)>,
-
-    /// In-memory store of pending diff proposals in the room.
+    /// In-memory store of pending diff proposals.
     diff_store: DiffStore,
 
-    /// Broadcast receiver that sees every SessionEvent sent on peer_tx.
-    /// Used to intercept Diff/DiffEdit/DiffAccept/DiffReject events from peers
-    /// without routing them through the plain-text peer_inbox_rx.
+    /// Receiver for local Diff/DiffEdit/DiffAccept/DiffReject events.
     peer_session_rx: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
 
     // ── LLM worker loop channel ───────────────────────────────────────────
@@ -645,7 +630,6 @@ impl EventLoop {
         enable_summarization: bool,
         auto_compact_enabled: bool,
         brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
-        remote_peers: Vec<String>,
         daemon_base_url: Option<String>,
         provider_resolver: crate::runtime::scheduler::ProviderResolver,
         agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
@@ -750,12 +734,8 @@ impl EventLoop {
             )
         };
 
-        // Peer channels remain idle until an explicit remote peer is connected.
-        let (peer_inbox_tx, peer_inbox_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(Uuid, String, String)>();
         let (peer_tx, peer_session_rx) =
             tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
-        let (peer_inbox_mirror_tx, _) = tokio::sync::broadcast::channel::<(String, String)>(128);
 
         Self {
             event_rx,
@@ -822,14 +802,10 @@ impl EventLoop {
             poset,
             plan_word: None,
             peer_tx,
-            peer_inbox_tx,
-            peer_inbox_rx,
             diff_store: DiffStore::new(),
             peer_session_rx,
-            remote_peers,
             active_remote_brain: None,
             daemon_base_url,
-            peer_inbox_mirror_tx,
             llm_tx,
             llm_rx: Some(llm_rx),
         }
@@ -841,11 +817,6 @@ impl EventLoop {
         // Signal that the TUI owns the terminal so proposal editors perform a
         // complete terminal-protocol handoff before launching $VISUAL/$EDITOR.
         crate::set_tui_active(true);
-
-        // ── Connect to remote peers (--peer flag) ────────────────────────────
-        // For each remote daemon address: establish a bidirectional WS bridge so
-        // the remote machine participates in this session's peer loop.
-        self.bridge_remote_peers().await;
 
         // ── Startup header (Claude Code style) ───────────────────────────────
         // Clear accumulated startup noise from the output manager, then print a
@@ -1086,7 +1057,6 @@ impl EventLoop {
                         ReplEvent::PosetComplete { result: Err(_) } => "PosetComplete(err)",
                         ReplEvent::LispResult { result: Ok(_) } => "LispResult(ok)",
                         ReplEvent::LispResult { result: Err(_) } => "LispResult(err)",
-                        ReplEvent::PeerMessage { .. } => "PeerMessage",
                         ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
                         ReplEvent::RemoteBrainDisconnected { .. } => "RemoteBrainDisconnected",
@@ -1284,14 +1254,6 @@ impl EventLoop {
                 // Periodic cleanup
                 _ = cleanup_interval.tick() => {
                     self.cleanup_old_queries().await;
-                }
-
-                // Peer reply — one of the forked event loops responded
-                Some((id, name, text)) = self.peer_inbox_rx.recv() => {
-                    let _ = id; // available for filtering if needed
-                    let _ = self.event_tx.send(ReplEvent::PeerMessage { text: format!("{name}: {text}") });
-                    // Mirror to remote peers so they can see our peer responses.
-                    let _ = self.peer_inbox_mirror_tx.send((name, text));
                 }
 
                 // Structured session events from peers (Diff proposals, edits, accepts, rejects)
@@ -2912,13 +2874,6 @@ Rules:\n\
                     self.render_tui().await?;
                 }
             }
-            ReplEvent::PeerMessage { text } => {
-                use crossterm::style::Stylize;
-                self.output_manager
-                    .write_info(text.as_str().cyan().to_string());
-                self.render_tui().await?;
-            }
-
             ReplEvent::ShowDialog {
                 dialog: _,
                 response_tx,
@@ -3447,241 +3402,6 @@ Rules:\n\
             // chat item. The adjacent Program/Result events are its visible
             // projection.
             BrainEventKind::RuntimeCommitted { .. } => {}
-        }
-    }
-
-    /// Establish WebSocket bridges to all addresses in `self.remote_peers`.
-    ///
-    /// For each remote daemon at `host:port`:
-    /// 1. Connect to `ws://host:port/v1/session/ws?from=<local-daemon-addr>`.
-    /// 2. Spawn a task that forwards `peer_tx` broadcasts to the remote (so the
-    ///    remote machine executes our Forth programs and replies).
-    /// 3. Spawn a task that receives the remote's `Chat` replies and routes them
-    ///    to `peer_inbox_tx` so they appear alongside the in-process peer responses.
-    /// 4. Spawn a task that forwards local `peer_inbox_mirror` (our in-process
-    ///    peer responses) back to the remote so it can observe our session.
-    ///
-    /// Additionally, start a background poller that:
-    /// - Drains `GET /v1/session/relay-drain` every 300 ms to capture messages from
-    ///   remote peers that connected TO our daemon (i.e., machines that ran
-    ///   `finch --peer <this-machine>`).
-    /// - Polls `GET /v1/peer/announced` for newly arrived remote peers and connects
-    ///   back to them symmetrically.
-    async fn bridge_remote_peers(&mut self) {
-        let daemon_base = self.daemon_base_url.clone();
-
-        // ── Outbound connections (we dial the remote) ─────────────────────────
-        for peer_addr in self.remote_peers.clone() {
-            let ws_url = match &daemon_base {
-                Some(base) => {
-                    // Strip http:// prefix to get host:port for the ?from= param.
-                    let my_addr: &str = base
-                        .trim_start_matches("http://")
-                        .trim_start_matches("https://");
-                    format!("ws://{peer_addr}/v1/session/ws?from={my_addr}")
-                }
-                None => format!("ws://{peer_addr}/v1/session/ws"),
-            };
-
-            let peer_tx = self.peer_tx.clone();
-            let peer_inbox_tx = self.peer_inbox_tx.clone();
-            let mut mirror_rx = self.peer_inbox_mirror_tx.subscribe();
-            let addr = peer_addr.clone();
-
-            tokio::spawn(async move {
-                match crate::session::transport::connect(&ws_url).await {
-                    Ok(crate::session::SessionBus {
-                        tx: ws_tx,
-                        rx: mut ws_rx,
-                    }) => {
-                        tracing::info!("joined remote peer {addr}");
-
-                        // Remote → local inbox: their peer loop responses appear as our peers.
-                        let inbox = peer_inbox_tx.clone();
-                        let a2 = addr.clone();
-                        let ws_tx2 = ws_tx.clone();
-                        tokio::spawn(async move {
-                            while let Some(ev) = ws_rx.recv().await {
-                                if let crate::session::SessionEvent::Chat { text } = ev {
-                                    if !text.is_empty() {
-                                        let id = uuid::Uuid::new_v4();
-                                        let name =
-                                            format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
-                                        let _ = inbox.send((id, name, text));
-                                    }
-                                }
-                            }
-                        });
-
-                        // Our in-process peer responses → remote (mirror).
-                        let ws_tx3 = ws_tx.clone();
-                        tokio::spawn(async move {
-                            while let Ok((name, text)) = mirror_rx.recv().await {
-                                let ev =
-                                    crate::session::SessionEvent::chat(format!("{name}: {text}"));
-                                if ws_tx3.send(ev).await.is_err() {
-                                    break;
-                                }
-                            }
-                        });
-
-                        // Our peer_tx broadcasts → remote (so they execute our Forth programs).
-                        let mut bcast_rx = peer_tx.subscribe();
-                        while let Ok(ev) = bcast_rx.recv().await {
-                            if ws_tx.send(ev).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!("--peer {addr}: connect failed: {e}"),
-                }
-            });
-        }
-
-        // ── Background poller: relay-drain + announced peers ──────────────────
-        if let Some(base) = daemon_base {
-            let base: String = base;
-            let peer_inbox_tx = self.peer_inbox_tx.clone();
-            let peer_tx = self.peer_tx.clone();
-            let mirror_tx = self.peer_inbox_mirror_tx.clone();
-            let initial_known: std::collections::HashSet<String> =
-                self.remote_peers.iter().cloned().collect();
-
-            let drain_url = format!("{base}/v1/session/relay-drain");
-            let announced_url = format!("{base}/v1/peer/announced");
-            let bcast_url2 = format!("{base}/v1/session/relay-broadcast");
-
-            tokio::spawn(async move {
-                let http = reqwest::Client::new();
-                let drain_url = drain_url;
-                let announced_url = announced_url;
-                let mut known = initial_known;
-                let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
-
-                loop {
-                    interval.tick().await;
-
-                    // Drain messages from remote peers that connected TO our daemon.
-                    if let Ok(resp) = http
-                        .get(&drain_url)
-                        .timeout(std::time::Duration::from_secs(1))
-                        .send()
-                        .await
-                    {
-                        if let Ok(msgs) = resp.json::<Vec<(String, String)>>().await {
-                            for (from, text) in msgs {
-                                let id = uuid::Uuid::new_v4();
-                                let _ = peer_inbox_tx.send((id, from, text));
-                            }
-                        }
-                    }
-
-                    // Check for newly announced peers; connect back symmetrically.
-                    if let Ok(resp) = http
-                        .get(&announced_url)
-                        .timeout(std::time::Duration::from_secs(1))
-                        .send()
-                        .await
-                    {
-                        if let Ok(addrs) = resp.json::<Vec<String>>().await {
-                            for addr in addrs {
-                                if known.contains(&addr) {
-                                    continue;
-                                }
-                                known.insert(addr.clone());
-
-                                let ws_url = format!("ws://{addr}/v1/session/ws?from=relay");
-                                let ptx = peer_tx.clone();
-                                let pib = peer_inbox_tx.clone();
-                                let mut mirror_rx2 = mirror_tx.subscribe();
-                                let a = addr.clone();
-
-                                tokio::spawn(async move {
-                                    if let Ok(crate::session::SessionBus {
-                                        tx: ws_tx,
-                                        rx: mut ws_rx,
-                                    }) = crate::session::transport::connect(&ws_url).await
-                                    {
-                                        tracing::info!("connected back to announced peer {a}");
-
-                                        // Their replies → our inbox.
-                                        let pib2 = pib;
-                                        let a2 = a.clone();
-                                        let ws_tx2 = ws_tx.clone();
-                                        tokio::spawn(async move {
-                                            while let Some(ev) = ws_rx.recv().await {
-                                                let display = match ev {
-                                                    crate::session::SessionEvent::Chat { text } if !text.is_empty() => {
-                                                        Some(text)
-                                                    }
-                                                    crate::session::SessionEvent::ChannelMessage { channel, sender, bundle } => {
-                                                        let primary = bundle.primary();
-                                                        let comment = if bundle.comments.is_empty() {
-                                                            String::new()
-                                                        } else {
-                                                            format!("  \\ {}", bundle.comments.join("; "))
-                                                        };
-                                                        Some(format!("{channel} {sender}: {}{comment}", primary.code))
-                                                    }
-                                                    _ => None,
-                                                };
-                                                if let Some(text) = display {
-                                                    let id = uuid::Uuid::new_v4();
-                                                    let name = format!(
-                                                        "peer@{}",
-                                                        a2.split(':').next().unwrap_or(&a2)
-                                                    );
-                                                    let _ = pib2.send((id, name, text));
-                                                }
-                                            }
-                                        });
-
-                                        // Our mirror → them.
-                                        let ws_tx3 = ws_tx.clone();
-                                        tokio::spawn(async move {
-                                            while let Ok((name, text)) = mirror_rx2.recv().await {
-                                                let ev = crate::session::SessionEvent::chat(
-                                                    format!("{name}: {text}"),
-                                                );
-                                                if ws_tx3.send(ev).await.is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        });
-
-                                        // Our broadcasts → them.
-                                        let mut bcast_rx = ptx.subscribe();
-                                        while let Ok(ev) = bcast_rx.recv().await {
-                                            if ws_tx.send(ev).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Bridge peer_tx → POST /v1/session/relay-broadcast so remote peers
-            // that connected TO our daemon also receive our broadcasts.
-            let bcast_url = bcast_url2;
-            let mut bcast_rx = self.peer_tx.subscribe();
-            tokio::spawn(async move {
-                let http = reqwest::Client::new();
-                while let Ok(ev) = bcast_rx.recv().await {
-                    if let crate::session::SessionEvent::Chat { ref text } = ev {
-                        let body = serde_json::json!({ "text": text });
-                        let _ = http
-                            .post(&bcast_url)
-                            .json(&body)
-                            .timeout(std::time::Duration::from_millis(500))
-                            .send()
-                            .await;
-                    }
-                }
-            });
         }
     }
 
