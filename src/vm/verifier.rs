@@ -260,7 +260,15 @@ impl<'a> Verifier<'a> {
                 stack.push(Type::Record(fields.clone()));
             }
             Instruction::RecordGet { field, value_type } => {
-                let record = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let field_name = stack.pop().ok_or_else(|| underflow(origin, 2, 0))?;
+                if field_name != Type::String {
+                    return Err(VmDiagnostic::type_mismatch(
+                        Type::String,
+                        field_name,
+                        Some(origin.clone()),
+                    ));
+                }
+                let record = stack.pop().ok_or_else(|| underflow(origin, 2, 1))?;
                 let Type::Record(fields) = record else {
                     return Err(VmDiagnostic::error(
                         "E-RECORD-004",

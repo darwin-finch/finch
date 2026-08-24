@@ -57,16 +57,19 @@ then
 
 `{ ... }` constructs an immutable heterogeneous record. `name:` is a syntax
 label (not a stack value), so every label must have exactly one following value. Project a known
-field with `record-get:<name>`; it produces `option<T>` and can be checked with `unwrap` or the
+field with `"name" record-get`; it produces `option<T>` and can be checked with `unwrap` or the
 typed option branch forms:
 
 ```forth
-{ name: "Ada" age: 37 } record-get:age unwrap  \ leaves 37
-{ name: "Ada" age: 37 } 38 "age" record-set record-get:age unwrap  \ leaves 38
+{ name: "Ada" age: 37 } "age" record-get unwrap  \ leaves 37
+{ name: "Ada" age: 37 } 38 "age" record-set "age" record-get unwrap  \ leaves 38
 ```
 
 `record-set` creates a new record; it does not mutate the original value. Its final field name is
 a literal string, and the replacement must have the field's statically known type.
+
+`record-get:<name>` remains accepted as compatibility syntax, but new programs should use the
+ordinary stack spelling `"name" record-get`.
 
 `case` is a typed integer switch with no fallthrough. Each `of ... endof` arm and the optional
 `otherwise` arm must leave the same stack row. The selector is removed before an arm begins;

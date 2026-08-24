@@ -508,13 +508,35 @@ impl<'a> VmTrampoline<'a> {
                     Ok(None)
                 }
                 Instruction::RecordGet { field, value_type } => {
+                    let Some(TypedValue::String(field_name)) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-027",
+                                DiagnosticPhase::Interpretation,
+                                "record field projection requires a field-name string",
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    };
+                    if field_name != field {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-028",
+                                DiagnosticPhase::Interpretation,
+                                format!("record projection field '{field_name}' does not match verified field '{field}'"),
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    }
                     let Some(record) = continuation.stack.pop() else {
                         return VmStep::Failed(self.underflow(&located.origin, &continuation));
                     };
                     let TypedValue::Record(fields) = record else {
                         return VmStep::Failed(self.with_trace(
                             VmDiagnostic::error(
-                                "E-RUNTIME-028",
+                                "E-RUNTIME-029",
                                 DiagnosticPhase::Interpretation,
                                 "record field projection requires a typed record",
                                 Some(located.origin),

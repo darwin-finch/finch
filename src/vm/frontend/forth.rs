@@ -495,12 +495,71 @@ fn compile_forth_body_with_locals(
                 };
                 let value_type = value_type.clone();
                 stack.pop();
+                stack.push(Type::String);
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::Constant {
+                        value: TypedValue::String(field.to_owned()),
+                    },
+                    origin.clone(),
+                );
+                stack.pop();
                 stack.push(Type::Option(Box::new(value_type.clone())));
                 emit(
                     &mut blocks,
                     current,
                     Instruction::RecordGet {
                         field: field.to_owned(),
+                        value_type,
+                    },
+                    origin,
+                );
+                token_index += 1;
+                continue;
+            }
+            if word == "record-get" {
+                let Some(Token {
+                    value: TokenValue::String(field),
+                    ..
+                }) = tokens.get(token_index.wrapping_sub(1)) else {
+                    return Err(vec![control_error(
+                        "E-RECORD-004",
+                        "record-get requires a literal string field name immediately before it",
+                        origin,
+                    )]);
+                };
+                if stack.len() < 2 {
+                    return Err(vec![control_error(
+                        "E-RECORD-004",
+                        "record-get requires a typed record followed by a literal field name",
+                        origin,
+                    )]);
+                }
+                let record_index = stack.len() - 2;
+                let Type::Record(fields) = &stack[record_index] else {
+                    return Err(vec![control_error(
+                        "E-RECORD-004",
+                        "record-get requires a typed record below the field name",
+                        origin,
+                    )]);
+                };
+                let Some((_, value_type)) = fields.iter().find(|(name, _)| name == field) else {
+                    return Err(vec![control_error(
+                        "E-RECORD-005",
+                        format!("record has no field '{field}'"),
+                        origin,
+                    )]);
+                };
+                let value_type = value_type.clone();
+                stack.pop();
+                stack.pop();
+                stack.push(Type::Option(Box::new(value_type.clone())));
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::RecordGet {
+                        field: field.clone(),
                         value_type,
                     },
                     origin,
@@ -2558,7 +2617,7 @@ mod tests {
     fn constructs_and_projects_heterogeneous_typed_records() {
         let module = compile_forth(
             "record.forth",
-            "{ name: \"Ada\" age: 37 } record-get:name unwrap",
+            "{ name: \"Ada\" age: 37 } \"name\" record-get unwrap",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -2571,7 +2630,7 @@ mod tests {
 
         let invalid = compile_forth(
             "record-invalid.forth",
-            "{ name: \"Ada\" } record-get:age",
+            "{ name: \"Ada\" } \"age\" record-get",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -2580,7 +2639,7 @@ mod tests {
 
         let updated = compile_forth(
             "record-update.forth",
-            "{ name: \"Ada\" age: 37 } 38 \"age\" record-set record-get:age unwrap",
+            "{ name: \"Ada\" age: 37 } 38 \"age\" record-set \"age\" record-get unwrap",
             Vec::new(),
             &core_vocabulary(),
         )

@@ -1350,6 +1350,16 @@ impl Compiler<'_> {
                 "record-get requires a typed record",
             )]);
         };
+        let field_type = self.compile_expression_at(
+            &expressions[1],
+            expression_sources.and_then(|sources| sources.get(1)),
+            builder,
+        )?;
+        if field_type != Type::String {
+            return Err(vec![self.error(
+                "E-RECORD-004", "record-get field name must be a literal string",
+            )]);
+        }
         let Some((_, value_type)) = fields.iter().find(|(name, _)| name == field) else {
             return Err(vec![self.error(
                 "E-RECORD-005",
@@ -1357,6 +1367,7 @@ impl Compiler<'_> {
             )]);
         };
         let value_type = value_type.clone();
+        builder.stack.pop();
         builder.stack.pop();
         builder.emit(
             Instruction::RecordGet {

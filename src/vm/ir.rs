@@ -87,9 +87,11 @@ pub enum Instruction {
     MakeRecord {
         fields: Vec<(String, Type)>,
     },
-    /// Project a statically named record field. The optional result makes a
-    /// missing field explicit at the language boundary even though verified
-    /// source normally cannot request a field absent from its record type.
+    /// Project a statically named record field. The field-name string remains
+    /// on the stack for normal concatenative calling convention, though the
+    /// frontend has already proven it matches `field`. The optional result
+    /// makes a missing field explicit at the language boundary even though
+    /// verified source normally cannot request an absent field.
     RecordGet {
         field: String,
         value_type: Type,

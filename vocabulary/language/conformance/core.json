@@ -60,14 +60,14 @@
     },
     {
       "name": "typed-record-construction-and-projection",
-      "forth": "{ name: \"Ada\" age: 37 } record-get:age unwrap",
+      "forth": "{ name: \"Ada\" age: 37 } \"age\" record-get unwrap",
       "lisp": "(unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))",
       "expected_values": [{ "type": "int", "value": 37 }],
       "expected_output": ""
     },
     {
       "name": "immutable-typed-record-update",
-      "forth": "{ name: \"Ada\" age: 37 } 38 \"age\" record-set record-get:age unwrap",
+      "forth": "{ name: \"Ada\" age: 37 } 38 \"age\" record-set \"age\" record-get unwrap",
       "lisp": "(unwrap (record-get (record-set { :name \"Ada\" :age 37 } \"age\" 38) \"age\"))",
       "expected_values": [{ "type": "int", "value": 38 }],
       "expected_output": ""
