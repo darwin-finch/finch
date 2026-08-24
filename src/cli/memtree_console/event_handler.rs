@@ -97,7 +97,9 @@ impl EventHandler {
             ReplEvent::VocabSync(_) => {}
             ReplEvent::PeerMessage { .. } => {}
             ReplEvent::RemoteBrainMessage { .. } => {}
-            ReplEvent::RemoteBrainError { .. } | ReplEvent::AgentLifecycle(_) => {}
+            ReplEvent::RemoteBrainError { .. }
+            | ReplEvent::RemoteBrainDisconnected { .. }
+            | ReplEvent::AgentLifecycle(_) => {}
         }
 
         Ok(())

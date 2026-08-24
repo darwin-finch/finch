@@ -182,6 +182,12 @@ pub enum ReplEvent {
         target: String,
         error: String,
     },
+    /// The named-Brain WebSocket ended. Retain the attachment identity so
+    /// later input cannot silently fall back to the local Brain, but make the
+    /// offline runner state explicit in the status/UI.
+    RemoteBrainDisconnected {
+        target: String,
+    },
 
 }
 

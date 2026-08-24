@@ -1983,6 +1983,7 @@ impl EventLoop {
                         ReplEvent::PeerMessage { .. } => "PeerMessage",
                         ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
+                        ReplEvent::RemoteBrainDisconnected { .. } => "RemoteBrainDisconnected",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -4174,6 +4175,22 @@ Rules:\n\
                 self.output_manager.write_info(format!("{target}: {error}"));
                 self.render_tui().await?;
             }
+            ReplEvent::RemoteBrainDisconnected { target } => {
+                let is_current = self
+                    .active_remote_brain
+                    .as_ref()
+                    .is_some_and(|client| client.target.display_name() == target);
+                if is_current {
+                    self.status_bar.update_line(
+                        crate::cli::status_bar::StatusLineType::SessionLabel,
+                        format!("◆ brain: {target} · driver · runner offline"),
+                    );
+                    self.output_manager.write_info(format!(
+                        "{target}: runner connection closed; detach or reattach to reconnect"
+                    ));
+                    self.render_tui().await?;
+                }
+            }
             ReplEvent::PeerMessage { text } => {
                 use crossterm::style::Stylize;
                 // Channel messages are tagged with a sentinel that may be preceded
@@ -4600,6 +4617,9 @@ Rules:\n\
                     break;
                 }
             }
+            let _ = event_tx.send(ReplEvent::RemoteBrainDisconnected {
+                target: target_name,
+            });
         });
         Ok(())
     }
