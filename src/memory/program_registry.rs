@@ -37,12 +37,7 @@ impl MemorySystem {
         let extension = definition.language.as_str();
         let filename = format!("{}.{extension}", safe_program_filename(&definition.name));
         let path = authored_root.join(filename);
-        write_program_source(
-            &path,
-            definition.language,
-            definition.effect,
-            &definition.source,
-        )?;
+        write_program_source(&path, &definition.source)?;
 
         let mut indexed =
             ProgramDefinition::from_source_file(&path, &root, definition.scope)?;
@@ -255,21 +250,8 @@ fn safe_program_filename(name: &str) -> String {
     }
 }
 
-fn write_program_source(
-    path: &Path,
-    language: ProgramLanguage,
-    effect: ExecutionEffect,
-    source: &str,
-) -> Result<()> {
-    let comment = match language {
-        ProgramLanguage::Forth => "\\",
-        ProgramLanguage::Lisp => ";",
-    };
-    let mut normalized = if source.lines().any(|line| line.contains("finch-effect:")) {
-        source.to_string()
-    } else {
-        format!("{comment} finch-effect: {}\n{source}", effect.as_str())
-    };
+fn write_program_source(path: &Path, source: &str) -> Result<()> {
+    let mut normalized = source.to_string();
     if !normalized.ends_with('\n') {
         normalized.push('\n');
     }
@@ -550,7 +532,7 @@ mod tests {
             .join("vocabulary/programs/generated/triple.lisp");
         assert_eq!(
             std::fs::read_to_string(source_path).unwrap(),
-            "; finch-effect: unclassified\n(define (triple x) (* x 3))\n"
+            "(define (triple x) (* x 3))\n"
         );
     }
 

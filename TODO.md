@@ -201,10 +201,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   remain quarantined. The native Lisp evaluator and effectful standard library are now removed;
   only its neutral reader syntax tree remains for direct lowering to shared IR. The interactive
   event loop no longer replays the obsolete `lisp_env` table; its reader remains migration-only
-  until older databases have been projected into the typed program registry. The outer provider
-  tool gate no longer trusts a submitted coarse `ExecutionEffect`: every `submit_program` enters
-  the typed broker, whose verified requirements and grants are the sole host-authority decision.
-  Explicit `finch-effect` comments remain non-authoritative registry/review metadata only.
+  until older databases have been projected into the typed program registry. Source-text effect
+  inference and generated `finch-effect` comments are removed: unverified/imported definitions are
+  conservatively `unclassified`, while explicit typed registry metadata survives independently of
+  source. The outer provider tool gate no longer trusts a submitted coarse `ExecutionEffect`:
+  every `submit_program` enters the typed broker, whose verified requirements and grants are the
+  sole host-authority decision.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth

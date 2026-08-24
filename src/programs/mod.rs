@@ -712,7 +712,6 @@ impl ProgramDefinition {
         source: impl Into<String>,
     ) -> Self {
         let source = source.into();
-        let effect = declared_effect(&source, language).unwrap_or(ExecutionEffect::Unclassified);
         Self {
             reference: ProgramRef {
                 id: Uuid::new_v4(),
@@ -724,7 +723,9 @@ impl ProgramDefinition {
             source,
             documentation: String::new(),
             signature: None,
-            effect,
+            // A candidate has not yet been verified. Do not infer authority or
+            // even review metadata from source spelling/comments.
+            effect: ExecutionEffect::Unclassified,
             capabilities: Vec::new(),
             dependencies: Vec::new(),
             tests: Vec::new(),
@@ -797,8 +798,7 @@ impl ProgramDefinition {
                 .filter(|documentation| !documentation.is_empty())
                 .unwrap_or_else(|| "Persisted Lisp definition".to_string()),
             signature,
-            effect: declared_effect(source, ProgramLanguage::Lisp)
-                .unwrap_or(ExecutionEffect::Unclassified),
+            effect: ExecutionEffect::Unclassified,
             capabilities: Vec::new(),
             dependencies: Vec::new(),
             tests: Vec::new(),
@@ -844,7 +844,6 @@ impl ProgramDefinition {
         };
         let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
         let identity = format!("{}:{}:{relative}", scope.as_str(), root.display());
-        let effect = declared_effect(&source, language).unwrap_or(ExecutionEffect::Unclassified);
         Ok(Self {
             reference: ProgramRef {
                 id: Uuid::new_v5(&Uuid::NAMESPACE_URL, identity.as_bytes()),
@@ -856,7 +855,9 @@ impl ProgramDefinition {
             documentation: leading_documentation(&source, language),
             source,
             signature,
-            effect,
+            // Import is conservative until typed compilation supplies
+            // registry metadata; source comments are never effect inference.
+            effect: ExecutionEffect::Unclassified,
             capabilities: Vec::new(),
             dependencies: Vec::new(),
             tests: Vec::new(),
@@ -1100,20 +1101,6 @@ fn leading_documentation(source: &str, language: ProgramLanguage) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn declared_effect(source: &str, language: ProgramLanguage) -> Option<ExecutionEffect> {
-    use std::str::FromStr;
-
-    source.lines().take(16).find_map(|line| {
-        let line = line.trim();
-        let comment = match language {
-            ProgramLanguage::Forth => line.strip_prefix('\\'),
-            ProgramLanguage::Lisp => line.strip_prefix(';'),
-        }?;
-        let value = comment.trim().strip_prefix("finch-effect:")?.trim();
-        ExecutionEffect::from_str(value).ok()
-    })
 }
 
 #[cfg(test)]
@@ -1386,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_effect_is_declared_in_language_comment() {
+    fn source_comments_cannot_declare_effect_metadata() {
         let forth = ProgramDefinition::candidate(
             "double",
             ProgramLanguage::Forth,
@@ -1397,9 +1384,9 @@ mod tests {
             ProgramLanguage::Lisp,
             "; finch-effect: workspace_read\n(define (files root) root)",
         );
-        assert_eq!(forth.effect, ExecutionEffect::Pure);
-        assert_eq!(lisp.effect, ExecutionEffect::WorkspaceRead);
-        assert!(forth.effect.runs_autonomously());
+        assert_eq!(forth.effect, ExecutionEffect::Unclassified);
+        assert_eq!(lisp.effect, ExecutionEffect::Unclassified);
+        assert!(!forth.effect.runs_autonomously());
     }
 
     #[test]
