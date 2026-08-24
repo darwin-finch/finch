@@ -62,6 +62,8 @@ the full closed type, selected tag, and optional payload type.
 Safe projection also shares one IR operation: Lisp `(variant-get value :some)` and Co-Forth
 `value variant-get<some>` return `option<int>`. A matching payload-free tag returns `some(unit)`;
 a different tag returns `none`.
+Lisp's exhaustive closed-variant `match` is syntax over `VariantGet`, ordinary option branches,
+locals, and verified merge edges; Co-Forth can compose those same public operations directly.
 
 Structured option branches are part of the common semantics: Co-Forth `if-some ... else ... then`
 and Lisp `(match-option option (some name ...) (none ...))` both lower to typed branch edges. The

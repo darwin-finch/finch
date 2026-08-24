@@ -160,6 +160,17 @@ The full type prevents an isolated tag value from losing the other alternatives 
 exhaustive checking.
 `(variant-get value :some)` safely returns `option<int>` for the example type. A payload-free tag
 returns `option<unit>`, allowing the same operation to support ordinary exhaustive branching.
+Closed variants support exhaustive patterns. Payload tags bind one name; payload-free tags do not:
+
+```lisp
+(match value
+  (none 0)
+  (some number (+ number 1)))
+```
+
+Every declared tag must appear exactly once and every arm must produce the same type. Use the
+explicit `match-variant` spelling when tag names intentionally collide with built-in option/result
+patterns such as `some` followed by `none`.
 
 Records may contain ordinary typed closure values, which makes an immutable object-style value
 possible without a second object runtime. Method invocation remains explicit: project, unwrap, and

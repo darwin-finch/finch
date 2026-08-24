@@ -1027,6 +1027,11 @@ impl Compiler<'_> {
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
             ),
+            "match-variant" => self.compile_variant_match(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             "match-option" => self.compile_match_option(
                 &items[1..],
                 source_children.as_deref().and_then(|children| children.get(1..)),
@@ -2167,7 +2172,218 @@ impl Compiler<'_> {
         {
             return self.compile_record_match(expressions, expression_sources, builder);
         }
+        if expressions[1..].iter().all(|arm| {
+            arm_marker(arm).is_some_and(|marker| {
+                !matches!(marker.as_str(), "true" | "false" | "_")
+            })
+        }) {
+            return self.compile_variant_match(expressions, expression_sources, builder);
+        }
         self.compile_literal_match(expressions, expression_sources, builder)
+    }
+
+    /// Exhaustively match a closed variant through the public `VariantGet`
+    /// operation. Every declared tag must occur exactly once; payload tags
+    /// bind one lexical name while payload-free tags bind nothing.
+    fn compile_variant_match(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let Some((variant_expression, arms)) = expressions.split_first() else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-014",
+                "variant match requires a value and one exhaustive arm per tag",
+            )]);
+        };
+        if arms.is_empty() {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-014",
+                "variant match requires one exhaustive arm per tag",
+            )]);
+        }
+        let Type::Variant(variants) = self.compile_expression_at(
+            variant_expression,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )? else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-014",
+                "variant patterns require a statically typed closed variant",
+            )]);
+        };
+
+        let mut parsed = Vec::with_capacity(arms.len());
+        let mut seen = HashSet::new();
+        for arm in arms {
+            let Val::List(items) = arm else {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-014",
+                    "variant arms must be (tag body...) or (tag binding body...)",
+                )]);
+            };
+            let Some(Val::Symbol(marker)) = items.first() else {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-014",
+                    "variant arm tags must be literal symbols",
+                )]);
+            };
+            let tag = marker.strip_prefix(':').unwrap_or(marker);
+            let Some((_, payload_type)) = variants.iter().find(|(name, _)| name == tag) else {
+                return Err(vec![self.error(
+                    "E-VARIANT-002",
+                    format!("variant has no tag '{tag}'"),
+                )]);
+            };
+            if !seen.insert(tag.to_string()) {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-014",
+                    format!("variant tag '{tag}' is matched more than once"),
+                )]);
+            }
+            let (binding, body_start) = if payload_type.is_some() {
+                let Some(Val::Symbol(binding)) = items.get(1) else {
+                    return Err(vec![self.error(
+                        "E-LISP-MATCH-014",
+                        format!("variant tag '{tag}' requires a payload binding"),
+                    )]);
+                };
+                (Some(binding.clone()), 2)
+            } else {
+                (None, 1)
+            };
+            if items.len() <= body_start {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-014",
+                    format!("variant tag '{tag}' requires a non-empty body"),
+                )]);
+            }
+            parsed.push((tag.to_string(), payload_type.clone(), binding, body_start));
+        }
+        if seen.len() != variants.len()
+            || variants.iter().any(|(tag, _)| !seen.contains(tag))
+        {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-014",
+                "variant match must cover every declared tag exactly once",
+            )]);
+        }
+
+        let variant_type = Type::Variant(variants.clone());
+        let variant_local = builder.allocate_local(variant_type.clone());
+        builder.stack.pop();
+        builder.emit(
+            Instruction::LocalSet { index: variant_local },
+            self.origin("match/variant"),
+        );
+        let branch_stack = builder.stack.clone();
+        let merge_block = builder.new_block();
+        let mut merged: Option<(Type, Vec<Type>)> = None;
+
+        for (arm_index, (tag, payload_type, binding, body_start)) in
+            parsed.into_iter().enumerate()
+        {
+            builder.emit(
+                Instruction::LocalGet { index: variant_local },
+                self.origin(format!("match/variant/{tag}")),
+            );
+            builder.emit(
+                Instruction::VariantGet {
+                    variants: variants.clone(),
+                    tag: tag.clone(),
+                    payload_type: payload_type.clone(),
+                },
+                self.origin(format!("match/variant/{tag}")),
+            );
+            builder.emit(Instruction::Dup, self.origin("match/variant/test"));
+            builder.emit(
+                Instruction::Call {
+                    function: "is-some".into(),
+                },
+                self.origin("match/variant/test"),
+            );
+            let arm_block = builder.new_block();
+            let next_block = builder.new_block();
+            builder.emit(
+                Instruction::Branch {
+                    then_block: arm_block,
+                    else_block: next_block,
+                },
+                self.origin("match/variant/test"),
+            );
+
+            builder.switch_to(arm_block, branch_stack.clone());
+            builder.emit(
+                Instruction::Call {
+                    function: "unwrap".into(),
+                },
+                self.origin(format!("match/variant/{tag}")),
+            );
+            let mut scope = HashMap::new();
+            if let Some(payload_type) = payload_type {
+                builder.stack.push(payload_type.clone());
+                if binding.as_deref() == Some("_") {
+                    builder.stack.pop();
+                    builder.emit(Instruction::Drop, self.origin("match/variant/_"));
+                } else {
+                    let binding = binding.expect("payload arm has a binding");
+                    let index = builder.allocate_local(payload_type.clone());
+                    builder.stack.pop();
+                    builder.emit(
+                        Instruction::LocalSet { index },
+                        self.origin(binding.clone()),
+                    );
+                    scope.insert(binding, Binding::Local { index, ty: payload_type });
+                }
+            } else {
+                builder.emit(Instruction::Drop, self.origin("match/variant/unit"));
+            }
+            builder.scopes.push(scope);
+            let Val::List(arm_items) = &arms[arm_index] else {
+                unreachable!("variant arms were validated as lists");
+            };
+            let body = &arm_items[body_start..];
+            let body_sources = expression_sources
+                .and_then(|sources| sources.get(arm_index + 1))
+                .and_then(|source| Self::source_list_children(source, arm_items))
+                .and_then(|sources| sources.get(body_start..));
+            let arm_type = self.compile_begin(body, body_sources, builder)?;
+            builder.scopes.pop();
+            builder.stack.push(arm_type.clone());
+            let arm_stack = builder.stack.clone();
+            if let Some((expected_type, expected_stack)) = &merged {
+                if expected_type != &arm_type || expected_stack != &arm_stack {
+                    return Err(vec![VmDiagnostic::type_mismatch(
+                        expected_type.clone(),
+                        arm_type,
+                        Some(self.origin("match/variant")),
+                    )]);
+                }
+            } else {
+                merged = Some((arm_type, arm_stack));
+            }
+            builder.emit(
+                Instruction::Jump { target: merge_block },
+                self.origin(format!("match/variant/{tag}-end")),
+            );
+
+            builder.switch_to(next_block, branch_stack.clone());
+            builder.emit(Instruction::Drop, self.origin("match/variant/miss"));
+            if arm_index + 1 == arms.len() {
+                builder.emit(
+                    Instruction::Trap {
+                        code: "E-VARIANT-006".into(),
+                    },
+                    self.origin("match/variant/impossible-tag"),
+                );
+            }
+        }
+
+        let (result_type, result_stack) = merged.expect("variant match has arms");
+        builder.switch_to(merge_block, result_stack);
+        builder.stack.pop();
+        Ok(result_type)
     }
 
     /// Destructure a statically typed record through the same `record-get`
@@ -4664,6 +4880,45 @@ mod tests {
                 .unwrap(),
             vec![TypedValue::Bool(true)]
         );
+    }
+
+    #[test]
+    fn exhaustively_matches_closed_variants() {
+        assert_eq!(
+            run("(match (variant variant{none|some(int)} :some 41) \
+                         (none 0) \
+                         (some value (+ value 1)))")
+                .unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+        assert_eq!(
+            run("(match (variant variant{idle|busy(string)} :idle) \
+                         (idle 7) \
+                         (busy message (begin message 0)))")
+                .unwrap(),
+            vec![TypedValue::Int(7)]
+        );
+        assert_eq!(
+            run("(match-variant (variant variant{some(int)|none} :some 21) \
+                                 (some value (* value 2)) \
+                                 (none 0))")
+                .unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+    }
+
+    #[test]
+    fn variant_match_rejects_non_exhaustive_or_malformed_arms() {
+        for source in [
+            "(match (variant variant{none|some(int)} :none) (none 0))",
+            "(match (variant variant{none|some(int)} :none) (none 0) (none 1))",
+            "(match (variant variant{none|some(int)} :some 1) (none 0) (some))",
+            "(match (variant variant{none|some(int)} :some 1) (none 0) (some value))",
+        ] {
+            let errors = compile_lisp("variant-match.lisp", source, Vec::new(), &core_vocabulary())
+                .expect_err("invalid variant patterns must not compile");
+            assert_eq!(errors[0].code, "E-LISP-MATCH-014", "source: {source}");
+        }
     }
 
     #[test]
