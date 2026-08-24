@@ -221,6 +221,23 @@ Implement adapters for in-process calls, Cap'n Proto IPC, HTTP/WebSocket, and fu
 peer RPC. Handlers perform decoding, authentication, and presentation only; lifecycle logic stays in
 the service.
 
+### Local frontend/daemon contract
+
+The local Finch frontend and daemon are separate processes, so their normal control and event path
+is a versioned Cap'n Proto contract over the Unix socket.  It is the binary local representation of
+`BrainService`, not merely a faster encoding of a few legacy RPC methods.  In particular, the
+schema must carry structured `BrainEvent` records, attachment cursors, role/lease state,
+`ProgramRun` snapshots/outcomes, and correlated typed VM records equivalent to
+`VmEffectEnvelope { execution_id, sequence, kind, arguments, origin }` and
+`VmResume { execution_id, sequence, response }`.
+
+Do not make Cap'n Proto the VM's internal value representation or require every embedder to use it.
+The runtime stays transport-neutral and HTTP/WebSocket remain suitable remote adapters.  But the
+local CLI/daemon boundary must not fall back to free-form JSON event payloads for state that the
+daemon has to validate, replay, or resume.  The existing legacy `AnyPointer`/JSON event path is a
+migration compatibility surface; B4 replaces it with explicit versioned schema fields and
+cross-transport conformance fixtures.
+
 Every mutating request includes `BrainId`, caller identity, expected Brain revision, environment
 generation, and an idempotency key. Names are aliases resolved to IDs, not durable identity.
 
@@ -313,6 +330,8 @@ Exit: every background activity has identical lifecycle and ancestry semantics.
 ### B4: One service, multiple transports
 
 - Implement `BrainService` once.
+- Version the Cap'n Proto frontend/daemon schema for typed Brain events, attachment cursors, run
+  outcomes, and VM effect/resume correlation; eliminate its JSON-shaped lifecycle payloads.
 - Convert HTTP, WebSocket, Cap'n Proto, daemon client, remote client, and embedded mode into adapters.
 - Remove duplicated route/IPC spawn orchestration.
 

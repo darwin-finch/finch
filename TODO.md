@@ -140,6 +140,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
+  When the later Brain gate opens, make the normal local frontend/daemon path a versioned Cap'n
+  Proto projection of those structured records (including attachment cursors and effect/resume
+  correlation), not a free-form JSON event bus; HTTP/WebSocket remain remote adapters.
 - [x] Complete the fiber/task split: `(defer :cpu (lambda () ...))` / `defer-cpu` has private-stack,
   immutable-capture CPU work with typed `task<T>` poll/join/cancel operations. A running join
   suspends the parent VM continuation rather than blocking the event loop; CPU fibers reject
