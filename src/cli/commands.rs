@@ -177,7 +177,9 @@ impl Command {
             "/license" | "/license status" => return Some(Command::LicenseStatus),
             "/license remove" => return Some(Command::LicenseRemove),
             // Brain sessions
-            "/brains" | "/brains list" => return Some(Command::Brains),
+            "/brains" | "/brains list" | "/brain list" | "/brain ls" => {
+                return Some(Command::Brains);
+            }
             "/brain detach" => return Some(Command::BrainDetach),
             "/brain password" => return Some(Command::BrainPassword(None)),
             "/graph" => return Some(Command::Graph),
@@ -953,7 +955,7 @@ pub fn format_help() -> String {
          {yellow_bold}🧠 Daemon Brain Sessions:{reset}\n\
          {cyan}  /brain <task>{reset}      Spawn a background research brain\n\
          {gray}                     Example: /brain investigate why auth tests are flaky{reset}\n\
-         {cyan}  /brains{reset}            List active brain sessions\n\
+         {cyan}  /brain list{reset}        List active brain sessions ({gray}/brains{reset} also works)\n\
          {cyan}  /brain cancel <n>{reset}  Cancel a brain by name or id\n\
          {cyan}  /brain attach <brain@machine>{reset}  Attach to a named remote brain\n\
          {cyan}  /brain detach{reset}      Return to this local session\n\
@@ -1137,6 +1139,9 @@ mod tests {
             Command::parse("/brain password new-secret-value"),
             Some(Command::BrainPassword(Some(password))) if password == "new-secret-value"
         ));
+        assert!(matches!(Command::parse("/brain list"), Some(Command::Brains)));
+        assert!(matches!(Command::parse("/brain ls"), Some(Command::Brains)));
+        assert!(format_help().contains("/brain list"));
     }
 
     #[test]
