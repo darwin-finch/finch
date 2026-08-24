@@ -262,13 +262,21 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 ## TUI and tool presentation
 
 - [ ] Batch model-authored edits into one explicit multi-file changeset/proposal and request one
-  approval before applying it to the real workspace. Use a Finch-owned `GIT_EXTERNAL_DIFF` adapter
-  to turn each tracked-file comparison from one bracketed `git diff` invocation into typed diff
-  records associated with the same proposal ID; explicitly include untracked creations because Git
-  does not send them through the external-diff hook. The proposal coordinator—not the environment
-  variable—owns atomic apply/reject/request-changes, editor co-editing, stale-base detection, and
-  the final aggregate added/removed counts. Small edits may still auto-apply only when an explicit
-  capability/policy grant permits that workflow.
+  approval before applying it to the real workspace. Keep the familiar model-facing edit/write
+  tools, but make them target a per-run proposal overlay by default: later reads, searches, and test
+  processes in that run see the overlay, while the user's workspace remains unchanged. Multiple
+  edit calls are internal proposal events: update one live summary WorkUnit instead of committing a
+  stream of intermediate per-file diffs to scrollback, then present the aggregate multi-file diff at
+  the review boundary. User comments and requested changes resume the proposal's agent/run against
+  the same executable overlay and create a new proposal revision; accept applies the final complete
+  changeset atomically, reject discards it, and `$EDITOR` co-editing is optional rather than the only
+  review UI. Use a Finch-owned `GIT_EXTERNAL_DIFF` adapter to turn each tracked-file
+  comparison from one bracketed `git diff` invocation into typed diff records associated with the
+  same proposal ID; explicitly include untracked creations because Git does not send them through
+  the external-diff hook. The proposal coordinator—not the environment variable—owns atomic
+  apply/reject/request-changes, stale-base/three-way-conflict handling, and final aggregate counts.
+  Immediate real-workspace writes require an explicit task/session autonomous-write policy grant,
+  so users can deliberately choose delegation without making disengagement the default UX.
 - [ ] Render edit/write tool results as structured diffs rather than unstyled text: show a stable
   `Edited path (+added -removed)` title, retained context and line numbers, green backgrounds for
   additions, red backgrounds for removals, and neutral styling for unchanged context. Feed typed
