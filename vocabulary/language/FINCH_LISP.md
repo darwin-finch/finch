@@ -101,9 +101,19 @@ final `_` arm. These are statically typed branch forms, not dynamic dispatch:
   (_ 0))
 ```
 
-Integer literal arms must be unique, and `_` must be the final arm. Strings, records, lists, and
-arbitrary JSON have no general pattern matcher yet: use their explicit typed operations rather than
-falling back to a dynamic dispatcher.
+Integer literal arms must be unique, and `_` must be the final arm. A statically typed record has
+one total destructuring arm whose `(field binding)` pairs may select any known subset; `_` validates
+a field without binding it:
+
+```lisp
+(match { :name "Ada" :age 37 }
+  (record ((name who) (age years))
+    (+ years 5))) ; => 42
+```
+
+This is syntax over the same `record-get` plus typed-local operations available in Co-Forth; it is
+not a Lisp-only runtime matcher. Strings, lists, and arbitrary JSON have no general pattern matcher
+yet: use their explicit typed operations rather than falling back to a dynamic dispatcher.
 
 `{ ... }` constructs a typed immutable product from `:name value` field forms. Each field keeps its own
 type; it is not an untyped JSON object. `record-get` takes a literal field name and returns an

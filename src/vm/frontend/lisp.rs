@@ -2042,7 +2042,182 @@ impl Compiler<'_> {
                 _ => {}
             }
         }
+        if expressions.len() == 2
+            && matches!(arm_marker(&expressions[1]).as_deref(), Some("record"))
+        {
+            return self.compile_record_match(expressions, expression_sources, builder);
+        }
         self.compile_literal_match(expressions, expression_sources, builder)
+    }
+
+    /// Destructure a statically typed record through the same `record-get`
+    /// and `unwrap` operations available to Co-Forth. The single arm is total:
+    /// its field set was proven when the record type was constructed, and a
+    /// pattern may bind any subset without introducing a runtime dispatcher.
+    ///
+    /// ```lisp
+    /// (match person
+    ///   (record ((name who) (age years))
+    ///     (say who)))
+    /// ```
+    fn compile_record_match(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [record_expression, arm] = expressions else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-012",
+                "record match requires one (record ((field binding) ...) body...) arm",
+            )]);
+        };
+        let Type::Record(record_fields) = self.compile_expression_at(
+            record_expression,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )? else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-012",
+                "record pattern requires a statically typed record value",
+            )]);
+        };
+
+        let Val::List(arm_items) = arm else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-012",
+                "record match arm must be (record ((field binding) ...) body...)",
+            )]);
+        };
+        let [Val::Symbol(marker), Val::List(patterns), body @ ..] = arm_items.as_slice() else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-012",
+                "record match arm must be (record ((field binding) ...) body...)",
+            )]);
+        };
+        if marker != "record" || body.is_empty() {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-012",
+                "record match arm must be (record ((field binding) ...) body...)",
+            )]);
+        }
+
+        let mut parsed = Vec::with_capacity(patterns.len());
+        let mut seen_fields = HashSet::new();
+        let mut seen_bindings = HashSet::new();
+        for pattern in patterns {
+            let Val::List(pair) = pattern else {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-012",
+                    "record patterns must contain (field binding) pairs",
+                )]);
+            };
+            let [field, Val::Symbol(binding)] = pair.as_slice() else {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-012",
+                    "record patterns must contain (field binding) pairs",
+                )]);
+            };
+            let field = match field {
+                Val::Symbol(field) | Val::Str(field) => field.clone(),
+                _ => {
+                    return Err(vec![self.error(
+                        "E-LISP-MATCH-012",
+                        "record pattern fields must be symbols or literal strings",
+                    )]);
+                }
+            };
+            if !seen_fields.insert(field.clone()) {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-012",
+                    format!("record pattern field '{field}' is listed more than once"),
+                )]);
+            }
+            if binding != "_" && !seen_bindings.insert(binding.clone()) {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-012",
+                    format!("record pattern binding '{binding}' is declared more than once"),
+                )]);
+            }
+            let Some((_, field_type)) = record_fields.iter().find(|(name, _)| name == &field)
+            else {
+                return Err(vec![self.error(
+                    "E-RECORD-005",
+                    format!("record has no field '{field}'"),
+                )]);
+            };
+            parsed.push((field, binding.clone(), field_type.clone()));
+        }
+
+        let record_local = builder.allocate_local(Type::Record(record_fields.clone()));
+        builder.stack.pop();
+        builder.emit(
+            Instruction::LocalSet {
+                index: record_local,
+            },
+            self.origin("match/record"),
+        );
+
+        let mut scope = HashMap::new();
+        for (field, binding, field_type) in parsed {
+            if binding == "_" {
+                continue;
+            }
+            builder.emit(
+                Instruction::LocalGet {
+                    index: record_local,
+                },
+                self.origin(format!("match/record/{field}")),
+            );
+            builder.stack.push(Type::Record(record_fields.clone()));
+            builder.emit(
+                Instruction::Constant {
+                    value: TypedValue::String(field.clone()),
+                },
+                self.origin(format!("match/record/{field}")),
+            );
+            builder.stack.push(Type::String);
+            builder.stack.pop();
+            builder.stack.pop();
+            builder.emit(
+                Instruction::RecordGet {
+                    field: field.clone(),
+                    value_type: field_type.clone(),
+                },
+                self.origin(format!("match/record/{field}")),
+            );
+            builder.stack.push(Type::Option(Box::new(field_type.clone())));
+            builder.stack.pop();
+            builder.emit(
+                Instruction::Call {
+                    function: "unwrap".into(),
+                },
+                self.origin(format!("match/record/{field}")),
+            );
+            builder.stack.push(field_type.clone());
+            let index = builder.allocate_local(field_type.clone());
+            builder.stack.pop();
+            builder.emit(
+                Instruction::LocalSet { index },
+                self.origin(binding.clone()),
+            );
+            scope.insert(
+                binding,
+                Binding::Local {
+                    index,
+                    ty: field_type,
+                },
+            );
+        }
+
+        builder.scopes.push(scope);
+        let body_sources = expression_sources
+            .and_then(|sources| sources.get(1))
+            .and_then(|source| Self::source_list_children(source, arm_items))
+            .and_then(|sources| sources.get(2..));
+        let result = self.compile_begin(body, body_sources, builder);
+        builder.scopes.pop();
+        result
     }
 
     /// Compile the non-dynamic literal subset of `match`.
@@ -2051,9 +2226,9 @@ impl Compiler<'_> {
     /// Integers use zero or more literal arms followed by one required final
     /// `(_ body...)` arm, so every branch remains total and the same typed
     /// merge rules as `if` apply.  This is deliberately not a general runtime
-    /// pattern dispatcher: strings, records, lists, and JSON retain their
-    /// explicit typed operations until their structural patterns have a
-    /// verified lowering design.
+    /// pattern dispatcher: strings, lists, and JSON retain their explicit
+    /// typed operations until their structural patterns have a verified
+    /// lowering design. Records use the total destructuring form above.
     fn compile_literal_match(
         &mut self,
         expressions: &[Val],
@@ -3930,6 +4105,24 @@ mod tests {
             .unwrap(),
             vec![TypedValue::Int(42)]
         );
+        assert_eq!(
+            run(
+                "(match { :name \"Ada\" :age 37 } \
+                   (record ((name who) (age years)) \
+                     (begin who (+ years 5))))",
+            )
+            .unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+
+        let missing_pattern = compile_lisp(
+            "record-pattern.lisp",
+            "(match { :name \"Ada\" } (record ((age years)) years))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("record patterns may only project statically present fields");
+        assert_eq!(missing_pattern[0].code, "E-RECORD-005");
     }
 
     #[test]
@@ -4307,6 +4500,7 @@ mod tests {
         for source in [
             "(match-option (some 1) (some value missing) (none 0))",
             "(match-result (ok 1) (ok value missing) (err problem 0))",
+            "(match { :age 1 } (record ((age years)) missing))",
             "(while true missing)",
         ] {
             let errors = compile_lisp("patterns.lisp", source, Vec::new(), &core_vocabulary())

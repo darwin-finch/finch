@@ -27,15 +27,17 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   statically named option-valued field projection, immutable static field update, and
   insertion-ordered `map-entries` iteration through typed key/value records, homogeneous typed-list
   construction/immutable append in both frontends, direct pasted Co-Forth JSON-object literals,
-  and explicit `json-as-map -> option<map<string,json>>` normalization; still add structured
+  explicit `json-as-map -> option<map<string,json>>` normalization, and total statically checked
+  Lisp record-subset destructuring lowered to shared `record-get`/local IR; still add list/variant
   patterns and row-polymorphic record rules. The deliberate typed brace-record syntax is the only record
   source surface; `json-parse`/`json-get`/scalar option projections remain the safe boundary for
   arbitrary JSON objects rather than exposing the internal `TypedValue::Record` ABI ad hoc.
 - [ ] Extend the implemented typed option/result branches, type-directed Lisp `match`, and
   no-fallthrough integer Co-Forth `case` to richer structured patterns plus expression-valued
   named `break` after the loop verifier is generalized to check each target's declared result
-  stack row. Simple named stack-preserving `break`/`continue` already lower to verified loop
-  edges; do not add unrestricted jumps or C-style fallthrough switches.
+  stack row. Total record subset patterns now bind statically present fields through ordinary
+  shared projection/local operations. Simple named stack-preserving `break`/`continue` already
+  lower to verified loop edges; do not add unrestricted jumps or C-style fallthrough switches.
 - [x] Add explicit typed result propagation after branch forms are stable: Lisp `try` and
   Co-Forth `?` early-return an `err` only from a function whose sole declared output is a
   compatible `result<T,E>`. The verifier checks the cold return edge, the interpreter unwinds the

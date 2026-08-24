@@ -115,6 +115,13 @@
       "expected_output": ""
     },
     {
+      "name": "typed-record-destructuring",
+      "forth": "{ name: \"Ada\" age: 37 } \"age\" record-get unwrap 5 +",
+      "lisp": "(match { :name \"Ada\" :age 37 } (record ((name who) (age years)) (begin who (+ years 5))))",
+      "expected_values": [{ "type": "int", "value": 42 }],
+      "expected_output": ""
+    },
+    {
       "name": "metered-loop-exit",
       "forth": "begin true until 7",
       "lisp": "(begin (while false 1) 7)",

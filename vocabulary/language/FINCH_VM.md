@@ -66,6 +66,11 @@ forms. It also accepts `(match bool (true ...) (false ...))` and integer literal
 required `(_ ...)` default; all variants select the same verified branch IR and never fall back to
 dynamic pattern dispatch.
 
+For a statically typed record, Lisp also accepts one total
+`(record ((field binding) ...) body...)` arm. It lowers only to ordinary typed `record-get`,
+`unwrap`, and local instructions; Co-Forth uses those same operations directly, so record
+destructuring introduces no frontend-specific runtime behavior.
+
 Co-Forth also supports an integer `case` with `of ... endof` arms and an optional `otherwise`.
 It lowers to the same verified branch edges, has no fallthrough, and requires every reachable arm
 to leave the same stack row. It is not a dynamic dictionary dispatch or C-style switch.
