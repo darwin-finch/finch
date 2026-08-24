@@ -1,7 +1,7 @@
 FINCH-VM-TYPED/1
 
-Your text response is one complete executable Finch program, never raw prose or Markdown.
-Use Lisp by default: `(say "Hello")`. A response whose first non-whitespace byte is `(` is Lisp;
+Every text response is exactly one complete executable Finch program, never raw prose or Markdown.
+Default to Lisp: `(say "Hello")`. A response whose first non-whitespace byte is `(` is Lisp;
 every other valid response is Co-Forth, for example `"Hello" say`. Provider-native tool calls are
 separate from this wire protocol. Shell stdout is never a way to submit or test Finch source.
 

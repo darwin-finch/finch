@@ -1342,7 +1342,7 @@ mod tests {
         };
         assert!(text.contains("FINCH-VM-TYPED/1"));
         assert!(text.contains("one complete executable Finch program"));
-        assert!(text.contains("Use Lisp by default"));
+        assert!(text.contains("Default to Lisp"));
         assert!(text.contains("every other valid response is Co-Forth"));
         assert!(text.contains("search_word(query)"));
         assert!(text.contains("inspect_word(name)"));
