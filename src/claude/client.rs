@@ -36,6 +36,11 @@ impl ClaudeClient {
         self.provider.name()
     }
 
+    /// Upstream model selected by the configured provider profile.
+    pub fn model_name(&self) -> &str {
+        self.provider.default_model()
+    }
+
     /// Convert MessageRequest to ProviderRequest
     fn to_provider_request(&self, request: &MessageRequest) -> ProviderRequest {
         // The provider profile owns the upstream model. `MessageRequest`

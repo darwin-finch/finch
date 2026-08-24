@@ -206,6 +206,10 @@ impl Generator for ClaudeGenerator {
     fn name(&self) -> &str {
         self.client.provider_name()
     }
+
+    fn model_name(&self) -> &str {
+        self.client.model_name()
+    }
 }
 
 #[cfg(test)]

@@ -54,6 +54,10 @@ impl Generator for ProfiledGenerator {
     fn name(&self) -> &str {
         &self.profile_name
     }
+
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
 }
 
 /// Unified generator interface for Claude, Qwen, and future generators
@@ -78,6 +82,12 @@ pub trait Generator: Send + Sync {
 
     /// Get generator name for logging
     fn name(&self) -> &str;
+
+    /// Exact upstream model when it is known before generation. Local or
+    /// compatibility generators may retain the profile name as a fallback.
+    fn model_name(&self) -> &str {
+        self.name()
+    }
 }
 
 /// Generator capabilities (what features are supported)

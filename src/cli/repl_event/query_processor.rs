@@ -245,12 +245,12 @@ async fn execute_wire_with_single_repair(
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
-        generator.name(),
+        generator.model_name(),
         "interactive",
     );
     crate::programs::corpus::capture_from_env(
         generator.name(),
-        generator.name(),
+        generator.model_name(),
         "interactive",
         crate::programs::corpus::WireCorpusAttempt::FirstPass,
         &source,
@@ -343,7 +343,7 @@ async fn execute_wire_with_single_repair(
     let repaired_source = raw_wire_source(&repair.text);
     crate::programs::corpus::capture_from_env(
         generator.name(),
-        generator.name(),
+        generator.model_name(),
         "interactive",
         crate::programs::corpus::WireCorpusAttempt::Repair,
         &repaired_source,
