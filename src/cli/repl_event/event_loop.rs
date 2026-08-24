@@ -2399,6 +2399,7 @@ Rules:\n\
         let executor_guard = tool_executor.lock().await;
 
         if let Some(mcp_client) = executor_guard.mcp_client() {
+            let mcp_client = Arc::clone(mcp_client);
             self.output_manager.write_info("Refreshing MCP tools...");
             self.render_tui().await?;
 
@@ -2406,10 +2407,25 @@ Rules:\n\
                 Ok(()) => {
                     let tools = mcp_client.list_tools().await;
                     *self.tool_definitions.write().await = executor_guard.list_all_tools().await;
-                    self.output_manager.write_info(format!(
-                        "✓ Refreshed MCP tools ({} tools available)",
-                        tools.len()
-                    ));
+                    drop(executor_guard);
+                    match self.program_runtime.bind_mcp_client(mcp_client).await {
+                        Ok(rejected) => {
+                            for diagnostic in &rejected {
+                                tracing::warn!(
+                                    "MCP tool was not published to typed VM after refresh: {diagnostic}"
+                                );
+                            }
+                            self.output_manager.write_info(format!(
+                                "✓ Refreshed MCP tools ({} tools available, {} typed binding{} rejected)",
+                                tools.len(),
+                                rejected.len(),
+                                if rejected.len() == 1 { "" } else { "s" }
+                            ));
+                        }
+                        Err(error) => self.output_manager.write_error(format!(
+                            "MCP tools refreshed, but typed VM vocabulary update failed: {error:#}"
+                        )),
+                    }
                 }
                 Err(e) => {
                     self.output_manager
@@ -2429,17 +2445,33 @@ Rules:\n\
         let tool_executor = self.tool_coordinator.tool_executor();
         let executor_guard = tool_executor.lock().await;
         if let Some(mcp_client) = executor_guard.mcp_client() {
+            let mcp_client = Arc::clone(mcp_client);
             self.output_manager
                 .write_info("Reconnecting to configured MCP servers...");
             mcp_client.reload().await?;
             let servers = mcp_client.list_servers().await;
             let tools = mcp_client.list_tools().await;
             *self.tool_definitions.write().await = executor_guard.list_all_tools().await;
-            self.output_manager.write_info(format!(
-                "✓ Connected to {} MCP server(s) with {} tool(s)",
-                servers.len(),
-                tools.len()
-            ));
+            drop(executor_guard);
+            match self.program_runtime.bind_mcp_client(mcp_client).await {
+                Ok(rejected) => {
+                    for diagnostic in &rejected {
+                        tracing::warn!(
+                            "MCP tool was not published to typed VM after reload: {diagnostic}"
+                        );
+                    }
+                    self.output_manager.write_info(format!(
+                        "✓ Connected to {} MCP server(s) with {} tool(s); {} typed binding{} rejected",
+                        servers.len(),
+                        tools.len(),
+                        rejected.len(),
+                        if rejected.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                Err(error) => self.output_manager.write_error(format!(
+                    "MCP servers reconnected, but typed VM vocabulary update failed: {error:#}"
+                )),
+            }
         } else {
             self.output_manager.write_info("No MCP servers configured.");
         }
