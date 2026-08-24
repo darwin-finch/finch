@@ -693,7 +693,7 @@ impl Compiler<'_> {
                 self.origin("define-parameter"),
             );
         }
-        let result_type = self.compile_begin(definition.body, &mut child)?;
+        let result_type = self.compile_begin(definition.body, None, &mut child)?;
         if let Some(expected) = &definition.return_type {
             if result_type != *expected {
                 return Err(vec![self.error(
@@ -818,9 +818,17 @@ impl Compiler<'_> {
             _ => return self.compile_closure_call(&items[0], &items[1..], builder),
         };
         match operator {
-            "begin" => self.compile_begin(&items[1..], builder),
+            "begin" => self.compile_begin(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             "let" => self.compile_let(&items[1..], builder),
-            "if" => self.compile_if(&items[1..], builder),
+            "if" => self.compile_if(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             "match" => self.compile_match(&items[1..], builder),
             "match-option" => self.compile_match_option(&items[1..], builder),
             "match-result" => self.compile_match_result(&items[1..], builder),
@@ -852,6 +860,7 @@ impl Compiler<'_> {
     fn compile_begin(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.is_empty() {
@@ -863,12 +872,21 @@ impl Compiler<'_> {
             );
             return Ok(Type::Unit);
         }
-        for expression in &expressions[..expressions.len() - 1] {
-            self.compile_expression(expression, builder)?;
+        for (index, expression) in expressions[..expressions.len() - 1].iter().enumerate() {
+            self.compile_expression_at(
+                expression,
+                expression_sources.and_then(|sources| sources.get(index)),
+                builder,
+            )?;
             builder.stack.pop();
             builder.emit(Instruction::Drop, self.origin("begin"));
         }
-        self.compile_expression(&expressions[expressions.len() - 1], builder)?;
+        let last_index = expressions.len() - 1;
+        self.compile_expression_at(
+            &expressions[last_index],
+            expression_sources.and_then(|sources| sources.get(last_index)),
+            builder,
+        )?;
         Ok(builder
             .stack
             .pop()
@@ -1156,7 +1174,7 @@ impl Compiler<'_> {
             );
         }
         builder.scopes.push(scope);
-        let result = self.compile_begin(&expressions[1..], builder);
+        let result = self.compile_begin(&expressions[1..], None, builder);
         builder.scopes.pop();
         result
     }
@@ -1164,6 +1182,7 @@ impl Compiler<'_> {
     fn compile_if(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() != 3 {
@@ -1171,7 +1190,11 @@ impl Compiler<'_> {
                 self.error("E-LISP-005", "if requires condition, then, and else")
             ]);
         }
-        let condition = self.compile_expression(&expressions[0], builder)?;
+        let condition = self.compile_expression_at(
+            &expressions[0],
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?;
         if condition != Type::Bool {
             return Err(vec![VmDiagnostic::type_mismatch(
                 Type::Bool,
@@ -1193,7 +1216,11 @@ impl Compiler<'_> {
         );
 
         builder.switch_to(then_block, branch_stack.clone());
-        let then_type = self.compile_expression(&expressions[1], builder)?;
+        let then_type = self.compile_expression_at(
+            &expressions[1],
+            expression_sources.and_then(|sources| sources.get(1)),
+            builder,
+        )?;
         let then_stack = builder.stack.clone();
         builder.emit(
             Instruction::Jump {
@@ -1203,7 +1230,11 @@ impl Compiler<'_> {
         );
 
         builder.switch_to(else_block, branch_stack);
-        let else_type = self.compile_expression(&expressions[2], builder)?;
+        let else_type = self.compile_expression_at(
+            &expressions[2],
+            expression_sources.and_then(|sources| sources.get(2)),
+            builder,
+        )?;
         if then_type != else_type || builder.stack != then_stack {
             return Err(vec![VmDiagnostic::type_mismatch(
                 then_type,
@@ -1330,7 +1361,7 @@ impl Compiler<'_> {
                 ty: (*inner).clone(),
             },
         )]));
-        let some_type = self.compile_begin(some_body, builder)?;
+        let some_type = self.compile_begin(some_body, None, builder)?;
         builder.scopes.pop();
         builder.stack.push(some_type.clone());
         let some_stack = builder.stack.clone();
@@ -1343,7 +1374,7 @@ impl Compiler<'_> {
 
         builder.switch_to(else_block, branch_stack);
         builder.emit(Instruction::Drop, self.origin("match-option/none"));
-        let none_type = self.compile_begin(none_body, builder)?;
+        let none_type = self.compile_begin(none_body, None, builder)?;
         builder.stack.push(none_type.clone());
         let none_stack = builder.stack.clone();
         if some_type != none_type || some_stack != none_stack {
@@ -1496,7 +1527,7 @@ impl Compiler<'_> {
                 ty: (*ok_type).clone(),
             },
         )]));
-        let ok_result = self.compile_begin(&ok_body, builder)?;
+        let ok_result = self.compile_begin(&ok_body, None, builder)?;
         builder.scopes.pop();
         builder.stack.push(ok_result.clone());
         let ok_stack = builder.stack.clone();
@@ -1528,7 +1559,7 @@ impl Compiler<'_> {
                 ty: (*err_type).clone(),
             },
         )]));
-        let err_result = self.compile_begin(&err_body, builder)?;
+        let err_result = self.compile_begin(&err_body, None, builder)?;
         builder.scopes.pop();
         builder.stack.push(err_result.clone());
         let err_stack = builder.stack.clone();
@@ -1614,7 +1645,7 @@ impl Compiler<'_> {
             exit: exit_block,
             stack: loop_stack.clone(),
         });
-        let body = self.compile_begin(&expressions[condition_index + 1..], builder);
+        let body = self.compile_begin(&expressions[condition_index + 1..], None, builder);
         builder.loops.pop();
         body?;
         builder.emit(Instruction::Drop, self.origin("while/body-result"));
@@ -1766,7 +1797,7 @@ impl Compiler<'_> {
                 self.origin("lambda-parameter"),
             );
         }
-        let result_type = self.compile_begin(&expressions[1..], &mut child)?;
+        let result_type = self.compile_begin(&expressions[1..], None, &mut child)?;
         child.stack.push(result_type.clone());
         child.emit(Instruction::Return, self.origin("lambda-return"));
         let child_function = child.finish(vec![result_type.clone()]);
@@ -2834,6 +2865,23 @@ mod tests {
             .expect("unknown nested call diagnostic");
         let span = unknown.primary.as_ref().and_then(|origin| origin.span.as_ref()).unwrap();
         assert_eq!(&source[span.start_byte..span.end_byte], "unknown");
+    }
+
+    #[test]
+    fn sequence_and_branch_diagnostics_keep_nested_source_spans() {
+        let source = "(begin 1 (if true 2 missing))";
+        let errors = compile_lisp("control.lisp", source, Vec::new(), &core_vocabulary())
+            .expect_err("the else branch has an unbound name");
+        let missing = errors
+            .iter()
+            .find(|error| error.code == "E-NAME-001")
+            .expect("unbound else-branch diagnostic");
+        let span = missing
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("exact source span");
+        assert_eq!(&source[span.start_byte..span.end_byte], "missing");
     }
 
     #[test]
