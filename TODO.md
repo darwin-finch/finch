@@ -428,6 +428,15 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   across tool-result continuations. Keep the unchecked gate items unchecked until their missing
   semantics and fixed cross-provider measurements exist. Do not require the later Cranelift JIT
   optimization tier to begin Brain convergence.
+- [ ] Run report-only replay over retained real provider/model outputs before tightening source
+  rules further. Publish first-pass parse/verify success, repair success/attempts, raw-prose and
+  Markdown leakage, invented words, annotation needs, forward-reference/source-order patterns,
+  inferred capability mismatches, language choice, and tokens per successful ProgramRun by
+  provider/model. Keep the corpus immutable and versioned so syntax and prompt changes can be
+  compared rather than judged from interactive anecdotes.
+
+### Separate language/compiler research track — not a Brain convergence prerequisite
+
 - [ ] After interpreter semantics, parametric HIR, CTFE, monomorphization, and Cranelift differential
   gates are stable, add a separate `finchc` AOT target. It should emit either a pure standalone
   executable with a minimal runtime or a capability-hosted executable linked to the portable
@@ -450,11 +459,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   lifetime, thread-affinity, and effect metadata; raw pointers, variadics, and unchecked descriptor
   access require a distinct unsafe-FFI capability.
 - [ ] Make native performance and application expressiveness measurable release gates. For
-  monomorphized effect-free compute, parsing, collection, and control-flow kernels, compare optimized
-  Finch against checked-in equivalent optimized Rust/C++ using wall time, allocations, peak memory,
-  code size, compile latency, and boundary overhead; keep missing vectorization, escape/alias
-  analysis, bounds-check elimination, and range fusion visible rather than declaring victory when
-  Cranelift emits code. Maintain application-sized Lisp/Co-Forth fixtures demonstrating the same
+  monomorphized effect-free compute, parsing, collection, and control-flow kernels, compare Finch
+  against checked-in interpreter, Cranelift, optimized Rust, and C++ baselines using wall time,
+  allocations, peak memory, code size, compile latency, and boundary overhead. Cranelift is the
+  fast baseline backend, not a promise of Rust-class loop/vector/alias optimization. Treat
+  Rust/C++-class output as a separate long-term optimizing-backend/compiler-research target and do
+  not put it on the Finch Runtime or Brain roadmap until a backend capable of it is selected.
+  Maintain application-sized Lisp/Co-Forth fixtures demonstrating the same
   structural records, variants, closures, parametric functions, concepts, modules, derivation, async
   resources, and range composition expected from a TypeScript-class application language, without
   relying routinely on `dynamic` or giving either frontend privileged semantics.
@@ -466,6 +477,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   normalized IR/native output with complete source/module/runtime/target hashes. Compiler modules
   must use the same public syntax/type/CTFE APIs as other Finch code rather than gaining a hidden
   metaprogramming path.
+
+### Runtime completion gate continues
+
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.

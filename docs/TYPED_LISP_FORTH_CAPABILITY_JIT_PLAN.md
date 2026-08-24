@@ -1433,13 +1433,15 @@ verifies and compiles it locally.
 
 ### Performance and expressiveness targets
 
-Native-code generation is not itself the performance goal. For monomorphized effect-free numeric,
-collection, parsing, and control-flow kernels, optimized Finch should compete in the performance
-class of optimized Rust/C++ on the same machine. Track wall time, allocations, peak resident memory,
-code size, compile latency, and dispatch/host-boundary overhead against checked-in equivalent Rust,
-C++, and interpreter baselines. Publish distributions over representative programs; do not claim
-parity from one arithmetic microbenchmark. Gaps caused by missing vectorization, alias analysis,
-escape analysis, bounds-check elimination, or range fusion remain named compiler work.
+Native-code generation is not itself the performance goal. Cranelift is a low-latency baseline JIT;
+it does not by itself supply the loop optimization, vectorization, and alias analysis behind
+optimized Rust/C++ results. Track wall time, allocations, peak resident memory, code size, compile
+latency, and dispatch/host-boundary overhead against checked-in interpreter, Cranelift, optimized
+Rust, and C++ baselines. The product roadmap requires meaningful wins on measured hot Finch
+programs without harming startup or agent latency. Rust/C++-class output remains a separate
+language/compiler research target that requires an appropriate optimizing backend or substantial
+optimizer work; it is not a Finch Runtime, Brain, or initial Cranelift acceptance gate. Publish
+distributions over representative programs and never claim parity from one arithmetic benchmark.
 
 The source-language expressiveness target is comparable to TypeScript for ordinary application
 modeling—structural records, closed variants, closures, parametric functions, structural concepts,
@@ -1451,6 +1453,11 @@ required annotations, diagnostic quality, first-pass model success, incremental 
 and generated IR as features land. Annotation density is a product metric: common private
 application code should read like a scripting language even though module publication and the
 independent verifier retain complete static signatures.
+
+The following self-hosting, AOT, native-application, and FFI sections are a separate multi-year
+language/compiler track sharing the verified frontend and IR. They must not delay or distort the
+smaller product-critical runtime used for model programs, capabilities, effects, diagnostics, and
+Brains.
 
 ### Eventual self-hosting
 
@@ -1526,12 +1533,19 @@ unsafe FFI boundary, while a typed wrapper may use CTFE packs to present a safe 
 
 ## Implementation work packages
 
+This is a dependency/acceptance map, not current implementation status. Phases 1–6 already have
+substantial implementations; the canonical checked/unchecked status and remaining gates live in
+`TODO.md`. Items below describe contracts that must still be true at each exit, not a claim that
+the phase has not started.
+
 ### Phase 0: Freeze contracts and fixtures
 
-- Write RFCs for value representation, typed signatures, capability selectors, errors, Lisp
-  semantics, and Co-Forth syntax.
+- Reconcile the existing value/signature/capability/error/Lisp/Co-Forth specifications with the
+  implementation and remove stale duplicate contracts.
 - Add canonical language artifact directories and version fields.
 - Capture existing useful Forth/Lisp programs as migration and conformance fixtures.
+- Replay retained real provider outputs without execution and publish failure/repair categories by
+  provider/model before changing declaration order, annotation requirements, or default syntax.
 - Inventory every builtin and assign its current cell effect, intended typed signature, effects,
   suspension behavior, and migration status.
 
