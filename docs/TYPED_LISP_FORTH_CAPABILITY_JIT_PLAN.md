@@ -79,6 +79,28 @@ the same module or an imported module interface. Macros are bounded structured t
 not context-sensitive token reinterpretation. A parser must never need to guess and revisit an
 earlier token after discovering a later declaration.
 
+Single-pass parsing does not mean emitting final IR directly from lexer tokens. Each frontend must
+produce an explicit, span-preserving syntax tree in that one source pass. Lisp already has the
+beginnings of this boundary in `Val` and `SpannedVal`; Co-Forth must replace its predominantly
+token-to-IR compiler with structured nodes for definitions, signatures, quotations, control flow,
+literals, and calls. Syntactic sugar, macros, and other rewrites operate on those nodes, and one
+post-order semantic lowering emits the common typed stack IR. Generated syntax retains both its
+call-site and definition origin and is never converted to text and reparsed.
+
+Keep that pipeline deliberately short:
+
+```text
+source bytes -- one reader/parser pass --> frontend AST
+frontend AST -- one post-order semantic lowering --> typed stack IR
+typed stack IR -- independent security verification --> executable module
+```
+
+Shared lowering helpers enforce Lisp/Co-Forth parity without requiring a generic intermediate tree
+for its own sake. Introduce a shared HIR only when a concrete transformation genuinely needs a
+frontend-neutral structured representation before stack lowering; it must not become an excuse for
+a succession of mandatory compiler passes. Optimization may traverse retained IR and never changes
+the one-pass source contract.
+
 Modules are compilation units, never textual includes. A module has an immutable identity, typed
 imports and exports, a namespace, a compiled interface, IR, source map, and content hash. Importing
 a module links its declared interface/IR; it does not paste source, execute ambient initialization,
