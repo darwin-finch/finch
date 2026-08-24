@@ -1123,15 +1123,13 @@ mod tests {
         let prompt = manifest.prompt_block();
         assert!(prompt.contains("secret-helper"));
         assert!(!prompt.contains("12345"));
-        assert!(prompt.contains("otherwise treats the source as Forth"));
+        assert!(prompt.contains("every other valid response is Co-Forth"));
         assert!(prompt.contains("get_language_definition"));
-        assert!(prompt.contains("\"response\" say"));
-        assert!(prompt.contains("\"\"\"text\"\"\""));
-        assert!(prompt.contains("if-some ... else ... then"));
-        assert!(prompt.contains(": factorial ( S n:int -- S int ! pure )"));
-        assert!(prompt.contains("begin condition while ... repeat"));
-        assert!(prompt.contains("[1, 2, 3]"));
-        assert!(prompt.contains("{\"first name\":\"Ada\"}"));
+        assert!(prompt.contains("\"Hello\" say"));
+        assert!(prompt.contains("search_word(query)"));
+        assert!(prompt.contains("inspect_word(name)"));
+        assert!(prompt.contains(": square ( S int -- S int ! pure )"));
+        assert!(prompt.contains("distance2 ( S x:int y:int -- S int ! pure )"));
         assert!(prompt.contains("Language packages: boot@FINCH-VM-TYPED/1#"));
         assert!(!prompt.contains(".\" response\""));
     }

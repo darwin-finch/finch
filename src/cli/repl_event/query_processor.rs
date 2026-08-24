@@ -1337,13 +1337,13 @@ mod tests {
             panic!("the system message must retain its text block");
         };
         assert!(text.contains("FINCH-VM-TYPED/1"));
-        assert!(text.contains("## Mandatory response shape"));
-        assert!(text.contains("Default to Lisp"));
-        assert!(text.contains("otherwise treats the source as Forth"));
-        assert!(text.contains("(define (factorial (n : int)) : int"));
-        assert!(text.contains("\"response\" say"));
-        assert!(text.contains("s\"response\" say"));
-        assert!(!text.contains(".\" response\""));
+        assert!(text.contains("one complete executable Finch program"));
+        assert!(text.contains("Use Lisp by default"));
+        assert!(text.contains("every other valid response is Co-Forth"));
+        assert!(text.contains("search_word(query)"));
+        assert!(text.contains("inspect_word(name)"));
+        assert!(text.contains("\"Hello\" say"));
+        assert!(text.contains("`s\"text\"` is equivalent"));
         assert!(messages[1].content[0].as_text().is_some_and(|text| text == "add two numbers"));
     }
 
