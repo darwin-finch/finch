@@ -373,6 +373,98 @@ pub(crate) fn compute_cursor_row_from_top(
     total_rows.saturating_sub(1 + rows_below_cursor)
 }
 
+/// Select the newest live transcript rows that fit above the input/status
+/// area. Unlike the old logical-line cap, this budgets actual terminal rows,
+/// so ANSI text and wrapped tool output cannot silently push the cursor origin
+/// out of sync. A visible marker makes clipping explicit; the complete message
+/// is still committed to permanent scrollback when its WorkUnit finishes.
+fn live_viewport_lines(
+    lines: &[String],
+    terminal_width: usize,
+    row_budget: usize,
+) -> (Vec<String>, usize) {
+    let width = terminal_width.max(1);
+    let budget = row_budget.max(1);
+    let total_rows = lines
+        .iter()
+        .map(|line| shadow_buffer::physical_rows(line, width))
+        .sum::<usize>();
+    if total_rows <= budget {
+        return (lines.to_vec(), 0);
+    }
+
+    // Reserve one physical row for an honest clipping marker.
+    let mut remaining = budget.saturating_sub(1);
+    let mut selected = Vec::new();
+    let mut selected_rows = 0usize;
+    for line in lines.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let rows = shadow_buffer::physical_rows(line, width);
+        if rows <= remaining {
+            selected.push(line.clone());
+            remaining -= rows;
+            selected_rows += rows;
+        } else {
+            let fragment = visible_tail(line, remaining.saturating_mul(width));
+            if !fragment.is_empty() {
+                selected_rows += shadow_buffer::physical_rows(&fragment, width);
+                selected.push(fragment);
+            }
+            break;
+        }
+    }
+    selected.reverse();
+    let omitted_rows = total_rows.saturating_sub(selected_rows);
+    let marker = format!("… {omitted_rows} earlier live rows clipped; retained until completion …");
+    selected.insert(0, visible_prefix(&marker, width));
+    (selected, omitted_rows)
+}
+
+/// Return a plain visible suffix small enough to fit in `columns`. This is
+/// used only when one logical line is itself taller than the remaining live
+/// viewport; completed scrollback retains the original ANSI-bearing line.
+fn visible_tail(line: &str, columns: usize) -> String {
+    if columns == 0 {
+        return String::new();
+    }
+    let marker = "… ";
+    let marker_width = shadow_buffer::visible_length(marker);
+    if columns <= marker_width {
+        return visible_prefix(marker, columns);
+    }
+    let available = columns.saturating_sub(marker_width);
+    let (visible, _) = shadow_buffer::extract_visible_chars(line);
+    let mut suffix = Vec::new();
+    let mut used = 0usize;
+    for character in visible.into_iter().rev() {
+        let width = shadow_buffer::visible_length(&character.to_string());
+        if used + width > available {
+            break;
+        }
+        suffix.push(character);
+        used += width;
+    }
+    suffix.reverse();
+    format!("{marker}{}", suffix.into_iter().collect::<String>())
+}
+
+fn visible_prefix(line: &str, columns: usize) -> String {
+    let (visible, _) = shadow_buffer::extract_visible_chars(line);
+    let mut prefix = String::new();
+    let mut used = 0usize;
+    for character in visible {
+        let width = shadow_buffer::visible_length(&character.to_string());
+        if used + width > columns {
+            break;
+        }
+        prefix.push(character);
+        used += width;
+    }
+    prefix
+}
+
 /// Compute the ghost-text suffix to append after the user's current input.
 ///
 /// Returns `Some(suffix)` when `input` is a `/command` prefix that unambiguously
@@ -804,11 +896,12 @@ impl TuiRenderer {
         let mut rows: usize = 0;
 
         // ── 1. Active WorkUnit ────────────────────────────────────────────────
-        // Cap to the last third of the terminal height so streaming responses
-        // don't grow the live area upward and shoot content off-screen.
+        // Leave a small fixed reserve for the separator, input, status, and a
+        // couple of transient task rows. The prior one-third logical-line cap
+        // erased most tool activity on tall terminals and ignored wrapping.
         let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let max_live_lines = (term_h / 3).max(5);
+        let max_live_rows = term_h.saturating_sub(8).max(1);
         let live_messages = self.find_live_messages();
         if !live_messages.is_empty() {
             // A Brain can have more than one live work unit (for example a
@@ -819,8 +912,9 @@ impl TuiRenderer {
             for message in live_messages {
                 all_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
             }
-            let start = all_lines.len().saturating_sub(max_live_lines);
-            for line in &all_lines[start..] {
+            let (visible_lines, _) =
+                live_viewport_lines(&all_lines, term_width, max_live_rows);
+            for line in &visible_lines {
                 let line = line.trim_end_matches('\r');
                 execute!(stdout, Print(line), Print("\r\n"))?;
                 rows += shadow_buffer::physical_rows(line, term_width);
@@ -2352,6 +2446,38 @@ mod tests {
     #[test]
     fn test_redraw_predicate_triggers_when_in_progress() {
         assert!(should_redraw_live_area(true, false));
+    }
+
+    #[test]
+    fn live_viewport_uses_physical_rows_and_marks_a_clipped_prefix() {
+        let lines = (0..12).map(|index| format!("line {index}")).collect::<Vec<_>>();
+        let (visible, omitted) = live_viewport_lines(&lines, 80, 5);
+
+        assert_eq!(omitted, 8);
+        assert_eq!(visible.len(), 5, "one marker plus four retained rows");
+        assert!(visible[0].contains("8 earlier live rows clipped"));
+        assert_eq!(&visible[1..], &lines[8..]);
+    }
+
+    #[test]
+    fn live_viewport_counts_wrapped_ansi_lines_instead_of_logical_lines() {
+        let lines = vec![
+            "first".to_string(),
+            "\x1b[36m1234567890123456789012345\x1b[0m".to_string(),
+        ];
+        let (visible, omitted) = live_viewport_lines(&lines, 10, 3);
+
+        assert_eq!(omitted, 2);
+        assert_eq!(visible.len(), 2);
+        assert!(visible[0].starts_with("… 2"));
+        assert_eq!(shadow_buffer::physical_rows(&visible[1], 10), 2);
+        assert!(visible[1].ends_with("9012345"));
+    }
+
+    #[test]
+    fn live_viewport_does_not_modify_content_that_already_fits() {
+        let lines = vec!["one".to_string(), "two".to_string()];
+        assert_eq!(live_viewport_lines(&lines, 80, 10), (lines, 0));
     }
 
     #[test]
