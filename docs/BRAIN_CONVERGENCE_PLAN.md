@@ -1,6 +1,6 @@
 # Brain Runtime Convergence Plan
 
-Status: deferred until the typed Lisp/Co-Forth VM integration gate is complete.
+Status: active as of 2026-08-24 on the tested shared typed runtime.
 
 ## Goal
 
@@ -51,39 +51,42 @@ supported deployment option.
 This work must consolidate the existing implementations. It must not create another registry,
 session abstraction, or transport-specific lifecycle.
 
-## Hard prerequisite: finish the shared VM first
+## Entry gate: one working shared VM before convergence
 
-No Brain convergence phase beyond inventory and tests begins until all of these are true:
+Brain convergence must start from one executable runtime rather than preserve competing Lisp,
+Co-Forth, provider-tool, or named-session implementations. The product-critical entry gate passed
+on 2026-08-24 with the following evidence:
 
-- Co-Forth and Finch Lisp both compile source directly to the common typed stack IR.
-- Co-Forth has parsed definitions/signatures, conditionals, loops, locals, quotations, closures,
-  managed typed values, and versioned vocabulary publication.
-- Finch Lisp has definitions, lexical bindings, conditionals, metered loops, closures, typed
-  collections, bounded hygienic macros, error/result forms, and direct shared-vocabulary calls.
+- Co-Forth and Finch Lisp both compile source directly to the common typed stack IR and execute in
+  `ProgramRuntime`; the native Lisp evaluator and Lisp-to-Forth text fallback are absent.
+- Both frontends have enough shared definitions, lexical/stack bindings, conditionals, metered
+  loops, closures/quotations, typed collections/results, yields, and vocabulary publication to run
+  real provider-authored programs. Remaining CTFE, generic, pattern, and syntax work extends this
+  surface rather than defining another runtime.
 - Every production primitive is generated from one typed signature/effect/implementation registry.
-- Capabilities compose transitively, including bounded argument-dependent selectors.
-- The broker implements availability, grants, attenuation, revocation, audit, approval, and typed
-  suspend/resume for files, tools, processes, network, automation, MemTree, scheduling, agents, and
-  response emission.
-- `ProgramRuntime` uses one persistent typed stack, dictionary, heap, transaction manager, and
-  revision history for both languages.
+- Capabilities compose transitively with bounded selectors, live policy/grant rechecks, attenuation,
+  revocation, audit, and typed suspend/resume. A Brain phase may add a missing host adapter only by
+  binding this broker; it may not add transport-owned authority.
+- `ProgramRuntime` uses one persistent typed stack, dictionary, transactional working snapshot,
+  producer/task state, and bounded reducible revision archive for both languages.
 - VM state inspection exposes typed values, stack shape, definitions, capability availability, and
   revisions to providers and UI.
-- Structured diagnostics and authorization outcomes reach the shadow-buffer UI without string
-  scraping.
+- Provider text is executed as Lisp/Co-Forth wire source; structured diagnostics support one bounded
+  source-only repair and program/output history remains visible.
 - VM-local mutation rolls back on failure, cancellation, stale revision, or denied approval;
   external effects are separately journaled.
-- Agent spawning, joining, cancellation, model selection, starting context, MemTree, automation,
-  and scheduled callbacks run through typed VM primitives without shelling out.
-- The removed native Lisp evaluator stays removed; the Lisp-to-Forth text path, source-text effect
-  inference, and duplicate legacy model-tool paths are removed or isolated behind an explicit
-  versioned legacy boundary.
-- Parser, verifier, interpreter, broker, host-binding, concurrency, provider-conformance, and UI
-  suites pass, including adversarial selector and rollback tests.
+- Reducible named-Brain checkpoints restore after daemon restart without replaying effects; two
+  attached consoles share committed definitions through one serialized turn lane.
+- The complete current `cargo test --all-targets --no-fail-fast` target set passed, and a rebuilt
+  configured-Grok smoke produced and executed raw Lisp under the persistent wire contract.
 - Independent executions do not require a process-wide GIL.
 
-The Cranelift tier is not a prerequisite. Its ABI hooks, source maps, and interpreter differential
-fixtures should exist, but JIT optimization remains a later performance project.
+This opens convergence; it does not declare the language roadmap complete. Unchecked VM items in
+`TODO.md` remain required work and may block the particular Brain phase that depends on them—for
+example durable output replay blocks reconnect completion, and approval lifecycle gaps block remote
+authority handoff. Advanced CTFE, concepts, mixed syntax, generalized coroutines, legacy-library
+migration, Cranelift optimization, AOT, and self-hosting are not prerequisites for attaching real
+clients and providers to the existing shared runtime.
 
 ## Existing implementations to converge
 

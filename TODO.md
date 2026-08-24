@@ -5,7 +5,16 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 [`docs/SHARED_PROGRAM_RUNTIME_PLAN.md`](docs/SHARED_PROGRAM_RUNTIME_PLAN.md), and
 [`docs/BRAIN_CONVERGENCE_PLAN.md`](docs/BRAIN_CONVERGENCE_PLAN.md).
 
-## Typed Lisp/Co-Forth VM — prerequisite for Brain convergence
+## Typed Lisp/Co-Forth VM — working substrate and ongoing language evolution
+
+The product-critical Brain entry gate passed on 2026-08-24: both frontends lower directly to the
+shared verified runtime, production words come from the typed registry, provider wire programs and
+bounded repair execute end to end, reducible checkpoints restore across daemon restart, two
+consoles share committed definitions, and the complete current test target set passes. Unchecked
+items below remain real VM/language work, but advanced CTFE, generics, mixed syntax, richer records,
+JIT/AOT, and future coroutine policy no longer prevent testing and converging Brains on the working
+runtime. Any change that would create a second execution, authority, checkpoint, or event lifecycle
+still blocks the corresponding Brain phase until it is unified.
 
 - [ ] Make "statically safe, scripting-language feel" a conformance requirement for both source
   languages. Infer literal, local, parameter, return, stack-row, effect, yield, and generic
@@ -637,7 +646,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 
 ## Shared brains and environments
 
-- [ ] After every VM prerequisite above passes, execute
+- [x] Open the Brain convergence gate on the tested shared runtime without declaring the remaining
+  language roadmap complete. The 2026-08-24 evidence is recorded above and in the runtime plan;
+  future language features must extend the same runtime rather than creating a parallel Brain path.
+- [ ] Execute
   [`docs/BRAIN_CONVERGENCE_PLAN.md`](docs/BRAIN_CONVERGENCE_PLAN.md): consolidate the three current
   Brain concepts into one daemon-authoritative event log, VM history, environment, and authority
   boundary; model interactive turns, speculative helpers, schedules, and subagents as `BrainRun`s;
