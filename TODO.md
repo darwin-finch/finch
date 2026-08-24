@@ -18,6 +18,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   operation must have one canonical Co-Forth spelling and conformance test; Lisp may add readable
   syntax but must lower directly to that same IR rather than introduce Lisp-only execution
   semantics. Preserve source spans directly—never satisfy parity by reparsing generated Forth text.
+  Captured anonymous Co-Forth quotations now lower to the same closure IR as Lisp lambdas, retain
+  exact body spans/effect inference, may escape their defining frame, and survive checkpoints;
+  finish the remaining bounded compile-time and structured-pattern surface before closing this gate.
 - [ ] Generalize the managed JSON boundary into first-class typed records/maps. Both frontends now
   share immutable typed-map construction, key lookup/update, keys/length, serialization across the
   public runtime boundary, map-type unification, immutable heterogeneous record construction, and
@@ -198,7 +201,7 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   had configured Grok emit Co-Forth that invoked the restored word. This is useful integration
   evidence, not a substitute for fixed multi-provider conformance fixtures or recovery-rate
   measurements. A 2026-08-24 gate audit passes the complete current `cargo test` target set (the
-  library alone is 2,385 passed, 0 failed, 7 ignored), and a rebuilt configured-Grok one-shot
+  library alone is 2,395 passed, 0 failed, 7 ignored after captured Co-Forth quotation parity), and a rebuilt configured-Grok one-shot
   `hello finch` smoke test produced and executed raw Lisp after the VM contract was made persistent
   across tool-result continuations. Keep the unchecked gate items unchecked until their missing
   semantics and fixed cross-provider measurements exist. Do not require the later Cranelift JIT
