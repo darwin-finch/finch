@@ -206,9 +206,14 @@ const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
         description: "Homogeneous immutable typed list literal: (list value ...). All elements must share one inferred type; use list-get, list-length, or list-append to inspect or extend it.",
     },
     SourceSyntaxEntry {
+        name: "[",
+        languages: &["forth"],
+        description: "Homogeneous immutable Co-Forth typed list literal: [ value ... ]. All elements must share one inferred type; list-append returns a replacement list. ['] word remains the separate quotation syntax.",
+    },
+    SourceSyntaxEntry {
         name: "list{",
         languages: &["forth"],
-        description: "Homogeneous immutable Co-Forth typed list literal: list{ value ... }list. All elements must share one inferred type; list-append returns a replacement list.",
+        description: "Compatibility spelling for a typed list literal: list{ value ... }list. Prefer [ value ... ] in new source.",
     },
     SourceSyntaxEntry {
         name: "empty-list",
@@ -1215,6 +1220,19 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry["name"] == "list{"));
+
+        let bracket_list_result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "["}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(bracket_list_result["syntax_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "["));
     }
 
     #[tokio::test]

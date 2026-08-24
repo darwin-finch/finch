@@ -80,7 +80,7 @@ struct MapLiteralFrame {
     origin: SourceOrigin,
 }
 
-/// A typed `list{ value ... }list` literal records the pre-literal stack
+/// A typed `[ value ... ]` literal records the pre-literal stack
 /// depth while ordinary Forth tokens compile its element expressions. The
 /// close delimiter lowers that homogeneous suffix to the shared `MakeList`
 /// IR, matching Lisp's `(list value ...)` source form.
@@ -661,7 +661,7 @@ fn compile_forth_body_with_locals(
                 continue;
             }
             match word.as_str() {
-                "list{" => {
+                "[" | "list{" => {
                     list_literals.push(ListLiteralFrame {
                         stack_start: stack.len(),
                         origin,
@@ -669,11 +669,11 @@ fn compile_forth_body_with_locals(
                     token_index += 1;
                     continue;
                 }
-                "}list" => {
+                "]" | "}list" => {
                     let Some(frame) = list_literals.pop() else {
                         return Err(vec![control_error(
                             "E-LIST-002",
-                            "}list has no matching list{",
+                            "list close delimiter has no matching [",
                             origin,
                         )]);
                     };
@@ -681,7 +681,7 @@ fn compile_forth_body_with_locals(
                     let Some(element_type) = values.first().cloned() else {
                         return Err(vec![control_error(
                             "E-LIST-001",
-                            "list{ requires one or more values; use a typed empty-list form when one is available",
+                            "[ ... ] requires one or more values; use empty-list<T> for an explicitly typed empty list",
                             frame.origin,
                         )]);
                     };
@@ -1840,7 +1840,7 @@ fn compile_forth_body_with_locals(
     if let Some(frame) = list_literals.last() {
         return Err(vec![control_error(
             "E-LIST-004",
-            "unterminated list{ literal",
+            "unterminated [ list literal",
             frame.origin.clone(),
         )]);
     }
@@ -3068,7 +3068,7 @@ mod tests {
     fn constructs_and_appends_typed_list_literals() {
         let module = compile_forth(
             "input.forth",
-            "list{ 1 2 }list 3 list-append 2 list-get",
+            "[ 1 2 ] 3 list-append 2 list-get",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -3084,7 +3084,7 @@ mod tests {
     fn rejects_mixed_or_unterminated_typed_list_literals() {
         let mixed = compile_forth(
             "input.forth",
-            "list{ 1 s\" two\" }list",
+            "[ 1 s\" two\" ]",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -3093,7 +3093,7 @@ mod tests {
 
         let unclosed = compile_forth(
             "input.forth",
-            "list{ 1",
+            "[ 1",
             Vec::new(),
             &core_vocabulary(),
         )

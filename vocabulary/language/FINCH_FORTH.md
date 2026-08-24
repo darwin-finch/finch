@@ -302,12 +302,14 @@ map{ s" answer" 42 s" other" 7 }map
 s" answer" map-get unwrap
 ```
 
-Typed lists are likewise immutable. Use `list{` / `}list` around one or more homogeneous values;
-`list-append` returns a replacement list rather than changing the original. An empty list has no
-inferable element type, so use `empty-list<T>` to state one explicitly:
+Typed lists are likewise immutable. Use `[` / `]` around one or more homogeneous values;
+`list-append` returns a replacement list rather than changing the original. `['] word` remains a
+distinct quotation form. An empty list has no inferable element type, so use `empty-list<T>` to
+state one explicitly. `list{` / `}list` remains a compatibility spelling while existing scripts
+migrate:
 
 ```forth
-list{ 1 2 }list 3 list-append
+[ 1 2 ] 3 list-append
 2 list-get                 \ leaves 3
 empty-list<string>
 ```
