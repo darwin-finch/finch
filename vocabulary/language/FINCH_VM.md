@@ -153,8 +153,21 @@ known scalar through `json-as-string`, `json-as-int`, `json-as-float`, or `json-
 `option` rather than coercing or guessing. `json-index` similarly returns an option for an array
 element, and `json-keys` returns a typed `list<string>` (empty for a non-object). `json-stringify`
 explicitly returns compact JSON text.
-Records and maps remain internal ABI types until construction, field naming, and pattern rules are
-specified for both source frontends.
+
+Typed maps and records are also shared source values, distinct from arbitrary `json`. Maps accept
+typed keys and values: Lisp spells construction `(map key value ...)`, while Co-Forth spells
+`map{ key value ... }map`. `map-get` returns `option<V>`, `map-set` returns a replacement map, and
+`map-entries` returns an insertion-ordered `list<record{key:K,value:V}>`. String-keyed maps are
+the appropriate normalized representation for external keys such as `"first name"`.
+
+Typed records are immutable heterogeneous products with statically known identifier-like field
+names: Lisp `{ :name value ... }`; Co-Forth `{ name: value ... }`. `(record-get record "name")`
+and `record "name" record-get` return `option<T>`. `(record-set record "name" value)` and
+`record value "name" record-set` return a replacement record after verifying the literal field
+name and replacement type. A record may hold a typed closure; method invocation remains explicit
+and never grants ambient mutable `self` access. Arbitrary JSON object keys—including keys with
+spaces—remain at the `json-get` or string-keyed-map boundary rather than being silently coerced
+into typed record fields.
 
 Lisp symbols are identifiers, not strings: `'name` is quoted data (equivalent to `(quote name)`),
 whereas `(say "name")` contains text. Co-Forth uses bare tokens for executable dictionary words;

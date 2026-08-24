@@ -864,6 +864,8 @@ mod tests {
             .unwrap();
         assert!(shared.contains("otherwise treats the source as Forth"));
         assert!(shared.contains("s\"Your response to the human\" say"));
+        assert!(shared.contains("Typed maps and records are also shared source values"));
+        assert!(shared.contains("keys with\nspaces"));
     }
 
     #[tokio::test]
