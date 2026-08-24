@@ -323,8 +323,11 @@ yield        forall Y Resume S. (S Y -- S Resume) ! yields<Y,Resume>
 mutation, nondeterminism, and other observable behavior are distinct tagged members of that row,
 not unrelated annotation systems. The broker selects capability-bearing members for authorization;
 the verifier, optimizer, scheduler, handlers, and generic reflection inspect the whole row. Omitted
-`!` means the inferred row is empty, and `! pure` is optional explicit syntax asserting that complete
-emptiness. A yielding callable is therefore not pure merely because it requires no host authority.
+`!` means the inferred row is empty. `pure` is not itself a row member or an alias for emptiness: it
+is a verifier-derived predicate over the resolved row and body. A deterministic function with only
+`throws<E>` may be pure but partial; a function may separately be total, deterministic, and
+non-suspending. Generic constraints can require those predicates explicitly. A yielding callable
+remains a scheduling barrier even when it performs no mutation or host operation.
 Optimizers treat `yields<Y,Resume>` as a control barrier, while the scheduler uses its typed payload
 and resumption contract. Source spells row union with `|`, for example
 `! fs.read<R> | throws<IoError> | yields<Progress,unit>`. Within a signature this pipe belongs to the
@@ -345,6 +348,9 @@ core and user definitions. Core attributes live in explicit namespaces and may b
 short names; user attributes have the same typed reflection and bounded `syntax -> syntax`
 transformation contract. Callable inputs/outputs and `! EffectRow` are type structure rather than
 attributes. There is no D-style mixture of magic bare attributes and second-class user annotations.
+Reflection derives `pure`, `total`, `deterministic`, and `non-suspending` as separate properties.
+They are ordinary constraints over a callable/effect row, not `@` annotations: `throws<E>` may
+satisfy `pure` while failing `total`, and `yields<Y,Resume>` prevents non-suspending transformations.
 
 Capability requirements should likewise become ordinary versioned typed descriptors rather than a
 permanent closed compiler enum. A host registry supplies the stable unforgeable capability identity,

@@ -169,8 +169,11 @@ still blocks the corresponding Brain phase until it is unified.
   `syntax -> syntax` transforms. Built-in and user-defined attributes use the same `@name(...)`
   lookup, reflection value, hygiene, and wrapper contract; no D-style mixture of magic bare
   attributes and second-class user annotations. Inputs/outputs and the canonical `! EffectRow`
-  remain callable type structure rather than attributes. Omitted `!` means an inferred empty row;
-  optional `! pure` asserts that the complete row is empty and is verifier-checked.
+  remain callable type structure rather than attributes. Omitted `!` means an inferred empty row.
+  Derive `pure`, `total`, `deterministic`, and `non-suspending` independently from the resolved row
+  and body: a deterministic `throws<E>` function may be pure but not total, while yielding remains
+  a scheduling barrier. Expose these predicates as ordinary concept constraints, not attributes or
+  effect members.
 - [ ] Generalize concrete host capability enum cases into versioned namespaced capability
   descriptors with stable unforgeable identity, typed selector/schema metadata, containment, and
   host binding. User modules may define abstract effects, attributes, wrappers, handlers, and
