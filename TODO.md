@@ -259,6 +259,26 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   `published` definitions between Finches; verify source/IR, dependencies, certificates, provenance,
   and local capability policy before installation.
 
+## TUI and tool presentation
+
+- [ ] Batch model-authored edits into one explicit multi-file changeset/proposal and request one
+  approval before applying it to the real workspace. Use a Finch-owned `GIT_EXTERNAL_DIFF` adapter
+  to turn each tracked-file comparison from one bracketed `git diff` invocation into typed diff
+  records associated with the same proposal ID; explicitly include untracked creations because Git
+  does not send them through the external-diff hook. The proposal coordinator—not the environment
+  variable—owns atomic apply/reject/request-changes, editor co-editing, stale-base detection, and
+  the final aggregate added/removed counts. Small edits may still auto-apply only when an explicit
+  capability/policy grant permits that workflow.
+- [ ] Render edit/write tool results as structured diffs rather than unstyled text: show a stable
+  `Edited path (+added -removed)` title, retained context and line numbers, green backgrounds for
+  additions, red backgrounds for removals, and neutral styling for unchanged context. Feed typed
+  styled lines through `OutputManager`/shadow-buffer projection so live redraw, scrollback, copy,
+  resize, and concurrent WorkUnits remain stable; never print raw ANSI directly from a tool.
+- [ ] Add syntax highlighting to structured code and diff bodies as a separate layer after diff
+  semantics are correct. Select the grammar from the path/language metadata, compose token color
+  with added/removed backgrounds legibly across themes, and fall back to plain code without
+  changing layout when the language is unknown.
+
 ## Shared brains and environments
 
 - [ ] After every VM prerequisite above passes, execute
