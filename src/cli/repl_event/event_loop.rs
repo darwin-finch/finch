@@ -7883,14 +7883,17 @@ Rules:\n\
 
         let exact = serde_json::to_string_pretty(&prompt.exact)
             .unwrap_or_else(|_| format!("{:?}", prompt.exact));
+        let availability = self
+            .program_runtime
+            .capability_availability(&prompt.exact);
         let warning = if prompt.broad_scope_warning {
             "\n\nWarning: this request covers a broad resource scope."
         } else {
             ""
         };
         let dialog = Dialog::select("Finch VM capability request", options).with_body(format!(
-            "Reason: {}\n\nRequired capability:\n{}{}",
-            prompt.request.reason, exact, warning
+            "Reason: {}\nHost availability: {:?}\n\nRequired capability:\n{}{}",
+            prompt.request.reason, availability, exact, warning
         ));
 
         self.pending_vm_approval = Some((response_tx, choices));

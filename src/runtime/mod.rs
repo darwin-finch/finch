@@ -13,7 +13,8 @@ use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
 use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
     ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
-    CapabilityLedger, CapabilityRequest, CapabilityRequirement, EffectSet, GrantScope,
+    CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityRequest,
+    CapabilityRequirement, EffectSet, GrantScope,
     SourceOrigin, Type, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,
     TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
@@ -570,6 +571,87 @@ impl ProgramRuntime {
 
     pub fn automation(&self) -> Arc<AutomationBroker> {
         Arc::clone(&self.automation)
+    }
+
+    /// Report whether the application has an implementation for a capability
+    /// independently of whether this ProgramRun currently has a grant. This
+    /// is selector-aware for authority-bearing roots and never prompts.
+    pub fn capability_availability(
+        &self,
+        requirement: &CapabilityRequirement,
+    ) -> CapabilityAvailability {
+        use crate::runtime::automation::AutomationState;
+        use crate::vm::{ResourceRoot, ResourceSelector};
+
+        let root_availability = |root: &ResourceRoot| match root {
+            ResourceRoot::Workspace => CapabilityAvailability::Available,
+            ResourceRoot::HostMachine => match self.host_machine_root.read() {
+                Ok(root) if root.is_some() => CapabilityAvailability::Available,
+                Ok(_) => CapabilityAvailability::Disabled,
+                Err(_) => CapabilityAvailability::Degraded {
+                    reason: "host-machine root binding lock poisoned".into(),
+                },
+            },
+            _ => CapabilityAvailability::Unsupported,
+        };
+        match requirement.capability {
+            CapabilityKind::SessionEmit | CapabilityKind::VmRead => {
+                CapabilityAvailability::Available
+            }
+            CapabilityKind::FileRead | CapabilityKind::FileWrite => {
+                match &requirement.selector {
+                    ResourceSelector::File { selector } => root_availability(&selector.root),
+                    ResourceSelector::FileTemplate { template } => {
+                        root_availability(&template.root)
+                    }
+                    _ => CapabilityAvailability::Unsupported,
+                }
+            }
+            CapabilityKind::AutomationInspect | CapabilityKind::AutomationWrite => {
+                match self.automation.availability().state {
+                    AutomationState::Disabled => CapabilityAvailability::Disabled,
+                    AutomationState::Unsupported => CapabilityAvailability::Unsupported,
+                    AutomationState::PermissionRequired => {
+                        CapabilityAvailability::PermissionRequired
+                    }
+                    AutomationState::Available => CapabilityAvailability::Available,
+                }
+            }
+            CapabilityKind::AgentSpawn
+            | CapabilityKind::AgentAwait
+            | CapabilityKind::AgentPoll
+            | CapabilityKind::AgentCancel => match self.agent_scheduler.read() {
+                Ok(scheduler) if scheduler.upgrade().is_some() => {
+                    CapabilityAvailability::Available
+                }
+                Ok(_) => CapabilityAvailability::Disabled,
+                Err(_) => CapabilityAvailability::Degraded {
+                    reason: "agent scheduler binding lock poisoned".into(),
+                },
+            },
+            CapabilityKind::MemoryRead | CapabilityKind::MemoryWrite => match self.memory.read() {
+                Ok(memory) if memory.is_some() => CapabilityAvailability::Available,
+                Ok(_) => CapabilityAvailability::Disabled,
+                Err(_) => CapabilityAvailability::Degraded {
+                    reason: "memory binding lock poisoned".into(),
+                },
+            },
+            CapabilityKind::ScheduleCreate => match self.schedule_queue.read() {
+                Ok(queue) if queue.is_some() => CapabilityAvailability::Available,
+                Ok(_) => CapabilityAvailability::Disabled,
+                Err(_) => CapabilityAvailability::Degraded {
+                    reason: "schedule queue binding lock poisoned".into(),
+                },
+            },
+            CapabilityKind::NetworkConnect
+            | CapabilityKind::ProcessRun
+            | CapabilityKind::ProgramInvoke => CapabilityAvailability::Available,
+            CapabilityKind::VmWrite
+            | CapabilityKind::MemoryConsolidate
+            | CapabilityKind::ScheduleRead
+            | CapabilityKind::ScheduleManage
+            | CapabilityKind::UnsafeMemory => CapabilityAvailability::Unsupported,
+        }
     }
 
     /// Install the host-owned root behind `root<host-machine>`. This is an
@@ -7260,6 +7342,45 @@ mod tests {
         let mut restored = ProgramRuntime::new();
         assert!(restored.restore_authority_state(state).is_err());
         assert!(restored.capability_ledger().unwrap().grants.grants.is_empty());
+    }
+
+    #[test]
+    fn capability_availability_is_separate_from_grants_and_selector_aware() {
+        let runtime = ProgramRuntime::new();
+        let workspace_read = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        );
+        assert_eq!(
+            runtime.capability_availability(&workspace_read),
+            crate::vm::CapabilityAvailability::Available
+        );
+        assert!(runtime.capability_ledger().unwrap().grants.grants.is_empty());
+
+        let root = tempfile::tempdir().unwrap();
+        let host_read = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector {
+                root: crate::vm::ResourceRoot::HostMachine,
+                pattern: "**".into(),
+            },
+        );
+        assert_eq!(
+            runtime.capability_availability(&host_read),
+            crate::vm::CapabilityAvailability::Disabled
+        );
+        runtime.bind_host_machine_root(root.path()).unwrap();
+        assert_eq!(
+            runtime.capability_availability(&host_read),
+            crate::vm::CapabilityAvailability::Available
+        );
+        assert_eq!(
+            runtime.capability_availability(&crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::VmWrite,
+                selector: crate::vm::ResourceSelector::None,
+            }),
+            crate::vm::CapabilityAvailability::Unsupported
+        );
     }
 
     #[tokio::test]
