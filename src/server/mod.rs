@@ -100,6 +100,14 @@ pub struct AgentServer {
     >,
     /// Authoritative event logs and program stacks for named shared brains.
     shared_brains: crate::brain::shared::SharedBrainStore,
+    /// Application-owned MCP configuration and lazily connected transport for
+    /// daemon-executed named-Brain programs. The transport is shared, while
+    /// each Brain runtime installs its own verified vocabulary metadata.
+    mcp_servers: std::collections::HashMap<
+        String,
+        crate::tools::mcp::McpServerConfig,
+    >,
+    mcp_client: tokio::sync::OnceCell<Arc<crate::tools::mcp::McpClient>>,
     /// Runtime-rotatable password for remote named-brain access.
     brain_password: Arc<RwLock<String>>,
 }
@@ -150,6 +158,7 @@ impl AgentServer {
             format!("{machine}.local")
         };
         let brain_password = server_config.brain_password.clone();
+        let mcp_servers = config.mcp_servers.clone();
 
         Ok(Self {
             claude_client: Arc::new(claude_client),
@@ -165,6 +174,8 @@ impl AgentServer {
             training_tx: Arc::new(training_tx),
             training_rx: std::sync::Mutex::new(Some(training_rx)),
             shared_brains: crate::brain::shared::SharedBrainStore::new(machine),
+            mcp_servers,
+            mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(brain_password)),
         })
     }
@@ -387,6 +398,24 @@ impl AgentServer {
 
     pub fn shared_brains(&self) -> &crate::brain::shared::SharedBrainStore {
         &self.shared_brains
+    }
+
+    /// Return the daemon-owned MCP transport, connecting it on first use.
+    /// Named Brain runtimes borrow this host service but retain independent
+    /// typed dictionaries, manifests, grants, and effect journals.
+    pub async fn mcp_client(&self) -> Result<Option<Arc<crate::tools::mcp::McpClient>>> {
+        if self.mcp_servers.is_empty() {
+            return Ok(None);
+        }
+        let client = self
+            .mcp_client
+            .get_or_try_init(|| async {
+                crate::tools::mcp::McpClient::from_config(&self.mcp_servers)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?;
+        Ok(Some(Arc::clone(client)))
     }
 
     pub async fn brain_password(&self) -> String {

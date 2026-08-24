@@ -328,6 +328,16 @@ async fn execute_named_brain_program(
     let snapshot = server.shared_brains().snapshot(name)?;
     ensure_named_brain_environment(server, &snapshot)?;
     let runtime = server.shared_brains().program_runtime(name)?;
+    if !runtime.has_mcp_client() {
+        if let Some(client) = server.mcp_client().await? {
+            for diagnostic in runtime.bind_mcp_client(client).await? {
+                tracing::warn!(
+                    brain = name,
+                    "MCP tool was not published to named-Brain typed VM: {diagnostic}"
+                );
+            }
+        }
+    }
     let language = match language {
         crate::brain::shared::ProgramLanguage::Forth => crate::programs::ProgramLanguage::Forth,
         crate::brain::shared::ProgramLanguage::Lisp => crate::programs::ProgramLanguage::Lisp,

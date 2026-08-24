@@ -796,6 +796,16 @@ impl ProgramRuntime {
         Ok(rejected)
     }
 
+    /// Whether this runtime already has an application-owned MCP transport.
+    /// This exposes availability only; it does not reveal transport state or
+    /// imply that any MCP capability has been granted.
+    pub fn has_mcp_client(&self) -> bool {
+        self.mcp_client
+            .read()
+            .map(|client| client.is_some())
+            .unwrap_or(false)
+    }
+
     /// Install the host-owned root behind `root<host-machine>`. This is an
     /// availability binding, deliberately separate from capability grants;
     /// callers must still grant a matching `file.read` or `file.write`
@@ -8099,7 +8109,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         )]);
         let client = Arc::new(crate::tools::mcp::McpClient::from_config(&config).await.unwrap());
         let runtime = ProgramRuntime::new();
+        assert!(!runtime.has_mcp_client());
         assert!(runtime.bind_mcp_client(client).await.unwrap().is_empty());
+        assert!(runtime.has_mcp_client());
         let state = runtime.inspect().await.unwrap();
         let namespaced = state
             .typed_vocabulary
