@@ -425,8 +425,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   two live consoles, shared a Lisp definition between them, restored it across daemon restart, and
   had configured Grok emit Co-Forth that invoked the restored word. This is useful integration
   evidence, not a substitute for fixed multi-provider conformance fixtures or recovery-rate
-  measurements. A 2026-08-24 gate audit passes the complete current `cargo test` target set (the
-  library alone is 2,395 passed, 0 failed, 7 ignored after captured Co-Forth quotation parity), and a rebuilt configured-Grok one-shot
+  measurements. A 2026-08-24 gate audit passes the complete current
+  `cargo test --all-targets --no-fail-fast` target set after public legacy execution-path deletion
+  (the library alone is 2,316 passed, 0 failed, 7 ignored), and a rebuilt configured-Grok one-shot
   `hello finch` smoke test produced and executed raw Lisp after the VM contract was made persistent
   across tool-result continuations. Keep the unchecked gate items unchecked until their missing
   semantics and fixed cross-provider measurements exist. Do not require the later Cranelift JIT
