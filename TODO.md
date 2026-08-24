@@ -393,6 +393,15 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   declarations and generated interpreter/Cranelift shims with explicit layout, ownership, callback
   lifetime, thread-affinity, and effect metadata; raw pointers, variadics, and unchecked descriptor
   access require a distinct unsafe-FFI capability.
+- [ ] Make native performance and application expressiveness measurable release gates. For
+  monomorphized effect-free compute, parsing, collection, and control-flow kernels, compare optimized
+  Finch against checked-in equivalent optimized Rust/C++ using wall time, allocations, peak memory,
+  code size, compile latency, and boundary overhead; keep missing vectorization, escape/alias
+  analysis, bounds-check elimination, and range fusion visible rather than declaring victory when
+  Cranelift emits code. Maintain application-sized Lisp/Co-Forth fixtures demonstrating the same
+  structural records, variants, closures, parametric functions, concepts, modules, derivation, async
+  resources, and range composition expected from a TypeScript-class application language, without
+  relying routinely on `dynamic` or giving either frontend privileged semantics.
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
