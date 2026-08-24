@@ -40,6 +40,15 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   machines over native stackful fibers unless measurement proves the latter materially simpler.
   This design is informed by SDC's small fiber-based semantic scheduler, without inheriting its
   unresolved-forward-reference or per-fiber native-stack limitations.
+- [ ] Unify macros, templates, derivation, compile-time `if`/`foreach`, concepts, and reflection as
+  ordinary pure bounded Finch CTFE over first-class `syntax`, `type`, constraint-evidence, and
+  module/symbol-reference values. `syntax` must retain origin/expansion ancestry, lexical scope
+  marks, and stable symbol identity so transformation functions remain hygienic and diagnostic-rich;
+  do not add a privileged macro evaluator, string mixins, or a parallel template language.
+  `define-syntax` may be sugar for registering a `syntax -> syntax` CTFE function. Keep classic
+  S-expressions as the canonical structural Lisp reader, while allowing a later lighter
+  expression/indentation reader that immediately produces the identical syntax tree. Reader sugar
+  must disappear before expansion/elaboration and must not create a second semantic path.
 - [ ] Put an explicit span-preserving AST boundary between both source readers and typed stack IR.
   Formalize Lisp's existing `Val`/`SpannedVal` tree as its frontend AST. Co-Forth now tokenizes a
   module once into a span-preserving `ForthModuleAst` containing definitions and retained body
