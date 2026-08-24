@@ -304,15 +304,14 @@ fn compile_forth_body_with_locals(
     };
 
     let mut token_index = 0;
-    // A Co-Forth `locals| a b |` declaration names the declared inputs in
-    // bottom-to-top stack order. Store the top value first, exactly as a Lisp
-    // parameter prologue does, so the function body begins with a clean
-    // shared data stack and its values live only in this activation frame.
+    // Signature names store declared inputs in bottom-to-top order. Store the
+    // top value first, exactly as a Lisp parameter prologue does, so the body
+    // begins with a clean shared stack and values live in this activation.
     for (index, local) in locals.iter().enumerate().rev() {
         let found = stack.pop().ok_or_else(|| {
             vec![control_error(
                 "E-FORTH-LOCAL-003",
-                "locals declaration requires a corresponding typed input",
+                "named signature input requires a corresponding typed value",
                 local.origin.clone(),
             )]
         })?;
@@ -1971,7 +1970,7 @@ fn extract_definitions(
                 )]
             })?;
         let signature_tokens = &tokens[cursor + 3..close];
-        let (signature, declares_pure) =
+        let (signature, declares_pure, locals) =
             parse_definition_signature(source_id, source, signature_tokens, open)?;
         let body_start_index = close + 1;
         let end = (body_start_index..tokens.len())
@@ -2000,13 +1999,6 @@ fn extract_definitions(
             .map_or(tokens[end].start, |token| token.start);
         let body_end = tokens[end].start;
         let definition_end = tokens[end].end;
-        let (locals, body_start) = parse_definition_locals(
-            source_id,
-            source,
-            &tokens[body_start_index..end],
-            body_start,
-            &signature.input.values,
-        )?;
         definitions.push(ParsedDefinition {
             name: name.clone(),
             documentation: forth_definition_documentation(source, definition_start),
@@ -2042,95 +2034,12 @@ fn forth_definition_documentation(source: &str, definition_start: usize) -> Opti
         .map(str::to_owned)
 }
 
-/// Parse the direct Co-Forth spelling for frame-local parameter names:
-///
-/// ```forth
-/// : area ( S int int -- S int ! pure ) locals| width height | width height * ;
-/// ```
-///
-/// This is intentionally not a macro. It lowers to one `LocalSet` per
-/// declared input at function entry, followed by `LocalGet` at each use.
-/// The declaration must name every typed input, in its bottom-to-top stack
-/// order, so it cannot conceal a stack rearrangement from the IR viewer.
-fn parse_definition_locals(
-    source_id: &str,
-    source: &str,
-    body_tokens: &[Token],
-    default_body_start: usize,
-    input_types: &[Type],
-) -> Result<(Vec<LocalBinding>, usize), Vec<VmDiagnostic>> {
-    let Some(first) = body_tokens.first() else {
-        return Ok((Vec::new(), default_body_start));
-    };
-    if !token_is(first, "locals|") {
-        return Ok((Vec::new(), default_body_start));
-    }
-    let close = body_tokens[1..]
-        .iter()
-        .position(|token| token_is(token, "|"))
-        .map(|index| index + 1)
-        .ok_or_else(|| {
-            vec![definition_error(
-                source_id,
-                source,
-                first,
-                "unterminated locals declaration; expected '|'",
-            )]
-        })?;
-    let names = &body_tokens[1..close];
-    if names.len() != input_types.len() {
-        return Err(vec![definition_error(
-            source_id,
-            source,
-            first,
-            format!(
-                "locals declaration names {} values but word signature has {} inputs",
-                names.len(),
-                input_types.len()
-            ),
-        )]);
-    }
-    let mut locals = Vec::with_capacity(names.len());
-    for (token, ty) in names.iter().zip(input_types) {
-        let TokenValue::Word(name) = &token.value else {
-            return Err(vec![definition_error(
-                source_id,
-                source,
-                token,
-                "local name must be an identifier",
-            )]);
-        };
-        if name == "|"
-            || name == "locals|"
-            || locals
-                .iter()
-                .any(|local: &LocalBinding| local.name == *name)
-        {
-            return Err(vec![definition_error(
-                source_id,
-                source,
-                token,
-                format!("invalid or duplicate local name '{name}'"),
-            )]);
-        }
-        locals.push(LocalBinding {
-            name: name.clone(),
-            ty: ty.clone(),
-            origin: origin(source_id, source, token.start, token.end),
-        });
-    }
-    let body_start = body_tokens
-        .get(close + 1)
-        .map_or(default_body_start, |token| token.start);
-    Ok((locals, body_start))
-}
-
 fn parse_definition_signature(
     source_id: &str,
     source: &str,
     tokens: &[Token],
     fallback: &Token,
-) -> Result<(StackSignature, bool), Vec<VmDiagnostic>> {
+) -> Result<(StackSignature, bool, Vec<LocalBinding>), Vec<VmDiagnostic>> {
     let separator = tokens
         .iter()
         .position(|token| token_is(token, "--"))
@@ -2148,7 +2057,7 @@ fn parse_definition_signature(
     let output_tokens = &tokens[separator + 1..output_end];
     validate_preserved_stack_row(source_id, source, input_tokens, fallback, "input")?;
     validate_preserved_stack_row(source_id, source, output_tokens, fallback, "output")?;
-    let input = parse_stack_types(source_id, source, &input_tokens[1..])?;
+    let (input, locals) = parse_input_stack_types(source_id, source, &input_tokens[1..])?;
     let output = parse_stack_types(source_id, source, &output_tokens[1..])?;
     let declares_pure = if let Some(effect) = effect {
         let annotation = &tokens[effect + 1..];
@@ -2176,7 +2085,65 @@ fn parse_definition_signature(
             control: ControlEffect::Returns,
         },
         declares_pure,
+        locals,
     ))
+}
+
+/// Signature-local names are the sole lexical-local syntax for typed words.
+/// `width:int` is both a public input contract and a lowering instruction to
+/// move that input into the frame at entry.  Either name every input or name
+/// none: partial naming makes the stack contract harder to read than it is
+/// worth.
+fn parse_input_stack_types(
+    source_id: &str,
+    source: &str,
+    tokens: &[Token],
+) -> Result<(Vec<Type>, Vec<LocalBinding>), Vec<VmDiagnostic>> {
+    let mut types = Vec::with_capacity(tokens.len());
+    let mut locals = Vec::new();
+    let mut saw_named = false;
+    let mut saw_unnamed = false;
+    for token in tokens {
+        let TokenValue::Word(spelling) = &token.value else {
+            return Err(vec![definition_error(source_id, source, token, "stack type must be an identifier")]);
+        };
+        let named = (!spelling.starts_with("record{")).then(|| spelling.split_once(':')).flatten();
+        let (name, type_spelling) = match named {
+            Some((name, type_spelling)) if !name.is_empty() && !type_spelling.is_empty() => {
+                saw_named = true;
+                (Some(name), type_spelling)
+            }
+            _ => {
+                saw_unnamed = true;
+                (None, spelling.as_str())
+            }
+        };
+        let ty = super::lisp::parse_type_name(type_spelling).map_err(|_| {
+            vec![definition_error(source_id, source, token, format!("unknown stack type '{type_spelling}'"))]
+        })?;
+        if let Some(name) = name {
+            if !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                || locals.iter().any(|local: &LocalBinding| local.name == name)
+            {
+                return Err(vec![definition_error(source_id, source, token, format!("invalid or duplicate input name '{name}'"))]);
+            }
+            locals.push(LocalBinding {
+                name: name.to_string(),
+                ty: ty.clone(),
+                origin: origin(source_id, source, token.start, token.end),
+            });
+        }
+        types.push(ty);
+    }
+    if saw_named && saw_unnamed {
+        return Err(vec![definition_error(
+            source_id,
+            source,
+            tokens.first().expect("mixed names require an input token"),
+            "typed word inputs must either all use name:type or all be unnamed types",
+        )]);
+    }
+    Ok((types, locals))
 }
 
 fn parse_stack_types(
@@ -3031,10 +2998,10 @@ mod tests {
     }
 
     #[test]
-    fn typed_forth_locals_lower_to_explicit_frame_operations() {
+    fn typed_forth_named_signature_inputs_lower_to_explicit_frame_operations() {
         let module = compile_forth(
-            "locals.forth",
-            ": area ( S int int -- S int ! pure ) locals| width height | width height * ; 4 3 area",
+            "named-signature.forth",
+            ": area ( S width:int height:int -- S int ! pure ) width height * ; 4 3 area",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -3071,8 +3038,7 @@ mod tests {
         let module = compile_forth(
             "factorial.forth",
             r#"
-: factorial ( S int -- S int ! pure )
-  locals| n |
+: factorial ( S n:int -- S int ! pure )
   n 1 <= if
     1
   else
@@ -3124,10 +3090,10 @@ mod tests {
     }
 
     #[test]
-    fn locals_must_name_every_declared_input() {
+    fn typed_input_names_must_cover_every_declared_input() {
         let errors = compile_forth(
-            "locals.forth",
-            ": area ( S int int -- S int ! pure ) locals| width | width ;",
+            "named-signature.forth",
+            ": area ( S width:int int -- S int ! pure ) width ;",
             Vec::new(),
             &core_vocabulary(),
         )

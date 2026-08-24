@@ -2274,8 +2274,7 @@ mod tests {
         let definition = runtime.execute(
             ProgramLanguage::Forth,
             "words.forth",
-            ": factorial ( S int -- S int ! pure ) \
-               locals| n | \
+            ": factorial ( S n:int -- S int ! pure ) \
                n 1 <= if 1 else n n 1 - factorial * then ;",
             1_000,
         );
@@ -2293,10 +2292,10 @@ mod tests {
         let definition = runtime.execute(
             ProgramLanguage::Forth,
             "words.forth",
-            ": even? ( S int -- S bool ! pure ) \
-               locals| n | n 0 = if true else n 1 - odd? then ; \
-             : odd? ( S int -- S bool ! pure ) \
-               locals| n | n 0 = if false else n 1 - even? then ;",
+            ": even? ( S n:int -- S bool ! pure ) \
+               n 0 = if true else n 1 - odd? then ; \
+             : odd? ( S n:int -- S bool ! pure ) \
+               n 0 = if false else n 1 - even? then ;",
             1_000,
         );
         assert_eq!(definition.status, TypedExecutionStatus::Completed);

@@ -25,14 +25,14 @@
     },
     {
       "name": "typed-definition-and-locals",
-      "forth": ": subtract ( S int int -- S int ! pure ) locals| left right | left right - ; 10 5 subtract",
+      "forth": ": subtract ( S left:int right:int -- S int ! pure ) left right - ; 10 5 subtract",
       "lisp": "(define (subtract (left : int) (right : int)) (- left right)) (subtract 10 5)",
       "expected_values": [{ "type": "int", "value": 5 }],
       "expected_output": ""
     },
     {
       "name": "recursive-typed-definition",
-      "forth": ": factorial ( S int -- S int ! pure ) locals| n | n 1 <= if 1 else n n 1 - factorial * then ; 6 factorial",
+      "forth": ": factorial ( S n:int -- S int ! pure ) n 1 <= if 1 else n n 1 - factorial * then ; 6 factorial",
       "lisp": "(define (factorial (n : int)) : int (if (<= n 1) 1 (* n (factorial (- n 1))))) (factorial 6)",
       "expected_values": [{ "type": "int", "value": 720 }],
       "expected_output": ""

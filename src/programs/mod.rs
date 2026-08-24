@@ -1128,7 +1128,7 @@ mod tests {
         assert!(prompt.contains("\"response\" say"));
         assert!(prompt.contains("\"\"\"text\"\"\""));
         assert!(prompt.contains("if-some ... else ... then"));
-        assert!(prompt.contains(": factorial ( S int -- S int ! pure )"));
+        assert!(prompt.contains(": factorial ( S n:int -- S int ! pure )"));
         assert!(prompt.contains("begin condition while ... repeat"));
         assert!(prompt.contains("[1, 2, 3]"));
         assert!(prompt.contains("{\"first name\":\"Ada\"}"));

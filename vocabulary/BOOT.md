@@ -61,13 +61,12 @@ such as `{"first name":"Ada"}`, is accepted directly and pushes managed `json`; 
 `{ :field value }` for the corresponding Lisp forms.
 
 Co-Forth can define reusable typed words directly. A definition must state its stack contract;
-write `S` first on both sides of `--` to preserve the unknown caller stack below its inputs. Use `locals|` first in the body when a
-word has named inputs. Pure definitions use `! pure` and may recurse or mutually recurse in the
+write `S` first on both sides of `--` to preserve the unknown caller stack below its inputs. Name
+inputs in the signature as `name:type` when the body needs them. Pure definitions use `! pure` and may recurse or mutually recurse in the
 same program; use `! infer` when the body intentionally has inferred effects:
 
 ```forth
-: factorial ( S int -- S int ! pure )
-  locals| n |
+: factorial ( S n:int -- S int ! pure )
   n 1 <= if 1 else n n 1 - factorial * then
 ;
 6 factorial int-to-string say

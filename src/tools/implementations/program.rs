@@ -236,9 +236,9 @@ const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
         description: "Persistent typed word definition: : name ( S inputs -- S outputs ! effects ) body ;.",
     },
     SourceSyntaxEntry {
-        name: "locals|",
+        name: "name:type",
         languages: &["forth"],
-        description: "First form of a typed word definition; names all declared inputs in bottom-to-top order.",
+        description: "Named typed Co-Forth input inside a definition signature, for example `width:int`. Either name every input or leave every input unnamed; names lower to lexical frame locals.",
     },
     SourceSyntaxEntry {
         name: "s\"",

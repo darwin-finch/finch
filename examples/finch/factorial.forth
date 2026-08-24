@@ -1,7 +1,6 @@
 #!/usr/local/bin/finch --exec
 \ A self-contained typed Co-Forth recursive definition.
-: factorial ( S int -- S int ! pure )
-  locals| n |
+: factorial ( S n:int -- S int ! pure )
   n 1 <= if
     1
   else

@@ -140,12 +140,11 @@ Type names may be parameterized in a signature, including nested forms such as `
 `capability<kind>`. A fixed product type is `record{name:string,age:int}`; it is distinct from
 an open `map<string,T>` and may be the input or output of a typed word.
 
-Named input locals are an optional direct IR spelling. `locals|` must be the first form in a typed
-word and must name every declared input in bottom-to-top stack order:
+Name inputs directly in the typed signature when the body needs them. Names are in bottom-to-top
+stack order and lower directly to frame locals; there is no separate locals declaration:
 
 ```forth
-: area ( S int int -- S int ! pure )
-  locals| width height |
+: area ( S width:int height:int -- S int ! pure )
   width height *
 ;
 ```
