@@ -38,6 +38,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [x] Publish the canonical source surface in the generated language package: `s"..."` strings,
   exact escaping/comment rules, `say` composition, Lisp form examples, and no-free-prose protocol
   rule. Include common stack-error corrections rather than only error codes.
+- [ ] Consider an opt-in typed unresolved-word handler for a module/run. Ordinary unbound bare
+  words must remain linking diagnostics; an explicitly installed handler may receive the unknown
+  token as `symbol`/`string` and has one declared signature/effect contract, allowing controlled
+  lookup/delegation without silently turning leaked prose or misspelled capabilities into data.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
 - [ ] Finish Lisp source maps: the reader now retains structural spans and typed lowering preserves
