@@ -215,9 +215,10 @@ event loop. `(task-cancel handle)` consumes a `cpu_fiber` handle and requests co
 cancellation; a worker observes that request at its next VM boundary. CPU task operations reject
 agent-task handles; use `agent-cancel` for child agents.
 
-`(yield)` is a cooperative statement expression. Finch records the remaining typed VM frames,
-returns control to its event loop, and later resumes the following expression. It evaluates to
-`unit`; it is not a first-class continuation and does not terminate the program:
+`(yield)` is a cooperative statement expression. Finch records the remaining typed VM frames and
+returns control to its event loop as a saved suspension. A host must later resume that same
+execution; automatic requeueing is not implemented yet. It evaluates to `unit`; it is not a
+first-class continuation and does not terminate the program:
 
 ```lisp
 (begin
