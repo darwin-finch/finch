@@ -461,7 +461,14 @@ impl Message for WorkUnit {
                 let mut out = match &inner.presentation {
                     WorkUnitPresentation::Assistant => {
                         if inner.response_text.is_empty() {
-                            format!("{}⏺{}{}", CYAN, RESET, timing)
+                            let title = if inner.rows.is_empty() {
+                                String::new()
+                            } else if inner.rows.len() == 1 {
+                                " Tools".to_string()
+                            } else {
+                                format!(" Tools ({})", inner.rows.len())
+                            };
+                            format!("{}⏺{}{}{}", CYAN, RESET, title, timing)
                         } else {
                             format!("{}⏺{} {}{}", CYAN, RESET, inner.response_text, timing)
                         }
@@ -940,6 +947,19 @@ mod tests {
         assert!(f.contains("⎿"));
         assert!(f.contains("bash(ls)"));
         assert!(f.contains("3 files"));
+    }
+
+    #[test]
+    fn completed_tool_only_unit_has_an_overall_title() {
+        let wu = WorkUnit::new("Channeling");
+        let first = wu.add_row("read(one.rs)");
+        wu.complete_row(first, "10 lines");
+        let second = wu.add_row("read(two.rs)");
+        wu.complete_row(second, "20 lines");
+        wu.set_complete();
+
+        let formatted = wu.format(&colors());
+        assert!(formatted.contains("⏺\u{1b}[0m Tools (2)"), "{formatted:?}");
     }
 
     #[test]

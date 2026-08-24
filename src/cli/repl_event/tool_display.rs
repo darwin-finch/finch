@@ -33,15 +33,13 @@ pub fn format_tool_label(name: &str, input: &Value) -> String {
         format!("{}{}{}{}", CYAN, BOLD, name, RESET)
     } else {
         format!(
-            "{}{}{}{}({}{}{}{}){}",
+            "{}{}{}{}{}({}){}",
             CYAN,
             BOLD,
             name,
             RESET,
             GRAY,
             truncate(&key_param, MAX_PARAM_LEN),
-            RESET,
-            CYAN,
             RESET,
         )
     }
@@ -418,6 +416,10 @@ mod tests {
         let label = format_tool_label("Bash", &serde_json::json!({"command": "git status"}));
         assert!(label.contains("Bash"), "got: {:?}", label);
         assert!(label.contains("git status"), "got: {:?}", label);
+        assert!(
+            label.contains(&format!("{}(git status){}", GRAY, RESET)),
+            "both parentheses and the argument should use one color: {label:?}"
+        );
     }
 
     #[test]
