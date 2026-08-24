@@ -79,13 +79,7 @@ pub enum Command {
     StackForget(usize),            // /forget W1        — remove word and AI descendants
     StackDup(usize),               // /dup W1           — clone word as new entry
     StackSwap(usize, usize),       // /swap W1 W2       — swap labels of two words
-    StackDescribe(String),         // /describe <word>  — show library entry for a word
-    StackDefine(String, String),   // /define <word> <def> — add word to repo vocabulary
-    StackOverride(String, String), // /override <word> <def> — machine-local override (~/.finch/library.toml)
     ForthEval(String),             // : word ... ; or /forth <expr> — execute in the typed VM
-    VmDump,                        // /vm — dump VM source to scrollback + clipboard
-    LibraryUndefine(String),       // /undefine <word> — remove last user library entry for word
-    LibraryRun(String),            // /run <word> — execute the Forth snippet for a library word
     Setup,   // /setup — open the setup wizard (run 'finch setup' to reconfigure)
     Share,   // /share — format session as a pasteable proof block
     BoxDiff, // /box-diff — compare all peers, offer to fix outliers
@@ -175,7 +169,6 @@ impl Command {
             "/brain password" => return Some(Command::BrainPassword(None)),
             "/graph" => return Some(Command::Graph),
             // Co-Forth VM
-            "/vm" | "/vm dump" | "/vm copy" => return Some(Command::VmDump),
             "/stack" | "/stack list" | "/stack show" => return Some(Command::StackShow),
             "/stack clear" | "/stack reset" => return Some(Command::StackClear),
             "/pop" => return Some(Command::StackPop),
@@ -331,28 +324,9 @@ impl Command {
                 }
             }
         }
-        if let Some(rest) = trimmed.strip_prefix("/describe ") {
-            let word = rest.trim();
-            if !word.is_empty() {
-                return Some(Command::StackDescribe(word.to_string()));
-            }
-        }
         // Forth definition typed directly: `: word ... ;`
         if trimmed.starts_with(": ") {
             return Some(Command::ForthEval(trimmed.to_string()));
-        }
-        // Forth / library undo
-        if let Some(rest) = trimmed.strip_prefix("/undefine ") {
-            let word = rest.trim().to_string();
-            if !word.is_empty() {
-                return Some(Command::LibraryUndefine(word));
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix("/run ") {
-            let word = rest.trim().to_string();
-            if !word.is_empty() && !word.contains(' ') {
-                return Some(Command::LibraryRun(word));
-            }
         }
         // Typed Co-Forth eval via /forth. The former semiotic interpreter has
         // no public evaluation command.
@@ -360,65 +334,6 @@ impl Command {
             let expr = rest.trim();
             if !expr.is_empty() {
                 return Some(Command::ForthEval(expr.to_string()));
-            }
-        }
-
-        if let Some(rest) = trimmed.strip_prefix("/define ") {
-            // /define <word> <definition…>   — definition may be empty (AI auto-define)
-            // Word may be:
-            //   • a single token (no spaces)  →  /define hello   A greeting
-            //   • a quoted phrase              →  /define "machine learning"   AI technique
-            //   • a Chinese word/phrase        →  /define 你好   A Chinese greeting
-            let rest = rest.trim();
-            if !rest.is_empty() {
-                let (word, definition) = if rest.starts_with('"') {
-                    // Quoted phrase: find closing '"'
-                    if let Some(close) = rest[1..].find('"') {
-                        let phrase = rest[1..=close].to_string();
-                        let def = rest[close + 2..].trim().to_string();
-                        (phrase, def)
-                    } else {
-                        // Unclosed quote — treat whole thing as the word
-                        (rest.trim_matches('"').to_string(), String::new())
-                    }
-                } else if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
-                    (
-                        rest[..space].trim().to_string(),
-                        rest[space..].trim().to_string(),
-                    )
-                } else {
-                    (rest.to_string(), String::new())
-                };
-                if !word.is_empty() {
-                    return Some(Command::StackDefine(word, definition));
-                }
-            }
-        }
-
-        // Handle /override — machine-local word override (writes to ~/.finch/library.toml)
-        if let Some(rest) = trimmed.strip_prefix("/override ") {
-            let rest = rest.trim();
-            if !rest.is_empty() {
-                let (word, definition) = if rest.starts_with('"') {
-                    if let Some(close) = rest[1..].find('"') {
-                        (
-                            rest[1..=close].to_string(),
-                            rest[close + 2..].trim().to_string(),
-                        )
-                    } else {
-                        (rest.trim_matches('"').to_string(), String::new())
-                    }
-                } else if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
-                    (
-                        rest[..space].trim().to_string(),
-                        rest[space..].trim().to_string(),
-                    )
-                } else {
-                    (rest.to_string(), String::new())
-                };
-                if !word.is_empty() {
-                    return Some(Command::StackOverride(word, definition));
-                }
             }
         }
 
@@ -698,13 +613,7 @@ pub fn handle_command(
         | Command::StackForget(_)
         | Command::StackDup(_)
         | Command::StackSwap(_, _)
-        | Command::StackDescribe(_)
-        | Command::StackDefine(_, _)
-        | Command::StackOverride(_, _)
-        | Command::ForthEval(_)
-        | Command::VmDump
-        | Command::LibraryUndefine(_)
-        | Command::LibraryRun(_) => Ok(CommandOutput::Status(
+        | Command::ForthEval(_) => Ok(CommandOutput::Status(
             "Stack commands should be handled in REPL.".to_string(),
         )),
         // Setup command is handled directly in REPL
@@ -860,15 +769,9 @@ pub fn format_help() -> String {
          {cyan}  /program{reset}           Show current program as Forth source\n\
          {cyan}  /stack{reset}             Show stack contents\n\
          {cyan}  /stack clear{reset}       Drop all stack items\n\
-         {cyan}  /describe <word>{reset}   Show library definition + related words\n\
-         {cyan}  /define <w> <def>{reset}  Add/override a word in your personal library\n\
-         {cyan}  /define \"phrase\" <def>{reset} Override a multi-word phrase or Chinese term\n\
-         {cyan}  /define <w>:<sense>{reset} Add a specific sense (e.g. /define bank:river the sloping land)\n\
-         {gray}                     (1030 English words preloaded — override at your peril){reset}\n\
          {reset}\n\
-         {gray}  Type text to push words. The AI pushes back via Push tool.\n\
-         The stack builds a Forth dialect. /run executes it.{reset}\n\
-         {gray}  /run collapses the stack and executes it.{reset}\n\n\
+         {gray}  The current stack/poset panel is an experimental review surface.\n\
+         /run presents the assembled dependency plan before execution.{reset}\n\n\
          {yellow_bold}💬 Channel Commands:{reset}\n\
          {cyan}  /join #channel{reset}     Join a named channel; announce to all peers\n\
          {cyan}  /part #channel{reset}     Leave a named channel\n\
@@ -1128,6 +1031,21 @@ mod tests {
         ] {
             assert!(matches!(Command::parse(source), Some(Command::Help)));
         }
+    }
+
+    #[test]
+    fn removed_legacy_library_commands_do_not_enter_the_command_surface() {
+        for source in [
+            "/vm",
+            "/describe love",
+            "/define love a feeling",
+            "/override love another feeling",
+            "/undefine love",
+            "/run love",
+        ] {
+            assert!(matches!(Command::parse(source), Some(Command::Help)));
+        }
+        assert!(matches!(Command::parse("/run"), Some(Command::StackRun)));
     }
 
     #[test]

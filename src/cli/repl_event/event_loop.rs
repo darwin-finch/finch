@@ -2604,15 +2604,6 @@ Rules:\n\
                     Command::StackSwap(a, b) => {
                         self.handle_stack_swap(a, b).await?;
                     }
-                    Command::StackDescribe(word) => {
-                        self.handle_stack_describe(word).await?;
-                    }
-                    Command::StackDefine(word, definition) => {
-                        self.handle_stack_define(word, definition).await?;
-                    }
-                    Command::StackOverride(word, definition) => {
-                        self.handle_stack_override(word, definition).await?;
-                    }
                     Command::Ask(query) => {
                         self.execute_query(query).await?;
                     }
@@ -2630,15 +2621,6 @@ Rules:\n\
                             )
                             .await?;
                         }
-                    }
-                    Command::VmDump => {
-                        self.handle_vm_dump().await?;
-                    }
-                    Command::LibraryUndefine(word) => {
-                        self.handle_library_undefine(word).await?;
-                    }
-                    Command::LibraryRun(word) => {
-                        self.handle_library_run(word).await?;
                     }
                     Command::Machines => {
                         self.handle_machines().await?;
@@ -2717,24 +2699,8 @@ Rules:\n\
                 }
                 return Ok(());
             } else {
-                // Give usage hints for known commands with missing arguments
-                let msg = if input.trim() == "/define" {
-                    "Usage: /define <word>[:<sense>] [definition]  (e.g. /define love   or   /define bank:river the edge of a stream)".to_string()
-                } else if input.trim() == "/describe" {
-                    "Usage: /describe <word>  (e.g. /describe love)".to_string()
-                } else if let Some(word) = input.trim().strip_prefix('/') {
-                    // /word  → treat as /describe word (look it up in the library)
-                    let word = word.trim().to_string();
-                    if !word.is_empty() && word.split_whitespace().count() == 1 {
-                        self.handle_stack_describe(word).await?;
-                        return Ok(());
-                    } else {
-                        format!("Unknown command: {}", input)
-                    }
-                } else {
-                    format!("Unknown command: {}", input)
-                };
-                self.output_manager.write_info(msg);
+                self.output_manager
+                    .write_info(format!("Unknown command: {input}"));
                 self.render_tui().await?;
                 return Ok(());
             }

@@ -69,8 +69,8 @@ Patterns: /patterns  /patterns add  /patterns rm <id>  /patterns clear
 Feedback: /critical [note]  /medium [note]  /good [note]
   (aliases: /feedback critical|medium|good [note])
 
-Co-Forth VM: /push <text>  /pop  /run  /program  /stack  /stack clear
-  /describe <word>  /define <word> [def]  /vm  /forth <expr>  /undefine [word]
+Typed Co-Forth: /forth <expr>
+Execution-plan prototype: /push <text>  /pop  /run  /program  /stack  /stack clear
   /chain W1 W2  /forget W1  /dup W1  /swap W1 W2  /share  /box-diff
 
 
