@@ -19,7 +19,8 @@ use crate::vm::{
     TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
 use crate::vm::vocabulary::{
-    agent_task_spec_type, core_word_spec, CoreHostBinding, CoreWordImplementation,
+    agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type, core_word_spec,
+    CoreHostBinding, CoreWordImplementation,
 };
 use anyhow::{bail, Context, Result};
 use automation::AutomationBroker;
@@ -3098,6 +3099,92 @@ fn typed_agent_task_spec(
     })
 }
 
+fn agent_task_status_name(status: scheduler::AgentTaskStatus) -> &'static str {
+    match status {
+        scheduler::AgentTaskStatus::Queued => "queued",
+        scheduler::AgentTaskStatus::Running => "running",
+        scheduler::AgentTaskStatus::Completed => "completed",
+        scheduler::AgentTaskStatus::Failed => "failed",
+        scheduler::AgentTaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn agent_role_name(role: scheduler::AgentRole) -> &'static str {
+    match role {
+        scheduler::AgentRole::General => "general",
+        scheduler::AgentRole::Explore => "explore",
+        scheduler::AgentRole::Research => "research",
+        scheduler::AgentRole::Code => "code",
+    }
+}
+
+fn typed_agent_task_result(
+    result: scheduler::AgentTaskResult,
+    origin: &SourceOrigin,
+) -> std::result::Result<TypedValue, VmDiagnostic> {
+    let turns = i64::try_from(result.turns)
+        .map_err(|_| host_binding_error(origin, "agent turn count exceeds VM integer range"))?;
+    let elapsed_ms = i64::try_from(result.elapsed_ms)
+        .map_err(|_| host_binding_error(origin, "agent elapsed time exceeds VM integer range"))?;
+    let depth = i64::try_from(result.identity.depth)
+        .map_err(|_| host_binding_error(origin, "agent depth exceeds VM integer range"))?;
+    let value = TypedValue::Record(vec![
+        ("task-id".into(), TypedValue::String(result.identity.task_id.to_string())),
+        ("agent-id".into(), TypedValue::String(result.identity.agent_id.to_string())),
+        ("status".into(), TypedValue::String(agent_task_status_name(result.status).into())),
+        ("final-message".into(), TypedValue::String(result.final_message)),
+        (
+            "diagnostics".into(),
+            TypedValue::List {
+                element_type: Type::String,
+                values: result
+                    .diagnostics
+                    .into_iter()
+                    .map(TypedValue::String)
+                    .collect(),
+            },
+        ),
+        ("turns".into(), TypedValue::Int(turns)),
+        ("elapsed-ms".into(), TypedValue::Int(elapsed_ms)),
+        (
+            "provider-model".into(),
+            TypedValue::String(result.identity.provider_model),
+        ),
+        ("depth".into(), TypedValue::Int(depth)),
+    ]);
+    debug_assert_eq!(value.value_type(), agent_task_result_type());
+    Ok(value)
+}
+
+fn typed_agent_task_snapshot(
+    snapshot: scheduler::AgentTaskSnapshot,
+    origin: &SourceOrigin,
+) -> std::result::Result<TypedValue, VmDiagnostic> {
+    let depth = i64::try_from(snapshot.identity.depth)
+        .map_err(|_| host_binding_error(origin, "agent depth exceeds VM integer range"))?;
+    let complete = matches!(
+        snapshot.status,
+        scheduler::AgentTaskStatus::Completed
+            | scheduler::AgentTaskStatus::Failed
+            | scheduler::AgentTaskStatus::Cancelled
+    );
+    let value = TypedValue::Record(vec![
+        ("task-id".into(), TypedValue::String(snapshot.identity.task_id.to_string())),
+        ("agent-id".into(), TypedValue::String(snapshot.identity.agent_id.to_string())),
+        ("status".into(), TypedValue::String(agent_task_status_name(snapshot.status).into())),
+        ("task".into(), TypedValue::String(snapshot.task)),
+        ("role".into(), TypedValue::String(agent_role_name(snapshot.role).into())),
+        (
+            "provider-model".into(),
+            TypedValue::String(snapshot.identity.provider_model),
+        ),
+        ("depth".into(), TypedValue::Int(depth)),
+        ("complete".into(), TypedValue::Bool(complete)),
+    ]);
+    debug_assert_eq!(value.value_type(), agent_task_snapshot_type());
+    Ok(value)
+}
+
 impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
     fn authorize_awaited_effect(
         &mut self,
@@ -3619,7 +3706,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![TypedValue::Task {
                     id: identity.task_id.to_string(),
-                    result_type: Type::String,
+                    result_type: agent_task_result_type(),
                     kind: crate::vm::TaskKind::Agent,
                 }]);
             }
@@ -3636,7 +3723,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 let result = binding
                     .block_on(async move { wait_binding.wait(task_id).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                return Ok(vec![TypedValue::String(result.final_message)]);
+                return Ok(vec![typed_agent_task_result(result, origin)?]);
             }
             crate::vm::CapabilityKind::AgentPoll => {
                 let [TypedValue::Task { id: task_id, .. }] = arguments.as_slice() else {
@@ -3651,9 +3738,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 let snapshot = binding
                     .block_on(async move { poll_binding.poll(task_id).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                let json = serde_json::to_string(&snapshot)
-                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                return Ok(vec![TypedValue::String(json)]);
+                return Ok(vec![typed_agent_task_snapshot(snapshot, origin)?]);
             }
             crate::vm::CapabilityKind::AgentCancel => {
                 let [TypedValue::Task { id: task_id, .. }] = arguments.as_slice() else {

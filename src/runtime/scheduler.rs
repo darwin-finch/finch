@@ -897,6 +897,25 @@ mod tests {
             outcome.status,
             crate::runtime::outcome::ExecutionStatus::Completed
         );
+        let Some(crate::programs::ProgramValue::Record(fields)) = outcome.values.first() else {
+            panic!("agent-await must return a typed result record");
+        };
+        assert!(fields.iter().any(|(name, value)| {
+            name == "status"
+                && value == &crate::programs::ProgramValue::String("completed".to_string())
+        }));
+        assert!(fields.iter().any(|(name, value)| {
+            name == "final-message"
+                && matches!(
+                    value,
+                    crate::programs::ProgramValue::String(message)
+                        if message.contains("focus on typed effects")
+                )
+        }));
+        assert!(fields.iter().any(|(name, value)| {
+            name == "provider-model"
+                && value == &crate::programs::ProgramValue::String("echo".to_string())
+        }));
         let tasks = scheduler.tasks.read().await;
         let task = tasks.values().next().expect("one structured child task");
         assert_eq!(task.snapshot.role, AgentRole::Explore);
@@ -1024,7 +1043,8 @@ mod tests {
         let snapshot = runtime.inspect().await.unwrap();
         assert!(matches!(
             snapshot.typed_stack.last().map(|cell| &cell.value_type),
-            Some(crate::vm::Type::Task(result)) if **result == crate::vm::Type::String
+            Some(crate::vm::Type::Task(result))
+                if **result == crate::vm::vocabulary::agent_task_result_type()
         ));
         let poll = runtime
             .submit(crate::runtime::ProgramSubmission {
@@ -1039,11 +1059,21 @@ mod tests {
                 budget: None,
             })
             .await;
-        assert!(poll.is_ok());
-        assert!(matches!(
-            poll.unwrap().values.first(),
-            Some(crate::programs::ProgramValue::String(_))
-        ));
+        let poll = poll.expect("polling a typed child task must succeed");
+        let Some(crate::programs::ProgramValue::Record(fields)) = poll.values.first() else {
+            panic!("agent-poll must return a typed snapshot record");
+        };
+        assert!(fields.iter().any(|(name, value)| {
+            name == "task"
+                && value == &crate::programs::ProgramValue::String("inspect the VM".to_string())
+        }));
+        assert!(fields.iter().any(|(name, value)| {
+            name == "role"
+                && value == &crate::programs::ProgramValue::String("general".to_string())
+        }));
+        assert!(fields.iter().any(|(name, value)| {
+            name == "complete" && matches!(value, crate::programs::ProgramValue::Bool(_))
+        }));
         assert_eq!(scheduler.tasks.read().await.len(), 1);
     }
 }

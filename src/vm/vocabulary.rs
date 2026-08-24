@@ -129,7 +129,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "process-run" => CoreWordDocumentation { summary: "Run an approved executable directly with a list of string arguments; it never invokes a shell. Use proposal-open for editable scripts.", lisp: "(process-run command arguments)", forth: "command arguments process-run", example: "(process-run \"git\" (list \"status\" \"--short\"))" },
         "proposal-open" => CoreWordDocumentation { summary: "Ask the host to open a human-editable artifact proposal. Approval may execute the edited artifact through its normal validator, return edited text for chat, or cancel; this word does not run a shell itself.", lisp: "(proposal-open language title source)", forth: "language title source proposal-open", example: "(proposal-open \"python\" \"Report\" \"print('hello')\\n\")" },
         "mem-recall" | "mem-store" => CoreWordDocumentation { summary: "Read matching session memory entries or store one text memory entry. Both use the host memory tree and require their respective memory capability.", lisp: "(mem-recall query), (mem-store text)", forth: "query mem-recall; text mem-store", example: "(mem-store \"tested release candidate\")" },
-        "agent-spawn" | "agent-await" | "agent-poll" | "agent-cancel" => CoreWordDocumentation { summary: "Create or control a separate typed child-agent task. Agent tasks have their own stack, budget, ancestry, and attenuated grants; they are not fibers or shared-stack threads.", lisp: "(agent-spawn task), (agent-poll handle), (agent-await handle), (agent-cancel handle)", forth: "task agent-spawn; handle agent-poll; handle agent-await; handle agent-cancel", example: "(agent-poll (agent-spawn \"summarize recent test failures\"))" },
+        "agent-spawn" | "agent-await" | "agent-poll" | "agent-cancel" => CoreWordDocumentation { summary: "Create or control a separate typed child-agent task. Agent tasks have their own stack, budget, ancestry, and attenuated grants; poll and await return typed snapshot/result records rather than serialized text.", lisp: "(agent-spawn task), (agent-poll handle), (agent-await handle), (agent-cancel handle)", forth: "task agent-spawn; handle agent-poll; handle agent-await; handle agent-cancel", example: "(agent-poll (agent-spawn \"summarize recent test failures\"))" },
         "agent-spawn-with" => CoreWordDocumentation { summary: "Spawn a bounded child agent from an explicit typed task specification, including role, parent-authored background, optional provider/model selection, and resource budgets. Empty background/provider/model strings select no override.", lisp: "(agent-spawn-with spec)", forth: "spec agent-spawn-with", example: "(agent-spawn-with { :task \"inspect failures\" :role \"explore\" :background \"\" :provider \"\" :model \"\" :max-turns 4 :timeout-ms 60000 :max-output-bytes 65536 })" },
         "defer" => CoreWordDocumentation { summary: "Turn a pure zero-argument yielding closure into a cooperative fiber<Y,R>. The runtime owns its private continuation and runs it only through fiber operations.", lisp: "(defer closure) or (defer :fiber closure)", forth: "['] producer defer", example: "(defer (lambda () (begin (yield 1) 2)))" },
         "defer-cpu" => CoreWordDocumentation { summary: "Run a pure zero-argument non-producing closure on the bounded native worker pool and return task<R>.", lisp: "(defer :cpu closure) or (defer-cpu closure)", forth: "['] work defer-cpu", example: "(defer :cpu (lambda () (* 6 7)))" },
@@ -239,6 +239,33 @@ pub fn agent_task_spec_type() -> Type {
         ("max-turns".into(), Type::Int),
         ("timeout-ms".into(), Type::Int),
         ("max-output-bytes".into(), Type::Int),
+    ])
+}
+
+pub fn agent_task_result_type() -> Type {
+    Type::Record(vec![
+        ("task-id".into(), Type::String),
+        ("agent-id".into(), Type::String),
+        ("status".into(), Type::String),
+        ("final-message".into(), Type::String),
+        ("diagnostics".into(), Type::list(Type::String)),
+        ("turns".into(), Type::Int),
+        ("elapsed-ms".into(), Type::Int),
+        ("provider-model".into(), Type::String),
+        ("depth".into(), Type::Int),
+    ])
+}
+
+pub fn agent_task_snapshot_type() -> Type {
+    Type::Record(vec![
+        ("task-id".into(), Type::String),
+        ("agent-id".into(), Type::String),
+        ("status".into(), Type::String),
+        ("task".into(), Type::String),
+        ("role".into(), Type::String),
+        ("provider-model".into(), Type::String),
+        ("depth".into(), Type::Int),
+        ("complete".into(), Type::Bool),
     ])
 }
 
@@ -1069,7 +1096,7 @@ fn core_signatures() -> Vocabulary {
             "agent-spawn".into(),
             capability(
                 vec![Type::String],
-                vec![Type::Task(Box::new(Type::String))],
+                vec![Type::Task(Box::new(agent_task_result_type()))],
                 unscoped(CapabilityKind::AgentSpawn),
             ),
         ),
@@ -1077,30 +1104,30 @@ fn core_signatures() -> Vocabulary {
             "agent-spawn-with".into(),
             capability(
                 vec![agent_task_spec_type()],
-                vec![Type::Task(Box::new(Type::String))],
+                vec![Type::Task(Box::new(agent_task_result_type()))],
                 unscoped(CapabilityKind::AgentSpawn),
             ),
         ),
         (
             "agent-await".into(),
             capability(
-                vec![Type::Task(Box::new(Type::String))],
-                vec![Type::String],
+                vec![Type::Task(Box::new(agent_task_result_type()))],
+                vec![agent_task_result_type()],
                 unscoped(CapabilityKind::AgentAwait),
             ),
         ),
         (
             "agent-poll".into(),
             capability(
-                vec![Type::Task(Box::new(Type::String))],
-                vec![Type::String],
+                vec![Type::Task(Box::new(agent_task_result_type()))],
+                vec![agent_task_snapshot_type()],
                 unscoped(CapabilityKind::AgentPoll),
             ),
         ),
         (
             "agent-cancel".into(),
             capability(
-                vec![Type::Task(Box::new(Type::String))],
+                vec![Type::Task(Box::new(agent_task_result_type()))],
                 vec![Type::Unit],
                 unscoped(CapabilityKind::AgentCancel),
             ),
@@ -1281,6 +1308,18 @@ mod tests {
         let vocabulary = core_vocabulary();
         assert_eq!(vocabulary["dup"].to_string(), "( S A -- S A A ! pure )");
         assert!(!vocabulary["agent-spawn"].effects.is_pure());
+        assert_eq!(
+            vocabulary["agent-spawn"].output.values,
+            vec![Type::Task(Box::new(agent_task_result_type()))]
+        );
+        assert_eq!(
+            vocabulary["agent-await"].output.values,
+            vec![agent_task_result_type()]
+        );
+        assert_eq!(
+            vocabulary["agent-poll"].output.values,
+            vec![agent_task_snapshot_type()]
+        );
     }
 
     #[test]
