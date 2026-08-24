@@ -284,7 +284,7 @@ AgentTaskSpec
   context: ContextSpec
   provider: optional provider selector
   model: optional model selector
-  capabilities: requested subset of parent grants
+  capabilities: opaque capability-grant resources selecting a subset of parent grants
   budget: turns, tokens, deadline, output bytes, child count
   execution_mode: foreground | background
 ```
@@ -323,6 +323,13 @@ Large artifacts remain addressable and are fetched through native capabilities o
 spawn result records a hash of the effective starting context so the run can be audited or
 reproduced. Secrets are passed only as opaque capability grants and are never inserted into the
 prompt.
+
+The implemented typed surface obtains those resources through `capability-list`. Discovery is
+filtered by the current ProgramRun ceiling, and spawn revalidates every selected grant against live
+policy, scope, expiry/revocation, and parent containment. An explicit empty selection delegates only
+intrinsic VM authority; the compact `agent-spawn` convenience inherits the caller's full
+creation-time ceiling. A serialized grant UUID or requirement description is metadata, not a
+forgeable substitute for the opaque resource value.
 
 The default is intentionally small: task, parent summary, boot capsule, relevant manifest slice,
 workspace identity, and grants. The parent must opt into conversation excerpts or additional

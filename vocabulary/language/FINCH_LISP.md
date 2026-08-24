@@ -370,6 +370,7 @@ bounded parent-authored background, provider/model selection, or tighter budgets
     :kind "artifact"
     :id "failure-log"
     :sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })
+  :capabilities (empty-list resource<capability-grant>)
   :max-turns 4
   :timeout-ms 60000
   :max-output-bytes 65536 })
@@ -379,7 +380,12 @@ Roles are `general`, `explore`, `research`, or `code`. Empty background/provider
 mean no override. Use `(empty-list record{kind:string,id:string,sha256:string})` when there are no
 context references. References and the effective `starting-context-hash` make child inputs
 auditable; the host must still resolve referenced artifacts and verify their declared digests. An
-unavailable explicit provider/model fails before a child task is created.
+unavailable explicit provider/model fails before a child task is created. Use `(capability-list)`
+to discover live delegable grants, extract a chosen entry's opaque `grant` resource with
+`record-get`, and place those resources in `:capabilities`. An empty capability list delegates no
+non-intrinsic authority; UUID strings and the adjacent JSON requirement metadata cannot be used in
+their place. The compact `(agent-spawn task)` form deliberately inherits the caller's entire
+creation-time ceiling.
 
 `(defer :cpu (lambda () expression))` starts a pure zero-argument closure on a bounded private CPU
 worker and returns `task<T>`. Captures are immutable snapshots, not references to the parent stack.

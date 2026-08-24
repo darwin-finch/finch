@@ -304,6 +304,7 @@ same structured spawn contract is available without a frontend special case:
   provider: ""
   model: ""
   context-refs: empty-list<record{kind:string,id:string,sha256:string}>
+  capabilities: empty-list<resource<capability-grant>>
   max-turns: 4
   timeout-ms: 60000
   max-output-bytes: 65536
@@ -314,7 +315,11 @@ Roles are `general`, `explore`, `research`, or `code`; empty background/provider
 no override. Context references are bounded `{kind,id,sha256}` descriptors and poll/await expose the
 effective `starting-context-hash`; an artifact host must verify referenced bytes against those
 digests before materializing them. Budgets are positive and host-bounded, and unavailable explicit
-model selection fails before the scheduler creates a task.
+model selection fails before the scheduler creates a task. `capability-list` returns typed records
+whose `grant` field is an opaque `resource<capability-grant>`; select only those resources to pass
+in `capabilities`. An empty list delegates no non-intrinsic authority. Printed UUID strings and JSON
+requirement metadata are not authority. The compact `task agent-spawn` form deliberately inherits
+the caller's whole creation-time ceiling.
 
 For CPU-bound pure closures, `['] zero-argument-word defer-cpu` starts a private worker and leaves
 `task<T>`. `task-poll` replaces it with `option<T>`; `task-join` replaces it with `T`, suspending
