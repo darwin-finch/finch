@@ -101,6 +101,38 @@ Finch as a model; Finch does not expose an MCP server.
 
 ---
 
+## Shared brains (experimental)
+
+A named Brain keeps one ordered conversation and one persistent typed Lisp/Co-Forth VM across
+multiple terminals and daemon restarts. Start the daemon, open Finch in two terminals, and attach
+both to the same local name:
+
+```text
+finch daemon-start
+finch
+
+/brain attach demo@127.0.0.1
+```
+
+The second `finch` process uses the same `/brain attach` command. Programs, provider responses, VM
+output, and errors appear in both consoles. For example, define a word in one terminal:
+
+```lisp
+(define (triple (n : int)) (* n 3))
+```
+
+and invoke it from the other:
+
+```lisp
+(say (int-to-string (triple 14)))
+```
+
+Use `/brain detach` to return that console to its local session. Named-Brain workspace/process
+effects and scoped participant roles are still under development; the current compatibility path
+is intended for shared conversation and pure/session-output VM testing.
+
+---
+
 ## Local model (offline use)
 
 If you want finch to run without any cloud provider, it can download and run a local model via ONNX Runtime. Six model families are supported (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek). Qwen 2.5 is the default, selected automatically based on your available RAM:
@@ -131,6 +163,8 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 | `/model <name>`      | Switch profiles without clearing conversation context  |
 | `/provider …`        | Compatibility alias for `/model …`                     |
 | `/teacher …`         | Compatibility alias for `/model …`                     |
+| `/brain attach NAME@HOST` | Attach this console to a named shared Brain      |
+| `/brain detach`      | Return this console to its local session                 |
 | `/license status`    | Show current license type                              |
 | `/license activate <key>` | Activate a commercial license key                 |
 | `/help`              | Show available commands                                |
