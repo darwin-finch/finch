@@ -1464,7 +1464,7 @@ mod tests {
             envelope,
         }) = event_rx.try_recv()
         {
-            if projection.project_envelope(&envelope) {
+            if !projection.project_envelope(envelope).is_empty() {
                 projected += 1;
             }
         }

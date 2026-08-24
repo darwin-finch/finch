@@ -5327,7 +5327,7 @@ mod tests {
         ));
         for event in events.iter() {
             assert!(
-                projection.project_envelope(event),
+                !projection.project_envelope(event.clone()).is_empty(),
                 "the UI projection must not discard a same-sequence create event"
             );
         }

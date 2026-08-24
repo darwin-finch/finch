@@ -6,7 +6,7 @@
 // This enables terminal scrollback while maintaining TUI compatibility.
 
 use std::io::{self, Write};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
@@ -36,6 +36,13 @@ pub struct VmOutputProjection {
     /// event log will persist that acknowledgement; this guard protects a
     /// live attached client while the runtime remains embedder-neutral.
     next_effect_sequence: Arc<Mutex<HashMap<uuid::Uuid, u64>>>,
+    /// Effects may cross a host/event-loop boundary from different workers.
+    /// Retain a suffix that arrives before its prefix instead of dropping it:
+    /// once the missing event arrives, the whole contiguous run is projected
+    /// in journal order. Durable acknowledgement/replay is still owned by the
+    /// later Brain event log, but a live client must not lose output merely
+    /// because its local delivery was reordered.
+    pending_effects: Arc<Mutex<HashMap<uuid::Uuid, BTreeMap<u64, VmEffectEnvelope>>>>,
 }
 
 impl std::fmt::Debug for VmOutputProjection {
@@ -60,31 +67,53 @@ impl VmOutputProjection {
             default_response,
             handles: Arc::new(Mutex::new(HashMap::new())),
             next_effect_sequence: Arc::new(Mutex::new(HashMap::new())),
+            pending_effects: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Project a portable, correlated VM effect exactly once and in its
-    /// journal order. Returns `true` when the event was applied. A `false`
-    /// result means this client has already projected the sequence, or it is
-    /// missing an earlier event and must wait for/replay the contiguous
-    /// journal prefix instead of rendering a misleading partial update.
-    pub fn project_envelope(&self, envelope: &VmEffectEnvelope) -> bool {
+    /// journal order. Returns every effect newly applied by this call. A
+    /// replayed effect returns an empty vector; an out-of-order suffix is
+    /// retained until its missing prefix arrives. Returning the complete
+    /// drained prefix lets the event loop apply host-specific lifecycle work
+    /// (such as a proposal request) for buffered effects as well as render
+    /// their output.
+    pub fn project_envelope(&self, envelope: VmEffectEnvelope) -> Vec<VmEffectEnvelope> {
+        let execution_id = envelope.execution_id;
         let mut cursors = self
             .next_effect_sequence
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let expected = cursors.entry(envelope.execution_id).or_insert(0);
-        if envelope.effect.sequence != *expected {
-            return false;
+        let mut pending = self
+            .pending_effects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expected = cursors.entry(execution_id).or_insert(0);
+        if envelope.effect.sequence < *expected {
+            return Vec::new();
         }
+        let queue = pending.entry(execution_id).or_default();
+        if queue.contains_key(&envelope.effect.sequence) {
+            // A duplicate future event is still pending; retain the first
+            // copy and wait for the missing prefix.
+            return Vec::new();
+        }
+        queue.insert(envelope.effect.sequence, envelope);
 
-        // Keep the cursor lock while projecting. This makes the sequence
-        // guard meaningful even if a non-terminal embedder calls this adapter
-        // from several worker threads: later events cannot render ahead of an
-        // earlier event that has reserved its sequence.
-        self.project(&envelope.effect);
-        *expected += 1;
-        true
+        let mut projected = Vec::new();
+        while let Some(next) = queue.remove(expected) {
+            // Keep the cursor lock while projecting. This makes the sequence
+            // guard meaningful even if a non-terminal embedder calls this
+            // adapter from several worker threads: later events cannot render
+            // ahead of an earlier event that has reserved its sequence.
+            self.project(&next.effect);
+            projected.push(next);
+            *expected += 1;
+        }
+        if queue.is_empty() {
+            pending.remove(&execution_id);
+        }
+        projected
     }
 
     /// Apply one ordered VM event. Unknown or already-closed handles are
@@ -576,17 +605,24 @@ mod tests {
         let third = emit(2, "third");
         let second = emit(1, " second");
 
-        assert!(projection.project_envelope(&first));
+        assert_eq!(projection.project_envelope(first.clone()).len(), 1);
         assert!(
-            !projection.project_envelope(&first),
+            projection.project_envelope(first).is_empty(),
             "a replayed journal effect must not duplicate output"
         );
         assert!(
-            !projection.project_envelope(&third),
-            "a gap must wait for the missing sequence rather than rendering ahead"
+            projection.project_envelope(third).is_empty(),
+            "a gap must be retained without rendering ahead"
         );
-        assert!(projection.project_envelope(&second));
-        assert!(projection.project_envelope(&third));
+        let drained = projection.project_envelope(second);
+        assert_eq!(
+            drained
+                .iter()
+                .map(|effect| effect.effect.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "the missing event must drain the retained contiguous suffix"
+        );
         assert_eq!(response.content(), "first secondthird");
     }
 

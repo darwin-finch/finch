@@ -3839,12 +3839,16 @@ Rules:\n\
                 // duplicates/gaps before rendering notices or mutating a
                 // WorkUnit; the durable acknowledgement belongs to the later
                 // Brain event-log layer.
-                if !projection.project_envelope(&envelope) {
+                let projected = projection.project_envelope(envelope);
+                if projected.is_empty() {
                     return Ok(());
                 }
-                if envelope.effect.requirement.capability
-                    == crate::vm::CapabilityKind::ProgramInvoke
-                {
+                for envelope in projected {
+                    if envelope.effect.requirement.capability
+                        != crate::vm::CapabilityKind::ProgramInvoke
+                    {
+                        continue;
+                    }
                     let intent = match &envelope.effect.event {
                         crate::vm::HostSideEffect::Request { arguments } => arguments
                             .get(1)
