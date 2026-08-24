@@ -2362,6 +2362,35 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_round_trips_lisp_closure_bodies_and_captures() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute(
+            ProgramLanguage::Lisp,
+            "closure-definition.lisp",
+            "(define (make-adder (n : int)) (lambda ((x : int)) (+ n x)))",
+            1_000,
+        );
+        assert_eq!(definition.status, TypedExecutionStatus::Completed);
+
+        let checkpoint = runtime.checkpoint().expect("closure state checkpoints");
+        assert!(checkpoint
+            .functions
+            .keys()
+            .any(|name| name.starts_with("lambda$")));
+        let mut restored = TypedRuntime::from_checkpoint(checkpoint)
+            .expect("generated lambda bodies restore with their public definition");
+        let result = restored.execute(
+            ProgramLanguage::Lisp,
+            "closure-call.lisp",
+            "((make-adder 7) 35)",
+            1_000,
+        );
+
+        assert_eq!(result.status, TypedExecutionStatus::Completed);
+        assert_eq!(restored.stack(), &[TypedValue::Int(42)]);
+    }
+
+    #[test]
     fn checkpoint_rejects_host_owned_handles() {
         let value = TypedValue::Stream {
             id: "cursor-1".into(),
