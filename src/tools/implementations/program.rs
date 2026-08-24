@@ -211,6 +211,11 @@ const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
         description: "Homogeneous immutable Co-Forth typed list literal: list{ value ... }list. All elements must share one inferred type; list-append returns a replacement list.",
     },
     SourceSyntaxEntry {
+        name: "empty-list",
+        languages: &["lisp", "forth"],
+        description: "Explicit typed empty list. Lisp: (empty-list element-type); Co-Forth: empty-list<element-type>. This supplies the element type an empty literal cannot infer.",
+    },
+    SourceSyntaxEntry {
         name: "map",
         languages: &["lisp"],
         description: "Immutable typed map literal: (map key value ...). Keys share one inferred type and values share one inferred type; use map-get, map-set, map-entries, or map-length to inspect it.",

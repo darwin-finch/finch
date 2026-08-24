@@ -59,6 +59,13 @@
       "expected_output": ""
     },
     {
+      "name": "explicit-typed-empty-list",
+      "forth": "empty-list<int> 3 list-append 0 list-get",
+      "lisp": "(list-get (list-append (empty-list int) 3) 0)",
+      "expected_values": [{ "type": "int", "value": 3 }],
+      "expected_output": ""
+    },
+    {
       "name": "immutable-map-update",
       "forth": "empty-map<string,int> s\" answer\" 42 map-set s\" answer\" map-get unwrap",
       "lisp": "(unwrap (map-get (map-set (empty-map string int) \"answer\" 42) \"answer\"))",

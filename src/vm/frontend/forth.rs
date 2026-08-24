@@ -449,6 +449,30 @@ fn compile_forth_body_with_locals(
                 token_index += 1;
                 continue;
             }
+            if let Some(element) = word
+                .strip_prefix("empty-list<")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                let element_type = super::lisp::parse_type_name(element).map_err(|_| {
+                    vec![control_error(
+                        "E-LIST-005",
+                        "empty-list requires one valid type argument, for example empty-list<string>",
+                        origin.clone(),
+                    )]
+                })?;
+                stack.push(Type::list(element_type.clone()));
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::MakeList {
+                        element_type,
+                        count: 0,
+                    },
+                    origin,
+                );
+                token_index += 1;
+                continue;
+            }
             if let Some(field) = word
                 .strip_prefix("field:")
                 .or_else(|| record_literals.last().and_then(|_| word.strip_suffix(':')))

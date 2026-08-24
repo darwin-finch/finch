@@ -956,6 +956,7 @@ impl Compiler<'_> {
                 builder,
             ),
             "list" => self.compile_list_value(&items[1..], builder),
+            "empty-list" => self.compile_empty_list(&items[1..], builder),
             "map" => self.compile_map_value(&items[1..], builder),
             "empty-map" => self.compile_empty_map(&items[1..], builder),
             "finch-record-literal" => self.compile_record_value(
@@ -1204,6 +1205,33 @@ impl Compiler<'_> {
                 count: expressions.len() as u32,
             },
             self.origin("list"),
+        );
+        Ok(Type::list(element_type))
+    }
+
+    fn compile_empty_list(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [Val::Symbol(element)] = expressions else {
+            return Err(vec![self.error(
+                "E-LIST-005",
+                "empty-list requires one element type name, for example (empty-list string)",
+            )]);
+        };
+        let element_type = parse_type_name(element).map_err(|_| {
+            vec![self.error(
+                "E-LIST-005",
+                format!("unknown list element type '{element}'"),
+            )]
+        })?;
+        builder.emit(
+            Instruction::MakeList {
+                element_type: element_type.clone(),
+                count: 0,
+            },
+            self.origin("empty-list"),
         );
         Ok(Type::list(element_type))
     }
