@@ -3,6 +3,7 @@
 pub mod agent_vm;
 pub mod automation;
 pub mod context;
+pub mod effect_log;
 pub mod fiber;
 pub mod outcome;
 pub mod scheduler;
@@ -35,7 +36,7 @@ use std::time::Instant;
 /// A portable VM event attached to its owning ProgramRun. The VM event itself
 /// remains embedder-neutral; the envelope provides the other half of its
 /// idempotency key to a host/UI callback.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VmEffectEnvelope {
     pub execution_id: uuid::Uuid,
     pub effect: VmSideEffect,

@@ -145,7 +145,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   whose completion returns through that same loop. The process-wide string-only output callback has
   been removed; live output is now exclusively a per-run typed `(execution_id, sequence)` envelope.
   Client projections reject duplicates and retain a gapped in-memory suffix until its prefix arrives,
-  but this is only a live reconnect guard; durable application-journal/replay support remains.
+  but this is only a live reconnect guard. The application-side `VmEffectDeliveryLog` now provides
+  durable idempotent JSONL append, per-client prefix acknowledgement, ordered suffix replay, and
+  fail-closed corruption/gap checks; bind it to the converged Brain/client identity and projection
+  lifecycle before treating reconnect replay as complete.
 - [ ] Complete the application-owned policy for cooperative typed-VM `yield`: the interactive
   provider-wire runner now yields its Tokio task and automatically resumes only an exact
   `PendingTypedReason::Yielded` continuation. General daemon/frontend scheduling still needs
