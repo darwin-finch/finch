@@ -116,6 +116,29 @@ a module links its declared interface/IR; it does not paste source, execute ambi
 or confer capabilities. Self-contained model-authored scripts remain the default when an import
 would make an artifact harder to audit.
 
+Semantic analysis should be dependency-driven rather than implemented as repeated whole-module
+passes. After the one parser pass registers declaration skeletons, each symbol and generic
+instantiation owns a bounded semantic job with monotonic readiness phases:
+
+```text
+Declared -> SignatureReady -> BodyTyped -> Lowered
+```
+
+A job that requires another symbol at a particular phase yields an explicit compiler continuation
+such as `Needs(symbol_id, SignatureReady)`. The scheduler advances the dependency and resumes the
+requester. Generic instantiation creates or reuses a synthetic job keyed by immutable module and
+definition identity plus its type/value arguments. Phase-aware dependency traces distinguish legal
+mutual recursion, whose declared signatures break the cycle, from impossible compile-time value or
+layout cycles and report the complete chain with source origins.
+
+This is the useful architectural lesson from [SDC's semantic
+scheduler](https://github.com/snazzy-d/sdc/blob/master/src/d/semantic/scheduler.d): its source uses
+stackful fibers to make `require(symbol, phase)` read synchronously while dependent symbols advance
+on demand. Finch should initially implement the same dependency semantics with explicit resumable
+compiler jobs rather than native fiber stacks. That preserves deterministic scheduling, cycle
+diagnostics, fuel limits, and straightforward tests/serialization. Compiler continuations are an
+internal frontend mechanism and are not language-level `fiber<Y,R>` values.
+
 Package retrieval is a separate later layer over modules. Dependency declarations identify a
 source locator and exact version or immutable content hash, and a checked-in lockfile fixes the
 complete transitive graph. Resolvers must support local paths and decentralized Git, HTTPS, and

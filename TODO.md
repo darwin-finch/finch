@@ -28,6 +28,18 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   parsing. Use declaration-before-use and explicit typed module interfaces where necessary;
   mutually recursive definitions may be declared in an interface before their bodies. Keep the
   verifier as an independent semantic pass over IR—security verification is not source parsing.
+- [ ] Add a dependency-driven semantic scheduler over retained AST/module interfaces. Parse and
+  register every declaration once, then advance each symbol or generic instantiation through
+  monotonic phases such as `Declared → SignatureReady → BodyTyped → Lowered`. A semantic job that
+  needs another symbol/phase yields an explicit compiler continuation (`Needs(symbol, phase)`), and
+  the scheduler resumes it when that dependency is ready. Memoize generic instantiations by
+  immutable definition/module identity plus type/value arguments. Detect phase-specific dependency
+  cycles with a complete source trace; permit declared mutual recursion where signatures break the
+  cycle, but reject compile-time value/layout cycles. Bound jobs and expansion fuel. Keep these
+  compiler continuations distinct from runtime `fiber<Y,R>`, and prefer explicit resumable state
+  machines over native stackful fibers unless measurement proves the latter materially simpler.
+  This design is informed by SDC's small fiber-based semantic scheduler, without inheriting its
+  unresolved-forward-reference or per-fiber native-stack limitations.
 - [ ] Put an explicit span-preserving AST boundary between both source readers and typed stack IR.
   Formalize Lisp's existing `Val`/`SpannedVal` tree as its frontend AST. Co-Forth now tokenizes a
   module once into a span-preserving `ForthModuleAst` containing definitions and retained body
