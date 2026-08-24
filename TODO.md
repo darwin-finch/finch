@@ -33,8 +33,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   module once into a span-preserving `ForthModuleAst` containing definitions and retained body
   atoms; definition and anonymous-quotation bodies lower from those retained nodes without source
   copying, masking, or re-tokenization, and nested diagnostics retain original module coordinates.
-  Finish replacing the remaining flat body atoms with structured Co-Forth AST nodes for signatures,
-  quotations, control flow, literals, and calls. Then perform one post-order semantic lowering into
+  Anonymous quotations and their signatures/bodies are now recursive parser-owned AST nodes, so
+  lowering does not rediscover their delimiters. Finish replacing the remaining flat body atoms
+  with structured Co-Forth AST nodes for definitions' signatures, control flow, literals, and
+  calls. Then perform one post-order semantic lowering into
   the shared IR; lower syntactic sugar and bounded macro rewrites over AST nodes without serializing
   or reparsing source. Do not add a chain of incidental HIR passes: add a shared HIR only if a
   concrete cross-frontend transformation cannot be expressed cleanly by shared AST-to-IR lowering
