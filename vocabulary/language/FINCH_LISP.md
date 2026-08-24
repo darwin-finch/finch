@@ -457,7 +457,15 @@ it returns `none` for non-objects and never guesses a typed-record schema.
 
 The generic MCP boundary is `(mcp-call server tool arguments-json)`. It returns managed `json` and
 requires authority for that exact server/tool pair. Construct arguments through `json-parse` in
-Lisp source; discovered namespaced bindings may expose narrower schema-derived types later.
+Lisp source. Discovered tools appear as `mcp.<server>.<tool>` and consume one schema-derived typed
+record when possible, otherwise one managed `json`. For example:
+
+```lisp
+(mcp.github.issue_get { :owner "darwin-finch" :repo "finch" :issue_number 42 })
+```
+
+Inspect the binding first: its immutable schema hash versions the discovered contract and a refresh
+increments the VM manifest generation.
 
 Typed maps are immutable shared-language collections, separate from JSON. Construct one with
 alternating key/value forms: `(map "answer" 42 "other" 7)`. All keys must share one type and all

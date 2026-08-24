@@ -296,6 +296,35 @@ impl TypedRuntime {
         &self.functions
     }
 
+    /// Replace application-supplied host vocabulary without allowing it to
+    /// shadow a core word or a source-defined function. These bindings are
+    /// availability metadata and are intentionally rebuilt by the host after
+    /// checkpoint restoration.
+    pub fn replace_host_vocabulary(
+        &mut self,
+        previous_names: impl IntoIterator<Item = String>,
+        replacements: &BTreeMap<String, super::signature::StackSignature>,
+    ) -> Result<(), VmDiagnostic> {
+        let core = core_vocabulary();
+        for name in replacements.keys() {
+            if core.contains_key(name) || self.functions.contains_key(name) {
+                return Err(VmDiagnostic::error(
+                    "E-LINK-006",
+                    DiagnosticPhase::Linking,
+                    format!("host vocabulary cannot shadow word '{name}'"),
+                    Some(SourceOrigin::generated(name.clone())),
+                ));
+            }
+        }
+        for name in previous_names {
+            if !core.contains_key(&name) && !self.functions.contains_key(&name) {
+                self.vocabulary.remove(&name);
+            }
+        }
+        self.vocabulary.extend(replacements.clone());
+        Ok(())
+    }
+
     /// Reclaim producer records after their last language-visible handle has
     /// disappeared. Terminal records remain deterministic tombstones while a
     /// duplicate/nested handle is reachable; ready records referenced by a

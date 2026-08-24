@@ -205,7 +205,10 @@ vocabulary. Use it (or the external `get_vm_state` tool) instead of guessing cal
 server string, tool string, and `json`, then returns `json`. The runtime derives the concrete
 `mcp.call(server,tool)` requirement from those first two arguments before dispatch; installing an
 MCP transport does not grant it. Schema-derived namespaced words may provide narrower static types,
-but unsupported schemas stay at this boundary rather than becoming `dynamic`.
+but unsupported schemas stay at this boundary rather than becoming `dynamic`. A discovered tool
+with an admissible object schema is published as `mcp.<server>.<tool>` with one typed-record input;
+unsupported but well-formed property shapes use one managed `json` input instead. Each discovered
+binding carries a schema hash and changes the manifest generation when installed.
 
 Structured values are part of the shared ABI. `some` and `none` construct `option<T>` values;
 `is-some` tests one and `unwrap` extracts its payload (returning a structured `E-OPTION-001`

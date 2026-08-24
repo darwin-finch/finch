@@ -11,6 +11,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Untrusted discovery data retained with its server provenance. Consumers
+/// must validate the schema and render the prose as data before publishing a
+/// model-facing binding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolDescriptor {
+    pub server: String,
+    pub tool: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+}
+
 /// MCP client that manages multiple server connections.
 pub struct McpClient {
     /// Original configuration, retained for reloads and timeout lookup.
@@ -100,8 +111,68 @@ impl McpClient {
         tools
     }
 
+    /// Return raw discovered descriptors with explicit server provenance.
+    /// This is the input to the typed VM adapter; unlike `list_tools`, it does
+    /// not flatten JSON Schema into the legacy provider-tool shape.
+    pub async fn tool_descriptors(&self) -> Vec<McpToolDescriptor> {
+        let connections = self.connections.read().await;
+        let mut descriptors = Vec::new();
+        for (server, connection) in connections.iter() {
+            for tool in connection.read().await.list_tools() {
+                descriptors.push(McpToolDescriptor {
+                    server: server.clone(),
+                    tool: tool.name.clone(),
+                    description: tool.description.clone(),
+                    input_schema: tool.input_schema.clone(),
+                });
+            }
+        }
+        descriptors.sort_by(|left, right| {
+            (&left.server, &left.tool).cmp(&(&right.server, &right.tool))
+        });
+        descriptors
+    }
+
     /// Execute a tool on the appropriate server
     pub async fn execute_tool(&self, tool_name: &str, params: Value) -> Result<String> {
+        let (server_name, actual_tool_name, conn) = self.resolve_tool(tool_name).await?;
+
+        tracing::debug!(
+            "Executing MCP tool '{}' on server '{}'",
+            actual_tool_name,
+            server_name
+        );
+
+        let conn = conn.read().await;
+        conn.call_tool(&actual_tool_name, params)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to execute tool '{}' on MCP server '{}'",
+                    actual_tool_name, server_name
+                )
+            })
+    }
+
+    /// Execute an MCP tool while preserving the structured JSON result for a
+    /// typed VM or other non-chat embedder.
+    pub async fn execute_tool_value(&self, tool_name: &str, params: Value) -> Result<Value> {
+        let (server_name, actual_tool_name, conn) = self.resolve_tool(tool_name).await?;
+        let conn = conn.read().await;
+        conn.call_tool_value(&actual_tool_name, params)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to execute tool '{}' on MCP server '{}'",
+                    actual_tool_name, server_name
+                )
+            })
+    }
+
+    async fn resolve_tool(
+        &self,
+        tool_name: &str,
+    ) -> Result<(String, String, Arc<RwLock<McpConnection>>)> {
         let connections = self.connections.read().await;
         let unprefixed = tool_name
             .strip_prefix("mcp_")
@@ -138,23 +209,7 @@ impl McpClient {
         }
         let (server_name, actual_tool_name, conn) =
             owner.with_context(|| format!("No connected MCP server owns tool '{tool_name}'"))?;
-
-        tracing::debug!(
-            "Executing MCP tool '{}' on server '{}'",
-            actual_tool_name,
-            server_name
-        );
-
-        // Call the tool
-        let conn = conn.read().await;
-        conn.call_tool(&actual_tool_name, params)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to execute tool '{}' on MCP server '{}'",
-                    actual_tool_name, server_name
-                )
-            })
+        Ok((server_name.to_owned(), actual_tool_name, Arc::clone(&conn)))
     }
 
     /// Refresh tools from all servers

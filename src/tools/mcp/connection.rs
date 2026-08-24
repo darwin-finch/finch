@@ -326,6 +326,13 @@ impl McpConnection {
 
     /// Call a tool on this server
     pub async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<String> {
+        let response = self.call_tool_value(tool_name, arguments).await?;
+        render_tool_response(&response)
+    }
+
+    /// Call a tool without flattening its structured result into prose. Typed
+    /// VM bindings use this path so JSON remains JSON across the host ABI.
+    pub async fn call_tool_value(&self, tool_name: &str, arguments: Value) -> Result<Value> {
         let response = self
             .send_request(
                 "tools/call",
@@ -335,49 +342,19 @@ impl McpConnection {
                 })),
             )
             .await?;
-
         let is_error = response
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-
-        // Preserve every content type. Text blocks remain plain text for the
-        // model; non-text blocks and structured content remain JSON.
-        let mut parts = Vec::new();
-        if let Some(content) = response.get("content") {
-            if let Some(arr) = content.as_array() {
-                for item in arr {
-                    if let Some(text) = item.get("text").and_then(Value::as_str) {
-                        parts.push(text.to_owned());
-                    } else {
-                        parts.push(serde_json::to_string_pretty(item)?);
-                    }
-                }
-            }
-        }
-        if let Some(structured) = response.get("structuredContent") {
-            parts.push(format!(
-                "Structured content:\n{}",
-                serde_json::to_string_pretty(structured)?
-            ));
-        }
-        let result = parts.join("\n");
         if is_error {
-            anyhow::bail!(
-                "{}",
-                if result.is_empty() {
-                    "MCP tool failed"
-                } else {
-                    &result
-                }
-            );
+            let rendered = render_tool_response(&response)?;
+            anyhow::bail!(if rendered.is_empty() {
+                "MCP tool failed".to_owned()
+            } else {
+                rendered
+            });
         }
-        if !result.is_empty() {
-            return Ok(result);
-        }
-
-        // Fallback: return entire response as JSON
-        Ok(serde_json::to_string_pretty(&response)?)
+        Ok(response)
     }
 
     /// Send a JSON-RPC request and get response
@@ -547,6 +524,32 @@ impl McpConnection {
         }
 
         Ok(())
+    }
+}
+
+fn render_tool_response(response: &Value) -> Result<String> {
+    // Preserve every content type. Text blocks remain plain text for the
+    // model; non-text blocks and structured content remain JSON.
+    let mut parts = Vec::new();
+    if let Some(content) = response.get("content").and_then(Value::as_array) {
+        for item in content {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_owned());
+            } else {
+                parts.push(serde_json::to_string_pretty(item)?);
+            }
+        }
+    }
+    if let Some(structured) = response.get("structuredContent") {
+        parts.push(format!(
+            "Structured content:\n{}",
+            serde_json::to_string_pretty(structured)?
+        ));
+    }
+    if parts.is_empty() {
+        serde_json::to_string_pretty(response).map_err(Into::into)
+    } else {
+        Ok(parts.join("\n"))
     }
 }
 

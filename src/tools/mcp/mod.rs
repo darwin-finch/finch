@@ -23,6 +23,6 @@ pub mod config;
 pub mod connection;
 pub mod protocol;
 
-pub use client::McpClient;
+pub use client::{McpClient, McpToolDescriptor};
 pub use config::{McpServerConfig, TransportType};
 pub use connection::McpConnection;

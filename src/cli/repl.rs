@@ -551,8 +551,15 @@ impl Repl {
         // Add MCP support if configured (graceful - always returns even on error)
         let executor = executor.with_mcp(&config).await;
         if let Some(client) = executor.mcp_client().cloned() {
-            if let Err(error) = program_runtime.bind_mcp_client(client) {
-                tracing::warn!("Failed to bind MCP client to typed VM: {error:#}");
+            match program_runtime.bind_mcp_client(client).await {
+                Ok(rejected) => {
+                    for diagnostic in rejected {
+                        tracing::warn!("MCP tool was not published to typed VM: {diagnostic}");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to bind MCP client to typed VM: {error:#}");
+                }
             }
         }
 

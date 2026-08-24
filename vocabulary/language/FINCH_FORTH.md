@@ -392,6 +392,14 @@ requires authority for that exact server/tool pair. For example:
 "github" "issue_get" {"owner":"darwin-finch","repo":"finch","issue_number":42} mcp-call
 ```
 
+Discovered tools also appear as `mcp.<server>.<tool>`. When its input schema is representable, the
+word consumes one typed record; otherwise it consumes one managed `json`. Inspect its exact
+signature rather than guessing fields:
+
+```forth
+{ owner: "darwin-finch" repo: "finch" issue_number: 42 } mcp.github.issue_get
+```
+
 For progressive prose, emit multiple typed chunks with `say`. Bare `"..."` pushes one typed
 `string` and never evaluates its contents. `s"..."` is an equivalent familiar Forth spelling; the
 `s` means **string**, not `say`. Both `s"text"` and the conventional `s" text"` spell the

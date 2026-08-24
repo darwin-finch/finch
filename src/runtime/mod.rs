@@ -6,6 +6,7 @@ pub mod automation;
 pub mod context;
 pub mod effect_log;
 pub mod fiber;
+mod mcp;
 pub mod outcome;
 pub mod scheduler;
 
@@ -31,7 +32,7 @@ use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -225,6 +226,15 @@ pub struct VmVocabularyEntry {
     /// word is not a host-bound core primitive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub documentation: Option<String>,
+    /// Immutable application-binding identity, such as an MCP schema hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostVocabularyMetadata {
+    documentation: String,
+    version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +356,7 @@ pub struct ProgramRuntime {
     /// Host-owned MCP transport. Installing it makes configured servers
     /// callable but never grants authority to any server or tool.
     mcp_client: RwLock<Option<Arc<crate::tools::mcp::McpClient>>>,
+    host_vocabulary: RwLock<BTreeMap<String, HostVocabularyMetadata>>,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
     /// Output handles are opaque, per-execution presentation resources.  They
     /// intentionally do not name an ambient "current work unit".
@@ -619,6 +630,7 @@ impl ProgramRuntime {
             host_machine_root: Arc::new(RwLock::new(None)),
             memory: RwLock::new(None),
             mcp_client: RwLock::new(None),
+            host_vocabulary: RwLock::new(BTreeMap::new()),
             network: Arc::new(Mutex::new(HashMap::new())),
             output_handles: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
@@ -730,13 +742,56 @@ impl ProgramRuntime {
         }
     }
 
-    /// Install the application-owned MCP transport without changing grants.
-    pub fn bind_mcp_client(&self, client: Arc<crate::tools::mcp::McpClient>) -> Result<()> {
+    /// Install the application-owned MCP transport and atomically replace its
+    /// discovered, validated namespaced vocabulary. This changes availability
+    /// and the manifest generation, never capability grants.
+    pub async fn bind_mcp_client(
+        &self,
+        client: Arc<crate::tools::mcp::McpClient>,
+    ) -> Result<Vec<String>> {
+        let mut rejected = Vec::new();
+        let mut signatures = BTreeMap::new();
+        let mut metadata = BTreeMap::new();
+        for descriptor in client.tool_descriptors().await {
+            match mcp::adapt_mcp_descriptor(&descriptor) {
+                Ok(binding) => {
+                    signatures.insert(binding.word_name.clone(), binding.signature);
+                    metadata.insert(
+                        binding.word_name,
+                        HostVocabularyMetadata {
+                            documentation: binding.documentation,
+                            version: binding.version,
+                        },
+                    );
+                }
+                Err(error) => rejected.push(format!(
+                    "{}.{}: {error:#}",
+                    descriptor.server, descriptor.tool
+                )),
+            }
+        }
+        let previous_names = self
+            .host_vocabulary
+            .read()
+            .map_err(|_| anyhow::anyhow!("host vocabulary lock poisoned"))?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
+            .replace_host_vocabulary(previous_names, &signatures)
+            .map_err(|diagnostic| anyhow::anyhow!(diagnostic.to_string()))?;
+        *self
+            .host_vocabulary
+            .write()
+            .map_err(|_| anyhow::anyhow!("host vocabulary lock poisoned"))? = metadata;
         *self
             .mcp_client
             .write()
             .map_err(|_| anyhow::anyhow!("MCP client binding lock poisoned"))? = Some(client);
-        Ok(())
+        self.manifest_generation.fetch_add(1, Ordering::AcqRel);
+        Ok(rejected)
     }
 
     /// Install the host-owned root behind `root<host-machine>`. This is an
@@ -2372,6 +2427,11 @@ impl ProgramRuntime {
         let typed = Arc::clone(&self.typed);
         let revision = Arc::clone(&self.revision);
         let manifest_generation = self.manifest_generation();
+        let host_vocabulary = self
+            .host_vocabulary
+            .read()
+            .map_err(|_| anyhow::anyhow!("host vocabulary lock poisoned"))?
+            .clone();
         tokio::task::spawn_blocking(move || {
             let revision = revision.load(Ordering::Acquire);
             let typed = typed
@@ -2394,10 +2454,18 @@ impl ProgramRuntime {
                 .map(|(name, signature)| VmVocabularyEntry {
                     name: name.clone(),
                     signature: Some(signature.to_string()),
-                    documentation: typed
-                        .functions()
+                    documentation: host_vocabulary
                         .get(name)
-                        .and_then(|function| function.documentation.clone()),
+                        .map(|metadata| metadata.documentation.clone())
+                        .or_else(|| {
+                            typed
+                                .functions()
+                                .get(name)
+                                .and_then(|function| function.documentation.clone())
+                        }),
+                    version: host_vocabulary
+                        .get(name)
+                        .map(|metadata| metadata.version.clone()),
                 })
                 .collect();
             // `stack` and `vocabulary` are retained for compatibility with
@@ -4267,14 +4335,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 }]);
             }
             crate::vm::CapabilityKind::McpCall => {
-                let [TypedValue::String(server), TypedValue::String(tool), TypedValue::Json(parameters)] =
-                    arguments.as_slice()
-                else {
-                    return Err(host_binding_error(
-                        origin,
-                        "mcp-call requires server, tool, and JSON arguments",
-                    ));
-                };
                 let ResourceSelector::Mcp {
                     server: authorized_server,
                     tool: authorized_tool,
@@ -4285,24 +4345,42 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         "mcp-call reached the host without a concrete server/tool selector",
                     ));
                 };
-                if server != authorized_server || tool != authorized_tool {
-                    return Err(host_binding_error(
-                        origin,
-                        "mcp-call arguments do not match the authorized server/tool selector",
-                    ));
-                }
+                let parameters = match arguments.as_slice() {
+                    [TypedValue::String(server), TypedValue::String(tool), TypedValue::Json(parameters)] => {
+                        if server != authorized_server || tool != authorized_tool {
+                            return Err(host_binding_error(
+                                origin,
+                                "mcp-call arguments do not match the authorized server/tool selector",
+                            ));
+                        }
+                        parameters.clone()
+                    }
+                    [parameters]
+                        if origin
+                            .word
+                            .as_deref()
+                            .is_some_and(|word| word.starts_with("mcp.")) =>
+                    {
+                        typed_mcp_arguments(parameters).map_err(|error| {
+                            host_binding_error(origin, format!("encode MCP arguments: {error}"))
+                        })?
+                    }
+                    _ => {
+                        return Err(host_binding_error(
+                            origin,
+                            "MCP calls require either server/tool/JSON or one namespaced binding argument",
+                        ));
+                    }
+                };
                 let Some(client) = self.mcp_client.clone() else {
                     return Err(host_binding_error(origin, "MCP client is unavailable"));
                 };
-                let wire_name = format!("mcp_{server}_{tool}");
-                let parameters = parameters.clone();
+                let wire_name = format!("mcp_{authorized_server}_{authorized_tool}");
                 let response = block_on_host(async move {
-                    client.execute_tool(&wire_name, parameters).await
+                    client.execute_tool_value(&wire_name, parameters).await
                 })
                 .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                let value = serde_json::from_str(&response)
-                    .unwrap_or_else(|_| serde_json::Value::String(response));
-                return Ok(vec![TypedValue::Json(value)]);
+                return Ok(vec![TypedValue::Json(response)]);
             }
             crate::vm::CapabilityKind::ProcessRun => {
                 let [TypedValue::String(command), TypedValue::List { values, .. }] =
@@ -4720,6 +4798,19 @@ fn registered_host_binding(
         return Ok(None);
     };
     let Some(spec) = core_word_spec(name) else {
+        if let (
+            &CapabilityKind::McpCall,
+            ResourceSelector::Mcp { server, tool },
+        ) = (&requirement.capability, &requirement.selector)
+        {
+            if name == format!("mcp.{server}.{tool}") {
+                return Ok(Some(CoreHostBinding::McpCall));
+            }
+            return Err(host_binding_error(
+                origin,
+                "namespaced MCP word does not match its concrete server/tool selector",
+            ));
+        }
         // User-defined calls inherit a source origin at a higher level; they
         // must not be mistaken for missing core host bindings.
         return Ok(None);
@@ -4769,6 +4860,47 @@ fn host_binding_error(
         message,
         Some(origin.clone()),
     )
+}
+
+/// Convert the statically admitted MCP input subset into JSON. Optional
+/// record fields represented by `none` are omitted rather than serialized as
+/// null; explicit JSON callers retain full control through generic mcp-call.
+fn typed_mcp_arguments(value: &TypedValue) -> std::result::Result<serde_json::Value, String> {
+    match value {
+        TypedValue::Unit => Ok(serde_json::Value::Null),
+        TypedValue::Bool(value) => Ok((*value).into()),
+        TypedValue::Int(value) => Ok((*value).into()),
+        TypedValue::UInt(value) => Ok((*value).into()),
+        TypedValue::Float(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| "non-finite floats are not valid JSON".into()),
+        TypedValue::Char(value) => Ok(value.to_string().into()),
+        TypedValue::String(value) | TypedValue::Symbol(value) => Ok(value.clone().into()),
+        TypedValue::Json(value) => Ok(value.clone()),
+        TypedValue::List { values, .. } => values
+            .iter()
+            .map(typed_mcp_arguments)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        TypedValue::Option {
+            value: Some(value), ..
+        } => typed_mcp_arguments(value),
+        TypedValue::Option { value: None, .. } => Ok(serde_json::Value::Null),
+        TypedValue::Record(fields) => {
+            let mut object = serde_json::Map::new();
+            for (name, value) in fields {
+                if matches!(value, TypedValue::Option { value: None, .. }) {
+                    continue;
+                }
+                object.insert(name.clone(), typed_mcp_arguments(value)?);
+            }
+            Ok(serde_json::Value::Object(object))
+        }
+        _ => Err(format!(
+            "typed value {} is outside the admitted MCP JSON subset",
+            value.value_type()
+        )),
+    }
 }
 
 /// Hash a file in bounded chunks, keeping large inputs out of VM memory.
@@ -7902,6 +8034,10 @@ IFS= read -r list
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo_value","description":"untrusted fixture prose","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}]}}'
 IFS= read -r call
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"fixture result"}],"structuredContent":{"ok":true},"isError":false}}'
+IFS= read -r typed_call
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"typed fixture result"}],"structuredContent":{"typed":true},"isError":false}}'
+IFS= read -r forth_call
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"forth fixture result"}],"structuredContent":{"forth":true},"isError":false}}'
 "#;
         let config = std::collections::HashMap::from([(
             "fixture".to_string(),
@@ -7917,7 +8053,24 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         )]);
         let client = Arc::new(crate::tools::mcp::McpClient::from_config(&config).await.unwrap());
         let runtime = ProgramRuntime::new();
-        runtime.bind_mcp_client(client).unwrap();
+        assert!(runtime.bind_mcp_client(client).await.unwrap().is_empty());
+        let state = runtime.inspect().await.unwrap();
+        let namespaced = state
+            .typed_vocabulary
+            .iter()
+            .find(|entry| entry.name == "mcp.fixture.echo_value")
+            .expect("discovered MCP word");
+        assert!(namespaced
+            .signature
+            .as_deref()
+            .unwrap()
+            .contains("record{value:string}"));
+        assert!(namespaced.version.as_deref().unwrap().starts_with("sha256:"));
+        assert!(namespaced
+            .documentation
+            .as_deref()
+            .unwrap()
+            .contains("Untrusted server description"));
         let requirement = CapabilityRequirement {
             capability: CapabilityKind::McpCall,
             selector: ResourceSelector::Mcp {
@@ -7927,14 +8080,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         };
         runtime.grant_typed_capability(requirement).unwrap();
 
-        let outcome = runtime
-            .submit(submission(
-                ProgramLanguage::Lisp,
-                r#"(mcp-call "fixture" "echo_value" (result-unwrap (json-parse "{\"value\":\"hello\"}")))"#,
-                ExecutionEffect::ExternalRead,
-            ))
-            .await
-            .unwrap();
+        let mut generic = submission(
+            ProgramLanguage::Lisp,
+            r#"(mcp-call "fixture" "echo_value" (result-unwrap (json-parse "{\"value\":\"hello\"}")))"#,
+            ExecutionEffect::ExternalRead,
+        );
+        generic.manifest_generation = runtime.manifest_generation();
+        let outcome = runtime.submit(generic).await.unwrap();
 
         assert_eq!(
             outcome.status,
@@ -7944,8 +8096,46 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         );
         assert!(matches!(
             outcome.values.as_slice(),
-            [ProgramValue::Json(serde_json::Value::String(value))]
-                if value.contains("fixture result") && value.contains("\"ok\": true")
+            [ProgramValue::Json(value)]
+                if value["structuredContent"]["ok"] == serde_json::Value::Bool(true)
+        ));
+
+        let mut typed = submission(
+            ProgramLanguage::Lisp,
+            r#"(mcp.fixture.echo_value { :value "typed" })"#,
+            ExecutionEffect::ExternalRead,
+        );
+        typed.manifest_generation = runtime.manifest_generation();
+        let outcome = runtime.submit(typed).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            ExecutionStatus::Completed,
+            "diagnostics: {:?}",
+            outcome.diagnostics
+        );
+        assert!(matches!(
+            outcome.values.last(),
+            Some(ProgramValue::Json(value))
+                if value["structuredContent"]["typed"] == serde_json::Value::Bool(true)
+        ), "values: {:?}", outcome.values);
+
+        let mut forth = submission(
+            ProgramLanguage::Forth,
+            r#"{ value: "forth" } mcp.fixture.echo_value"#,
+            ExecutionEffect::ExternalRead,
+        );
+        forth.manifest_generation = runtime.manifest_generation();
+        let outcome = runtime.submit(forth).await.unwrap();
+        assert_eq!(
+            outcome.status,
+            ExecutionStatus::Completed,
+            "diagnostics: {:?}",
+            outcome.diagnostics
+        );
+        assert!(matches!(
+            outcome.values.last(),
+            Some(ProgramValue::Json(value))
+                if value["structuredContent"]["forth"] == serde_json::Value::Bool(true)
         ));
     }
 
