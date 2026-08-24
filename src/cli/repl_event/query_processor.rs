@@ -29,6 +29,23 @@ fn raw_wire_source(source: &str) -> String {
     source.trim().to_string()
 }
 
+/// Whether a partial provider response is unambiguously beginning a Finch
+/// program. Ordinary prose and shell shebangs are buffered until the response
+/// boundary, avoiding a misleading "program" that later disappears when a
+/// tool-use block arrives.
+fn streamable_wire_prefix(source: &str) -> bool {
+    let source = source.trim_start();
+    source.starts_with('(')
+        || source.starts_with("s\"")
+        || source.starts_with(".\"")
+        || source.starts_with("\"\"\"")
+        || source.starts_with(": ")
+        || source
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+}
+
 /// Build the submission for a provider response carried on the VM wire rather
 /// than in a provider-native tool call.  The typed runtime derives authority
 /// from the program itself; `Pure` is only the coarse compatibility label and
@@ -684,8 +701,16 @@ pub(crate) async fn process_query_with_tools(
         // The shadow-buffer / insert_before architecture requires the message to
         // exist in output_manager before any blit cycles run — the WorkUnit's
         // time-driven animation will be visible during streaming.
-        let verb = crate::cli::messages::random_spinner_verb();
-        let work_unit = output_manager.start_work_unit(verb);
+        let inherited_tool_unit = if query.is_empty() {
+            query_states.tool_work_unit(query_id).await
+        } else {
+            None
+        };
+        let reusing_tool_unit = inherited_tool_unit.is_some();
+        let work_unit = inherited_tool_unit.unwrap_or_else(|| {
+            let verb = crate::cli::messages::random_spinner_verb();
+            output_manager.start_work_unit(verb)
+        });
 
         let stream_start = std::time::Instant::now();
         let mut token_count: usize = 0;
@@ -721,20 +746,25 @@ pub(crate) async fn process_query_with_tools(
                             tracing::debug!("Received TextDelta: {} bytes", delta.len());
                             text.push_str(&delta);
                             token_count += delta.split_whitespace().count();
-                            // WorkUnit accumulates tokens for its own animated display
+                            // A continuation inference belongs to the existing
+                            // Tools activity until we know whether it produced
+                            // more calls or a final wire program. Buffer its
+                            // text rather than replacing the tool block.
                             work_unit.add_tokens(&delta);
                             // The streamed text is VM source, not provisional
                             // assistant prose. As soon as its language can be
                             // identified, project the partial program visibly
                             // instead of hiding it behind the generic spinner.
-                            if !text.trim_start().is_empty() {
+                            if !reusing_tool_unit && streamable_wire_prefix(&text) {
                                 let language =
                                     crate::programs::ProgramLanguage::infer_source(&text);
                                 work_unit.set_program_source(language.as_str());
                             }
                             // Keep the shadow-buffer preview live. The program is
                             // still only parsed/executed at the explicit boundary.
-                            work_unit.set_response(&text);
+                            if !reusing_tool_unit && streamable_wire_prefix(&text) {
+                                work_unit.set_response(&text);
+                            }
                         }
                         Ok(StreamChunk::ContentBlockComplete(block)) => {
                             tracing::debug!("Received ContentBlockComplete: {:?}", block);
@@ -757,13 +787,6 @@ pub(crate) async fn process_query_with_tools(
                     blocks.len()
                 );
                 tracing::debug!("Stream receive loop ended");
-
-                // Stream complete — set the final response text on the WorkUnit.
-                // If tools follow, set_complete() will be called after all tools finish.
-                // If no tools, set_complete() is called below.
-                if !text.is_empty() {
-                    work_unit.set_response(&text);
-                }
 
                 // Send stats update
                 let _ = event_tx.send(ReplEvent::StatsUpdate {
@@ -793,6 +816,15 @@ pub(crate) async fn process_query_with_tools(
 
                 if !tool_uses.is_empty() {
                     tracing::debug!("[EVENT_LOOP] Tools detected, updating query state");
+                    // Text accompanying a tool-use response is provider
+                    // scratch narration, not an executable Finch wire
+                    // program. Keep only the structured calls in the stable
+                    // query-level tool activity block.
+                    work_unit.set_assistant_presentation();
+                    work_unit.set_response("");
+                    query_states
+                        .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
+                        .await;
                     // Update state: executing tools
                     query_states
                         .update_state(
@@ -847,11 +879,18 @@ pub(crate) async fn process_query_with_tools(
                 // then route its `say`/UI events to a distinct output unit.
                 // This keeps agent activity inspectable without making source
                 // and user-visible output compete for the same mutable row.
+                let source_unit = if reusing_tool_unit {
+                    work_unit.set_complete();
+                    query_states.set_tool_work_unit(query_id, None).await;
+                    output_manager.start_work_unit(crate::cli::messages::random_spinner_verb())
+                } else {
+                    Arc::clone(&work_unit)
+                };
                 let wire_source = raw_wire_source(&text);
                 let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
-                work_unit.set_program_source(wire_language.as_str());
-                work_unit.set_response(wire_source.clone());
-                work_unit.set_complete();
+                source_unit.set_program_source(wire_language.as_str());
+                source_unit.set_response(wire_source.clone());
+                source_unit.set_complete();
                 let wire_execution = execute_wire_with_single_repair(
                     program_runtime.as_ref(),
                     Arc::clone(&output_manager),
@@ -889,8 +928,16 @@ pub(crate) async fn process_query_with_tools(
     // Non-streaming path (for Qwen or fallback)
     // Create WorkUnit before the blocking generate call so the animated
     // header is visible during the wait (blit cycle runs every ~100ms).
-    let verb = crate::cli::messages::random_spinner_verb();
-    let work_unit = output_manager.start_work_unit(verb);
+    let inherited_tool_unit = if query.is_empty() {
+        query_states.tool_work_unit(query_id).await
+    } else {
+        None
+    };
+    let reusing_tool_unit = inherited_tool_unit.is_some();
+    let work_unit = inherited_tool_unit.unwrap_or_else(|| {
+        let verb = crate::cli::messages::random_spinner_verb();
+        output_manager.start_work_unit(verb)
+    });
     match generator
         .generate(messages.clone(), Some((*tool_definitions).clone()))
         .await
@@ -921,6 +968,11 @@ pub(crate) async fn process_query_with_tools(
                 .collect();
 
             if !tool_uses.is_empty() {
+                work_unit.set_assistant_presentation();
+                work_unit.set_response("");
+                query_states
+                    .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
+                    .await;
                 // Update state: executing tools
                 query_states
                     .update_state(
@@ -966,11 +1018,18 @@ pub(crate) async fn process_query_with_tools(
 
             // Non-streaming providers receive the same two-unit projection:
             // source first, then the independently reactive program output.
+            let source_unit = if reusing_tool_unit {
+                work_unit.set_complete();
+                query_states.set_tool_work_unit(query_id, None).await;
+                output_manager.start_work_unit(crate::cli::messages::random_spinner_verb())
+            } else {
+                Arc::clone(&work_unit)
+            };
             let wire_source = raw_wire_source(&response.text);
             let wire_language = crate::programs::ProgramLanguage::infer_source(&wire_source);
-            work_unit.set_program_source(wire_language.as_str());
-            work_unit.set_response(wire_source.clone());
-            work_unit.set_complete();
+            source_unit.set_program_source(wire_language.as_str());
+            source_unit.set_response(wire_source.clone());
+            source_unit.set_complete();
             let wire_execution = execute_wire_with_single_repair(
                 program_runtime.as_ref(),
                 Arc::clone(&output_manager),
@@ -1425,6 +1484,18 @@ mod tests {
             direct_wire_submission(&runtime, raw_wire_source("```forth\ns\"hello\" say\n```"))
                 .unwrap_err();
         assert!(error.to_string().contains("E-WIRE-002"));
+    }
+
+    #[test]
+    fn only_unambiguous_wire_prefixes_stream_as_programs() {
+        assert!(streamable_wire_prefix("(say \"hello\")"));
+        assert!(streamable_wire_prefix("s\"hello\" say"));
+        assert!(streamable_wire_prefix(".\"hello\""));
+        assert!(streamable_wire_prefix(": square ( S int -- S int ! pure )"));
+        assert!(streamable_wire_prefix("6 factorial"));
+        assert!(!streamable_wire_prefix("#!/bin/bash"));
+        assert!(!streamable_wire_prefix("Sure, I will inspect that."));
+        assert!(!streamable_wire_prefix("```lisp"));
     }
 
     #[tokio::test]

@@ -230,6 +230,17 @@ impl WorkUnit {
             .response_text = text.into();
     }
 
+    /// Return a generation unit to ordinary assistant/tool presentation.
+    /// Provider text may initially look like VM source before a later stream
+    /// block reveals tool calls; that provisional text must not remain labelled
+    /// as an executable program.
+    pub fn set_assistant_presentation(&self) {
+        self.inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .presentation = WorkUnitPresentation::Assistant;
+    }
+
     /// Append a chunk to the response text (for partial updates).
     pub fn append_response(&self, text: &str) {
         self.inner
@@ -411,6 +422,27 @@ impl Message for WorkUnit {
                     && program_output_has_visible_state(&inner)
                 {
                     return format_program_output(&inner);
+                }
+
+                // Once a provider turn has requested tools, the unit represents
+                // the entire query-level tool loop rather than a generic model
+                // spinner. Keep that stable title while later tool-result
+                // continuations append more rows.
+                if !inner.rows.is_empty() {
+                    let secs = elapsed.as_secs();
+                    let mut out = format!(
+                        "{}⏺{} Tools {}({} · working){}",
+                        CYAN,
+                        RESET,
+                        GRAY_DIM,
+                        fmt_elapsed(secs),
+                        RESET
+                    );
+                    for row in &inner.rows {
+                        out.push('\n');
+                        out.push_str(&format_row(row));
+                    }
+                    return out;
                 }
 
                 // Time-driven throb: frame changes every 200 ms, no external counter
@@ -960,6 +992,16 @@ mod tests {
 
         let formatted = wu.format(&colors());
         assert!(formatted.contains("⏺\u{1b}[0m Tools (2)"), "{formatted:?}");
+    }
+
+    #[test]
+    fn running_tool_unit_has_a_stable_overall_title() {
+        let wu = WorkUnit::new("Random spinner verb");
+        wu.add_row("read(one.rs)");
+
+        let formatted = wu.format(&colors());
+        assert!(formatted.contains("⏺\u{1b}[0m Tools"), "{formatted:?}");
+        assert!(!formatted.contains("Random spinner verb"), "{formatted:?}");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! Each query has associated `WorkUnit` rows that drive the live TUI display.
 
 use crate::claude::Message;
+use crate::cli::messages::WorkUnit;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -50,6 +51,11 @@ pub struct QueryMetadata {
 
     /// When this query was created
     pub created_at: std::time::Instant,
+
+    /// One reactive tool activity block for the entire provider/tool loop.
+    /// Keeping it live across continuation requests prevents each round trip
+    /// from becoming a separate anonymous transcript block.
+    pub tool_work_unit: Option<Arc<WorkUnit>>,
 }
 
 /// Manages state for all in-flight queries
@@ -74,6 +80,7 @@ impl QueryStateManager {
             conversation_snapshot,
             cancellation_token: CancellationToken::new(),
             created_at: std::time::Instant::now(),
+            tool_work_unit: None,
         };
 
         self.states.write().await.insert(id, metadata);
@@ -99,6 +106,20 @@ impl QueryStateManager {
     /// Get full metadata for a query
     pub async fn get_metadata(&self, query_id: Uuid) -> Option<QueryMetadata> {
         self.states.read().await.get(&query_id).cloned()
+    }
+
+    pub async fn set_tool_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>) {
+        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+            metadata.tool_work_unit = unit;
+        }
+    }
+
+    pub async fn tool_work_unit(&self, query_id: Uuid) -> Option<Arc<WorkUnit>> {
+        self.states
+            .read()
+            .await
+            .get(&query_id)
+            .and_then(|metadata| metadata.tool_work_unit.clone())
     }
 
     /// Cancel a query
@@ -175,6 +196,22 @@ mod tests {
         let manager = QueryStateManager::new();
         let unknown = Uuid::new_v4();
         assert!(manager.get_state(unknown).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn query_retains_one_tool_work_unit_across_continuations() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        let unit = Arc::new(WorkUnit::new("Tools"));
+
+        manager
+            .set_tool_work_unit(id, Some(Arc::clone(&unit)))
+            .await;
+        let retained = manager.tool_work_unit(id).await.expect("tool unit");
+        assert!(Arc::ptr_eq(&unit, &retained));
+
+        manager.set_tool_work_unit(id, None).await;
+        assert!(manager.tool_work_unit(id).await.is_none());
     }
 
     #[tokio::test]

@@ -3791,6 +3791,11 @@ Rules:\n\
                     )
                     .await;
 
+                if let Some(unit) = self.query_states.tool_work_unit(query_id).await {
+                    unit.set_failed();
+                    self.query_states.set_tool_work_unit(query_id, None).await;
+                }
+
                 // Display error
                 self.output_manager
                     .write_error(format!("Query failed: {}", error));
@@ -5481,10 +5486,10 @@ Rules:\n\
                     .unwrap_or(0);
 
                 if results_count >= tools_pending {
-                    // All tools completed — mark the WorkUnit complete so the
-                    // animation stops and the final content is shown.
-                    work_unit.set_complete();
-                    // format results and add to conversation
+                    // Keep the query-level Tools unit live while the provider
+                    // consumes these results. A later tool round appends rows
+                    // to the same unit; a final wire program closes it before
+                    // opening the distinct program-source unit.
                     self.finalize_tool_execution(query_id).await?;
                 }
             }
