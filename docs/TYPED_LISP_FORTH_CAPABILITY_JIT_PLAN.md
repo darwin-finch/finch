@@ -726,8 +726,16 @@ Illustrative syntax:
   (file/write path contents))
 ```
 
-Local inference should make annotations optional inside functions. Public definitions require an
-inferred or declared stable signature before publication.
+The intended experience is *statically safe scripting*, not annotation-heavy systems programming.
+Infer literals, locals, parameters, results, stack rows, effects, yields, and generic
+instantiations whenever the program determines them. Private Lisp and Co-Forth definitions should
+normally need no annotations; publication freezes an inferred or explicitly declared stable
+signature. Require annotations at genuinely ambiguous or recursive module interfaces, refinement
+and capability-selector boundaries, and FFI—not merely because the compiler implementation has
+not yet propagated information. Concepts, parameter packs, ranges, overload resolution, and
+bounded CTFE should make routine code feel as direct as Python or JavaScript while retaining one
+static, optimizable execution path. Do not achieve convenience by silently inserting `dynamic`,
+unchecked coercions, or an interpreter-only fallback.
 
 ### Lowering
 
@@ -1417,7 +1425,10 @@ modules, reflection/derivation, asynchronous resources, and ergonomic collection
 without JavaScript prototype mutation or `dynamic` as the routine escape hatch. Both Lisp and
 Co-Forth must expose that same typed semantic surface even when Lisp is the more ergonomic human
 frontend. Maintain a corpus of equivalent application-sized programs to measure source size,
-required annotations, diagnostic quality, and generated IR as features land.
+required annotations, diagnostic quality, first-pass model success, incremental compile latency,
+and generated IR as features land. Annotation density is a product metric: common private
+application code should read like a scripting language even though module publication and the
+independent verifier retain complete static signatures.
 
 ### Eventual self-hosting
 

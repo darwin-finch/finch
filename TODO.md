@@ -7,6 +7,16 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 
 ## Typed Lisp/Co-Forth VM — prerequisite for Brain convergence
 
+- [ ] Make "statically safe, scripting-language feel" a conformance requirement for both source
+  languages. Infer literal, local, parameter, return, stack-row, effect, yield, and generic
+  instantiation types wherever the program determines them; private definitions should normally
+  need no annotations, while publication freezes an inferred or explicitly declared stable
+  interface. Use concepts, overload resolution, parameter packs, ranges, and bounded CTFE to make
+  ordinary collection/data/application code feel as direct as Python or JavaScript without
+  introducing routine `dynamic`, implicit unsafe coercions, or a slower alternate execution path.
+  Require annotations only at genuinely ambiguous, recursive-interface, module/API, refinement,
+  capability-selector, and FFI boundaries. Track annotation density, first-pass model success,
+  compile latency, and diagnostic locality in the cross-provider corpus.
 - [x] Fix startup rendering ownership: the live event loop projects its header through
   `OutputManager`, puts notices in the status bar, silently loads vocabulary, and never executes
   legacy boot scripts at interactive startup. Startup diagnostics and suggestions must continue to
