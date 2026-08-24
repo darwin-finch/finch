@@ -132,6 +132,46 @@ fn write_query_response(
     }
 }
 
+async fn execute_typed_forth_ipc(program: String) -> Result<(Vec<i64>, String)> {
+    let runtime = crate::runtime::ProgramRuntime::new();
+    runtime.grant_typed_capability(crate::vm::CapabilityRequirement {
+        capability: crate::vm::CapabilityKind::SessionEmit,
+        selector: crate::vm::ResourceSelector::None,
+    })?;
+    let outcome = runtime
+        .submit_typed_only(crate::runtime::ProgramSubmission {
+            language: crate::programs::ProgramLanguage::Forth,
+            source_id: Some("capnp:evalForth".to_string()),
+            source: program,
+            intent: "execute typed Co-Forth over the local IPC boundary".to_string(),
+            effect: crate::programs::ExecutionEffect::Unclassified,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: None,
+            budget: None,
+        })
+        .await?;
+    if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
+        let diagnostic = outcome
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("typed Co-Forth ended as {:?}", outcome.status));
+        anyhow::bail!(diagnostic);
+    }
+    let stack = outcome
+        .values
+        .iter()
+        .map(|value| match value {
+            crate::programs::ProgramValue::Int(value) => Ok(*value),
+            other => anyhow::bail!(
+                "evalForth IPC supports only integer stack results; found {other:?}"
+            ),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((stack, outcome.output))
+}
+
 // ---------------------------------------------------------------------------
 // RPC method implementations
 // ---------------------------------------------------------------------------
@@ -266,7 +306,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         })
     }
 
-    // ---- Co-Forth --------------------------------------------------------
+    // ---- Typed Co-Forth --------------------------------------------------
 
     fn eval_forth(
         &mut self,
@@ -278,24 +318,19 @@ impl finch_daemon::Server for FinchDaemonImpl {
             .unwrap_or("")
             .to_owned();
 
-        // Spin up a fresh Forth VM cloned from the precompiled dict, run the
-        // program, then return the full data stack + any printed output.
-        let mut vm = crate::coforth::Library::precompiled_vm();
-        match crate::coforth::Forth::run_on(&mut vm, &program) {
-            Ok((stack, output)) => {
-                let mut r = results.get();
-                let mut list = r.reborrow().init_stack(stack.len() as u32);
-                for (i, v) in stack.iter().enumerate() {
-                    list.set(i as u32, *v);
-                }
-                r.reborrow().set_output(&output);
+        Promise::from_future(async move {
+            let (stack, output) = execute_typed_forth_ipc(program)
+                .await
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            let mut response = results.get();
+            let mut list = response.reborrow().init_stack(stack.len() as u32);
+            for (index, value) in stack.into_iter().enumerate() {
+                list.set(index as u32, value);
             }
-            Err(e) => {
-                let msg = e.to_string();
-                results.get().set_error(&msg);
-            }
-        }
-        Promise::ok(())
+            response.reborrow().set_output(&output);
+            response.set_error("");
+            Ok(())
+        })
     }
 
     // ---- health ----------------------------------------------------------
@@ -307,6 +342,27 @@ impl finch_daemon::Server for FinchDaemonImpl {
     ) -> Promise<(), capnp::Error> {
         results.get().set_version(env!("CARGO_PKG_VERSION"));
         Promise::ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute_typed_forth_ipc;
+
+    #[tokio::test]
+    async fn eval_forth_uses_typed_signatures_and_runtime() {
+        let (stack, output) = execute_typed_forth_ipc(
+            ": double ( S n:int -- S int ! pure ) n n + ; 21 double".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stack, vec![42]);
+        assert!(output.is_empty());
+
+        let error = execute_typed_forth_ipc(": legacy dup * ; 4 legacy".to_string())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("E-FORTH-SIG-001"));
     }
 }
 
