@@ -7,10 +7,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 
 ## Typed Lisp/Co-Forth VM — prerequisite for Brain convergence
 
-- [ ] Fix startup rendering ownership: direct stdout from the legacy banner/proof demo can overlap
-  the shadow-buffer live area and leave stale glyphs (for example a corrupted `258/258` proof
-  count). Startup diagnostics and suggestions must be projected through the same UI/event path or
-  remain opt-in commands; never interleave direct terminal writes with shadow-buffer redraws.
+- [x] Fix startup rendering ownership: the live event loop projects its header through
+  `OutputManager`, puts notices in the status bar, silently loads vocabulary, and never executes
+  legacy boot scripts at interactive startup. Startup diagnostics and suggestions must continue to
+  use that UI/event path or remain opt-in commands; never interleave direct terminal writes with
+  shadow-buffer redraws.
 - [ ] Finish both source frontends and their shared typed IR semantics: definitions/signatures,
   conditionals, metered loops, locals, quotations, closures, collections, bounded macros, and
   structured error/result forms.
