@@ -562,6 +562,18 @@ impl Compiler<'_> {
         (source_items.as_slice() == items).then_some(source.children.as_slice())
     }
 
+    /// Return reader-owned span metadata for a structural suffix of the
+    /// current form. Definition bodies are such a suffix after optional type,
+    /// effect, and docstring metadata, so this avoids source-text searching.
+    fn current_form_suffix_sources(&self, suffix: &[Val]) -> Option<Vec<SpannedVal>> {
+        let source = self.current_source.as_ref()?;
+        let Val::List(items) = &source.value else {
+            return None;
+        };
+        let start = items.len().checked_sub(suffix.len())?;
+        (items[start..] == *suffix).then(|| source.children[start..].to_vec())
+    }
+
     fn compile_expression(
         &mut self,
         expression: &Val,
@@ -693,7 +705,8 @@ impl Compiler<'_> {
                 self.origin("define-parameter"),
             );
         }
-        let result_type = self.compile_begin(definition.body, None, &mut child)?;
+        let body_sources = self.current_form_suffix_sources(definition.body);
+        let result_type = self.compile_begin(definition.body, body_sources.as_deref(), &mut child)?;
         if let Some(expected) = &definition.return_type {
             if result_type != *expected {
                 return Err(vec![self.error(
@@ -815,7 +828,15 @@ impl Compiler<'_> {
         }
         let operator = match &items[0] {
             Val::Symbol(operator) => operator.as_str(),
-            _ => return self.compile_closure_call(&items[0], &items[1..], builder),
+            _ => {
+                return self.compile_closure_call(
+                    &items[0],
+                    &items[1..],
+                    source_children.as_deref().and_then(|children| children.first()),
+                    source_children.as_deref().and_then(|children| children.get(1..)),
+                    builder,
+                )
+            }
         };
         match operator {
             "begin" => self.compile_begin(
@@ -823,7 +844,11 @@ impl Compiler<'_> {
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
             ),
-            "let" => self.compile_let(&items[1..], builder),
+            "let" => self.compile_let(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             "if" => self.compile_if(
                 &items[1..],
                 source_children.as_deref().and_then(|children| children.get(1..)),
@@ -835,7 +860,11 @@ impl Compiler<'_> {
             "while" => self.compile_while(&items[1..], builder),
             "break" => self.compile_loop_exit("break", &items[1..], builder),
             "continue" => self.compile_loop_exit("continue", &items[1..], builder),
-            "lambda" => self.compile_lambda(&items[1..], builder),
+            "lambda" => self.compile_lambda(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             "defer" => self.compile_defer(&items[1..], builder),
             "defer-cpu" => self.compile_defer_cpu(&items[1..], builder),
             "task-poll" => self.compile_cpu_task_operation(&items[1..], builder, false),
@@ -845,7 +874,13 @@ impl Compiler<'_> {
             "map" => self.compile_map_value(&items[1..], builder),
             "empty-map" => self.compile_empty_map(&items[1..], builder),
             _ if builder.resolve(operator).is_some() => {
-                self.compile_closure_call(&items[0], &items[1..], builder)
+                self.compile_closure_call(
+                    &items[0],
+                    &items[1..],
+                    source_children.as_deref().and_then(|children| children.first()),
+                    source_children.as_deref().and_then(|children| children.get(1..)),
+                    builder,
+                )
             }
             _ => self.compile_named_call(
                 operator,
@@ -1127,6 +1162,7 @@ impl Compiler<'_> {
     fn compile_let(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() < 2 {
@@ -1174,7 +1210,11 @@ impl Compiler<'_> {
             );
         }
         builder.scopes.push(scope);
-        let result = self.compile_begin(&expressions[1..], None, builder);
+        let result = self.compile_begin(
+            &expressions[1..],
+            expression_sources.and_then(|sources| sources.get(1..)),
+            builder,
+        );
         builder.scopes.pop();
         result
     }
@@ -1726,6 +1766,7 @@ impl Compiler<'_> {
     fn compile_lambda(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.len() < 2 {
@@ -1797,7 +1838,11 @@ impl Compiler<'_> {
                 self.origin("lambda-parameter"),
             );
         }
-        let result_type = self.compile_begin(&expressions[1..], None, &mut child)?;
+        let result_type = self.compile_begin(
+            &expressions[1..],
+            expression_sources.and_then(|sources| sources.get(1..)),
+            &mut child,
+        )?;
         child.stack.push(result_type.clone());
         child.emit(Instruction::Return, self.origin("lambda-return"));
         let child_function = child.finish(vec![result_type.clone()]);
@@ -1927,12 +1972,18 @@ impl Compiler<'_> {
         &mut self,
         target: &Val,
         arguments: &[Val],
+        target_source: Option<&SpannedVal>,
+        argument_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
-        for argument in arguments {
-            self.compile_expression(argument, builder)?;
+        for (index, argument) in arguments.iter().enumerate() {
+            self.compile_expression_at(
+                argument,
+                argument_sources.and_then(|sources| sources.get(index)),
+                builder,
+            )?;
         }
-        let closure_type = self.compile_expression(target, builder)?;
+        let closure_type = self.compile_expression_at(target, target_source, builder)?;
         let Type::Function {
             arguments: expected,
             result,
@@ -2882,6 +2933,28 @@ mod tests {
             .and_then(|origin| origin.span.as_ref())
             .expect("exact source span");
         assert_eq!(&source[span.start_byte..span.end_byte], "missing");
+    }
+
+    #[test]
+    fn lexical_body_diagnostics_keep_nested_source_spans() {
+        for source in [
+            "(define (broken (value : int)) : int missing)",
+            "(let ((value 1)) missing)",
+            "((lambda ((value : int)) missing) 1)",
+        ] {
+            let errors = compile_lisp("lexical.lisp", source, Vec::new(), &core_vocabulary())
+                .expect_err("body contains an unbound name");
+            let missing = errors
+                .iter()
+                .find(|error| error.code == "E-NAME-001")
+                .expect("unbound lexical-body diagnostic");
+            let span = missing
+                .primary
+                .as_ref()
+                .and_then(|origin| origin.span.as_ref())
+                .expect("exact source span");
+            assert_eq!(&source[span.start_byte..span.end_byte], "missing");
+        }
     }
 
     #[test]
