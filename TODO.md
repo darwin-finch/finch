@@ -182,9 +182,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth
-  response programs through the raw wire receiver; this is useful integration evidence, not a
-  substitute for fixed multi-provider conformance fixtures or recovery-rate measurements. Do not
-  require the later Cranelift JIT optimization tier to begin Brain convergence.
+  response programs through the raw wire receiver. A 2026-08-24 named-Brain smoke check attached
+  two live consoles, shared a Lisp definition between them, restored it across daemon restart, and
+  had configured Grok emit Co-Forth that invoked the restored word. This is useful integration
+  evidence, not a substitute for fixed multi-provider conformance fixtures or recovery-rate
+  measurements. Do not require the later Cranelift JIT optimization tier to begin Brain convergence.
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
@@ -247,8 +249,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   process, dialog, or network effects while restoring VM state.
 - [ ] Add typed compensating actions for reversible effects. File undo must use preimage and
   postimage hashes plus a conflict-aware reverse changeset.
-- [ ] Finish remote named-brain attach/detach, live scrollback replacement, status display, and
-  prompt/Forth/Lisp routing through the daemon-owned event stream.
+- [x] Finish remote named-brain attach/detach, live scrollback replacement, status display, and
+  prompt/Forth/Lisp routing through the daemon-owned event stream. The WebSocket now begins with an
+  atomic snapshot/live subscription, attached clients render typed source and output distinctly,
+  and one per-Brain daemon turn lane serializes concurrent consoles against the authoritative VM
+  revision. A two-console test on 2026-08-24 also passed restart/checkpoint restoration and a real
+  configured-Grok prompt. Durable per-client acknowledgement cursors and scoped participant roles
+  remain separate items below.
 - [ ] After the VM gate, launch each local active Brain runner in a named `tmux` session by default
   on Unix. Keep the daemon as a durable event-log/coordinator with no workspace, accessibility, or
   credential handles; the master frontend runner is the only environment authority. Recover only

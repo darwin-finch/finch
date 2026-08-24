@@ -114,6 +114,11 @@ the old Co-Forth or native Lisp evaluators. Program events and raw provider-wire
 typed `ProgramRuntime`; successful reducible revisions are stored as content-addressed checkpoints
 beside the event log and restored without replaying source or effects. Concurrent commits journal
 their exact runtime revision and recovery never regresses to a later-appended older checkpoint.
+Each named Brain also owns one daemon turn lane, so concurrent attached consoles cannot interleave
+input acceptance, VM commit, checkpoint publication, and Result events. Its WebSocket subscription
+is snapshot-first without a snapshot/subscribe gap. A 2026-08-24 two-console smoke test shared a
+definition live, restored it after daemon restart, and executed a configured-Grok Co-Forth response
+against the restored dictionary.
 This remains a compatibility adapter, not the final runner-lease architecture: it has no approval
 audience and therefore cannot acquire workspace/host grants. B2-B4 must move its runtime ownership
 to the leased environment runner and retain the daemon as durable coordinator only.
