@@ -149,11 +149,6 @@ enum Command {
         #[command(subcommand)]
         license_command: Option<LicenseCommand>,
     },
-    /// Co-Forth: run or validate Forth code
-    Coforth {
-        #[command(subcommand)]
-        coforth_command: CoforthCommand,
-    },
     /// English word library: build, list, and inspect
     Library {
         #[command(subcommand)]
@@ -214,22 +209,6 @@ enum NetworkCommand {
 enum TrainCommand {
     /// Install Python dependencies for LoRA training
     Setup,
-}
-
-#[derive(Parser, Debug)]
-enum CoforthCommand {
-    /// Run Forth code and print output
-    Run {
-        /// Forth source code to execute
-        #[arg(long)]
-        code: String,
-    },
-    /// Validate Forth code (run and report success/failure)
-    Validate {
-        /// Forth source code to validate
-        #[arg(long)]
-        code: String,
-    },
 }
 
 #[derive(Parser, Debug)]
@@ -852,9 +831,6 @@ async fn main() -> Result<()> {
         Some(Command::License { license_command }) => {
             return run_license_command(license_command).await;
         }
-        Some(Command::Coforth { coforth_command }) => {
-            return run_coforth_command(coforth_command);
-        }
         Some(Command::Library { library_command }) => {
             return run_library_command(library_command).await;
         }
@@ -884,10 +860,8 @@ async fn main() -> Result<()> {
         return run_finch_script(script, args.json).await;
     }
 
-    // --forth: direct typed Co-Forth evaluation, no AI, TUI, or config
-    // needed. The explicit `coforth` maintenance subcommand remains the
-    // legacy interpreter's home; provider-facing/direct source must not gain
-    // a bypass around the shared verifier and capability broker.
+    // --forth: direct typed Co-Forth evaluation, no AI, TUI, or config.
+    // All public source enters the shared verifier and capability broker.
     if let Some(forth_expr) = &args.forth {
         return run_direct_typed_source_with_json(
             finch::programs::ProgramLanguage::Forth,
@@ -2671,44 +2645,6 @@ async fn run_node_info() -> Result<()> {
     Ok(())
 }
 
-// ── finch coforth ─────────────────────────────────────────────────────────────
-
-fn execute_coforth_code(code: &str) -> Result<String> {
-    // Use the pre-compiled VM so major words and the full library are available.
-    // Do not run legacy `boot` entries implicitly: they can print poetry or run
-    // proof demonstrations before the requested program, and startup work must
-    // be an explicit, reviewed BrainRun rather than ambient VM behavior.
-    let mut vm = finch::coforth::Library::precompiled_vm();
-    vm.exec(code)?;
-    Ok(std::mem::take(&mut vm.out))
-}
-
-fn run_coforth_command(cmd: CoforthCommand) -> Result<()> {
-    match cmd {
-        CoforthCommand::Run { code } => match execute_coforth_code(&code) {
-            Ok(out) => print!("{out}"),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        },
-        CoforthCommand::Validate { code } => match execute_coforth_code(&code) {
-            Ok(out) if !out.is_empty() => {
-                println!("ok  →  {:?}", out.trim());
-            }
-            Ok(_) => {
-                eprintln!("fail: compiled and ran but produced no output");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("fail: {e}");
-                std::process::exit(1);
-            }
-        },
-    }
-    Ok(())
-}
-
 // ── finch library ─────────────────────────────────────────────────────────────
 
 /// Build an AI generator from the teacher config, with an optional model override.
@@ -3557,13 +3493,14 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_coforth_code, register_query_vm_tools};
+    use super::{register_query_vm_tools, Args};
+    use clap::Parser;
     use std::sync::Arc;
 
     #[test]
-    fn coforth_command_does_not_run_legacy_boot_entries_implicitly() {
-        let output = execute_coforth_code("1 2 + .").expect("program executes");
-        assert_eq!(output, "3 ");
+    fn legacy_coforth_subcommand_is_not_public() {
+        assert!(Args::try_parse_from(["finch", "coforth", "run", "--code", "1 2 +"])
+            .is_err());
     }
 
     #[test]
