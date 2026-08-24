@@ -82,10 +82,6 @@ pub enum Command {
     Setup,   // /setup — open the setup wizard (run 'finch setup' to reconfigure)
     Share,   // /share — format session as a pasteable proof block
     BoxDiff, // /box-diff — compare all peers, offer to fix outliers
-    // Channel commands (IRC-style)
-    JoinChannel(String),        // /join #channel        — join a named channel
-    PartChannel(String),        // /part #channel        — leave a named channel
-    SayChannel(String, String), // /say #channel message — send a message to a channel
     // Peer connect / disconnect
     Connect(String), // /connect <host:port>   — add peer to current room + peer list
     Disconnect(String), // /disconnect <name-or-addr> — remove peer from room + list
@@ -203,37 +199,6 @@ impl Command {
             } else {
                 Some(reason.to_string())
             }));
-        }
-
-        // Channel commands
-        fn ensure_hash(s: &str) -> String {
-            if s.starts_with('#') {
-                s.to_string()
-            } else {
-                format!("#{s}")
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix("/join ") {
-            let chan = rest.trim();
-            if !chan.is_empty() {
-                return Some(Command::JoinChannel(ensure_hash(chan)));
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix("/part ") {
-            let chan = rest.trim();
-            if !chan.is_empty() {
-                return Some(Command::PartChannel(ensure_hash(chan)));
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix("/say ") {
-            let rest = rest.trim();
-            if let Some(space) = rest.find(|c: char| c.is_whitespace()) {
-                let chan = rest[..space].trim();
-                let msg = rest[space..].trim();
-                if !chan.is_empty() && !msg.is_empty() {
-                    return Some(Command::SayChannel(ensure_hash(chan), msg.to_string()));
-                }
-            }
         }
 
         if let Some(rest) = trimmed.strip_prefix("/connect ") {
@@ -640,10 +605,6 @@ pub fn handle_command(
         Command::Accept(_) | Command::Reject(_) => Ok(CommandOutput::Status(
             "Diff command should be handled in REPL.".to_string(),
         )),
-        // Channel commands are handled directly in REPL
-        Command::JoinChannel(_) | Command::PartChannel(_) | Command::SayChannel(_, _) => Ok(
-            CommandOutput::Status("Channel commands should be handled in REPL.".to_string()),
-        ),
     }
 }
 
@@ -769,11 +730,6 @@ pub fn format_help() -> String {
          {reset}\n\
          {gray}  The current stack/poset panel is an experimental review surface.\n\
          /run presents the assembled dependency plan before execution.{reset}\n\n\
-         {yellow_bold}💬 Channel Commands:{reset}\n\
-         {cyan}  /join #channel{reset}     Join a named channel; announce to all peers\n\
-         {cyan}  /part #channel{reset}     Leave a named channel\n\
-         {cyan}  /say #channel msg{reset}  Send a message to a channel\n\
-         {reset}\n\
          {yellow_bold}🔀 Diff Proposal Flow:{reset}\n\
          {gray}  Peers (AI or remote) propose diffs in the room. You argue back in chat.{reset}\n\
          {gray}  When you're satisfied, accept or reject:{reset}\n\

@@ -269,14 +269,6 @@ pub struct EventLoop {
     /// From config.client.auto_discover.
     auto_discover: bool,
 
-    /// Channels this session has joined (e.g. "#general").
-    /// Persisted across sessions in ~/.finch/channels.json.
-    joined_channels: std::collections::HashSet<String>,
-
-    /// Ring buffer of recently received channel messages: (channel, sender, text).
-    /// Indexed 0 = most recent. Capped at 20.
-    recent_channel_msgs: std::collections::VecDeque<(String, String, String)>,
-
     /// Remote peer daemon addresses (host:port) from --peer flag.
     remote_peers: Vec<String>,
 
@@ -397,16 +389,6 @@ pub enum ViewMode {
 /// Extract a Forth definition from a channel message, if present.
 /// Channel messages have the format `[#channel] sender: <content>`.
 /// If `<content>` starts with `:` (a colon definition), return it.
-/// Heuristic: does this input look like natural language rather than Forth code?
-/// Used to decide whether to fall through to AI even when the VM ran silently.
-///
-/// Triggers on:
-/// - Questions (ASCII `?` or fullwidth `？`)
-/// - Non-Latin scripts (Chinese, Arabic, Japanese, Korean, etc.) that aren't
-///   Forth definitions — these never need uppercase to signal "sentence"
-/// - Latin sentences starting with an uppercase letter
-/// Returns `true` when `word` has a dedicated magic-word response.
-/// Returns the specific response for a magic word, or `None` for unknowns.
 /// Try to fetch the `name` field from a peer's `/v1/node/info` endpoint.
 /// Returns `None` on any error (network, timeout, missing field).
 async fn fetch_peer_name(addr: &str) -> Option<String> {
@@ -448,48 +430,6 @@ async fn fetch_peer_vocab_source(addr: &str) -> String {
             .and_then(|j| j["source"].as_str().map(|s| s.to_string()))
             .unwrap_or_default(),
         Err(_) => String::new(),
-    }
-}
-
-fn extract_channel_forth(msg: &str) -> Option<String> {
-    if !msg.starts_with('[') {
-        return None;
-    }
-    let close = msg.find(']')?;
-    let after_bracket = msg[close + 1..].trim_start_matches(':').trim_start();
-    // after_bracket is now "sender: content" — find the ": content" part
-    let colon_pos = after_bracket.find(": ")?;
-    let content = after_bracket[colon_pos + 2..].trim();
-    if content.starts_with(':') {
-        Some(content.to_string())
-    } else {
-        None
-    }
-}
-
-fn channels_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".finch").join("channels.json"))
-}
-
-fn load_joined_channels() -> std::collections::HashSet<String> {
-    let Some(path) = channels_path() else {
-        return std::collections::HashSet::new();
-    };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return std::collections::HashSet::new();
-    };
-    serde_json::from_str::<Vec<String>>(&contents)
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
-}
-
-fn save_joined_channels(channels: &std::collections::HashSet<String>) {
-    let Some(path) = channels_path() else { return };
-    let mut sorted: Vec<&String> = channels.iter().collect();
-    sorted.sort();
-    if let Ok(json) = serde_json::to_string(&sorted) {
-        let _ = std::fs::write(path, json);
     }
 }
 
@@ -958,8 +898,6 @@ impl EventLoop {
             peer_inbox_rx,
             diff_store: DiffStore::new(),
             peer_session_rx,
-            joined_channels: load_joined_channels(),
-            recent_channel_msgs: std::collections::VecDeque::new(),
             remote_peers,
             active_remote_brain: None,
             daemon_base_url,
@@ -1470,20 +1408,10 @@ impl EventLoop {
                     }
                     for msg in incoming {
                         use crossterm::style::Stylize;
-                        // Channel messages ([#name] sender: text) get distinct colour
-                        let display = if msg.starts_with('[') && msg.contains(']') {
-                            format!("{}", msg.as_str().cyan())
-                        } else {
-                            format!("{}  {}", "←".dark_grey(), msg.as_str().white())
-                        };
+                        let display = format!("{}  {}", "←".dark_grey(), msg.as_str().white());
                         self.output_manager.write_info(display);
 
-                        // Word propagation: if the message is a channel Forth definition,
-                        // compile it silently into the local VM so the shared vocabulary grows.
-                        // Format: "[#channel] sender: : word body ;"
-                        if let Some(forth_def) = extract_channel_forth(&msg) {
-                            let _ = self.forth_vm.exec_with_fuel(&forth_def, 0);
-                        } else if let Err(e) = self.handle_stack_push(msg).await {
+                        if let Err(e) = self.handle_stack_push(msg).await {
                             tracing::warn!("Failed to handle incoming push: {e}");
                         }
                     }
@@ -1649,45 +1577,6 @@ impl EventLoop {
         if input.trim().starts_with('/') {
             // Echo the command to output (like user queries)
             self.output_manager.write_user(input.clone());
-
-            // /exec [n] — execute a received channel message by index (0 = most recent).
-            //   /exec      → list buffered messages with indices
-            //   /exec 2    → run message at index 2
-            if let Some(rest) = input.trim().strip_prefix("/exec") {
-                let rest = rest.trim();
-                if rest.is_empty() {
-                    if self.recent_channel_msgs.is_empty() {
-                        self.output_manager
-                            .write_info("no channel messages received yet".to_string());
-                    } else {
-                        let lines: Vec<String> = self
-                            .recent_channel_msgs
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (ch, snd, txt))| format!("[{i}] {ch} {snd}: {txt}"))
-                            .collect();
-                        self.output_manager.write_info(lines.join("\n"));
-                    }
-                    self.render_tui().await?;
-                    return Ok(());
-                }
-                if let Ok(idx) = rest.parse::<usize>() {
-                    if let Some((channel, sender, text)) =
-                        self.recent_channel_msgs.get(idx).cloned()
-                    {
-                        self.output_manager
-                            .write_info(format!("executing [{idx}] {channel} {sender}: {text}"));
-                        // Route through the stack/query path directly (no recursion).
-                        self.output_manager.write_user(text.clone());
-                        return self.handle_forth_or_query(text).await;
-                    } else {
-                        self.output_manager
-                            .write_info(format!("no message at index {idx}"));
-                        self.render_tui().await?;
-                    }
-                    return Ok(());
-                }
-            }
 
             if let Some(command) = Command::parse(&input) {
                 match command {
@@ -2116,30 +2005,6 @@ Rules:\n\
                     Command::Discover => {
                         self.handle_discover().await?;
                     }
-                    Command::JoinChannel(chan) => {
-                        self.joined_channels.insert(chan.clone());
-                        save_joined_channels(&self.joined_channels);
-                        let ev = crate::session::SessionEvent::chat(format!("joined {chan}"));
-                        let _ = self.peer_tx.send(ev);
-                    }
-                    Command::PartChannel(chan) => {
-                        self.joined_channels.remove(&chan);
-                        save_joined_channels(&self.joined_channels);
-                        let ev = crate::session::SessionEvent::chat(format!("parted {chan}"));
-                        let _ = self.peer_tx.send(ev);
-                    }
-                    Command::SayChannel(chan, msg) => {
-                        self.output_manager
-                            .write_user(format!("/say {} {}", chan, msg));
-                        let promise = crate::session::Promise::natural(msg);
-                        let bundle = crate::session::ProofBundle::new(promise, vec![]);
-                        let ev = crate::session::SessionEvent::ChannelMessage {
-                            channel: chan,
-                            sender: self.session_label.clone(),
-                            bundle,
-                        };
-                        let _ = self.peer_tx.send(ev);
-                    }
                     Command::Connect(addr) => {
                         self.handle_connect(addr).await?;
                     }
@@ -2246,62 +2111,18 @@ Rules:\n\
                     })
                     .await;
             }
-            // Broadcast to channels so peers can see (and /exec) it.
-            for chan in &self.joined_channels {
-                let promise = crate::session::Promise::lisp(input.clone());
-                let bundle = crate::session::ProofBundle::new(promise, vec![]);
-                let ev = crate::session::SessionEvent::ChannelMessage {
-                    channel: chan.clone(),
-                    sender: self.session_label.clone(),
-                    bundle,
-                };
-                let _ = self.peer_tx.send(ev);
-            }
             return self
                 .execute_interactive_typed_program(
                     crate::programs::ProgramLanguage::Lisp,
                     input,
                 )
                 .await;
-        }
-
-        // Broadcast ordinary user text as text. A channel must not gain an
-        // execution interpretation merely because the legacy dictionary happens
-        // to recognize its words.
-        if !self.joined_channels.is_empty() {
-            let promise = crate::session::Promise::natural(input.clone());
-            let bundle = crate::session::ProofBundle::new(promise, vec![]);
-            for chan in &self.joined_channels {
-                let ev = crate::session::SessionEvent::ChannelMessage {
-                    channel: chan.clone(),
-                    sender: self.session_label.clone(),
-                    bundle: bundle.clone(),
-                };
-                let _ = self.peer_tx.send(ev);
-            }
         }
 
         // Plain terminal text is always a user turn. Executable source is
         // deliberately explicit: Lisp begins with `(`, typed definitions begin
         // with `:`, and other Co-Forth uses `/forth`. Never classify prose by
         // asking the historical semiotic dictionary whether its words exist.
-        self.execute_query(input).await
-    }
-
-    /// Route an explicitly selected received channel message without slash-command
-    /// handling or another channel broadcast. Lisp remains structurally
-    /// unambiguous; all other text is an agent turn rather than an implicit legacy
-    /// stack program.
-    async fn handle_forth_or_query(&mut self, input: String) -> Result<()> {
-        // Lisp
-        if input.trim_start().starts_with('(') {
-            return self
-                .execute_interactive_typed_program(
-                    crate::programs::ProgramLanguage::Lisp,
-                    input,
-                )
-                .await;
-        }
         self.execute_query(input).await
     }
 
@@ -3340,31 +3161,8 @@ Rules:\n\
             }
             ReplEvent::PeerMessage { text } => {
                 use crossterm::style::Stylize;
-                // Channel messages are tagged with a sentinel that may be preceded
-                // by "peer-XXXX: " when the peer loop wraps the tagged string.
-                if let Some(sentinel_pos) = text.find("\x01CHAN\x01") {
-                    let sentinel = &text[sentinel_pos..];
-                    let parts: Vec<&str> = sentinel.splitn(5, '\x01').collect();
-                    // parts: ["", "CHAN", channel, sender, text_body]
-                    if parts.len() == 5 {
-                        let (channel, sender, body) = (parts[2], parts[3], parts[4]);
-                        let idx = self.recent_channel_msgs.len();
-                        self.recent_channel_msgs.push_front((
-                            channel.to_string(),
-                            sender.to_string(),
-                            body.to_string(),
-                        ));
-                        if self.recent_channel_msgs.len() > 20 {
-                            self.recent_channel_msgs.pop_back();
-                        }
-                        let line = format!("[{idx}] {channel} {sender}: {body}");
-                        self.output_manager.write_info(line.cyan().to_string());
-                    }
-                } else {
-                    // text is already "peer-XXXXXXXX: result" from the select! branch
-                    self.output_manager
-                        .write_info(text.as_str().cyan().to_string());
-                }
+                self.output_manager
+                    .write_info(text.as_str().cyan().to_string());
                 self.render_tui().await?;
             }
 
@@ -7314,27 +7112,6 @@ mod tests {
             options.is_empty(),
             "pending_brain_question_options should be cleared"
         );
-    }
-
-    #[test]
-    fn test_extract_channel_forth_definition() {
-        let msg = "[#forth] alice: : double  2 * ;";
-        assert_eq!(
-            extract_channel_forth(msg),
-            Some(": double  2 * ;".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_channel_forth_non_definition() {
-        let msg = "[#general] alice: hello world";
-        assert_eq!(extract_channel_forth(msg), None);
-    }
-
-    #[test]
-    fn test_extract_channel_forth_non_channel() {
-        let msg = "← plain peer message";
-        assert_eq!(extract_channel_forth(msg), None);
     }
 
     #[test]
